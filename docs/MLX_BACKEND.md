@@ -1,7 +1,8 @@
 # MLX backend implementation lane
 
 Branch: feat/mlx-backend. Initial base: release main 776e257.
-This is a native C++ backend project; MLX inference is not implemented yet.
+This is an experimental native C++ backend lane. Dense qwen35 forward exists;
+production Model/session dispatch and the HTTP server are not wired yet.
 
 Keep the existing numerical quant formats. Custom MLX/Metal operators must
 preserve each format's codes, scales, codebook and activation basis. Container
@@ -45,7 +46,8 @@ Mac lane ownership before any hardware run; one loaded model at a time.
 The portable host build and tests run on Apple Silicon. Configure
 `TQLLM_CUDA=OFF`, `TQLLM_MLX=ON` and point `CMAKE_PREFIX_PATH` at an installed
 MLX C++ package (MLX 0.32 or later). This builds `tqmlx` and `test-mlx-tq4`.
-It does not yet build a complete MLX inference engine or server.
+It also builds `tqmlx-probe`, a noninteractive dense qwen35 forward harness.
+It does not yet build an MLX HTTP server.
 
 The first operators preserve the existing 128-point signed rotation and
 nonuniform TQ4 codebook: uint8 packed codes, FP16 scales per 128 columns,
@@ -77,3 +79,24 @@ Strict FP32 oracle tests use `MLX_ENABLE_TF32=0`. MLX defaults can use reduced
 precision for FP32 matrix multiplication, so batched dense matrices must not
 be assumed to match the FP32 oracle under the default environment. Keep the
 precision setting in benchmark provenance.
+
+## Experimental dense forward
+
+`Qwen35` loads compressed GGUF weights and owns independent attention,
+convolution and DeltaNet caches. GGUF value-head ordering is tiled: value head
+h uses key head h % key_heads. The MLX recurrence receives explicitly expanded
+key/query heads in that order. Reset clears every sequence cache.
+
+`tqmlx-probe --model file.gguf --prompt text --generate 32 --repeat 2` loads one
+model, produces greedy text and rejects unequal token output across repeated
+resets. `--tokens-file` accepts whitespace-separated exact token IDs;
+`--ignore-eos` is only for fixed-length throughput probes. Decode reports
+(output_tokens - 1) / elapsed time after the first token. Precision, warmup,
+repeats and prefill chunk must be matched and recorded in comparisons.
+`--all-logits --logits file` dumps FP32 prompt logits for teacher-forced gates.
+
+This path is experimental, without speculative decode, vision, MoE, tied
+embeddings or RoPE scaling. It requires native Q4_K embeddings. Coherent text
+and reset equality are smoke gates; they do not establish model quality or a
+speed win. Keep it out of release dispatch until the many-token quality and
+performance gates pass.
