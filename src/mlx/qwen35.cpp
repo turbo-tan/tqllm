@@ -51,6 +51,8 @@ struct Qwen35::Impl {
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
     std::optional<mx::array> last_hidden;
+    std::optional<mx::array> last_features;
+    std::vector<int> feature_ids;
     Cache mtp_cache;
     int mtp_pos=1;
     bool mtp_enabled=false;
@@ -238,8 +240,10 @@ struct Qwen35::Impl {
             stages[name]+=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;
         };
         const int m=int(tokens.size());auto x=bf(q4_embedding(*embedding,tokens));
+        std::vector<mx::array> features;
         if(stage_profiling)record("embedding",{x});
         for(int l=0;l<layers;++l) {
+            if(std::binary_search(feature_ids.begin(),feature_ids.end(),l))features.push_back(x);
             const std::string p="blk."+std::to_string(l)+".";
             auto n=norm(x,p+"attn_norm.weight");
             auto attn=(l+1)%interval==0?full_attention(p,n,caches[l],pos):gdn(p,n,caches[l],tapes[l]);
@@ -256,9 +260,11 @@ struct Qwen35::Impl {
             if(stage_profiling)record("ffn_down",{x});
         }
         last_hidden=x;
+        if(!features.empty())last_features=mx::concatenate(features,1);
         x=norm(x,"output_norm.weight");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
         std::vector<mx::array> live={x};
+        if(last_features)live.push_back(*last_features);
         for(const auto& c:caches) {
             if(c.conv) live.push_back(*c.conv);
             if(c.state) live.push_back(*c.state);
@@ -284,10 +290,11 @@ struct Qwen35::Snapshot::State {
     int pos;
     std::vector<Cache> caches;
     std::optional<mx::array> hidden;
+    std::optional<mx::array> features;
 };
 Qwen35::Snapshot Qwen35::checkpoint() const {
     Snapshot result;
-    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches,impl_->last_hidden});
+    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches,impl_->last_hidden,impl_->last_features});
     return result;
 }
 void Qwen35::restore(const Snapshot& snapshot) {
@@ -296,6 +303,7 @@ void Qwen35::restore(const Snapshot& snapshot) {
     impl_->pos=snapshot.state_->pos;
     impl_->caches=snapshot.state_->caches;
     impl_->last_hidden=snapshot.state_->hidden;
+    impl_->last_features=snapshot.state_->features;
     ++impl_->revision;
 }
 struct Qwen35::Verification::State {
@@ -305,6 +313,7 @@ struct Qwen35::Verification::State {
     std::vector<Cache> before,after;
     std::vector<PrefixTape> tapes;
     std::optional<mx::array> hidden_before,hidden_after;
+    std::optional<mx::array> features_before,features_after;
 };
 mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
     if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
@@ -317,7 +326,8 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
         auto logits=impl_->forward(tokens,true);
         batch.state_=std::make_shared<Verification::State>(Verification::State{
             impl_.get(),impl_->epoch,impl_->revision,before.state_->pos,int(tokens.size()),
-            before.state_->caches,impl_->caches,impl_->tapes,before.state_->hidden,impl_->last_hidden});
+            before.state_->caches,impl_->caches,impl_->tapes,before.state_->hidden,impl_->last_hidden,
+            before.state_->features,impl_->last_features});
         impl_->capture_prefix=false;
         for(auto& tape:impl_->tapes)tape=PrefixTape{};
         return logits;
@@ -349,6 +359,24 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     mx::eval(live);
     impl_->caches=std::move(caches);impl_->pos=s->start+int(count);++impl_->revision;
     impl_->last_hidden=count?std::optional<mx::array>(tail_slice(*s->hidden_after,0,int(count)-1,int(count))):s->hidden_before;
+    impl_->last_features=count && s->features_after?std::optional<mx::array>(tail_slice(*s->features_after,0,0,int(count))):s->features_before;
+}
+void Qwen35::feature_layers(const std::vector<int>& layers) {
+    if(impl_->pos!=0 || !std::is_sorted(layers.begin(),layers.end()) ||
+       std::adjacent_find(layers.begin(),layers.end())!=layers.end() ||
+       (!layers.empty() && (layers.front()<0 || layers.back()>=impl_->layers)))
+        throw std::invalid_argument("feature layers must be unique, ordered and configured before prefill");
+    impl_->feature_ids=layers;impl_->last_features.reset();
+}
+mx::array Qwen35::feature_states() const {
+    if(!impl_->last_features)throw std::invalid_argument("no target features captured");
+    return *impl_->last_features;
+}
+mx::array Qwen35::embed_tokens(std::span<const uint32_t> tokens) const {return bf(q4_embedding(*impl_->embedding,tokens));}
+mx::array Qwen35::shared_draft_head(const mx::array& x) const {
+    if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid shared draft-head input");
+    return impl_->mtp_head?q6_matmul(*impl_->mtp_head,x):linear(impl_->matrices.at("output.weight"),x);
 }
 mx::array Qwen35::hidden_states() const {
     if(!impl_->last_hidden)throw std::invalid_argument("no MLX target hidden states");
@@ -380,7 +408,7 @@ void Qwen35::enable_mtp() {
     impl_->mtp_enabled=true;
 }
 void Qwen35::draft_shortlist(const mx::array& logits,int count) {
-    if(!impl_->mtp_enabled || count<1 || count>impl_->vocab || logits.shape()!=mx::Shape{1,impl_->vocab})
+    if(count<1 || count>impl_->vocab || logits.shape()!=mx::Shape{1,impl_->vocab})
         throw std::invalid_argument("invalid MTP shortlist");
     const auto* head=std::get_if<Q6Weights>(&impl_->matrices.at("output.weight"));
     if(!head)throw std::invalid_argument("MTP shortlist requires Q6_K target head");
@@ -473,6 +501,7 @@ void Qwen35::reset() {
     ++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};
     impl_->last_hidden.reset();impl_->mtp_cache=Cache{};impl_->mtp_pos=1;
     impl_->mtp_hidden.reset();
+    impl_->last_features.reset();
 }
 int Qwen35::position() const {return impl_->pos;}
 int Qwen35::vocabulary() const {return impl_->vocab;}
