@@ -46,15 +46,25 @@ for (uint b = lane; b < K/32; b += 32) {
  uint a1 = planes[(row*3+1)*(K/32)+b];
  uint sg = planes[(row*3+2)*(K/32)+b];
  float s = float(scales[row*(K/128)+b/4]);
- for (uint m = 0; m < 4; ++m) {
-  if (col+m >= M) break;
-  float partial = 0.0f;
-  for (uint j = 0; j < 32; ++j) {
-   uint rank = ((j < 16 ? a0 : a1) >> (4*(j%8)+((j%16 >= 8) ? 2 : 0))) & 3u;
-   uint sign = (sg >> (4*(j%8)+j/8)) & 1u;
-   partial += (LV[rank | (sign<<2)] * s) * x[(col+m)*K+b*32+j];
+ float4 weights[8];
+ for (uint side=0;side<4;++side) {
+  for (uint group=0;group<2;++group) {
+   uint shift=group*16;
+   uint ranks=(side<2?a0:a1)>>(shift+2*(side%2));
+   uint signs=sg>>(shift+side);
+   weights[side*2+group]=float4(
+    LV[(ranks&3u)|((signs&1u)<<2)],
+    LV[((ranks>>4)&3u)|(((signs>>4)&1u)<<2)],
+    LV[((ranks>>8)&3u)|(((signs>>8)&1u)<<2)],
+    LV[((ranks>>12)&3u)|(((signs>>12)&1u)<<2)])*s;
   }
-  acc[m] += partial;
+ }
+ for (uint m=0;m<4;++m) {
+  if (col+m>=M) break;
+  const device float4* input=(const device float4*)(x+(col+m)*K+b*32);
+  float partial=0.0f;
+  for (uint j=0;j<8;++j) partial+=dot(weights[j],input[j]);
+  acc[m]+=partial;
  }
 }
 for (uint m = 0; m < 4; ++m) {
