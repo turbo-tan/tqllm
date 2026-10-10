@@ -7,6 +7,8 @@ namespace tqllm::mlx_backend {
 // Experimental dense text forward. One independent cache per instance, no speculation.
 class Qwen35 {
 public:
+    enum class GdnMode { baseline,native,scan };
+    void gdn_mode(GdnMode mode);
     class Snapshot {
         struct State;
         std::shared_ptr<const State> state_;

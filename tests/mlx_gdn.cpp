@@ -40,6 +40,7 @@ int main(int argc,char** argv) {
         } else if(argc!=1)throw std::invalid_argument("usage: test-mlx-gdn [model.gguf]");
         if(heads<1 || key_heads<1 || heads%key_heads || dk<32 || dk%32 || dv<1)throw std::invalid_argument("invalid GDN dimensions");
         const bool native=std::getenv("TQLLM_MLX_NATIVE_GDN")!=nullptr;
+        const bool scan=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
         auto order=tqllm::mlx_backend::gdn_head_order(key_heads,heads);
         for(const auto& [kh,vh]:std::vector<std::pair<int,int>>{{16,16},{16,32},{16,48},{16,64},{24,24},{32,32}}) {
             auto layout=tqllm::mlx_backend::gdn_head_order(kh,vh);
@@ -62,7 +63,7 @@ int main(int argc,char** argv) {
             for(size_t i=0;i<v.size();++i)v[i]=std::sin(float(i)*.037f)*.1f;
             for(size_t i=0;i<g.size();++i) {g[i]=.8f+.19f*std::abs(std::cos(float(i)*.13f));beta[i]=.3f+.2f*std::sin(float(i)*.17f);}
             for(size_t i=0;i<initial.size();++i)initial[i]=.01f*std::sin(float(i)*.019f);
-            std::vector<double> state(initial.begin(),initial.end()),output(v.size());
+            std::vector<double> state(initial.begin(),initial.end()),output(v.size()),prefix_states;
             for(int t=0;t<count;++t)for(int h=0;h<heads;++h)for(int row=0;row<dv;++row) {
                 const size_t at=(size_t(h)*dv+row)*dk,kh=(size_t(t)*key_heads+h%key_heads)*dk;
                 double memory=0;
@@ -71,20 +72,27 @@ int main(int argc,char** argv) {
                 double y=0;
                 for(int j=0;j<dk;++j) {state[at+j]+=k[kh+j]*delta;y+=state[at+j]*q[kh+j];}
                 output[(size_t(t)*heads+h)*dv+row]=y;
+                if(scan && count<=8 && h==heads-1 && row==dv-1)
+                    prefix_states.insert(prefix_states.end(),state.begin(),state.end());
             }
             mx::array aq(q.data(),{1,count,key_heads,dk}),ak(k.data(),{1,count,key_heads,dk});
             mx::array av(v.data(),{1,count,heads,dv}),ag(g.data(),{1,count,heads}),ab(beta.data(),{1,count,heads});
             mx::array as(initial.data(),{1,heads,dv,dk});
-            if(native)as=mx::take(as,order.to_native,1);
-            else {aq=mx::take(aq,key_indices,2);ak=mx::take(ak,key_indices,2);}
+            if(native && !scan)as=mx::take(as,order.to_native,1);
+            else if(!scan) {aq=mx::take(aq,key_indices,2);ak=mx::take(ak,key_indices,2);}
             mx::eval(aq,ak,av,ag,ab,as);
             std::vector<double> times;
             for(int run=-1;run<5;++run) {
                 const auto start=Clock::now();
-                auto update=native?tqllm::mlx_backend::gdn_native(aq,ak,av,ag,ab,as,order):
+                auto scanned=scan?std::optional<tqllm::mlx_backend::GdnScan>(
+                    tqllm::mlx_backend::gdn_scan(aq,ak,av,ag,ab,as,count<=8)):std::nullopt;
+                auto update=scanned?std::vector<mx::array>{scanned->output,scanned->state}:native?tqllm::mlx_backend::gdn_native(aq,ak,av,ag,ab,as,order):
                     mx::fast::gated_delta_update(aq,ak,av,ag,ab,as);mx::eval(update);
                 const double ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
-                if(run==0) {check(update[0],output,"output");check(native?mx::take(update[1],order.from_native,1):update[1],state,"state");}
+                if(run==0) {
+                    check(update[0],output,"output");check(native && !scan?mx::take(update[1],order.from_native,1):update[1],state,"state");
+                    if(scanned && scanned->snapshots)check(*scanned->snapshots,prefix_states,"prefix_states");
+                }
                 if(run>=0)times.push_back(ms);
             }
             std::sort(times.begin(),times.end());

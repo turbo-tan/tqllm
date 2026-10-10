@@ -50,6 +50,7 @@ struct Qwen35::Impl {
     float eps,theta;
     mx::array key_indices;
     std::optional<GdnHeadOrder> native_head_order;
+    bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
@@ -196,13 +197,14 @@ struct Qwen35::Impl {
             return mx::multiply(a,mx::multiply(mx::rsqrt(mx::add(mx::sum(mx::square(a),-1,true),mx::array(1e-6f))),mx::array(scale)));
         };
         q=normalize(q,1.0f/std::sqrt(float(dk)));k=normalize(k,1);
-        if(!native_head_order) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
+        if(!native_head_order && !scan_gdn) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
         auto a=mat(p+"ssm_alpha.weight",x),b=mat(p+"ssm_beta.weight",x);
         auto dt=mx::add(a,plain.at(p+"ssm_dt.bias"));
         auto sp=mx::add(mx::maximum(dt,mx::array(0.0f)),mx::log1p(mx::exp(mx::negative(mx::abs(dt)))));
         auto decay=mx::reshape(mx::exp(mx::multiply(sp,plain.at(p+"ssm_a"))),{1,m,vh});
         auto beta=mx::reshape(mx::sigmoid(b),{1,m,vh});
-        auto update=native_head_order?gdn_native(q,k,v,decay,beta,c.state,*native_head_order):
+        auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state)):std::nullopt;
+        auto update=scanned?std::vector<mx::array>{scanned->output,scanned->state}:native_head_order?gdn_native(q,k,v,decay,beta,c.state,*native_head_order):
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
         auto z=mx::reshape(mat(p+"attn_gate.weight",x),{1,m,vh,dv});
@@ -278,6 +280,15 @@ void Qwen35::restore(const Snapshot& snapshot) {
 }
 Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}
 Qwen35::~Qwen35()=default;
+void Qwen35::gdn_mode(GdnMode mode) {
+    if(impl_->pos!=0)throw std::invalid_argument("cannot change GDN layout during a session");
+    reset();
+    impl_->native_head_order.reset();impl_->scan_gdn=false;
+    if(mode!=GdnMode::baseline && (impl_->dk!=128 || impl_->dv!=128))
+        throw std::invalid_argument("unsupported optimized GDN dimensions");
+    if(mode==GdnMode::native)impl_->native_head_order=gdn_head_order(impl_->kh,impl_->vh);
+    if(mode==GdnMode::scan)impl_->scan_gdn=true;
+}
 mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {return impl_->forward(tokens,all_logits);}
 void Qwen35::reset() {++impl_->epoch;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
 int Qwen35::position() const {return impl_->pos;}
