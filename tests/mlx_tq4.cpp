@@ -1,5 +1,6 @@
 #include "tq4.hpp"
 #include "tq3.hpp"
+#include "q6.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -9,6 +10,47 @@
 
 namespace mx = mlx::core;
 using tqllm::mlx_backend::tq4_matmul;
+
+static void test_q6() {
+    constexpr int rows = 17, k = 512;
+    std::vector<uint8_t> raw(rows*(k/256)*210);
+    std::vector<float> weights(rows*k);
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < k/256; ++b) {
+            auto* p = raw.data()+(r*(k/256)+b)*210;
+            p[208] = 0; p[209] = 0x18; // FP16 1/512
+            for (int g = 0; g < 16; ++g) p[192+g] = uint8_t(int8_t((g&1)?-g-1:g+1));
+            for (int h = 0; h < 2; ++h)
+                for (int c = 0; c < 4; ++c)
+                    for (int l = 0; l < 32; ++l) {
+                        const int j = h*128+c*32+l;
+                        const int q = (r*13+b*7+j*3)%64;
+                        p[h*64+(c%2)*32+l] |= uint8_t((q&15) << (c/2*4));
+                        p[128+h*32+l] |= uint8_t((q>>4) << (2*c));
+                        const int scale = int8_t(p[192+h*8+c*2+l/16]);
+                        weights[r*k+b*256+j] = (q-32)*float(scale)/512.0f;
+                    }
+        }
+    auto packed = tqllm::mlx_backend::load_q6_blocks(raw, rows, k);
+    for (int m : {1, 8, 64}) {
+        std::vector<float> input(m*k);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = std::cos(float(i)*0.1f);
+        auto out = tqllm::mlx_backend::q6_matmul(packed, mx::array(input.data(), {m,k}));
+        mx::eval(out);
+        for (int a = 0; a < m; ++a)
+            for (int r = 0; r < rows; ++r) {
+                double expected = 0;
+                for (int j = 0; j < k; ++j) expected += double(weights[r*k+j])*input[a*k+j];
+                if (std::abs(out.data<float>()[a*rows+r]-expected) > 3e-4)
+                    throw std::runtime_error("Q6_K code, signed scale or arithmetic failed");
+            }
+    }
+    raw.pop_back();
+    bool rejected = false;
+    try { tqllm::mlx_backend::load_q6_blocks(raw, rows, k); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("Q6_K truncated payload accepted");
+}
 
 static void test_tq3() {
     constexpr int rows = 17, k = 256;
@@ -56,6 +98,7 @@ static void test_tq3() {
 }
 
 int main() {
+    test_q6();
     test_tq3();
     constexpr int rows = 17, k = 256;
     const int levels[] = {6, 18, 31, 44, 58, 75, 96, 127, -6, -18, -31, -44, -58, -75, -96, -127};
