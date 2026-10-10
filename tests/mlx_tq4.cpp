@@ -1,4 +1,5 @@
 #include "tq4.hpp"
+#include "tq3.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -9,7 +10,53 @@
 namespace mx = mlx::core;
 using tqllm::mlx_backend::tq4_matmul;
 
+static void test_tq3() {
+    constexpr int rows = 17, k = 256;
+    constexpr int levels[] = {14, 45, 79, 127, -14, -45, -79, -127};
+    std::vector<uint8_t> codes(rows * k), blocks(rows * k / 128 * 50);
+    for (int r = 0; r < rows; ++r)
+        for (int j = 0; j < k; ++j) codes[r*k+j] = uint8_t((r*17+j*3+(j/32)*5)&7);
+    for (int g = 0; g < rows*k/128; ++g) {
+        blocks[g*50] = 0;
+        blocks[g*50+1] = (g&1) ? 0x30 : 0x2c; // 0.125 or 0.0625
+        for (int b = 0; b < 4; ++b) {
+            uint32_t planes[3] = {};
+            for (int j = 0; j < 32; ++j) {
+                const int c = codes[g*128+b*32+j];
+                planes[j/16] |= uint32_t(c&3) << ((j%8)*4+((j%16)/8)*2);
+                planes[2] |= uint32_t(c>>2) << ((j%8)*4+j/8);
+            }
+            for (int p = 0; p < 3; ++p)
+                for (int byte = 0; byte < 4; ++byte)
+                    blocks[g*50+2+(b*3+p)*4+byte] = uint8_t(planes[p] >> (byte*8));
+        }
+    }
+    const auto weights = tqllm::mlx_backend::load_tq3_blocks(blocks, rows, k);
+    for (int m : {1, 8, 64}) {
+        std::vector<float> x(m*k);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i)*0.09f);
+        auto out = tqllm::mlx_backend::tq3_matmul(weights, mx::array(x.data(), {m,k}));
+        mx::eval(out);
+        for (int a = 0; a < m; ++a)
+            for (int r = 0; r < rows; ++r) {
+                double expected = 0;
+                for (int j = 0; j < k; ++j) {
+                    const float s = ((r*k+j)/128)&1 ? 0.125f : 0.0625f;
+                    expected += levels[codes[r*k+j]] * double(s) * x[a*k+j];
+                }
+                if (std::abs(out.data<float>()[a*rows+r]-expected) > 3e-4)
+                    throw std::runtime_error("TQ3 plane decoder or scale arithmetic failed");
+            }
+    }
+    blocks.pop_back();
+    bool rejected = false;
+    try { tqllm::mlx_backend::load_tq3_blocks(blocks, rows, k); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("TQ3 truncated payload accepted");
+}
+
 int main() {
+    test_tq3();
     constexpr int rows = 17, k = 256;
     const int levels[] = {6, 18, 31, 44, 58, 75, 96, 127, -6, -18, -31, -44, -58, -75, -96, -127};
     std::vector<uint8_t> codes(rows * k / 2);
@@ -28,6 +75,21 @@ int main() {
         auto same_codes = mx::all(mx::equal(loaded.codes, c));
         auto same_scales = mx::all(mx::equal(loaded.scales, s));
         if (!same_codes.item<bool>() || !same_scales.item<bool>()) return 5;
+        std::vector<float> input(k);
+        for (int j = 0; j < k; ++j) input[j] = std::sin(float(j) * 0.11f);
+        auto physical = tq4_matmul(loaded, mx::array(input.data(), {1, k}));
+        mx::eval(physical);
+        for (int r = 0; r < rows; ++r) {
+            double expected = 0;
+            for (int j = 0; j < k; ++j) {
+                int code = (codes[r * k / 2 + j / 2] >> ((j & 1) * 4)) & 15;
+                expected += double(levels[code]) * 0.125 * input[j];
+            }
+            if (std::abs(physical.data<float>()[r] - expected) > 1e-4) {
+                std::cerr << "GGUF integer-codebook scale convention failed\n";
+                return 7;
+            }
+        }
         blocks.pop_back();
         bool rejected = false;
         try { tqllm::mlx_backend::load_tq4_blocks(blocks, rows, k); }

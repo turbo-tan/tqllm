@@ -7,6 +7,7 @@ namespace tqllm::mlx_backend {
 namespace mx = mlx::core;
 namespace {
 const char* source = R"METAL(
+    constant float* values = INTEGER_LEVELS ? LVI : LV;
     // Decode each row's packed weights once, then reuse them across the M activation columns.
     uint lane = thread_position_in_threadgroup.x;
     uint col0 = threadgroup_position_in_grid.z * MCOLS;
@@ -27,8 +28,8 @@ const char* source = R"METAL(
             uint cw[4] = {c4.x, c4.y, c4.z, c4.w};
             for (uint q = 0; q < 8; ++q) {
                 uint packed = cw[q >> 1] >> ((q & 1u) * 16u);
-                wv[r][q] = float4(LV[packed & 15u], LV[(packed >> 4) & 15u],
-                                  LV[(packed >> 8) & 15u], LV[(packed >> 12) & 15u]) * s;
+                wv[r][q] = float4(values[packed & 15u], values[(packed >> 4) & 15u],
+                                  values[(packed >> 8) & 15u], values[(packed >> 12) & 15u]) * s;
             }
         }
         for (uint m = 0; m < MCOLS; ++m) {
@@ -54,7 +55,7 @@ const char* source = R"METAL(
         }
     }
 )METAL";
-const char* header = R"METAL(constant float LV[16] = {0.129099213f, 0.387297638f, 0.667012598f, 0.946727559f, 1.247959055f, 1.613740157f, 2.065587402f, 2.732600000f, -0.129099213f, -0.387297638f, -0.667012598f, -0.946727559f, -1.247959055f, -1.613740157f, -2.065587402f, -2.732600000f};)METAL";
+const char* header = R"METAL(constant float LV[16] = {0.129099213f, 0.387297638f, 0.667012598f, 0.946727559f, 1.247959055f, 1.613740157f, 2.065587402f, 2.732600000f, -0.129099213f, -0.387297638f, -0.667012598f, -0.946727559f, -1.247959055f, -1.613740157f, -2.065587402f, -2.732600000f}; constant float LVI[16] = {6.0f,18.0f,31.0f,44.0f,58.0f,75.0f,96.0f,127.0f,-6.0f,-18.0f,-31.0f,-44.0f,-58.0f,-75.0f,-96.0f,-127.0f};)METAL";
 }
 
 Tq4Weights load_tq4_blocks(std::span<const uint8_t> blocks, int rows, int columns) {
@@ -88,7 +89,7 @@ mx::array tq4_rotate(const mx::array& x) {
 }
 
 mx::array tq4_matmul(const mx::array& codes, const mx::array& scales,
-                    const mx::array& x, int rps, int cols, int simds) {
+                    const mx::array& x, int rps, int cols, int simds, bool integer_levels) {
     if (codes.ndim() != 2 || scales.ndim() != 2 || x.ndim() != 2 ||
         codes.dtype() != mx::uint8 || scales.dtype() != mx::float16 ||
         x.dtype() != mx::float32)
@@ -105,7 +106,11 @@ mx::array tq4_matmul(const mx::array& codes, const mx::array& scales,
     const int groups = (rows + rps - 1) / rps;
     return kernel({codes, scales, x}, {{m, rows}}, {mx::float32},
                   {32, (groups + simds - 1) / simds * simds, (m + cols - 1) / cols}, {32, simds, 1},
-                  {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"RPS", rps}},
+                  {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"RPS", rps}, {"INTEGER_LEVELS", integer_levels}},
                   std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
+mx::array tq4_matmul(const Tq4Weights& weights, const mx::array& x, int rps, int cols, int simds) {
+    return tq4_matmul(weights.codes, weights.scales, x, rps, cols, simds, weights.integer_levels);
+}
+
 }

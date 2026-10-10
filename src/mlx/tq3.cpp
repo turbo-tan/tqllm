@@ -1,0 +1,70 @@
+#include "tq3.hpp"
+#include <stdexcept>
+#include <vector>
+
+namespace tqllm::mlx_backend {
+namespace mx = mlx::core;
+Tq3Weights load_tq3_blocks(std::span<const uint8_t> blocks, int rows, int columns) {
+    if (rows <= 0 || columns <= 0 || columns % 128)
+        throw std::invalid_argument("invalid TQ3 block dimensions");
+    const uint64_t groups = uint64_t(rows) * uint64_t(columns / 128);
+    if (blocks.size() != groups * 50)
+        throw std::invalid_argument("TQ3 block payload size mismatch");
+    const size_t nb = size_t(columns) / 32;
+    std::vector<uint32_t> planes(size_t(rows) * nb * 3);
+    std::vector<uint16_t> scales(static_cast<size_t>(groups));
+    for (uint64_t g = 0; g < groups; ++g) {
+        scales[g] = uint16_t(blocks[g * 50]) | (uint16_t(blocks[g * 50 + 1]) << 8);
+        const size_t row = g / (columns / 128), at = g % (columns / 128) * 4;
+        for (size_t b = 0; b < 4; ++b)
+            for (size_t p = 0; p < 3; ++p) {
+                const uint8_t* v = blocks.data() + g * 50 + 2 + (b * 3 + p) * 4;
+                planes[(row * 3 + p) * nb + at + b] = uint32_t(v[0]) | (uint32_t(v[1]) << 8) |
+                    (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
+            }
+    }
+    return {mx::array(planes.data(), {rows, 3, columns / 32}, mx::uint32),
+            mx::view(mx::array(scales.data(), {rows, columns / 128}, mx::uint16), mx::float16)};
+}
+
+mx::array tq3_matmul(const Tq3Weights& w, const mx::array& x) {
+    if (w.planes.ndim() != 3 || w.planes.shape(1) != 3 || w.planes.dtype() != mx::uint32 ||
+        w.scales.ndim() != 2 || w.scales.dtype() != mx::float16 || x.ndim() != 2 || x.dtype() != mx::float32)
+        throw std::invalid_argument("invalid TQ3 matrix types");
+    const int rows = w.planes.shape(0), k = w.planes.shape(2) * 32, m = x.shape(0);
+    if (rows <= 0 || k <= 0 || k % 128 || m <= 0 || x.shape(1) != k ||
+        w.scales.shape(0) != rows || w.scales.shape(1) != k / 128)
+        throw std::invalid_argument("incompatible TQ3 matrix shapes");
+    static auto kernel = mx::fast::metal_kernel("tqllm_tq3_matmul", {"planes", "scales", "x"}, {"y"}, R"METAL(
+uint lane = thread_position_in_threadgroup.x;
+uint row = threadgroup_position_in_grid.y * threads_per_threadgroup.y + thread_position_in_threadgroup.y;
+uint col = threadgroup_position_in_grid.z * 4;
+if (row >= R) return;
+float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+for (uint b = lane; b < K/32; b += 32) {
+ uint a0 = planes[(row*3)*(K/32)+b];
+ uint a1 = planes[(row*3+1)*(K/32)+b];
+ uint sg = planes[(row*3+2)*(K/32)+b];
+ float s = float(scales[row*(K/128)+b/4]);
+ for (uint m = 0; m < 4; ++m) {
+  if (col+m >= M) break;
+  float partial = 0.0f;
+  for (uint j = 0; j < 32; ++j) {
+   uint rank = ((j < 16 ? a0 : a1) >> (4*(j%8)+((j%16 >= 8) ? 2 : 0))) & 3u;
+   uint sign = (sg >> (4*(j%8)+j/8)) & 1u;
+   partial += (LV[rank | (sign<<2)] * s) * x[(col+m)*K+b*32+j];
+  }
+  acc[m] += partial;
+ }
+}
+for (uint m = 0; m < 4; ++m) {
+ if (col+m >= M) break;
+ float value = simd_sum(acc[m]);
+ if (lane == 0) y[(col+m)*R+row] = value;
+}
+)METAL", "constant float LV[8] = {14.0f,45.0f,79.0f,127.0f,-14.0f,-45.0f,-79.0f,-127.0f};");
+    return kernel({w.planes, w.scales, x}, {{m, rows}}, {mx::float32},
+                  {32, (rows + 1) / 2 * 2, (m + 3) / 4}, {32, 2, 1},
+                  {{"R", rows}, {"K", k}, {"M", m}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+}
