@@ -88,7 +88,7 @@ mx::array tq4_rotate(const mx::array& x) {
 }
 
 mx::array tq4_matmul(const mx::array& codes, const mx::array& scales,
-                    const mx::array& x, int rps, int cols) {
+                    const mx::array& x, int rps, int cols, int simds) {
     if (codes.ndim() != 2 || scales.ndim() != 2 || x.ndim() != 2 ||
         codes.dtype() != mx::uint8 || scales.dtype() != mx::float16 ||
         x.dtype() != mx::float32)
@@ -98,12 +98,13 @@ mx::array tq4_matmul(const mx::array& codes, const mx::array& scales,
         scales.shape(0) != rows || scales.shape(1) != k / 128)
         throw std::invalid_argument("TQ4 matrix shapes are incompatible");
     if ((rps != 1 && rps != 2 && rps != 4 && rps != 8) ||
-        (cols != 1 && cols != 2 && cols != 4 && cols != 8 && cols != 16))
+        (cols != 1 && cols != 2 && cols != 4 && cols != 8 && cols != 16) ||
+        (simds != 1 && simds != 2 && simds != 4 && simds != 8))
         throw std::invalid_argument("invalid TQ4 Metal tile");
     static auto kernel = mx::fast::metal_kernel("tqllm_tq4_matmul", {"codes", "scale", "x"}, {"y"}, source, header);
     const int groups = (rows + rps - 1) / rps;
     return kernel({codes, scales, x}, {{m, rows}}, {mx::float32},
-                  {32, (groups + 1) / 2 * 2, (m + cols - 1) / cols}, {32, 2, 1},
+                  {32, (groups + simds - 1) / simds * simds, (m + cols - 1) / cols}, {32, simds, 1},
                   {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"RPS", rps}},
                   std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }

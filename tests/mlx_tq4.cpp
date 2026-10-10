@@ -69,8 +69,9 @@ int main() {
             }
         auto input = mx::array(x.data(), {m, k});
         for (int rps : {1, 2, 4, 8})
-            for (int cols : {1, 4, 16}) {
-                auto out = tq4_matmul(c, s, input, rps, cols);
+            for (int cols : {1, 4, 16})
+            for (int simds : {1, 2, 4, 8}) {
+                auto out = tq4_matmul(c, s, input, rps, cols, simds);
                 mx::eval(out);
                 float max_error = 0;
                 for (size_t i = 0; i < expected.size(); ++i)
