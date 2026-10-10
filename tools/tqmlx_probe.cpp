@@ -12,7 +12,7 @@ int main(int argc,char** argv) {
     try {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
-        bool ignore_eos=false,all_logits=false;
+        bool ignore_eos=false,all_logits=false,profiling=false;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
             auto value=[&]() {if(++i==argc)throw std::invalid_argument("missing argument value");return std::string(argv[i]);};
@@ -27,6 +27,7 @@ int main(int argc,char** argv) {
             else if(arg=="--context") context=std::stoi(value());
             else if(arg=="--ignore-eos") ignore_eos=true;
             else if(arg=="--all-logits") all_logits=true;
+            else if(arg=="--profile") profiling=true;
             else throw std::invalid_argument("unknown argument: "+arg);
         }
         if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1)
@@ -37,6 +38,7 @@ int main(int argc,char** argv) {
         else {std::ifstream in(tokens_path);uint32_t token;while(in>>token)input.push_back(token);if(!in.eof())throw std::runtime_error("invalid tokens file");}
         if(input.empty()||input.size()+size_t(count)>size_t(context))throw std::invalid_argument("prompt or output exceeds context");
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
+        engine.profile(profiling);
         std::cerr<<"MLX_MODEL_LOADED seconds="<<elapsed(started)<<" vocabulary="<<engine.vocabulary()<<'\n';
         std::vector<uint32_t> baseline;
         for(int run=-warmup;run<repeat;++run) {
@@ -57,6 +59,10 @@ int main(int argc,char** argv) {
             const auto first=Clock::now();
             for(int i=1;i<count && (ignore_eos || next!=tokenizer.eos_id());++i) {
                 logits=engine.forward({&next,1});next=mx::argmax(*logits).item<uint32_t>();output.push_back(next);
+                if(profiling) {
+                    const auto [body,head]=engine.timings();
+                    std::cerr<<"MLX_PROFILE body_ms="<<body<<" head_ms="<<head<<'\n';
+                }
             }
             const double decode=elapsed(first);
             if(run<0)continue;

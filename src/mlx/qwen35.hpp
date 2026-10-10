@@ -12,6 +12,8 @@ public:
     void reset();
     int position() const;
     int vocabulary() const;
+    void profile(bool enabled);
+    std::pair<double, double> timings() const; // body, head milliseconds of the last forward
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

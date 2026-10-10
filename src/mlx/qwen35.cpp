@@ -1,5 +1,6 @@
 #include "qwen35.hpp"
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
@@ -29,6 +30,8 @@ struct Qwen35::Impl {
     int context,pos=0,layers,hidden,heads,kvheads,hd,rot,kh,vh,dk,dv,conv,interval,vocab;
     float eps,theta;
     mx::array key_indices;
+    bool profiling=false;
+    std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         const auto arch=file.kv.at("general.architecture").str;
         if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
@@ -141,6 +144,7 @@ struct Qwen35::Impl {
         return mat(p+"ssm_out.weight",mx::reshape(out,{m,vh*dv}));
     }
     mx::array forward(std::span<const uint32_t> tokens,bool all_logits) {
+        auto start=std::chrono::steady_clock::now();
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
         const int m=int(tokens.size());auto x=bf(q4_embedding(*embedding,tokens));
         for(int l=0;l<layers;++l) {
@@ -153,15 +157,21 @@ struct Qwen35::Impl {
         }
         x=norm(x,"output_norm.weight");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
-        auto logits=linear(matrices.at("output.weight"),x);
-        std::vector<mx::array> live={logits};
+        std::vector<mx::array> live={x};
         for(const auto& c:caches) {
             if(c.conv) live.push_back(*c.conv);
             if(c.state) live.push_back(*c.state);
             if(c.keys) live.push_back(*c.keys);
             if(c.values) live.push_back(*c.values);
         }
+        if(profiling) mx::eval(live);
+        auto body_end=std::chrono::steady_clock::now();
+        auto logits=linear(matrices.at("output.weight"),x);
+        live.push_back(logits);
         mx::eval(live);
+        auto end=std::chrono::steady_clock::now();
+        times={std::chrono::duration<double,std::milli>(body_end-start).count(),
+               std::chrono::duration<double,std::milli>(end-body_end).count()};
         pos+=m;
         return logits;
     }
@@ -172,4 +182,6 @@ mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {ret
 void Qwen35::reset() {impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
 int Qwen35::position() const {return impl_->pos;}
 int Qwen35::vocabulary() const {return impl_->vocab;}
+void Qwen35::profile(bool enabled) {impl_->profiling=enabled;}
+std::pair<double,double> Qwen35::timings() const {return impl_->times;}
 }
