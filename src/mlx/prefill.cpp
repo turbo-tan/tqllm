@@ -17,17 +17,19 @@ y[i]=bfloat16_t(s*(INTEGER_LEVELS?LVI[code]:LV[code]));
                   {{"R",r},{"K",k},{"INTEGER_LEVELS",w.integer_levels}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
 mx::array dense(const Tq3Weights& w) {
-    const int r=w.planes.shape(0),k=w.planes.shape(2)*32;
+    const int r=w.planes.shape(0),k=(w.interleaved?w.planes.shape(1):w.planes.shape(2))*32;
     static auto kernel=mx::fast::metal_kernel("tqllm_tq3_stage",{"planes","scales"},{"y"},R"METAL(
 uint i=thread_position_in_grid.x;
 if(i>=R*K) return;
 uint row=i/K,col=i%K,b=col/32,j=col%32;
-uint rank=(planes[(row*3+j/16)*(K/32)+b]>>(4*(j%8)+2*((j%16)/8)))&3u;
-uint sign=(planes[(row*3+2)*(K/32)+b]>>(4*(j%8)+j/8))&1u;
+uint a=INTERLEAVED?planes[(row*(K/32)+b)*4+j/16]:planes[(row*3+j/16)*(K/32)+b];
+uint signs=INTERLEAVED?planes[(row*(K/32)+b)*4+2]:planes[(row*3+2)*(K/32)+b];
+uint rank=(a>>(4*(j%8)+2*((j%16)/8)))&3u;
+uint sign=(signs>>(4*(j%8)+j/8))&1u;
 y[i]=bfloat16_t(float(scales[row*(K/128)+col/128])*LV[rank|(sign<<2)]);
 )METAL","constant float LV[8]={14.0f,45.0f,79.0f,127.0f,-14.0f,-45.0f,-79.0f,-127.0f};");
     return kernel({w.planes,w.scales},{{r,k}},{mx::bfloat16},{r*k,1,1},{256,1,1},
-                  {{"R",r},{"K",k}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+                  {{"R",r},{"K",k},{"INTERLEAVED",w.interleaved}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
 mx::array dense(const Q6Weights& w) {
     const int r=w.blocks.shape(0),k=w.blocks.shape(1)*256;

@@ -1,6 +1,7 @@
 #pragma once
 #include "weights.hpp"
 #include <memory>
+#include <map>
 
 namespace tqllm::mlx_backend {
 // Experimental dense text forward. One independent cache per instance, no speculation.
@@ -21,6 +22,10 @@ public:
     int vocabulary() const;
     void profile(bool enabled);
     void prefill_gemm(bool enabled);
+    void verify_tiles(bool enabled);
+    void tq3_vector_load(bool enabled);
+    void profile_stages(bool enabled);
+    const std::map<std::string,double>& stage_timings() const;
     std::pair<double, double> timings() const; // body, head milliseconds of the last forward
 private:
     struct Impl;

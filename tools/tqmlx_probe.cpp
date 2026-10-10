@@ -19,7 +19,7 @@ int main(int argc,char** argv) {
     try {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
-        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false;
+        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false;
         size_t cache_limit=0;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
@@ -37,6 +37,9 @@ int main(int argc,char** argv) {
             else if(arg=="--all-logits") all_logits=true;
             else if(arg=="--profile") profiling=true;
             else if(arg=="--verify-probe") verify_probe=true;
+            else if(arg=="--verify-tiles") verify_tiles=true;
+            else if(arg=="--tq3-vector-load") tq3_vector_load=true;
+            else if(arg=="--stage-profile") stage_profiling=true;
             else if(arg=="--prefill-gemm") prefill_gemm=true;
             else if(arg=="--clear-cache-after-prefill") clear_prefill_cache=true;
             else if(arg=="--cache-limit-mib") cache_limit=std::stoull(value())*1024*1024;
@@ -53,6 +56,9 @@ int main(int argc,char** argv) {
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
         engine.profile(profiling);
         engine.prefill_gemm(prefill_gemm);
+        engine.verify_tiles(verify_tiles);
+        engine.tq3_vector_load(tq3_vector_load);
+        engine.profile_stages(stage_profiling);
         std::cerr<<"MLX_MODEL_LOADED seconds="<<elapsed(started)<<" vocabulary="<<engine.vocabulary()<<'\n';
         memory("loaded");
         if(verify_probe) {
@@ -71,7 +77,7 @@ int main(int argc,char** argv) {
                 token=mx::argmax(y).item<uint32_t>();
             }
             for(int width:{1,2,4,8}) {
-                std::vector<double> milliseconds;
+                std::vector<double> milliseconds,bodies,heads;
                 double max_diff=0,mean_kld=0;
                 int same=0;
                 for(int run=-1;run<5;++run) {
@@ -81,8 +87,13 @@ int main(int argc,char** argv) {
                     auto y=engine.forward({chain.data(),size_t(width)},true);
                     const float* values=y.data<float>();
                     const double ms=elapsed(begin)*1000;
-                    if(run>=0)milliseconds.push_back(ms);
+                    if(run>=0) {milliseconds.push_back(ms);const auto [body,head]=engine.timings();bodies.push_back(body);heads.push_back(head);}
                     if(run==0) {
+                        if(stage_profiling) {
+                            std::cerr<<"MLX_STAGE_PROFILE width="<<width<<" sync_per_stage=1";
+                            for(const auto& [name,ms]:engine.stage_timings())std::cerr<<' '<<name<<"_ms="<<ms;
+                            std::cerr<<'\n';
+                        }
                         for(int row=0;row<width;++row) {
                             const auto& ref=reference[row];const float* got=values+size_t(row)*ref.size();
                             const double a=*std::max_element(ref.begin(),ref.end()),b=*std::max_element(got,got+ref.size());
@@ -94,8 +105,9 @@ int main(int argc,char** argv) {
                         }
                     }
                 }
-                std::sort(milliseconds.begin(),milliseconds.end());const double ms=milliseconds[milliseconds.size()/2];
+                std::sort(milliseconds.begin(),milliseconds.end());std::sort(bodies.begin(),bodies.end());std::sort(heads.begin(),heads.end());const double ms=milliseconds[milliseconds.size()/2];
                 std::cout<<"{\"kind\":\"verify_cost_only\",\"width\":"<<width<<",\"median_ms\":"<<ms
+                         <<",\"body_ms\":"<<bodies[bodies.size()/2]<<",\"head_ms\":"<<heads[heads.size()/2]<<",\"profile_sync\":"<<profiling
                          <<",\"ideal_tokens_per_s\":"<<1000*width/ms<<",\"mean_kld_vs_sequential\":"<<mean_kld
                          <<",\"top1_same\":"<<same<<",\"max_logit_difference\":"<<max_diff<<"}"<<std::endl;
                 if(width==1 && (max_diff!=0 || same!=1))throw std::runtime_error("snapshot replay changed sequential logits");

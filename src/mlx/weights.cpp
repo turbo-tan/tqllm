@@ -1,3 +1,4 @@
+#include "tuning.hpp"
 #include "weights.hpp"
 #include <cstring>
 #include <limits>
@@ -74,7 +75,8 @@ mx::array linear(const Matrix& weights, const mx::array& input) {
         } else if constexpr (std::is_same_v<T, Tq3Weights>) {
             return tq3_matmul(w, tq4_rotate(input));
         } else if constexpr (std::is_same_v<T, Tq4Weights>) {
-            return tq4_matmul(w, tq4_rotate(input));
+            const int cols=matmul_columns(input.shape(0));
+            return tq4_matmul(w, tq4_rotate(input),1,cols,matmul_simds());
         } else if constexpr (std::is_same_v<T, Q6Weights>) {
             return q6_matmul(w, input);
         } else {

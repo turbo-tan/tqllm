@@ -1,5 +1,7 @@
+#include "tensorops.hpp"
 #include "weights.hpp"
 #include "prefill.hpp"
+#include "verify.hpp"
 #include "../src/dequant.hpp"
 #include <algorithm>
 #include <bit>
@@ -8,6 +10,8 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <optional>
+#include <cstdlib>
 
 namespace mx = mlx::core;
 using namespace tqllm;
@@ -59,8 +63,17 @@ static std::vector<float> rotate(std::vector<float> x) {
 }
 int main(int argc,char** argv) {
     if(argc!=2 && argc!=3) {std::cerr<<"usage: test-mlx-gguf model.gguf [--prefill]\n";return 2;}
+    const bool affine_half=argc==3 && std::string(argv[2])=="--affine-half";
+    const bool affine_gu=argc==3 && std::string(argv[2])=="--affine-gu";
+    const bool expanded_half=argc==3 && std::string(argv[2])=="--expanded-half";
+    const bool affine8=argc==3 && std::string(argv[2])=="--affine8";
+    const bool expanded=argc==3 && std::string(argv[2])=="--expanded";
     const bool prefill=argc==3 && std::string(argv[2])=="--prefill";
-    if(argc==3 && !prefill) return 2;
+    const bool tensorops_half=argc==3 && std::string(argv[2])=="--tensorops-half";
+    const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
+    const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
+    const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
+    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu) return 2;
     auto file=gguf_open(argv[1]); std::set<uint32_t> covered;
     for(const auto& [name,original]:file.tensors) {
         if(original.ne.size()!=2 || covered.count(original.type)) continue;
@@ -68,7 +81,7 @@ int main(int argc,char** argv) {
            original.type!=GGML_TQ3 && original.type!=GGML_TQ4 && original.type!=GGML_Q6_K && original.type!=GGML_Q8_0)
             throw std::runtime_error("unsupported model tensor type");
         auto t=original;
-        const int k=int(t.ne[0]),r=int(std::min<uint64_t>(17,t.ne[1]));
+        const int k=int(t.ne[0]);int r=int(std::min<uint64_t>(17,t.ne[1]));
         t.bytes=t.bytes/t.ne[1]*uint64_t(r);t.ne[1]=uint64_t(r);
         auto data=file.read(t);
         std::vector<uint8_t> payload(data.begin(),data.end());
@@ -84,6 +97,29 @@ int main(int argc,char** argv) {
             std::cout<<"GGUF_EMBED_PASS type="<<t.type<<" max_abs="<<error<<" tensor="<<name<<'\n';
         } else {
             auto matrix=load_matrix(t,payload);
+            std::optional<Tq3Affine8> affine;
+            if((affine8 || affine_half || affine_gu) && t.type==GGML_TQ3) {
+                affine=tq3_affine8(std::get<Tq3Weights>(matrix));
+                auto decoded=mx::dequantize(affine->codes,affine->scales,affine->biases,128,8,"affine");
+                mx::eval(decoded);
+                for(size_t i=0;i<w.size();++i)
+                    if(decoded.data<float>()[i]!=w[i])throw std::runtime_error("affine8 changed TQ3 weight");
+                std::cout<<"GGUF_AFFINE8_WEIGHT_EXACT tensor="<<name<<'\n';
+                if(affine_gu) {
+                    auto twice=[](const mx::array& a){return mx::multiply(a,mx::array(2.0f,a.dtype()));};
+                    Tq3Affine8 up{affine->codes,twice(affine->scales),twice(affine->biases),
+                        twice(affine->half_scales),twice(affine->half_biases)};
+                    affine=tq3_affine8_join(*affine,up);
+                    auto copy=w;
+                    for(float value:copy)w.push_back(value*2.0f);
+                    r*=2;
+                    std::cout<<"GGUF_AFFINE8_JOIN rows="<<r<<'\n';
+                }
+            }
+            std::optional<Tq3Expanded> decoded;
+            if((expanded || expanded_half) && t.type==GGML_TQ3)decoded=tq3_expand(std::get<Tq3Weights>(matrix));
+            std::optional<Matrix> planar;
+            if(vector_load && t.type==GGML_TQ3) {planar=matrix;matrix=tq3_interleave(std::get<Tq3Weights>(matrix));}
             if(prefill) {
                 auto staged=stage_bf16(matrix);
                 if(staged.dtype()!=mx::bfloat16)throw std::runtime_error("prefill staging dtype mismatch");
@@ -96,24 +132,58 @@ int main(int argc,char** argv) {
                 }
                 std::cout<<"GGUF_STAGE_PASS type="<<t.type<<" tensor="<<name<<'\n';
             }
-            for(int m:{1,8,64}) {
+            for(int m:{1,8,16,64}) {
+                const bool native_half=affine_half && t.type==GGML_TQ3 && m<=8;
                 std::vector<float> input(size_t(m)*k);
                 for(size_t i=0;i<input.size();++i) input[i]=std::sin(float(i)*0.037f)*0.1f;
                 auto refinput=(t.type==GGML_TQ3||t.type==GGML_TQ4)?rotate(input):input;
-                auto y=linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
-                double diff=0,total=0;float maxerr=0;
+                auto y=affine?tq3_affine8_matmul(*affine,tq4_rotate(mx::array(input.data(),{m,k}))):decoded && expanded_half?verify_expanded_tensorops(*decoded,mx::array(input.data(),{m,k})):decoded?tq3_expanded_matmul(*decoded,tq4_rotate(mx::array(input.data(),{m,k}))):(tensorops || tensorops_half)?verify_tensorops(matrix,mx::array(input.data(),{m,k}),tensorops_half):(verify_tiles && m>1)?verify_tiled(matrix,mx::array(input.data(),{m,k})):linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
+                if(std::getenv("TQLLM_MLX_TQ3_STREAM") && t.type==GGML_TQ3) {
+                    unsetenv("TQLLM_MLX_TQ3_STREAM");
+                    auto base=linear(matrix,mx::array(input.data(),{m,k}));mx::eval(base);
+                    setenv("TQLLM_MLX_TQ3_STREAM","1",1);
+                    for(size_t i=0;i<y.size();++i)
+                        if(std::bit_cast<uint32_t>(y.data<float>()[i])!=std::bit_cast<uint32_t>(base.data<float>()[i]))
+                            throw std::runtime_error("streaming TQ3 changed output bits");
+                    std::cout<<"GGUF_TQ3_STREAM_BITEXACT m="<<m<<'\n';
+                }
+                if(planar) {
+                    auto base=linear(*planar,mx::array(input.data(),{m,k}));mx::eval(base);
+                    for(size_t i=0;i<y.size();++i)
+                        if(std::bit_cast<uint32_t>(y.data<float>()[i])!=std::bit_cast<uint32_t>(base.data<float>()[i]))
+                            throw std::runtime_error("interleaved TQ3 changed planar output bits");
+                    std::cout<<"GGUF_TQ3_LAYOUT_BITEXACT m="<<m<<'\n';
+                }
+                double diff=0,total=0,original_diff=0,original_total=0;float maxerr=0;
                 for(int a=0;a<m;++a) for(int row=0;row<r;++row) {
-                    double expected=0;
-                    for(int j=0;j<k;++j) expected+=double(w[row*k+j])*refinput[a*k+j];
+                    double expected=0,original_expected=0;
+                    const bool rounded=(tensorops_half && (t.type==GGML_TQ3 || t.type==GGML_TQ4 || t.type==GGML_Q6_K)) || (expanded_half && t.type==GGML_TQ3);
+                    for(int j=0;j<k;++j) {
+                        const float weight=w[row*k+j],value=refinput[a*k+j];
+                        original_expected+=double(weight)*value;
+                        // Native QMV dequantises in FP32 even with FP16 inputs.
+                        if(native_half)
+                            expected+=double(weight)*float((_Float16)value);
+                        else expected+=rounded?double(float((_Float16)weight))*float((_Float16)value):double(weight)*value;
+                    }
+                    if(native_half)expected=float((_Float16)expected);
+                    const double original_delta=y.data<float>()[a*r+row]-original_expected;
+                    original_diff+=original_delta*original_delta;original_total+=original_expected*original_expected;
                     const double delta=y.data<float>()[a*r+row]-expected;
                     diff+=delta*delta;total+=expected*expected;maxerr=std::max(maxerr,float(std::abs(delta)));
                 }
                 const double rel=std::sqrt(diff/std::max(total,1e-20));
-                if(rel>2e-5 && maxerr>1e-5) {
+                if(tensorops_half || expanded_half || affine_half) {
+                    const double drift=std::sqrt(original_diff/std::max(original_total,1e-20));
+                    std::cout<<"GGUF_FP16_DRIFT type="<<t.type<<" m="<<m<<" rel_l2="<<drift<<'\n';
+                    if(drift>1e-3)throw std::runtime_error("FP16 projection drift exceeds screen");
+                }
+                const bool approximate=native_half;
+                if(rel>(approximate?1e-3:2e-5) && maxerr>1e-5) {
                     std::cerr<<"GGUF_LINEAR_FAIL type="<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<'\n';
                     throw std::runtime_error("real GGUF linear mismatch: "+name);
                 }
-                std::cout<<"GGUF_LINEAR_PASS type="<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<" tensor="<<name<<'\n';
+                std::cout<<(approximate?"GGUF_FP16_SCREEN_PASS type=":"GGUF_LINEAR_PASS type=")<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<" tensor="<<name<<'\n';
             }
         }
         covered.insert(t.type);
