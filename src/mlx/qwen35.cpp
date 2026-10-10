@@ -32,6 +32,9 @@ mx::array swiglu(const mx::array& gate,const mx::array& up) {
 struct Cache {
     std::optional<mx::array> conv,state,keys,values;
 };
+struct PrefixTape {
+    std::optional<mx::array> conv_inputs,states;
+};
 }
 struct Qwen35::Impl {
     GgufFile file;
@@ -45,7 +48,9 @@ struct Qwen35::Impl {
     std::map<std::string,mx::array> plain;
     std::optional<Q4Embedding> embedding;
     std::vector<Cache> caches;
-    uint64_t epoch=0;
+    std::vector<PrefixTape> tapes;
+    bool capture_prefix=false;
+    uint64_t epoch=0,revision=0;
     int context,pos=0,layers,hidden,heads,kvheads,hd,rot,kh,vh,dk,dv,conv,interval,vocab;
     float eps,theta;
     mx::array key_indices;
@@ -129,6 +134,7 @@ struct Qwen35::Impl {
             }
         }
         caches.resize(layers);
+        tapes.resize(layers);
     }
     mx::array mat(const std::string& name,const mx::array& x) {
         const auto& w=matrices.at(name);
@@ -177,11 +183,12 @@ struct Qwen35::Impl {
         out=bf(mx::multiply(bf(out),bf(mx::sigmoid(gate))));
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
     }
-    mx::array gdn(const std::string& p,const mx::array& x,Cache& c) {
+    mx::array gdn(const std::string& p,const mx::array& x,Cache& c,PrefixTape& tape) {
         const int m=x.shape(0),width=2*kh*dk+vh*dv;
         auto qkv=mat(p+"attn_qkv.weight",x);
         auto history=c.conv?*c.conv:mx::zeros({conv-1,width});
         auto joined=mx::concatenate({history,qkv},0);
+        if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
         auto result=mx::zeros({m,width});
         for(int tap=0;tap<conv;++tap) {
@@ -203,7 +210,8 @@ struct Qwen35::Impl {
         auto sp=mx::add(mx::maximum(dt,mx::array(0.0f)),mx::log1p(mx::exp(mx::negative(mx::abs(dt)))));
         auto decay=mx::reshape(mx::exp(mx::multiply(sp,plain.at(p+"ssm_a"))),{1,m,vh});
         auto beta=mx::reshape(mx::sigmoid(b),{1,m,vh});
-        auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state)):std::nullopt;
+        auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix)):std::nullopt;
+        if(capture_prefix)tape.states=scanned->snapshots;
         auto update=scanned?std::vector<mx::array>{scanned->output,scanned->state}:native_head_order?gdn_native(q,k,v,decay,beta,c.state,*native_head_order):
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
@@ -227,7 +235,7 @@ struct Qwen35::Impl {
         for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
             auto n=norm(x,p+"attn_norm.weight");
-            auto attn=(l+1)%interval==0?full_attention(p,n,caches[l]):gdn(p,n,caches[l]);
+            auto attn=(l+1)%interval==0?full_attention(p,n,caches[l]):gdn(p,n,caches[l],tapes[l]);
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
                 for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)values.push_back(**a);
@@ -249,6 +257,7 @@ struct Qwen35::Impl {
             if(c.keys) live.push_back(*c.keys);
             if(c.values) live.push_back(*c.values);
         }
+        if(capture_prefix)for(const auto& t:tapes)if(t.states)live.push_back(*t.states);
         if(profiling) mx::eval(live);
         auto body_end=std::chrono::steady_clock::now();
         auto logits=gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):linear(matrices.at("output.weight"),x);
@@ -257,7 +266,7 @@ struct Qwen35::Impl {
         auto end=std::chrono::steady_clock::now();
         times={std::chrono::duration<double,std::milli>(body_end-start).count(),
                std::chrono::duration<double,std::milli>(end-body_end).count()};
-        pos+=m;rotation.reset();
+        pos+=m;++revision;rotation.reset();
         return logits;
     }
 };
@@ -277,6 +286,57 @@ void Qwen35::restore(const Snapshot& snapshot) {
         throw std::invalid_argument("MLX snapshot belongs to another engine or reset generation");
     impl_->pos=snapshot.state_->pos;
     impl_->caches=snapshot.state_->caches;
+    ++impl_->revision;
+}
+struct Qwen35::Verification::State {
+    const void* owner;
+    uint64_t epoch,revision;
+    int start,count;
+    std::vector<Cache> before,after;
+    std::vector<PrefixTape> tapes;
+};
+mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
+    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
+        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-8 tokens");
+    batch.state_.reset();
+    const auto before=checkpoint();
+    impl_->capture_prefix=true;
+    for(auto& tape:impl_->tapes)tape=PrefixTape{};
+    try {
+        auto logits=impl_->forward(tokens,true);
+        batch.state_=std::make_shared<Verification::State>(Verification::State{
+            impl_.get(),impl_->epoch,impl_->revision,before.state_->pos,int(tokens.size()),
+            before.state_->caches,impl_->caches,impl_->tapes});
+        impl_->capture_prefix=false;
+        for(auto& tape:impl_->tapes)tape=PrefixTape{};
+        return logits;
+    } catch(...) {
+        impl_->capture_prefix=false;
+        for(auto& tape:impl_->tapes)tape=PrefixTape{};
+        restore(before);
+        throw;
+    }
+}
+void Qwen35::accept_prefix(const Verification& batch,size_t count) {
+    const auto* s=batch.state_.get();
+    if(!s || s->owner!=impl_.get() || s->epoch!=impl_->epoch || s->revision!=impl_->revision ||
+       count>size_t(s->count) || impl_->pos!=s->start+s->count)
+        throw std::invalid_argument("MLX prefix verification is stale or count is invalid");
+    auto caches=count?s->after:s->before;
+    if(count && count<size_t(s->count))for(int l=0;l<impl_->layers;++l) {
+        auto& c=caches[l];const auto& tape=s->tapes[l];
+        if((l+1)%impl_->interval==0) {
+            c.keys=mx::contiguous(tail_slice(*c.keys,2,0,s->start+int(count)));
+            c.values=mx::contiguous(tail_slice(*c.values,2,0,s->start+int(count)));
+        } else {
+            c.conv=mx::contiguous(tail_slice(*tape.conv_inputs,0,int(count),int(count)+impl_->conv-1));
+            c.state=mx::contiguous(tail_slice(*tape.states,0,int(count)-1,int(count)));
+        }
+    }
+    std::vector<mx::array> live;
+    for(const auto& c:caches)for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)live.push_back(**a);
+    mx::eval(live);
+    impl_->caches=std::move(caches);impl_->pos=s->start+int(count);++impl_->revision;
 }
 Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}
 Qwen35::~Qwen35()=default;
@@ -290,7 +350,7 @@ void Qwen35::gdn_mode(GdnMode mode) {
     if(mode==GdnMode::scan)impl_->scan_gdn=true;
 }
 mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {return impl_->forward(tokens,all_logits);}
-void Qwen35::reset() {++impl_->epoch;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
+void Qwen35::reset() {++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
 int Qwen35::position() const {return impl_->pos;}
 int Qwen35::vocabulary() const {return impl_->vocab;}
 void Qwen35::profile(bool enabled) {impl_->profiling=enabled;}

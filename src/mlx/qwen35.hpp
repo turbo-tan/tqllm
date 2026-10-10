@@ -4,7 +4,7 @@
 #include <map>
 
 namespace tqllm::mlx_backend {
-// Experimental dense text forward. One independent cache per instance, no speculation.
+// Experimental dense text forward. One independent cache per instance.
 class Qwen35 {
 public:
     enum class GdnMode { baseline,native,scan };
@@ -16,6 +16,13 @@ public:
     };
     Snapshot checkpoint() const;
     void restore(const Snapshot& snapshot);
+    class Verification {
+        struct State;
+        std::shared_ptr<const State> state_;
+        friend class Qwen35;
+    };
+    mlx::core::array verify(std::span<const uint32_t> tokens, Verification& batch);
+    void accept_prefix(const Verification& batch, size_t count);
     Qwen35(const std::string& path, int context);
     ~Qwen35();
     mlx::core::array forward(std::span<const uint32_t> tokens, bool all_logits = false);
