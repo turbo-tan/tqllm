@@ -1,6 +1,9 @@
 #include "tq4.hpp"
 #include "tq3.hpp"
 #include "q6.hpp"
+#include "q8.hpp"
+#include "q4_embedding.hpp"
+#include "weights.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -10,6 +13,127 @@
 
 namespace mx = mlx::core;
 using tqllm::mlx_backend::tq4_matmul;
+
+static void test_weight_dispatch() {
+    using namespace tqllm::mlx_backend;
+    tqllm::GgufTensor t;
+    t.type = tqllm::GGML_BF16;
+    t.ne = {3, 2};
+    std::vector<uint16_t> bits = {0x3f80, 0xc000, 0x3f00, 0x4080, 0x4000, 0xbf80};
+    std::span<const uint8_t> raw(reinterpret_cast<const uint8_t*>(bits.data()), bits.size()*2);
+    auto weights = load_matrix(t, raw);
+    float data[] = {1, 2, 3, -1, 0, 1};
+    auto out = linear(weights, mx::array(data, {2, 3}));
+    mx::eval(out);
+    const float expected[] = {-1.5f, 5.0f, -0.5f, -5.0f};
+    for (int i=0;i<4;++i)
+        if (out.data<float>()[i] != expected[i])
+            throw std::runtime_error("GGUF dense shape or BF16 dispatch failed");
+    for (int bad=0;bad<4;++bad) {
+        bool rejected=false;
+        try {
+            auto invalid=t;
+            if (bad==0) invalid.ne={3};
+            if (bad==1) invalid.type=tqllm::GGML_Q4_K;
+            if (bad==2) invalid.ne={0,2};
+            load_matrix(invalid,bad==3?raw.subspan(1):raw);
+        } catch (const std::invalid_argument&) {rejected=true;}
+        if (!rejected) throw std::runtime_error("invalid GGUF matrix accepted");
+    }
+    // Physical TQ4 scales select the integer codebook and rotate inputs exactly once.
+    t.type=tqllm::GGML_TQ4;t.ne={128,1};
+    std::vector<uint8_t> packed(66,0);
+    packed[0]=0;packed[1]=0x1c; // scale 1/256
+    auto matrix=load_matrix(t,packed);
+    std::vector<float> x(128,0);x[0]=1;
+    auto y=linear(matrix,mx::array(x.data(),{1,128}));
+    auto rotated=tq4_rotate(mx::array(x.data(),{1,128}));
+    mx::eval(y,rotated);
+    double sum=0;
+    for(int j=0;j<128;++j) sum+=rotated.data<float>()[j]*6.0/256.0;
+    if(std::abs(y.item<float>()-sum)>1e-6)
+        throw std::runtime_error("GGUF TQ4 dispatch rotation or codebook units failed");
+    // Long FP32 activations expose reduced-precision batched GEMM defaults.
+    t.type=tqllm::GGML_BF16;t.ne={5120,2};
+    std::vector<uint16_t> bf16(10240);
+    std::vector<float> dense(10240),input(8*5120);
+    for(size_t i=0;i<bf16.size();++i) {
+        bf16[i]=uint16_t(std::bit_cast<uint32_t>(std::sin(float(i)*0.071f)*0.1f)>>16);
+        dense[i]=std::bit_cast<float>(uint32_t(bf16[i])<<16);
+    }
+    for(size_t i=0;i<input.size();++i) input[i]=std::sin(float(i)*0.037f)*0.1f;
+    matrix=load_matrix(t,{reinterpret_cast<const uint8_t*>(bf16.data()),bf16.size()*2});
+    y=linear(matrix,mx::array(input.data(),{8,5120}));mx::eval(y);
+    for(int a=0;a<8;++a) for(int r=0;r<2;++r) {
+        double expected=0;
+        for(int j=0;j<5120;++j) expected+=double(input[a*5120+j])*dense[r*5120+j];
+        if(std::abs(y.data<float>()[a*2+r]-expected)>1e-5)
+            throw std::runtime_error("batched dense FP32 precision failed; strict tests require MLX_ENABLE_TF32=0");
+    }
+}
+
+static void test_q8() {
+    constexpr int rows=7,k=256;
+    std::vector<uint8_t> raw(rows*(k/32)*34);
+    std::vector<float> weights(rows*k);
+    for(int r=0;r<rows;++r)
+        for(int b=0;b<k/32;++b) {
+            auto* p=raw.data()+(r*(k/32)+b)*34;
+            p[0]=0; p[1]=(b&1)?0x9c:0x1c; // signed 1/256
+            for(int j=0;j<32;++j) {
+                const int q=(r*17+b*7+j*11)%256-128;
+                p[2+j]=uint8_t(int8_t(q));
+                weights[r*k+b*32+j]=q*((b&1)?-1.0f:1.0f)/256.0f;
+            }
+        }
+    auto packed=tqllm::mlx_backend::load_q8_blocks(raw,rows,k);
+    for(int m:{1,8,64}) {
+        std::vector<float> x(m*k);
+        for(size_t i=0;i<x.size();++i) x[i]=std::sin(float(i)*0.05f);
+        auto out=tqllm::mlx_backend::q8_matmul(packed,mx::array(x.data(),{m,k}));
+        mx::eval(out);
+        for(int a=0;a<m;++a) for(int r=0;r<rows;++r) {
+            double expected=0;
+            for(int j=0;j<k;++j) expected+=double(weights[r*k+j])*x[a*k+j];
+            if(std::abs(out.data<float>()[a*rows+r]-expected)>1e-4)
+                throw std::runtime_error("Q8_0 signed codes or scale failed");
+        }
+    }
+}
+
+static void test_q4_embedding() {
+    constexpr int rows=7,k=512;
+    std::vector<uint8_t> raw(rows*(k/256)*144);
+    std::vector<float> expected(rows*k);
+    for(int r=0;r<rows;++r) for(int b=0;b<k/256;++b) {
+        auto* p=raw.data()+(r*(k/256)+b)*144;
+        p[0]=0;p[1]=0x14;p[2]=0;p[3]=0x18; // d=1/1024, min=1/512
+        int scales[8],mins[8];
+        for(int i=0;i<8;++i) {scales[i]=(i*9+r*3+7)%64;mins[i]=(i*11+b*5+3)%64;}
+        for(int i=0;i<4;++i) {
+            p[4+i]=uint8_t(scales[i]|((scales[i+4]>>4)<<6));
+            p[8+i]=uint8_t(mins[i]|((mins[i+4]>>4)<<6));
+            p[12+i]=uint8_t((scales[i+4]&15)|((mins[i+4]&15)<<4));
+        }
+        for(int j=0;j<256;++j) {
+            const int sub=j/32,q=(r*7+b*3+j*11)%16;
+            p[16+(sub/2)*32+j%32]|=uint8_t(q<<(4*(sub%2)));
+            expected[r*k+b*256+j]=scales[sub]*q/1024.0f-mins[sub]/512.0f;
+        }
+    }
+    auto packed=tqllm::mlx_backend::load_q4_embedding(raw,rows,k);
+    const std::vector<uint32_t> ids={0,6,3,0};
+    auto out=tqllm::mlx_backend::q4_embedding(packed,ids);
+    mx::eval(out);
+    for(size_t a=0;a<ids.size();++a) for(int j=0;j<k;++j)
+        if(std::abs(out.data<float>()[a*k+j]-expected[ids[a]*k+j])>1e-6)
+            throw std::runtime_error("Q4_K scale/minimum unpack or lookup failed");
+    bool rejected=false;
+    const uint32_t invalid=rows;
+    try {tqllm::mlx_backend::q4_embedding(packed,{&invalid,1});}
+    catch(const std::out_of_range&) {rejected=true;}
+    if(!rejected) throw std::runtime_error("embedding out-of-range token accepted");
+}
 
 static void test_q6() {
     constexpr int rows = 17, k = 512;
@@ -98,6 +222,9 @@ static void test_tq3() {
 }
 
 int main() {
+    test_weight_dispatch();
+    test_q4_embedding();
+    test_q8();
     test_q6();
     test_tq3();
     constexpr int rows = 17, k = 256;

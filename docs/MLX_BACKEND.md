@@ -49,8 +49,9 @@ It does not yet build a complete MLX inference engine or server.
 
 The first operators preserve the existing 128-point signed rotation and
 nonuniform TQ4 codebook: uint8 packed codes, FP16 scales per 128 columns,
-and FP32 accumulation. They cover the existing safetensors layout, not all
-GGUF quant types. The test compares the rotation and matrix outputs to
+and FP32 accumulation. They cover the existing safetensors layout and native GGUF300/301,
+Q6_K, Q8_0 and Q4_K embedding blocks. GGUF scales use integer codebook
+levels; the older safetensors layout uses normalized levels. The test compares the rotation and matrix outputs to
 independent CPU calculations across tile sizes and partial output rows.
 
 Use one output row per SIMD group initially. A wider tile is not an assumed
@@ -58,3 +59,21 @@ optimization; select tiles only after whole-model timing and correctness.
 Integer-level expansion into native MLX affine 8-bit storage is a diagnostic
 experiment, not an enabled backend: some batch sizes failed its precision
 gate, and it increases weight storage.
+
+## GGUF matrix boundary
+
+`src/mlx/weights.hpp` dispatches native compressed matrices and reverses GGUF
+column-first dimensions into MLX row-major dimensions. TQ matrices apply their
+128-point input rotation exactly once. Plain F32/F16/BF16 tensors retain their
+stored values. Unsupported types and malformed lengths fail explicitly.
+Q4_K embeddings read only requested rows; the vocabulary is never expanded
+into a second dense table.
+
+`test-mlx-gguf <model.gguf>` checks representative real-file rows against CPU
+calculations for every matrix type present, including batches1/8/64 and repeated
+embedding indices. It is an arithmetic gate, not a model quality test.
+
+Strict FP32 oracle tests use `MLX_ENABLE_TF32=0`. MLX defaults can use reduced
+precision for FP32 matrix multiplication, so batched dense matrices must not
+be assumed to match the FP32 oracle under the default environment. Keep the
+precision setting in benchmark provenance.
