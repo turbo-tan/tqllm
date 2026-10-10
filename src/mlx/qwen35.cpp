@@ -50,6 +50,13 @@ struct Qwen35::Impl {
     std::vector<Cache> caches;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
+    std::optional<mx::array> last_hidden;
+    Cache mtp_cache;
+    int mtp_pos=1;
+    bool mtp_enabled=false;
+    std::optional<Q6Weights> mtp_head;
+    std::optional<mx::array> mtp_ids;
+    std::optional<mx::array> mtp_hidden;
     uint64_t epoch=0,revision=0;
     int context,pos=0,layers,hidden,heads,kvheads,hd,rot,kh,vh,dk,dv,conv,interval,vocab;
     float eps,theta;
@@ -167,7 +174,7 @@ struct Qwen35::Impl {
             }
         return {mat(p+"ffn_gate.weight",x),mat(p+"ffn_up.weight",x)};
     }
-    mx::array full_attention(const std::string& p,const mx::array& x,Cache& c) {
+    mx::array full_attention(const std::string& p,const mx::array& x,Cache& c,int offset) {
         const int m=x.shape(0);
         auto qg=mx::reshape(mat(p+"attn_q.weight",x),{m,heads,2*hd});
         auto q=tail_slice(qg,2,0,hd),gate=tail_slice(qg,2,hd,2*hd);
@@ -175,7 +182,7 @@ struct Qwen35::Impl {
         auto k=mx::reshape(mat(p+"attn_k.weight",x),{1,m,kvheads,hd});
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
         auto v=mx::transpose(mx::reshape(mat(p+"attn_v.weight",x),{1,m,kvheads,hd}),{0,2,1,3});
-        q=bf(mx::fast::rope(q,rot,false,theta,1.0f,pos));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,pos));
+        q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
         c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
         c.values=c.values?mx::concatenate({*c.values,v},2):v;
         auto out=mx::fast::scaled_dot_product_attention(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),m>1?"causal":"");
@@ -235,7 +242,7 @@ struct Qwen35::Impl {
         for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
             auto n=norm(x,p+"attn_norm.weight");
-            auto attn=(l+1)%interval==0?full_attention(p,n,caches[l]):gdn(p,n,caches[l],tapes[l]);
+            auto attn=(l+1)%interval==0?full_attention(p,n,caches[l],pos):gdn(p,n,caches[l],tapes[l]);
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
                 for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)values.push_back(**a);
@@ -248,6 +255,7 @@ struct Qwen35::Impl {
             x=bf(mx::add(x,mat(p+"ffn_down.weight",ff)));
             if(stage_profiling)record("ffn_down",{x});
         }
+        last_hidden=x;
         x=norm(x,"output_norm.weight");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
         std::vector<mx::array> live={x};
@@ -275,10 +283,11 @@ struct Qwen35::Snapshot::State {
     uint64_t epoch;
     int pos;
     std::vector<Cache> caches;
+    std::optional<mx::array> hidden;
 };
 Qwen35::Snapshot Qwen35::checkpoint() const {
     Snapshot result;
-    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches});
+    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches,impl_->last_hidden});
     return result;
 }
 void Qwen35::restore(const Snapshot& snapshot) {
@@ -286,6 +295,7 @@ void Qwen35::restore(const Snapshot& snapshot) {
         throw std::invalid_argument("MLX snapshot belongs to another engine or reset generation");
     impl_->pos=snapshot.state_->pos;
     impl_->caches=snapshot.state_->caches;
+    impl_->last_hidden=snapshot.state_->hidden;
     ++impl_->revision;
 }
 struct Qwen35::Verification::State {
@@ -294,6 +304,7 @@ struct Qwen35::Verification::State {
     int start,count;
     std::vector<Cache> before,after;
     std::vector<PrefixTape> tapes;
+    std::optional<mx::array> hidden_before,hidden_after;
 };
 mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
     if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
@@ -306,7 +317,7 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
         auto logits=impl_->forward(tokens,true);
         batch.state_=std::make_shared<Verification::State>(Verification::State{
             impl_.get(),impl_->epoch,impl_->revision,before.state_->pos,int(tokens.size()),
-            before.state_->caches,impl_->caches,impl_->tapes});
+            before.state_->caches,impl_->caches,impl_->tapes,before.state_->hidden,impl_->last_hidden});
         impl_->capture_prefix=false;
         for(auto& tape:impl_->tapes)tape=PrefixTape{};
         return logits;
@@ -337,6 +348,114 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     for(const auto& c:caches)for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)live.push_back(**a);
     mx::eval(live);
     impl_->caches=std::move(caches);impl_->pos=s->start+int(count);++impl_->revision;
+    impl_->last_hidden=count?std::optional<mx::array>(tail_slice(*s->hidden_after,0,int(count)-1,int(count))):s->hidden_before;
+}
+mx::array Qwen35::hidden_states() const {
+    if(!impl_->last_hidden)throw std::invalid_argument("no MLX target hidden states");
+    return *impl_->last_hidden;
+}
+void Qwen35::enable_mtp() {
+    if(impl_->pos!=0)throw std::invalid_argument("MTP must be loaded before starting a session");
+    if(impl_->mtp_enabled)return;
+    const std::string p="blk."+std::to_string(impl_->layers)+".";
+    if(!impl_->file.tensors.contains(p+"nextn.eh_proj.weight"))throw std::invalid_argument("model has no MTP head");
+    for(const auto* suffix:{"nextn.eh_proj.weight","attn_q.weight","attn_k.weight","attn_v.weight",
+         "attn_output.weight","ffn_gate.weight","ffn_up.weight","ffn_down.weight"}) {
+        auto w=load_matrix(impl_->file,p+suffix);
+        std::visit([](const auto& v) {
+            using T=std::decay_t<decltype(v)>;
+            if constexpr(std::is_same_v<T,mx::array>)mx::eval(v);
+            else if constexpr(std::is_same_v<T,Tq3Weights>)mx::eval(v.planes,v.scales);
+            else if constexpr(std::is_same_v<T,Tq4Weights>)mx::eval(v.codes,v.scales);
+            else mx::eval(v.blocks);
+        },w);
+        impl_->matrices.emplace(p+suffix,std::move(w));
+    }
+    for(const auto* suffix:{"nextn.enorm.weight","nextn.hnorm.weight","nextn.shared_head_norm.weight",
+         "attn_norm.weight","post_attention_norm.weight","attn_q_norm.weight","attn_k_norm.weight"}) {
+        const auto& t=impl_->file.tensors.at(p+suffix);auto raw=impl_->file.read(t);
+        auto value=mx::astype(load_plain_tensor(t,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()}),mx::float32);
+        mx::eval(value);impl_->plain.emplace(p+suffix,std::move(value));
+    }
+    impl_->mtp_enabled=true;
+}
+void Qwen35::draft_shortlist(const mx::array& logits,int count) {
+    if(!impl_->mtp_enabled || count<1 || count>impl_->vocab || logits.shape()!=mx::Shape{1,impl_->vocab})
+        throw std::invalid_argument("invalid MTP shortlist");
+    const auto* head=std::get_if<Q6Weights>(&impl_->matrices.at("output.weight"));
+    if(!head)throw std::invalid_argument("MTP shortlist requires Q6_K target head");
+    auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
+    impl_->mtp_ids=mx::contiguous(tail_slice(ordered,0,impl_->vocab-count,impl_->vocab));
+    impl_->mtp_head=Q6Weights{mx::contiguous(mx::take(head->blocks,*impl_->mtp_ids,0))};
+    mx::eval(*impl_->mtp_ids,impl_->mtp_head->blocks);
+}
+mx::array Qwen35::draft_ids() const {
+    if(impl_->mtp_ids)return *impl_->mtp_ids;
+    return mx::arange(impl_->vocab,mx::uint32);
+}
+struct Qwen35::DraftSnapshot::State {
+    const void* owner;
+    uint64_t epoch;
+    int pos;
+    Cache cache;
+    std::optional<mx::array> hidden;
+};
+Qwen35::DraftSnapshot Qwen35::draft_checkpoint() const {
+    if(!impl_->mtp_enabled)throw std::invalid_argument("MTP is not loaded");
+    DraftSnapshot result;
+    result.state_=std::make_shared<DraftSnapshot::State>(DraftSnapshot::State{
+        impl_.get(),impl_->epoch,impl_->mtp_pos,impl_->mtp_cache,impl_->mtp_hidden});
+    return result;
+}
+void Qwen35::draft_restore(const DraftSnapshot& snapshot) {
+    if(!snapshot.state_ || snapshot.state_->owner!=impl_.get() || snapshot.state_->epoch!=impl_->epoch)
+        throw std::invalid_argument("MTP snapshot belongs to another engine or reset generation");
+    impl_->mtp_pos=snapshot.state_->pos;impl_->mtp_cache=snapshot.state_->cache;
+    impl_->mtp_hidden=snapshot.state_->hidden;
+}
+mx::array Qwen35::draft_hidden_states() const {
+    if(!impl_->mtp_hidden)throw std::invalid_argument("no MTP hidden states");
+    return *impl_->mtp_hidden;
+}
+void Qwen35::draft_inject(std::span<const uint32_t> tokens,const mx::array& hidden,int position) {
+    auto& i=*impl_;const int n=int(tokens.size());
+    if(!i.mtp_enabled || n<1 || position!=i.mtp_pos || n>i.context-position ||
+       hidden.shape()!=mx::Shape{n,i.hidden} || hidden.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid MTP injection batch or position");
+    const std::string p="blk."+std::to_string(i.layers)+".";
+    auto embedded=bf(q4_embedding(*i.embedding,tokens));
+    auto joined=mx::concatenate({i.norm(embedded,p+"nextn.enorm.weight"),i.norm(hidden,p+"nextn.hnorm.weight")},1);
+    auto x=i.norm(i.mat(p+"nextn.eh_proj.weight",joined),p+"attn_norm.weight");
+    auto k=mx::reshape(i.mat(p+"attn_k.weight",x),{1,n,i.kvheads,i.hd});
+    k=mx::transpose(i.norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
+    k=bf(mx::fast::rope(k,i.rot,false,i.theta,1.0f,position));
+    auto v=mx::transpose(mx::reshape(i.mat(p+"attn_v.weight",x),{1,n,i.kvheads,i.hd}),{0,2,1,3});
+    i.mtp_cache.keys=i.mtp_cache.keys?mx::concatenate({*i.mtp_cache.keys,k},2):k;
+    i.mtp_cache.values=i.mtp_cache.values?mx::concatenate({*i.mtp_cache.values,v},2):v;
+    mx::eval(*i.mtp_cache.keys,*i.mtp_cache.values);i.mtp_pos+=n;i.mtp_hidden.reset();i.rotation.reset();
+}
+mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array& hidden,int position,bool logits) {
+    auto& i=*impl_;const int n=int(tokens.size());
+    if(!i.mtp_enabled || n<1 || position!=i.mtp_pos || n>i.context-position ||
+       hidden.shape()!=mx::Shape{n,i.hidden} || hidden.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid MTP token/hidden batch or position");
+    const std::string p="blk."+std::to_string(i.layers)+".";
+    auto embedded=bf(q4_embedding(*i.embedding,tokens));
+    auto joined=mx::concatenate({i.norm(embedded,p+"nextn.enorm.weight"),i.norm(hidden,p+"nextn.hnorm.weight")},1);
+    auto x=i.mat(p+"nextn.eh_proj.weight",joined);
+    x=bf(mx::add(x,i.full_attention(p,i.norm(x,p+"attn_norm.weight"),i.mtp_cache,position)));
+    auto normed=i.norm(x,p+"post_attention_norm.weight");
+    auto [gate,up]=i.gate_up(p,normed);
+    x=bf(mx::add(x,i.mat(p+"ffn_down.weight",bf(mx::multiply(bf(silu(gate)),up)))));
+    auto output=x;
+    i.mtp_hidden=tail_slice(x,0,n-1,n);
+    if(logits) {
+        auto normalized=i.norm(tail_slice(x,0,n-1,n),p+"nextn.shared_head_norm.weight");
+        output=i.mtp_head?q6_matmul(*i.mtp_head,normalized):linear(i.matrices.at("output.weight"),normalized);
+    }
+    mx::eval(output,*i.mtp_cache.keys,*i.mtp_cache.values);
+    i.mtp_pos+=n;i.rotation.reset();
+    return output;
 }
 Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}
 Qwen35::~Qwen35()=default;
@@ -350,7 +469,11 @@ void Qwen35::gdn_mode(GdnMode mode) {
     if(mode==GdnMode::scan)impl_->scan_gdn=true;
 }
 mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {return impl_->forward(tokens,all_logits);}
-void Qwen35::reset() {++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
+void Qwen35::reset() {
+    ++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};
+    impl_->last_hidden.reset();impl_->mtp_cache=Cache{};impl_->mtp_pos=1;
+    impl_->mtp_hidden.reset();
+}
 int Qwen35::position() const {return impl_->pos;}
 int Qwen35::vocabulary() const {return impl_->vocab;}
 void Qwen35::profile(bool enabled) {impl_->profiling=enabled;}
