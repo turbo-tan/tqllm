@@ -1,18 +1,26 @@
 #include "qwen35.hpp"
+#include "mlx/memory.h"
 #include "tqllm/tokenizer.hpp"
 #include <chrono>
+#include <cmath>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 
 namespace mx=mlx::core;
+static void memory(const char* phase) {
+    std::cerr << "MLX_MEMORY phase=" << phase << " active=" << mx::get_active_memory()
+              << " cache=" << mx::get_cache_memory() << " peak=" << mx::get_peak_memory() << '\n';
+}
 using Clock=std::chrono::steady_clock;
 static double elapsed(Clock::time_point t) {return std::chrono::duration<double>(Clock::now()-t).count();}
 int main(int argc,char** argv) {
     try {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
-        bool ignore_eos=false,all_logits=false,profiling=false;
+        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false;
+        size_t cache_limit=0;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
             auto value=[&]() {if(++i==argc)throw std::invalid_argument("missing argument value");return std::string(argv[i]);};
@@ -28,6 +36,10 @@ int main(int argc,char** argv) {
             else if(arg=="--ignore-eos") ignore_eos=true;
             else if(arg=="--all-logits") all_logits=true;
             else if(arg=="--profile") profiling=true;
+            else if(arg=="--verify-probe") verify_probe=true;
+            else if(arg=="--prefill-gemm") prefill_gemm=true;
+            else if(arg=="--clear-cache-after-prefill") clear_prefill_cache=true;
+            else if(arg=="--cache-limit-mib") cache_limit=std::stoull(value())*1024*1024;
             else throw std::invalid_argument("unknown argument: "+arg);
         }
         if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1)
@@ -37,9 +49,63 @@ int main(int argc,char** argv) {
         if(tokens_path.empty()) input=tokenizer.encode(prompt);
         else {std::ifstream in(tokens_path);uint32_t token;while(in>>token)input.push_back(token);if(!in.eof())throw std::runtime_error("invalid tokens file");}
         if(input.empty()||input.size()+size_t(count)>size_t(context))throw std::invalid_argument("prompt or output exceeds context");
+        if(cache_limit)mx::set_cache_limit(cache_limit);
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
         engine.profile(profiling);
+        engine.prefill_gemm(prefill_gemm);
         std::cerr<<"MLX_MODEL_LOADED seconds="<<elapsed(started)<<" vocabulary="<<engine.vocabulary()<<'\n';
+        memory("loaded");
+        if(verify_probe) {
+            std::optional<mx::array> last;
+            for(size_t p=0;p<input.size();p+=size_t(chunk))
+                last=engine.forward({input.data()+p,std::min(size_t(chunk),input.size()-p)});
+            const auto checkpoint=engine.checkpoint();
+            const int start_pos=engine.position();
+            uint32_t token=mx::argmax(*last).item<uint32_t>();
+            std::vector<uint32_t> chain;
+            std::vector<std::vector<float>> reference;
+            for(int i=0;i<8;++i) {
+                chain.push_back(token);
+                auto y=engine.forward({&token,1});
+                const float* p=y.data<float>();reference.emplace_back(p,p+y.size());
+                token=mx::argmax(y).item<uint32_t>();
+            }
+            for(int width:{1,2,4,8}) {
+                std::vector<double> milliseconds;
+                double max_diff=0,mean_kld=0;
+                int same=0;
+                for(int run=-1;run<5;++run) {
+                    engine.restore(checkpoint);
+                    if(engine.position()!=start_pos)throw std::runtime_error("snapshot restored wrong position");
+                    const auto begin=Clock::now();
+                    auto y=engine.forward({chain.data(),size_t(width)},true);
+                    const float* values=y.data<float>();
+                    const double ms=elapsed(begin)*1000;
+                    if(run>=0)milliseconds.push_back(ms);
+                    if(run==0) {
+                        for(int row=0;row<width;++row) {
+                            const auto& ref=reference[row];const float* got=values+size_t(row)*ref.size();
+                            const double a=*std::max_element(ref.begin(),ref.end()),b=*std::max_element(got,got+ref.size());
+                            double sa=0,sb=0,kld=0;
+                            for(size_t j=0;j<ref.size();++j) {sa+=std::exp(double(ref[j])-a);sb+=std::exp(double(got[j])-b);max_diff=std::max(max_diff,std::abs(double(ref[j])-got[j]));}
+                            for(size_t j=0;j<ref.size();++j) kld+=std::exp(double(ref[j])-a)/sa*((double(ref[j])-a-std::log(sa))-(double(got[j])-b-std::log(sb)));
+                            mean_kld+=kld/width;
+                            same+=std::max_element(ref.begin(),ref.end())-ref.begin()==std::max_element(got,got+ref.size())-got;
+                        }
+                    }
+                }
+                std::sort(milliseconds.begin(),milliseconds.end());const double ms=milliseconds[milliseconds.size()/2];
+                std::cout<<"{\"kind\":\"verify_cost_only\",\"width\":"<<width<<",\"median_ms\":"<<ms
+                         <<",\"ideal_tokens_per_s\":"<<1000*width/ms<<",\"mean_kld_vs_sequential\":"<<mean_kld
+                         <<",\"top1_same\":"<<same<<",\"max_logit_difference\":"<<max_diff<<"}"<<std::endl;
+                if(width==1 && (max_diff!=0 || same!=1))throw std::runtime_error("snapshot replay changed sequential logits");
+            }
+            engine.reset();bool rejected=false;
+            try {engine.restore(checkpoint);}catch(const std::invalid_argument&) {rejected=true;}
+            if(!rejected)throw std::runtime_error("snapshot survived reset");
+            std::cerr<<"MLX_SNAPSHOT_REPLAY_PASS stale_reset_rejected=1\n";
+            return 0;
+        }
         std::vector<uint32_t> baseline;
         for(int run=-warmup;run<repeat;++run) {
             engine.reset();started=Clock::now();std::optional<mx::array> logits;
@@ -54,6 +120,8 @@ int main(int argc,char** argv) {
                 logits=mx::reshape(mx::slice(y,{y.shape(0)-1,0},{y.shape(0),y.shape(1)}),{y.shape(1)});
             }
             const double prefill=elapsed(started);
+            memory("prefilled");
+            if(clear_prefill_cache) {mx::clear_cache();memory("cache_cleared");}
             uint32_t next=mx::argmax(*logits).item<uint32_t>();
             std::vector<uint32_t> output={next};
             const auto first=Clock::now();
@@ -65,6 +133,7 @@ int main(int argc,char** argv) {
                 }
             }
             const double decode=elapsed(first);
+            memory("decoded");
             if(run<0)continue;
             if(baseline.empty())baseline=output;
             if(output!=baseline)throw std::runtime_error("reset changed greedy output across repeats");

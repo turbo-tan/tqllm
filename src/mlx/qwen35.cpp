@@ -1,4 +1,5 @@
 #include "qwen35.hpp"
+#include "prefill.hpp"
 #include <cmath>
 #include <chrono>
 #include <limits>
@@ -27,10 +28,12 @@ struct Qwen35::Impl {
     std::map<std::string,mx::array> plain;
     std::optional<Q4Embedding> embedding;
     std::vector<Cache> caches;
+    uint64_t epoch=0;
     int context,pos=0,layers,hidden,heads,kvheads,hd,rot,kh,vh,dk,dv,conv,interval,vocab;
     float eps,theta;
     mx::array key_indices;
     bool profiling=false;
+    bool gemm_prefill=false;
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         const auto arch=file.kv.at("general.architecture").str;
@@ -94,7 +97,10 @@ struct Qwen35::Impl {
         }
         caches.resize(layers);
     }
-    mx::array mat(const std::string& name,const mx::array& x) {return bf(linear(matrices.at(name),x));}
+    mx::array mat(const std::string& name,const mx::array& x) {
+        const auto& w=matrices.at(name);
+        return bf(gemm_prefill && x.shape(0)>=8?prefill_linear(w,x):linear(w,x));
+    }
     mx::array norm(const mx::array& x,const std::string& name) {return bf(mx::fast::rms_norm(x,plain.at(name),eps));}
     mx::array full_attention(const std::string& p,const mx::array& x,Cache& c) {
         const int m=x.shape(0);
@@ -176,12 +182,30 @@ struct Qwen35::Impl {
         return logits;
     }
 };
+struct Qwen35::Snapshot::State {
+    const void* owner;
+    uint64_t epoch;
+    int pos;
+    std::vector<Cache> caches;
+};
+Qwen35::Snapshot Qwen35::checkpoint() const {
+    Snapshot result;
+    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches});
+    return result;
+}
+void Qwen35::restore(const Snapshot& snapshot) {
+    if(!snapshot.state_ || snapshot.state_->owner!=impl_.get() || snapshot.state_->epoch!=impl_->epoch)
+        throw std::invalid_argument("MLX snapshot belongs to another engine or reset generation");
+    impl_->pos=snapshot.state_->pos;
+    impl_->caches=snapshot.state_->caches;
+}
 Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}
 Qwen35::~Qwen35()=default;
 mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {return impl_->forward(tokens,all_logits);}
-void Qwen35::reset() {impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
+void Qwen35::reset() {++impl_->epoch;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};}
 int Qwen35::position() const {return impl_->pos;}
 int Qwen35::vocabulary() const {return impl_->vocab;}
 void Qwen35::profile(bool enabled) {impl_->profiling=enabled;}
+void Qwen35::prefill_gemm(bool enabled) {impl_->gemm_prefill=enabled;}
 std::pair<double,double> Qwen35::timings() const {return impl_->times;}
 }

@@ -1,4 +1,5 @@
 #include "weights.hpp"
+#include "prefill.hpp"
 #include "../src/dequant.hpp"
 #include <algorithm>
 #include <bit>
@@ -57,7 +58,9 @@ static std::vector<float> rotate(std::vector<float> x) {
     return x;
 }
 int main(int argc,char** argv) {
-    if(argc!=2) {std::cerr<<"usage: test-mlx-gguf model.gguf\n";return 2;}
+    if(argc!=2 && argc!=3) {std::cerr<<"usage: test-mlx-gguf model.gguf [--prefill]\n";return 2;}
+    const bool prefill=argc==3 && std::string(argv[2])=="--prefill";
+    if(argc==3 && !prefill) return 2;
     auto file=gguf_open(argv[1]); std::set<uint32_t> covered;
     for(const auto& [name,original]:file.tensors) {
         if(original.ne.size()!=2 || covered.count(original.type)) continue;
@@ -81,6 +84,18 @@ int main(int argc,char** argv) {
             std::cout<<"GGUF_EMBED_PASS type="<<t.type<<" max_abs="<<error<<" tensor="<<name<<'\n';
         } else {
             auto matrix=load_matrix(t,payload);
+            if(prefill) {
+                auto staged=stage_bf16(matrix);
+                if(staged.dtype()!=mx::bfloat16)throw std::runtime_error("prefill staging dtype mismatch");
+                auto staged_fp32=mx::astype(staged,mx::float32);mx::eval(staged_fp32);
+                for(size_t i=0;i<w.size();++i) {
+                    const uint32_t bits=std::bit_cast<uint32_t>(w[i]);
+                    const float rounded=std::bit_cast<float>((bits+0x7fffu+((bits>>16)&1u))&0xffff0000u);
+                    if(staged_fp32.data<float>()[i]!=rounded)
+                        throw std::runtime_error("prefill BF16 weights differ from CPU rounding: "+name);
+                }
+                std::cout<<"GGUF_STAGE_PASS type="<<t.type<<" tensor="<<name<<'\n';
+            }
             for(int m:{1,8,64}) {
                 std::vector<float> input(size_t(m)*k);
                 for(size_t i=0;i<input.size();++i) input[i]=std::sin(float(i)*0.037f)*0.1f;
