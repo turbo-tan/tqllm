@@ -17,6 +17,23 @@ int main() {
     std::vector<float> scales(rows * k / 128, 0.125f);
     auto c = mx::array(codes.data(), {rows, k / 2}, mx::uint8);
     auto s = mx::astype(mx::array(scales.data(), {rows, k / 128}), mx::float16);
+    {
+        std::vector<uint8_t> blocks(rows * (k / 128) * 66);
+        for (int b = 0; b < rows * k / 128; ++b) {
+            blocks[b * 66] = 0;
+            blocks[b * 66 + 1] = 0x30; // FP16 0.125
+            std::copy_n(codes.data() + b * 64, 64, blocks.data() + b * 66 + 2);
+        }
+        auto loaded = tqllm::mlx_backend::load_tq4_blocks(blocks, rows, k);
+        auto same_codes = mx::all(mx::equal(loaded.codes, c));
+        auto same_scales = mx::all(mx::equal(loaded.scales, s));
+        if (!same_codes.item<bool>() || !same_scales.item<bool>()) return 5;
+        blocks.pop_back();
+        bool rejected = false;
+        try { tqllm::mlx_backend::load_tq4_blocks(blocks, rows, k); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) return 6;
+    }
     int cases = 0;
     {
         std::vector<float> input(2 * k);

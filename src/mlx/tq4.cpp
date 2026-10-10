@@ -1,6 +1,7 @@
 #include "tq4.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <cstring>
 
 namespace tqllm::mlx_backend {
 namespace mx = mlx::core;
@@ -54,6 +55,22 @@ const char* source = R"METAL(
     }
 )METAL";
 const char* header = R"METAL(constant float LV[16] = {0.129099213f, 0.387297638f, 0.667012598f, 0.946727559f, 1.247959055f, 1.613740157f, 2.065587402f, 2.732600000f, -0.129099213f, -0.387297638f, -0.667012598f, -0.946727559f, -1.247959055f, -1.613740157f, -2.065587402f, -2.732600000f};)METAL";
+}
+
+Tq4Weights load_tq4_blocks(std::span<const uint8_t> blocks, int rows, int columns) {
+    if (rows <= 0 || columns <= 0 || columns % 128)
+        throw std::invalid_argument("invalid TQ4 block dimensions");
+    const uint64_t count = uint64_t(rows) * uint64_t(columns / 128);
+    if (blocks.size() != count * 66)
+        throw std::invalid_argument("TQ4 block payload size mismatch");
+    std::vector<uint8_t> codes(size_t(count) * 64);
+    std::vector<uint16_t> scales(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        scales[i] = uint16_t(blocks[i * 66]) | (uint16_t(blocks[i * 66 + 1]) << 8);
+        std::memcpy(codes.data() + i * 64, blocks.data() + i * 66 + 2, 64);
+    }
+    return {mx::array(codes.data(), {rows, columns / 2}, mx::uint8),
+            mx::view(mx::array(scales.data(), {rows, columns / 128}, mx::uint16), mx::float16)};
 }
 
 mx::array tq4_rotate(const mx::array& x) {
