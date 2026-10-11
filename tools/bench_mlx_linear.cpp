@@ -50,6 +50,15 @@ int main(int argc, char** argv) {
             const double rotation = measure([&] { return tq4_rotate(input); });
             const double compressed = measure([&] { return linear(weights, input); });
             const double affine_ms = affine ? measure([&] { return tq3_affine8_matmul(*affine,tq4_rotate(input)); }) : 0;
+            double affine_error=-1;
+            if(affine && std::getenv("MLX_ENABLE_TF32") && std::string(std::getenv("MLX_ENABLE_TF32"))=="1") {
+                auto expected=linear(weights,input);
+                auto got=tq3_affine8_matmul(*affine,tq4_rotate(input));
+                affine_error=mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got,expected))),
+                    mx::maximum(mx::sum(mx::square(expected)),mx::array(1e-20f)))).item<float>();
+                if(!std::isfinite(affine_error) || affine_error>1e-3)
+                    throw std::runtime_error("TF32 affine projection drift exceeds screen");
+            }
             const double decoded_tensor_ms = expanded && !std::getenv("TQLLM_MLX_TENSOR_MEMORY") ? measure([&] { return verify_expanded_tensorops(*expanded,input); }) : 0;
             const double decoded_ms = expanded ? measure([&] { return tq3_expanded_matmul(*expanded,tq4_rotate(input)); }) : 0;
             const double tensorops = measure([&] { return verify_tensorops(weights, input, true); });
@@ -70,7 +79,7 @@ int main(int argc, char** argv) {
                       << " rows=" << rows << " k=" << k << " m=" << m
                       << " rotate_ms=" << rotation << " unpack_ms=" << unpack
                       << " compressed_ms=" << compressed << " staged_ms=" << staged
-                      << " affine8_ms=" << affine_ms << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " tensorops_rel_l2=" << tensor_error << " resident_gemm_ms=" << gemm << std::endl;
+                      << " affine8_ms=" << affine_ms << " affine8_rel_l2=" << affine_error << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " tensorops_rel_l2=" << tensor_error << " resident_gemm_ms=" << gemm << std::endl;
         }
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

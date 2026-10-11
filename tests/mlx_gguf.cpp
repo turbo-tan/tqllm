@@ -64,6 +64,7 @@ static std::vector<float> rotate(std::vector<float> x) {
 int main(int argc,char** argv) {
     if(argc!=2 && argc!=3) {std::cerr<<"usage: test-mlx-gguf model.gguf [--prefill]\n";return 2;}
     const bool affine_half=argc==3 && std::string(argv[2])=="--affine-half";
+    const bool affine_tf32=argc==3 && std::string(argv[2])=="--affine-tf32";
     const bool affine_gu=argc==3 && std::string(argv[2])=="--affine-gu";
     const bool expanded_half=argc==3 && std::string(argv[2])=="--expanded-half";
     const bool affine8=argc==3 && std::string(argv[2])=="--affine8";
@@ -73,7 +74,10 @@ int main(int argc,char** argv) {
     const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
     const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
     const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
-    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu) return 2;
+    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32) return 2;
+    if(affine_tf32 && (!std::getenv("MLX_ENABLE_TF32") || std::string(std::getenv("MLX_ENABLE_TF32"))!="1" ||
+       std::getenv("TQLLM_MLX_AFFINE_HALF")))
+        throw std::invalid_argument("TF32 screen requires MLX_ENABLE_TF32=1 and FP32 affine inputs");
     auto file=gguf_open(argv[1]); std::set<uint32_t> covered;
     for(const auto& [name,original]:file.tensors) {
         if(original.ne.size()!=2 || covered.count(original.type)) continue;
@@ -98,7 +102,7 @@ int main(int argc,char** argv) {
         } else {
             auto matrix=load_matrix(t,payload);
             std::optional<Tq3Affine8> affine;
-            if((affine8 || affine_half || affine_gu) && t.type==GGML_TQ3) {
+            if((affine8 || affine_half || affine_gu || affine_tf32) && t.type==GGML_TQ3) {
                 affine=tq3_affine8(std::get<Tq3Weights>(matrix));
                 auto decoded=mx::dequantize(affine->codes,affine->scales,affine->biases,128,8,"affine");
                 mx::eval(decoded);
@@ -173,17 +177,17 @@ int main(int argc,char** argv) {
                     diff+=delta*delta;total+=expected*expected;maxerr=std::max(maxerr,float(std::abs(delta)));
                 }
                 const double rel=std::sqrt(diff/std::max(total,1e-20));
-                if(tensorops_half || expanded_half || affine_half) {
+                if(tensorops_half || expanded_half || affine_half || affine_tf32) {
                     const double drift=std::sqrt(original_diff/std::max(original_total,1e-20));
-                    std::cout<<"GGUF_FP16_DRIFT type="<<t.type<<" m="<<m<<" rel_l2="<<drift<<'\n';
-                    if(drift>1e-3)throw std::runtime_error("FP16 projection drift exceeds screen");
+                    std::cout<<(affine_tf32?"GGUF_TF32_DRIFT type=":"GGUF_FP16_DRIFT type=")<<t.type<<" m="<<m<<" rel_l2="<<drift<<'\n';
+                    if(drift>1e-3)throw std::runtime_error("reduced precision projection drift exceeds screen");
                 }
-                const bool approximate=native_half;
+                const bool approximate=native_half || affine_tf32;
                 if(rel>(approximate?1e-3:2e-5) && maxerr>1e-5) {
                     std::cerr<<"GGUF_LINEAR_FAIL type="<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<'\n';
                     throw std::runtime_error("real GGUF linear mismatch: "+name);
                 }
-                std::cout<<(approximate?"GGUF_FP16_SCREEN_PASS type=":"GGUF_LINEAR_PASS type=")<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<" tensor="<<name<<'\n';
+                std::cout<<(affine_tf32?"GGUF_TF32_SCREEN_PASS type=":approximate?"GGUF_FP16_SCREEN_PASS type=":"GGUF_LINEAR_PASS type=")<<t.type<<" m="<<m<<" rel_l2="<<rel<<" max_abs="<<maxerr<<" tensor="<<name<<'\n';
             }
         }
         covered.insert(t.type);
