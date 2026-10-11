@@ -14,8 +14,10 @@ namespace mx=mlx::core;
 using tqllm::mlx_backend::Qwen35;
 int main(int argc,char** argv) {
     try {
-        if(argc<3 || argc>4)throw std::invalid_argument("usage: tqmlx-kld model.gguf corpus.txt [chunks]");
-        const int chunks=argc==4?std::stoi(argv[3]):2,rows=512,batch=8;
+        if(argc<3 || argc>5)throw std::invalid_argument("usage: tqmlx-kld model.gguf corpus.txt [chunks] [--verify]");
+        const int chunks=argc>=4?std::stoi(argv[3]):2,rows=512,batch=8;
+        const bool verification=argc==5 && std::string(argv[4])=="--verify";
+        if(argc==5 && !verification)throw std::invalid_argument("unknown accuracy mode");
         if(chunks<1 || chunks>100)throw std::invalid_argument("chunks must be 1..100");
         std::ifstream in(argv[2]);if(!in)throw std::runtime_error("cannot open corpus");
         std::string text{std::istreambuf_iterator<char>(in),{}};
@@ -28,13 +30,15 @@ int main(int argc,char** argv) {
         int total_same=0;
         for(int chunk=0;chunk<chunks;++chunk) {
             const auto* input=tokens.data()+size_t(chunk)*rows;
-            engine.reset();engine.gdn_mode(Qwen35::GdnMode::baseline);
+            engine.reset();engine.gdn_mode(verification?Qwen35::GdnMode::scan:Qwen35::GdnMode::baseline);
+            engine.verify_tiles(!verification);
             std::vector<float> reference(size_t(rows)*vocab);
-            for(int off=0;off<rows;off+=batch) {
-                auto y=engine.forward({input+off,batch},true);
+            const int reference_batch=verification?1:batch;
+            for(int off=0;off<rows;off+=reference_batch) {
+                auto y=engine.forward({input+off,size_t(reference_batch)},true);
                 std::copy(y.data<float>(),y.data<float>()+y.size(),reference.begin()+size_t(off)*vocab);
             }
-            engine.reset();engine.gdn_mode(Qwen35::GdnMode::scan);
+            engine.reset();engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
             double kl_sum=0,ppl_sum=0;int same=0;
             for(int off=0;off<rows;off+=batch) {
                 auto y=engine.forward({input+off,batch},true);const auto* values=y.data<float>();
@@ -49,17 +53,21 @@ int main(int argc,char** argv) {
                     for(int j=0;j<vocab;++j)kl+=std::exp(double(a[j])-za)*(double(a[j])-za-double(b[j])+zb);
                     const auto target=input[off+r+1];
                     if(target>=uint32_t(vocab))throw std::runtime_error("target token outside vocabulary");
-                    kl_sum+=kl;ppl_sum+=(zb-b[target])-(za-a[target]);same+=ia==ib;
+                    const double delta=(zb-b[target])-(za-a[target]);
+                    if(!std::isfinite(kl) || !std::isfinite(delta) || kl < -1e-6)
+                        throw std::runtime_error("invalid accuracy statistic");
+                    kl_sum+=kl;ppl_sum+=delta;same+=ia==ib;
                 }
             }
             total_same+=same;chunk_kld.push_back(kl_sum/rows);chunk_ppl.push_back(ppl_sum/rows);
-            std::cout<<"{\"kind\":\"same_file_gdn_screen\",\"chunk\":"<<chunk<<",\"rows\":"<<rows
+            std::cout<<"{\"kind\":\""<<(verification?"same_file_verify_screen":"same_file_gdn_screen")<<"\",\"chunk\":"<<chunk<<",\"rows\":"<<rows
+                     <<",\"reference_batch\":"<<reference_batch
                      <<",\"batch\":"<<batch<<",\"mean_kld\":"<<kl_sum/rows<<",\"ln_ppl_ratio\":"<<ppl_sum/rows
                      <<",\"top1_same\":"<<same<<",\"active_bytes\":"<<mx::get_active_memory()<<"}"<<std::endl;
         }
         auto mean=[](const auto& x){return std::accumulate(x.begin(),x.end(),0.0)/x.size();};
         auto se=[&](const auto& x) {if(x.size()<2)return 0.0;double ss=0,m=mean(x);for(double a:x)ss+=(a-m)*(a-m);return std::sqrt(ss/(x.size()*(x.size()-1)));};
-        std::cout<<"{\"kind\":\"same_file_gdn_summary\",\"chunks\":"<<chunks<<",\"rows_per_chunk\":"<<rows
+        std::cout<<"{\"kind\":\""<<(verification?"same_file_verify_summary":"same_file_gdn_summary")<<"\",\"chunks\":"<<chunks<<",\"rows_per_chunk\":"<<rows
                  <<",\"mean_kld\":"<<mean(chunk_kld)<<",\"kld_chunk_se\":"<<se(chunk_kld)
                  <<",\"ln_ppl_ratio\":"<<mean(chunk_ppl)<<",\"ppl_chunk_se\":"<<se(chunk_ppl)
                  <<",\"top1_same\":"<<total_same<<"}"<<std::endl;
