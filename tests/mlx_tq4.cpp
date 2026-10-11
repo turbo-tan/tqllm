@@ -5,6 +5,7 @@
 #include "q4_embedding.hpp"
 #include "weights.hpp"
 #include "tensorops.hpp"
+#include "int8_tiles.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -236,6 +237,25 @@ static void test_tq3() {
         }
     }
     const auto weights = tqllm::mlx_backend::load_tq3_blocks(blocks, rows, k);
+    if (std::getenv("TQLLM_MLX_INT8_TILE")) {
+        for (bool interleaved : {false, true}) for (int m : {1, 3, 5, 8, 17}) for (bool zero : {false, true}) {
+            std::vector<float> input(size_t(m) * k);
+            for (size_t i = 0; i < input.size(); ++i) input[i] = zero ? 0.0f : std::sin(float(i) * .09f);
+            auto matrix = interleaved ? tqllm::mlx_backend::tq3_interleave(weights) : weights;
+            auto x = mx::array(input.data(), {m, k});
+            auto expected = tqllm::mlx_backend::tq3_matmul(weights, tqllm::mlx_backend::tq4_rotate(x));
+            auto got = tqllm::mlx_backend::verify_tq3_int8(matrix, x);
+            float error = mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got, expected))),
+                mx::maximum(mx::sum(mx::square(expected)), mx::array(1e-20f)))).item<float>();
+            if (!std::isfinite(error) || error > 2e-5f)
+                throw std::runtime_error("residual INT8 layout, zero or tail failed");
+        }
+        bool rejected = false;
+        try { tqllm::mlx_backend::verify_tq3_int8(weights, mx::zeros({1, k}, mx::float32), 1); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("one-plane activation accepted");
+        std::cout << "INT8_TILE_LAYOUT_PASS planar=1 interleaved=1 zero=1 row_tail=17 column_tail=17\n";
+    }
     if(std::getenv("TQLLM_MLX_TENSOR_MEMORY")) {
         for(bool interleaved:{false,true})for(int m:{1,2,3,5,8,17}) {
             std::vector<float> input(size_t(m)*k);

@@ -1,6 +1,7 @@
 #include "prefill.hpp"
 #include "verify.hpp"
 #include "tensorops.hpp"
+#include "int8_tiles.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,16 @@ int main(int argc, char** argv) {
             mx::eval(half_input);
             const double rotation = measure([&] { return tq4_rotate(input); });
             const double compressed = measure([&] { return linear(weights, input); });
+            double int8_ms = -1, int8_error = -1;
+            if (std::getenv("TQLLM_MLX_INT8_TILE") && std::holds_alternative<Tq3Weights>(weights)) {
+                const auto& w = std::get<Tq3Weights>(weights);
+                auto expected = linear(weights, input), got = verify_tq3_int8(w, input);
+                int8_error = mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got, expected))),
+                    mx::maximum(mx::sum(mx::square(expected)), mx::array(1e-20f)))).item<float>();
+                if (!std::isfinite(int8_error) || int8_error > 2e-5)
+                    throw std::runtime_error("residual INT8 projection drift exceeds FP32 gate");
+                int8_ms = measure([&] { return verify_tq3_int8(w, input); });
+            }
             const double affine_ms = affine ? measure([&] { return tq3_affine8_matmul(*affine,tq4_rotate(input)); }) : 0;
             double affine_error=-1;
             if(affine && std::getenv("MLX_ENABLE_TF32") && std::string(std::getenv("MLX_ENABLE_TF32"))=="1") {
@@ -79,6 +90,7 @@ int main(int argc, char** argv) {
                       << " rows=" << rows << " k=" << k << " m=" << m
                       << " rotate_ms=" << rotation << " unpack_ms=" << unpack
                       << " compressed_ms=" << compressed << " staged_ms=" << staged
+                      << " int8_tile_ms=" << int8_ms << " int8_tile_rel_l2=" << int8_error
                       << " affine8_ms=" << affine_ms << " affine8_rel_l2=" << affine_error << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " tensorops_rel_l2=" << tensor_error << " resident_gemm_ms=" << gemm << std::endl;
         }
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

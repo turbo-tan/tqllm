@@ -1,4 +1,5 @@
 #include "tensorops.hpp"
+#include "int8_tiles.hpp"
 #include "weights.hpp"
 #include "prefill.hpp"
 #include "verify.hpp"
@@ -72,9 +73,10 @@ int main(int argc,char** argv) {
     const bool prefill=argc==3 && std::string(argv[2])=="--prefill";
     const bool tensorops_half=argc==3 && std::string(argv[2])=="--tensorops-half";
     const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
+    const bool int8_tiles=argc==3 && std::string(argv[2])=="--int8-tiles";
     const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
     const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
-    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32) return 2;
+    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32 && !int8_tiles) return 2;
     if(affine_tf32 && (!std::getenv("MLX_ENABLE_TF32") || std::string(std::getenv("MLX_ENABLE_TF32"))!="1" ||
        std::getenv("TQLLM_MLX_AFFINE_HALF")))
         throw std::invalid_argument("TF32 screen requires MLX_ENABLE_TF32=1 and FP32 affine inputs");
@@ -141,6 +143,23 @@ int main(int argc,char** argv) {
                 std::vector<float> input(size_t(m)*k);
                 for(size_t i=0;i<input.size();++i) input[i]=std::sin(float(i)*0.037f)*0.1f;
                 auto refinput=(t.type==GGML_TQ3||t.type==GGML_TQ4)?rotate(input):input;
+                if (int8_tiles && t.type == GGML_TQ3) {
+                    auto y = verify_tq3_int8(std::get<Tq3Weights>(matrix), mx::array(input.data(), {m, k}));
+                    mx::eval(y);
+                    double diff = 0, total = 0;
+                    float maxerr = 0;
+                    for (int a = 0; a < m; ++a) for (int row = 0; row < r; ++row) {
+                        double expected = 0;
+                        for (int j = 0; j < k; ++j) expected += double(w[row*k+j]) * refinput[a*k+j];
+                        const double delta = y.data<float>()[a*r+row] - expected;
+                        diff += delta*delta; total += expected*expected;
+                        maxerr = std::max(maxerr, float(std::abs(delta)));
+                    }
+                    const double rel = std::sqrt(diff / std::max(total, 1e-20));
+                    if (!std::isfinite(rel) || (rel > 2e-5 && maxerr > 1e-5))
+                        throw std::runtime_error("residual INT8 real GGUF projection failed");
+                    std::cout << "GGUF_INT8_TILE_PASS m=" << m << " rel_l2=" << rel << " max_abs=" << maxerr << '\n';
+                }
                 auto y=affine?tq3_affine8_matmul(*affine,tq4_rotate(mx::array(input.data(),{m,k}))):decoded && expanded_half?verify_expanded_tensorops(*decoded,mx::array(input.data(),{m,k})):decoded?tq3_expanded_matmul(*decoded,tq4_rotate(mx::array(input.data(),{m,k}))):(tensorops || tensorops_half)?verify_tensorops(matrix,mx::array(input.data(),{m,k}),tensorops_half):(verify_tiles && m>1)?verify_tiled(matrix,mx::array(input.data(),{m,k})):linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
                 if(std::getenv("TQLLM_MLX_TQ3_STREAM") && t.type==GGML_TQ3) {
                     unsetenv("TQLLM_MLX_TQ3_STREAM");
