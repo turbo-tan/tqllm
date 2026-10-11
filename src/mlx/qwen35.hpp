@@ -43,6 +43,7 @@ public:
     mlx::core::array feature_states() const;
     mlx::core::array embed_tokens(std::span<const uint32_t> tokens) const;
     mlx::core::array shared_draft_head(const mlx::core::array& normalized) const;
+    void enable_draft_head4();
     Qwen35(const std::string& path, int context);
     ~Qwen35();
     mlx::core::array forward(std::span<const uint32_t> tokens, bool all_logits = false);

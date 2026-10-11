@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -24,12 +25,14 @@ int main(int argc,char** argv) {
         mx::set_cache_limit(512*1024*1024);
         Qwen35 engine(argv[1],int(prompt.size())+count+16);
         engine.gdn_mode(Qwen35::GdnMode::scan);engine.enable_mtp();engine.verify_tiles(true);
+        const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4")!=nullptr;
+        if(head4)engine.enable_draft_head4();
         std::vector<uint32_t> reference,first_spec;
         for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             engine.reset();auto begin=Clock::now();
             auto logits=engine.forward(prompt);
             if(mode) {
-                if(shortlist)engine.draft_shortlist(logits,shortlist);
+                if(shortlist && !head4)engine.draft_shortlist(logits,shortlist);
                 engine.draft_inject({prompt.data()+1,prompt.size()-1},rows(engine.hidden_states(),0,int(prompt.size())-1),1);
             }
             const double prefill=seconds(begin);
@@ -79,7 +82,7 @@ int main(int argc,char** argv) {
             if(check!=output)throw std::runtime_error("greedy output changed across reset repetitions");
             size_t equal=0;while(equal<std::min(output.size(),reference.size()) && output[equal]==reference[equal])++equal;
             std::cout<<"{\"kind\":\"mtp_generation\",\"mode\":\""<<(mode?"spec":"ar")<<"\",\"run\":"<<run
-                     <<",\"draft\":"<<draft<<",\"shortlist\":"<<shortlist<<",\"prompt_tokens\":"<<prompt.size()
+                     <<",\"draft\":"<<draft<<",\"proposal_head_bits\":"<<(head4?4:6)<<",\"shortlist\":"<<(head4?0:shortlist)<<",\"prompt_tokens\":"<<prompt.size()
                      <<",\"output_tokens\":"<<output.size()<<",\"decode_tok_s\":"<<(output.size()-1)/decode
                      <<",\"ttft_ms\":"<<prefill*1000<<",\"steps\":"<<steps<<",\"drafted\":"<<drafted<<",\"accepted\":"<<accepted_total
                      <<",\"draft_ms\":"<<draft_ms<<",\"verify_ms\":"<<verify_ms<<",\"commit_ms\":"<<commit_ms

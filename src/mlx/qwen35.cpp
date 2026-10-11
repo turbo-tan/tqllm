@@ -3,6 +3,7 @@
 #include "verify.hpp"
 #include "tuning.hpp"
 #include "gdn.hpp"
+#include "draft_head.hpp"
 #include <mlx/compile.h>
 #include <cstdlib>
 #include <cmath>
@@ -57,12 +58,14 @@ struct Qwen35::Impl {
     int mtp_pos=1;
     bool mtp_enabled=false;
     std::optional<Q6Weights> mtp_head;
+    std::optional<DraftHead4> proposal_head;
     std::optional<mx::array> mtp_ids;
     std::optional<mx::array> mtp_hidden;
     uint64_t epoch=0,revision=0;
     int context,pos=0,layers,hidden,heads,kvheads,hd,rot,kh,vh,dk,dv,conv,interval,vocab;
     float eps,theta;
     mx::array key_indices;
+    mx::array global_ids=mx::array(0,mx::uint32);
     std::optional<GdnHeadOrder> native_head_order;
     bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
     bool profiling=false,stage_profiling=false;
@@ -95,7 +98,8 @@ struct Qwen35::Impl {
         const auto& emb=file.tensors.at("token_embd.weight");
         if(emb.type!=GGML_Q4_K||emb.ne.size()!=2||emb.ne[0]!=uint64_t(hidden)||emb.ne[1]>uint64_t(INT32_MAX))
             throw std::invalid_argument("experimental MLX forward requires Q4_K embeddings");
-        vocab=int(emb.ne[1]);auto data=file.read(emb);
+        vocab=int(emb.ne[1]);global_ids=mx::arange(vocab,mx::uint32);mx::eval(global_ids);
+        auto data=file.read(emb);
         embedding=load_q4_embedding({reinterpret_cast<const uint8_t*>(data.data()),data.size()},vocab,hidden);
         mx::eval(embedding->blocks);data.clear();data.shrink_to_fit();
         std::vector<uint32_t> indices(vh);
@@ -376,7 +380,12 @@ mx::array Qwen35::embed_tokens(std::span<const uint32_t> tokens) const {return b
 mx::array Qwen35::shared_draft_head(const mx::array& x) const {
     if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
         throw std::invalid_argument("invalid shared draft-head input");
+    if(impl_->proposal_head)return draft_head4_matmul(*impl_->proposal_head,x);
     return impl_->mtp_head?q6_matmul(*impl_->mtp_head,x):linear(impl_->matrices.at("output.weight"),x);
+}
+void Qwen35::enable_draft_head4() {
+    if(impl_->pos!=0)throw std::invalid_argument("proposal head must be configured before prefill");
+    if(!impl_->proposal_head)impl_->proposal_head=draft_head4(impl_->matrices.at("output.weight"));
 }
 mx::array Qwen35::hidden_states() const {
     if(!impl_->last_hidden)throw std::invalid_argument("no MLX target hidden states");
@@ -418,8 +427,9 @@ void Qwen35::draft_shortlist(const mx::array& logits,int count) {
     mx::eval(*impl_->mtp_ids,impl_->mtp_head->blocks);
 }
 mx::array Qwen35::draft_ids() const {
+    if(impl_->proposal_head)return impl_->global_ids;
     if(impl_->mtp_ids)return *impl_->mtp_ids;
-    return mx::arange(impl_->vocab,mx::uint32);
+    return impl_->global_ids;
 }
 struct Qwen35::DraftSnapshot::State {
     const void* owner;
@@ -479,7 +489,7 @@ mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array
     i.mtp_hidden=tail_slice(x,0,n-1,n);
     if(logits) {
         auto normalized=i.norm(tail_slice(x,0,n-1,n),p+"nextn.shared_head_norm.weight");
-        output=i.mtp_head?q6_matmul(*i.mtp_head,normalized):linear(i.matrices.at("output.weight"),normalized);
+        output=shared_draft_head(normalized);
     }
     mx::eval(output,*i.mtp_cache.keys,*i.mtp_cache.values);
     i.mtp_pos+=n;i.rotation.reset();

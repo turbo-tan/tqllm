@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 namespace mx=mlx::core;
@@ -23,10 +24,12 @@ int main(int argc,char** argv) {
         mx::set_cache_limit(512*1024*1024);
         Qwen35 engine(argv[1],int(prompt.size())+count+16);engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
         DFlash2 drafter(argv[2],engine);
+        const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4")!=nullptr;
+        if(head4)engine.enable_draft_head4();
         std::vector<uint32_t> reference,first_spec;
         for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             engine.reset();drafter.reset();auto begin=Clock::now();auto logits=engine.forward(prompt);
-            if(mode) {engine.draft_shortlist(logits,shortlist);drafter.inject(engine.feature_states(),0);}
+            if(mode) {if(!head4)engine.draft_shortlist(logits,shortlist);drafter.inject(engine.feature_states(),0);}
             const double prefill=seconds(begin);uint32_t pending=mx::argmax(logits).item<uint32_t>();
             std::vector<uint32_t> output{pending};int steps=0,drafted=0,accepted_total=0;
             double draft_ms=0,verify_ms=0,commit_ms=0;const auto start=Clock::now();
@@ -52,7 +55,7 @@ int main(int argc,char** argv) {
             if(repeat!=output)throw std::runtime_error("DFlash reset changed greedy output");
             size_t equal=0;while(equal<std::min(output.size(),reference.size()) && output[equal]==reference[equal])++equal;
             std::cout<<"{\"kind\":\"dflash_generation\",\"mode\":\""<<(mode?"spec":"ar")<<"\",\"run\":"<<run
-                     <<",\"width\":"<<width<<",\"shortlist\":"<<shortlist<<",\"prompt_tokens\":"<<prompt.size()
+                     <<",\"width\":"<<width<<",\"proposal_head_bits\":"<<(head4?4:6)<<",\"shortlist\":"<<(head4?0:shortlist)<<",\"prompt_tokens\":"<<prompt.size()
                      <<",\"output_tokens\":"<<output.size()<<",\"decode_tok_s\":"<<(output.size()-1)/decode
                      <<",\"ttft_ms\":"<<prefill*1000<<",\"steps\":"<<steps<<",\"drafted\":"<<drafted<<",\"accepted\":"<<accepted_total
                      <<",\"draft_ms\":"<<draft_ms<<",\"verify_ms\":"<<verify_ms<<",\"commit_ms\":"<<commit_ms
