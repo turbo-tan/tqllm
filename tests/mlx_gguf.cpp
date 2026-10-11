@@ -173,6 +173,25 @@ int main(int argc,char** argv) {
                     std::cout << "GGUF_INT8_TILE_PASS m=" << m << " rel_l2=" << rel << " max_abs=" << maxerr << '\n';
                 }
                 auto y=q6_split?q6_affine_matmul(*q6_split,mx::array(input.data(),{m,k})):affine?tq3_affine8_matmul(*affine,tq4_rotate(mx::array(input.data(),{m,k}))):decoded && expanded_half?verify_expanded_tensorops(*decoded,mx::array(input.data(),{m,k})):decoded?tq3_expanded_matmul(*decoded,tq4_rotate(mx::array(input.data(),{m,k}))):(tensorops || tensorops_half)?verify_tensorops(matrix,mx::array(input.data(),{m,k}),tensorops_half):(verify_tiles && m>1)?verify_tiled(matrix,mx::array(input.data(),{m,k})):linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
+                if (std::getenv("TQLLM_MLX_COLUMN_AUDIT") && !affine_gu) {
+                    size_t changed = 0, bf16_changed = 0;
+                    float maximum = 0;
+                    for (int a = 0; a < m; ++a) {
+                        auto single = linear(matrix, mx::array(input.data()+size_t(a)*k, {1,k}));
+                        mx::eval(single);
+                        for (int row = 0; row < r; ++row) {
+                            const float batched = y.data<float>()[a*r+row], sequential = single.data<float>()[row];
+                            const uint32_t b = std::bit_cast<uint32_t>(batched), q = std::bit_cast<uint32_t>(sequential);
+                            auto rounded = [](uint32_t v) { return (v+0x7fffu+((v>>16)&1u))&0xffff0000u; };
+                            changed += b != q;
+                            bf16_changed += rounded(b) != rounded(q);
+                            maximum = std::max(maximum, std::abs(batched-sequential));
+                        }
+                    }
+                    std::cout << "GGUF_COLUMN_AUDIT type=" << t.type << " m=" << m
+                              << " changed=" << changed << " bf16_changed=" << bf16_changed
+                              << " total=" << size_t(m)*r << " max_abs=" << maximum << " tensor=" << name << '\n';
+                }
                 if(std::getenv("TQLLM_MLX_TQ3_STREAM") && t.type==GGML_TQ3) {
                     unsetenv("TQLLM_MLX_TQ3_STREAM");
                     auto base=linear(matrix,mx::array(input.data(),{m,k}));mx::eval(base);
