@@ -1,10 +1,55 @@
 #include "gdn.hpp"
+#include <mlx/compile.h>
 #include <stdexcept>
 #include <cstdlib>
 #include <string_view>
 
 namespace tqllm::mlx_backend {
 namespace mx=mlx::core;
+namespace {
+mx::array bf(const mx::array& x) {return mx::astype(mx::astype(x,mx::bfloat16),mx::float32);}
+std::vector<mx::array> convolve(const std::vector<mx::array>& args) {
+    const auto& joined=args[0];const auto& weights=args[1];
+    const int m=joined.shape(0)-3,width=joined.shape(1);
+    auto result=mx::zeros({m,width});
+    for(int tap=0;tap<4;++tap) {
+        auto w=mx::reshape(mx::slice(weights,{0,tap},{width,tap+1}),{1,width});
+        result=mx::add(result,mx::multiply(mx::slice(joined,{tap,0},{tap+m,width}),w));
+    }
+    result=bf(result);
+    return {bf(mx::multiply(result,mx::sigmoid(result)))};
+}
+std::vector<mx::array> normalize(const std::vector<mx::array>& args) {
+    auto inverse=mx::rsqrt(mx::add(mx::sum(mx::square(args[0]),-1,true),mx::array(1e-6f)));
+    return {mx::multiply(args[0],mx::multiply(inverse,args[1]))};
+}
+std::vector<mx::array> decay(const std::vector<mx::array>& args) {
+    auto dt=mx::add(args[0],args[1]);
+    auto sp=mx::add(mx::maximum(dt,mx::array(0.0f)),mx::log1p(mx::exp(mx::negative(mx::abs(dt)))));
+    return {mx::exp(mx::multiply(sp,args[2]))};
+}
+}
+mx::array gdn_convolve(const mx::array& joined,const mx::array& weights,bool compiled) {
+    if(joined.ndim()!=2 || joined.shape(0)<4 || weights.shape()!=mx::Shape{joined.shape(1),4} ||
+       joined.dtype()!=mx::float32 || weights.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid GDN convolution dimensions");
+    static auto fused=mx::compile(convolve);
+    return compiled?fused({joined,weights})[0]:convolve({joined,weights})[0];
+}
+mx::array gdn_normalize(const mx::array& input,float scale,bool compiled) {
+    if(input.ndim()!=4 || input.shape(3)<32 || input.shape(3)%32 || input.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid GDN normalization dimensions");
+    static auto fused=mx::compile(normalize);
+    auto factor=mx::array(scale);
+    return compiled?fused({input,factor})[0]:normalize({input,factor})[0];
+}
+mx::array gdn_decay(const mx::array& alpha,const mx::array& bias,const mx::array& rate,bool compiled) {
+    if(alpha.ndim()!=2 || bias.shape()!=mx::Shape{alpha.shape(1)} || rate.shape()!=bias.shape() ||
+       alpha.dtype()!=mx::float32 || bias.dtype()!=mx::float32 || rate.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid GDN decay dimensions");
+    static auto fused=mx::compile(decay);
+    return compiled?fused({alpha,bias,rate})[0]:decay({alpha,bias,rate})[0];
+}
 GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,bool snapshots) {
     if(q.ndim()!=4 || q.shape(0)!=1 || q.shape(3)!=128 || q.dtype()!=mx::float32 || k.shape()!=q.shape() ||

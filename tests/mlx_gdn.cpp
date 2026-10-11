@@ -53,7 +53,46 @@ int main(int argc,char** argv) {
         std::vector<uint32_t> indices(heads);
         for(int h=0;h<heads;++h)indices[h]=uint32_t(h%key_heads);
         mx::array key_indices(indices.data(),{heads},mx::uint32);
-        for(int count:{1,8,16,64}) {
+        for(int count:{1,3,5,8}) {
+            const int width=2*key_heads*dk+heads*dv;
+            std::vector<float> joined(size_t(count+3)*width),weights(size_t(width)*4);
+            std::vector<float> alpha(size_t(count)*heads),bias(heads),rate(heads);
+            for(size_t i=0;i<joined.size();++i)joined[i]=std::sin(float(i)*.031f)*2.0f;
+            for(size_t i=0;i<weights.size();++i)weights[i]=std::cos(float(i)*.023f)*.3f;
+            for(size_t i=0;i<alpha.size();++i)alpha[i]=std::sin(float(i)*.071f)*100.0f;
+            for(int i=0;i<heads;++i) {bias[i]=std::cos(float(i)*.11f);rate[i]=-.01f*(i+1);}
+            mx::array aj(joined.data(),{count+3,width}),aw(weights.data(),{width,4});
+            mx::array aa(alpha.data(),{count,heads}),abias(bias.data(),{heads}),ar(rate.data(),{heads});
+            auto reference=tqllm::mlx_backend::gdn_convolve(aj,aw);
+            mx::eval(reference);
+            std::vector<double> expected(reference.data<float>(),reference.data<float>()+reference.size());
+            auto aq=mx::reshape(mx::slice(reference,{0,0},{count,key_heads*dk}),{1,count,key_heads,dk});
+            auto normalized=tqllm::mlx_backend::gdn_normalize(aq,1.0f/std::sqrt(float(dk)));
+            auto decay=tqllm::mlx_backend::gdn_decay(aa,abias,ar);
+            mx::eval(normalized,decay);
+            std::vector<double> nq(normalized.data<float>(),normalized.data<float>()+normalized.size());
+            std::vector<double> dg(decay.data<float>(),decay.data<float>()+decay.size());
+            auto fused=tqllm::mlx_backend::gdn_convolve(aj,aw,true);
+            check(fused,expected,"compiled_convolution");
+            auto fq=mx::reshape(mx::slice(fused,{0,0},{count,key_heads*dk}),{1,count,key_heads,dk});
+            check(tqllm::mlx_backend::gdn_normalize(fq,1.0f/std::sqrt(float(dk)),true),nq,"compiled_normalization");
+            check(tqllm::mlx_backend::gdn_decay(aa,abias,ar,true),dg,"compiled_decay_extremes");
+            for(bool compiled:{false,true}) {
+                std::vector<double> times;
+                for(int run=-1;run<5;++run) {
+                    auto start=Clock::now();
+                    auto cv=tqllm::mlx_backend::gdn_convolve(aj,aw,compiled);
+                    auto qv=mx::reshape(mx::slice(cv,{0,0},{count,key_heads*dk}),{1,count,key_heads,dk});
+                    auto nv=tqllm::mlx_backend::gdn_normalize(qv,1.0f/std::sqrt(float(dk)),compiled);
+                    auto dv=tqllm::mlx_backend::gdn_decay(aa,abias,ar,compiled);
+                    mx::eval(cv,nv,dv);
+                    if(run>=0)times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+                }
+                std::sort(times.begin(),times.end());
+                std::cout<<"GDN_PREP_BENCH count="<<count<<" compiled="<<compiled<<" median_ms="<<times[2]<<std::endl;
+            }
+        }
+        for(int count:{1,3,5,8,16,64}) {
             std::vector<float> q(size_t(count)*key_heads*dk),k(q.size()),v(size_t(count)*heads*dv);
             std::vector<float> g(size_t(count)*heads),beta(g.size()),initial(size_t(heads)*dv*dk);
             for(size_t i=0;i<q.size();++i) {

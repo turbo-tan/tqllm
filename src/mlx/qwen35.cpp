@@ -68,6 +68,7 @@ struct Qwen35::Impl {
     mx::array global_ids=mx::array(0,mx::uint32);
     std::optional<GdnHeadOrder> native_head_order;
     bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
+    bool compiled_gdn=std::getenv("TQLLM_MLX_COMPILED_GDN")!=nullptr;
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
@@ -203,25 +204,16 @@ struct Qwen35::Impl {
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
-        auto result=mx::zeros({m,width});
-        for(int tap=0;tap<conv;++tap) {
-            auto w=mx::reshape(tail_slice(weights,1,tap,tap+1),{1,width});
-            result=mx::add(result,mx::multiply(tail_slice(joined,0,tap,tap+m),w));
-        }
+        auto result=gdn_convolve(joined,weights,compiled_gdn);
         c.conv=mx::contiguous(tail_slice(joined,0,m,m+conv-1));
-        result=bf(silu(bf(result)));
         auto q=mx::reshape(tail_slice(result,1,0,kh*dk),{1,m,kh,dk});
         auto k=mx::reshape(tail_slice(result,1,kh*dk,2*kh*dk),{1,m,kh,dk});
         auto v=mx::reshape(tail_slice(result,1,2*kh*dk,width),{1,m,vh,dv});
-        auto normalize=[&](const mx::array& a,float scale) {
-            return mx::multiply(a,mx::multiply(mx::rsqrt(mx::add(mx::sum(mx::square(a),-1,true),mx::array(1e-6f))),mx::array(scale)));
-        };
-        q=normalize(q,1.0f/std::sqrt(float(dk)));k=normalize(k,1);
+        q=gdn_normalize(q,1.0f/std::sqrt(float(dk)),compiled_gdn);
+        k=gdn_normalize(k,1,compiled_gdn);
         if(!native_head_order && !scan_gdn) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
         auto a=mat(p+"ssm_alpha.weight",x),b=mat(p+"ssm_beta.weight",x);
-        auto dt=mx::add(a,plain.at(p+"ssm_dt.bias"));
-        auto sp=mx::add(mx::maximum(dt,mx::array(0.0f)),mx::log1p(mx::exp(mx::negative(mx::abs(dt)))));
-        auto decay=mx::reshape(mx::exp(mx::multiply(sp,plain.at(p+"ssm_a"))),{1,m,vh});
+        auto decay=mx::reshape(gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),{1,m,vh});
         auto beta=mx::reshape(mx::sigmoid(b),{1,m,vh});
         auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix)):std::nullopt;
         if(capture_prefix)tape.states=scanned->snapshots;
