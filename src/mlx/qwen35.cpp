@@ -172,7 +172,7 @@ struct Qwen35::Impl {
     }
     mx::array norm(const mx::array& x,const std::string& name) {return bf(mx::fast::rms_norm(x,plain.at(name),eps));}
     std::pair<mx::array,mx::array> gate_up(const std::string& p,const mx::array& x) {
-        if(x.shape(0)>=8 && !gemm_prefill)
+        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=affine_gu.find(p);found!=affine_gu.end()) {
                 auto gu=tq3_affine8_matmul(found->second,tq4_rotate(x));
                 const int rows=gu.shape(1)/2;

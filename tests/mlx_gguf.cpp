@@ -132,7 +132,7 @@ int main(int argc,char** argv) {
                 }
                 std::cout<<"GGUF_STAGE_PASS type="<<t.type<<" tensor="<<name<<'\n';
             }
-            for(int m:{1,8,16,64}) {
+            for(int m:{1,2,3,5,8,16,64}) {
                 const bool native_half=affine_half && t.type==GGML_TQ3 && m<=8;
                 std::vector<float> input(size_t(m)*k);
                 for(size_t i=0;i<input.size();++i) input[i]=std::sin(float(i)*0.037f)*0.1f;
