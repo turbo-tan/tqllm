@@ -1,0 +1,29 @@
+TQLLM
+Copyright 2026 The TQLLM authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party code under its own licence:
+
+* third_party/jinja - the Jinja chat-template engine from llama.cpp.
+  MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: third_party/jinja/LICENSE.
+
+* kernels/*_grid.inc, kernels/ksigns_iq2xs.inc, kernels/kvalues_iq4nl.inc - the IQ quantisation grids, sign tables and
+  IQ4_NL codebook from ggml (llama.cpp), used only to read GGUF files stored in those formats.
+  MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
+
+* src/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
+
+Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
+
+* ggml / llama.cpp (Georgi Gerganov and contributors): the GGUF file format and the K-quant and IQ block layouts that
+  TQLLM reads natively, and the reference engine every result is compared against.
+* Qwen team, Alibaba: the Qwen3.5 / Qwen3.8 models and the Qwen3-VL vision encoder design.
+* z-lab: DFlash2, the block-diffusion draft model used for speculative decoding.
+* spiritbuun (buun-llama-cpp): the trellis-coded quantisation idea behind the tcq KV-cache codecs (own codebooks and code).
+* Google Research: TurboQuant (ICLR 2026), the rotation-plus-codebook lineage the TQ3 / TQ4 formats follow.
+* TheTom (turboquant_plus): TurboQuant KV-cache ideas and the REFRACT distance-from-reference quality metric.
+* Avarok (TorQuant): learned rotations for quantisation.
+* Unsloth: the UD GGUF quantisations, which TQLLM runs natively and benchmarks against.
+
+The full credits table, including methods and comparison baselines, is in README.md (Credits).

@@ -1,0 +1,28 @@
+services:
+  tqllm:
+    image: ${TQLLM_IMAGE:-ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13}
+    build:
+      context: .
+      args:
+        CUDA_ARCHITECTURES: ${CUDA_ARCHITECTURES:-}
+    ports:
+      - "127.0.0.1:8086:8086"
+    volumes:
+      - ${MODEL_DIR:-./models}:/models:ro
+    environment:
+      MODEL_FILE: /models/${MODEL_NAME:-model.gguf}
+      TOKENIZER_FILE: ${TOKENIZER_NAME:+/models/${TOKENIZER_NAME}}
+      CONTEXT: ${CONTEXT:-16384}
+      PARALLEL: ${PARALLEL:-1}
+      REASONING: ${REASONING:-off}
+      MAX_TOKENS: ${MAX_TOKENS:-1024}
+      DRAFT_MODEL_FILE: ${DRAFT_NAME:+/models/${DRAFT_NAME}}
+      DRAFT_VOCAB_FILE: ${VOCAB_NAME:+/models/${VOCAB_NAME}}
+      KV_FORMAT: ${KV_FORMAT:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

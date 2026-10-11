@@ -1,0 +1,55 @@
+#pragma once
+// Engine options, fixed when a Model is built. Every tool parses them with parse_engine_option (llama.cpp names
+// where llama.cpp has the option); tqserve's memory fit fills the placement fields itself.
+#include <cstdint>
+#include <string>
+
+#include "tqllm/rope_scaling.hpp"
+
+namespace tqllm {
+struct EngineOptions {
+    std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
+                                   // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
+    std::string kv;
+    std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv_store.hpp; flat, paged, tiered)
+    RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
+    int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
+                           // stand-ins R times smaller that the GPU reads directly (approximate; staged + tq3 KV only)
+    bool kv_compact_turn = false;  // --kv-compact-at idle|turn: turn compacts after each request's prefill, fitted on its
+                                   // queries (the question), at the cost of that time before the first token
+    int prefill_int8 = -1;  // --prefill-int8 on|off: prefill GEMMs in int8 (per-row x per-token scales) default on RTX 30 / 40 / 50, opt-in elsewhere (sm_80+)
+    int prefill_fp8 = -1;  // --prefill-fp8 on|off: prefill GEMMs in FP8 (E4M3, per-row x per-token scales); default on GB10 (validated), opt-in on other sm_89+ GPUs
+    bool prompt_cache = false;  // --prompt-cache on|off: one slot keeps the previous request's cache and prefills only the
+                                // part of a new prompt past the shared prefix (on with --kv-compact)
+    bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
+                           // link speed (one slot, compressed KV); off: the newest positions stay in host memory
+    long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
+                        // decides (0 when the context fits, else the fewest that do)
+    std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (none: native MTP heads when the model has them)
+    std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
+    int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
+    int draft_retrieve = 0;    // --draft-retrieve C: C x 16 positions of the drafter window are far chunks it retrieves (one slot)
+    bool tree = true;          // --no-tree: chain verify instead of tree verify with a drafter
+    int lookup = 0;            // --lookup L: prompt-lookup chain of up to L tokens beside the draft tree (copy tasks)
+    int lookup_first = 0;      // --lookup-first K: a lookup match of >= K tokens takes the whole verify block
+    int ubatch = 0;            // -ub / --ubatch-size: prefill buffer columns (0: engine default)
+    // memory placement; the fit (Model) sets them when the device is short
+    bool embed_host = false;   // token embeddings in host memory
+    bool head_host = false;    // int8 LM head in host memory
+    int gemm_rows = 0;         // prefill FP16 weight blocks of this many rows (0: whole matrices)
+    // memory fit (llama.cpp names): -fit on|off, -fitt MiB free after loading, -fitc smallest context it may set
+    bool fit = true;
+    long fit_target_mb = -1;  // -1: 768, or 256 under WSL (WDDM; measured 2026-10-08, results/20261008_kv_host_tail)
+    uint32_t fit_min_ctx = 4096;
+
+    std::string kv_format() const;  // the KV format name these options select ("bf16" when none)
+};
+
+// Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
+bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);
+const char * engine_options_usage();
+
+// Stops the tool when a removed TQLLM_* variable is set (config/flags.yaml kind retired names the replacement) and
+// warns about unknown TQLLM_* names.
+void check_env_flags(const char * tool);
+}  // namespace tqllm

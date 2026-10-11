@@ -1,0 +1,7 @@
+.git
+build*
+models
+*.gguf
+*.safetensors
+*.log
+results

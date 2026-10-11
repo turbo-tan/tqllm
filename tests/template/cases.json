@@ -1,0 +1,228 @@
+{
+ "A_think_default": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ]
+ },
+ "B_think_off": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "chat_template_kwargs": {
+   "enable_thinking": false
+  }
+ },
+ "C_system_low": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "reasoning_effort": "low"
+ },
+ "D_tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "E_tool_multiturn": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Need the weather tool.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "18C sunny"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "E2_tool_dict_args_2calls": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris and Rome?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two cities.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     },
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Rome"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "Error: city service unavailable"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "Traceback (most recent call last): boom"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "G_preserve_off": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a number."
+   },
+   {
+    "role": "assistant",
+    "content": "7",
+    "reasoning_content": "Say 7."
+   },
+   {
+    "role": "user",
+    "content": "Double it."
+   }
+  ],
+  "chat_template_kwargs": {
+   "preserve_thinking": false
+  }
+ },
+ "H_inline_think": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a number."
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nSay 7.\n</think>\n\n7"
+   },
+   {
+    "role": "user",
+    "content": "Double it."
+   }
+  ]
+ },
+ "F_chat_multiturn": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a number."
+   },
+   {
+    "role": "assistant",
+    "content": "7",
+    "reasoning_content": "Any number works; say 7."
+   },
+   {
+    "role": "user",
+    "content": "Double it."
+   }
+  ]
+ }
+}

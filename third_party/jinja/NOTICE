@@ -1,0 +1,4 @@
+Jinja template engine from llama.cpp (common/jinja), MIT licence, Copyright (c) 2023-2026 The ggml authors.
+Source: https://github.com/ggml-org/llama.cpp, commit 3ca591616 (our fork turbo-tan/llama.cpp-tq3), files lexer, parser, runtime, string, value, utils.
+Local changes: the optional nlohmann::json bridge (from_json / global_from_json) and the capability probe (caps.cpp) are removed;
+a small unicode shim replaces llama.cpp's unicode.h. The engine was introduced upstream in PR #18462, inspired by huggingface.js jinja.
