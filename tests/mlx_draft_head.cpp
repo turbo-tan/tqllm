@@ -22,7 +22,7 @@ int main(int argc,char** argv) {
         for(int r=0;r<rows;++r)for(int j=0;j<k;++j)
             if(decoded.data<float>()[r*k+j]!=weight(r,j))
                 throw std::runtime_error("proposal head affine dequantization differs from CPU");
-        for(int m:{1,8}) {
+        for(int m:{1,3,5,7,8,16}) {
             std::vector<float> x(size_t(m)*k);for(size_t j=0;j<x.size();++j)x[j]=std::sin(float(j)*.037f)*.1f;
             auto y=draft_head4_matmul(head,mx::array(x.data(),{m,k}));mx::eval(y);double difference=0,total=0;
             for(int t=0;t<m;++t)for(int r=0;r<rows;++r) {
