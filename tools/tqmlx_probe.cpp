@@ -19,6 +19,7 @@ int main(int argc,char** argv) {
     try {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
+        int verify_repeats=5,verify_width=0;
         bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false;
         size_t cache_limit=0;
         for(int i=1;i<argc;++i) {
@@ -37,6 +38,8 @@ int main(int argc,char** argv) {
             else if(arg=="--all-logits") all_logits=true;
             else if(arg=="--profile") profiling=true;
             else if(arg=="--verify-probe") verify_probe=true;
+            else if(arg=="--verify-repeats") verify_repeats=std::stoi(value());
+            else if(arg=="--verify-width") verify_width=std::stoi(value());
             else if(arg=="--verify-tiles") verify_tiles=true;
             else if(arg=="--tq3-vector-load") tq3_vector_load=true;
             else if(arg=="--stage-profile") stage_profiling=true;
@@ -45,7 +48,8 @@ int main(int argc,char** argv) {
             else if(arg=="--cache-limit-mib") cache_limit=std::stoull(value())*1024*1024;
             else throw std::invalid_argument("unknown argument: "+arg);
         }
-        if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1)
+        if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1||verify_repeats<1||
+           (verify_width!=0 && verify_width!=1 && verify_width!=2 && verify_width!=4 && verify_width!=8))
             throw std::invalid_argument("usage: tqmlx-probe --model file.gguf --prompt text [--generate N --repeat N --warmup N]");
         tqllm::Tokenizer tokenizer;tokenizer.load(model);
         std::vector<uint32_t> input;
@@ -77,10 +81,11 @@ int main(int argc,char** argv) {
                 token=mx::argmax(y).item<uint32_t>();
             }
             for(int width:{1,2,4,8}) {
+                if(verify_width && width!=verify_width)continue;
                 std::vector<double> milliseconds,bodies,heads;
                 double max_diff=0,mean_kld=0;
                 int same=0;
-                for(int run=-1;run<5;++run) {
+                for(int run=-1;run<verify_repeats;++run) {
                     engine.restore(checkpoint);
                     if(engine.position()!=start_pos)throw std::runtime_error("snapshot restored wrong position");
                     const auto begin=Clock::now();
