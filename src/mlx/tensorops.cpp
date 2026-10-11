@@ -93,30 +93,31 @@ mx::array packed_tq3_memory(const Tq3Weights& w,const mx::array& x,bool fp16) {
         const char* value=std::getenv(name);return value?std::stoi(value):fallback;
     };
     const int m=x.shape(0),k=x.shape(1),rows=w.planes.shape(0);
+    const int mt=option("TQLLM_MLX_TENSOR_M",16);
     const int nt=option("TQLLM_MLX_TENSOR_N",64),bk=option("TQLLM_MLX_TENSOR_K",128);
     const int simds=option("TQLLM_MLX_TENSOR_SIMDS",4),split=option("TQLLM_MLX_TENSOR_SPLIT",1);
-    if((nt!=32 && nt!=64) || (bk!=32 && bk!=64 && bk!=128) ||
+    if((mt!=8 && mt!=16) || (nt!=32 && nt!=64) || (bk!=32 && bk!=64 && bk!=128) ||
        (simds!=1 && simds!=2 && simds!=4) ||
        (split!=1 && split!=2 && split!=4 && split!=8) || k%(split*bk))
         throw std::invalid_argument("invalid packed TQ3 memory tile");
-    const int scratch=(16*bk+nt*bk)*(fp16?2:4)+16*nt*4;
+    const int scratch=(mt*bk+nt*bk)*(fp16?2:4)+mt*nt*4;
     if(scratch>32768)throw std::invalid_argument("packed TQ3 tile exceeds threadgroup memory budget");
     static auto kernel=mx::fast::metal_kernel("tqllm_tq3_tensor_memory",{"packed","scales","x"},{"y"},R"METAL(
 uint tid=thread_position_in_threadgroup.x;
 uint row0=threadgroup_position_in_grid.y*uint(NT);
-uint col0=(threadgroup_position_in_grid.z/uint(SPLIT))*16u;
+uint col0=(threadgroup_position_in_grid.z/uint(SPLIT))*uint(MT);
 uint part=threadgroup_position_in_grid.z%uint(SPLIT);
-threadgroup Operand A[16*BK],B[NT*BK];
-threadgroup float C[16*NT];
-tensor<threadgroup Operand,extents<int,BK,16>,tensor_inline> ta(A,extents<int,BK,16>());
+threadgroup Operand A[MT*BK],B[NT*BK];
+threadgroup float C[MT*NT];
+tensor<threadgroup Operand,extents<int,BK,MT>,tensor_inline> ta(A,extents<int,BK,MT>());
 tensor<threadgroup Operand,extents<int,BK,NT>,tensor_inline> tb(B,extents<int,BK,NT>());
-tensor<threadgroup float,extents<int,NT,16>,tensor_inline> tc(C,extents<int,NT,16>());
-constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(16,NT,BK,false,true,false,mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+tensor<threadgroup float,extents<int,NT,MT>,tensor_inline> tc(C,extents<int,NT,MT>());
+constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(MT,NT,BK,false,true,false,mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroups<SIMDS>> op;
 auto acc=op.template get_destination_cooperative_tensor<decltype(ta),decltype(tb),float>();
 for(uint i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i))acc[i]=0.0f;
 for(uint base=part*(K/SPLIT);base<(part+1u)*(K/SPLIT);base+=uint(BK)) {
- for(uint i=tid;i<16u*uint(BK);i+=32u*uint(SIMDS)) {
+ for(uint i=tid;i<uint(MT)*uint(BK);i+=32u*uint(SIMDS)) {
   uint col=base+i%uint(BK),m=col0+i/uint(BK);
   A[i]=Operand(m<M?x[m*K+col]:0.0f);
  }
@@ -159,7 +160,7 @@ for(uint base=part*(K/SPLIT);base<(part+1u)*(K/SPLIT);base+=uint(BK)) {
 }
 acc.store(tc);
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for(uint i=tid;i<16u*uint(NT);i+=32u*uint(SIMDS)) {
+for(uint i=tid;i<uint(MT)*uint(NT);i+=32u*uint(SIMDS)) {
  uint row=row0+i%uint(NT),m=col0+i/uint(NT);
  if(row<R && m<M)y[(part*M+m)*R+row]=C[i];
 }
@@ -169,8 +170,8 @@ for(uint i=tid;i<16u*uint(NT);i+=32u*uint(SIMDS)) {
 constant float L3[8]={14.0f,45.0f,79.0f,127.0f,-14.0f,-45.0f,-79.0f,-127.0f};
 )METAL");
     auto result=kernel({w.planes,w.scales,tq4_rotate(x)},{{split,m,rows}},{mx::float32},
-        {32*simds,(rows+nt-1)/nt,(m+15)/16*split},{32*simds,1,1},
-        {{"NT",nt},{"BK",bk},{"SIMDS",simds},{"SPLIT",split},{"WIDE_UNPACK",option("TQLLM_MLX_TENSOR_WIDE",0)!=0},{"Operand",fp16?mx::float16:mx::float32},
+        {32*simds,(rows+nt-1)/nt,(m+mt-1)/mt*split},{32*simds,1,1},
+        {{"MT",mt},{"NT",nt},{"BK",bk},{"SIMDS",simds},{"SPLIT",split},{"WIDE_UNPACK",option("TQLLM_MLX_TENSOR_WIDE",0)!=0},{"Operand",fp16?mx::float16:mx::float32},
          {"R",rows},{"K",k},{"M",m},{"INTERLEAVED",w.interleaved}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
     return split==1?mx::reshape(result,{m,rows}):mx::sum(result,0);
 }

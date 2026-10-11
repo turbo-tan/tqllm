@@ -17,7 +17,7 @@
 static void test_tensor_limits() {
     using namespace tqllm::mlx_backend;
     const std::vector<std::string> names={"TQLLM_MLX_TENSOR_MEMORY","TQLLM_MLX_TENSOR_N",
-        "TQLLM_MLX_TENSOR_K","TQLLM_MLX_TENSOR_SIMDS","TQLLM_MLX_TENSOR_SPLIT"};
+        "TQLLM_MLX_TENSOR_K","TQLLM_MLX_TENSOR_SIMDS","TQLLM_MLX_TENSOR_SPLIT","TQLLM_MLX_TENSOR_M"};
     std::vector<std::optional<std::string>> saved;
     for(const auto& name:names) {
         const char* value=std::getenv(name.c_str());
