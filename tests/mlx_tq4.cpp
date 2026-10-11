@@ -4,12 +4,50 @@
 #include "q8.hpp"
 #include "q4_embedding.hpp"
 #include "weights.hpp"
+#include "tensorops.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 #include <bit>
+#include <cstdlib>
+#include <optional>
+
+static void test_tensor_limits() {
+    using namespace tqllm::mlx_backend;
+    const std::vector<std::string> names={"TQLLM_MLX_TENSOR_MEMORY","TQLLM_MLX_TENSOR_N",
+        "TQLLM_MLX_TENSOR_K","TQLLM_MLX_TENSOR_SIMDS","TQLLM_MLX_TENSOR_SPLIT"};
+    std::vector<std::optional<std::string>> saved;
+    for(const auto& name:names) {
+        const char* value=std::getenv(name.c_str());
+        saved.emplace_back(value?std::optional<std::string>(value):std::nullopt);
+        unsetenv(name.c_str());
+    }
+    auto input=mlx::core::zeros({1,256},mlx::core::float32);
+    Matrix q4=Tq4Weights{mlx::core::zeros({1,128},mlx::core::uint8),
+        mlx::core::zeros({1,2},mlx::core::float16),true};
+    for(int width:{64,128}) {
+        setenv("TQLLM_MLX_TENSOR_K",std::to_string(width).c_str(),1);
+        bool rejected=false;
+        try {verify_tensorops(q4,input,true);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        if(!rejected)throw std::runtime_error("unsupported cooperative reduction tile accepted");
+    }
+    setenv("TQLLM_MLX_TENSOR_MEMORY","1",1);
+    setenv("TQLLM_MLX_TENSOR_N","64",1);
+    Matrix q3=Tq3Weights{mlx::core::zeros({1,3,8},mlx::core::uint32),
+        mlx::core::zeros({1,2},mlx::core::float16),false};
+    bool rejected=false;
+    try {verify_tensorops(q3,input,false);}
+    catch(const std::invalid_argument&) {rejected=true;}
+    if(!rejected)throw std::runtime_error("oversized threadgroup scratch accepted");
+    for(size_t i=0;i<names.size();++i) {
+        if(saved[i])setenv(names[i].c_str(),saved[i]->c_str(),1);
+        else unsetenv(names[i].c_str());
+    }
+    std::cout<<"TENSOR_LIMITS_PASS cooperative_k=64,128_rejected oversized_scratch_rejected=1\n";
+}
 
 namespace mx = mlx::core;
 using tqllm::mlx_backend::tq4_matmul;
@@ -198,6 +236,22 @@ static void test_tq3() {
         }
     }
     const auto weights = tqllm::mlx_backend::load_tq3_blocks(blocks, rows, k);
+    if(std::getenv("TQLLM_MLX_TENSOR_MEMORY")) {
+        for(bool interleaved:{false,true})for(int m:{1,2,3,5,8,17}) {
+            std::vector<float> input(size_t(m)*k);
+            for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i)*0.09f);
+            auto matrix=interleaved?tqllm::mlx_backend::tq3_interleave(weights):weights;
+            auto x=mx::array(input.data(),{m,k});
+            auto expected=tqllm::mlx_backend::tq3_matmul(weights,tqllm::mlx_backend::tq4_rotate(x));
+            auto got=tqllm::mlx_backend::verify_tensorops(matrix,x,true);
+            auto error=mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got,expected))),
+                mx::maximum(mx::sum(mx::square(expected)),mx::array(1e-20f))));
+            float value=error.item<float>();
+            if(!std::isfinite(value) || value>1e-3f)
+                throw std::runtime_error("packed TensorOps layout or tail differs from scalar projection");
+        }
+        std::cout<<"TENSOR_MEMORY_LAYOUT_PASS planar=1 interleaved=1 row_tail=17 column_tail=17\n";
+    }
     for (int m : {1, 8, 64}) {
         std::vector<float> x(m*k);
         for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i)*0.09f);
@@ -326,5 +380,6 @@ int main() {
     try { tq4_matmul(c, s, mx::zeros({1, k / 2})); }
     catch (const std::invalid_argument&) { rejected = true; }
     if (!rejected) return 3;
+    test_tensor_limits();
     std::cout << "MLX_TQ4_PASS " << cases << " arithmetic cases; invalid tiles and shapes rejected\n";
 }

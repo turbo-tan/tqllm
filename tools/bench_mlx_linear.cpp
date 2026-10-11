@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
         auto dense = stage_bf16(weights);
         mx::eval(dense);
         const double unpack = measure([&] { return stage_bf16(weights); });
-        for (int m : (argc==4 ? std::vector<int>{1,8,16} : std::vector<int>{1,4,8,16,64,512})) {
+        for (int m : (argc==4 ? std::vector<int>{1,3,5,8,16} : std::vector<int>{1,4,8,16,64,512})) {
             std::vector<float> values(size_t(m) * k);
             for (size_t i = 0; i < values.size(); ++i) values[i] = .1f * std::sin(float(i) * .037f);
             mx::array input(values.data(), {m, k}, mx::float32);
@@ -49,16 +50,27 @@ int main(int argc, char** argv) {
             const double rotation = measure([&] { return tq4_rotate(input); });
             const double compressed = measure([&] { return linear(weights, input); });
             const double affine_ms = affine ? measure([&] { return tq3_affine8_matmul(*affine,tq4_rotate(input)); }) : 0;
-            const double decoded_tensor_ms = expanded ? measure([&] { return verify_expanded_tensorops(*expanded,input); }) : 0;
+            const double decoded_tensor_ms = expanded && !std::getenv("TQLLM_MLX_TENSOR_MEMORY") ? measure([&] { return verify_expanded_tensorops(*expanded,input); }) : 0;
             const double decoded_ms = expanded ? measure([&] { return tq3_expanded_matmul(*expanded,tq4_rotate(input)); }) : 0;
             const double tensorops = measure([&] { return verify_tensorops(weights, input, true); });
+            double tensor_error = 0;
+            if (std::getenv("TQLLM_MLX_TENSOR_MEMORY")) {
+                auto expected = linear(weights, input);
+                auto got = verify_tensorops(weights, input, true);
+                auto delta = mx::subtract(got, expected);
+                auto error = mx::sqrt(mx::divide(mx::sum(mx::square(delta)),
+                    mx::maximum(mx::sum(mx::square(expected)), mx::array(1e-20f))));
+                tensor_error = error.item<float>();
+                if (!std::isfinite(tensor_error) || tensor_error > 1e-3)
+                    throw std::runtime_error("packed tensor tile differs from compressed projection");
+            }
             const double staged = measure([&] { return prefill_linear(weights, input); });
             const double gemm = measure([&] { return mx::matmul(half_input, mx::transpose(dense)); });
             std::cout << "LINEAR_BENCH tensor=" << argv[2] << " type=" << tensor.type
                       << " rows=" << rows << " k=" << k << " m=" << m
                       << " rotate_ms=" << rotation << " unpack_ms=" << unpack
                       << " compressed_ms=" << compressed << " staged_ms=" << staged
-                      << " affine8_ms=" << affine_ms << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " resident_gemm_ms=" << gemm << std::endl;
+                      << " affine8_ms=" << affine_ms << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " tensorops_rel_l2=" << tensor_error << " resident_gemm_ms=" << gemm << std::endl;
         }
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
