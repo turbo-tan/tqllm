@@ -74,9 +74,10 @@ int main(int argc,char** argv) {
     const bool tensorops_half=argc==3 && std::string(argv[2])=="--tensorops-half";
     const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
     const bool int8_tiles=argc==3 && std::string(argv[2])=="--int8-tiles";
+    const bool q6_affine=argc==3 && std::string(argv[2])=="--q6-affine";
     const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
     const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
-    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32 && !int8_tiles) return 2;
+    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32 && !int8_tiles && !q6_affine) return 2;
     if(affine_tf32 && (!std::getenv("MLX_ENABLE_TF32") || std::string(std::getenv("MLX_ENABLE_TF32"))!="1" ||
        std::getenv("TQLLM_MLX_AFFINE_HALF")))
         throw std::invalid_argument("TF32 screen requires MLX_ENABLE_TF32=1 and FP32 affine inputs");
@@ -103,6 +104,8 @@ int main(int argc,char** argv) {
             std::cout<<"GGUF_EMBED_PASS type="<<t.type<<" max_abs="<<error<<" tensor="<<name<<'\n';
         } else {
             auto matrix=load_matrix(t,payload);
+            std::optional<Q6AffineSplit> q6_split;
+            if (q6_affine && t.type == GGML_Q6_K) q6_split = q6_affine_split(std::get<Q6Weights>(matrix));
             std::optional<Tq3Affine8> affine;
             if((affine8 || affine_half || affine_gu || affine_tf32) && t.type==GGML_TQ3) {
                 affine=tq3_affine8(std::get<Tq3Weights>(matrix));
@@ -160,7 +163,7 @@ int main(int argc,char** argv) {
                         throw std::runtime_error("residual INT8 real GGUF projection failed");
                     std::cout << "GGUF_INT8_TILE_PASS m=" << m << " rel_l2=" << rel << " max_abs=" << maxerr << '\n';
                 }
-                auto y=affine?tq3_affine8_matmul(*affine,tq4_rotate(mx::array(input.data(),{m,k}))):decoded && expanded_half?verify_expanded_tensorops(*decoded,mx::array(input.data(),{m,k})):decoded?tq3_expanded_matmul(*decoded,tq4_rotate(mx::array(input.data(),{m,k}))):(tensorops || tensorops_half)?verify_tensorops(matrix,mx::array(input.data(),{m,k}),tensorops_half):(verify_tiles && m>1)?verify_tiled(matrix,mx::array(input.data(),{m,k})):linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
+                auto y=q6_split?q6_affine_matmul(*q6_split,mx::array(input.data(),{m,k})):affine?tq3_affine8_matmul(*affine,tq4_rotate(mx::array(input.data(),{m,k}))):decoded && expanded_half?verify_expanded_tensorops(*decoded,mx::array(input.data(),{m,k})):decoded?tq3_expanded_matmul(*decoded,tq4_rotate(mx::array(input.data(),{m,k}))):(tensorops || tensorops_half)?verify_tensorops(matrix,mx::array(input.data(),{m,k}),tensorops_half):(verify_tiles && m>1)?verify_tiled(matrix,mx::array(input.data(),{m,k})):linear(matrix,mx::array(input.data(),{m,k}));mx::eval(y);
                 if(std::getenv("TQLLM_MLX_TQ3_STREAM") && t.type==GGML_TQ3) {
                     unsetenv("TQLLM_MLX_TQ3_STREAM");
                     auto base=linear(matrix,mx::array(input.data(),{m,k}));mx::eval(base);

@@ -195,10 +195,13 @@ static void test_q6() {
                     }
         }
     auto packed = tqllm::mlx_backend::load_q6_blocks(raw, rows, k);
+    std::optional<tqllm::mlx_backend::Q6AffineSplit> split;
+    if (std::getenv("TQLLM_MLX_Q6_AFFINE")) split = tqllm::mlx_backend::q6_affine_split(packed);
     for (int m : {1, 8, 64}) {
         std::vector<float> input(m*k);
         for (size_t i = 0; i < input.size(); ++i) input[i] = std::cos(float(i)*0.1f);
         auto out = tqllm::mlx_backend::q6_matmul(packed, mx::array(input.data(), {m,k}));
+        if (split) out = tqllm::mlx_backend::q6_affine_matmul(*split, mx::array(input.data(), {m,k}));
         mx::eval(out);
         for (int a = 0; a < m; ++a)
             for (int r = 0; r < rows; ++r) {
