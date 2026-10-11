@@ -58,6 +58,7 @@ struct Qwen35::Impl {
     int mtp_pos=1;
     bool mtp_enabled=false;
     std::optional<Q6Weights> mtp_head;
+    std::optional<Q6AffineSplit> target_head;
     std::optional<DraftHead4> proposal_head;
     std::optional<mx::array> mtp_ids;
     std::optional<mx::array> mtp_hidden;
@@ -128,6 +129,11 @@ struct Qwen35::Impl {
             mx::eval(w);plain.emplace(name,std::move(w));
         };
         matrix("output.weight");scalar("output_norm.weight");
+        if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
+            const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
+            if (!head) throw std::invalid_argument("Q6 affine head requires Q6_K output weights");
+            target_head = q6_affine_split(*head);
+        }
         for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
             for(const auto* name:{"ffn_gate.weight","ffn_up.weight","ffn_down.weight"}) matrix(p+name);
@@ -270,7 +276,7 @@ struct Qwen35::Impl {
         if(capture_prefix)for(const auto& t:tapes)if(t.states)live.push_back(*t.states);
         if(profiling) mx::eval(live);
         auto body_end=std::chrono::steady_clock::now();
-        auto logits=gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):linear(matrices.at("output.weight"),x);
+        auto logits=target_head && x.shape(0)<=5?q6_affine_matmul(*target_head,x):gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):linear(matrices.at("output.weight"),x);
         live.push_back(logits);
         mx::eval(live);
         auto end=std::chrono::steady_clock::now();
