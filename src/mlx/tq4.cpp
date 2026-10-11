@@ -5,6 +5,29 @@
 
 namespace tqllm::mlx_backend {
 namespace mx = mlx::core;
+Affine8Weights tq4_affine8(const Tq4Weights& w) {
+    if (!w.integer_levels || w.codes.ndim() != 2 || w.codes.dtype() != mx::uint8 ||
+        w.codes.shape(0) <= 0 || w.codes.shape(1) <= 0 || w.codes.shape(1) % 64 ||
+        w.scales.dtype() != mx::float16 ||
+        w.scales.shape() != mx::Shape{w.codes.shape(0), w.codes.shape(1) / 64})
+        throw std::invalid_argument("TQ4 affine expansion requires integer-level group128 weights");
+    const int r = w.codes.shape(0), k = w.codes.shape(1) * 2;
+    static auto expand = mx::fast::metal_kernel("tqllm_tq4_affine8", {"packed"}, {"codes"}, R"METAL(
+uint i=thread_position_in_grid.x;
+if(i>=R*K)return;
+uint row=i/K,col=i%K;
+uint code=(packed[row*(K/2u)+col/2u]>>(4u*(col%2u)))&15u;
+int level=int(L4[code&7u]);
+codes[i]=uchar(128+(code<8u?level:-level));
+)METAL", "constant uchar L4[8]={6,18,31,44,58,75,96,127};");
+    auto bytes = expand({w.codes}, {{r, k}}, {mx::uint8}, {r * k, 1, 1}, {256, 1, 1},
+        {{"R", r}, {"K", k}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    auto codes = mx::view(bytes, mx::uint32), scales = mx::astype(w.scales, mx::float32);
+    auto biases = mx::multiply(scales, mx::array(-128.0f));
+    auto half_scales = mx::astype(scales, mx::float16), half_biases = mx::astype(biases, mx::float16);
+    mx::eval(codes, scales, biases, half_scales, half_biases);
+    return {codes, scales, biases, half_scales, half_biases};
+}
 namespace {
 const char* source = R"METAL(
     constant float* values = INTEGER_LEVELS ? LVI : LV;

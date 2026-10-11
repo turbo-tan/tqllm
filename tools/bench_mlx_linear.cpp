@@ -34,8 +34,13 @@ int main(int argc, char** argv) {
         const int k = tensor.ne[0], rows = tensor.ne[1];
         auto weights = load_matrix(file, argv[2]);
         std::optional<Tq3Affine8> affine;
+        std::optional<Q6AffineSplit> q6_split;
+        if (std::getenv("TQLLM_MLX_Q6_AFFINE") && std::holds_alternative<Q6Weights>(weights))
+            q6_split = q6_affine_split(std::get<Q6Weights>(weights));
         std::optional<Tq3Expanded> expanded;
         if(auto w=std::get_if<Tq3Weights>(&weights)) {expanded=tq3_expand(*w);affine=tq3_affine8(*w);}
+        if (std::getenv("TQLLM_MLX_AFFINE_TQ4"))
+            if (auto w = std::get_if<Tq4Weights>(&weights)) affine = tq4_affine8(*w);
         auto dense = stage_bf16(weights);
         mx::eval(dense);
         const double unpack = measure([&] { return stage_bf16(weights); });
@@ -50,6 +55,16 @@ int main(int argc, char** argv) {
             mx::eval(half_input);
             const double rotation = measure([&] { return tq4_rotate(input); });
             const double compressed = measure([&] { return linear(weights, input); });
+            const double verify_ms = measure([&] { return verify_tiled(weights, input); });
+            double q6_affine_ms = -1, q6_affine_error = -1;
+            if (q6_split) {
+                auto expected = linear(weights, input), got = q6_affine_matmul(*q6_split, input);
+                q6_affine_error = mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got, expected))),
+                    mx::maximum(mx::sum(mx::square(expected)), mx::array(1e-20f)))).item<float>();
+                if (!std::isfinite(q6_affine_error) || q6_affine_error > 2e-5)
+                    throw std::runtime_error("Q6 affine projection drift exceeds FP32 gate");
+                q6_affine_ms = measure([&] { return q6_affine_matmul(*q6_split, input); });
+            }
             double int8_ms = -1, int8_error = -1;
             if (std::getenv("TQLLM_MLX_INT8_TILE") && std::holds_alternative<Tq3Weights>(weights)) {
                 const auto& w = std::get<Tq3Weights>(weights);
@@ -62,13 +77,16 @@ int main(int argc, char** argv) {
             }
             const double affine_ms = affine ? measure([&] { return tq3_affine8_matmul(*affine,tq4_rotate(input)); }) : 0;
             double affine_error=-1;
-            if(affine && std::getenv("MLX_ENABLE_TF32") && std::string(std::getenv("MLX_ENABLE_TF32"))=="1") {
+            if(affine && (std::getenv("TQLLM_MLX_AFFINE_TQ4") ||
+               (std::getenv("MLX_ENABLE_TF32") && std::string(std::getenv("MLX_ENABLE_TF32"))=="1"))) {
                 auto expected=linear(weights,input);
                 auto got=tq3_affine8_matmul(*affine,tq4_rotate(input));
                 affine_error=mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got,expected))),
                     mx::maximum(mx::sum(mx::square(expected)),mx::array(1e-20f)))).item<float>();
-                if(!std::isfinite(affine_error) || affine_error>1e-3)
-                    throw std::runtime_error("TF32 affine projection drift exceeds screen");
+                const bool rounded = std::getenv("TQLLM_MLX_AFFINE_HALF") ||
+                    (std::getenv("MLX_ENABLE_TF32") && std::string(std::getenv("MLX_ENABLE_TF32"))=="1");
+                if(!std::isfinite(affine_error) || affine_error>(rounded?1e-3:2e-5))
+                    throw std::runtime_error("affine projection drift exceeds precision gate");
             }
             const double decoded_tensor_ms = expanded && !std::getenv("TQLLM_MLX_TENSOR_MEMORY") ? measure([&] { return verify_expanded_tensorops(*expanded,input); }) : 0;
             const double decoded_ms = expanded ? measure([&] { return tq3_expanded_matmul(*expanded,tq4_rotate(input)); }) : 0;
@@ -90,6 +108,8 @@ int main(int argc, char** argv) {
                       << " rows=" << rows << " k=" << k << " m=" << m
                       << " rotate_ms=" << rotation << " unpack_ms=" << unpack
                       << " compressed_ms=" << compressed << " staged_ms=" << staged
+                      << " q6_affine_ms=" << q6_affine_ms << " q6_affine_rel_l2=" << q6_affine_error
+                      << " verify_tiled_ms=" << verify_ms
                       << " int8_tile_ms=" << int8_ms << " int8_tile_rel_l2=" << int8_error
                       << " affine8_ms=" << affine_ms << " affine8_rel_l2=" << affine_error << " decoded_tensor_ms=" << decoded_tensor_ms << " decoded_ms=" << decoded_ms << " tensorops_ms=" << tensorops << " tensorops_rel_l2=" << tensor_error << " resident_gemm_ms=" << gemm << std::endl;
         }

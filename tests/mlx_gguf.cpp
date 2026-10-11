@@ -75,9 +75,10 @@ int main(int argc,char** argv) {
     const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
     const bool int8_tiles=argc==3 && std::string(argv[2])=="--int8-tiles";
     const bool q6_affine=argc==3 && std::string(argv[2])=="--q6-affine";
+    const bool affine_tq4=argc==3 && std::string(argv[2])=="--affine-tq4";
     const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
     const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
-    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32 && !int8_tiles && !q6_affine) return 2;
+    if(argc==3 && !prefill && !verify_tiles && !vector_load && !tensorops && !tensorops_half && !expanded && !affine8 && !expanded_half && !affine_half && !affine_gu && !affine_tf32 && !int8_tiles && !q6_affine && !affine_tq4) return 2;
     if(affine_tf32 && (!std::getenv("MLX_ENABLE_TF32") || std::string(std::getenv("MLX_ENABLE_TF32"))!="1" ||
        std::getenv("TQLLM_MLX_AFFINE_HALF")))
         throw std::invalid_argument("TF32 screen requires MLX_ENABLE_TF32=1 and FP32 affine inputs");
@@ -107,6 +108,14 @@ int main(int argc,char** argv) {
             std::optional<Q6AffineSplit> q6_split;
             if (q6_affine && t.type == GGML_Q6_K) q6_split = q6_affine_split(std::get<Q6Weights>(matrix));
             std::optional<Tq3Affine8> affine;
+            if (affine_tq4 && t.type == GGML_TQ4) {
+                affine = tq4_affine8(std::get<Tq4Weights>(matrix));
+                auto decoded = mx::dequantize(affine->codes, affine->scales, affine->biases, 128, 8, "affine");
+                mx::eval(decoded);
+                for (size_t j = 0; j < w.size(); ++j)
+                    if (decoded.data<float>()[j] != w[j]) throw std::runtime_error("affine8 changed TQ4 weight");
+                std::cout << "GGUF_TQ4_AFFINE_WEIGHT_EXACT tensor=" << name << '\n';
+            }
             if((affine8 || affine_half || affine_gu || affine_tf32) && t.type==GGML_TQ3) {
                 affine=tq3_affine8(std::get<Tq3Weights>(matrix));
                 auto decoded=mx::dequantize(affine->codes,affine->scales,affine->biases,128,8,"affine");

@@ -78,8 +78,7 @@ Tq3Affine8 tq3_affine8_join(const Tq3Affine8& gate,const Tq3Affine8& up) {
     mx::eval(joined.codes,joined.scales,joined.biases,joined.half_scales,joined.half_biases);
     return joined;
 }
-mx::array tq3_affine8_matmul(const Tq3Affine8& weights,const mx::array& x) {
-    const bool half=std::getenv("TQLLM_MLX_AFFINE_HALF")!=nullptr && x.shape(0)<=8;
+mx::array affine8_matmul(const Affine8Weights& weights,const mx::array& x,bool half) {
     auto input=half?mx::astype(x,mx::float16):x;
     const auto& scales=half?weights.half_scales:weights.scales;
     const auto& biases=half?weights.half_biases:weights.biases;
@@ -89,6 +88,9 @@ mx::array tq3_affine8_matmul(const Tq3Affine8& weights,const mx::array& x) {
         return mx::astype(mx::slice(result,{0,0},{x.shape(0),weights.codes.shape(0)}),mx::float32);
     }
     return mx::astype(mx::quantized_matmul(input,weights.codes,scales,biases,true,128,8,"affine"),mx::float32);
+}
+mx::array tq3_affine8_matmul(const Tq3Affine8& weights,const mx::array& x) {
+    return affine8_matmul(weights,x,std::getenv("TQLLM_MLX_AFFINE_HALF")!=nullptr && x.shape(0)<=8);
 }
 
 }

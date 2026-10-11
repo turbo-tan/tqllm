@@ -319,6 +319,33 @@ int main() {
             std::copy_n(codes.data() + b * 64, 64, blocks.data() + b * 66 + 2);
         }
         auto loaded = tqllm::mlx_backend::load_tq4_blocks(blocks, rows, k);
+        if (std::getenv("TQLLM_MLX_AFFINE_TQ4")) {
+            auto affine = tqllm::mlx_backend::tq4_affine8(loaded);
+            auto decoded = mx::dequantize(affine.codes, affine.scales, affine.biases, 128, 8, "affine");
+            mx::eval(decoded);
+            for (int row = 0; row < rows; ++row) for (int j = 0; j < k; ++j) {
+                int code = (codes[row*k/2+j/2] >> ((j&1)*4)) & 15;
+                if (decoded.data<float>()[row*k+j] != float(levels[code]) * 0.125f)
+                    throw std::runtime_error("affine expansion changed TQ4 weights");
+            }
+            for (int m : {1, 3, 5, 8, 17}) {
+                std::vector<float> input(size_t(m)*k);
+                for (size_t j = 0; j < input.size(); ++j) input[j] = std::sin(float(j)*.09f);
+                auto x = mx::array(input.data(), {m,k});
+                auto expected = tq4_matmul(loaded, x);
+                auto got = tqllm::mlx_backend::tq3_affine8_matmul(affine, x);
+                float error = mx::sqrt(mx::divide(mx::sum(mx::square(mx::subtract(got,expected))),
+                    mx::maximum(mx::sum(mx::square(expected)),mx::array(1e-20f)))).item<float>();
+                if (!std::isfinite(error) || error > 2e-5f)
+                    throw std::runtime_error("TQ4 affine FP32 projection failed");
+            }
+            auto legacy = loaded; legacy.integer_levels = false;
+            bool rejected = false;
+            try { tqllm::mlx_backend::tq4_affine8(legacy); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) throw std::runtime_error("legacy noninteger TQ4 expansion accepted");
+            std::cout << "TQ4_AFFINE_WEIGHT_EXACT projection_fp32_pass=1 tails=17\n";
+        }
         auto same_codes = mx::all(mx::equal(loaded.codes, c));
         auto same_scales = mx::all(mx::equal(loaded.scales, s));
         if (!same_codes.item<bool>() || !same_scales.item<bool>()) return 5;

@@ -2,6 +2,7 @@
 #include <mlx/mlx.h>
 #include <span>
 #include <cstdint>
+#include "affine8.hpp"
 
 namespace tqllm::mlx_backend {
 struct Tq3Weights {
@@ -15,9 +16,7 @@ struct Tq3Expanded {
     mlx::core::array values;
     mlx::core::array scales;
 };
-struct Tq3Affine8 {
-    mlx::core::array codes,scales,biases,half_scales,half_biases;
-};
+using Tq3Affine8 = Affine8Weights;
 Tq3Affine8 tq3_affine8(const Tq3Weights& weights);
 Tq3Affine8 tq3_affine8_join(const Tq3Affine8& gate,const Tq3Affine8& up);
 mlx::core::array tq3_affine8_matmul(const Tq3Affine8& weights,const mlx::core::array& rotated_input);

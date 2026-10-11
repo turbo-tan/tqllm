@@ -44,6 +44,9 @@ struct Qwen35::Impl {
     std::map<std::string,Tq3Affine8> affine_ffn;
     std::map<std::string,Tq3Affine8> affine_gu;
     bool joined_gu=std::getenv("TQLLM_MLX_AFFINE_GU")!=nullptr;
+    bool affine_tq4=std::getenv("TQLLM_MLX_AFFINE_TQ4")!=nullptr;
+    bool affine_tq4_fp32=std::getenv("TQLLM_MLX_AFFINE_TQ4_FP32")!=nullptr;
+    bool affine_mixer=std::getenv("TQLLM_MLX_AFFINE_MIXER")!=nullptr;
     std::optional<std::pair<mx::array,mx::array>> rotation;
     bool reuse_rotation=std::getenv("TQLLM_MLX_REUSE_ROTATION")!=nullptr;
     std::map<std::string,mx::array> plain;
@@ -119,6 +122,10 @@ struct Qwen35::Impl {
             },w);
             if((std::getenv("TQLLM_MLX_AFFINE_FFN") || joined_gu) && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq3Weights>(&w))affine_ffn.emplace(name,tq3_affine8(*packed));
+            if(affine_tq4 && name.find(".ffn_")!=std::string::npos)
+                if(auto packed=std::get_if<Tq4Weights>(&w))affine_ffn.emplace(name,tq4_affine8(*packed));
+            if(affine_mixer && (name.find(".attn_")!=std::string::npos || name.ends_with(".ssm_out.weight")))
+                if(auto packed=std::get_if<Tq3Weights>(&w))affine_ffn.emplace(name,tq3_affine8(*packed));
             if(std::getenv("TQLLM_MLX_DECODED_FFN") && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq3Weights>(&w))decoded_ffn.emplace(name,tq3_expand(*packed));
             matrices.emplace(name,std::move(w));
@@ -165,8 +172,11 @@ struct Qwen35::Impl {
             return value;
         };
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
-            if(auto found=affine_ffn.find(name);found!=affine_ffn.end())
-                return bf(tq3_affine8_matmul(found->second,rotated()));
+            if(auto found=affine_ffn.find(name);found!=affine_ffn.end()) {
+                const bool fp32=(affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(w)) ||
+                    (affine_mixer && name.find(".ffn_")==std::string::npos);
+                return bf(fp32?affine8_matmul(found->second,rotated(),false):tq3_affine8_matmul(found->second,rotated()));
+            }
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=decoded_ffn.find(name);found!=decoded_ffn.end())
                 return bf(tq3_expanded_matmul(found->second,rotated()));
@@ -181,7 +191,8 @@ struct Qwen35::Impl {
     std::pair<mx::array,mx::array> gate_up(const std::string& p,const mx::array& x) {
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=affine_gu.find(p);found!=affine_gu.end()) {
-                auto gu=tq3_affine8_matmul(found->second,tq4_rotate(x));
+                const bool fp32=affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(matrices.at(p+"ffn_gate.weight"));
+                auto gu=fp32?affine8_matmul(found->second,tq4_rotate(x),false):tq3_affine8_matmul(found->second,tq4_rotate(x));
                 const int rows=gu.shape(1)/2;
                 return {bf(tail_slice(gu,1,0,rows)),bf(tail_slice(gu,1,rows,2*rows))};
             }
