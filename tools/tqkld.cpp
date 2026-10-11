@@ -93,7 +93,7 @@ std::pair<double, float> kld_token(int n_vocab, const float * logits, const uint
 }
 
 int llama_base_mode(const std::string & model_path, const std::string & tok_path, const std::string & base, int block,
-                    int max_chunks) {
+                    int max_chunks, bool prefill) {
     std::ifstream in(base, std::ios::binary);
     char check[9] = {};
     in.read(check, 8);
@@ -131,7 +131,10 @@ int llama_base_mode(const std::string & model_path, const std::string & tok_path
     std::printf("chunk  KLD (running mean)  same top\n");
     for (int c = 0; c < n_chunk; ++c) {
         const int32_t * tk = tokens.data() + size_t(c) * n_ctx;  // Qwen vocabularies add no BOS (llama.cpp add_bos false)
-        for (int pos = 0; pos < int(n_ctx) - 1; pos += B) {
+        // --llama-prefill: the unscored first half goes through the chunked prefill path (its GEMM shapes the scored KV)
+        if (prefill && !model.prefill_state(std::vector<uint32_t>(tk, tk + first), 0))
+            throw std::runtime_error("--llama-prefill needs a model with chunked prefill");
+        for (int pos = prefill ? first : 0; pos < int(n_ctx) - 1; pos += B) {
             const int n = std::min(B, int(n_ctx) - 1 - pos);
             std::vector<uint32_t> blk(tk + pos, tk + pos + n), next;
             model.verify(blk, uint32_t(pos), next);
@@ -261,6 +264,7 @@ int main(int argc, char ** argv) {
     std::string model_path, tok_path, ref, out;
     std::string llama_base, dump_ref;
     int skip = 16, block = 8, max_chunks = 0, tail = 0;
+    bool llama_prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -275,6 +279,7 @@ int main(int argc, char ** argv) {
         else if (a == "--block") block = std::stoi(val());  // verify block, 1..8
         else if (a == "--chunks") max_chunks = std::stoi(val());
         else if (a == "--llama-base") llama_base = val();
+        else if (a == "--llama-prefill") llama_prefill = true;
         else if (a == "--dump-ref") dump_ref = val();
         else if (a == "--tail") tail = std::stoi(val());  // long context: prefill each chunk without the head, score only its last N positions  // write this model's own top-K reference (same format) into DIR  // llama.cpp-standard KLD against a --kl-divergence-base file
         else if (tqllm::parse_engine_option(argc, argv, i, kld_engine())) continue;
@@ -283,7 +288,7 @@ int main(int argc, char ** argv) {
     tok_path = tqllm::tokenizer_for(model_path, tok_path);
     if (!llama_base.empty() && !model_path.empty() && !tok_path.empty()) {
         try {
-            return llama_base_mode(model_path, tok_path, llama_base, block, max_chunks);
+            return llama_base_mode(model_path, tok_path, llama_base, block, max_chunks, llama_prefill);
         } catch (const std::exception & e) {
             std::cerr << "tqkld: " << e.what() << "\n";
             return 1;
