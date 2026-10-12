@@ -19,6 +19,8 @@ mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
     bool full_precision = false,
     const std::optional<mlx::core::array>& expanded = std::nullopt, int simdgroups = 1);
+mlx::core::array tq_register_matmul(const TqTiledWeights& weights,
+    const mlx::core::array& input, int splits = 4);
 // Lossless int8 code levels, packed four per word in output-coalesced order.
 mlx::core::array tq_expand_tiled_codes(const TqTiledWeights& weights);
 // Integer codes stay exact in FP16; high/residual input rows share one tile.
