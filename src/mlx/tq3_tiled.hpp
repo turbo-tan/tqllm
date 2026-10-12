@@ -11,5 +11,5 @@ struct Tq3TiledWeights {
 Tq3TiledWeights tq3_tile(const Tq3Weights& weights);
 // Input is already rotated. FP16 operands and FP32 accumulation are explicit.
 mlx::core::array tq3_tiled_matmul(const Tq3TiledWeights& weights,
-    const mlx::core::array& input, int splits = 1, bool prefetch = true);
+    const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32);
 }
