@@ -184,7 +184,8 @@ static void bench(const GgufFile& file, const std::string& name) {
 }
 int main(int argc, char** argv) {
     try {
-        if (argc != 1 && argc != 2) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf]");
+        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only]]");
+        if (argc == 3 && std::string(argv[2]) != "--cpu-only") throw std::invalid_argument("unknown test option");
         // Cancellation fixtures validate the stated FP16 contract, while reporting original FP32 drift.
         for (int rows : {1, 17, 33, 64}) for (int k : {128, 512})
             check_projection(fixture(rows, k), rows, k, false);
@@ -207,12 +208,13 @@ int main(int argc, char** argv) {
         catch (const std::invalid_argument&) { caught = true; }
         if (!caught) throw std::runtime_error("unsupported verifier width accepted");
         std::cout << "TILED_LAYOUT_AND_SYNTHETIC_PASS" << std::endl;
-        if (argc == 2) {
+        if (argc >= 2) {
             auto file = gguf_open(argv[1]);
             std::vector<std::string> names;
             for (const auto& [name, t] : file.tensors)
                 if ((t.type == GGML_TQ3 || t.type == GGML_TQ4) && t.ne.size() == 2 &&
-                    name.find(".ffn_") != std::string::npos && t.ne[0] * t.ne[1] > 50000000) {
+                    (name.ends_with(".ffn_gate.weight") || name.ends_with(".ffn_down.weight")) &&
+                    t.ne[0] * t.ne[1] > 1000000) {
                     bool seen = false;
                     for (const auto& n : names)
                         if (file.tensors.at(n).ne[0] == t.ne[0] && file.tensors.at(n).type == t.type) seen = true;
@@ -225,7 +227,7 @@ int main(int argc, char** argv) {
                     t.type == GGML_TQ3 ? 3 : 4);
             }
             std::cout << "TILED_REAL_CPU_GATE_PASS" << std::endl;
-            for (const auto& name : names) bench(file, name);
+            if (argc == 2) for (const auto& name : names) bench(file, name);
         }
         std::cout << "TILED_SCREEN_COMPLETE" << std::endl;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
