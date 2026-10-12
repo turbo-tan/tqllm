@@ -172,7 +172,7 @@ constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
-mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool integer_operand) {
+mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool integer_operand, bool packed_cache) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
         (w.bits != 3 && w.bits != 4) || (w.bits == 3 && !w.integer_levels) ||
@@ -190,6 +190,8 @@ mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, in
     static auto kernel = mx::fast::metal_kernel("tqllm_register_decoded_tq",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
 uint tile = threadgroup_position_in_grid.y, part = threadgroup_position_in_grid.z;
+uint lane = thread_position_in_threadgroup.x;
+threadgroup uint payload[(BK / 32) * BITS * 32];
 tensor<device float, dextents<int, 2>, tensor_inline> inputs(
     (device float*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
 constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, false, false,
@@ -203,6 +205,13 @@ for (uint i = 0; i < accumulator.get_capacity(); ++i)
     if (accumulator.is_valid_element(i)) { accumulator[i] = 0.0f; scaled_sum[i] = 0.0f; }
 uint begin = part * (K / BK / SPLITS), end = (part + 1u) * (K / BK / SPLITS);
 for (uint block = begin; block < end; ++block) {
+    if (PACKED_CACHE) {
+        for (uint g = 0; g < BK/32u; ++g) for (uint plane = 0; plane < BITS; ++plane) {
+            ulong at = (ulong(tile) * (K / 32u) + block * (BK/32u) + g) * (32u * BITS) + plane * 32u + lane;
+            payload[(g * BITS + plane) * 32u + lane] = planes[at];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (INTEGER_OPERAND) for (uint i = 0; i < accumulator.get_capacity(); ++i)
         if (accumulator.is_valid_element(i)) accumulator[i] = 0.0f;
     #pragma clang loop unroll(full)
@@ -211,15 +220,18 @@ for (uint block = begin; block < end; ++block) {
         auto position = weights.get_multidimensional_index(i);
         uint row = uint(position[0]), column = block * BK + uint(position[1]), j = column % 32u;
         ulong at = (ulong(tile) * (K / 32u) + column / 32u) * (32u * BITS) + row;
+        uint cached = ((uint(position[1]) / 32u) * BITS) * 32u + row;
         float level;
         if (BITS == 3) {
-            uint ranks = planes[at + (j / 16u) * 32u];
+            uint ranks = PACKED_CACHE ? payload[cached + (j / 16u) * 32u] : planes[at + (j / 16u) * 32u];
             uint rank = (ranks >> (4u * (j % 8u) + 2u * ((j % 16u) / 8u))) & 3u;
-            uint sign = (planes[at + 64u] >> (4u * (j % 8u) + j / 8u)) & 1u;
+            uint signs = PACKED_CACHE ? payload[cached + 64u] : planes[at + 64u];
+            uint sign = (signs >> (4u * (j % 8u) + j / 8u)) & 1u;
             int magnitude = int((0x7f4f2d0eu >> (rank * 8u)) & 255u);
             level = float(sign ? -magnitude : magnitude);
         } else {
-            uint code = (planes[at + (j / 8u) * 32u] >> (4u * (j % 8u))) & 15u;
+            uint word = PACKED_CACHE ? payload[cached + (j / 8u) * 32u] : planes[at + (j / 8u) * 32u];
+            uint code = (word >> (4u * (j % 8u))) & 15u;
             level = INTEGER_LEVELS ? LEVELI[code] : LEVELF[code];
         }
         ulong scale_at = (ulong(tile) * (K / 128u) + column / 128u) * 32u + row;
@@ -251,7 +263,7 @@ constant float LEVELF[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
         {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels},
          {"BK", integer_operand ? 128 : 32}, {"Code", integer_operand ? mx::int8 : mx::float32},
-         {"INTEGER_OPERAND", integer_operand}},
+         {"INTEGER_OPERAND", integer_operand}, {"PACKED_CACHE", packed_cache}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
