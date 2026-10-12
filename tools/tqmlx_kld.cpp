@@ -25,6 +25,7 @@ int main(int argc,char** argv) {
             return value?std::optional<std::string>(value):std::nullopt;
         };
         const auto subgroup=setting("TQLLM_MLX_TQ3_SUBGROUP"),columns=setting("TQLLM_MLX_MATMUL_COLS");
+        const auto tiled_tq3=setting("TQLLM_MLX_TILED_TQ3_FP16");
         if(kernel_verification && (!subgroup || *subgroup!="8"))
             throw std::invalid_argument("kernel verification requires the subgroup8 candidate");
         if(argc==5 && !verification)throw std::invalid_argument("unknown accuracy mode");
@@ -42,6 +43,7 @@ int main(int argc,char** argv) {
             const auto* input=tokens.data()+size_t(chunk)*rows;
             if(kernel_verification) {
                 unsetenv("TQLLM_MLX_TQ3_SUBGROUP");unsetenv("TQLLM_MLX_MATMUL_COLS");
+                unsetenv("TQLLM_MLX_TILED_TQ3_FP16");
             }
             engine.reset();engine.gdn_mode(verification?Qwen35::GdnMode::scan:Qwen35::GdnMode::baseline);
             engine.verify_tiles(!verification);
@@ -55,6 +57,7 @@ int main(int argc,char** argv) {
                 setenv("TQLLM_MLX_TQ3_SUBGROUP",subgroup->c_str(),1);
                 if(columns)setenv("TQLLM_MLX_MATMUL_COLS",columns->c_str(),1);
                 else unsetenv("TQLLM_MLX_MATMUL_COLS");
+                if(tiled_tq3)setenv("TQLLM_MLX_TILED_TQ3_FP16",tiled_tq3->c_str(),1);
             }
             engine.reset();engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
             double kl_sum=0,ppl_sum=0;int same=0;
@@ -83,14 +86,14 @@ int main(int argc,char** argv) {
             total_same+=same;chunk_kld.push_back(kl_sum/rows);chunk_ppl.push_back(ppl_sum/rows);
             std::cout<<"{\"kind\":\""<<(kernel_verification?"same_file_kernel_verify_screen":verification?"same_file_verify_screen":"same_file_gdn_screen")<<"\",\"chunk\":"<<chunk<<",\"rows\":"<<rows
                      <<",\"reference_batch\":"<<reference_batch
-                     <<",\"captures_prefix\":"<<kernel_verification
+                     <<",\"candidate_fp16_tq3\":"<<bool(tiled_tq3)<<",\"captures_prefix\":"<<kernel_verification
                      <<",\"batch\":"<<batch<<",\"mean_kld\":"<<kl_sum/rows<<",\"ln_ppl_ratio\":"<<ppl_sum/rows
                      <<",\"top1_same\":"<<same<<",\"active_bytes\":"<<mx::get_active_memory()<<"}"<<std::endl;
         }
         auto mean=[](const auto& x){return std::accumulate(x.begin(),x.end(),0.0)/x.size();};
         auto se=[&](const auto& x) {if(x.size()<2)return 0.0;double ss=0,m=mean(x);for(double a:x)ss+=(a-m)*(a-m);return std::sqrt(ss/(x.size()*(x.size()-1)));};
         std::cout<<"{\"kind\":\""<<(kernel_verification?"same_file_kernel_verify_summary":verification?"same_file_verify_summary":"same_file_gdn_summary")<<"\",\"chunks\":"<<chunks<<",\"rows_per_chunk\":"<<rows
-                 <<",\"mean_kld\":"<<mean(chunk_kld)<<",\"kld_chunk_se\":"<<se(chunk_kld)
+                 <<",\"candidate_fp16_tq3\":"<<bool(tiled_tq3)<<",\"mean_kld\":"<<mean(chunk_kld)<<",\"kld_chunk_se\":"<<se(chunk_kld)
                  <<",\"ln_ppl_ratio\":"<<mean(chunk_ppl)<<",\"ppl_chunk_se\":"<<se(chunk_ppl)
                  <<",\"top1_same\":"<<total_same<<"}"<<std::endl;
     } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
