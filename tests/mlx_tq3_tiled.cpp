@@ -211,7 +211,8 @@ int main(int argc, char** argv) {
             auto file = gguf_open(argv[1]);
             std::vector<std::string> names;
             for (const auto& [name, t] : file.tensors)
-                if ((t.type == GGML_TQ3 || t.type == GGML_TQ4) && t.ne.size() == 2 && t.ne[0] * t.ne[1] > 50000000) {
+                if ((t.type == GGML_TQ3 || t.type == GGML_TQ4) && t.ne.size() == 2 &&
+                    name.find(".ffn_") != std::string::npos && t.ne[0] * t.ne[1] > 50000000) {
                     bool seen = false;
                     for (const auto& n : names)
                         if (file.tensors.at(n).ne[0] == t.ne[0] && file.tensors.at(n).type == t.type) seen = true;
