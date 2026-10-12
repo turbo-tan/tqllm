@@ -60,6 +60,7 @@ struct Qwen35::Impl {
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
     bool serial_verify_attention=std::getenv("TQLLM_MLX_SERIAL_VERIFY_ATTENTION")!=nullptr;
+    bool attention_kv_views=std::getenv("TQLLM_MLX_ATTENTION_KV_VIEWS")!=nullptr;
     bool serial_verify_dense=std::getenv("TQLLM_MLX_SERIAL_VERIFY_DENSE")!=nullptr;
     std::optional<mx::array> last_hidden;
     std::optional<mx::array> last_features;
@@ -273,7 +274,7 @@ struct Qwen35::Impl {
         q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
         c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
         c.values=c.values?mx::concatenate({*c.values,v},2):v;
-        auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix);
+        auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         out=bf(mx::multiply(bf(out),bf(mx::sigmoid(gate))));
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
