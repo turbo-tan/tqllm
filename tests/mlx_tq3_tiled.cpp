@@ -82,7 +82,7 @@ static double rel_l2(const mx::array& a, const mx::array& b) {
     return std::sqrt(error / std::max(norm, 1e-30));
 }
 static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, bool original_gate,
-    int bits = 3, bool integer_levels = true, bool compensated = false, bool expanded_screen = false) {
+    int bits = 3, bool integer_levels = true, bool compensated = false, bool expanded_screen = false, bool cooperative_screen = false) {
     auto prepare = [&] {
         if (bits == 3) return tq3_tile(load_tq3_blocks(raw, rows, k));
         auto w = load_tq4_blocks(raw, rows, k); w.integer_levels = integer_levels;
@@ -132,6 +132,24 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
         rounded[size_t(m) * rows + r] = float(half_sum);
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
+    if (cooperative_screen) {
+        for (int split : {1, 2, 4}) {
+            if (k % (128 * split)) continue;
+            auto reference = tq_tiled_matmul(tiled, x, split, true, 32, true, std::nullopt, 4);
+            const double error = rel_l2(reference, full);
+            if (!std::isfinite(error) || error > 2e-5)
+                throw std::runtime_error("cooperative projection failed original CPU oracle");
+            for (int width : {1, 3, 5, 8}) for (bool prefetch : {false, true}) {
+                auto got = tq_tiled_matmul(tiled, mx::array(values.data(), {width, k}), split, prefetch, 32, true, std::nullopt, 4);
+                mx::eval(got);
+                if (std::memcmp(got.data<float>(), reference.data<float>(), size_t(width) * rows * sizeof(float)))
+                    throw std::runtime_error("cooperative projection changed with width or prefetch");
+            }
+            std::cout << "COOPERATIVE_ORACLE_PASS bits=" << bits << " rows=" << rows << " k=" << k
+                      << " splits=" << split << " original_cpu_rel_l2=" << error << std::endl;
+        }
+        return;
+    }
     if (expanded_screen) {
         auto expanded = tq_expand_tiled_codes(tiled); mx::eval(expanded);
         const auto* words = expanded.data<uint32_t>();
@@ -254,7 +272,7 @@ static void bench(const GgufFile& file, const std::string& name, bool one_point 
         }
     }
 }
-static void bench_compensated(const GgufFile& file, const std::string& name, bool expanded_screen = false) {
+static void bench_compensated(const GgufFile& file, const std::string& name, bool expanded_screen = false, bool cooperative_screen = false) {
     const auto& tensor = file.tensors.at(name);
     auto data = file.read(tensor);
     std::vector<uint8_t> raw(data.begin(), data.end());
@@ -265,11 +283,12 @@ static void bench_compensated(const GgufFile& file, const std::string& name, boo
     std::optional<mx::array> expanded;
     if (expanded_screen) { expanded = tq_expand_tiled_codes(weights); mx::eval(*expanded); }
     for (int width : {1, 8}) for (int tile_k : {32, 128}) {
-        if (expanded_screen && tile_k != 32) continue;
+        if ((expanded_screen || cooperative_screen) && tile_k != 32) continue;
         auto values = inputs(width, weights.columns);
         auto x = mx::array(values.data(), {width, weights.columns}); mx::eval(x);
         auto baseline = [&] { return tq_tiled_matmul(weights, x, 4, true, 32, true); };
-        auto candidate = [&] { return expanded_screen ?
+        auto candidate = [&] { return cooperative_screen ?
+            tq_tiled_matmul(weights, x, 4, true, 32, true, std::nullopt, 4) : expanded_screen ?
             tq_tiled_matmul(weights, x, 4, true, 32, true, expanded) :
             tq_compensated_matmul(weights, x, 4, tile_k); };
         const double error = rel_l2(candidate(), baseline());
@@ -280,7 +299,7 @@ static void bench_compensated(const GgufFile& file, const std::string& name, boo
             const double elapsed = comp ? measure(candidate) : measure(baseline);
             std::cout << "COMPENSATED_BENCH tensor=" << name << " rows=" << weights.rows
                       << " k=" << weights.columns << " width=" << width << " arm=" << arm
-                      << " expanded=" << expanded_screen << " expanded_bytes=" << (expanded ? expanded->nbytes() : 0)
+                      << " cooperative=" << cooperative_screen << " expanded=" << expanded_screen << " expanded_bytes=" << (expanded ? expanded->nbytes() : 0)
                       << " tile_k=" << tile_k << " compensated=" << comp << " elapsed_ms=" << elapsed
                       << " fp32_baseline_rel_l2=" << error << std::endl;
         }
@@ -288,13 +307,14 @@ static void bench_compensated(const GgufFile& file, const std::string& name, boo
 }
 int main(int argc, char** argv) {
     try {
-        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu|--compensated|--expanded]]");
+        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu|--compensated|--expanded|--cooperative]]");
         if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point" &&
-            std::string(argv[2]) != "--mixer-cpu" && std::string(argv[2]) != "--compensated" && std::string(argv[2]) != "--expanded")
+            std::string(argv[2]) != "--mixer-cpu" && std::string(argv[2]) != "--compensated" && std::string(argv[2]) != "--expanded" && std::string(argv[2]) != "--cooperative")
             throw std::invalid_argument("unknown test option");
         const bool compensated = argc == 3 && std::string(argv[2]) == "--compensated";
         const bool expanded_screen = argc == 3 && std::string(argv[2]) == "--expanded";
-        if (compensated || expanded_screen) {
+        const bool cooperative_screen = argc == 3 && std::string(argv[2]) == "--cooperative";
+        if (compensated || expanded_screen || cooperative_screen) {
             for (int bits : {3, 4}) for (int rows : {1, 17, 33, 64}) for (int k : {128, 512}) {
                 auto raw = fixture(rows, k, bits);
                 const int stride = bits == 3 ? 50 : 66;
@@ -306,7 +326,7 @@ int main(int argc, char** argv) {
                         raw[at] = uint8_t(scale); raw[at + 1] = uint8_t(scale >> 8);
                     }
                 }
-                check_projection(raw, rows, k, false, bits, true, compensated, expanded_screen);
+                check_projection(raw, rows, k, false, bits, true, compensated, expanded_screen, cooperative_screen);
             }
             auto tiled = tq3_tile(load_tq3_blocks(fixture(1, 512), 1, 512));
             for (int bad = 0; bad < 5; ++bad) {
@@ -368,12 +388,12 @@ int main(int argc, char** argv) {
             for (const auto& name : names) {
                 auto t = file.tensors.at(name); t.bytes = t.bytes / t.ne[1] * 33; t.ne[1] = 33;
                 auto raw = file.read(t); check_projection({raw.begin(), raw.end()}, 33, int(t.ne[0]), true,
-                    t.type == GGML_TQ3 ? 3 : 4, true, compensated, expanded_screen);
+                    t.type == GGML_TQ3 ? 3 : 4, true, compensated, expanded_screen, cooperative_screen);
             }
             std::cout << "TILED_REAL_CPU_GATE_PASS" << std::endl;
-            if (compensated || expanded_screen) {
-                for (const auto& name : names) bench_compensated(file, name, expanded_screen);
-                std::cout << (expanded_screen ? "EXPANDED_SCREEN_COMPLETE" : "COMPENSATED_SCREEN_COMPLETE") << std::endl;
+            if (compensated || expanded_screen || cooperative_screen) {
+                for (const auto& name : names) bench_compensated(file, name, expanded_screen, cooperative_screen);
+                std::cout << (cooperative_screen ? "COOPERATIVE_SCREEN_COMPLETE" : expanded_screen ? "EXPANDED_SCREEN_COMPLETE" : "COMPENSATED_SCREEN_COMPLETE") << std::endl;
             }
             if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--one-point"))
                 for (const auto& name : names) bench(file, name, argc == 3);
