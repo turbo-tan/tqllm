@@ -275,11 +275,20 @@ static void test_tq3() {
         }
         std::cout<<"TENSOR_MEMORY_LAYOUT_PASS planar=1 interleaved=1 row_tail=17 column_tail=17\n";
     }
-    for (int m : {1, 8, 64}) {
+    for (int m : {1, 2, 3, 5, 8, 17, 64}) {
         std::vector<float> x(m*k);
         for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i)*0.09f);
         auto out = tqllm::mlx_backend::tq3_matmul(weights, mx::array(x.data(), {m,k}));
         mx::eval(out);
+        if (std::getenv("TQLLM_MLX_TQ3_SUBGROUP")) {
+            for (int col=0;col<m;++col) {
+                auto one=tqllm::mlx_backend::tq3_matmul(weights,mx::array(x.data()+size_t(col)*k,{1,k}));
+                mx::eval(one);
+                for (int row=0;row<rows;++row)
+                    if (std::bit_cast<uint32_t>(one.data<float>()[row])!=std::bit_cast<uint32_t>(out.data<float>()[col*rows+row]))
+                        throw std::runtime_error("TQ3 subgroup changed reduction with column count");
+            }
+        }
         for (int a = 0; a < m; ++a)
             for (int r = 0; r < rows; ++r) {
                 double expected = 0;

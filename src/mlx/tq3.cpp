@@ -47,12 +47,14 @@ mx::array tq3_matmul(const Tq3Weights& w, const mx::array& x) {
         throw std::invalid_argument("incompatible TQ3 matrix shapes");
     static auto kernel = mx::fast::metal_kernel("tqllm_tq3_matmul", {"planes", "scales", "x"}, {"y"}, R"METAL(
 uint lane = thread_position_in_threadgroup.x;
-uint row = threadgroup_position_in_grid.y * threads_per_threadgroup.y + thread_position_in_threadgroup.y;
+uint klane = lane % KLANES;
+uint rows_per_simd = 32u / KLANES;
+uint row = (threadgroup_position_in_grid.y * threads_per_threadgroup.y + thread_position_in_threadgroup.y) * rows_per_simd + lane / KLANES;
 uint col = threadgroup_position_in_grid.z * MCOLS;
 if (row >= R) return;
 float acc[MCOLS];
 for(uint m=0;m<MCOLS;++m)acc[m]=0.0f;
-for (uint b = lane; b < K/32; b += 32) {
+for (uint b = klane; b < K/32; b += KLANES) {
  uint a0,a1,sg;
  if(INTERLEAVED) {
   uint4 record=((const device uint4*)planes)[row*(K/32)+b];
@@ -107,15 +109,28 @@ for (uint b = lane; b < K/32; b += 32) {
 }
 for (uint m = 0; m < MCOLS; ++m) {
  if (col+m >= M) break;
- float value = simd_sum(acc[m]);
- if (lane == 0) y[(col+m)*R+row] = value;
+ float value = acc[m];
+ if (KLANES == 32) value = simd_sum(value);
+ else {
+  value += simd_shuffle_down(value, 4);
+  value += simd_shuffle_down(value, 2);
+  value += simd_shuffle_down(value, 1);
+ }
+ if (klane == 0) y[(col+m)*R+row] = value;
 }
 )METAL", "inline float tq3_level(uint rank,uint sign) { int value=int((0x7f4f2d0eu>>(rank*8u))&255u); return float(sign?-value:value); }");
     const int cols=matmul_columns(m);
     const int simds=matmul_simds();
+    int klanes=32;
+    if (const char* option=std::getenv("TQLLM_MLX_TQ3_SUBGROUP")) {
+        if (std::string_view(option)!="8")
+            throw std::invalid_argument("TQLLM_MLX_TQ3_SUBGROUP must be 8");
+        klanes=8;
+    }
+    const int rows_per_group=simds*32/klanes;
     return kernel({w.planes, w.scales, x}, {{m, rows}}, {mx::float32},
-                  {32, (rows + simds - 1) / simds * simds, (m + cols - 1) / cols}, {32, simds, 1},
-                  {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"INTERLEAVED",w.interleaved},
+                  {32, (rows + rows_per_group - 1) / rows_per_group * simds, (m + cols - 1) / cols}, {32, simds, 1},
+                  {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"KLANES", klanes}, {"INTERLEAVED",w.interleaved},
                    {"STREAMING",std::getenv("TQLLM_MLX_TQ3_STREAM")!=nullptr}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 }
