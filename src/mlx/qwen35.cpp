@@ -275,12 +275,13 @@ struct Qwen35::Impl {
     }
     mx::array norm(const mx::array& x,const std::string& name) {return bf(mx::fast::rms_norm(x,plain.at(name),eps));}
     std::optional<mx::array> paired_ff(const std::string& p,const mx::array& x) {
-        if(!paired_gate_up || x.shape(0)>8)return std::nullopt;
+        if(!paired_gate_up || !std::getenv("TQLLM_MLX_PAIRED_GATE_UP") || x.shape(0)>8)return std::nullopt;
         auto g=tiled_projections.find(p+"ffn_gate.weight"),u=tiled_projections.find(p+"ffn_up.weight");
         if(g==tiled_projections.end() || u==tiled_projections.end() ||
            g->second.bits!=u->second.bits || g->second.integer_levels!=u->second.integer_levels ||
            g->second.rows!=u->second.rows || g->second.columns!=u->second.columns)return std::nullopt;
         const bool fp32=std::getenv(g->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
+        if(!fp32 && !std::getenv(g->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"))return std::nullopt;
         return tq_paired_swiglu(g->second,u->second,tq4_rotate(x),fp32);
     }
     std::pair<mx::array,mx::array> gate_up(const std::string& p,const mx::array& x) {

@@ -88,3 +88,8 @@ if(BUILD_TESTING)
   add_test(NAME mlx_paired_gate_up COMMAND test-mlx-paired-gate-up)
   set_tests_properties(mlx_paired_gate_up PROPERTIES ENVIRONMENT "MLX_ENABLE_TF32=0")
 endif()
+
+if(BUILD_TESTING)
+  add_executable(test-mlx-kld-settings tests/mlx_kld_settings.cpp)
+  add_test(NAME mlx_kld_settings COMMAND test-mlx-kld-settings)
+endif()
