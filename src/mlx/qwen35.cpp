@@ -90,9 +90,12 @@ struct Qwen35::Impl {
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
+    bool paired_gate_up=std::getenv("TQLLM_MLX_PAIRED_GATE_UP")!=nullptr;
     bool fused_epilogue=std::getenv("TQLLM_MLX_FUSE_EPILOGUE")!=nullptr;
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
+        if(const char* mode=std::getenv("TQLLM_MLX_PAIRED_GATE_UP"))
+            if(std::string_view(mode)!="1")throw std::invalid_argument("TQLLM_MLX_PAIRED_GATE_UP must be 1");
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ3_FP16"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP16 must be 1");
@@ -266,6 +269,15 @@ struct Qwen35::Impl {
         return bf(gemm_prefill && x.shape(0)>=8?prefill_linear(w,x):linear(w,x));
     }
     mx::array norm(const mx::array& x,const std::string& name) {return bf(mx::fast::rms_norm(x,plain.at(name),eps));}
+    std::optional<mx::array> paired_ff(const std::string& p,const mx::array& x) {
+        if(!paired_gate_up || x.shape(0)>8)return std::nullopt;
+        auto g=tiled_projections.find(p+"ffn_gate.weight"),u=tiled_projections.find(p+"ffn_up.weight");
+        if(g==tiled_projections.end() || u==tiled_projections.end() ||
+           g->second.bits!=u->second.bits || g->second.integer_levels!=u->second.integer_levels ||
+           g->second.rows!=u->second.rows || g->second.columns!=u->second.columns)return std::nullopt;
+        const bool fp32=std::getenv(g->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
+        return tq_paired_swiglu(g->second,u->second,tq4_rotate(x),fp32);
+    }
     std::pair<mx::array,mx::array> gate_up(const std::string& p,const mx::array& x) {
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=affine_gu.find(p);found!=affine_gu.end()) {
@@ -348,8 +360,11 @@ struct Qwen35::Impl {
                 record((l+1)%interval==0?"attention":"gdn_mixer",values);
             }
             x=bf(mx::add(x,attn));n=norm(x,p+"post_attention_norm.weight");
-            auto [gate,up]=gate_up(p,n);
-            auto ff=fused_epilogue?swiglu(gate,up):bf(mx::multiply(bf(silu(gate)),up));
+            auto paired=paired_ff(p,n);
+            auto ff=paired?*paired:[&] {
+                auto [gate,up]=gate_up(p,n);
+                return fused_epilogue?swiglu(gate,up):bf(mx::multiply(bf(silu(gate)),up));
+            }();
             if(stage_profiling)record("ffn_gate_up",{ff});
             x=bf(mx::add(x,mat(p+"ffn_down.weight",ff)));
             if(stage_profiling)record("ffn_down",{x});

@@ -2,6 +2,7 @@
 #include "tq3.hpp"
 #include "tq4.hpp"
 #include <optional>
+#include <utility>
 
 namespace tqllm::mlx_backend {
 struct TqTiledWeights {
@@ -20,6 +21,11 @@ mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
     bool full_precision = false,
     const std::optional<mlx::core::array>& expanded = std::nullopt, int simdgroups = 1, bool transpose_stage = false, int padded_rows = 8);
+std::pair<mlx::core::array,mlx::core::array> tq_paired_matmul(
+    const TqTiledWeights& gate,const TqTiledWeights& up,
+    const mlx::core::array& rotated_input,bool full_precision,int splits = 4);
+mlx::core::array tq_paired_swiglu(const TqTiledWeights& gate,const TqTiledWeights& up,
+    const mlx::core::array& rotated_input,bool full_precision,int splits = 4);
 mlx::core::array tq_register_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 4, bool integer_operand = false, bool packed_cache = false, bool compensated_input = false);
 // Lossless int8 code levels, packed four per word in output-coalesced order.

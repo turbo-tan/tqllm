@@ -617,3 +617,7 @@ flags:
     kind: debug
     default: "unset (backend default)"
     doc: "Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes."
+  - name: TQLLM_MLX_PAIRED_GATE_UP
+    kind: debug
+    default: "unset (separate projections)"
+    doc: "Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required."
