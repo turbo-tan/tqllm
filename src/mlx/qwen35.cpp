@@ -36,6 +36,7 @@ struct Cache {
 };
 struct PrefixTape {
     std::optional<mx::array> conv_inputs,states;
+    std::optional<mx::array> keys,decay,deltas;
 };
 }
 struct Qwen35::Impl {
@@ -75,6 +76,7 @@ struct Qwen35::Impl {
     mx::array global_ids=mx::array(0,mx::uint32);
     std::optional<GdnHeadOrder> native_head_order;
     bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
+    bool compact_gdn=std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE")!=nullptr;
     bool compiled_gdn=std::getenv("TQLLM_MLX_COMPILED_GDN")!=nullptr;
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
@@ -82,6 +84,8 @@ struct Qwen35::Impl {
     bool fused_epilogue=std::getenv("TQLLM_MLX_FUSE_EPILOGUE")!=nullptr;
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
+        if(compact_gdn && std::string_view(std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE"))!="1")
+            throw std::invalid_argument("TQLLM_MLX_COMPACT_GDN_TAPE must be 1");
         const auto arch=file.kv.at("general.architecture").str;
         if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
         const std::string a="qwen35.";
@@ -242,8 +246,11 @@ struct Qwen35::Impl {
         auto a=mat(p+"ssm_alpha.weight",x),b=mat(p+"ssm_beta.weight",x);
         auto decay=mx::reshape(gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),{1,m,vh});
         auto beta=mx::reshape(mx::sigmoid(b),{1,m,vh});
-        auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix)):std::nullopt;
-        if(capture_prefix)tape.states=scanned->snapshots;
+        auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
+        if(capture_prefix) {
+            tape.states=scanned->snapshots;
+            if(compact_gdn) {tape.keys=k;tape.decay=decay;tape.deltas=scanned->deltas;}
+        }
         auto update=scanned?std::vector<mx::array>{scanned->output,scanned->state}:native_head_order?gdn_native(q,k,v,decay,beta,c.state,*native_head_order):
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
@@ -294,7 +301,8 @@ struct Qwen35::Impl {
             if(c.keys) live.push_back(*c.keys);
             if(c.values) live.push_back(*c.values);
         }
-        if(capture_prefix)for(const auto& t:tapes)if(t.states)live.push_back(*t.states);
+        if(capture_prefix)for(const auto& t:tapes)
+            for(const auto* a:{&t.states,&t.keys,&t.decay,&t.deltas})if(*a)live.push_back(**a);
         if(profiling) mx::eval(live);
         auto body_end=std::chrono::steady_clock::now();
         auto logits=target_head && x.shape(0)<=5?q6_affine_matmul(*target_head,x):gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):linear(matrices.at("output.weight"),x);
@@ -374,7 +382,8 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
             c.values=mx::contiguous(tail_slice(*c.values,2,0,s->start+int(count)));
         } else {
             c.conv=mx::contiguous(tail_slice(*tape.conv_inputs,0,int(count),int(count)+impl_->conv-1));
-            c.state=mx::contiguous(tail_slice(*tape.states,0,int(count)-1,int(count)));
+            c.state=tape.deltas?gdn_replay_prefix(*tape.keys,*tape.decay,*tape.deltas,s->before[l].state,int(count)):
+                mx::contiguous(tail_slice(*tape.states,0,int(count)-1,int(count)));
         }
     }
     std::vector<mx::array> live;

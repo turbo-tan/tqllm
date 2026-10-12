@@ -131,6 +131,49 @@ int main(int argc,char** argv) {
                 if(run==0) {
                     check(update[0],output,"output");check(native && !scan?mx::take(update[1],order.from_native,1):update[1],state,"state");
                     if(scanned && scanned->snapshots)check(*scanned->snapshots,prefix_states,"prefix_states");
+                    if(scanned && count<=8) {
+                        auto compact=tqllm::mlx_backend::gdn_scan(aq,ak,av,ag,ab,as,true,true);
+                        mx::eval(compact.output,compact.state,*compact.deltas);
+                        check(compact.output,output,"compact_output_cpu");
+                        check(compact.state,state,"compact_final_cpu");
+                        if(compact.snapshots || !mx::all(mx::equal(compact.output,scanned->output)).item<bool>() ||
+                           !mx::all(mx::equal(compact.state,scanned->state)).item<bool>())
+                            throw std::runtime_error("compact tape changed original scan output/final state");
+                        for(int prefix=1;prefix<=count;++prefix) {
+                            auto restored=tqllm::mlx_backend::gdn_replay_prefix(ak,ag,*compact.deltas,as,prefix);
+                            auto expected=mx::slice(*scanned->snapshots,{prefix-1,0,0,0},{prefix,heads,dv,dk});
+                            if(!mx::all(mx::equal(restored,expected)).item<bool>())
+                                throw std::runtime_error("compact replay differs from independently saved prefix state");
+                            const size_t n=initial.size();
+                            check(restored,std::vector<double>(prefix_states.begin()+size_t(prefix-1)*n,
+                                prefix_states.begin()+size_t(prefix)*n),"compact_prefix_cpu");
+                        }
+                        auto empty=tqllm::mlx_backend::gdn_scan(aq,ak,av,ag,ab,std::nullopt,true);
+                        auto compact_empty=tqllm::mlx_backend::gdn_scan(aq,ak,av,ag,ab,std::nullopt,true,true);
+                        for(int prefix=1;prefix<=count;++prefix) {
+                            auto restored=tqllm::mlx_backend::gdn_replay_prefix(ak,ag,*compact_empty.deltas,std::nullopt,prefix);
+                            if(!mx::all(mx::equal(restored,mx::slice(*empty.snapshots,{prefix-1,0,0,0},{prefix,heads,dv,dk}))).item<bool>())
+                                throw std::runtime_error("compact empty-initial replay differs from original");
+                        }
+                        for(int bad:{0,count+1}) {
+                            bool rejected=false;
+                            try {tqllm::mlx_backend::gdn_replay_prefix(ak,ag,*compact.deltas,as,bad);}
+                            catch(const std::invalid_argument&) {rejected=true;}
+                            if(!rejected)throw std::runtime_error("compact replay accepted invalid prefix count");
+                        }
+                        std::vector<double> compact_times,replay_times;
+                        for(int run=-1;run<5;++run) {
+                            auto begin=Clock::now();auto candidate=tqllm::mlx_backend::gdn_scan(aq,ak,av,ag,ab,as,true,true);
+                            mx::eval(candidate.output,candidate.state,*candidate.deltas);
+                            const double scan_ms=std::chrono::duration<double,std::milli>(Clock::now()-begin).count();
+                            begin=Clock::now();mx::eval(tqllm::mlx_backend::gdn_replay_prefix(ak,ag,*candidate.deltas,as,std::max(1,count-1)));
+                            if(run>=0) {compact_times.push_back(scan_ms);replay_times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-begin).count());}
+                        }
+                        std::sort(compact_times.begin(),compact_times.end());std::sort(replay_times.begin(),replay_times.end());
+                        std::cout<<"GDN_COMPACT_PASS count="<<count<<" compact_scan_ms="<<compact_times[2]
+                            <<" partial_replay_ms="<<replay_times[2]<<" full_tape_bytes="<<scanned->snapshots->nbytes()
+                            <<" compact_delta_bytes="<<compact.deltas->nbytes()<<" final_state_bytes="<<compact.state.nbytes()<<std::endl;
+                    }
                 }
                 if(run>=0)times.push_back(ms);
             }

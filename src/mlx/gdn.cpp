@@ -51,7 +51,7 @@ mx::array gdn_decay(const mx::array& alpha,const mx::array& bias,const mx::array
     return compiled?fused({alpha,bias,rate})[0]:decay({alpha,bias,rate})[0];
 }
 GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
-    const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,bool snapshots) {
+    const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,bool snapshots,bool compact) {
     if(q.ndim()!=4 || q.shape(0)!=1 || q.shape(3)!=128 || q.dtype()!=mx::float32 || k.shape()!=q.shape() ||
        k.dtype()!=mx::float32 || v.ndim()!=4 || v.shape(0)!=1 || v.shape(1)!=q.shape(1) ||
        v.shape(3)!=128 || v.dtype()!=mx::float32 || q.shape(2)<1 || v.shape(2)%q.shape(2) ||
@@ -59,10 +59,12 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
        decay.dtype()!=mx::float32 || beta.dtype()!=mx::float32)
         throw std::invalid_argument("unsupported GDN scan dimensions");
     const int m=q.shape(1),kh=q.shape(2),vh=v.shape(2);
+    if(compact && (!snapshots || m>8))
+        throw std::invalid_argument("compact GDN tape requires prefix snapshots and 1-8 tokens");
     auto initial=state?*state:mx::zeros({1,vh,128,128});
     if(initial.shape()!=mx::Shape{1,vh,128,128} || initial.dtype()!=mx::float32)
         throw std::invalid_argument("invalid GDN scan state");
-    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states"},R"METAL(
+    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states","deltas"},R"METAL(
 uint lane=thread_position_in_threadgroup.x;
 uint row=thread_position_in_grid.y,head=thread_position_in_grid.z;
 uint base=(head*128u+row)*128u+lane*4u;
@@ -76,22 +78,53 @@ for(uint t=0;t<M;++t) {
  for(uint j=0;j<4;++j)memory+=s[j]*key[j];
  memory=simd_sum(memory);
  float delta=(v[(t*VH+head)*128u+row]-memory)*beta[t*VH+head];
+ if(COMPACT && lane==0)deltas[(t*VH+head)*128u+row]=delta;
  float value=0.0f;
  for(uint j=0;j<4;++j) {s[j]=s[j]+key[j]*delta;value+=s[j]*query[j];}
  value=simd_sum(value);
  if(lane==0)out[(t*VH+head)*128u+row]=value;
- if(SNAPSHOTS || t+1==M) {
-  uint offset=(SNAPSHOTS?t:0u)*VH*128u*128u+base;
+ if((SNAPSHOTS && !COMPACT) || t+1==M) {
+  uint offset=((SNAPSHOTS && !COMPACT)?t:0u)*VH*128u*128u+base;
   *((device float4*)(states+offset))=s;
  }
 }
 )METAL");
     auto result=kernel({mx::contiguous(q),mx::contiguous(k),mx::contiguous(v),mx::contiguous(decay),
-        mx::contiguous(beta),mx::contiguous(initial)},{{1,m,vh,128},{snapshots?m:1,vh,128,128}},
-        {mx::float32,mx::float32},{32,128,vh},{32,4,1},{{"M",m},{"KH",kh},{"VH",vh},{"SNAPSHOTS",snapshots}},
+        mx::contiguous(beta),mx::contiguous(initial)},{{1,m,vh,128},{snapshots&&!compact?m:1,vh,128,128},compact?mx::Shape{m,vh,128}:mx::Shape{1}},
+        {mx::float32,mx::float32,mx::float32},{32,128,vh},{32,4,1},{{"M",m},{"KH",kh},{"VH",vh},{"SNAPSHOTS",snapshots},{"COMPACT",compact}},
         std::nullopt,false,mx::Device(mx::Device::gpu));
-    auto final=snapshots?mx::slice(result[1],{m-1,0,0,0},{m,vh,128,128}):result[1];
-    return {result[0],final,snapshots?std::optional<mx::array>(result[1]):std::nullopt};
+    auto final=snapshots&&!compact?mx::slice(result[1],{m-1,0,0,0},{m,vh,128,128}):result[1];
+    return {result[0],final,snapshots&&!compact?std::optional<mx::array>(result[1]):std::nullopt,
+        compact?std::optional<mx::array>(result[2]):std::nullopt};
+}
+mx::array gdn_replay_prefix(const mx::array& keys,const mx::array& decay,const mx::array& deltas,
+    const std::optional<mx::array>& initial,int count) {
+    if(keys.ndim()!=4 || keys.shape(0)!=1 || keys.shape(2)<1 || keys.shape(3)!=128 || keys.dtype()!=mx::float32 ||
+       deltas.ndim()!=3 || deltas.shape(0)!=keys.shape(1) || deltas.shape(1)<1 || deltas.shape(2)!=128 ||
+       deltas.dtype()!=mx::float32 || deltas.shape(1)%keys.shape(2) ||
+       decay.shape()!=mx::Shape{1,keys.shape(1),deltas.shape(1)} || decay.dtype()!=mx::float32 ||
+       count<1 || count>keys.shape(1) || keys.shape(1)>8)
+        throw std::invalid_argument("invalid compact GDN prefix tape");
+    const int kh=keys.shape(2),vh=deltas.shape(1);
+    auto state=initial?*initial:mx::zeros({1,vh,128,128});
+    if(state.shape()!=mx::Shape{1,vh,128,128} || state.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid compact GDN initial state");
+    static auto replay=mx::fast::metal_kernel("tqllm_gdn_replay_prefix",{"keys","decay","deltas","initial"},{"state"},R"METAL(
+uint i=thread_position_in_grid.x;
+if(i>=VH*128u*128u/4u)return;
+uint head=i/(128u*32u),row=(i/32u)%128u,col=(i%32u)*4u;
+float4 s=((const device float4*)initial)[i];
+for(uint t=0;t<COUNT;++t) {
+ float4 key=*((const device float4*)(keys+(t*KH+head%KH)*128u+col));
+ float delta=deltas[(t*VH+head)*128u+row];
+ s*=decay[t*VH+head];
+ for(uint j=0;j<4;++j)s[j]=s[j]+key[j]*delta;
+}
+((device float4*)state)[i]=s;
+)METAL");
+    return replay({mx::contiguous(keys),mx::contiguous(decay),mx::contiguous(deltas),mx::contiguous(state)},
+        {{1,vh,128,128}},{mx::float32},{vh*128*32,1,1},{256,1,1},
+        {{"VH",vh},{"KH",kh},{"COUNT",count}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
 GdnHeadOrder gdn_head_order(int kh,int vh) {
     if(!((kh==16 && (vh==16 || vh==32 || vh==48 || vh==64)) ||

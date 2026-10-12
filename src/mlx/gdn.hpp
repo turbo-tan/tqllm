@@ -15,10 +15,14 @@ GdnHeadOrder gdn_head_order(int key_heads,int value_heads);
 struct GdnScan {
     mlx::core::array output,state;
     std::optional<mlx::core::array> snapshots;
+    std::optional<mlx::core::array> deltas;
 };
 GdnScan gdn_scan(const mlx::core::array& q,const mlx::core::array& k,
     const mlx::core::array& v,const mlx::core::array& decay,const mlx::core::array& beta,
-    const std::optional<mlx::core::array>& state,bool snapshots=false);
+    const std::optional<mlx::core::array>& state,bool snapshots=false,bool compact=false);
+mlx::core::array gdn_replay_prefix(const mlx::core::array& keys,
+    const mlx::core::array& decay,const mlx::core::array& deltas,
+    const std::optional<mlx::core::array>& initial,int count);
 // Recurrent state stays in native head order; readout returns model head order.
 std::vector<mlx::core::array> gdn_native(const mlx::core::array& q,const mlx::core::array& k,
     const mlx::core::array& v,const mlx::core::array& decay,const mlx::core::array& beta,
