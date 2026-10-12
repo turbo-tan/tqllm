@@ -67,7 +67,8 @@ mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int s
     static auto kernel = mx::fast::metal_kernel("tqllm_tq3_coalesced_stage",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
 uint lane = thread_position_in_threadgroup.x % 32u;
-uint group = thread_position_in_threadgroup.x / 32u;
+// Preserve compile-time unrolling in the one-group control.
+uint group = SIMDS == 1 ? 0u : thread_position_in_threadgroup.x / 32u;
 uint tile = threadgroup_position_in_grid.y;
 uint part = threadgroup_position_in_grid.z;
 if (tile >= (R + 31u) / 32u) return;
