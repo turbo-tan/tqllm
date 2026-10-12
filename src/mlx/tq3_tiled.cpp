@@ -172,11 +172,11 @@ constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
-mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool integer_operand, bool packed_cache) {
+mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool integer_operand, bool packed_cache, bool compensated_input) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
         (w.bits != 3 && w.bits != 4) || (w.bits == 3 && !w.integer_levels) ||
-        (integer_operand && !w.integer_levels) ||
+        (integer_operand && !w.integer_levels) || (compensated_input && !integer_operand) ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
         w.planes.shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 32, w.bits, 32} ||
         w.scales.shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 128, 32} ||
@@ -186,19 +186,25 @@ mx::array tq_register_matmul(const TqTiledWeights& w, const mx::array& input, in
     const int m = input.shape(0);
     auto x = input;
     if (m < 8) x = mx::concatenate({x, mx::zeros({8 - m, w.columns}, mx::float32)}, 0);
+    if (compensated_input) {
+        auto high = mx::astype(x,mx::float16);
+        auto low = mx::astype((x-mx::astype(high,mx::float32))*mx::array(2048.0f),mx::float16);
+        x = mx::concatenate({high,low},0);
+    }
     x = mx::contiguous(x);
+    const int output_rows = compensated_input ? 16 : m;
     static auto kernel = mx::fast::metal_kernel("tqllm_register_decoded_tq",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
 uint tile = threadgroup_position_in_grid.y, part = threadgroup_position_in_grid.z;
 uint lane = thread_position_in_threadgroup.x;
 threadgroup uint payload[(BK / 32) * BITS * 32];
-tensor<device float, dextents<int, 2>, tensor_inline> inputs(
-    (device float*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
-constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, false, false,
+tensor<device Left, dextents<int, 2>, tensor_inline> inputs(
+    (device Left*)x, dextents<int, 2>{int(K), NCOLS}, array<int, 2>{1, int(K)});
+constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(NCOLS, 32, BK, false, false, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<1>> operation;
-auto weights = operation.template get_right_input_cooperative_tensor<float, Code, float>();
-auto initial = inputs.template slice<BK, 8>(0, 0);
+auto weights = operation.template get_right_input_cooperative_tensor<Left, Code, float>();
+auto initial = inputs.template slice<BK, NCOLS>(0, 0);
 auto accumulator = operation.template get_destination_cooperative_tensor<decltype(initial), decltype(weights), float>();
 auto scaled_sum = operation.template get_destination_cooperative_tensor<decltype(initial), decltype(weights), float>();
 for (uint i = 0; i < accumulator.get_capacity(); ++i)
@@ -237,7 +243,7 @@ for (uint block = begin; block < end; ++block) {
         ulong scale_at = (ulong(tile) * (K / 128u) + column / 128u) * 32u + row;
         weights[i] = INTEGER_OPERAND ? Code(level) : Code(float(scales[scale_at]) * level);
     }
-    auto activation = inputs.template slice<BK, 8>(block * BK, 0);
+    auto activation = inputs.template slice<BK, NCOLS>(block * BK, 0);
     operation.run(activation, weights, accumulator);
     if (INTEGER_OPERAND) for (uint i = 0; i < accumulator.get_capacity(); ++i) {
         if (!accumulator.is_valid_element(i)) continue;
@@ -250,7 +256,7 @@ for (uint i = 0; i < accumulator.get_capacity(); ++i) {
     if (!accumulator.is_valid_element(i)) continue;
     auto pos = accumulator.get_multidimensional_index(i);
     uint row = tile * 32u + uint(pos[0]), column = uint(pos[1]);
-    if (row < R && column < M) partials[(part * M + column) * R + row] = INTEGER_OPERAND ? scaled_sum[i] : accumulator[i];
+    if (row < R && column < OROWS) partials[(part * OROWS + column) * R + row] = INTEGER_OPERAND ? scaled_sum[i] : accumulator[i];
 }
 )METAL", R"METAL(
 #include <metal_tensor>
@@ -259,13 +265,18 @@ for (uint i = 0; i < accumulator.get_capacity(); ++i) {
 constant float LEVELI[16] = {6.0f,18.0f,31.0f,44.0f,58.0f,75.0f,96.0f,127.0f,-6.0f,-18.0f,-31.0f,-44.0f,-58.0f,-75.0f,-96.0f,-127.0f};
 constant float LEVELF[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.247959055f,1.613740157f,2.065587402f,2.732600000f,-0.129099213f,-0.387297638f,-0.667012598f,-0.946727559f,-1.247959055f,-1.613740157f,-2.065587402f,-2.732600000f};
 )METAL");
-    auto output = kernel({w.planes, w.scales, x}, {{splits, m, w.rows}}, {mx::float32},
+    auto output = kernel({w.planes, w.scales, x}, {{splits, output_rows, w.rows}}, {mx::float32},
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
         {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels},
          {"BK", integer_operand ? 128 : 32}, {"Code", integer_operand ? mx::int8 : mx::float32},
-         {"INTEGER_OPERAND", integer_operand}, {"PACKED_CACHE", packed_cache}},
+         {"INTEGER_OPERAND", integer_operand}, {"PACKED_CACHE", packed_cache},
+         {"NCOLS", compensated_input ? 16 : 8}, {"OROWS", output_rows},
+         {"Left", compensated_input ? mx::float16 : mx::float32}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
-    return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
+    auto combined = splits == 1 ? mx::reshape(output, {output_rows, w.rows}) : mx::sum(output, 0);
+    if (!compensated_input) return combined;
+    return mx::slice(combined,{0,0},{m,w.rows}) +
+        mx::slice(combined,{8,0},{8+m,w.rows}) * mx::array(1.0f/2048.0f);
 }
 
 mx::array tq_expand_tiled_codes(const TqTiledWeights& w) {
