@@ -3,8 +3,10 @@
 #include <mlx/memory.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -16,13 +18,20 @@ template<class F> void rejects(F operation) {
 }
 int main(int argc,char** argv) {
     try {
-        if(argc!=2)throw std::invalid_argument("usage: test-mlx-prefix model.gguf");
+        const bool sequential = argc==3 && std::string(argv[2])=="--sequential-reference";
+        if(argc!=2 && !sequential)throw std::invalid_argument("usage: test-mlx-prefix model.gguf [--sequential-reference]");
         mx::set_cache_limit(512*1024*1024);
         tqllm::Tokenizer tokenizer;tokenizer.load(argv[1]);
         auto prompt=tokenizer.encode("Explain why rainbows form, including refraction and reflection.");
         auto tokens=tokenizer.encode("The light bends through water droplets before it reflects and emerges.");
         if(tokens.size()<9)throw std::runtime_error("prefix test token fixture is too short");
         Qwen35 engine(argv[1],256);
+        if(sequential) {
+            const auto file=tqllm::gguf_open(argv[1]);
+            const int layers=int(file.num("qwen35.block_count"))-int(file.num("qwen35.nextn_predict_layers",0));
+            std::vector<int> selected(layers);std::iota(selected.begin(),selected.end(),0);
+            engine.feature_layers(selected);
+        }
         engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
         engine.forward(prompt);
         const auto start=engine.checkpoint();const int position=engine.position(),vocab=engine.vocabulary();
@@ -30,9 +39,16 @@ int main(int argc,char** argv) {
         rejects([&]{engine.accept_prefix(ticket,0);});
         for(int accepted=0;accepted<=8;++accepted) {
             engine.restore(start);
-            if(accepted)engine.forward({tokens.data(),size_t(accepted)},true);
+            if(sequential) {
+                for(int t=0;t<accepted;++t)engine.forward({tokens.data()+t,1},true);
+            } else if(accepted)engine.forward({tokens.data(),size_t(accepted)},true);
             auto reference=engine.forward({&tokens[8],1});
             std::vector<float> a(reference.data<float>(),reference.data<float>()+vocab);
+            std::vector<float> feature_reference;
+            if(sequential) {
+                auto features=engine.feature_states();mx::eval(features);
+                feature_reference.assign(features.data<float>(),features.data<float>()+features.size());
+            }
             engine.restore(start);
             auto begin=std::chrono::steady_clock::now();
             engine.verify({tokens.data(),8},ticket);
@@ -52,8 +68,16 @@ int main(int argc,char** argv) {
             std::cout<<"PREFIX_CHECK accepted="<<accepted<<" kld="<<kld<<" top1_same="<<(ia==ib)
                      <<" max_abs="<<max_error<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
                      <<" active_bytes="<<mx::get_active_memory()<<std::endl;
-            if(!std::isfinite(kld) || kld>0.002 || ((accepted==0 || accepted==8) && max_error!=0))
+            if(!std::isfinite(kld) || kld>0.002 || ((sequential || accepted==0 || accepted==8) && max_error!=0)) {
+                if(sequential) {
+                    auto features=engine.feature_states();mx::eval(features);
+                    const int hidden=int(tqllm::gguf_open(argv[1]).num("qwen35.embedding_length"));
+                    for(size_t i=0;i<feature_reference.size();++i) if(feature_reference[i]!=features.data<float>()[i]) {
+                        std::cerr<<"PREFIX_FIRST_DIFFERENCE accepted="<<accepted<<" layer_input="<<i/size_t(hidden)<<'\n';break;
+                    }
+                }
                 throw std::runtime_error("prefix state continuation failed accuracy gate");
+            }
         }
         engine.restore(start);engine.verify({tokens.data(),8},ticket);engine.forward({&tokens[8],1});
         rejects([&]{engine.accept_prefix(ticket,1);});

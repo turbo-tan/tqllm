@@ -4,6 +4,7 @@
 #include "tuning.hpp"
 #include "gdn.hpp"
 #include "draft_head.hpp"
+#include "attention_rows.hpp"
 #include <mlx/compile.h>
 #include <cstdlib>
 #include <cmath>
@@ -54,6 +55,8 @@ struct Qwen35::Impl {
     std::vector<Cache> caches;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
+    bool serial_verify_attention=std::getenv("TQLLM_MLX_SERIAL_VERIFY_ATTENTION")!=nullptr;
+    bool serial_verify_dense=std::getenv("TQLLM_MLX_SERIAL_VERIFY_DENSE")!=nullptr;
     std::optional<mx::array> last_hidden;
     std::optional<mx::array> last_features;
     std::vector<int> feature_ids;
@@ -165,6 +168,13 @@ struct Qwen35::Impl {
     }
     mx::array mat(const std::string& name,const mx::array& x) {
         const auto& w=matrices.at(name);
+        if(capture_prefix && serial_verify_dense && x.shape(0)>1 && std::holds_alternative<mx::array>(w)) {
+            std::vector<mx::array> rows;
+            rows.reserve(x.shape(0));
+            for(int t=0;t<x.shape(0);++t)
+                rows.push_back(bf(linear(w,mx::contiguous(tail_slice(x,0,t,t+1)))));
+            return mx::concatenate(rows,0);
+        }
         auto rotated=[&]() {
             if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
             auto value=tq4_rotate(x);
@@ -209,7 +219,7 @@ struct Qwen35::Impl {
         q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
         c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
         c.values=c.values?mx::concatenate({*c.values,v},2):v;
-        auto out=mx::fast::scaled_dot_product_attention(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),m>1?"causal":"");
+        auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         out=bf(mx::multiply(bf(out),bf(mx::sigmoid(gate))));
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
