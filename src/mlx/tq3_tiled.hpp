@@ -18,6 +18,9 @@ TqTiledWeights tq4_tile(const Tq4Weights& weights);
 mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
     bool full_precision = false);
+// Integer codes stay exact in FP16; high/residual input rows share one tile.
+mlx::core::array tq_compensated_matmul(const TqTiledWeights& weights,
+    const mlx::core::array& input, int splits = 4);
 inline mlx::core::array tq3_tiled_matmul(const Tq3TiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
     bool full_precision = false) {

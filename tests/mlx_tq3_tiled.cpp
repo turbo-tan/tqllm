@@ -82,7 +82,7 @@ static double rel_l2(const mx::array& a, const mx::array& b) {
     return std::sqrt(error / std::max(norm, 1e-30));
 }
 static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, bool original_gate,
-    int bits = 3, bool integer_levels = true) {
+    int bits = 3, bool integer_levels = true, bool compensated = false) {
     auto prepare = [&] {
         if (bits == 3) return tq3_tile(load_tq3_blocks(raw, rows, k));
         auto w = load_tq4_blocks(raw, rows, k); w.integer_levels = integer_levels;
@@ -90,7 +90,18 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
     };
     auto tiled = prepare();
     check_layout(tiled, raw);
-    const auto values = inputs(8, k);
+    auto values = inputs(8, k);
+    if (compensated) {
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i % 19 == 0) values[i] *= 100.0f;
+            if (i % 23 == 0) values[i] *= 1e-5f;
+            const float hi = float(_Float16(values[i]));
+            const float lo = float(_Float16((values[i] - hi) * 2048.0f));
+            const double reconstructed = double(hi) + double(lo) / 2048.0;
+            if (std::abs(reconstructed - values[i]) > 2e-7 * std::abs(values[i]) + 2e-11)
+                throw std::runtime_error("compensated input reconstruction failed");
+        }
+    }
     auto x = mx::array(values.data(), {8, k});
     constexpr int levels[] = {14, 45, 79, 127, -14, -45, -79, -127};
     constexpr int levels4[] = {6,18,31,44,58,75,96,127,-6,-18,-31,-44,-58,-75,-96,-127};
@@ -121,6 +132,24 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
         rounded[size_t(m) * rows + r] = float(half_sum);
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
+    if (compensated) {
+        for (int split : {1, 2, 4}) {
+            if (k % (128 * split)) continue;
+            auto reference = tq_compensated_matmul(tiled, x, split);
+            const double error = rel_l2(reference, full);
+            if (!std::isfinite(error) || error > 2e-5)
+                throw std::runtime_error("compensated projection failed original GGUF CPU oracle");
+            for (int width : {1, 3, 5, 8}) {
+                auto got = tq_compensated_matmul(tiled, mx::array(values.data(), {width, k}), split);
+                mx::eval(got);
+                if (std::memcmp(got.data<float>(), reference.data<float>(), size_t(width) * rows * sizeof(float)))
+                    throw std::runtime_error("compensated projection changed with width");
+            }
+            std::cout << "COMPENSATED_ORACLE_PASS bits=" << bits << " rows=" << rows << " k=" << k
+                      << " splits=" << split << " original_cpu_rel_l2=" << error << std::endl;
+        }
+        return;
+    }
     for (int split : {1, 2, 4}) for (int tile_k : {32, 64, 128}) for (bool fp32 : {false, true}) {
         if (fp32 && tile_k == 128) continue;
         if (k % (128 * split)) continue;
@@ -183,12 +212,71 @@ static void bench(const GgufFile& file, const std::string& name, bool one_point 
         }
     }
 }
+static void bench_compensated(const GgufFile& file, const std::string& name) {
+    const auto& tensor = file.tensors.at(name);
+    auto data = file.read(tensor);
+    std::vector<uint8_t> raw(data.begin(), data.end());
+    auto weights = tensor.type == GGML_TQ3 ?
+        tq3_tile(load_tq3_blocks(raw, int(tensor.ne[1]), int(tensor.ne[0]))) :
+        tq4_tile(load_tq4_blocks(raw, int(tensor.ne[1]), int(tensor.ne[0])));
+    mx::eval(weights.planes, weights.scales);
+    for (int width : {1, 8}) {
+        auto values = inputs(width, weights.columns);
+        auto x = mx::array(values.data(), {width, weights.columns}); mx::eval(x);
+        auto baseline = [&] { return tq_tiled_matmul(weights, x, 4, true, 32, true); };
+        auto candidate = [&] { return tq_compensated_matmul(weights, x, 4); };
+        const double error = rel_l2(candidate(), baseline());
+        if (!std::isfinite(error) || error > 2e-5)
+            throw std::runtime_error("compensated full shape precision failed");
+        for (int arm = 0; arm < 4; ++arm) {
+            const bool comp = arm == 1 || arm == 2;
+            const double elapsed = comp ? measure(candidate) : measure(baseline);
+            std::cout << "COMPENSATED_BENCH tensor=" << name << " rows=" << weights.rows
+                      << " k=" << weights.columns << " width=" << width << " arm=" << arm
+                      << " compensated=" << comp << " elapsed_ms=" << elapsed
+                      << " fp32_baseline_rel_l2=" << error << std::endl;
+        }
+    }
+}
 int main(int argc, char** argv) {
     try {
-        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu]]");
+        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu|--compensated]]");
         if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point" &&
-            std::string(argv[2]) != "--mixer-cpu")
+            std::string(argv[2]) != "--mixer-cpu" && std::string(argv[2]) != "--compensated")
             throw std::invalid_argument("unknown test option");
+        const bool compensated = argc == 3 && std::string(argv[2]) == "--compensated";
+        if (compensated) {
+            for (int bits : {3, 4}) for (int rows : {1, 17, 33, 64}) for (int k : {128, 512}) {
+                auto raw = fixture(rows, k, bits);
+                const int stride = bits == 3 ? 50 : 66;
+                for (int r = 0; r < rows; ++r) for (int group = 0; group < k / 128; ++group) {
+                    const uint16_t edge[] = {0x0000,0x0001,0x8001,0x0400,0x8400};
+                    if ((r + group) % 7 < 5) {
+                        uint16_t scale = edge[(r + group) % 7];
+                        size_t at = (size_t(r) * (k / 128) + group) * stride;
+                        raw[at] = uint8_t(scale); raw[at + 1] = uint8_t(scale >> 8);
+                    }
+                }
+                check_projection(raw, rows, k, false, bits, true, true);
+            }
+            auto tiled = tq3_tile(load_tq3_blocks(fixture(1, 512), 1, 512));
+            for (int bad = 0; bad < 5; ++bad) {
+                bool rejected = false;
+                try {
+                    auto w = tiled;
+                    auto x = mx::zeros({1, 512}, mx::float32);
+                    int split = 4;
+                    if (bad == 0) w.integer_levels = false;
+                    if (bad == 1) x = mx::zeros({9, 512}, mx::float32);
+                    if (bad == 2) x = mx::zeros({1, 512}, mx::float16);
+                    if (bad == 3) split = 3;
+                    if (bad == 4) w.scales = mx::zeros({1, 4, 31}, mx::float16);
+                    tq_compensated_matmul(w, x, split);
+                } catch (const std::invalid_argument&) { rejected = true; }
+                if (!rejected) throw std::runtime_error("invalid compensated layout accepted");
+            }
+            std::cout << "COMPENSATED_SYNTHETIC_PASS" << std::endl;
+        } else {
         // Cancellation fixtures validate the stated FP16 contract, while reporting original FP32 drift.
         for (int rows : {1, 17, 33, 64}) for (int k : {128, 512})
             check_projection(fixture(rows, k), rows, k, false);
@@ -211,6 +299,7 @@ int main(int argc, char** argv) {
         catch (const std::invalid_argument&) { caught = true; }
         if (!caught) throw std::runtime_error("unsupported verifier width accepted");
         std::cout << "TILED_LAYOUT_AND_SYNTHETIC_PASS" << std::endl;
+        }
         if (argc >= 2) {
             auto file = gguf_open(argv[1]);
             std::vector<std::string> names;
@@ -230,9 +319,13 @@ int main(int argc, char** argv) {
             for (const auto& name : names) {
                 auto t = file.tensors.at(name); t.bytes = t.bytes / t.ne[1] * 33; t.ne[1] = 33;
                 auto raw = file.read(t); check_projection({raw.begin(), raw.end()}, 33, int(t.ne[0]), true,
-                    t.type == GGML_TQ3 ? 3 : 4);
+                    t.type == GGML_TQ3 ? 3 : 4, true, compensated);
             }
             std::cout << "TILED_REAL_CPU_GATE_PASS" << std::endl;
+            if (compensated) {
+                for (const auto& name : names) bench_compensated(file, name);
+                std::cout << "COMPENSATED_SCREEN_COMPLETE" << std::endl;
+            }
             if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--one-point"))
                 for (const auto& name : names) bench(file, name, argc == 3);
         }
