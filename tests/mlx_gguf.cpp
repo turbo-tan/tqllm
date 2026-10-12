@@ -74,7 +74,8 @@ int main(int argc,char** argv) {
     const bool tensorops_half=argc==3 && std::string(argv[2])=="--tensorops-half";
     const bool tensorops=argc==3 && std::string(argv[2])=="--tensorops";
     const bool int8_tiles=argc==3 && std::string(argv[2])=="--int8-tiles";
-    const bool q6_affine=argc==3 && std::string(argv[2])=="--q6-affine";
+    const bool q6_six=argc==3 && std::string(argv[2])=="--q6-affine6";
+    const bool q6_affine=q6_six || (argc==3 && std::string(argv[2])=="--q6-affine");
     const bool affine_tq4=argc==3 && std::string(argv[2])=="--affine-tq4";
     const bool verify_tiles=argc==3 && std::string(argv[2])=="--verify-tiles";
     const bool vector_load=argc==3 && std::string(argv[2])=="--vector-load";
@@ -106,7 +107,15 @@ int main(int argc,char** argv) {
         } else {
             auto matrix=load_matrix(t,payload);
             std::optional<Q6AffineSplit> q6_split;
-            if (q6_affine && t.type == GGML_Q6_K) q6_split = q6_affine_split(std::get<Q6Weights>(matrix));
+            if (q6_affine && t.type == GGML_Q6_K) q6_split = q6_affine_split(std::get<Q6Weights>(matrix),q6_six?6:8);
+            if(q6_six && q6_split) {
+                std::vector<mx::array> pieces;
+                for(int part=0;part<2;++part)pieces.push_back(mx::dequantize(q6_split->codes[part],q6_split->scales[part],q6_split->biases[part],32,6,"affine"));
+                auto decoded=mx::add(pieces[0],pieces[1]);mx::eval(decoded);
+                for(size_t j=0;j<w.size();++j)
+                    if(decoded.data<float>()[j]!=w[j])throw std::runtime_error("Q6 native6 changed a stored weight");
+                std::cout<<"Q6_NATIVE6_WEIGHT_EXACT tensor="<<name<<std::endl;
+            }
             std::optional<Tq3Affine8> affine;
             if (affine_tq4 && t.type == GGML_TQ4) {
                 affine = tq4_affine8(std::get<Tq4Weights>(matrix));

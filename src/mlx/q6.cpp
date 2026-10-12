@@ -3,7 +3,8 @@
 
 namespace tqllm::mlx_backend {
 namespace mx = mlx::core;
-Q6AffineSplit q6_affine_split(const Q6Weights& w) {
+Q6AffineSplit q6_affine_split(const Q6Weights& w, int bits) {
+    if (bits != 6 && bits != 8) throw std::invalid_argument("Q6 affine cache bits must be 6 or 8");
     if (w.blocks.ndim() != 3 || w.blocks.shape(2) != 210 || w.blocks.dtype() != mx::uint8 ||
         w.blocks.shape(0) <= 0 || w.blocks.shape(1) <= 0)
         throw std::invalid_argument("invalid Q6 affine expansion");
@@ -27,20 +28,35 @@ if(j==0u) {
  scales[row*(K/32u)+g]=s;biases[row*(K/32u)+g]=-128.0f*s;
 }
 )METAL");
-    Q6AffineSplit result;
+    static auto pack6 = mx::fast::metal_kernel("tqllm_q6_pack6", {"codes"}, {"packed"}, R"METAL(
+uint i=thread_position_in_grid.x;
+if(i>=N/4u)return;
+uint word=0u;
+for(uint j=0u;j<4u;++j)word|=(uint(codes[4u*i+j])-96u)<<(6u*j);
+packed[3u*i]=uchar(word);
+packed[3u*i+1u]=uchar(word>>8u);
+packed[3u*i+2u]=uchar(word>>16u);
+)METAL");
+    Q6AffineSplit result; result.bits = bits;
     for (int part = 0; part < 2; ++part) {
         auto a = expand({w.blocks}, {{r, k}, {r, k / 32}, {r, k / 32}},
             {mx::uint8, mx::float32, mx::float32}, {r * k, 1, 1}, {256, 1, 1},
             {{"R", r}, {"K", k}, {"PART", part}}, std::nullopt, false, mx::Device(mx::Device::gpu));
-        result.codes.push_back(mx::reshape(mx::view(a[0], mx::uint32), {r, k / 4}));
-        result.scales.push_back(a[1]); result.biases.push_back(a[2]);
+        auto codes = a[0];
+        if (bits == 6) {
+            codes = pack6({codes}, {{r, k * 3 / 4}}, {mx::uint8}, {r * k / 4, 1, 1},
+                {256, 1, 1}, {{"N", r * k}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+        }
+        result.codes.push_back(mx::reshape(mx::view(codes, mx::uint32), {r, k / 32 * bits}));
+        result.scales.push_back(a[1]);
+        result.biases.push_back(bits == 6 ? mx::multiply(a[1], mx::array(-32.0f)) : a[2]);
         mx::eval(result.codes.back(), result.scales.back(), result.biases.back());
     }
     return result;
 }
 
 mx::array q6_affine_matmul(const Q6AffineSplit& w, const mx::array& x) {
-    if (w.codes.size() != 2 || w.scales.size() != 2 || w.biases.size() != 2 ||
+    if ((w.bits != 6 && w.bits != 8) || w.codes.size() != 2 || w.scales.size() != 2 || w.biases.size() != 2 ||
         x.ndim() != 2 || x.dtype() != mx::float32 || x.shape(0) <= 0 ||
         x.shape(1) <= 0 || x.shape(1) % 256 || w.codes[0].ndim() != 2)
         throw std::invalid_argument("invalid Q6 affine projection");
@@ -48,13 +64,13 @@ mx::array q6_affine_matmul(const Q6AffineSplit& w, const mx::array& x) {
     auto pairs = mx::reshape(x, {m, k / 32, 2, 16});
     std::vector<mx::array> products;
     for (int part = 0; part < 2; ++part) {
-        if (w.codes[part].shape() != mx::Shape{r, k / 4} || w.codes[part].dtype() != mx::uint32 ||
+        if (w.codes[part].shape() != mx::Shape{r, k / 32 * w.bits} || w.codes[part].dtype() != mx::uint32 ||
             w.scales[part].shape() != mx::Shape{r, k / 32} || w.scales[part].dtype() != mx::float32 ||
             w.biases[part].shape() != mx::Shape{r, k / 32} || w.biases[part].dtype() != mx::float32)
             throw std::invalid_argument("Q6 affine weight shape mismatch");
         auto columns = mx::reshape(mx::slice(pairs, {0, 0, part, 0}, {m, k / 32, part + 1, 16}), {m, k / 32, 16});
         auto padded = mx::reshape(mx::concatenate({columns, mx::zeros({m, k / 32, 16}, mx::float32)}, 2), {m, k});
-        products.push_back(mx::quantized_matmul(padded, w.codes[part], w.scales[part], w.biases[part], true, 32, 8, "affine"));
+        products.push_back(mx::quantized_matmul(padded, w.codes[part], w.scales[part], w.biases[part], true, 32, w.bits, "affine"));
     }
     return mx::add(products[0], products[1]);
 }
