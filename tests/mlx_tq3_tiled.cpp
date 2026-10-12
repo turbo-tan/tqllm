@@ -185,8 +185,9 @@ static void bench(const GgufFile& file, const std::string& name, bool one_point 
 }
 int main(int argc, char** argv) {
     try {
-        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point]]");
-        if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point")
+        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu]]");
+        if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point" &&
+            std::string(argv[2]) != "--mixer-cpu")
             throw std::invalid_argument("unknown test option");
         // Cancellation fixtures validate the stated FP16 contract, while reporting original FP32 drift.
         for (int rows : {1, 17, 33, 64}) for (int k : {128, 512})
@@ -213,16 +214,19 @@ int main(int argc, char** argv) {
         if (argc >= 2) {
             auto file = gguf_open(argv[1]);
             std::vector<std::string> names;
+            const bool mixer=argc==3 && std::string(argv[2])=="--mixer-cpu";
             for (const auto& [name, t] : file.tensors)
                 if ((t.type == GGML_TQ3 || t.type == GGML_TQ4) && t.ne.size() == 2 &&
-                    (name.ends_with(".ffn_gate.weight") || name.ends_with(".ffn_down.weight")) &&
+                    (mixer?(name.ends_with(".attn_qkv.weight") || name.ends_with(".attn_gate.weight") ||
+                            name.ends_with(".ssm_out.weight")):
+                           (name.ends_with(".ffn_gate.weight") || name.ends_with(".ffn_down.weight"))) &&
                     t.ne[0] * t.ne[1] > 1000000) {
                     bool seen = false;
                     for (const auto& n : names)
                         if (file.tensors.at(n).ne[0] == t.ne[0] && file.tensors.at(n).type == t.type) seen = true;
                     if (!seen) names.push_back(name);
                 }
-            if (names.size() < 2) throw std::runtime_error("missing real FFN shapes");
+            if (names.size() < 2) throw std::runtime_error("missing real projection shapes");
             for (const auto& name : names) {
                 auto t = file.tensors.at(name); t.bytes = t.bytes / t.ne[1] * 33; t.ne[1] = 33;
                 auto raw = file.read(t); check_projection({raw.begin(), raw.end()}, 33, int(t.ne[0]), true,

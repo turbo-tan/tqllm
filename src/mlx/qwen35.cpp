@@ -44,7 +44,8 @@ struct Qwen35::Impl {
     GgufFile file;
     std::map<std::string,Matrix> matrices;
     std::map<std::string,Tq3Expanded> decoded_ffn;
-    std::map<std::string,TqTiledWeights> tiled_ffn;
+    std::map<std::string,TqTiledWeights> tiled_projections;
+    bool tiled_mixer=std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr;
     std::map<std::string,Tq3Affine8> affine_ffn;
     std::map<std::string,Tq3Affine8> affine_gu;
     bool joined_gu=std::getenv("TQLLM_MLX_AFFINE_GU")!=nullptr;
@@ -97,6 +98,9 @@ struct Qwen35::Impl {
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ4_FP32"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ4_FP32 must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_TILED_MIXER_FP32"))
+            if(std::string_view(mode)!="1")
+                throw std::invalid_argument("TQLLM_MLX_TILED_MIXER_FP32 must be 1");
         if(compact_gdn && std::string_view(std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE"))!="1")
             throw std::invalid_argument("TQLLM_MLX_COMPACT_GDN_TAPE must be 1");
         const auto arch=file.kv.at("general.architecture").str;
@@ -153,14 +157,24 @@ struct Qwen35::Impl {
                 if(auto packed=std::get_if<Tq3Weights>(&w)) {
                     auto tiled=tq3_tile(*packed);
                     mx::eval(tiled.planes,tiled.scales);
-                    tiled_ffn.emplace(name,std::move(tiled));
+                    tiled_projections.emplace(name,std::move(tiled));
                 }
             if(std::getenv("TQLLM_MLX_TILED_TQ4_FP32") && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq4Weights>(&w)) {
                     auto tiled=tq4_tile(*packed);
                     mx::eval(tiled.planes,tiled.scales);
-                    tiled_ffn.emplace(name,std::move(tiled));
+                    tiled_projections.emplace(name,std::move(tiled));
                 }
+            if(tiled_mixer && (name.ends_with(".attn_qkv.weight") ||
+               name.ends_with(".attn_gate.weight") || name.ends_with(".ssm_out.weight"))) {
+                if(auto packed=std::get_if<Tq3Weights>(&w)) {
+                    auto tiled=tq3_tile(*packed);mx::eval(tiled.planes,tiled.scales);
+                    tiled_projections.emplace(name,std::move(tiled));
+                }else if(auto packed=std::get_if<Tq4Weights>(&w)) {
+                    auto tiled=tq4_tile(*packed);mx::eval(tiled.planes,tiled.scales);
+                    tiled_projections.emplace(name,std::move(tiled));
+                }
+            }
             matrices.emplace(name,std::move(w));
         };
         auto scalar=[&](const std::string& name) {
@@ -212,9 +226,12 @@ struct Qwen35::Impl {
             return value;
         };
         if(x.shape(0)<=8)
-            if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end()) {
-                const bool fp32=std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
-                const bool active=fp32 || (found->second.bits==3 && std::getenv("TQLLM_MLX_TILED_TQ3_FP16"));
+            if(auto found=tiled_projections.find(name);found!=tiled_projections.end()) {
+                const bool mixer_projection=name.find(".ffn_")==std::string::npos;
+                const bool fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
+                    std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
+                const bool active=fp32 || (!mixer_projection && found->second.bits==3 &&
+                    std::getenv("TQLLM_MLX_TILED_TQ3_FP16"));
                 if(active)return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
             }
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
