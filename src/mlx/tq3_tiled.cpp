@@ -44,7 +44,7 @@ TqTiledWeights tq4_tile(const Tq4Weights& w) {
 }
 
 mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool prefetch,
-    int tile_k, bool full_precision) {
+    int tile_k, bool full_precision, const std::optional<mx::array>& expanded) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 63 || w.columns <= 0 ||
         w.columns % 128 || w.planes.ndim() != 4 || w.scales.ndim() != 3 ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
@@ -56,6 +56,9 @@ mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int s
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
         (tile_k != 32 && tile_k != 64 && tile_k != 128) || (full_precision && tile_k == 128))
         throw std::invalid_argument("invalid tiled TQ3 projection");
+    if (expanded && (!w.integer_levels || expanded->dtype() != mx::uint32 ||
+        expanded->shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 4, 32}))
+        throw std::invalid_argument("invalid expanded tiled codes");
     const int m = input.shape(0);
     auto padded = input;
     if (m < 8) padded = mx::concatenate({padded, mx::zeros({8 - m, w.columns}, mx::float32)}, 0);
@@ -82,22 +85,26 @@ auto accumulator = operation.template get_destination_cooperative_tensor<decltyp
 for (uint i = 0; i < accumulator.get_capacity(); ++i)
     if (accumulator.is_valid_element(i)) accumulator[i] = 0.0f;
 uint begin = part * (K / BK / SPLITS), end = (part + 1u) * (K / BK / SPLITS);
-ulong origin = ulong(tile) * (K / 32u) * (32u * BITS) + lane;
+ulong origin = ulong(tile) * (K / 32u) * (32u * (EXPANDED ? 8u : BITS)) + lane;
 ulong meta = ulong(tile) * (K / 128u) * 32u + lane;
-uint low[BK/32], high[BK/32], sign[BK/32], fourth[BK/32];
-for (uint g = 0; g < BK/32u; ++g) {
+uint low[BK/32], high[BK/32], sign[BK/32], fourth[BK/32], words[BK/4];
+if (!EXPANDED) for (uint g = 0; g < BK/32u; ++g) {
     ulong at = origin + ulong(begin * (BK/32u) + g) * (32u * BITS);
     low[g] = planes[at]; high[g] = planes[at + 32u]; sign[g] = planes[at + 64u];
     if (BITS == 4) fourth[g] = planes[at + 96u];
 }
+if (EXPANDED) for (uint j = 0; j < BK/4u; ++j)
+    words[j] = planes[origin + ulong(begin * (BK/4u) + j) * 32u];
 float scale = float(scales[meta + ulong(begin / (128u / BK)) * 32u]);
 for (uint block = begin; block < end; ++block) {
     if (!PREFETCH) {
-        for (uint g = 0; g < BK/32u; ++g) {
+        if (!EXPANDED) for (uint g = 0; g < BK/32u; ++g) {
             ulong at = origin + ulong(block * (BK/32u) + g) * (32u * BITS);
             low[g] = planes[at]; high[g] = planes[at + 32u]; sign[g] = planes[at + 64u];
             if (BITS == 4) fourth[g] = planes[at + 96u];
         }
+        if (EXPANDED) for (uint j = 0; j < BK/4u; ++j)
+            words[j] = planes[origin + ulong(block * (BK/4u) + j) * 32u];
         scale = float(scales[meta + ulong(block / (128u / BK)) * 32u]);
     }
     threadgroup Operand* destination = (block & 1u) ? second : first;
@@ -106,7 +113,10 @@ for (uint block = begin; block < end; ++block) {
     #pragma clang loop unroll(full)
     for (uint j = 0; j < 32u; ++j) {
         float value;
-        if (BITS == 3) {
+        if (EXPANDED) {
+            uint packed = words[(g * 32u + j) / 4u];
+            value = float(char((packed >> (8u * (j % 4u))) & 255u));
+        } else if (BITS == 3) {
             uint ranks = j < 16u ? low[g] : high[g];
             uint rank = (ranks >> (4u * (j % 8u) + 2u * ((j % 16u) / 8u))) & 3u;
             uint negative = (sign[g] >> (4u * (j % 8u) + j / 8u)) & 1u;
@@ -122,11 +132,13 @@ for (uint block = begin; block < end; ++block) {
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (PREFETCH && block + 1u < end) {
-        for (uint g = 0; g < BK/32u; ++g) {
+        if (!EXPANDED) for (uint g = 0; g < BK/32u; ++g) {
             ulong at = origin + ulong((block + 1u) * (BK/32u) + g) * (32u * BITS);
             low[g] = planes[at]; high[g] = planes[at + 32u]; sign[g] = planes[at + 64u];
             if (BITS == 4) fourth[g] = planes[at + 96u];
         }
+        if (EXPANDED) for (uint j = 0; j < BK/4u; ++j)
+            words[j] = planes[origin + ulong((block + 1u) * (BK/4u) + j) * 32u];
         if ((block + 1u) % (128u / BK) == 0u)
             scale = float(scales[meta + ulong((block + 1u) / (128u / BK)) * 32u]);
     }
@@ -147,14 +159,59 @@ for (uint i = 0; i < accumulator.get_capacity(); ++i) {
 constant float L4I[16] = {6.0f,18.0f,31.0f,44.0f,58.0f,75.0f,96.0f,127.0f,-6.0f,-18.0f,-31.0f,-44.0f,-58.0f,-75.0f,-96.0f,-127.0f};
 constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.247959055f,1.613740157f,2.065587402f,2.732600000f,-0.129099213f,-0.387297638f,-0.667012598f,-0.946727559f,-1.247959055f,-1.613740157f,-2.065587402f,-2.732600000f};
 )METAL");
-    auto output = kernel({w.planes, w.scales, operands}, {{splits, m, w.rows}}, {mx::float32},
+    auto output = kernel({expanded ? *expanded : w.planes, w.scales, operands}, {{splits, m, w.rows}}, {mx::float32},
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
         {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"PREFETCH", prefetch},
          {"BK", tile_k}, {"Operand", full_precision ? mx::float32 : mx::float16},
-         {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels}},
+         {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels}, {"EXPANDED", expanded.has_value()}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
+mx::array tq_expand_tiled_codes(const TqTiledWeights& w) {
+    if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
+        w.columns % 128 || (w.bits != 3 && w.bits != 4) || !w.integer_levels ||
+        w.planes.dtype() != mx::uint32 ||
+        w.planes.shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 32, w.bits, 32})
+        throw std::invalid_argument("invalid tiled integer expansion");
+    static auto expand = mx::fast::metal_kernel("tqllm_expand_tiled_integer_codes",
+        {"planes"}, {"values"}, R"METAL(
+uint i = thread_position_in_grid.x;
+uint tiles = (R + 31u) / 32u;
+if (i >= tiles * (K / 4u) * 32u) return;
+uint lane = i % 32u, word = (i / 32u) % (K / 4u), tile = i / ((K / 4u) * 32u);
+uint block = word / 8u;
+ulong origin = (ulong(tile) * (K / 32u) + block) * (BITS * 32u) + lane;
+uint packed = 0u;
+for (uint byte = 0; byte < 4u; ++byte) {
+    uint j = (word % 8u) * 4u + byte;
+    int value;
+    if (BITS == 3) {
+        uint ranks = planes[origin + (j / 16u) * 32u];
+        uint rank = (ranks >> (4u * (j % 8u) + 2u * ((j % 16u) / 8u))) & 3u;
+        uint sign = (planes[origin + 64u] >> (4u * (j % 8u) + j / 8u)) & 1u;
+        value = int((0x7f4f2d0eu >> (rank * 8u)) & 255u);
+        if (sign) value = -value;
+    } else {
+        uint code = (planes[origin + (j / 8u) * 32u] >> (4u * (j % 8u))) & 15u;
+        value = LEVELS[code];
+    }
+    if (tile * 32u + lane >= R) value = 0;
+    packed |= (uint(value) & 255u) << (8u * byte);
+}
+values[i] = packed;
+)METAL", R"METAL(
+constant int LEVELS[16] = {6,18,31,44,58,75,96,127,-6,-18,-31,-44,-58,-75,-96,-127};
+)METAL");
+    const int tiles = (w.rows + 31) / 32;
+    // Guard Metal's grid indexing before constructing the launch dimensions.
+    const int64_t count = int64_t(tiles) * (w.columns / 4) * 32;
+    if (count > std::numeric_limits<int>::max())
+        throw std::invalid_argument("expanded tiled grid exceeds supported size");
+    return expand({w.planes}, {{tiles, w.columns / 4, 32}}, {mx::uint32},
+        {int(count), 1, 1}, {256, 1, 1}, {{"R", w.rows}, {"K", w.columns}, {"BITS", w.bits}},
+        std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input, int splits, int tile_k) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||

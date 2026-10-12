@@ -17,7 +17,10 @@ TqTiledWeights tq4_tile(const Tq4Weights& weights);
 // Input is already rotated. Operand precision is explicit; accumulation is FP32.
 mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
-    bool full_precision = false);
+    bool full_precision = false,
+    const std::optional<mlx::core::array>& expanded = std::nullopt);
+// Lossless int8 code levels, packed four per word in output-coalesced order.
+mlx::core::array tq_expand_tiled_codes(const TqTiledWeights& weights);
 // Integer codes stay exact in FP16; high/residual input rows share one tile.
 mlx::core::array tq_compensated_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 4, int tile_k = 32);
