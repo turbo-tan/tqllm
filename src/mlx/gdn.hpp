@@ -4,6 +4,11 @@
 namespace tqllm::mlx_backend {
 mlx::core::array gdn_convolve(const mlx::core::array& joined,
     const mlx::core::array& weights,bool compiled=false);
+mlx::core::array gdn_convolve_native(const mlx::core::array& joined,
+    const mlx::core::array& weights);
+std::pair<mlx::core::array,mlx::core::array> gdn_gates_native(
+    const mlx::core::array& alpha,const mlx::core::array& beta,
+    const mlx::core::array& bias,const mlx::core::array& rate);
 mlx::core::array gdn_normalize(const mlx::core::array& input,float scale,bool compiled=false);
 mlx::core::array gdn_decay(const mlx::core::array& alpha,const mlx::core::array& bias,
     const mlx::core::array& rate,bool compiled=false);

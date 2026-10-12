@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 #include <cstdlib>
+#include <bit>
 
 namespace mx=mlx::core;
 using Clock=std::chrono::steady_clock;
@@ -50,6 +51,17 @@ int main(int argc,char** argv) {
                    layout.to_native.data<uint32_t>()[i]%uint32_t(kh)!=uint32_t(i/(vh/kh)))
                     throw std::runtime_error("GDN head order is not an inverse permutation");
         }
+        for(int invalid=0;invalid<5;++invalid) {
+            bool rejected=false;
+            try {
+                if(invalid==0)tqllm::mlx_backend::gdn_convolve_native(mx::zeros({3,32}),mx::zeros({32,4}));
+                if(invalid==1)tqllm::mlx_backend::gdn_convolve_native(mx::zeros({4,32}),mx::zeros({4,32}));
+                if(invalid==2)tqllm::mlx_backend::gdn_convolve_native(mx::zeros({4,32},mx::bfloat16),mx::zeros({32,4}));
+                if(invalid==3)tqllm::mlx_backend::gdn_gates_native(mx::zeros({8,48}),mx::zeros({8,47}),mx::zeros({48}),mx::zeros({48}));
+                if(invalid==4)tqllm::mlx_backend::gdn_gates_native(mx::zeros({0,48}),mx::zeros({0,48}),mx::zeros({48}),mx::zeros({48}));
+            } catch(const std::invalid_argument&) {rejected=true;}
+            if(!rejected)throw std::runtime_error("invalid native GDN preparation accepted");
+        }
         std::vector<uint32_t> indices(heads);
         for(int h=0;h<heads;++h)indices[h]=uint32_t(h%key_heads);
         mx::array key_indices(indices.data(),{heads},mx::uint32);
@@ -77,19 +89,46 @@ int main(int argc,char** argv) {
             auto fq=mx::reshape(mx::slice(fused,{0,0},{count,key_heads*dk}),{1,count,key_heads,dk});
             check(tqllm::mlx_backend::gdn_normalize(fq,1.0f/std::sqrt(float(dk)),true),nq,"compiled_normalization");
             check(tqllm::mlx_backend::gdn_decay(aa,abias,ar,true),dg,"compiled_decay_extremes");
-            for(bool compiled:{false,true}) {
+            auto native_cv=tqllm::mlx_backend::gdn_convolve_native(aj,aw);
+            check(native_cv,expected,"native_convolution_vs_original");
+            auto native_gates=tqllm::mlx_backend::gdn_gates_native(aa,aa,abias,ar);
+            check(native_gates.first,dg,"native_decay_vs_original");
+            std::vector<double> cpu_decay(alpha.size()),cpu_beta(alpha.size()),cpu_cv(size_t(count)*width);
+            auto round_bf=[](float x) {
+                auto bits=std::bit_cast<uint32_t>(x);
+                bits+=0x7fffu+((bits>>16)&1u);
+                return std::bit_cast<float>(bits&0xffff0000u);
+            };
+            for(int token=0;token<count;++token)for(int col=0;col<width;++col) {
+                float sum=0;
+                for(int tap=0;tap<4;++tap)
+                    sum=sum+joined[size_t(token+tap)*width+col]*weights[size_t(col)*4+tap];
+                float rounded=round_bf(sum);
+                cpu_cv[size_t(token)*width+col]=round_bf(rounded*(1.0f/(1.0f+std::exp(-rounded))));
+            }
+            for(size_t i=0;i<alpha.size();++i) {
+                const double dt=double(alpha[i])+bias[i%heads];
+                cpu_decay[i]=std::exp((std::max(dt,0.0)+std::log1p(std::exp(-std::abs(dt))))*rate[i%heads]);
+                cpu_beta[i]=1.0/(1.0+std::exp(-double(alpha[i])));
+            }
+            check(native_cv,cpu_cv,"native_convolution_cpu");
+            check(native_gates.first,cpu_decay,"native_decay_cpu");
+            check(native_gates.second,cpu_beta,"native_beta_cpu");
+            for(int mode:{0,1,2}) {
                 std::vector<double> times;
                 for(int run=-1;run<5;++run) {
                     auto start=Clock::now();
-                    auto cv=tqllm::mlx_backend::gdn_convolve(aj,aw,compiled);
+                    auto cv=mode==2?tqllm::mlx_backend::gdn_convolve_native(aj,aw):
+                        tqllm::mlx_backend::gdn_convolve(aj,aw,mode==1);
                     auto qv=mx::reshape(mx::slice(cv,{0,0},{count,key_heads*dk}),{1,count,key_heads,dk});
-                    auto nv=tqllm::mlx_backend::gdn_normalize(qv,1.0f/std::sqrt(float(dk)),compiled);
-                    auto dv=tqllm::mlx_backend::gdn_decay(aa,abias,ar,compiled);
-                    mx::eval(cv,nv,dv);
+                    auto nv=tqllm::mlx_backend::gdn_normalize(qv,1.0f/std::sqrt(float(dk)),mode==1);
+                    auto gates=mode==2?tqllm::mlx_backend::gdn_gates_native(aa,aa,abias,ar):
+                        std::pair{tqllm::mlx_backend::gdn_decay(aa,abias,ar,mode==1),mx::sigmoid(aa)};
+                    mx::eval(cv,nv,gates.first,gates.second);
                     if(run>=0)times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
                 }
                 std::sort(times.begin(),times.end());
-                std::cout<<"GDN_PREP_BENCH count="<<count<<" compiled="<<compiled<<" median_ms="<<times[2]<<std::endl;
+                std::cout<<"GDN_PREP_BENCH count="<<count<<" mode="<<mode<<" median_ms="<<times[2]<<std::endl;
             }
         }
         for(int count:{1,3,5,8,16,64}) {

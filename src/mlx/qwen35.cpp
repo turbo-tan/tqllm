@@ -81,6 +81,7 @@ struct Qwen35::Impl {
     bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
     bool compact_gdn=std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE")!=nullptr;
     bool compiled_gdn=std::getenv("TQLLM_MLX_COMPILED_GDN")!=nullptr;
+    bool native_gdn_prep=std::getenv("TQLLM_MLX_NATIVE_GDN_PREP")!=nullptr;
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
@@ -284,7 +285,7 @@ struct Qwen35::Impl {
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
-        auto result=gdn_convolve(joined,weights,compiled_gdn);
+        auto result=native_gdn_prep?gdn_convolve_native(joined,weights):gdn_convolve(joined,weights,compiled_gdn);
         c.conv=mx::contiguous(tail_slice(joined,0,m,m+conv-1));
         auto q=mx::reshape(tail_slice(result,1,0,kh*dk),{1,m,kh,dk});
         auto k=mx::reshape(tail_slice(result,1,kh*dk,2*kh*dk),{1,m,kh,dk});
@@ -293,8 +294,9 @@ struct Qwen35::Impl {
         k=gdn_normalize(k,1,compiled_gdn);
         if(!native_head_order && !scan_gdn) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
         auto a=mat(p+"ssm_alpha.weight",x),b=mat(p+"ssm_beta.weight",x);
-        auto decay=mx::reshape(gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),{1,m,vh});
-        auto beta=mx::reshape(mx::sigmoid(b),{1,m,vh});
+        auto gates=native_gdn_prep?gdn_gates_native(a,b,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a")):
+            std::pair{gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),mx::sigmoid(b)};
+        auto decay=mx::reshape(gates.first,{1,m,vh}),beta=mx::reshape(gates.second,{1,m,vh});
         auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
         if(capture_prefix) {
             tape.states=scanned->snapshots;

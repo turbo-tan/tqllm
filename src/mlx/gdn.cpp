@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <string_view>
+#include <limits>
 
 namespace tqllm::mlx_backend {
 namespace mx=mlx::core;
@@ -35,6 +36,53 @@ mx::array gdn_convolve(const mx::array& joined,const mx::array& weights,bool com
         throw std::invalid_argument("invalid GDN convolution dimensions");
     static auto fused=mx::compile(convolve);
     return compiled?fused({joined,weights})[0]:convolve({joined,weights})[0];
+}
+mx::array gdn_convolve_native(const mx::array& joined,const mx::array& weights) {
+    if(joined.ndim()!=2 || joined.shape(0)<4 || joined.shape(1)<1 ||
+       uint64_t(joined.shape(0)-3)*uint64_t(joined.shape(1))>uint64_t(std::numeric_limits<int>::max()) ||
+       weights.shape()!=mx::Shape{joined.shape(1),4} ||
+       joined.dtype()!=mx::float32 || weights.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid native GDN convolution dimensions");
+    const int m=joined.shape(0)-3,width=joined.shape(1);
+    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_convolve_native",{"joined","weights"},{"out"},R"METAL(
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+uint i=thread_position_in_grid.x;
+if(i>=M*WIDTH)return;
+uint token=i/WIDTH,col=i%WIDTH;
+float sum=0.0f;
+for(uint tap=0;tap<4u;++tap)sum=sum+joined[(token+tap)*WIDTH+col]*weights[col*4u+tap];
+float rounded=float(bfloat16_t(sum));
+float gate=1.0f/(1.0f+exp(-rounded));
+out[i]=float(bfloat16_t(rounded*gate));
+)METAL");
+    return kernel({mx::contiguous(joined),mx::contiguous(weights)},{{m,width}},{mx::float32},
+        {m*width,1,1},{256,1,1},{{"M",m},{"WIDTH",width}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+}
+std::pair<mx::array,mx::array> gdn_gates_native(const mx::array& alpha,const mx::array& beta,
+    const mx::array& bias,const mx::array& rate) {
+    if(alpha.ndim()!=2 || alpha.shape(0)<1 || alpha.shape(1)<1 ||
+       alpha.size()>size_t(std::numeric_limits<int>::max()) ||
+       alpha.shape()!=beta.shape() || bias.shape()!=mx::Shape{alpha.shape(1)} ||
+       rate.shape()!=bias.shape() || alpha.dtype()!=mx::float32 || beta.dtype()!=mx::float32 ||
+       bias.dtype()!=mx::float32 || rate.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid native GDN gates dimensions");
+    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_gates_native",{"alpha","beta","bias","rate"},
+        {"decay","gate"},R"METAL(
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+uint i=thread_position_in_grid.x;
+if(i>=N)return;
+uint head=i%HEADS;
+float dt=alpha[i]+bias[head];
+float softplus=max(dt,0.0f)+log1p(exp(-abs(dt)));
+decay[i]=exp(softplus*rate[head]);
+gate[i]=1.0f/(1.0f+exp(-beta[i]));
+)METAL");
+    auto result=kernel({mx::contiguous(alpha),mx::contiguous(beta),mx::contiguous(bias),mx::contiguous(rate)},
+        {alpha.shape(),alpha.shape()},{mx::float32,mx::float32},{int(alpha.size()),1,1},{256,1,1},
+        {{"N",int(alpha.size())},{"HEADS",alpha.shape(1)}},std::nullopt,false,mx::Device(mx::Device::gpu));
+    return {result[0],result[1]};
 }
 mx::array gdn_normalize(const mx::array& input,float scale,bool compiled) {
     if(input.ndim()!=4 || input.shape(3)<32 || input.shape(3)%32 || input.dtype()!=mx::float32)
