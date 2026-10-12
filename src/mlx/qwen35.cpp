@@ -44,7 +44,7 @@ struct Qwen35::Impl {
     GgufFile file;
     std::map<std::string,Matrix> matrices;
     std::map<std::string,Tq3Expanded> decoded_ffn;
-    std::map<std::string,Tq3TiledWeights> tiled_ffn;
+    std::map<std::string,TqTiledWeights> tiled_ffn;
     std::map<std::string,Tq3Affine8> affine_ffn;
     std::map<std::string,Tq3Affine8> affine_gu;
     bool joined_gu=std::getenv("TQLLM_MLX_AFFINE_GU")!=nullptr;
@@ -94,6 +94,9 @@ struct Qwen35::Impl {
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP32 must be 1");
         if(std::getenv("TQLLM_MLX_TILED_TQ3_FP16") && std::getenv("TQLLM_MLX_TILED_TQ3_FP32"))
             throw std::invalid_argument("select only one tiled TQ3 operand precision");
+        if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ4_FP32"))
+            if(std::string_view(mode)!="1")
+                throw std::invalid_argument("TQLLM_MLX_TILED_TQ4_FP32 must be 1");
         if(compact_gdn && std::string_view(std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE"))!="1")
             throw std::invalid_argument("TQLLM_MLX_COMPACT_GDN_TAPE must be 1");
         const auto arch=file.kv.at("general.architecture").str;
@@ -152,6 +155,12 @@ struct Qwen35::Impl {
                     mx::eval(tiled.planes,tiled.scales);
                     tiled_ffn.emplace(name,std::move(tiled));
                 }
+            if(std::getenv("TQLLM_MLX_TILED_TQ4_FP32") && name.find(".ffn_")!=std::string::npos)
+                if(auto packed=std::get_if<Tq4Weights>(&w)) {
+                    auto tiled=tq4_tile(*packed);
+                    mx::eval(tiled.planes,tiled.scales);
+                    tiled_ffn.emplace(name,std::move(tiled));
+                }
             matrices.emplace(name,std::move(w));
         };
         auto scalar=[&](const std::string& name) {
@@ -202,10 +211,12 @@ struct Qwen35::Impl {
             if(reuse_rotation)rotation=std::pair{x,value};
             return value;
         };
-        if((std::getenv("TQLLM_MLX_TILED_TQ3_FP16") || std::getenv("TQLLM_MLX_TILED_TQ3_FP32")) && x.shape(0)<=8)
-            if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end())
-                return bf(tq3_tiled_matmul(found->second,rotated(),4,true,32,
-                    std::getenv("TQLLM_MLX_TILED_TQ3_FP32")!=nullptr));
+        if(x.shape(0)<=8)
+            if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end()) {
+                const bool fp32=std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
+                const bool active=fp32 || (found->second.bits==3 && std::getenv("TQLLM_MLX_TILED_TQ3_FP16"));
+                if(active)return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
+            }
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=affine_ffn.find(name);found!=affine_ffn.end()) {
                 const bool fp32=(affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(w)) ||
