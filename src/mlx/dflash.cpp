@@ -2,6 +2,7 @@
 #include "../dequant.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -30,6 +31,48 @@ mx::array dflash_conv(const mx::array& x,const mx::array& dynamic,const mx::arra
         result=mx::add(result,mx::multiply(weights,input));
     }
     return bf(result);
+}
+mx::array dflash_select(const mx::array& mapped,const mx::array& unary,const mx::array& gate,
+    const mx::array& successors,const mx::array& predecessors,uint32_t anchor,int count) {
+    if(mapped.shape()!=mx::Shape{8,16} || mapped.dtype()!=mx::uint32 ||
+       unary.shape()!=mapped.shape() || unary.dtype()!=mx::float32 ||
+       gate.shape()!=mx::Shape{8,256} || gate.dtype()!=mx::float32 ||
+       successors.shape()!=mx::Shape{8,16,256} || successors.dtype()!=mx::float32 ||
+       predecessors.ndim()!=2 || predecessors.shape(1)!=256 || predecessors.dtype()!=mx::bfloat16 ||
+       anchor>=uint32_t(predecessors.shape(0)) || count<1 || count>7)
+        throw std::invalid_argument("invalid DFlash selector dimensions");
+    static auto select=mx::fast::metal_kernel("tqllm_dflash_select",
+        {"mapped","unary","gate","successors","predecessors","anchor"},{"tokens"},R"METAL(
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+uint lane=thread_position_in_threadgroup.x;
+uint previous=anchor;
+for(uint step=1;step<=COUNT;++step) {
+ float maximum=-INFINITY;
+ uint winner=0;
+ for(uint candidate=0;candidate<16u;++candidate) {
+  float sum=0.0f;
+  for(uint block=0;block<2u;++block)for(uint j=0;j<4u;++j) {
+   uint col=block*128u+lane*4u+j;
+   float weighted=float(predecessors[previous*256u+col])*gate[step*256u+col];
+   float product=successors[(step*16u+candidate)*256u+col]*weighted;
+   sum=sum+product;
+  }
+  float score=simd_sum(sum)+unary[step*16u+candidate];
+  if(score>maximum) {maximum=score;winner=candidate;}
+ }
+ previous=mapped[step*16u+winner];
+ if(previous>=VOCAB) {
+  if(lane==0)for(uint rest=step;rest<=COUNT;++rest)tokens[rest-1u]=VOCAB;
+  return;
+ }
+ if(lane==0)tokens[step-1u]=previous;
+}
+)METAL");
+    return select({mx::contiguous(mapped),mx::contiguous(unary),mx::contiguous(gate),
+        mx::contiguous(successors),mx::contiguous(predecessors),mx::array(anchor)},
+        {{count}},{mx::uint32},{32,1,1},{32,1,1},
+        {{"COUNT",count},{"VOCAB",predecessors.shape(0)}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
 struct DFlash2::Impl {
     Qwen35& target;
@@ -150,6 +193,15 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
+    if(std::getenv("TQLLM_MLX_DEVICE_SELECTOR")) {
+        auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
+            i.plain.at("selector_predecessor.weight"),anchor,count);
+        mx::eval(chosen);
+        std::vector<uint32_t> result(chosen.data<uint32_t>(),chosen.data<uint32_t>()+count);
+        if(std::any_of(result.begin(),result.end(),[&](uint32_t id){return id>=uint32_t(i.vocab);}))
+            throw std::runtime_error("DFlash selector token outside vocabulary");
+        return result;
+    }
     mx::eval(mapped,unary,gate,successors);
     std::vector<uint32_t> result;
     uint32_t predecessor=anchor;
