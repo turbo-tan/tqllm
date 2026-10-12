@@ -205,6 +205,7 @@ uint begin = part * (K / BK / SPLITS), end = (part + 1u) * (K / BK / SPLITS);
 for (uint block = begin; block < end; ++block) {
     if (INTEGER_OPERAND) for (uint i = 0; i < accumulator.get_capacity(); ++i)
         if (accumulator.is_valid_element(i)) accumulator[i] = 0.0f;
+    #pragma clang loop unroll(full)
     for (uint i = 0; i < weights.get_capacity(); ++i) {
         if (!weights.is_valid_element(i)) continue;
         auto position = weights.get_multidimensional_index(i);
