@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <numeric>
@@ -41,9 +42,21 @@ int main(int argc, char** argv) {
                 reference[t].insert(reference[t].end(),last.data<float>(),last.data<float>()+last.size());
             }
             model.restore(start); Qwen35::Verification ticket;
+            const char* capture = width == 8 ? std::getenv("TQLLM_MLX_CAPTURE_VERIFY") : nullptr;
+            if (capture) {
+                auto warm = model.verify({tokens.data(),size_t(width)},ticket);
+                mx::eval(warm);model.restore(start);
+                mx::metal::start_capture(capture);
+            }
             const auto began = std::chrono::steady_clock::now();
-            auto logits = model.verify({tokens.data(),size_t(width)},ticket);
-            mx::eval(logits);
+            try {
+                auto logits = model.verify({tokens.data(),size_t(width)},ticket);
+                mx::eval(logits);
+            } catch (...) {
+                if (capture) mx::metal::stop_capture();
+                throw;
+            }
+            if (capture) mx::metal::stop_capture();
             std::cout << "LAYER_VERIFY_MS width=" << width << " ms="
                       << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count() << std::endl;
             auto features = model.feature_states(), last = model.hidden_states(); mx::eval(features,last);
