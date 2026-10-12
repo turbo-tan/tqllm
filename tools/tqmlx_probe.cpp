@@ -20,7 +20,7 @@ int main(int argc,char** argv) {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
         int verify_repeats=5,verify_width=0;
-        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false,verify_prefix_probe=false;
+        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false,verify_prefix_probe=false,draft_head4=false;
         size_t cache_limit=0;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
@@ -44,6 +44,7 @@ int main(int argc,char** argv) {
             else if(arg=="--verify-tiles") verify_tiles=true;
             else if(arg=="--tq3-vector-load") tq3_vector_load=true;
             else if(arg=="--stage-profile") stage_profiling=true;
+            else if(arg=="--draft-head4") draft_head4=true;
             else if(arg=="--prefill-gemm") prefill_gemm=true;
             else if(arg=="--clear-cache-after-prefill") clear_prefill_cache=true;
             else if(arg=="--cache-limit-mib") cache_limit=std::stoull(value())*1024*1024;
@@ -65,6 +66,7 @@ int main(int argc,char** argv) {
         engine.verify_tiles(verify_tiles);
         engine.tq3_vector_load(tq3_vector_load);
         engine.profile_stages(stage_profiling);
+        if(draft_head4)engine.enable_draft_head4();
         std::cerr<<"MLX_MODEL_LOADED seconds="<<elapsed(started)<<" vocabulary="<<engine.vocabulary()<<'\n';
         memory("loaded");
         if(verify_probe) {
