@@ -60,6 +60,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_TILED_TQ4_FP32` | unset (backend default) | Experimental Apple MLX tiled tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
 | `TQLLM_MLX_TQ3_STREAM` | unset (backend default) | Experimental Apple MLX tq3 stream override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
 | `TQLLM_MLX_TQ3_SUBGROUP` | unset (backend default) | Experimental Apple MLX tq3 subgroup override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_TQ4_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes. |  |
 
 ## Retired (the tool stops; use the replacement)
 

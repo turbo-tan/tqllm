@@ -101,6 +101,11 @@ struct Qwen35::Impl {
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP32 must be 1");
         if(std::getenv("TQLLM_MLX_TILED_TQ3_FP16") && std::getenv("TQLLM_MLX_TILED_TQ3_FP32"))
             throw std::invalid_argument("select only one tiled TQ3 operand precision");
+        if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ4_FP16"))
+            if(std::string_view(mode)!="1")
+                throw std::invalid_argument("TQLLM_MLX_TILED_TQ4_FP16 must be 1");
+        if(std::getenv("TQLLM_MLX_TILED_TQ4_FP16") && std::getenv("TQLLM_MLX_TILED_TQ4_FP32"))
+            throw std::invalid_argument("select only one tiled TQ4 operand precision");
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ4_FP32"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ4_FP32 must be 1");
@@ -165,7 +170,7 @@ struct Qwen35::Impl {
                     mx::eval(tiled.planes,tiled.scales);
                     tiled_projections.emplace(name,std::move(tiled));
                 }
-            if(std::getenv("TQLLM_MLX_TILED_TQ4_FP32") && name.find(".ffn_")!=std::string::npos)
+            if((std::getenv("TQLLM_MLX_TILED_TQ4_FP16") || std::getenv("TQLLM_MLX_TILED_TQ4_FP32")) && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq4Weights>(&w)) {
                     auto tiled=tq4_tile(*packed);
                     mx::eval(tiled.planes,tiled.scales);
@@ -240,8 +245,8 @@ struct Qwen35::Impl {
                 const bool mixer_projection=name.find(".ffn_")==std::string::npos;
                 const bool fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
                     std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
-                const bool active=fp32 || (!mixer_projection && found->second.bits==3 &&
-                    std::getenv("TQLLM_MLX_TILED_TQ3_FP16"));
+                const bool active=fp32 || (!mixer_projection &&
+                    std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"));
                 if(active)return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
             }
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))

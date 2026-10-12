@@ -613,3 +613,7 @@ flags:
     kind: debug
     default: "unset (backend default)"
     doc: "Experimental Apple MLX tq3 subgroup override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
+  - name: TQLLM_MLX_TILED_TQ4_FP16
+    kind: debug
+    default: "unset (backend default)"
+    doc: "Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes."
