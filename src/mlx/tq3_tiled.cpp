@@ -155,10 +155,11 @@ constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
-mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input, int splits) {
+mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input, int splits, int tile_k) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
         (w.bits != 3 && w.bits != 4) || !w.integer_levels ||
+        (tile_k != 32 && tile_k != 128) ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
         w.planes.shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 32, w.bits, 32} ||
         w.scales.shape() != mx::Shape{(w.rows + 31) / 32, w.columns / 128, 32} ||
@@ -176,65 +177,71 @@ mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input,
 uint lane = thread_position_in_threadgroup.x;
 uint tile = threadgroup_position_in_grid.y;
 uint part = threadgroup_position_in_grid.z;
-threadgroup half storage[2 * 32 * 32];
+threadgroup half storage[2 * 32 * BK];
 threadgroup float dots[16 * 32];
 tensor<device half, dextents<int, 2>, tensor_inline> inputs(
     (device half*)x, dextents<int, 2>{int(K), 16}, array<int, 2>{1, int(K)});
-tensor<threadgroup half, extents<int, 32, 32>, tensor_inline> stage0(storage, extents<int, 32, 32>());
-tensor<threadgroup half, extents<int, 32, 32>, tensor_inline> stage1(storage + 32 * 32, extents<int, 32, 32>());
-constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, false, false,
+tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage0(storage, extents<int, 32, BK>());
+tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage1(storage + 32 * BK, extents<int, 32, BK>());
+constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(16, 32, BK, false, false, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<1>> operation;
-auto initial = inputs.template slice<32, 16>(0, 0);
+auto initial = inputs.template slice<BK, 16>(0, 0);
 auto accumulator = operation.template get_destination_cooperative_tensor<decltype(initial), decltype(stage0), float>();
 float sums[8];
 for (uint col = 0; col < 8u; ++col) sums[col] = 0.0f;
-uint begin = part * (K / 32u / SPLITS), end = (part + 1u) * (K / 32u / SPLITS);
+uint begin = part * (K / BK / SPLITS), end = (part + 1u) * (K / BK / SPLITS);
 ulong origin = ulong(tile) * (K / 32u) * (32u * BITS) + lane;
 ulong meta = ulong(tile) * (K / 128u) * 32u + lane;
-uint low_code = planes[origin + ulong(begin) * (32u * BITS)];
-uint high_code = planes[origin + ulong(begin) * (32u * BITS) + 32u];
-uint sign_code = planes[origin + ulong(begin) * (32u * BITS) + 64u];
-uint fourth = 0u;
-if (BITS == 4) fourth = planes[origin + ulong(begin) * (32u * BITS) + 96u];
+uint low_code[BK/32], high_code[BK/32], sign_code[BK/32], fourth[BK/32];
+for (uint g = 0; g < BK/32u; ++g) {
+    ulong at = origin + ulong(begin * (BK/32u) + g) * (32u * BITS);
+    low_code[g] = planes[at]; high_code[g] = planes[at + 32u]; sign_code[g] = planes[at + 64u];
+    if (BITS == 4) fourth[g] = planes[at + 96u];
+}
 for (uint block = begin; block < end; ++block) {
-    if (block % 4u == 0u)
+    if (block % (128u / BK) == 0u)
         for (uint i = 0; i < accumulator.get_capacity(); ++i)
             if (accumulator.is_valid_element(i)) accumulator[i] = 0.0f;
-    threadgroup half* destination = storage + (block & 1u) * (32u * 32u);
+    threadgroup half* destination = storage + (block & 1u) * (32u * BK);
+    #pragma clang loop unroll(full)
+    for (uint g = 0; g < BK/32u; ++g) {
     #pragma clang loop unroll(full)
     for (uint j = 0; j < 32u; ++j) {
         int level;
         if (BITS == 3) {
-            uint ranks = j < 16u ? low_code : high_code;
+            uint ranks = j < 16u ? low_code[g] : high_code[g];
             uint rank = (ranks >> (4u * (j % 8u) + 2u * ((j % 16u) / 8u))) & 3u;
-            uint negative = (sign_code >> (4u * (j % 8u) + j / 8u)) & 1u;
+            uint negative = (sign_code[g] >> (4u * (j % 8u) + j / 8u)) & 1u;
             level = int((0x7f4f2d0eu >> (rank * 8u)) & 255u);
             if (negative) level = -level;
         } else {
-            uint packed = j < 8u ? low_code : j < 16u ? high_code : j < 24u ? sign_code : fourth;
+            uint packed = j < 8u ? low_code[g] : j < 16u ? high_code[g] : j < 24u ? sign_code[g] : fourth[g];
             uint code = (packed >> (4u * (j % 8u))) & 15u;
             level = LEVELS4[code];
         }
-        destination[j * 32u + lane] = half(level);
+        destination[(g * 32u + j) * 32u + lane] = half(level);
+    }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (block + 1u < end) {
-        ulong at = origin + ulong(block + 1u) * (32u * BITS);
-        low_code = planes[at]; high_code = planes[at + 32u]; sign_code = planes[at + 64u];
-        if (BITS == 4) fourth = planes[at + 96u];
+        for (uint g = 0; g < BK/32u; ++g) {
+            ulong at = origin + ulong((block + 1u) * (BK/32u) + g) * (32u * BITS);
+            low_code[g] = planes[at]; high_code[g] = planes[at + 32u]; sign_code[g] = planes[at + 64u];
+            if (BITS == 4) fourth[g] = planes[at + 96u];
+        }
     }
-    auto activation = inputs.template slice<32, 16>(block * 32u, 0);
+    auto activation = inputs.template slice<BK, 16>(block * BK, 0);
     if (block & 1u) operation.run(activation, stage1, accumulator);
     else operation.run(activation, stage0, accumulator);
-    if (block % 4u == 3u) {
+    if ((block + 1u) % (128u / BK) == 0u) {
         for (uint i = 0; i < accumulator.get_capacity(); ++i) {
             if (!accumulator.is_valid_element(i)) continue;
             auto pos = accumulator.get_multidimensional_index(i);
             dots[uint(pos[1]) * 32u + uint(pos[0])] = accumulator[i];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        float scale = float(scales[meta + ulong(block / 4u) * 32u]);
+        float scale = float(scales[meta + ulong(block / (128u / BK)) * 32u]);
         for (uint col = 0; col < 8u; ++col)
             sums[col] += scale * (dots[col * 32u + lane] + dots[(col + 8u) * 32u + lane] * (1.0f / 2048.0f));
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -251,7 +258,7 @@ constant int LEVELS4[16] = {6,18,31,44,58,75,96,127,-6,-18,-31,-44,-58,-75,-96,-
 )METAL");
     auto output = kernel({w.planes, w.scales, operands}, {{splits, m, w.rows}}, {mx::float32},
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
-        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}},
+        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}, {"BK", tile_k}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }

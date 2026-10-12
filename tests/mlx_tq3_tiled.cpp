@@ -133,20 +133,20 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
     if (compensated) {
-        for (int split : {1, 2, 4}) {
+        for (int split : {1, 2, 4}) for (int tile_k : {32, 128}) {
             if (k % (128 * split)) continue;
-            auto reference = tq_compensated_matmul(tiled, x, split);
+            auto reference = tq_compensated_matmul(tiled, x, split, tile_k);
             const double error = rel_l2(reference, full);
             if (!std::isfinite(error) || error > 2e-5)
                 throw std::runtime_error("compensated projection failed original GGUF CPU oracle");
             for (int width : {1, 3, 5, 8}) {
-                auto got = tq_compensated_matmul(tiled, mx::array(values.data(), {width, k}), split);
+                auto got = tq_compensated_matmul(tiled, mx::array(values.data(), {width, k}), split, tile_k);
                 mx::eval(got);
                 if (std::memcmp(got.data<float>(), reference.data<float>(), size_t(width) * rows * sizeof(float)))
                     throw std::runtime_error("compensated projection changed with width");
             }
             std::cout << "COMPENSATED_ORACLE_PASS bits=" << bits << " rows=" << rows << " k=" << k
-                      << " splits=" << split << " original_cpu_rel_l2=" << error << std::endl;
+                      << " splits=" << split << " tile_k=" << tile_k << " original_cpu_rel_l2=" << error << std::endl;
         }
         return;
     }
@@ -220,11 +220,11 @@ static void bench_compensated(const GgufFile& file, const std::string& name) {
         tq3_tile(load_tq3_blocks(raw, int(tensor.ne[1]), int(tensor.ne[0]))) :
         tq4_tile(load_tq4_blocks(raw, int(tensor.ne[1]), int(tensor.ne[0])));
     mx::eval(weights.planes, weights.scales);
-    for (int width : {1, 8}) {
+    for (int width : {1, 8}) for (int tile_k : {32, 128}) {
         auto values = inputs(width, weights.columns);
         auto x = mx::array(values.data(), {width, weights.columns}); mx::eval(x);
         auto baseline = [&] { return tq_tiled_matmul(weights, x, 4, true, 32, true); };
-        auto candidate = [&] { return tq_compensated_matmul(weights, x, 4); };
+        auto candidate = [&] { return tq_compensated_matmul(weights, x, 4, tile_k); };
         const double error = rel_l2(candidate(), baseline());
         if (!std::isfinite(error) || error > 2e-5)
             throw std::runtime_error("compensated full shape precision failed");
@@ -233,7 +233,7 @@ static void bench_compensated(const GgufFile& file, const std::string& name) {
             const double elapsed = comp ? measure(candidate) : measure(baseline);
             std::cout << "COMPENSATED_BENCH tensor=" << name << " rows=" << weights.rows
                       << " k=" << weights.columns << " width=" << width << " arm=" << arm
-                      << " compensated=" << comp << " elapsed_ms=" << elapsed
+                      << " tile_k=" << tile_k << " compensated=" << comp << " elapsed_ms=" << elapsed
                       << " fp32_baseline_rel_l2=" << error << std::endl;
         }
     }
