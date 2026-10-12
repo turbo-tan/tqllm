@@ -20,7 +20,7 @@ int main(int argc,char** argv) {
         std::string model,prompt,tokens_path,logits_path;
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
         int verify_repeats=5,verify_width=0;
-        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false;
+        bool ignore_eos=false,all_logits=false,profiling=false,prefill_gemm=false,clear_prefill_cache=false,verify_probe=false,verify_tiles=false,tq3_vector_load=false,stage_profiling=false,verify_prefix_probe=false;
         size_t cache_limit=0;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
@@ -38,6 +38,7 @@ int main(int argc,char** argv) {
             else if(arg=="--all-logits") all_logits=true;
             else if(arg=="--profile") profiling=true;
             else if(arg=="--verify-probe") verify_probe=true;
+            else if(arg=="--verify-prefix-probe") {verify_probe=true;verify_prefix_probe=true;}
             else if(arg=="--verify-repeats") verify_repeats=std::stoi(value());
             else if(arg=="--verify-width") verify_width=std::stoi(value());
             else if(arg=="--verify-tiles") verify_tiles=true;
@@ -58,6 +59,7 @@ int main(int argc,char** argv) {
         if(input.empty()||input.size()+size_t(count)>size_t(context))throw std::invalid_argument("prompt or output exceeds context");
         if(cache_limit)mx::set_cache_limit(cache_limit);
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
+        if(verify_prefix_probe)engine.gdn_mode(tqllm::mlx_backend::Qwen35::GdnMode::scan);
         engine.profile(profiling);
         engine.prefill_gemm(prefill_gemm);
         engine.verify_tiles(verify_tiles);
@@ -89,7 +91,9 @@ int main(int argc,char** argv) {
                     engine.restore(checkpoint);
                     if(engine.position()!=start_pos)throw std::runtime_error("snapshot restored wrong position");
                     const auto begin=Clock::now();
-                    auto y=engine.forward({chain.data(),size_t(width)},true);
+                    tqllm::mlx_backend::Qwen35::Verification ticket;
+                    auto y=verify_prefix_probe?engine.verify({chain.data(),size_t(width)},ticket):
+                        engine.forward({chain.data(),size_t(width)},true);
                     const float* values=y.data<float>();
                     const double ms=elapsed(begin)*1000;
                     if(run>=0) {milliseconds.push_back(ms);const auto [body,head]=engine.timings();bodies.push_back(body);heads.push_back(head);}
@@ -113,6 +117,7 @@ int main(int argc,char** argv) {
                 std::sort(milliseconds.begin(),milliseconds.end());std::sort(bodies.begin(),bodies.end());std::sort(heads.begin(),heads.end());const double ms=milliseconds[milliseconds.size()/2];
                 std::cout<<"{\"kind\":\"verify_cost_only\",\"width\":"<<width<<",\"median_ms\":"<<ms
                          <<",\"body_ms\":"<<bodies[bodies.size()/2]<<",\"head_ms\":"<<heads[heads.size()/2]<<",\"profile_sync\":"<<profiling
+                         <<",\"captures_prefix\":"<<verify_prefix_probe
                          <<",\"ideal_tokens_per_s\":"<<1000*width/ms<<",\"mean_kld_vs_sequential\":"<<mean_kld
                          <<",\"top1_same\":"<<same<<",\"max_logit_difference\":"<<max_diff<<"}"<<std::endl;
                 if(width==1 && (max_diff!=0 || same!=1))throw std::runtime_error("snapshot replay changed sequential logits");
