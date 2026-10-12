@@ -135,19 +135,20 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
     if (transposed_screen) {
-        for (bool fp32 : {true,false}) {
-            auto reference=tq_tiled_matmul(tiled,x,4,true,32,fp32,std::nullopt,1,true);
+        for (bool fp32 : {true,false}) for(int split:{1,2,4}) {
+            if(k%(128*split))continue;
+            auto reference=tq_tiled_matmul(tiled,x,split,true,32,fp32,std::nullopt,1,true);
             const double error=rel_l2(reference,fp32?full:cpu);
             if (!std::isfinite(error) || error>2e-5)
                 throw std::runtime_error("transposed tile differs from independent CPU precision oracle");
             for (int width : {1,3,5,8}) {
-                auto got=tq_tiled_matmul(tiled,mx::array(values.data(),{width,k}),4,true,32,fp32,std::nullopt,1,true);
+                auto got=tq_tiled_matmul(tiled,mx::array(values.data(),{width,k}),split,true,32,fp32,std::nullopt,1,true);
                 mx::eval(got,reference);
                 if(std::memcmp(got.data<float>(),reference.data<float>(),size_t(width)*rows*sizeof(float)))
                     throw std::runtime_error("transposed tile changes with column count");
             }
             std::cout<<"TRANSPOSE_CPU_PASS bits="<<bits<<" rows="<<rows<<" k="<<k
-                     <<" fp32="<<fp32<<" contract_rel_l2="<<error<<std::endl;
+                     <<" fp32="<<fp32<<" split="<<split<<" contract_rel_l2="<<error<<std::endl;
         }
         return;
     }
