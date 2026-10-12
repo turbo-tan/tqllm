@@ -43,7 +43,8 @@ static void fixture() {
     auto w=load_q6_blocks(bytes,r,k);auto cache=q6_affine_split(w,6);
     std::vector<mx::array> parts;
     for(int part=0;part<2;++part)parts.push_back(mx::dequantize(cache.codes[part],cache.scales[part],cache.biases[part],32,6,"affine"));
-    auto decoded=mx::add(parts[0],parts[1]);mx::eval(decoded);
+    for(auto& a:parts)a=mx::reshape(mx::slice(mx::reshape(a,{r,k/32,2,16}),{0,0,0,0},{r,k/32,1,16}),{r,k/32,16});
+    auto decoded=mx::reshape(mx::concatenate(parts,2),{r,k});mx::eval(decoded);
     for(size_t i=0;i<expected.size();++i)
         if(decoded.data<float>()[i]!=expected[i])throw std::runtime_error("native6 stored-weight mismatch");
     for(int m:{1,3,5,8}) {

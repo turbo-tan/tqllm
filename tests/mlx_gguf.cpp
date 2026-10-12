@@ -111,7 +111,8 @@ int main(int argc,char** argv) {
             if(q6_six && q6_split) {
                 std::vector<mx::array> pieces;
                 for(int part=0;part<2;++part)pieces.push_back(mx::dequantize(q6_split->codes[part],q6_split->scales[part],q6_split->biases[part],32,6,"affine"));
-                auto decoded=mx::add(pieces[0],pieces[1]);mx::eval(decoded);
+                for(auto& a:pieces)a=mx::reshape(mx::slice(mx::reshape(a,{r,k/32,2,16}),{0,0,0,0},{r,k/32,1,16}),{r,k/32,16});
+                auto decoded=mx::reshape(mx::concatenate(pieces,2),{r,k});mx::eval(decoded);
                 for(size_t j=0;j<w.size();++j)
                     if(decoded.data<float>()[j]!=w[j])throw std::runtime_error("Q6 native6 changed a stored weight");
                 std::cout<<"Q6_NATIVE6_WEIGHT_EXACT tensor="<<name<<std::endl;
