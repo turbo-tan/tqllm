@@ -46,7 +46,8 @@ struct Qwen35::Impl {
     std::map<std::string,Matrix> matrices;
     std::map<std::string,Tq3Expanded> decoded_ffn;
     std::map<std::string,TqTiledWeights> tiled_projections;
-    bool tiled_mixer=std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr;
+    bool tiled_mixer=std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr ||
+        std::getenv("TQLLM_MLX_TILED_MIXER_FP16")!=nullptr;
     std::map<std::string,Tq3Affine8> affine_ffn;
     std::map<std::string,Tq3Affine8> affine_gu;
     bool joined_gu=std::getenv("TQLLM_MLX_AFFINE_GU")!=nullptr;
@@ -112,6 +113,10 @@ struct Qwen35::Impl {
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ4_FP32"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ4_FP32 must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_TILED_MIXER_FP16"))
+            if(std::string_view(mode)!="1")throw std::invalid_argument("TQLLM_MLX_TILED_MIXER_FP16 must be 1");
+        if(std::getenv("TQLLM_MLX_TILED_MIXER_FP16") && std::getenv("TQLLM_MLX_TILED_MIXER_FP32"))
+            throw std::invalid_argument("select only one tiled mixer operand precision");
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_MIXER_FP32"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_MIXER_FP32 must be 1");
@@ -248,7 +253,7 @@ struct Qwen35::Impl {
                 const bool mixer_projection=name.find(".ffn_")==std::string::npos;
                 const bool fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
                     std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
-                const bool active=fp32 || (!mixer_projection &&
+                const bool active=fp32 || (mixer_projection && std::getenv("TQLLM_MLX_TILED_MIXER_FP16")) || (!mixer_projection &&
                     std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"));
                 if(active)return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
             }

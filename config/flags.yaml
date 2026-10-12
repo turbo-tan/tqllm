@@ -621,3 +621,7 @@ flags:
     kind: debug
     default: "unset (separate projections)"
     doc: "Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required."
+  - name: TQLLM_MLX_TILED_MIXER_FP16
+    kind: debug
+    default: "unset (backend default)"
+    doc: "Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates."
