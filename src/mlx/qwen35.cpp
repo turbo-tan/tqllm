@@ -1,4 +1,5 @@
 #include "qwen35.hpp"
+#include "dense_rows.hpp"
 #include "prefill.hpp"
 #include "verify.hpp"
 #include "tuning.hpp"
@@ -62,6 +63,8 @@ struct Qwen35::Impl {
     bool serial_verify_attention=std::getenv("TQLLM_MLX_SERIAL_VERIFY_ATTENTION")!=nullptr;
     bool attention_kv_views=std::getenv("TQLLM_MLX_ATTENTION_KV_VIEWS")!=nullptr;
     bool serial_verify_dense=std::getenv("TQLLM_MLX_SERIAL_VERIFY_DENSE")!=nullptr;
+    bool batch_decode_dense=std::getenv("TQLLM_MLX_BATCH_DECODE_DENSE")!=nullptr;
+    std::optional<std::pair<mx::array,mx::array>> dense_input;
     std::optional<mx::array> last_hidden;
     std::optional<mx::array> last_features;
     std::vector<int> feature_ids;
@@ -215,6 +218,10 @@ struct Qwen35::Impl {
     mx::array mat(const std::string& name,const mx::array& x) {
         const auto& w=matrices.at(name);
         if(capture_prefix && serial_verify_dense && x.shape(0)>1 && std::holds_alternative<mx::array>(w)) {
+            if(batch_decode_dense) {
+                if(!dense_input || dense_input->first.id()!=x.id())dense_input=std::pair{x,dense_row_views(x)};
+                return bf(dense_decode_rows(std::get<mx::array>(w),dense_input->second));
+            }
             std::vector<mx::array> rows;
             rows.reserve(x.shape(0));
             for(int t=0;t<x.shape(0);++t)
@@ -313,7 +320,7 @@ struct Qwen35::Impl {
     mx::array forward(std::span<const uint32_t> tokens,bool all_logits) {
         auto start=std::chrono::steady_clock::now();
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
-        stages.clear();rotation.reset();
+        stages.clear();rotation.reset();dense_input.reset();
         auto tick=std::chrono::steady_clock::now();
         auto record=[&](const char* name,const std::vector<mx::array>& arrays) {
             if(!stage_profiling)return;
@@ -363,7 +370,7 @@ struct Qwen35::Impl {
         auto end=std::chrono::steady_clock::now();
         times={std::chrono::duration<double,std::milli>(body_end-start).count(),
                std::chrono::duration<double,std::milli>(end-body_end).count()};
-        pos+=m;++revision;rotation.reset();
+        pos+=m;++revision;rotation.reset();dense_input.reset();
         return logits;
     }
 };
