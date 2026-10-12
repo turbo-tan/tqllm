@@ -54,7 +54,7 @@ mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int s
         input.ndim() != 2 || input.dtype() != mx::float32 || input.shape(0) < 1 ||
         input.shape(0) > 8 || input.shape(1) != w.columns ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
-        (tile_k != 32 && tile_k != 128) || (full_precision && tile_k != 32))
+        (tile_k != 32 && tile_k != 64 && tile_k != 128) || (full_precision && tile_k == 128))
         throw std::invalid_argument("invalid tiled TQ3 projection");
     const int m = input.shape(0);
     auto padded = input;

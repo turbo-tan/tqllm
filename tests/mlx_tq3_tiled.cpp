@@ -121,8 +121,8 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
         rounded[size_t(m) * rows + r] = float(half_sum);
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
-    for (int split : {1, 2, 4}) for (int tile_k : {32, 128}) for (bool fp32 : {false, true}) {
-        if (fp32 && tile_k != 32) continue;
+    for (int split : {1, 2, 4}) for (int tile_k : {32, 64, 128}) for (bool fp32 : {false, true}) {
+        if (fp32 && tile_k == 128) continue;
         if (k % (128 * split)) continue;
         auto reference = tq_tiled_matmul(tiled, x, split, true, tile_k, fp32);
         const double numerical = rel_l2(reference, fp32 ? full : cpu), precision = rel_l2(reference, full);
@@ -153,7 +153,7 @@ template<class F> static double measure(F operation) {
     }
     std::sort(times.begin(), times.end()); return times[3];
 }
-static void bench(const GgufFile& file, const std::string& name) {
+static void bench(const GgufFile& file, const std::string& name, bool one_point = false) {
     const auto& t = file.tensors.at(name);
     const auto data = file.read(t);
     const std::vector<uint8_t> raw(data.begin(), data.end());
@@ -169,8 +169,9 @@ static void bench(const GgufFile& file, const std::string& name) {
         auto native = [&] { return packed3 ? tq3_matmul(*packed3, x) : tq4_matmul(*packed4, x); };
         auto expected = native(); mx::eval(expected);
         const double baseline = measure(native);
-        for (int tile_k : {32, 128}) for (int split : {1, 2, 4}) for (bool prefetch : {false, true}) for (bool fp32 : {false, true}) {
-            if (fp32 && tile_k != 32) continue;
+        for (int tile_k : {32, 64, 128}) for (int split : {1, 2, 4}) for (bool prefetch : {false, true}) for (bool fp32 : {false, true}) {
+            if (fp32 && tile_k == 128) continue;
+            if (one_point && (tile_k == 128 || split != 4 || !prefetch || !fp32)) continue;
             auto result = tq_tiled_matmul(tiled, x, split, prefetch, tile_k, fp32);
             double error = rel_l2(result, expected);
             if (!std::isfinite(error) || error > (fp32 ? 2e-5 : 1e-3)) throw std::runtime_error("full-shape projection precision gate failed");
@@ -184,8 +185,9 @@ static void bench(const GgufFile& file, const std::string& name) {
 }
 int main(int argc, char** argv) {
     try {
-        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only]]");
-        if (argc == 3 && std::string(argv[2]) != "--cpu-only") throw std::invalid_argument("unknown test option");
+        if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point]]");
+        if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point")
+            throw std::invalid_argument("unknown test option");
         // Cancellation fixtures validate the stated FP16 contract, while reporting original FP32 drift.
         for (int rows : {1, 17, 33, 64}) for (int k : {128, 512})
             check_projection(fixture(rows, k), rows, k, false);
@@ -227,7 +229,8 @@ int main(int argc, char** argv) {
                     t.type == GGML_TQ3 ? 3 : 4);
             }
             std::cout << "TILED_REAL_CPU_GATE_PASS" << std::endl;
-            if (argc == 2) for (const auto& name : names) bench(file, name);
+            if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--one-point"))
+                for (const auto& name : names) bench(file, name, argc == 3);
         }
         std::cout << "TILED_SCREEN_COMPLETE" << std::endl;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
