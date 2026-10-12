@@ -1750,7 +1750,7 @@ public:
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(e));
     }
-    bool full_logits = false;
+    bool full_logits = tqllm::debug_value("full_head") != nullptr;  // TQLLM_DEBUG=full_head: full-vocabulary int8 head, the reference for the shortlist
     void set_full_logits(bool on) override { full_logits = on; }
     const float * verify_logits() const override { return v_logits.as<float>(); }
     void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) override {
