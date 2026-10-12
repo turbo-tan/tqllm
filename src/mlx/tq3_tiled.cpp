@@ -24,7 +24,8 @@ Tq3TiledWeights tq3_tile(const Tq3Weights& w) {
     return {codes, scales, rows, blocks * 32};
 }
 
-mx::array tq3_tiled_matmul(const Tq3TiledWeights& w, const mx::array& input, int splits, bool prefetch, int tile_k) {
+mx::array tq3_tiled_matmul(const Tq3TiledWeights& w, const mx::array& input, int splits, bool prefetch,
+    int tile_k, bool full_precision) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 63 || w.columns <= 0 ||
         w.columns % 128 || w.planes.ndim() != 4 || w.scales.ndim() != 3 ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
@@ -33,26 +34,26 @@ mx::array tq3_tiled_matmul(const Tq3TiledWeights& w, const mx::array& input, int
         input.ndim() != 2 || input.dtype() != mx::float32 || input.shape(0) < 1 ||
         input.shape(0) > 8 || input.shape(1) != w.columns ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
-        (tile_k != 32 && tile_k != 128))
+        (tile_k != 32 && tile_k != 128) || (full_precision && tile_k != 32))
         throw std::invalid_argument("invalid tiled TQ3 projection");
     const int m = input.shape(0);
     auto padded = input;
     if (m < 8) padded = mx::concatenate({padded, mx::zeros({8 - m, w.columns}, mx::float32)}, 0);
-    auto operands = mx::contiguous(mx::astype(padded, mx::float16));
+    auto operands = mx::contiguous(full_precision ? padded : mx::astype(padded, mx::float16));
     static auto kernel = mx::fast::metal_kernel("tqllm_tq3_coalesced_stage",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
 uint lane = thread_position_in_threadgroup.x % 32u;
 uint tile = threadgroup_position_in_grid.y;
 uint part = threadgroup_position_in_grid.z;
 if (tile >= (R + 31u) / 32u) return;
-threadgroup half storage[2 * 32 * BK];
-threadgroup half* first = storage;
-threadgroup half* second = first + 32u * BK;
+threadgroup Operand storage[2 * 32 * BK];
+threadgroup Operand* first = storage;
+threadgroup Operand* second = first + 32u * BK;
 // TensorOps requires an unqualified operand type; this view is only read.
-tensor<device half, dextents<int, 2>, tensor_inline> inputs(
-    (device half*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
-tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage0(first, extents<int, 32, BK>());
-tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage1(second, extents<int, 32, BK>());
+tensor<device Operand, dextents<int, 2>, tensor_inline> inputs(
+    (device Operand*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
+tensor<threadgroup Operand, extents<int, 32, BK>, tensor_inline> stage0(first, extents<int, 32, BK>());
+tensor<threadgroup Operand, extents<int, 32, BK>, tensor_inline> stage1(second, extents<int, 32, BK>());
 constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, false, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<1>> operation;
@@ -77,7 +78,7 @@ for (uint block = begin; block < end; ++block) {
         }
         scale = float(scales[meta + ulong(block / (128u / BK)) * 32u]);
     }
-    threadgroup half* destination = (block & 1u) ? second : first;
+    threadgroup Operand* destination = (block & 1u) ? second : first;
     #pragma clang loop unroll(full)
     for (uint g = 0; g < BK/32u; ++g) {
     #pragma clang loop unroll(full)
@@ -86,7 +87,7 @@ for (uint block = begin; block < end; ++block) {
         uint rank = (ranks >> (4u * (j % 8u) + 2u * ((j % 16u) / 8u))) & 3u;
         uint negative = (sign[g] >> (4u * (j % 8u) + j / 8u)) & 1u;
         int level = int((0x7f4f2d0eu >> (rank * 8u)) & 255u);
-        destination[(g * 32u + j) * 32u + lane] = half(scale * float(negative ? -level : level));
+        destination[(g * 32u + j) * 32u + lane] = Operand(scale * float(negative ? -level : level));
     }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -115,7 +116,8 @@ for (uint i = 0; i < accumulator.get_capacity(); ++i) {
 )METAL");
     auto output = kernel({w.planes, w.scales, operands}, {{splits, m, w.rows}}, {mx::float32},
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
-        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"PREFETCH", prefetch}, {"BK", tile_k}},
+        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"PREFETCH", prefetch},
+         {"BK", tile_k}, {"Operand", full_precision ? mx::float32 : mx::float16}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }

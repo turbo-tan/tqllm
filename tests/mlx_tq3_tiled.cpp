@@ -103,25 +103,26 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
         rounded[size_t(m) * rows + r] = float(half_sum);
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
-    for (int split : {1, 2, 4}) for (int tile_k : {32, 128}) {
+    for (int split : {1, 2, 4}) for (int tile_k : {32, 128}) for (bool fp32 : {false, true}) {
+        if (fp32 && tile_k != 32) continue;
         if (k % (128 * split)) continue;
-        auto reference = tq3_tiled_matmul(tiled, x, split, true, tile_k);
-        const double numerical = rel_l2(reference, cpu), precision = rel_l2(reference, full);
+        auto reference = tq3_tiled_matmul(tiled, x, split, true, tile_k, fp32);
+        const double numerical = rel_l2(reference, fp32 ? full : cpu), precision = rel_l2(reference, full);
         std::cout << "TILED_ORACLE_CHECK rows=" << rows << " k=" << k << " split=" << split << " tile_k=" << tile_k
-                  << " half_rel_l2=" << numerical << " original_rel_l2=" << precision << std::endl;
+                  << " fp32_operands=" << fp32 << " cpu_rel_l2=" << numerical << " original_rel_l2=" << precision << std::endl;
         if (!std::isfinite(numerical) || numerical > 5e-5 || !std::isfinite(precision) ||
             (original_gate && precision > 1e-3))
             throw std::runtime_error("tiled projection failed independent FP16 or original-weight CPU oracle");
         for (int width : {1, 3, 5, 8}) {
             auto slice = mx::array(values.data(), {width, k});
             for (bool prefetch : {false, true}) {
-                auto got = tq3_tiled_matmul(tiled, slice, split, prefetch, tile_k); mx::eval(got);
+                auto got = tq3_tiled_matmul(tiled, slice, split, prefetch, tile_k, fp32); mx::eval(got);
                 if (std::memcmp(got.data<float>(), reference.data<float>(), size_t(width) * rows * sizeof(float)))
                     throw std::runtime_error("tiled projection changed with width or prefetch");
             }
         }
         std::cout << "TILED_ORACLE_PASS rows=" << rows << " k=" << k << " split=" << split << " tile_k=" << tile_k
-                  << " half_rel_l2=" << numerical << " original_rel_l2=" << precision << std::endl;
+                  << " fp32_operands=" << fp32 << " cpu_rel_l2=" << numerical << " original_rel_l2=" << precision << std::endl;
     }
 }
 template<class F> static double measure(F operation) {
@@ -146,14 +147,15 @@ static void bench(const GgufFile& file, const std::string& name) {
         auto x = mx::array(values.data(), {width, tiled.columns}); mx::eval(x);
         auto expected = tq3_matmul(packed, x); mx::eval(expected);
         const double baseline = measure([&] { return tq3_matmul(packed, x); });
-        for (int tile_k : {32, 128}) for (int split : {1, 2, 4}) for (bool prefetch : {false, true}) {
-            auto result = tq3_tiled_matmul(tiled, x, split, prefetch, tile_k);
+        for (int tile_k : {32, 128}) for (int split : {1, 2, 4}) for (bool prefetch : {false, true}) for (bool fp32 : {false, true}) {
+            if (fp32 && tile_k != 32) continue;
+            auto result = tq3_tiled_matmul(tiled, x, split, prefetch, tile_k, fp32);
             double error = rel_l2(result, expected);
-            if (!std::isfinite(error) || error > 1e-3) throw std::runtime_error("full-shape projection precision gate failed");
-            const double time = measure([&] { return tq3_tiled_matmul(tiled, x, split, prefetch, tile_k); });
+            if (!std::isfinite(error) || error > (fp32 ? 2e-5 : 1e-3)) throw std::runtime_error("full-shape projection precision gate failed");
+            const double time = measure([&] { return tq3_tiled_matmul(tiled, x, split, prefetch, tile_k, fp32); });
             std::cout << "TILED_BENCH tensor=" << name << " rows=" << tiled.rows << " k=" << tiled.columns
                       << " width=" << width << " split=" << split << " prefetch=" << prefetch << " tile_k=" << tile_k
-                      << " fp16_operands=1 baseline_ms=" << baseline << " tiled_ms=" << time
+                      << " fp32_operands=" << fp32 << " baseline_ms=" << baseline << " tiled_ms=" << time
                       << " original_rel_l2=" << error << std::endl;
         }
     }
