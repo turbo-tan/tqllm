@@ -1,5 +1,6 @@
 #include "weights.hpp"
 #include "tq3_tiled.hpp"
+#include "prefill.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -67,15 +68,22 @@ int main(int argc, char** argv) {
                     auto x = mx::array(input.data(), {m, k});
                     auto low = mx::astype(x, dtype);
                     mx::eval(x, low);
-                    auto control = [&] { return tq_tiled_matmul(tiled, x, 4, true, 32, true); };
-                    auto candidate = [&] { return mx::quantized_matmul(low, packed[0], packed[1],
-                        packed[2], true, group, bits, "affine"); };
+                    auto control = [&] { return m <= 8 ? tq_tiled_matmul(tiled, x, 4, true, 32, true)
+                        : mx::astype(mx::matmul(mx::astype(x, mx::bfloat16),
+                            mx::transpose(stage_bf16(original))), mx::float32); };
                     auto reference = control();
                     auto truth = mx::matmul(x, mx::transpose(dense));
                     const float control_error = relative_l2(reference, truth);
-                    if (!std::isfinite(control_error) || control_error > 2e-5f)
+                    if (!std::isfinite(control_error) || control_error > (m <= 8 ? 2e-5f : .02f))
                         throw std::runtime_error("packed control differs from original dense projection");
-                    const float output_error = relative_l2(candidate(), reference);
+                    for (int pad : (m == 8 ? std::vector<int>{0, 32} : std::vector<int>{0})) {
+                    auto candidate = [&] {
+                        auto input = pad ? mx::concatenate({low, mx::zeros({pad-m, k}, dtype)}, 0) : low;
+                        auto out = mx::quantized_matmul(input, packed[0], packed[1], packed[2],
+                            true, group, bits, "affine");
+                        return pad ? mx::slice(out, {0,0}, {m,rows}) : out;
+                    };
+                    const float output_error = relative_l2(candidate(), truth);
                     if (!std::isfinite(output_error)) throw std::runtime_error("nonfinite repack projection");
                     for (int arm : {0, 1, 1, 0}) {
                         const double elapsed = arm ? median_ms(candidate) : median_ms(control);
@@ -83,9 +91,11 @@ int main(int argc, char** argv) {
                             << " k=" << k << " width=" << m
                             << " dtype=" << (dtype == mx::float16 ? "fp16" : "bf16")
                             << " bits=" << bits << " group=" << group << " arm=" << arm
+                            << " padded_rows=" << pad << " control=" << (m <= 8 ? "packed_fp32" : "staged_bf16")
                             << " elapsed_ms=" << elapsed << " bytes=" << bytes
                             << " weight_rel_l2=" << weight_error << " output_rel_l2=" << output_error
                             << " control_rel_l2=" << control_error << std::endl;
+                    }
                     }
                 }
             }
