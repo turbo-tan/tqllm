@@ -44,7 +44,7 @@ TqTiledWeights tq4_tile(const Tq4Weights& w) {
 }
 
 mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool prefetch,
-    int tile_k, bool full_precision, const std::optional<mx::array>& expanded, int simdgroups) {
+    int tile_k, bool full_precision, const std::optional<mx::array>& expanded, int simdgroups, bool transpose_stage) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 63 || w.columns <= 0 ||
         w.columns % 128 || w.planes.ndim() != 4 || w.scales.ndim() != 3 ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
@@ -78,9 +78,10 @@ threadgroup Operand* second = first + 32u * BK;
 // TensorOps requires an unqualified operand type; this view is only read.
 tensor<device Operand, dextents<int, 2>, tensor_inline> inputs(
     (device Operand*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
-tensor<threadgroup Operand, extents<int, 32, BK>, tensor_inline> stage0(first, extents<int, 32, BK>());
-tensor<threadgroup Operand, extents<int, 32, BK>, tensor_inline> stage1(second, extents<int, 32, BK>());
-constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, false, false,
+constexpr int B0 = TRANSPOSE_STAGE ? BK : 32, B1 = TRANSPOSE_STAGE ? 32 : BK;
+tensor<threadgroup Operand, extents<int, B0, B1>, tensor_inline> stage0(first, extents<int, B0, B1>());
+tensor<threadgroup Operand, extents<int, B0, B1>, tensor_inline> stage1(second, extents<int, B0, B1>());
+constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, TRANSPOSE_STAGE, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<SIMDS>> operation;
 auto initial = inputs.template slice<BK, 8>(0, 0);
@@ -130,7 +131,7 @@ for (uint block = begin; block < end; ++block) {
             uint code = (packed >> (4u * (j % 8u))) & 15u;
             value = INTEGER_LEVELS ? L4I[code] : L4F[code];
         }
-        destination[(g * 32u + j) * 32u + lane] = Operand(scale * value);
+        destination[TRANSPOSE_STAGE ? lane * BK + g * 32u + j : (g * 32u + j) * 32u + lane] = Operand(scale * value);
     }
     }
     if (SIMDS == 1) simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -168,7 +169,7 @@ constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.
         {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"PREFETCH", prefetch},
          {"BK", tile_k}, {"Operand", full_precision ? mx::float32 : mx::float16},
          {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels}, {"EXPANDED", expanded.has_value()},
-         {"SIMDS", simdgroups}},
+         {"SIMDS", simdgroups}, {"TRANSPOSE_STAGE", transpose_stage}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }

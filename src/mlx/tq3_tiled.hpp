@@ -19,7 +19,7 @@ TqTiledWeights tq4_tile(const Tq4Weights& weights);
 mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 1, bool prefetch = true, int tile_k = 32,
     bool full_precision = false,
-    const std::optional<mlx::core::array>& expanded = std::nullopt, int simdgroups = 1);
+    const std::optional<mlx::core::array>& expanded = std::nullopt, int simdgroups = 1, bool transpose_stage = false);
 mlx::core::array tq_register_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 4, bool integer_operand = false, bool packed_cache = false, bool compensated_input = false);
 // Lossless int8 code levels, packed four per word in output-coalesced order.
