@@ -324,7 +324,7 @@ constant int LEVELS[16] = {6,18,31,44,58,75,96,127,-6,-18,-31,-44,-58,-75,-96,-1
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
-mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input, int splits, int tile_k) {
+mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input, int splits, int tile_k, bool residual) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 31 || w.columns <= 0 ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
         (w.bits != 3 && w.bits != 4) || !w.integer_levels ||
@@ -340,22 +340,22 @@ mx::array tq_compensated_matmul(const TqTiledWeights& w, const mx::array& input,
     if (m < 8) padded = mx::concatenate({padded, mx::zeros({8 - m, w.columns}, mx::float32)}, 0);
     auto high = mx::astype(padded, mx::float16);
     auto low = mx::astype((padded - mx::astype(high, mx::float32)) * mx::array(2048.0f), mx::float16);
-    auto operands = mx::contiguous(mx::concatenate({high, low}, 0));
+    auto operands = mx::contiguous(residual ? mx::concatenate({high, low}, 0) : high);
     static auto kernel = mx::fast::metal_kernel("tqllm_tq_compensated_integer_stage",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
 uint lane = thread_position_in_threadgroup.x;
 uint tile = threadgroup_position_in_grid.y;
 uint part = threadgroup_position_in_grid.z;
 threadgroup half storage[2 * 32 * BK];
-threadgroup float dots[16 * 32];
+threadgroup float dots[NCOLS * 32];
 tensor<device half, dextents<int, 2>, tensor_inline> inputs(
-    (device half*)x, dextents<int, 2>{int(K), 16}, array<int, 2>{1, int(K)});
+    (device half*)x, dextents<int, 2>{int(K), NCOLS}, array<int, 2>{1, int(K)});
 tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage0(storage, extents<int, 32, BK>());
 tensor<threadgroup half, extents<int, 32, BK>, tensor_inline> stage1(storage + 32 * BK, extents<int, 32, BK>());
-constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(16, 32, BK, false, false, false,
+constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(NCOLS, 32, BK, false, false, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<1>> operation;
-auto initial = inputs.template slice<BK, 16>(0, 0);
+auto initial = inputs.template slice<BK, NCOLS>(0, 0);
 auto accumulator = operation.template get_destination_cooperative_tensor<decltype(initial), decltype(stage0), float>();
 float sums[8];
 for (uint col = 0; col < 8u; ++col) sums[col] = 0.0f;
@@ -400,7 +400,7 @@ for (uint block = begin; block < end; ++block) {
             if (BITS == 4) fourth[g] = planes[at + 96u];
         }
     }
-    auto activation = inputs.template slice<BK, 16>(block * BK, 0);
+    auto activation = inputs.template slice<BK, NCOLS>(block * BK, 0);
     if (block & 1u) operation.run(activation, stage1, accumulator);
     else operation.run(activation, stage0, accumulator);
     if ((block + 1u) % (128u / BK) == 0u) {
@@ -412,7 +412,7 @@ for (uint block = begin; block < end; ++block) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
         float scale = float(scales[meta + ulong(block / (128u / BK)) * 32u]);
         for (uint col = 0; col < 8u; ++col)
-            sums[col] += scale * (dots[col * 32u + lane] + dots[(col + 8u) * 32u + lane] * (1.0f / 2048.0f));
+            sums[col] += scale * (dots[col * 32u + lane] + (RESIDUAL ? dots[(col + 8u) * 32u + lane] * (1.0f / 2048.0f) : 0.0f));
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
@@ -427,7 +427,7 @@ constant int LEVELS4[16] = {6,18,31,44,58,75,96,127,-6,-18,-31,-44,-58,-75,-96,-
 )METAL");
     auto output = kernel({w.planes, w.scales, operands}, {{splits, m, w.rows}}, {mx::float32},
         {32, (w.rows + 31) / 32, splits}, {32, 1, 1},
-        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}, {"BK", tile_k}},
+        {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"BITS", w.bits}, {"BK", tile_k}, {"NCOLS", residual ? 16 : 8}, {"RESIDUAL", residual}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
