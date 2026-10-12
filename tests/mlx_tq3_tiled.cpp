@@ -82,7 +82,7 @@ static double rel_l2(const mx::array& a, const mx::array& b) {
     return std::sqrt(error / std::max(norm, 1e-30));
 }
 static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, bool original_gate,
-    int bits = 3, bool integer_levels = true, bool compensated = false, bool expanded_screen = false, bool cooperative_screen = false, bool register_screen = false, bool integer_screen = false, bool packed_cache = false, bool compensated_input = false, bool group_scaled = false, bool transposed_screen = false) {
+    int bits = 3, bool integer_levels = true, bool compensated = false, bool expanded_screen = false, bool cooperative_screen = false, bool register_screen = false, bool integer_screen = false, bool packed_cache = false, bool compensated_input = false, bool group_scaled = false, bool transposed_screen = false, bool padded_screen = false) {
     auto prepare = [&] {
         if (bits == 3) return tq3_tile(load_tq3_blocks(raw, rows, k));
         auto w = load_tq4_blocks(raw, rows, k); w.integer_levels = integer_levels;
@@ -134,21 +134,21 @@ static void check_projection(const std::vector<uint8_t>& raw, int rows, int k, b
         input_rounded[size_t(m) * rows + r] = float(input_half_sum);
     }
     auto cpu = mx::array(rounded.data(), {8, rows}), full = mx::array(original.data(), {8, rows});
-    if (transposed_screen) {
-        for (bool fp32 : {true,false}) for(int split:{1,2,4}) {
+    if (transposed_screen || padded_screen) {
+        for (bool fp32 : {true,false}) for(int split:{1,2,4}) for(int groups:(padded_screen?std::vector<int>{1,4}:std::vector<int>{1})) {
             if(k%(128*split))continue;
-            auto reference=tq_tiled_matmul(tiled,x,split,true,32,fp32,std::nullopt,1,true);
+            auto reference=tq_tiled_matmul(tiled,x,split,true,32,fp32,std::nullopt,groups,transposed_screen,padded_screen?32:8);
             const double error=rel_l2(reference,fp32?full:cpu);
             if (!std::isfinite(error) || error>2e-5)
                 throw std::runtime_error("transposed tile differs from independent CPU precision oracle");
             for (int width : {1,3,5,8}) {
-                auto got=tq_tiled_matmul(tiled,mx::array(values.data(),{width,k}),split,true,32,fp32,std::nullopt,1,true);
+                auto got=tq_tiled_matmul(tiled,mx::array(values.data(),{width,k}),split,true,32,fp32,std::nullopt,groups,transposed_screen,padded_screen?32:8);
                 mx::eval(got,reference);
                 if(std::memcmp(got.data<float>(),reference.data<float>(),size_t(width)*rows*sizeof(float)))
                     throw std::runtime_error("transposed tile changes with column count");
             }
             std::cout<<"TRANSPOSE_CPU_PASS bits="<<bits<<" rows="<<rows<<" k="<<k
-                     <<" fp32="<<fp32<<" split="<<split<<" contract_rel_l2="<<error<<std::endl;
+                     <<" fp32="<<fp32<<" padded="<<padded_screen<<" groups="<<groups<<" split="<<split<<" contract_rel_l2="<<error<<std::endl;
         }
         return;
     }
@@ -314,7 +314,7 @@ static void bench(const GgufFile& file, const std::string& name, bool one_point 
         }
     }
 }
-static void bench_compensated(const GgufFile& file, const std::string& name, bool expanded_screen = false, bool cooperative_screen = false, bool register_screen = false, bool integer_screen = false, bool packed_cache = false, bool compensated_input = false, bool group_scaled = false, bool transposed_screen = false) {
+static void bench_compensated(const GgufFile& file, const std::string& name, bool expanded_screen = false, bool cooperative_screen = false, bool register_screen = false, bool integer_screen = false, bool packed_cache = false, bool compensated_input = false, bool group_scaled = false, bool transposed_screen = false, bool padded_screen = false) {
     const auto& tensor = file.tensors.at(name);
     auto data = file.read(tensor);
     std::vector<uint8_t> raw(data.begin(), data.end());
@@ -324,19 +324,19 @@ static void bench_compensated(const GgufFile& file, const std::string& name, boo
     mx::eval(weights.planes, weights.scales);
     std::optional<mx::array> expanded;
     if (expanded_screen) { expanded = tq_expand_tiled_codes(weights); mx::eval(*expanded); }
-    if (transposed_screen) {
-        for (int width : {1,8}) for (bool fp32 : {true,false}) {
+    if (transposed_screen || padded_screen) {
+        for (int width : {1,8}) for (bool fp32 : {true,false}) for(int groups:(padded_screen?std::vector<int>{1,4}:std::vector<int>{1})) {
             auto values=inputs(width,weights.columns);
             auto x=mx::array(values.data(),{width,weights.columns});
             mx::eval(x);
             auto control=[&] {return tq_tiled_matmul(weights,x,4,true,32,fp32);};
-            auto candidate=[&] {return tq_tiled_matmul(weights,x,4,true,32,fp32,std::nullopt,1,true);};
+            auto candidate=[&] {return tq_tiled_matmul(weights,x,4,true,32,fp32,std::nullopt,groups,transposed_screen,padded_screen?32:8);};
             const double error=rel_l2(candidate(),control());
             if (!std::isfinite(error) || error>2e-5)
                 throw std::runtime_error("full transposed tile differs from current packed control");
             for (int arm : {0,1,1,0})
                 std::cout<<"TRANSPOSE_BENCH tensor="<<name<<" width="<<width<<" fp32="<<fp32
-                         <<" arm="<<arm<<" elapsed_ms="<<(arm?measure(candidate):measure(control))
+                         <<" padded="<<padded_screen<<" groups="<<groups<<" arm="<<arm<<" elapsed_ms="<<(arm?measure(candidate):measure(control))
                          <<" control_rel_l2="<<error<<std::endl;
         }
         return;
@@ -368,8 +368,9 @@ int main(int argc, char** argv) {
     try {
         if (argc != 1 && argc != 2 && argc != 3) throw std::invalid_argument("usage: test-mlx-tq3-tiled [model.gguf [--cpu-only|--one-point|--mixer-cpu|--compensated|--expanded|--cooperative|--register|--register-int8|--packed-register-int8|--compensated-register-int8]]");
         if (argc == 3 && std::string(argv[2]) != "--cpu-only" && std::string(argv[2]) != "--one-point" &&
-            std::string(argv[2]) != "--mixer-cpu" && std::string(argv[2]) != "--compensated" && std::string(argv[2]) != "--expanded" && std::string(argv[2]) != "--cooperative" && std::string(argv[2]) != "--register" && std::string(argv[2]) != "--register-int8" && std::string(argv[2]) != "--packed-register-int8" && std::string(argv[2]) != "--compensated-register-int8" && std::string(argv[2]) != "--group-scaled" && std::string(argv[2]) != "--transpose")
+            std::string(argv[2]) != "--mixer-cpu" && std::string(argv[2]) != "--compensated" && std::string(argv[2]) != "--expanded" && std::string(argv[2]) != "--cooperative" && std::string(argv[2]) != "--register" && std::string(argv[2]) != "--register-int8" && std::string(argv[2]) != "--packed-register-int8" && std::string(argv[2]) != "--compensated-register-int8" && std::string(argv[2]) != "--group-scaled" && std::string(argv[2]) != "--transpose" && std::string(argv[2]) != "--pad32")
             throw std::invalid_argument("unknown test option");
+        const bool padded_screen = argc == 3 && std::string(argv[2]) == "--pad32";
         const bool transposed_screen = argc == 3 && std::string(argv[2]) == "--transpose";
         const bool group_scaled = argc == 3 && std::string(argv[2]) == "--group-scaled";
         const bool compensated = argc == 3 && std::string(argv[2]) == "--compensated";
@@ -379,7 +380,7 @@ int main(int argc, char** argv) {
         const bool packed_cache = compensated_input || (argc == 3 && std::string(argv[2]) == "--packed-register-int8");
         const bool integer_screen = packed_cache || (argc == 3 && std::string(argv[2]) == "--register-int8");
         const bool register_screen = integer_screen || (argc == 3 && std::string(argv[2]) == "--register");
-        if (compensated || expanded_screen || cooperative_screen || register_screen || group_scaled || transposed_screen) {
+        if (compensated || expanded_screen || cooperative_screen || register_screen || group_scaled || transposed_screen || padded_screen) {
             for (int bits : {3, 4}) for (int rows : {1, 17, 33, 64}) for (int k : {128, 512}) {
                 auto raw = fixture(rows, k, bits);
                 const int stride = bits == 3 ? 50 : 66;
@@ -391,7 +392,7 @@ int main(int argc, char** argv) {
                         raw[at] = uint8_t(scale); raw[at + 1] = uint8_t(scale >> 8);
                     }
                 }
-                check_projection(raw, rows, k, false, bits, true, compensated, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen);
+                check_projection(raw, rows, k, false, bits, true, compensated, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen, padded_screen);
             }
             auto tiled = tq3_tile(load_tq3_blocks(fixture(1, 512), 1, 512));
             for (int bad = 0; bad < 5; ++bad) {
@@ -405,7 +406,7 @@ int main(int argc, char** argv) {
                     if (bad == 2) x = mx::zeros({1, 512}, mx::float16);
                     if (bad == 3) split = 3;
                     if (bad == 4) w.scales = mx::zeros({1, 4, 31}, mx::float16);
-                    if (transposed_screen) tq_tiled_matmul(w,x,split,true,32,true,std::nullopt,1,true);
+                    if (transposed_screen || padded_screen) tq_tiled_matmul(w,x,split,true,32,true,std::nullopt,1,transposed_screen,padded_screen?32:8);
                     else if (register_screen) tq_register_matmul(w, x, split, integer_screen, packed_cache, compensated_input);
                     else tq_compensated_matmul(w, x, split, 32, !group_scaled);
                 } catch (const std::invalid_argument&) { rejected = true; }
@@ -463,12 +464,12 @@ int main(int argc, char** argv) {
             for (const auto& name : names) {
                 auto t = file.tensors.at(name); t.bytes = t.bytes / t.ne[1] * 33; t.ne[1] = 33;
                 auto raw = file.read(t); check_projection({raw.begin(), raw.end()}, 33, int(t.ne[0]), true,
-                    t.type == GGML_TQ3 ? 3 : 4, true, compensated, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen);
+                    t.type == GGML_TQ3 ? 3 : 4, true, compensated, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen, padded_screen);
             }
             std::cout << "TILED_REAL_CPU_GATE_PASS" << std::endl;
-            if (compensated || expanded_screen || cooperative_screen || register_screen || group_scaled || transposed_screen) {
-                for (const auto& name : names) bench_compensated(file, name, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen);
-                std::cout << (transposed_screen ? "TRANSPOSE_SCREEN_COMPLETE" : group_scaled ? "GROUP_SCALED_SCREEN_COMPLETE" : register_screen ? "REGISTER_SCREEN_COMPLETE" : cooperative_screen ? "COOPERATIVE_SCREEN_COMPLETE" : expanded_screen ? "EXPANDED_SCREEN_COMPLETE" : "COMPENSATED_SCREEN_COMPLETE") << std::endl;
+            if (compensated || expanded_screen || cooperative_screen || register_screen || group_scaled || transposed_screen || padded_screen) {
+                for (const auto& name : names) bench_compensated(file, name, expanded_screen, cooperative_screen, register_screen, integer_screen, packed_cache, compensated_input, group_scaled, transposed_screen, padded_screen);
+                std::cout << (padded_screen ? "PAD32_SCREEN_COMPLETE" : transposed_screen ? "TRANSPOSE_SCREEN_COMPLETE" : group_scaled ? "GROUP_SCALED_SCREEN_COMPLETE" : register_screen ? "REGISTER_SCREEN_COMPLETE" : cooperative_screen ? "COOPERATIVE_SCREEN_COMPLETE" : expanded_screen ? "EXPANDED_SCREEN_COMPLETE" : "COMPENSATED_SCREEN_COMPLETE") << std::endl;
             }
             if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--one-point"))
                 for (const auto& name : names) bench(file, name, argc == 3);

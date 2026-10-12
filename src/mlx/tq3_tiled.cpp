@@ -44,7 +44,7 @@ TqTiledWeights tq4_tile(const Tq4Weights& w) {
 }
 
 mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int splits, bool prefetch,
-    int tile_k, bool full_precision, const std::optional<mx::array>& expanded, int simdgroups, bool transpose_stage) {
+    int tile_k, bool full_precision, const std::optional<mx::array>& expanded, int simdgroups, bool transpose_stage, int padded_rows) {
     if (w.rows <= 0 || w.rows > std::numeric_limits<int>::max() - 63 || w.columns <= 0 ||
         w.columns % 128 || w.planes.ndim() != 4 || w.scales.ndim() != 3 ||
         w.planes.dtype() != mx::uint32 || w.scales.dtype() != mx::float16 ||
@@ -54,7 +54,7 @@ mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int s
         input.ndim() != 2 || input.dtype() != mx::float32 || input.shape(0) < 1 ||
         input.shape(0) > 8 || input.shape(1) != w.columns ||
         (splits != 1 && splits != 2 && splits != 4) || w.columns % (128 * splits) ||
-        (simdgroups != 1 && simdgroups != 4) ||
+        (simdgroups != 1 && simdgroups != 4) || (padded_rows != 8 && padded_rows != 32) ||
         (tile_k != 32 && tile_k != 64 && tile_k != 128) || (full_precision && tile_k == 128))
         throw std::invalid_argument("invalid tiled TQ3 projection");
     if (expanded && (!w.integer_levels || expanded->dtype() != mx::uint32 ||
@@ -62,7 +62,7 @@ mx::array tq_tiled_matmul(const TqTiledWeights& w, const mx::array& input, int s
         throw std::invalid_argument("invalid expanded tiled codes");
     const int m = input.shape(0);
     auto padded = input;
-    if (m < 8) padded = mx::concatenate({padded, mx::zeros({8 - m, w.columns}, mx::float32)}, 0);
+    if (m < padded_rows) padded = mx::concatenate({padded, mx::zeros({padded_rows - m, w.columns}, mx::float32)}, 0);
     auto operands = mx::contiguous(full_precision ? padded : mx::astype(padded, mx::float16));
     static auto kernel = mx::fast::metal_kernel("tqllm_tq3_coalesced_stage",
         {"planes", "scales", "x"}, {"partials"}, R"METAL(
@@ -77,14 +77,14 @@ threadgroup Operand* first = storage;
 threadgroup Operand* second = first + 32u * BK;
 // TensorOps requires an unqualified operand type; this view is only read.
 tensor<device Operand, dextents<int, 2>, tensor_inline> inputs(
-    (device Operand*)x, dextents<int, 2>{int(K), 8}, array<int, 2>{1, int(K)});
+    (device Operand*)x, dextents<int, 2>{int(K), PAD_ROWS}, array<int, 2>{1, int(K)});
 constexpr int B0 = TRANSPOSE_STAGE ? BK : 32, B1 = TRANSPOSE_STAGE ? 32 : BK;
 tensor<threadgroup Operand, extents<int, B0, B1>, tensor_inline> stage0(first, extents<int, B0, B1>());
 tensor<threadgroup Operand, extents<int, B0, B1>, tensor_inline> stage1(second, extents<int, B0, B1>());
-constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(8, 32, BK, false, TRANSPOSE_STAGE, false,
+constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(PAD_ROWS, 32, BK, false, TRANSPOSE_STAGE, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroups<SIMDS>> operation;
-auto initial = inputs.template slice<BK, 8>(0, 0);
+auto initial = inputs.template slice<BK, PAD_ROWS>(0, 0);
 auto accumulator = operation.template get_destination_cooperative_tensor<decltype(initial), decltype(stage0), float>();
 for (uint i = 0; i < accumulator.get_capacity(); ++i)
     if (accumulator.is_valid_element(i)) accumulator[i] = 0.0f;
@@ -147,7 +147,7 @@ for (uint block = begin; block < end; ++block) {
         if ((block + 1u) % (128u / BK) == 0u)
             scale = float(scales[meta + ulong((block + 1u) / (128u / BK)) * 32u]);
     }
-    auto activation = inputs.template slice<BK, 8>(block * BK, 0);
+    auto activation = inputs.template slice<BK, PAD_ROWS>(block * BK, 0);
     if (block & 1u) operation.run(activation, stage1, accumulator);
     else operation.run(activation, stage0, accumulator);
 }
@@ -169,7 +169,7 @@ constant float L4F[16] = {0.129099213f,0.387297638f,0.667012598f,0.946727559f,1.
         {{"R", w.rows}, {"K", w.columns}, {"M", m}, {"SPLITS", splits}, {"PREFETCH", prefetch},
          {"BK", tile_k}, {"Operand", full_precision ? mx::float32 : mx::float16},
          {"BITS", w.bits}, {"INTEGER_LEVELS", w.integer_levels}, {"EXPANDED", expanded.has_value()},
-         {"SIMDS", simdgroups}, {"TRANSPOSE_STAGE", transpose_stage}},
+         {"SIMDS", simdgroups}, {"TRANSPOSE_STAGE", transpose_stage}, {"PAD_ROWS", padded_rows}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return splits == 1 ? mx::reshape(output, {m, w.rows}) : mx::sum(output, 0);
 }
