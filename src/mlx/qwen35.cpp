@@ -89,6 +89,11 @@ struct Qwen35::Impl {
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ3_FP16"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP16 must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ3_FP32"))
+            if(std::string_view(mode)!="1")
+                throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP32 must be 1");
+        if(std::getenv("TQLLM_MLX_TILED_TQ3_FP16") && std::getenv("TQLLM_MLX_TILED_TQ3_FP32"))
+            throw std::invalid_argument("select only one tiled TQ3 operand precision");
         if(compact_gdn && std::string_view(std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE"))!="1")
             throw std::invalid_argument("TQLLM_MLX_COMPACT_GDN_TAPE must be 1");
         const auto arch=file.kv.at("general.architecture").str;
@@ -140,7 +145,8 @@ struct Qwen35::Impl {
                 if(auto packed=std::get_if<Tq3Weights>(&w))affine_ffn.emplace(name,tq3_affine8(*packed));
             if(std::getenv("TQLLM_MLX_DECODED_FFN") && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq3Weights>(&w))decoded_ffn.emplace(name,tq3_expand(*packed));
-            if(std::getenv("TQLLM_MLX_TILED_TQ3_FP16") && name.find(".ffn_")!=std::string::npos)
+            if((std::getenv("TQLLM_MLX_TILED_TQ3_FP16") || std::getenv("TQLLM_MLX_TILED_TQ3_FP32")) &&
+               name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq3Weights>(&w)) {
                     auto tiled=tq3_tile(*packed);
                     mx::eval(tiled.planes,tiled.scales);
@@ -196,9 +202,10 @@ struct Qwen35::Impl {
             if(reuse_rotation)rotation=std::pair{x,value};
             return value;
         };
-        if(std::getenv("TQLLM_MLX_TILED_TQ3_FP16") && x.shape(0)<=8)
+        if((std::getenv("TQLLM_MLX_TILED_TQ3_FP16") || std::getenv("TQLLM_MLX_TILED_TQ3_FP32")) && x.shape(0)<=8)
             if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end())
-                return bf(tq3_tiled_matmul(found->second,rotated(),4,true,32));
+                return bf(tq3_tiled_matmul(found->second,rotated(),4,true,32,
+                    std::getenv("TQLLM_MLX_TILED_TQ3_FP32")!=nullptr));
         if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
             if(auto found=affine_ffn.find(name);found!=affine_ffn.end()) {
                 const bool fp32=(affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(w)) ||
