@@ -1,6 +1,7 @@
 #pragma once
 #include "tq3.hpp"
 #include "tq4.hpp"
+#include <optional>
 
 namespace tqllm::mlx_backend {
 struct TqTiledWeights {
@@ -20,7 +21,7 @@ mlx::core::array tq_tiled_matmul(const TqTiledWeights& weights,
     bool full_precision = false,
     const std::optional<mlx::core::array>& expanded = std::nullopt, int simdgroups = 1);
 mlx::core::array tq_register_matmul(const TqTiledWeights& weights,
-    const mlx::core::array& input, int splits = 4);
+    const mlx::core::array& input, int splits = 4, bool integer_operand = false);
 // Lossless int8 code levels, packed four per word in output-coalesced order.
 mlx::core::array tq_expand_tiled_codes(const TqTiledWeights& weights);
 // Integer codes stay exact in FP16; high/residual input rows share one tile.
