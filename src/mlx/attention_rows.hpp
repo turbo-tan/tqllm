@@ -27,7 +27,7 @@ uint visible=length-rows+token+1u;
 constexpr uint elements=DIM/32u;
 float query[elements],weighted[elements];
 for(uint j=0;j<elements;++j) {
-    query[j]=scale[0]*q[group*DIM+lane*elements+j];
+    query[j]=scale*q[group*DIM+lane*elements+j];
     weighted[j]=0.0f;
 }
 float peak=-3.4028234663852886e38f,mass=0.0f;
