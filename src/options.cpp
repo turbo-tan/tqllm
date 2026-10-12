@@ -7,6 +7,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#endif
 
 namespace tqllm {
 namespace {
@@ -103,7 +106,12 @@ const char * engine_options_usage() {
 
 void check_env_flags(const char * tool) {
     int retired = 0;
-    for (char ** e = environ; e && *e; ++e) {
+#if defined(__APPLE__)
+    char ** environment = *_NSGetEnviron();
+#else
+    char ** environment = environ;
+#endif
+    for (char ** e = environment; e && *e; ++e) {
         if (std::strncmp(*e, "TQLLM_", 6) != 0) continue;
         const std::string name(*e, std::strcspn(*e, "="));
         const auto * f = flags::find(name.c_str());
