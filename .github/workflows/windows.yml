@@ -1,0 +1,53 @@
+name: windows
+
+# Windows 11 users run the same Linux image through WSL 2 GPU passthrough.
+# GitHub's Windows runners can only build Windows containers, so the image itself
+# is built by build.yml on Linux. This job checks what breaks on a Windows
+# checkout: CRLF line endings in scripts and compose files that don't parse.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-checkout:
+    name: Windows checkout checks
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Same line-ending behaviour as Git for Windows with default settings
+      - name: Use Windows default line endings
+        run: git config --global core.autocrlf true
+
+      - uses: actions/checkout@v4
+
+      - name: Scripts that run in the container have LF line endings
+        run: |
+          bad=$(git ls-files '*.sh' 'Dockerfile' 'compose*.yaml' | xargs grep -lI $'\r' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::CRLF line endings in a Windows checkout (fails with '/bin/sh^M: bad interpreter'):"
+            echo "$bad"
+            echo "Fix: add 'eol=lf' rules for these files to .gitattributes."
+            exit 1
+          fi
+          echo "OK: no CRLF in container scripts"
+
+      - name: Compose file parses (default and Windows paths)
+        run: |
+          docker compose version
+          docker compose -f compose.yaml config --quiet
+          MODEL_DIR='C:\models' MODEL_NAME=model.gguf docker compose -f compose.yaml config --quiet
+          MODEL_DIR='/home/user/models' docker compose -f compose.yaml config --quiet
+          echo "OK: compose.yaml parses"
