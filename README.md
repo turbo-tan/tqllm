@@ -228,7 +228,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-fit on\|off` | on | load, measure, and step down until the margin is free, in this order: token embeddings and the LM head to host memory, smaller prefill buffers, a smaller KV format (when `--kv` is not set), prefill weight blocks, the KV tail to system RAM, then a shorter context |
 | `-fitt MiB` | 768 (256 under WSL) | free memory to leave on the GPU (64 MiB floor) |
 | `-fitc N` | 4096 | smallest context the fit may choose (with `--np`: the smallest context per slot) |
-| `-fitl on\|off` | off | allow the fit to switch to a lossier KV cache (q4/tcq2) or a shorter context; off: such a load is refused with what would fit |
+| `-fitl on\|off` | on | on: when the requested context / users do not fit at full settings, pick a compact KV cache (q4/tcq2), smaller prefill buffers or weight blocks, or a shorter context, and say so at start-up (and in `/health`); off: refuse instead |
 | `--gemm-rows N` | 0 | prefill FP16 weight blocks of N rows (less VRAM; a long prompt is summed in another order, so ask for it explicitly) |
 | `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 4, `--draft-max N`) |
 | `--draft-retrieve N` | 0 (off) | with `-md`: N far chunks of 16 positions in the drafter window; long prompts get faster (32: +8-12 % at 31K-51K on a 3090) but the drafter keeps K/V for the whole context (~20 KB / token: 1.25 GiB at 64K, 3.9 GiB at 200K), so turn it on when memory allows |
@@ -238,6 +238,28 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-ub N` | automatic | prefill chunk (ubatch) size |
 | `--prefill-fp8 on\|off` | off | FP8 prefill GEMMs (sm_89+): about +40 % prefill on GB10 but KLD ~0.01 vs FP16 prefill, so opt-in; slower on 16 GB cards |
 | `--prefill-int8 on\|off` | on for RTX 30 / 40 / 50 | int8 prefill GEMMs (RTX 50: +11-13 % prefill on a 5060 Ti; RTX 40 by analogy) |
+
+### Memory fit: what it does and how to override it
+
+You normally pass only `--context` (and `--np`). If that does not fit at full settings, the server picks what fits and
+prints one line, for example:
+
+```
+tqserve: fit: to fit 1 slot(s) x 131072 in GPU memory: KV cache q4/tcq2 (asked bf16), prefill buffers -ub 512,
+prefill FP16 weight blocks of 2048 rows (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)
+```
+
+`GET /health` reports the same in its `fit` field. Your own settings always win; examples:
+
+| you want | add |
+|---|---|
+| full-quality BF16 KV, accept a shorter context if needed | `--kv bf16` |
+| a specific compact cache | `--kv q4/tcq2` (trellis V, lowest KLD of the compact caches), `--kv q8/q8`, `--kv tq3` (`--list-kv`) |
+| bigger prompt buffers (faster prefill, more memory) | `-ub 2048` |
+| full weight matrices for prefill (faster, more memory) | `--gemm-rows 0` |
+| exactly what you asked for, or an error | `-fitl off` |
+| several users at a long context (e.g. 4 x 32K) | `--np 4 --context 131072` (the context is split across `--np`) |
+| keep more free memory for other programs | `-fitt 2048` (MiB left free) |
 
 ### Diagnostics
 

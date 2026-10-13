@@ -400,6 +400,7 @@ namespace {
 // graphs; ~0.4 GB measured on a 3090 at 32K). A shortfall or an out-of-memory load applies the next step and reloads:
 // embeddings, then the int8 LM head to host memory, smaller prefill buffers, the turbo3 V cache, prefill weight blocks,
 // then half the context (not below -fitc). Options the user set are left alone; -fit off loads once.
+std::string g_fit_note;  // settings the memory fit chose instead of the defaults (empty: none); Model::fit_note, /health
 std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string & tok, uint32_t ctx, int slots,
                                     EngineOptions opt) {
     // WSL / Windows (WDDM): cudaMemGetInfo reads ~0 near the budget, and 0.30 GB free at 262K ran at full speed with
@@ -436,14 +437,19 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
     const FitSetting asked{opt.kv_format(), ctx, long(opt.ubatch), long(opt.gemm_rows)};
     auto finish = [&](std::unique_ptr<Engine> en) {
         if (!en) return en;
-        // the fit may move weights and KV between device and host (same results); a lossier KV codec or a shorter context
-        // changes the answers, so it is refused unless asked for (-fitl on)
+        // the fit may move weights and KV between device and host (same results). Settings that change the arithmetic (KV
+        // codec, context, prefill buffers, weight blocks) are applied automatically and announced (also in /health); an
+        // explicit --kv / -ub / --gemm-rows / --context is never overridden. -fitl off refuses them instead.
         if (const std::string lossy = fit_result_changes(asked, {opt.kv_format(), en->context(), long(opt.ubatch), long(opt.gemm_rows)});
-            !lossy.empty() && !opt.fit_lossy)
-            throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
-                                     " per slot, KV " + asked.kv + "): it would need " + lossy +
-                                     ". Ask for that explicitly (--kv, -ub, --gemm-rows; e.g. --kv q4/tcq2 -ub 512), use fewer slots (--np) or a smaller --context, "
-                                     "or allow it with -fitl on");
+            !lossy.empty()) {
+            if (!opt.fit_lossy)
+                throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
+                                         " per slot, KV " + asked.kv + "): it would need " + lossy +
+                                         ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
+            g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
+            std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
+                         g_fit_note.c_str());
+        }
         if (slots <= 1) return en;
         size_t fr = 0, tot = 0;
         if (!measure(fr, tot)) return en;
@@ -666,6 +672,7 @@ bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
 bool Model::native_mtp() const { return impl_->e->native_mtp(); }
+std::string Model::fit_note() const { return g_fit_note; }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
 void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft) {

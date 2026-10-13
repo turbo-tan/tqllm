@@ -322,7 +322,9 @@ int main(int argc, char ** argv) {
             std::string body;
             status = 200;
             if (request.method == "GET" && request.path == "/health") {
-                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\"}";
+                std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
+                for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
+                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"}";
             } else if (request.path == "/admin/slots" && (request.method == "GET" || request.method == "POST")) {
                 // live parallelism: POST {"slots": k} admits at most k requests at once (1 .. --np), no reload
                 if (!scheduler) {
