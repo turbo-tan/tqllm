@@ -1165,6 +1165,7 @@ private:
         d_tdep = Buf(size_t(NB) * 4);
         d_tcols = Buf(size_t(NB) * 4);
         d_chain = Buf(size_t(NB) * 4);
+        d_cdep = Buf(size_t(NB) * 4);  // chain depths 0, 1, ...: two-part attention of chains longer than 8 queries
         d_gdesc = Buf(256 * sizeof(tqllm_cuda::PathGather));
         d_pend = Buf(sizeof(int));
         ck(cudaMemset(d_pend.p, 0, sizeof(int)));
@@ -1176,7 +1177,9 @@ private:
             ck(cudaMemcpy(d_tpar.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
             for (int i = 0; i < NB; ++i) ch[size_t(i)] = i;
             ck(cudaMemcpy(d_tdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
+            ck(cudaMemcpy(d_cdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
         }
+        chain2 = kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
         // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
         if (opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
             if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)
@@ -1386,7 +1389,8 @@ private:
     // depths d_tdep, parent < child). Every verify and replay then runs the tree-capable kernels (chains included), so a
     // node's result is exactly that of its path verified as a chain: outputs never depend on the drafts.
     bool tree_mode = false;
-    Buf d_tpar, d_tdep, d_chain, d_tcols, d_gdesc;
+    bool chain2 = false;  // KV format with two-part attention: every verify-sized block uses it (see vpar)
+    Buf d_tpar, d_tdep, d_chain, d_cdep, d_tcols, d_gdesc;
     const int * vpar = nullptr, * vdep = nullptr;
     bool tree_step = false;  // the current verify block is a drafted tree (d_tpar / d_tdep)
     void swap_seq(SeqState & s) {
@@ -1809,10 +1813,11 @@ public:
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
         if (!(defer && tree_step && n <= NVER)) flush_pending();
-        // tree mode: a drafted tree goes through the tree kernels; a chain block (chain drafts, MTP requests) through the
-        // causal ones, which equal one-token decode bit for bit (the two-part tree attention does not: tests/tree.cu)
-        vpar = tree_mode && tree_step && n <= NVER ? d_tpar.as<int>() : nullptr;
-        vdep = tree_mode && n <= NVER && tree_step ? d_tdep.as<int>() : nullptr;
+        // every verify-sized block (decode included) goes through the two-part attention when the KV format has it: a tree
+        // with its parents, anything else as a chain. One arithmetic for plain decode, chain / MTP / tree verify, so greedy
+        // speculative output equals plain decoding (one-part causal attention groups the sums differently: tests/tree.cu)
+        vpar = n <= NVER && chain2 ? (tree_mode && tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
+        vdep = !vpar ? nullptr : tree_mode && tree_step ? d_tdep.as<int>() : d_cdep.as<int>();
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
         bucket = std::min(bucket, context_);
@@ -1874,8 +1879,8 @@ public:
                 const auto & g = segs[i];
                 attn_core(L, T + size_t(g.col0) * rows, rows, Q + size_t(g.col0) * nh * hd, O + size_t(g.col0) * nh * hd,
                           kc_of(g.slot)[size_t(li)].as<bf16>(), vc_of(g.slot)[size_t(li)].as<bf16>(), g.n,
-                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : nullptr,  // chains: causal (exact)
-                          g.tree ? d_tdep.as<int>() + g.col0 : nullptr,
+                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : chain2 ? d_chain.as<int>() : nullptr,
+                          g.tree ? d_tdep.as<int>() + g.col0 : chain2 ? d_cdep.as<int>() : nullptr,
                           fuse ? XH + size_t(g.col0) * nh * hd : nullptr, part_of(i), v_rpos.as<int>() + 2 * i);
             });
         }
