@@ -35,11 +35,17 @@ jobs:
 
       - name: Scripts that run in the container have LF line endings
         run: |
-          bad=$(git ls-files '*.sh' 'Dockerfile' 'compose*.yaml' | xargs grep -lI $'\r' || true)
-          if [ -n "$bad" ]; then
-            echo "::error::CRLF line endings in a Windows checkout (fails with '/bin/sh^M: bad interpreter'):"
-            echo "$bad"
-            echo "Fix: add 'eol=lf' rules for these files to .gitattributes."
+          # i/ = how git stores the file, w/ = what this Windows checkout wrote
+          git ls-files --eol -- '*.sh' 'Dockerfile' 'compose*.yaml'
+          bad=0
+          for f in $(git ls-files -- '*.sh' 'Dockerfile' 'compose*.yaml'); do
+            if grep -qI $'\r' "$f"; then
+              echo "::error file=$f::CRLF line endings in a Windows checkout ($(git ls-files --eol -- "$f" | awk '{print $1, $2}')). In the container this fails with '/bin/sh^M: bad interpreter'."
+              bad=1
+            fi
+          done
+          if [ "$bad" = 1 ]; then
+            echo "Fix: keep the eol=lf rules in .gitattributes and run 'git add --renormalize .' to store these files with LF."
             exit 1
           fi
           echo "OK: no CRLF in container scripts"
