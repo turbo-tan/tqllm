@@ -665,6 +665,7 @@ uint32_t Model::context() const { return impl_->e->context(); }
 bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
+bool Model::native_mtp() const { return impl_->e->native_mtp(); }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
 void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft) {

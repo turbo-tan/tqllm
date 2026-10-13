@@ -438,7 +438,10 @@ public:
             else tqllm_cuda::residual(xp, mp, H, stream);
             if (capture && l + 1 < cfg.layers) to_host(xp, H, capture + size_t(l) * H);
         }
-        if (!sample) return 0;
+        if (!sample) {
+            sync_ck();
+            return 0;
+        }
 
         tqllm_cuda::rms_f(xp, 0, out_norm, np, 0, H, 1, cfg.eps, stream);
         if (capture) to_host(np, H, capture + size_t(cfg.layers - 1) * H);
@@ -1153,8 +1156,8 @@ private:
         v_cat = Buf(NVER * 2 * H * 2);
         mtp_h = Buf(H * 2);
         if (mtp.present) {
-            mtp_kc = Buf(size_t(context_) * cfg.kvheads * hd * 2);
-            mtp_vc = Buf(size_t(context_) * cfg.kvheads * hd * 2);
+            mtp_kc = Buf(kvf->key_bytes(context_, int(cfg.kvheads), int(hd)));
+            mtp_vc = Buf(kvf->value_bytes(context_, int(cfg.kvheads), int(hd)));
         }
         v_tokens = Buf(NBUF * 4);
         d_tpar = Buf(size_t(NB) * 4);
@@ -1342,6 +1345,8 @@ private:
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
+        std::vector<uint32_t> mtp_draft;
+        bool native_mtp = false;
         uint32_t P = 0, count = 0, pos = 0, pending = 0;
         int D = 0;
         int rdelta = 0;  // KV position - RoPE position: an image spans nx * ny cells but max(nx, ny) positions
@@ -2887,9 +2892,23 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) {
         const auto P = uint32_t(prompt.size());
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
+        const bool use_mtp = !dfl.present && opt.native_mtp;
+        if (use_mtp) {
+            if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
+            if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");
+            if (sampling()) throw std::runtime_error("--mtp currently needs temperature 0");
+            if (!mm_pending.empty()) throw std::runtime_error("--mtp currently needs a text-only prompt");
+            if (D < 1 || D >= NVER) throw std::runtime_error("MTP draft length exceeds verify capacity");
+        }
         // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
-        D = dfl.present ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : 0;
-        if (P == 0 || P + count + dfl.block + 1 > context_) throw std::runtime_error("request exceeds context capacity");
+        D = dfl.present ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
+        const int reserve = use_mtp ? D + 1 : dfl.block + 1;
+        if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
+            throw std::runtime_error("request exceeds context capacity");
+        if (use_mtp) {
+            ck(cudaMemsetAsync(mtp_kc.p, 0, kvf->key_bytes(context_, int(cfg.kvheads), int(cfg.head_dim)), stream));
+            ck(cudaMemsetAsync(mtp_vc.p, 0, kvf->value_bytes(context_, int(cfg.kvheads), int(cfg.head_dim)), stream));
+        }
         gen.rdelta = 0;
         // image prompt: per-token table (source row, t, h, w); an image takes nx * ny cache cells but advances the RoPE
         // position by max(nx, ny) (Qwen3-VL / llama.cpp mtmd)
@@ -2933,6 +2952,7 @@ public:
         if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
         // Queue prefill chunks on one stream and read back only the final next token.
         uint32_t next = 0;
+        uint32_t first_draft = 0;
         {
             // TQLLM_DEBUG=tf_dump:FILE: teacher-forced argmax at every prompt position ("pos argmax next_prompt_token")
             const std::string * tf_dump = tqllm::debug_value("tf_dump");
@@ -2967,6 +2987,20 @@ public:
                                  m, t, final ? h_tok : nullptr, false);
                     if (tf_host) ck(cudaMemcpyAsync(tf_host + t, v_tok.p, size_t(m) * 4, cudaMemcpyDeviceToHost, stream));
                     commit(m);
+                    if (use_mtp) {
+                        if (final) {
+                            sync_ck();
+                            next = h_tok[0];
+                        }
+                        const int pairs = int(std::min<uint32_t>(uint32_t(m), P - t - 1));
+                        for (int off = 0; off < pairs; off += NVER) {
+                            const int n = std::min(NVER, pairs - off);
+                            mtp_run(prompt.data() + t + uint32_t(off) + 1,
+                                    v_hid.as<bf16>() + size_t(off) * H, n, t + uint32_t(off) + 1, false);
+                        }
+                        if (final && count > 1 && next != eos_)
+                            first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
+                    }
                     for (int off = 0; off < m && dfl.present; off += 8) {
                         const int count = std::min(8, m - off);
                         if (t + uint32_t(off + count) <= inj0) continue;
@@ -2993,7 +3027,7 @@ public:
                     std::fclose(f);
                 }
             }
-            next = h_tok[0];
+            if (!use_mtp) next = h_tok[0];
             if (sampling()) {  // the final chunk's head wrote column 0's top-16
                 ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
                 ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
@@ -3014,6 +3048,8 @@ public:
         gen.P = P;
         gen.count = count;
         gen.D = D;
+        gen.native_mtp = use_mtp;
+        if (use_mtp && count > 1 && next != eos_) gen.mtp_draft.assign(1, first_draft);
         gen.pos = P;
         gen.rdelta = rdelta;
         gen.pending = next;
@@ -3555,8 +3591,15 @@ public:
     // x = eh_proj([enorm(embed(t)) ; hnorm(h)]), one full-attention decoder layer with its own KV cache, then the
     // shared LM head on shared_head_norm(x). Returns the greedy token after the last pair (the next draft) and keeps
     // the last pre-norm output as the hidden for chaining. `hidden`: device [n][H] (nullptr = chain from last MTP).
-    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos) {
+    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample = true) {
         if (!mtp.present) throw std::runtime_error("model has no MTP head");
+        struct RestoreBasis {
+            Basis & current;
+            Basis saved;
+            ~RestoreBasis() { current = saved; }
+        } restore{basis_, basis_};
+        // The nextn block can retain plain Q6_K weights beside a rotated TQ4 target.
+        basis_ = mtp.eh_proj.fmt ? mtp.eh_proj.fmt->basis() : Basis::Plain;
         const int H = int(cfg.hidden);
         auto *X = v_x.as<bf16>(), *R = v_r.as<bf16>(), *CAT = v_cat.as<bf16>(), *E = v_np.as<bf16>();
         auto * XH = v_xh.as<__half>();
@@ -3573,14 +3616,20 @@ public:
         tqllm_cuda::rms_f_multi(E, H, 0, mtp.enorm, CAT, 2 * H, 0, H, 1, n, cfg.eps, stream);
         tqllm_cuda::rms_f_multi(hidden ? hidden : mtp_h.as<bf16>(), H, 0, mtp.hnorm, CAT + H, 2 * H, 0, H, 1, n, cfg.eps,
                                 stream);
-        tqllm_cuda::tq3_rotate_h(CAT, XH, 2 * H, n, stream);
+        rot_h(CAT, XH, 2 * H, n);
         mm_h(mtp.eh_proj, X, n);
         tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
         ck(cudaMemcpyAsync(R, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
-        tqllm_cuda::norm_rotate_h(X, mtp.layer.in_norm, v_px.as<float>(), cfg.eps, XH, H, n, stream);
+        nrot_h(X, mtp.layer.in_norm, v_px.as<float>(), XH, H, n);
+        vpar = tree_mode ? d_chain.as<int>() : nullptr;
+        vdep = nullptr;
         attn_mixer(mtp.layer, mtp_kc.as<bf16>(), mtp_vc.as<bf16>(), n, int(bucket));
         ffn_block(mtp.layer, n);
         ck(cudaMemcpyAsync(mtp_h.p, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+        if (!sample) {
+            sync_ck();
+            return 0;
+        }
         if (mtp.draft_head.p) {  // argmax over the draft vocabulary only (the verifier still sees the full vocab)
             auto * NP = v_np.as<bf16>();
             tqllm_cuda::rms_f(X + size_t(n - 1) * H, H, mtp.shared_norm, NP, H, H, 1, cfg.eps, stream);
@@ -3592,7 +3641,8 @@ public:
             sync_ck();
             return mtp.draft_ids[h_tok[0]];
         }
-        head_argmax(mtp.shared_norm, n);
+        // Only the final repaired hidden state proposes the next draft token.
+        head_argmax(mtp.shared_norm, 1, n - 1);
         ck(cudaMemcpyAsync(h_tok, v_tok.as<uint32_t>() + (n - 1), 4, cudaMemcpyDeviceToHost, stream));
         sync_ck();
         return h_tok[0];
@@ -3601,6 +3651,7 @@ public:
     int slots() const override { return nslots; }
     bool incremental() const override { return fmt_target; }
     bool has_drafter() const override { return dfl.present; }
+    bool native_mtp() const override { return opt.native_mtp && mtp.present && !dfl.present; }
     void select_slot(int s) override {
         if (s < 0 || s >= nslots) throw std::out_of_range("slot out of range");
         if (s == active) return;
@@ -3630,18 +3681,71 @@ public:
         }
         sync_ck();
     }
+    bool mtp_advance() {
+        if (gen.done || gen.out.size() >= gen.count || gen.pending == eos_) {
+            gen.done = true;
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto & draft = gen.mtp_draft;
+        while (int(draft.size()) < gen.D)
+            draft.push_back(mtp_run(&draft.back(), nullptr, 1, gen.pos + uint32_t(draft.size())));
+        const auto t1 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> in{gen.pending}, res(size_t(gen.D) + 1);
+        in.insert(in.end(), draft.begin(), draft.end());
+        verify(in.data(), int(in.size()), gen.pos, res.data());
+        const auto t2 = std::chrono::steady_clock::now();
+        int j = 0;
+        while (j < gen.D && draft[size_t(j)] == res[size_t(j)]) ++j;
+        ++gen.steps;
+        gen.drafted += uint64_t(gen.D);
+        gen.accepted += uint64_t(j);
+        for (int i = 0; i < j && gen.out.size() < gen.count; ++i) {
+            gen.out.push_back(draft[size_t(i)]);
+            if (draft[size_t(i)] == eos_) {
+                gen.done = true;
+                break;
+            }
+        }
+        if (!gen.done && gen.out.size() < gen.count) gen.out.push_back(res[size_t(j)]);
+        commit(j + 1);
+        const uint32_t repair_pos = gen.pos + 1;
+        gen.pos += uint32_t(j + 1);
+        gen.pending = res[size_t(j)];
+        gen.done |= gen.out.size() >= gen.count || gen.pending == eos_;
+        if (!gen.done) {
+            std::vector<uint32_t> repaired(draft.begin(), draft.begin() + j);
+            repaired.push_back(gen.pending);
+            // Pair each committed token with the target hidden of its preceding position.
+            const uint32_t next = mtp_run(repaired.data(), verify_hidden(), int(repaired.size()), repair_pos);
+            draft.assign(1, next);
+        } else sync_ck();
+        const auto t3 = std::chrono::steady_clock::now();
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        gen.t_draft += ms(t0, t1);
+        gen.t_verify += ms(t1, t2);
+        gen.t_tail += ms(t2, t3);
+        return !gen.done;
+    }
+
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) override {
         if (!fmt_target) throw std::runtime_error("incremental decoding needs a quantized GGUF model");
         dflash_begin(prompt, count, D);
     }
     bool spec_advance() override {
+        if (gen.native_mtp) return mtp_advance();
         if (dfl.present) return dflash_advance();
         bool done = false;
         const int s = active;
         dflash_step(&s, 1, &done);
         return !done;
     }
-    void spec_step(const int * slots, int n, bool * done) override { dflash_step(slots, n, done); }
+    void spec_step(const int * slots, int n, bool * done) override {
+        if (gen.native_mtp) {
+            if (n != 1 || slots[0] != active) throw std::runtime_error("MTP step needs the active single slot");
+            done[0] = !mtp_advance();
+        } else dflash_step(slots, n, done);
+    }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override { return dflash_finish(stats); }
     std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {
@@ -3693,6 +3797,11 @@ public:
     std::vector<uint32_t> generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int D,
                                         uint64_t * stats) override {
         if (dfl.present) return generate_dflash(prompt, count, D, stats);
+        if (opt.native_mtp) {
+            spec_begin(prompt, count, D);
+            while (spec_advance()) {}
+            return spec_finish(stats);
+        }
         if (!mtp.present) throw std::runtime_error("model has no MTP head");
         if (D < 1 || D > NVER - 1) throw std::runtime_error("draft length exceeds verify capacity");
         const auto P = uint32_t(prompt.size());

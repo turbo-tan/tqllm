@@ -230,6 +230,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-fitc N` | 4096 | smallest context the fit may choose (with `--np`: the smallest context per slot) |
 | `-fitl on\|off` | off | allow the fit to switch to a lossier KV cache (q4/tcq2) or a shorter context; off: such a load is refused with what would fit |
 | `--gemm-rows N` | 0 | prefill FP16 weight blocks of N rows (less VRAM; a long prompt is summed in another order, so ask for it explicitly) |
+| `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 3, `--draft-max N`) |
 | `--slot-reserve MiB` | 128 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
 | `--graph-cache N` | 256 | captured CUDA graphs kept (~12 MB each); least recently used are evicted, also when free memory runs low |
 | `-ub N` | automatic | prefill chunk (ubatch) size |

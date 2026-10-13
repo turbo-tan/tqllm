@@ -44,6 +44,7 @@ public:
     bool kv_idle_pending() const;
     bool kv_idle_step();
     bool has_drafter() const;  // a DFlash2 drafter is loaded (-md)
+    bool native_mtp() const;   // --mtp: the model's own MTP head drafts
     bool incremental() const;  // spec_begin / spec_advance / spec_finish available (chunked prefill), with or without a drafter
     void select_slot(int slot);
     // Image embeddings for the next spec_begin on the active slot: prompt tokens [at, at + nx * ny) are placeholders;

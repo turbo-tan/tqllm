@@ -36,6 +36,7 @@ struct Engine {
     // (false once done) and spec_finish returns the generated ids. generate_spec = begin + advance* + finish.
     virtual int slots() const { return 1; }
     virtual bool has_drafter() const { return false; }
+    virtual bool native_mtp() const { return false; }  // --mtp drafts with the model's own nextn head
     virtual bool incremental() const { return false; }  // spec_begin / spec_advance work (chunked prefill), drafter or not
     virtual void select_slot(int s) {
         if (s != 0) throw std::runtime_error("this model has a single slot");
