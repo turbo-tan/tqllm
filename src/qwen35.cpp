@@ -842,7 +842,8 @@ private:
         lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
         if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
         const auto mp = "blk." + std::to_string(cfg.layers) + ".";
-        if (f.tensors.count(mp + "nextn.eh_proj.weight") && opt.draft_model.empty()) {  // DFlash2 drafts instead
+        // the MTP head drafts without -md, or beside DFlash2 with --mtp (--mtp-from N: prompts of N+ tokens use MTP)
+        if (f.tensors.count(mp + "nextn.eh_proj.weight") && (opt.draft_model.empty() || opt.native_mtp)) {
             mtp.present = true;
             mtp.eh_proj = g_mat(f, mp + "nextn.eh_proj.weight", H, 2 * H);
             mtp.enorm = g_f32(f, mp + "nextn.enorm.weight", H);
@@ -2892,7 +2893,10 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) {
         const auto P = uint32_t(prompt.size());
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
-        const bool use_mtp = !dfl.present && opt.native_mtp;
+        // --mtp with DFlash2 loaded: MTP for prompts of --mtp-from tokens or more, at --mtp-depth drafts
+        const bool use_mtp = opt.native_mtp && mtp.present && (!dfl.present || (opt.mtp_from > 0 && P >= opt.mtp_from));
+        const bool dfl_on = dfl.present && !use_mtp;
+        if (use_mtp && dfl.present) D = opt.mtp_depth;
         if (use_mtp) {
             if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
             if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");
@@ -2901,7 +2905,7 @@ public:
             if (D < 1 || D >= NVER) throw std::runtime_error("MTP draft length exceeds verify capacity");
         }
         // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
-        D = dfl.present ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
+        D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
         const int reserve = use_mtp ? D + 1 : dfl.block + 1;
         if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
             throw std::runtime_error("request exceeds context capacity");
@@ -3001,7 +3005,7 @@ public:
                         if (final && count > 1 && next != eos_)
                             first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
                     }
-                    for (int off = 0; off < m && dfl.present; off += 8) {
+                    for (int off = 0; off < m && dfl_on; off += 8) {
                         const int count = std::min(8, m - off);
                         if (t + uint32_t(off + count) <= inj0) continue;
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
@@ -3651,7 +3655,7 @@ public:
     int slots() const override { return nslots; }
     bool incremental() const override { return fmt_target; }
     bool has_drafter() const override { return dfl.present; }
-    bool native_mtp() const override { return opt.native_mtp && mtp.present && !dfl.present; }
+    bool native_mtp() const override { return opt.native_mtp && mtp.present && !dfl.present; }  // MTP only (no -md)
     void select_slot(int s) override {
         if (s < 0 || s >= nslots) throw std::out_of_range("slot out of range");
         if (s == active) return;
@@ -3744,7 +3748,7 @@ public:
         dflash_begin(prompt, count, D);
     }
     bool spec_advance() override {
-        if (gen.native_mtp) return mtp_advance();
+        if (gen.native_mtp) return mtp_advance();  // per request: an MTP request with DFlash2 loaded too
         if (dfl.present) return dflash_advance();
         bool done = false;
         const int s = active;

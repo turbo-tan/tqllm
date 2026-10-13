@@ -26,6 +26,8 @@ struct EngineOptions {
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
                         // decides (0 when the context fits, else the fewest that do)
     std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (none: native MTP heads when the model has them)
+    uint32_t mtp_from = 0;     // --mtp-from N with -md: prompts of N+ tokens draft with MTP, shorter ones with DFlash2
+    int mtp_depth = 5;         // --mtp-depth N: MTP drafts per step when DFlash2 is loaded too (else --draft-max)
     bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 5 by default)
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
     int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
