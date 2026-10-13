@@ -92,6 +92,10 @@ int main() {
         expect("never below zero", tqllm::fit_host_return(2048, size_t(4.0 * GB), size_t(0.27 * GB), tok16) == 0);
         expect("unknown token size: unchanged", tqllm::fit_host_return(4096, size_t(1.0 * GB), size_t(0.27 * GB), 0) == 4096);
     }
+    // F1 give-back: tester 3090 256K (10-13) ended 4.05 GB free against a 0.77 GB margin with the LM head in host memory
+    expect("give back with 3.3 GB spare", tqllm::fit_try_return(size_t(4.05 * GB), size_t(0.77 * GB)));
+    expect("no give-back with 0.18 GB spare", !tqllm::fit_try_return(size_t(0.95 * GB), size_t(0.77 * GB)));
+    expect("no give-back with the fit off", !tqllm::fit_try_return(size_t(4.0 * GB), 0));
     if (bad) return 1;
     std::printf("PASS fit_context (5060 Ti case -> %u)\n", c);
     return 0;

@@ -458,6 +458,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
         throw std::runtime_error(msg);
     };
     const bool user_pf = opt.ubatch != 0, user_kv = opt.kv_format() != "bf16";
+    const bool user_head = opt.head_host, user_embed = opt.embed_host;  // asked for: never given back
     const size_t floor_b = size_t(256) << 20;
     const bool host_auto = opt.kv_host < 0;
     int host_tries = 0;         // KV-to-host steps applied so far
@@ -548,7 +549,36 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                 if (!e2) break;  // out of memory: no measurement to refine with
                 ctx_short = best, free_short = fr2;
             }
-            if (reloaded) e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+            if (reloaded) {
+                e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                if (!e || !measure(fr, tot)) throw std::runtime_error("fit: reload at the interpolated context");
+            }
+            // give back placement steps that cost speed while the load leaves room for them (LM head first: every token)
+            struct Back { bool * on; bool user; const char * what; };
+            for (const Back & b : {Back{&opt.head_host, user_head, "int8 LM head back on the GPU"},
+                                   Back{&opt.embed_host, user_embed, "token embeddings back on the GPU"}}) {
+                if (!*b.on || b.user || !fit_try_return(fr, margin)) continue;
+                e.reset();
+                *b.on = false;
+                std::unique_ptr<Engine> e2;
+                try {
+                    e2 = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                } catch (const std::exception & ex) {
+                    if (!std::strstr(ex.what(), "out of memory")) throw;
+                }
+                size_t fr2 = 0;
+                if (e2 && measure(fr2, tot) && fr2 >= margin) {
+                    std::fprintf(stderr, "tqllm: fit: %s, %.2f GB free\n", b.what, double(fr2) / 1e9);
+                    e = std::move(e2);
+                    fr = fr2;
+                    continue;
+                }
+                e2.reset();
+                *b.on = true;
+                e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                if (!e || !measure(fr, tot)) throw std::runtime_error("fit: reload after a failed give-back");
+                break;
+            }
             if (step) std::fprintf(stderr, "tqllm: fit: %.2f GB free after %d step(s)\n", double(fr) / 1e9, step);
             return finish(std::move(e));
         }

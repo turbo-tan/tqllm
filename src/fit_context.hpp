@@ -91,4 +91,10 @@ inline std::string fit_result_changes(const FitSetting & asked, const FitSetting
     if (used.gemm_rows != asked.gemm_rows) add("prefill FP16 weight blocks of " + std::to_string(used.gemm_rows) + " rows");
     return out;
 }
+// F1 give-back: after a load that met the margin, a placement step the fit applied (LM head or embeddings in host
+// memory: slower prefill / decode) is undone when the load left at least min_spare above the margin. Beta tester 3090,
+// 256K (10-13): 4.05 GB free against a 0.77 GB margin with the LM head still in host memory.
+inline bool fit_try_return(size_t free_b, size_t margin, size_t min_spare = size_t(512) << 20) {
+    return margin && free_b > margin && free_b - margin >= min_spare;
+}
 }  // namespace tqllm
