@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tqllm-logo-dark.png">
+    <img src="docs/assets/tqllm-logo.png" alt="tqllm" width="360">
+  </picture>
+</p>
+
 # TQLLM
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000)
