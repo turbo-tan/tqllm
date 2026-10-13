@@ -93,3 +93,8 @@ if(BUILD_TESTING)
   add_executable(test-mlx-kld-settings tests/mlx_kld_settings.cpp)
   add_test(NAME mlx_kld_settings COMMAND test-mlx-kld-settings)
 endif()
+
+if(BUILD_TESTING)
+  add_executable(test-mlx-wired-budget tests/mlx_wired_budget.cpp)
+  add_test(NAME mlx_wired_budget COMMAND test-mlx-wired-budget)
+endif()

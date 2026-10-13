@@ -63,6 +63,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_TILED_TQ4_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes. |  |
 | `TQLLM_MLX_PAIRED_GATE_UP` | unset (separate projections) | Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required. |  |
 | `TQLLM_MLX_TILED_MIXER_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates. |  |
+| `TQLLM_MLX_WIRED_MIB` | unset (retain MLX default) | Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings. |  |
 
 ## Retired (the tool stops; use the replacement)
 

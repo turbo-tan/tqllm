@@ -1,3 +1,4 @@
+#include "wired_limit.hpp"
 #include "qwen35.hpp"
 #include "mlx/memory.h"
 #include "tqllm/tokenizer.hpp"
@@ -59,6 +60,7 @@ int main(int argc,char** argv) {
         else {std::ifstream in(tokens_path);uint32_t token;while(in>>token)input.push_back(token);if(!in.eof())throw std::runtime_error("invalid tokens file");}
         if(input.empty()||input.size()+size_t(count)>size_t(context))throw std::invalid_argument("prompt or output exceeds context");
         if(cache_limit)mx::set_cache_limit(cache_limit);
+        tqllm::mlx_backend::ScopedWiredLimit residency;
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
         if(verify_prefix_probe)engine.gdn_mode(tqllm::mlx_backend::Qwen35::GdnMode::scan);
         engine.profile(profiling);

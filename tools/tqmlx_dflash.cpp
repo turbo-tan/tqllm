@@ -1,3 +1,4 @@
+#include "wired_limit.hpp"
 #include "dflash.hpp"
 #include "tqllm/tokenizer.hpp"
 #include <mlx/memory.h>
@@ -22,6 +23,7 @@ int main(int argc,char** argv) {
         tqllm::Tokenizer tokenizer;tokenizer.load(argv[1]);auto prompt=tokenizer.encode(argv[3]);
         if(prompt.empty())throw std::invalid_argument("empty prompt");
         mx::set_cache_limit(512*1024*1024);
+        tqllm::mlx_backend::ScopedWiredLimit residency;
         Qwen35 engine(argv[1],int(prompt.size())+count+16);engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
         DFlash2 drafter(argv[2],engine);
         const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4")!=nullptr;

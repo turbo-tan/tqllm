@@ -625,3 +625,7 @@ flags:
     kind: debug
     default: "unset (backend default)"
     doc: "Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates."
+  - name: TQLLM_MLX_WIRED_MIB
+    kind: debug
+    default: "unset (retain MLX default)"
+    doc: "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings."
