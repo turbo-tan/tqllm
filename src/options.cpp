@@ -90,6 +90,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         o.fit = v == "on";
     } else if (a == "-fitt" || a == "--fit-target") o.fit_target_mb = count(0);
     else if (a == "-fitc" || a == "--fit-ctx") o.fit_min_ctx = uint32_t(count(256));
+    else if (a == "-fitl" || a == "--fit-lossy") {
+        const std::string v = value();
+        if (v != "on" && v != "off") throw std::invalid_argument("--fit-lossy must be on or off");
+        o.fit_lossy = v == "on";
+    }
     else if (a == "--slot-reserve") o.slot_reserve_mb = count(0);
     else if (a == "--graph-cache") o.graph_cache = count(1);
     else return false;
@@ -100,7 +105,7 @@ const char * engine_options_usage() {
     return "  engine: [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N]\n"
-           "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)]\n"
+           "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)] [-fitl on|off (off: refuse a load that needs a lossier KV or a shorter context)]\n"
            "          [--slot-reserve MiB free per parallel slot (128)] [--graph-cache captured CUDA graphs kept (256)]\n";
 }
 

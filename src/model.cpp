@@ -433,8 +433,19 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                          double(fr) / 1e9);
         return true;
     };
+    const uint32_t ctx_asked = ctx;
+    const std::string kv_asked = opt.kv_format();
     auto finish = [&](std::unique_ptr<Engine> en) {
-        if (slots <= 1 || !en) return en;
+        if (!en) return en;
+        // the fit may move weights and KV between device and host (same results); a lossier KV codec or a shorter context
+        // changes the answers, so it is refused unless asked for (-fitl on)
+        if (const std::string lossy = fit_result_changes(kv_asked, opt.kv_format(), ctx_asked, en->context());
+            !lossy.empty() && !opt.fit_lossy)
+            throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(ctx_asked) +
+                                     " per slot, KV " + kv_asked + "): it would need " + lossy +
+                                     ". Ask for that explicitly (e.g. --kv q4/tcq2, the trellis cache), use fewer slots (--np) or a smaller --context, "
+                                     "or allow it with -fitl on");
+        if (slots <= 1) return en;
         size_t fr = 0, tot = 0;
         if (!measure(fr, tot)) return en;
         const uint32_t ok = fit_slots(uint32_t(slots), en->context(), opt.fit_min_ctx, fr, base_margin, slot_b);
@@ -558,7 +569,8 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
             case 1: if (!opt.head_host) { opt.head_host = true; what = "int8 LM head to host memory"; applied = true; } break;
             case 2: if (!user_pf) { opt.ubatch = 1024; what = "prefill buffers 1024"; applied = true; } break;
             case 3: if (!user_pf) { opt.ubatch = 512; what = "prefill buffers 512"; applied = true; } break;
-            case 4: if (!user_kv) { opt.kv = "t4k-turbo3v"; what = "KV cache t4k-turbo3v"; applied = true; } break;
+            // q4 K + trellis 2-bit V: lowest KLD of the compact caches at 64K-200K (results/20261006_kv_longctx_kld)
+            case 4: if (!user_kv) { opt.kv = "q4/tcq2"; what = "KV cache q4/tcq2"; applied = true; } break;
             case 5: if (!opt.gemm_rows) { opt.gemm_rows = 2048; what = "prefill FP16 weight blocks of 2048 rows"; applied = true; } break;
             case 6:  // KV tail to host memory (exact; decode reads it over PCIe) before giving up context
             case 7:  // refine while each step frees memory (the per-token estimate undershoots: buffers grow with the tail)

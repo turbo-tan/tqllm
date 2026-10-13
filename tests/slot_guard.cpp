@@ -59,6 +59,15 @@ int main() {
     lru.clear(destroy);
     expect("clear frees everything", lru.size() == 0 && lru.evictions() == freed.size());
 
+    // lossy fit steps are reported (tqserve refuses them without -fitl on); placement-only loads report nothing.
+    // .77 3090, 27B TQ4_L --np 8 --context 262144 (10-13): the fit switched the KV cache to t4k-turbo3v and only 2 of 8
+    // answers matched np 1
+    expect("same KV and context: nothing", tqllm::fit_result_changes("bf16", "bf16", 32768, 32768).empty());
+    expect(".77 np 8 KV switch reported", tqllm::fit_result_changes("bf16", "q4/tcq2", 32768, 32768) == "KV cache q4/tcq2 (asked bf16)");
+    expect("context cut reported", tqllm::fit_result_changes("bf16", "bf16", 262144, 131072) == "context 131072 per slot (asked 262144)");
+    expect("both reported", tqllm::fit_result_changes("q8/q8", "t4k-turbo3v", 65536, 32768).find(", context 32768") != std::string::npos);
+    expect("a longer context is not a cut", tqllm::fit_result_changes("bf16", "bf16", 2048, 4096).empty());
+
     if (bad) return 1;
     std::puts("slot guard PASS");
     return 0;

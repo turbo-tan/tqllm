@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace tqllm {
 // Largest context (multiple of `align`) that keeps `margin` bytes free, from two loads: ctx_short left free_short
@@ -75,5 +76,13 @@ inline uint32_t fit_slots(uint32_t np, uint32_t slot_ctx, uint32_t min_ctx, size
     uint32_t by_mem = np;
     if (slot_b) by_mem = free_b <= margin ? 0 : uint32_t(std::min<uint64_t>(np, (free_b - margin) / slot_b));
     return std::max(1u, std::min({np, by_ctx, by_mem}));
+}
+// What the fit changed that alters results (not just where weights live): a different KV codec, or a context below the
+// one asked for. Empty when the load serves exactly what was asked. Without -fitl on, tqserve refuses such a load.
+inline std::string fit_result_changes(const std::string & kv_asked, const std::string & kv_used, uint32_t ctx_asked, uint32_t ctx_used) {
+    std::string out;
+    if (kv_used != kv_asked) out += "KV cache " + kv_used + " (asked " + kv_asked + ")";
+    if (ctx_used < ctx_asked) out += std::string(out.empty() ? "" : ", ") + "context " + std::to_string(ctx_used) + " per slot (asked " + std::to_string(ctx_asked) + ")";
+    return out;
 }
 }  // namespace tqllm

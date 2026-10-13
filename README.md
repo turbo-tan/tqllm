@@ -228,6 +228,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-fit on\|off` | on | load, measure, and step down until the margin is free, in this order: token embeddings and the LM head to host memory, smaller prefill buffers, a smaller KV format (when `--kv` is not set), prefill weight blocks, the KV tail to system RAM, then a shorter context |
 | `-fitt MiB` | 768 (256 under WSL) | free memory to leave on the GPU (64 MiB floor) |
 | `-fitc N` | 4096 | smallest context the fit may choose (with `--np`: the smallest context per slot) |
+| `-fitl on\|off` | off | allow the fit to switch to a lossier KV cache (q4/tcq2) or a shorter context; off: such a load is refused with what would fit |
 | `--slot-reserve MiB` | 128 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
 | `--graph-cache N` | 256 | captured CUDA graphs kept (~12 MB each); least recently used are evicted, also when free memory runs low |
 | `-ub N` | automatic | prefill chunk (ubatch) size |
