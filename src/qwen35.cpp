@@ -1809,8 +1809,9 @@ public:
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
         if (!(defer && tree_step && n <= NVER)) flush_pending();
-        // tree mode: every verify block (n <= NVER) goes through the tree kernels; a chain unless the caller drafted a tree
-        vpar = tree_mode && n <= NVER ? (tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
+        // tree mode: a drafted tree goes through the tree kernels; a chain block (chain drafts, MTP requests) through the
+        // causal ones, which equal one-token decode bit for bit (the two-part tree attention does not: tests/tree.cu)
+        vpar = tree_mode && tree_step && n <= NVER ? d_tpar.as<int>() : nullptr;
         vdep = tree_mode && n <= NVER && tree_step ? d_tdep.as<int>() : nullptr;
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
@@ -1873,7 +1874,7 @@ public:
                 const auto & g = segs[i];
                 attn_core(L, T + size_t(g.col0) * rows, rows, Q + size_t(g.col0) * nh * hd, O + size_t(g.col0) * nh * hd,
                           kc_of(g.slot)[size_t(li)].as<bf16>(), vc_of(g.slot)[size_t(li)].as<bf16>(), g.n,
-                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : tree_mode ? d_chain.as<int>() : nullptr,
+                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : nullptr,  // chains: causal (exact)
                           g.tree ? d_tdep.as<int>() + g.col0 : nullptr,
                           fuse ? XH + size_t(g.col0) * nh * hd : nullptr, part_of(i), v_rpos.as<int>() + 2 * i);
             });

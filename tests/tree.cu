@@ -489,6 +489,40 @@ void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, 
 
 }  // namespace
 
+// Codec attention (attention_kv_split): a chain through the tree path == one-query causal decode, bit for bit
+void test_codec_chain_vs_causal(const char * name, KvCodec kcod, KvCodec vcod, int n, int pos) {
+    const int heads = 24, kvh = 4, dim = 256, ctx = 512, nsplit = 18;
+    const size_t kr = kvh * codec_bytes(kcod), vr = kvh * codec_bytes(vcod), qw = size_t(heads) * dim;
+    const auto kv = randb(size_t(ctx) * 2 * kvh * dim), q = randb(size_t(n) * qw);
+    auto *dkv = dev(kv), *dq = dev(q);
+    auto * d0 = dev(std::vector<int>{0, 1});
+    uint8_t *dk = nullptr, *dv = nullptr;
+    cudaMalloc(&dk, ctx * kr), cudaMalloc(&dv, ctx * vr);
+    tqllm_cuda::cache_write_kv_side(kcod, dkv, 2 * kvh * dim, ctx, dk, d0, kvh, dim, nullptr);
+    tqllm_cuda::cache_write_kv_side(vcod, dkv + kvh * dim, 2 * kvh * dim, ctx, dv, d0, kvh, dim, nullptr);
+    bf16 * dy = nullptr;
+    float * part = nullptr;
+    cudaMalloc(&dy, size_t(n) * qw * 2);
+    cudaMalloc(&part, size_t(n) * heads * (nsplit + 1) * (dim + 2) * 4);
+    auto * dp = dev(std::vector<int>{pos, pos + 1});
+    std::vector<int> depth(n);
+    for (int i = 0; i < n; ++i) depth[i] = i;
+    auto *dch = dev(chain(n)), *ddep = dev(depth);
+    tqllm_cuda::attention_kv_split(kcod, vcod, dq, dk, dv, dy, part, dp + 1, n, heads, kvh, 1.f / 16.f, nsplit, nullptr, dch, ddep);
+    const auto yt = host(dy, size_t(n) * qw);
+    bool ok = true;
+    for (int z = 0; z < n; ++z) {
+        auto * dd = dev(std::vector<int>{pos + 1 + z});
+        tqllm_cuda::attention_kv_split(kcod, vcod, dq + size_t(z) * qw, dk, dv, dy, part, dd, 1, heads, kvh, 1.f / 16.f, nsplit, nullptr);
+        ok &= same(&yt[size_t(z) * qw], host(dy, qw).data(), qw);
+        cudaFree(dd);
+    }
+    char label[64];
+    std::snprintf(label, sizeof label, "attn %s chain == causal n%d", name, n);
+    report(label, ok);
+    cudaFree(dkv), cudaFree(dq), cudaFree(d0), cudaFree(dk), cudaFree(dv), cudaFree(dy), cudaFree(part), cudaFree(dp), cudaFree(dch), cudaFree(ddep);
+}
+
 int main() {
     test_gdn();
     test_conv();
@@ -508,6 +542,8 @@ int main() {
     for (const auto & c : codecs) test_attention_codec(c.name, c.k, c.v, 8, 333);
     test_attention_codec("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 12, 350);
     test_attention_codec("tcq3/tcq2", KvCodec::Tcq3, KvCodec::Tcq2, 12, 350);
+    test_codec_chain_vs_causal("q4/tcq2", KvCodec::Q4, KvCodec::Tcq2, 8, 333);
+    test_codec_chain_vs_causal("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 8, 333);
     const auto err = cudaGetLastError();
     if (err != cudaSuccess) {
         std::printf("CUDA error: %s\n", cudaGetErrorString(err));
