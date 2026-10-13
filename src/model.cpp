@@ -594,7 +594,13 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
         std::string what;
         for (bool applied = false; !applied; ++step) {
             switch (step) {
-            case 0: if (!opt.embed_host) { opt.embed_host = true; what = "token embeddings to host memory"; applied = true; } break;
+            case 0:
+                // drafter retrieval (default on) costs the drafter's K/V over the whole context; drafts never change the
+                // output, so the fit may turn it off before anything else (an explicit --draft-retrieve N stays)
+                if (opt.draft_retrieve < 0 && !opt.draft_model.empty()) {
+                    opt.draft_retrieve = 0; what = "drafter retrieval off (--draft-retrieve N keeps it)"; applied = true; step = -1;
+                } else if (!opt.embed_host) { opt.embed_host = true; what = "token embeddings to host memory"; applied = true; }
+                break;
             case 1: if (!opt.head_host) { opt.head_host = true; what = "int8 LM head to host memory"; applied = true; } break;
             case 2: if (!user_pf) { opt.ubatch = 1024; what = "prefill buffers 1024"; applied = true; } break;
             case 3: if (!user_pf) { opt.ubatch = 512; what = "prefill buffers 512"; applied = true; } break;

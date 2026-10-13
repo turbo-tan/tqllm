@@ -31,7 +31,8 @@ struct EngineOptions {
     bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 4 by default)
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
     int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
-    int draft_retrieve = 0;    // --draft-retrieve C: C x 16 positions of the drafter window are far chunks it retrieves (one slot)
+    int draft_retrieve = -1;   // --draft-retrieve C: C x 16 positions of the drafter window are far chunks it retrieves (one slot);
+                               // -1 (default): 32, turned off by the memory fit if needed (speed only: drafts never change output); 0: off
     bool tree = true;          // --no-tree: chain verify instead of tree verify with a drafter
     int lookup = 0;            // --lookup L: prompt-lookup chain of up to L tokens beside the draft tree (copy tasks)
     int lookup_first = 0;      // --lookup-first K: a lookup match of >= K tokens takes the whole verify block

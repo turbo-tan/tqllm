@@ -231,6 +231,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-fitl on\|off` | off | allow the fit to switch to a lossier KV cache (q4/tcq2) or a shorter context; off: such a load is refused with what would fit |
 | `--gemm-rows N` | 0 | prefill FP16 weight blocks of N rows (less VRAM; a long prompt is summed in another order, so ask for it explicitly) |
 | `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 4, `--draft-max N`) |
+| `--draft-retrieve N` | 32 (auto) | with `-md`: N far chunks of 16 positions in the drafter window (+8-12 % at 31K-51K on a 3090); costs ~20 KB / token of drafter K/V, so the memory fit turns the default off first when memory is short; `0` = off |
 | `--mtp-from N` | 0 | with `-md` and `--mtp`: prompts of N or more tokens draft with the MTP head (`--mtp-depth D`, default 4), shorter ones with DFlash2 |
 | `--slot-reserve MiB` | 128 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
 | `--graph-cache N` | 256 | captured CUDA graphs kept (~12 MB each); least recently used are evicted, also when free memory runs low |
