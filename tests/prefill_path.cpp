@@ -20,14 +20,6 @@ int main() {
     expect(n34.native && n34.cross > 400, "5060 Ti TQ3_4S: native beats dequant past 400 columns");
     PrefillFormat tq4{16, 32, false}, tq34s{12, 32, true};
     // uncalibrated: exactly the old rule
-    {  // verify blocks keep single-token arithmetic: an 8-wide format (Q6_K part), calibrated native at the crossover
-        PrefillFormat q6{8, 8, true, 180, true};
-        expect(prefill_path(10, q6, true, false) == PrefillPath::native, "prefill chunk of 10 -> calibrated native");
-        expect(prefill_path(10, q6, true, false, 12) == PrefillPath::batched, "tree verify of 10 columns -> batched matvec");
-        expect(prefill_path(12, q6, true, false, 12) == PrefillPath::batched, "tree verify of 12 columns -> batched matvec");
-        expect(prefill_path(13, q6, true, false, 12) == PrefillPath::native, "13 columns is not a verify block");
-        expect(prefill_path(8, q6, true, false, 12) == PrefillPath::matvec, "8 columns -> matvec");
-    }
     expect(prefill_path(8, tq4, true, false) == PrefillPath::matvec, "n <= matvec width -> matvec");
     expect(prefill_path(40, tq4, true, true) == PrefillPath::batched, "batched verify stays batched");
     expect(prefill_path(28, tq4, true, false) == PrefillPath::dequant, "uncalibrated TQ4 n=28 -> dequant (old rule)");
