@@ -1179,6 +1179,8 @@ private:
             ck(cudaMemcpy(d_tdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
             ck(cudaMemcpy(d_cdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
         }
+        if (opt.native_mtp && nslots != 1)  // refused at start-up, not per request
+            throw std::runtime_error("--mtp drafts for one slot only for now: use --np 1 (or -md for --np > 1)");
         chain2 = kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
         // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
         if (opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
@@ -2900,14 +2902,14 @@ public:
         const auto P = uint32_t(prompt.size());
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
         // --mtp with DFlash2 loaded: MTP for prompts of --mtp-from tokens or more, at --mtp-depth drafts
-        const bool use_mtp = opt.native_mtp && mtp.present && (!dfl.present || (opt.mtp_from > 0 && P >= opt.mtp_from));
+        // sampled or image requests decode without MTP (exact either way), so no request fails for asking for them
+        const bool use_mtp = opt.native_mtp && mtp.present && !sampling() && mm_pending.empty() &&
+                             (!dfl.present || (opt.mtp_from > 0 && P >= opt.mtp_from));
         const bool dfl_on = dfl.present && !use_mtp;
         if (use_mtp && dfl.present) D = opt.mtp_depth;
         if (use_mtp) {
             if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
             if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");
-            if (sampling()) throw std::runtime_error("--mtp currently needs temperature 0");
-            if (!mm_pending.empty()) throw std::runtime_error("--mtp currently needs a text-only prompt");
             if (D < 1 || D >= NVER) throw std::runtime_error("MTP draft length exceeds verify capacity");
         }
         // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
