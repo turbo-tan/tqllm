@@ -94,8 +94,9 @@ and 301 are TQLLM's own (above the ggml range), so these files need TQLLM; llama
 ## Fast decoding: about 250 tok/s on an RTX 3090
 
 TQLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
-and commits tokens that match its target verifier. Our greedy hash checks validate this configuration empirically;
-they do not prove agreement with a full-vocabulary head for every prompt. Download into `./models`:
+and commits the ones it would have produced itself. Greedy output is identical, token for token, to decoding without
+the drafter: plain decoding and every verify (tree, chain, MTP) share one attention arithmetic, checked by
+`test-tree`, `test-dflash-exact` and `test-native-mtp` and on long prompts up to 51K tokens. Download into `./models`:
 
 | file | Hugging Face repo |
 |---|---|
@@ -126,6 +127,13 @@ What to expect: on the LocalMaxxing reasoning prompt (32K context, 320 output to
 with this drafter (TQ3 and Q4_K_M builds measure the same). The server reports tok/s for every
 request. Speed depends on how often the drafter's guesses are accepted, so it varies with the text: predictable text
 (reasoning, prose) runs fastest, code and long contexts slower.
+
+Long prompts: `--draft-retrieve 32` lets the drafter also read 32 far passages of the prompt (RTX 3090, 64K context:
+31K / 40K / 51K-token prompts 158 / 143 / 137 -> 176 / 156 / 148 tok/s, short prompts -2 %). It keeps the drafter's
+cache for the whole context (about 20 KB per token), so it is off by default.
+
+No drafter file: `--mtp` drafts with the model's own prediction head (one user, greedy; same output as plain decoding):
+155 tok/s at 1.6K and 125 tok/s at 51K tokens on an RTX 3090, against 57 and 47 without drafting.
 
 ### Recommended settings
 
@@ -206,7 +214,6 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--draft-max N` | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there |
 | `--no-tree` | tree on | verify a single draft chain instead of a token tree |
 | `--draft-window N` | GGUF value | drafter attention window over the context (0 = whole context) |
-| `--draft-retrieve C` | 0 | prototype, one slot: C x 16 of the drafter window are far-context chunks it retrieves |
 | `--lookup L [--lookup-first K]` | off | prompt-lookup drafts (copies of earlier text) next to the tree; shares the verify budget |
 
 ### KV cache and long context (TqCache)
@@ -229,7 +236,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `-fitt MiB` | 768 (256 under WSL) | free memory to leave on the GPU (64 MiB floor) |
 | `-fitc N` | 4096 | smallest context the fit may choose (with `--np`: the smallest context per slot) |
 | `-fitl on\|off` | on | on: when the requested context / users do not fit at full settings, pick a compact KV cache (q4/tcq2), smaller prefill buffers or weight blocks, or a shorter context, and say so at start-up (and in `/health`); off: refuse instead |
-| `--gemm-rows N` | 0 | prefill FP16 weight blocks of N rows (less VRAM; a long prompt is summed in another order, so ask for it explicitly) |
+| `--gemm-rows N` | 0 (fit) | prefill FP16 weight blocks of N rows (less VRAM); the memory fit picks 2048 when needed and says so |
 | `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 4, `--draft-max N`) |
 | `--draft-retrieve N` | 0 (off) | with `-md`: N far chunks of 16 positions in the drafter window; long prompts get faster (32: +8-12 % at 31K-51K on a 3090) but the drafter keeps K/V for the whole context (~20 KB / token: 1.25 GiB at 64K, 3.9 GiB at 200K), so turn it on when memory allows |
 | `--mtp-from N` | 0 | with `-md` and `--mtp`: prompts of N or more tokens draft with the MTP head (`--mtp-depth D`, default 4), shorter ones with DFlash2 |
