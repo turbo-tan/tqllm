@@ -2372,9 +2372,8 @@ public:
             std::fprintf(stderr, "tqllm: drafter window %d -> %d (--draft-window)\n", dfl.window, opt.draft_window);
             dfl.window = opt.draft_window;
         }
-        // default 32 far chunks (+8-12 % at 31K-51K on the 3090); the drafter's K/V then spans the context (20 KB / token)
-        if (const int want = opt.draft_retrieve < 0 ? 32 : opt.draft_retrieve; want > 0 && dfl.window > 0) {
-            dfl.retr = std::min(want, 128);
+        if (opt.draft_retrieve > 0 && dfl.window > 0) {
+            dfl.retr = std::min(opt.draft_retrieve, 128);
             dfl.recent = std::max(64, dfl.window - dfl.retr * 16);
             std::fprintf(stderr, "tqllm: drafter retrieval window: %d far chunks of 16 + %d recent positions (--draft-retrieve)\n",
                          dfl.retr, dfl.recent);
