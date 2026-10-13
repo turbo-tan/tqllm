@@ -1575,7 +1575,7 @@ private:
             if ((n < NGEMM_BLAS || !gemm_w.p) && m.fmt->has_gemm()) return PrefillPath::native;
             return PrefillPath::dequant;
         }
-        return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, !segs.empty() || wide_mm);
+        return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, !segs.empty() || wide_mm, NVER);
     }
 
     // Prefill chunk: FP16 weights once per chunk + cuBLAS GEMM; column j of the result goes to out + j * ldo (ldo >= rows;

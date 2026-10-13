@@ -37,8 +37,14 @@ inline PrefillCross prefill_crossover(const PrefillCosts & c, int lo, int hi) {
     return r;
 }
 // have_dequant: the FP16 prefill weight buffer exists; batched_verify: np > 1 / draft columns (np = 1 numerics)
-inline PrefillPath prefill_path(int n, const PrefillFormat & f, bool have_dequant, bool batched_verify) {
+// exact_cols: column counts that are verify blocks (<= NVER). They must use the matvec arithmetic of single-token decode
+// (batched matvec past the kernel width), never the native multi-column kernel: greedy speculative output has to equal
+// plain decoding. The calibrated native-vs-batched choice is made at the crossover and depends on the prefill buffer
+// (.77 10-13: tree verify of 9-12 columns on Q6_K / Q4_K parts took the native kernel at -ub 4096, so DFlash2 changed
+// a 3.7K-token answer at token 368; at -ub 512 it did not).
+inline PrefillPath prefill_path(int n, const PrefillFormat & f, bool have_dequant, bool batched_verify, int exact_cols = 0) {
     if (n <= f.max_matvec_cols) return PrefillPath::matvec;
+    if (n <= exact_cols) return PrefillPath::batched;
     if (batched_verify) return PrefillPath::batched;
     if (f.cross < 0) {  // uncalibrated: the old rule
         if ((n < kNgemmBlas || !have_dequant) && f.native_gemm) return PrefillPath::native;
