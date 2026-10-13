@@ -1,1 +1,6 @@
 src/COMMIT export-subst
+
+# Keep LF in files that run inside the Linux container, also on Windows checkouts
+*.sh text eol=lf
+Dockerfile text eol=lf
+compose*.yaml text eol=lf
