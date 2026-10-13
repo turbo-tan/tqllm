@@ -23,7 +23,7 @@
 namespace tqserve {
 
 struct ServeOptions {
-    int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: 7 with -md, 5 with --mtp
+    int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: 7 with -md, 4 with --mtp
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
@@ -32,7 +32,7 @@ inline ServeOptions & serve_options() {  // set by tqserve's main before the fir
 }
 inline int draft_length(bool native_mtp = false) {
     const int d = serve_options().draft_max;
-    return d ? d : native_mtp ? 5 : 7;  // --mtp 5: best of 1 / 3 / 5 at 1.6K-51K (.77 3090, 10-13)
+    return d ? d : native_mtp ? 4 : 7;  // --mtp 4: best of depths 1-5 and 7 at 1.6K-51K (.77 3090, 10-13)
 }
 inline uint32_t repeat_limit() { return serve_options().repeat_limit; }
 
