@@ -77,12 +77,18 @@ inline uint32_t fit_slots(uint32_t np, uint32_t slot_ctx, uint32_t min_ctx, size
     if (slot_b) by_mem = free_b <= margin ? 0 : uint32_t(std::min<uint64_t>(np, (free_b - margin) / slot_b));
     return std::max(1u, std::min({np, by_ctx, by_mem}));
 }
-// What the fit changed that alters results (not just where weights live): a different KV codec, or a context below the
-// one asked for. Empty when the load serves exactly what was asked. Without -fitl on, tqserve refuses such a load.
-inline std::string fit_result_changes(const std::string & kv_asked, const std::string & kv_used, uint32_t ctx_asked, uint32_t ctx_used) {
+// What the fit changed that alters results (not just where weights live): a different KV codec, a context below the
+// one asked for, or a different prefill split (buffer tokens, FP16 weight blocks: a long prompt is cut and summed
+// differently). Moving the embeddings, the LM head or KV positions to host memory gives the same answers (.77, 10-13).
+// Empty when the load serves exactly what was asked. Without -fitl on, tqserve refuses such a load.
+struct FitSetting { std::string kv; uint32_t ctx = 0; long ubatch = 0; long gemm_rows = 0; };
+inline std::string fit_result_changes(const FitSetting & asked, const FitSetting & used) {
     std::string out;
-    if (kv_used != kv_asked) out += "KV cache " + kv_used + " (asked " + kv_asked + ")";
-    if (ctx_used < ctx_asked) out += std::string(out.empty() ? "" : ", ") + "context " + std::to_string(ctx_used) + " per slot (asked " + std::to_string(ctx_asked) + ")";
+    auto add = [&](const std::string & s) { out += (out.empty() ? "" : ", ") + s; };
+    if (used.kv != asked.kv) add("KV cache " + used.kv + " (asked " + asked.kv + ")");
+    if (used.ctx < asked.ctx) add("context " + std::to_string(used.ctx) + " per slot (asked " + std::to_string(asked.ctx) + ")");
+    if (used.ubatch != asked.ubatch) add("prefill buffers -ub " + std::to_string(used.ubatch));
+    if (used.gemm_rows != asked.gemm_rows) add("prefill FP16 weight blocks of " + std::to_string(used.gemm_rows) + " rows");
     return out;
 }
 }  // namespace tqllm

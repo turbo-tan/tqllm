@@ -433,17 +433,16 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                          double(fr) / 1e9);
         return true;
     };
-    const uint32_t ctx_asked = ctx;
-    const std::string kv_asked = opt.kv_format();
+    const FitSetting asked{opt.kv_format(), ctx, long(opt.ubatch), long(opt.gemm_rows)};
     auto finish = [&](std::unique_ptr<Engine> en) {
         if (!en) return en;
         // the fit may move weights and KV between device and host (same results); a lossier KV codec or a shorter context
         // changes the answers, so it is refused unless asked for (-fitl on)
-        if (const std::string lossy = fit_result_changes(kv_asked, opt.kv_format(), ctx_asked, en->context());
+        if (const std::string lossy = fit_result_changes(asked, {opt.kv_format(), en->context(), long(opt.ubatch), long(opt.gemm_rows)});
             !lossy.empty() && !opt.fit_lossy)
-            throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(ctx_asked) +
-                                     " per slot, KV " + kv_asked + "): it would need " + lossy +
-                                     ". Ask for that explicitly (e.g. --kv q4/tcq2, the trellis cache), use fewer slots (--np) or a smaller --context, "
+            throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
+                                     " per slot, KV " + asked.kv + "): it would need " + lossy +
+                                     ". Ask for that explicitly (e.g. --kv q4/tcq2 -ub 512), use fewer slots (--np) or a smaller --context, "
                                      "or allow it with -fitl on");
         if (slots <= 1) return en;
         size_t fr = 0, tot = 0;
