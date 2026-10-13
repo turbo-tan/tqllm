@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the image to ghcr.io (off by default; pushes, tags and pull requests only build)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,7 +41,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -48,7 +53,7 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
           tags: ${{ env.IMAGE }}:ci-${{ github.sha }}-${{ matrix.arch }}
           build-args: BUILD_JOBS=4
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -57,7 +62,7 @@ jobs:
   # Combines the two per-arch images into one multi-platform tag,
   # e.g. ghcr.io/turbo-tan/tqllm:beta-<sha>-cu13
   publish:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     needs: build
     runs-on: ubuntu-latest
     steps:
