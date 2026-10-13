@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <random>
@@ -341,6 +342,69 @@ void test_attention(int n, int pos) {
 }
 
 
+// The tree kernels on a plain chain (par = parent i - 1) must equal the causal kernels (par = null) bit for bit: in tree
+// mode every verify goes through the tree path, plain decoding through the causal one, and greedy output must not change
+// (.77 10-13: DFlash2 tree changed a 3.7K-token answer at token 368; --no-tree did not).
+void test_chain_vs_causal(int n, int pos) {
+    const int heads = 24, kvh = 4, dim = 256, ctx = 512, nsplit = 20;
+    const size_t kvw = size_t(kvh) * dim;
+    bool ok = true;
+    for (int trial = 0; trial < 4; ++trial) {
+        const auto kc = randb(size_t(ctx) * kvw), vc = randb(size_t(ctx) * kvw), q = randb(size_t(n) * heads * dim);
+        auto *dk = dev(kc), *dv = dev(vc), *dq = dev(q);
+        bf16 * dy = nullptr;
+        float * part = nullptr;
+        cudaMalloc(&dy, size_t(n) * heads * dim * 2);
+        cudaMalloc(&part, size_t(n) * heads * (nsplit + 1) * (dim + 2) * 4);
+        const std::vector<int> dpos{pos, pos + 1};
+        auto * dp = dev(dpos);
+        auto * dch = dev(chain(n));
+        std::vector<int> depth(n);
+        for (int i = 0; i < n; ++i) depth[i] = i;
+        auto * ddep = dev(depth);
+        tqllm_cuda::attention_mq256(dq, dk, dv, dy, part, dp + 1, n, heads, kvh, 1.f / 16.f, nsplit, nullptr, 0, dch, ddep);
+        auto yt = host(dy, size_t(n) * heads * dim);
+        if (std::getenv("TREE_CAUSAL_REF") && n <= 8) {  // control: causal block of n queries in one call
+            tqllm_cuda::attention_mq256(dq, dk, dv, dy, part, dp + 1, n, heads, kvh, 1.f / 16.f, nsplit, nullptr);
+            yt = host(dy, size_t(n) * heads * dim);
+        }
+        // plain decoding: one query per step, query z seeing keys [0, pos + 1 + z)
+        for (int z = 0; z < n; ++z) {
+            const std::vector<int> d1{pos + 1 + z};
+            auto * dd = dev(d1);
+            tqllm_cuda::attention_mq256(dq + size_t(z) * heads * dim, dk, dv, dy, part, dd, 1, heads, kvh, 1.f / 16.f, nsplit, nullptr);
+            const auto y1 = host(dy, size_t(heads) * dim);
+            if (!same(&yt[size_t(z) * heads * dim], y1.data(), y1.size())) {
+                ok = false;
+                if (trial == 0) std::printf("  query %d differs from one-query decode\n", z);
+            }
+            cudaFree(dd);
+        }
+        cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(dy), cudaFree(part), cudaFree(dp), cudaFree(dch), cudaFree(ddep);
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "attention chain == causal (n %d)", n);
+    report(name, ok);
+}
+void test_gdn_chain_vs_causal() {
+    const int n = 12, kh = 16, vh = 48, dk = 128, dv = 128, qkv = 2 * kh * dk + vh * dv, ab = 2 * vh;
+    const auto x = randb(size_t(n) * qkv, 0.5f), ba = randb(size_t(n) * ab, 1.f);
+    const auto neg_a = randf(vh, -1.f, -0.1f), dt = randf(vh, -0.5f, 0.5f), st = randf(size_t(vh) * dk * dv, -0.1f, 0.1f);
+    auto *dx = dev(x), *dba = dev(ba);
+    auto *dna = dev(neg_a), *ddt = dev(dt), *dst = dev(st);
+    float * dso = nullptr;
+    cudaMalloc(&dso, st.size() * 4);
+    bf16 * dy = nullptr;
+    cudaMalloc(&dy, size_t(n) * vh * dv * 2);
+    auto * dch = dev(chain(n));
+    tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dst, dso, dy, kh, vh, dk, dv, true, nullptr, dch);
+    const auto yt = host(dy, size_t(n) * vh * dv);
+    tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dst, dso, dy, kh, vh, dk, dv, true, nullptr, nullptr);
+    const auto yc = host(dy, size_t(n) * vh * dv);
+    report("gdn chain == causal", same(yt.data(), yc.data(), yt.size()));
+    cudaFree(dx), cudaFree(dba), cudaFree(dna), cudaFree(ddt), cudaFree(dst), cudaFree(dso), cudaFree(dy), cudaFree(dch);
+}
+
 using tqllm_cuda::KvCodec;
 size_t codec_bytes(KvCodec c) {
     switch (c) {
@@ -434,6 +498,10 @@ int main() {
     test_attention(8, 333);
     test_attention(12, 333);  // > 8 queries: tiled part in chunks
     test_attention(12, 350);  // deep nodes with the block start near a 32-key boundary
+    test_chain_vs_causal(8, 333);
+    test_chain_vs_causal(12, 333);
+    test_chain_vs_causal(12, 350);
+    test_gdn_chain_vs_causal();
     const struct { const char * name; KvCodec k, v; } codecs[] = {
         {"tq3/tq3", KvCodec::Tq3, KvCodec::Tq3}, {"tq3/tq2s", KvCodec::Tq3, KvCodec::Tq2s},
         {"tcq3/tcq2", KvCodec::Tcq3, KvCodec::Tcq2}, {"q8/q8", KvCodec::Q8, KvCodec::Q8}, {"q4/tcq2", KvCodec::Q4, KvCodec::Tcq2}};
