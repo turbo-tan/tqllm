@@ -410,7 +410,12 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
         std::getline(v, l);
         return l.find("icrosoft") != std::string::npos;
     }();
-    const size_t margin = fit_margin(opt.fit, opt.fit_target_mb, wsl);
+    // parallel slots: each needs --slot-reserve MiB free after loading (its batched-verify / draft graphs); the fit makes
+    // that room first (host placement, KV to host, context), then refuses an --np the memory cannot carry
+    const size_t base_margin = fit_margin(opt.fit, opt.fit_target_mb, wsl);
+    const size_t slot_b = slots > 1 ? size_t(std::max(0L, opt.slot_reserve_mb)) << 20 : 0;
+    const size_t margin = base_margin ? base_margin + size_t(slots) * slot_b : 0;
+    if (wsl) opt.graph_keep_mb = 0;  // the driver reads ~0 near the budget: the graph cache bounds itself by count only
     // in use before loading (CUDA context, desktop, other processes): read while far from the budget, so reliable on WSL too
     size_t free0 = 0, total0 = 0;
     if (cudaMemGetInfo(&free0, &total0) != cudaSuccess) free0 = total0 = 0;
@@ -427,6 +432,20 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                          double(tqllm_cuda::dev_bytes()) / 1e9, double(df) / 1e9, double(tot) / 1e9, double(used_before) / 1e9,
                          double(fr) / 1e9);
         return true;
+    };
+    auto finish = [&](std::unique_ptr<Engine> en) {
+        if (slots <= 1 || !en) return en;
+        size_t fr = 0, tot = 0;
+        if (!measure(fr, tot)) return en;
+        const uint32_t ok = fit_slots(uint32_t(slots), en->context(), opt.fit_min_ctx, fr, base_margin, slot_b);
+        if (ok >= uint32_t(slots)) return en;
+        char msg[512];
+        std::snprintf(msg, sizeof msg,
+                      "--np %d does not fit: %.2f GB free after loading, context %u per slot; each slot needs %u positions "
+                      "(-fitc) and %ld MiB (--slot-reserve) above the %.2f GB margin. Largest that fits: --np %u "
+                      "(or a smaller --context)", slots, double(fr) / 1e9, en->context(), opt.fit_min_ctx, opt.slot_reserve_mb,
+                      double(base_margin) / 1e9, ok);
+        throw std::runtime_error(msg);
     };
     const bool user_pf = opt.ubatch != 0, user_kv = opt.kv_format() != "bf16";
     const size_t floor_b = size_t(256) << 20;
@@ -481,7 +500,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                     if (e2 && measure(fr2, tot) && fr2 >= margin) {
                         std::fprintf(stderr, "tqllm: fit: %ld positions back on the GPU (%u in host memory), %.2f GB free\n",
                                      prev - long(h), h, double(fr2) / 1e9);
-                        return e2;
+                        return finish(std::move(e2));
                     }
                     h = uint32_t(prev) - (uint32_t(prev) - h) / 2 / 1024 * 1024;
                 }
@@ -513,7 +532,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                 if (e2 && fr2 >= margin) {
                     std::fprintf(stderr, "tqllm: fit: context %u (interpolated), %.2f GB free after %d step(s)\n", best,
                                  double(fr2) / 1e9, step + 1 + k);
-                    return e2;
+                    return finish(std::move(e2));
                 }
                 std::fprintf(stderr, "tqllm: fit: interpolated context %u left %.2f GB; refining\n", best, double(fr2) / 1e9);
                 if (!e2) break;  // out of memory: no measurement to refine with
@@ -521,13 +540,13 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
             }
             if (reloaded) e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
             if (step) std::fprintf(stderr, "tqllm: fit: %.2f GB free after %d step(s)\n", double(fr) / 1e9, step);
-            return e;
+            return finish(std::move(e));
         }
         // every memory step applied (or all KV already in host memory): keep the context if the floor is free
         if (e && fr >= floor_b && (step >= 8 || (host_auto && opt.kv_host >= long(ctx)))) {
             std::fprintf(stderr, "tqllm: fit: WARNING %.2f GB free (< %.2f GB margin) after %d step(s); keeping context %u\n",
                          double(fr) / 1e9, double(margin) / 1e9, step, ctx);
-            return e;
+            return finish(std::move(e));
         }
         const bool loaded = bool(e);
         const size_t token_b = e ? e->kv_token_bytes() : 0;
@@ -567,7 +586,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                         throw std::runtime_error("model does not fit in device memory (even at context " + std::to_string(ctx) + ")");
                     std::fprintf(stderr, "tqllm: fit: WARNING only %.2f GB free at the smallest setting; long prompts may "
                                          "fail (-fitt lowers the margin)\n", double(fr) / 1e9);
-                    return make_qwen35_engine(path, tok, ctx, slots, opt);
+                    return finish(make_qwen35_engine(path, tok, ctx, slots, opt));
                 }
                 if (loaded) ctx_short = ctx, free_short = fr;
                 if (host_auto) opt.kv_host = -1, measuring = false, host_tries = 0;  // host memory did not make room: weights and buffers are too big

@@ -41,6 +41,11 @@ struct EngineOptions {
     bool fit = true;
     long fit_target_mb = -1;  // -1: 768, or 256 under WSL (WDDM; measured 2026-10-08, results/20261008_kv_host_tail)
     uint32_t fit_min_ctx = 4096;
+    // parallel slots (tqserve --np): --slot-reserve MiB free per slot after loading, else the load refuses the --np and
+    // names the largest that fits; --graph-cache N captured CUDA graphs kept (~12 MB each, least recently used evicted)
+    long slot_reserve_mb = 128;
+    int graph_cache = 256;
+    long graph_keep_mb = 384;  // a graph miss also evicts while less than this is free; the fit sets 0 under WSL
 
     std::string kv_format() const;  // the KV format name these options select ("bf16" when none)
 };

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -62,5 +63,16 @@ inline size_t fit_free(bool wsl, size_t driver_free, size_t total, size_t used_b
     const size_t slack = size_t(192) << 20;  // cuBLAS / cuBLASLt workspaces, CUDA graphs, allocator rounding
     const size_t used = used_before + engine_bytes + slack;
     return used >= total ? 0 : total - used;
+}
+// Parallel slots a load can serve: each needs at least min_ctx positions of the context and slot_b bytes of the memory
+// left free after loading (its batched-verify / draft graphs, ~12 MB each), on top of `margin`. Returns np when they fit,
+// else the largest count that does (at least 1: one slot is the plain fit). tqserve refuses to start rather than fail
+// requests mid-run.
+inline uint32_t fit_slots(uint32_t np, uint32_t context, uint32_t min_ctx, size_t free_b, size_t margin, size_t slot_b) {
+    if (np <= 1) return np;
+    const uint32_t by_ctx = min_ctx ? context / min_ctx : np;
+    uint32_t by_mem = np;
+    if (slot_b) by_mem = free_b <= margin ? 0 : uint32_t(std::min<uint64_t>(np, (free_b - margin) / slot_b));
+    return std::max(1u, std::min({np, by_ctx, by_mem}));
 }
 }  // namespace tqllm
