@@ -79,7 +79,7 @@ inline uint32_t fit_slots(uint32_t np, uint32_t slot_ctx, uint32_t min_ctx, size
 }
 // What the fit changed that alters results (not just where weights live): a different KV codec, a context below the
 // one asked for, or a different prefill split (buffer tokens, FP16 weight blocks: a long prompt is cut and summed
-// differently). Moving the embeddings, the LM head or KV positions to host memory gives the same answers (.77, 10-13).
+// differently: .77 10-13, 1 of 8 answers changed with each). Moving the embeddings, the LM head or KV positions to host memory gives the same answers (.77, 10-13).
 // Empty when the load serves exactly what was asked. Without -fitl on, tqserve refuses such a load.
 struct FitSetting { std::string kv; uint32_t ctx = 0; long ubatch = 0; long gemm_rows = 0; };
 inline std::string fit_result_changes(const FitSetting & asked, const FitSetting & used) {

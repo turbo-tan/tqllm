@@ -442,7 +442,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
             !lossy.empty() && !opt.fit_lossy)
             throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
                                      " per slot, KV " + asked.kv + "): it would need " + lossy +
-                                     ". Ask for that explicitly (e.g. --kv q4/tcq2 -ub 512), use fewer slots (--np) or a smaller --context, "
+                                     ". Ask for that explicitly (--kv, -ub, --gemm-rows; e.g. --kv q4/tcq2 -ub 512), use fewer slots (--np) or a smaller --context, "
                                      "or allow it with -fitl on");
         if (slots <= 1) return en;
         size_t fr = 0, tot = 0;
