@@ -13,13 +13,17 @@ int main() {
     // .77 3090, 27B TQ4_L, tqserve 49e2fd6 --np 8 --context 32768 (2026-10-13): the fit left 1.63 GB free (margin 0.81 GB)
     // and the server failed mid-run with "graph instantiate: out of memory". The precheck must refuse that np.
     const size_t reserve = 128 * MB;
-    const uint32_t n77 = tqllm::fit_slots(8, 32768, 4096, size_t(1.63 * GB), size_t(0.81 * GB), reserve);
+    const uint32_t n77 = tqllm::fit_slots(8, 4096, 4096, size_t(1.63 * GB), size_t(0.81 * GB), reserve);
     expect(".77 np 8 refused", n77 < 8);
     expect(".77 suggestion fits the memory", n77 >= 1 && 0.81 * GB + n77 * reserve <= 1.63 * GB);
-    // np 16 on the same context: 2048 positions per slot is below the 4096 floor
-    expect("np 16 at 32K: context floor", tqllm::fit_slots(16, 32768, 4096, size_t(40 * GB), size_t(0.81 * GB), reserve) == 8);
-    // np 16 with room for every slot
-    expect("np 16 that fits", tqllm::fit_slots(16, 16 * 8192, 4096, size_t(8 * GB), size_t(0.81 * GB), reserve) == 16);
+    // the same load after the fit made room (3.46 GB free, .77 10-13 08:33): np 8 at 4096 per slot fits; the context is
+    // per slot, so it must not cap np by itself (the first version read it as the total and suggested --np 1)
+    expect(".77 np 8 after the fit", tqllm::fit_slots(8, 4096, 4096, size_t(3.46 * GB), size_t(0.81 * GB), reserve) == 8);
+    // np 16 at --context 65536 on .77: 2.65 GB free, memory for 13 slots
+    expect(".77 np 16 refused, 13 fit", tqllm::fit_slots(16, 4096, 4096, size_t(2.65 * GB), size_t(0.81 * GB), reserve) == 13);
+    // np 16 on a 32K context: 2048 positions per slot is below the 4096 floor -> 8 slots of 4096
+    expect("np 16 at 32K: context floor", tqllm::fit_slots(16, 2048, 4096, size_t(40 * GB), size_t(0.81 * GB), reserve) == 8);
+    expect("np 16 that fits", tqllm::fit_slots(16, 8192, 4096, size_t(8 * GB), size_t(0.81 * GB), reserve) == 16);
     expect("one slot is never refused", tqllm::fit_slots(1, 2048, 4096, 0, size_t(0.81 * GB), reserve) == 1);
     expect("no memory left: one slot suggested", tqllm::fit_slots(8, 65536, 4096, size_t(0.5 * GB), size_t(0.81 * GB), reserve) == 1);
 
