@@ -3688,17 +3688,28 @@ public:
         }
         const auto t0 = std::chrono::steady_clock::now();
         auto & draft = gen.mtp_draft;
-        while (int(draft.size()) < gen.D)
+        int D = gen.D;
+        // --lookup L: a match of the last tokens earlier in prompt + output that runs longer than the MTP chain (or >= K
+        // with --lookup-first K) is the draft instead; the MTP cache is rebuilt from the verified tokens either way
+        if (opt.lookup > 0) {
+            uint32_t lk[NVER];
+            const int n = lookup(lk, std::min(opt.lookup, NVER - 1));
+            if (n >= (opt.lookup_first > 0 ? opt.lookup_first : D + 1)) {
+                draft.assign(lk, lk + n);
+                D = n;
+            }
+        }
+        while (int(draft.size()) < D)
             draft.push_back(mtp_run(&draft.back(), nullptr, 1, gen.pos + uint32_t(draft.size())));
         const auto t1 = std::chrono::steady_clock::now();
-        std::vector<uint32_t> in{gen.pending}, res(size_t(gen.D) + 1);
+        std::vector<uint32_t> in{gen.pending}, res(size_t(D) + 1);
         in.insert(in.end(), draft.begin(), draft.end());
         verify(in.data(), int(in.size()), gen.pos, res.data());
         const auto t2 = std::chrono::steady_clock::now();
         int j = 0;
-        while (j < gen.D && draft[size_t(j)] == res[size_t(j)]) ++j;
+        while (j < D && draft[size_t(j)] == res[size_t(j)]) ++j;
         ++gen.steps;
-        gen.drafted += uint64_t(gen.D);
+        gen.drafted += uint64_t(D);
         gen.accepted += uint64_t(j);
         for (int i = 0; i < j && gen.out.size() < gen.count; ++i) {
             gen.out.push_back(draft[size_t(i)]);

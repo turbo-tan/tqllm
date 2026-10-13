@@ -40,8 +40,10 @@ int main(int argc, char ** argv) {
                     refs.push_back(ar.spec_finish(st));
                 }
         }
+        for (int lookup : {0, 16}) {  // MTP alone, then MTP with prompt lookup (prompt 3 repeats a sentence 40 times)
         tqllm::EngineOptions with = base;
         with.native_mtp = true;
+        with.lookup = lookup;
         tqllm::Model model(argv[1], argv[2], 8192, 1, with);
         size_t r = 0;
         for (size_t p = 0; p < inputs.size(); ++p)
@@ -62,7 +64,7 @@ int main(int argc, char ** argv) {
                     const auto mtp = model.spec_finish(stats);
                     if (mtp != ref) {
                         const auto mm = std::mismatch(ref.begin(), ref.end(), mtp.begin(), mtp.end());
-                        std::cerr << "FAIL prompt " << p << " count " << count << " depth " << depth << " first diff "
+                        std::cerr << "FAIL lookup " << lookup << " prompt " << p << " count " << count << " depth " << depth << " first diff "
                                   << mm.first - ref.begin() << '\n';
                         return 1;
                     }
@@ -70,12 +72,13 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("invalid output or prefill statistics");
                     if (count == 1 && (stats[0] || stats[1] || stats[2]))
                         throw std::runtime_error("one-token request drafted unnecessarily");
-                    if (stats[1] != stats[0] * uint64_t(depth) || stats[2] > stats[1])
+                    if ((!lookup && stats[1] != stats[0] * uint64_t(depth)) || stats[2] > stats[1])
                         throw std::runtime_error("invalid acceptance statistics");
-                    std::cout << "PASS prompt " << p << " count " << count << " depth " << depth << " tokens " << mtp.size()
+                    std::cout << "PASS lookup " << lookup << " prompt " << p << " count " << count << " depth " << depth << " tokens " << mtp.size()
                               << " accepted " << stats[2] << '/' << stats[1] << '\n' << std::flush;
                 }
             }
+        }
         std::cout << "all native MTP tests passed\n";
         return 0;
     } catch (const std::exception & e) {
