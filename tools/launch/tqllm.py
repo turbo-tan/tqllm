@@ -322,6 +322,9 @@ def main():
     if a.command == "launch" and not a.agent: p.error("launch needs an agent: opencode, codex or claude")
     resolve_model(a)
     if a.drafter and not a.draft_vocab: p.error("--drafter needs --draft-vocab")
+    def interrupt(*_): raise KeyboardInterrupt
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # background jobs start with SIGINT ignored
+        signal.signal(sig, interrupt)
     proc = cname = None
     if server_ok(a.port, NAME):
         print(f"tqllm: reusing the server on 127.0.0.1:{a.port}", file=sys.stderr)
