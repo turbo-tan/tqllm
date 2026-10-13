@@ -3631,8 +3631,8 @@ public:
         tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
         ck(cudaMemcpyAsync(R, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
         nrot_h(X, mtp.layer.in_norm, v_px.as<float>(), XH, H, n);
-        vpar = tree_mode ? d_chain.as<int>() : nullptr;
-        vdep = nullptr;
+        vpar = chain2 && n <= NVER ? d_chain.as<int>() : nullptr;  // the MTP layer's attention: two-part chain like the verify
+        vdep = vpar ? d_cdep.as<int>() : nullptr;                   // (> 8 queries need depths; tree mode crashed here)
         attn_mixer(mtp.layer, mtp_kc.as<bf16>(), mtp_vc.as<bf16>(), n, int(bucket));
         ffn_block(mtp.layer, n);
         ck(cudaMemcpyAsync(mtp_h.p, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
