@@ -207,6 +207,11 @@ void tq4b3_matvec(const uint8_t * w3, const __half * sc, const __half * xh, floa
 void tq4b3_matvec_variant(const uint8_t * w3, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                           int ncols, int v, cudaStream_t);
 void tq4b3_dequant_h(const uint8_t * w3, const __half * sc, __half * out, int rows, int k, cudaStream_t);
+// prefill GEMM on TQ4 / TQ3 weights (no FP16 copy of the matrix): y[c][r] (row stride ldy) = W xh[c], c < n; k % 128 == 0
+void tq4_gemm_h(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
+                cudaStream_t);
+void tq4b3_gemm_h(const uint8_t * w3, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
+                  cudaStream_t);
 // TQ4 matvec variants (row tiles / prefetch, bit-identical per column) and the per-shape pick made at load
 void tq4_matvec_variant(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                         int ncols, int variant, cudaStream_t);
