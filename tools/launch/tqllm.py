@@ -279,7 +279,7 @@ def run_agent(a, base):
     if tool == "opencode":
         cfg = {"$schema": "https://opencode.ai/config.json", "model": f"{NAME}/{NAME}",
                "provider": {NAME: {"npm": "@ai-sdk/openai-compatible", "name": "TQLLM (local)",
-                                   "options": {"baseURL": base + "/v1"}, "models": {NAME: {"name": os.path.basename(a.model)}}}}}
+                                   "options": {"baseURL": base + "/v1", "timeout": False, "chunkTimeout": 900000}, "models": {NAME: {"name": os.path.basename(a.model)}}}}}
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(cfg)
         cmd = ["opencode"] + extra
     elif tool == "codex":
