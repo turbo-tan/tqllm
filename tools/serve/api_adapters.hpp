@@ -118,12 +118,12 @@ inline std::string responses_to_chat(const std::string & body, std::string & err
             const std::string role = str_of(field(it, "role"));
             if ((!type && !role.empty()) || is_str(type, "message")) {
                 const std::string r = role == "developer" || role == "system" ? "system" : role == "assistant" ? "assistant" : "user";
-                if (r == "system" && !msgs.empty() && is_str(field(msgs.back(), "role"), "system")) {
-                    msgs.back().obj[1].second.str += "\n\n" + text_parts(field(it, "content"));  // one system turn
+                if (r == "system" && !msgs.empty() && is_str(field(msgs.front(), "role"), "system")) {
+                    msgs.front().obj[1].second.str += "\n\n" + text_parts(field(it, "content"));  // one system turn
                     continue;
                 }
-                if (r == "system" && !msgs.empty()) {  // a later developer message: keep it, as a user-visible system note
-                    msgs.push_back(O({{"role", S("user")}, {"content", S(text_parts(field(it, "content")))}}));
+                if (r == "system") {  // a later developer / system message joins the system prompt (templates want it first)
+                    msgs.insert(msgs.begin(), O({{"role", S("system")}, {"content", S(text_parts(field(it, "content")))}}));
                     continue;
                 }
                 msgs.push_back(O({{"role", S(r)}, {"content", r == "user" ? chat_content(field(it, "content")) : S(text_parts(field(it, "content")))}}));
@@ -179,6 +179,8 @@ inline std::string new_id(const char * prefix) {
     std::snprintf(b, sizeof b, "%s_%llx%06llx", prefix, static_cast<unsigned long long>(std::time(nullptr)), ++n);
     return b;
 }
+// chat answers number tool calls call_0, call_1 per answer; agent clients need ids unique across the conversation
+inline std::string unique_call(const std::string & chat_id) { return new_id("call") + "_" + chat_id; }
 inline Json resp_usage(const Json * u) {
     const double in = u ? field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0 : 0;
     const double outn = u ? field(*u, "completion_tokens") ? field(*u, "completion_tokens")->num : 0 : 0;
@@ -221,7 +223,7 @@ inline std::string chat_to_responses(const std::string & chat_json, const std::s
         if (const auto * calls = field(*msg, "tool_calls"); calls && calls->kind == Json::Array)
             for (const auto & tc : calls->arr) {
                 const auto * fn = field(tc, "function");
-                output.push_back(call_item(new_id("fc"), str_of(field(tc, "id")), fn ? str_of(field(*fn, "name")) : "",
+                output.push_back(call_item(new_id("fc"), unique_call(str_of(field(tc, "id"))), fn ? str_of(field(*fn, "name")) : "",
                                            fn ? str_of(field(*fn, "arguments")) : "", "completed"));
             }
     }
@@ -336,7 +338,7 @@ private:
                     if (!close_reasoning() || !close_text()) return false;
                     for (const auto & tc : calls->arr) {
                         const auto * fn = field(tc, "function");
-                        const std::string fid = new_id("fc"), call_id = str_of(field(tc, "id")),
+                        const std::string fid = new_id("fc"), call_id = unique_call(str_of(field(tc, "id"))),
                                           name = fn ? str_of(field(*fn, "name")) : "", args = fn ? str_of(field(*fn, "arguments")) : "";
                         const int idx = int(output_.size());
                         output_.push_back(call_item(fid, call_id, name, args, "completed"));
@@ -389,6 +391,13 @@ inline std::string messages_to_chat(const std::string & body, std::string & erro
         for (const auto & m : ms->arr) {
             const std::string role = str_of(field(m, "role"));
             const auto * c = field(m, "content");
+            if (role == "system") {  // Claude Code sends context as system messages between turns: fold into the system prompt
+                const std::string t = text_parts(c);
+                if (t.empty()) continue;
+                if (!msgs.empty() && is_str(field(msgs.front(), "role"), "system")) msgs.front().obj[1].second.str += "\n\n" + t;
+                else msgs.insert(msgs.begin(), O({{"role", S("system")}, {"content", S(t)}}));
+                continue;
+            }
             if (c && c->kind == Json::String) { msgs.push_back(O({{"role", S(role == "assistant" ? "assistant" : "user")}, {"content", *c}})); continue; }
             if (!c || c->kind != Json::Array) continue;
             if (role == "assistant") {
@@ -494,7 +503,7 @@ inline std::string chat_to_messages(const std::string & chat_json, const std::st
             for (const auto & tc : calls->arr) {
                 const auto * fn = field(tc, "function");
                 tools = true;
-                content.push_back(O({{"type", S("tool_use")}, {"id", S("toolu_" + str_of(field(tc, "id")))},
+                content.push_back(O({{"type", S("tool_use")}, {"id", S("toolu_" + unique_call(str_of(field(tc, "id"))))},
                                      {"name", S(fn ? str_of(field(*fn, "name")) : "")}, {"input", tool_input(fn ? str_of(field(*fn, "arguments")) : "")}}));
             }
     }
@@ -572,7 +581,7 @@ private:
                     open_ = "tool";
                     ++idx_;
                     if (!ev("content_block_start", O({{"index", N(idx_)}, {"content_block", O({{"type", S("tool_use")},
-                                {"id", S("toolu_" + str_of(field(tc, "id")))}, {"name", S(fn ? str_of(field(*fn, "name")) : "")}, {"input", O({})}})}})) ||
+                                {"id", S("toolu_" + unique_call(str_of(field(tc, "id"))))}, {"name", S(fn ? str_of(field(*fn, "name")) : "")}, {"input", O({})}})}})) ||
                         !ev("content_block_delta", O({{"index", N(idx_)}, {"delta", O({{"type", S("input_json_delta")},
                                 {"partial_json", S(fn ? str_of(field(*fn, "arguments")) : "")}})}})))
                         return false;

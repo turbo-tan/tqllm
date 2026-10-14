@@ -199,7 +199,7 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
             req.error = "max_tokens must be a non-negative integer";
             return req;
         }
-        if (req.max_tokens == 0) req.max_tokens = default_max_tokens;
+        if (!max_tokens || req.max_tokens == 0) req.max_tokens = default_max_tokens;  // omitted (Codex never sends it): server default
         req.max_tokens = std::min(req.max_tokens, default_max_tokens);
 
         if (const auto * stop = root.get("stop")) {
