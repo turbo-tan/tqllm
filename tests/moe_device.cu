@@ -400,6 +400,80 @@ static void split_test(unsigned type, int n, bool per_expert, bool use_gemm, con
                 use_gemm ? "GEMM" : "matvec", n, per_expert, cold.size());
 }
 
+// --moe-host-mb decode overlap: hot gate+up (paired) on one stream, cold gate+up (paired) on a second stream into the
+// same outputs, then down the same way; equals one unsplit paired launch + down (u4h-family kernels skip id -1).
+static void overlap_test(unsigned type, int n) {
+    const FmtSpec & sp = spec_of(type);
+    const auto * wf = tqllm::weight_format(type);
+    const int e = 6, k = 3, rows = 19, cols = 256, eb = rows * row_blocks(type) * sp.bytes;
+    std::mt19937 gen(131 + type);
+    auto weights = [&] {
+        std::vector<char> raw(size_t(e) * eb);
+        for (size_t b = 0; b < raw.size() / sp.bytes; ++b) {
+            for (int j = 0; j < sp.bytes; ++j) raw[b * sp.bytes + j] = char(gen() % 256);
+            const __half d = __float2half(.001f * (1 + b % 7));
+            std::memcpy(raw.data() + b * sp.bytes, &d, 2);
+            std::memcpy(raw.data() + b * sp.bytes + 2, &d, 2);
+            if (sp.clamp_hi > sp.clamp_lo) {
+                std::memcpy(raw.data() + b * sp.bytes + 208, &d, 2);
+                for (int j = sp.clamp_lo; j < sp.clamp_hi; ++j) raw[b * sp.bytes + j] = char(1 + gen() % 32);
+            }
+        }
+        return raw;
+    };
+    const auto rg = weights(), ru = weights();
+    const std::vector<int> cold = {1, 4};
+    std::vector<int> hot, hot_slot(e, -1), cold_slot(e, -1);
+    for (int i = 0; i < e; ++i) if (std::find(cold.begin(), cold.end(), i) == cold.end()) hot.push_back(i);
+    auto subset = [&](const std::vector<char> & raw, const std::vector<int> & set) {
+        std::vector<char> o; for (int x : set) o.insert(o.end(), raw.begin() + x * eb, raw.begin() + (x + 1) * eb); return o;
+    };
+    for (size_t i = 0; i < hot.size(); ++i) hot_slot[hot[i]] = int(i);
+    for (size_t i = 0; i < cold.size(); ++i) cold_slot[cold[i]] = int(i);
+    std::vector<void *> allocations;
+    tqllm::Upload upload = [&](const void * h, size_t b) {
+        void * p = nullptr; ck(cudaMalloc(&p, b)); ck(cudaMemcpy(p, h, b, cudaMemcpyHostToDevice));
+        allocations.push_back(p); return static_cast<const void *>(p);
+    };
+    const auto g = wf->load(rg, e * rows, cols, upload, nullptr), u = wf->load(ru, e * rows, cols, upload, nullptr);
+    if (g.fmt->u4h_id() < 0) {  // the engine overlaps only u4h-family experts
+        for (void * p : allocations) ck(cudaFree(p));
+        std::printf("GGUF %2u (%s) overlap: not u4h-family, skipped\n", sp.type, sp.name);
+        return;
+    }
+    const auto gh = wf->load(subset(rg, hot), int(hot.size()) * rows, cols, upload, nullptr);
+    const auto uh = wf->load(subset(ru, hot), int(hot.size()) * rows, cols, upload, nullptr);
+    const auto gc = wf->load(subset(rg, cold), int(cold.size()) * rows, cols, upload, nullptr);
+    const auto uc = wf->load(subset(ru, cold), int(cold.size()) * rows, cols, upload, nullptr);
+    std::vector<__half> x(n * cols);
+    for (auto & v : x) v = __float2half(float(int(gen() % 101) - 50) / 100.f);
+    std::vector<int> ids(n * k);
+    for (int t = 0; t < n; ++t) {
+        std::vector<int> pick(e); for (int i = 0; i < e; ++i) pick[i] = i;
+        std::shuffle(pick.begin(), pick.end(), gen);
+        for (int s2 = 0; s2 < k; ++s2) ids[t * k + s2] = pick[s2];
+    }
+    Device<__half> dx(x.size()); dx.put(x);
+    Device<int> di(ids.size()), dhs(e), dcs(e), dh(ids.size()), dc(ids.size());
+    di.put(ids); dhs.put(hot_slot); dcs.put(cold_slot);
+    Device<__nv_bfloat16> rgo(n * k * rows), ruo(n * k * rows), og(n * k * rows), ou(n * k * rows);
+    cudaStream_t s1, s2; ck(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking)); ck(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+    cudaEvent_t fork, join; ck(cudaEventCreate(&fork)); ck(cudaEventCreate(&join));
+    g.fmt->expert_matvec2(g, u, dx.p, rgo.p, ruo.p, rows, di.p, n, k, s1);
+    tqllm_cuda::moe_split_ids(di.p, dhs.p, dcs.p, dh.p, dc.p, n * k, s1);
+    ck(cudaEventRecord(fork, s1)); ck(cudaStreamWaitEvent(s2, fork, 0));
+    gc.fmt->expert_matvec2(gc, uc, dx.p, og.p, ou.p, rows, dc.p, n, k, s2);
+    gh.fmt->expert_matvec2(gh, uh, dx.p, og.p, ou.p, rows, dh.p, n, k, s1);
+    ck(cudaEventRecord(join, s2)); ck(cudaStreamWaitEvent(s1, join, 0));
+    ck(cudaStreamSynchronize(s1));
+    const auto a = og.get(n * k * rows), b = rgo.get(n * k * rows), c = ou.get(n * k * rows), d = ruo.get(n * k * rows);
+    if (std::memcmp(a.data(), b.data(), a.size() * 2) || std::memcmp(c.data(), d.data(), c.size() * 2))
+        throw std::runtime_error("overlapped hot / cold paired launch differs from the unsplit paired launch");
+    ck(cudaStreamDestroy(s1)); ck(cudaStreamDestroy(s2)); ck(cudaEventDestroy(fork)); ck(cudaEventDestroy(join));
+    for (void * p : allocations) ck(cudaFree(p));
+    std::printf("GGUF %2u (%s) hot/cold paired gate+up on two streams n=%d: bit-identical\n", sp.type, sp.name, n);
+}
+
 int main() {
     try {
         route_test();
@@ -411,6 +485,7 @@ int main() {
             for (int n : {1, 5, 17}) for (bool per : {false, true}) split_test(sp.type, n, per, false);
             for (int n : {5, 65, 129}) for (bool per : {false, true}) split_test(sp.type, n, per, true);
             for (bool gemm : {false, true}) split_test(sp.type, 5, false, gemm, {4});  // cold set smaller than k
+            for (int n : {1, 5}) overlap_test(sp.type, n);
             for (int n : {1, 5}) pair_test(sp.type, n);
         }
         attention_group_test();

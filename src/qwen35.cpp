@@ -425,6 +425,10 @@ public:
         kv_side = nullptr, kv_fork = kv_ready[0] = kv_ready[1] = kv_done[0] = kv_done[1] = nullptr;
         if (ev_fork) cudaEventDestroy(ev_fork);
         if (ev_join) cudaEventDestroy(ev_join);
+        if (moe_fork) cudaEventDestroy(moe_fork);
+        if (moe_join) cudaEventDestroy(moe_join);
+        if (moe_side) cudaStreamDestroy(moe_side);
+        moe_side = nullptr, moe_fork = moe_join = nullptr;
         for (auto st : seg_side) cudaStreamDestroy(st);
         for (auto ev : seg_join) cudaEventDestroy(ev);
         if (seg_fork) cudaEventDestroy(seg_fork);
@@ -659,6 +663,8 @@ private:
     cudaStream_t stream{};
     cudaStream_t side{};                // parallel branch for small independent matvecs (GDN b / a), graph-captured
     cudaEvent_t ev_fork{}, ev_join{};
+    cudaStream_t moe_side{};             // --moe-host-mb decode: cold (host) experts overlap the hot ones, graph-captured
+    cudaEvent_t moe_fork{}, moe_join{};
     std::vector<cudaStream_t> seg_side;  // batched verify: one branch per extra segment (per-slot GDN / attention)
     std::vector<cudaEvent_t> seg_join;
     cudaEvent_t seg_fork{};
@@ -2311,15 +2317,43 @@ public:
                 one(mat, moe_hot_ids.as<int>(), L.n_hot, moe_counts, moe_groups, input, output, rows, per_expert);
                 one(cold, moe_cold_ids.as<int>(), L.n_cold, moe_counts2, moe_groups2, input, output, rows, per_expert);
             };
-            if (!grouped_gemm && !split && L.ex_gate.fmt == L.ex_up.fmt && L.ex_gate.fmt->u4h_id() >= 0) {
+            const auto paired = [](const Mat & g, const Mat & u) { return g.fmt == u.fmt && g.fmt->u4h_id() >= 0; };
+            // decode with host experts: the cold set (PCIe reads) runs on a side branch beside the hot set. Both write
+            // disjoint assignments (the u4h-family expert kernels leave id -1 untouched), joined before each consumer.
+            const bool overlap = split && !grouped_gemm && paired(L.ex_gate, L.ex_up) && paired(L.cx_gate, L.cx_up) &&
+                                 L.ex_down.fmt->u4h_id() >= 0 && L.cx_down.fmt->u4h_id() >= 0;
+            if (overlap) {
+                if (!moe_side) {
+                    ck(cudaStreamCreateWithFlags(&moe_side, cudaStreamNonBlocking));
+                    ck(cudaEventCreateWithFlags(&moe_fork, cudaEventDisableTiming));
+                    ck(cudaEventCreateWithFlags(&moe_join, cudaEventDisableTiming));
+                }
+                auto fork = [&] { ck(cudaEventRecord(moe_fork, stream)); ck(cudaStreamWaitEvent(moe_side, moe_fork, 0)); };
+                auto join = [&] { ck(cudaEventRecord(moe_join, moe_side)); ck(cudaStreamWaitEvent(stream, moe_join, 0)); };
+                fork();
+                L.cx_gate.fmt->expert_matvec2(L.cx_gate, L.cx_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
+                                              moe_cold_ids.as<int>(), n, K, moe_side);
+                L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
+                                              moe_hot_ids.as<int>(), n, K, stream);
+                join();
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
+                fork();
+                L.cx_down.fmt->expert_matvec(L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_cold_ids.as<int>(), n, K,
+                                             true, moe_side);
+                L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, K,
+                                             true, stream);
+                join();
+            } else if (!grouped_gemm && !split && paired(L.ex_gate, L.ex_up)) {
                 L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
                                               moe_ids.as<int>(), n, K, stream);
             } else {
                 project(L.ex_gate, L.cx_gate, XH, moe_gate.as<bf16>(), FE, false);
                 project(L.ex_up, L.cx_up, XH, moe_up.as<bf16>(), FE, false);
             }
-            tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
-            project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
+            if (!overlap) {
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
+                project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
+            }
             mm_h(L.sh_gu, T, n);
             tqllm_cuda::swiglu_multi(T, n, FS, ACT, stream);
             rot_h(ACT, XH, FS, n);
