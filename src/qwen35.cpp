@@ -9,6 +9,7 @@
 #include "gguf.hpp"
 #include "prefill_chunk.hpp"
 #include "gemm_buffer.hpp"
+#include "gemm_pad.hpp"
 #include "prefill_path.hpp"
 #include "graph_capture.hpp"
 #include "graph_lru.hpp"
@@ -1922,8 +1923,8 @@ private:
     // rows of m into rows [r_off, r_off + m.rows) of gemm_c ([n][ldo], FP16)
     void gemm_c_rows(const Mat & m, int n, int ldo, int r_off) {
         const size_t rb = m.fmt->row_bytes(m.cols), ab = m.fmt->aux_row_bytes(m.cols);
-        constexpr int pad = 8;  // n % 8: cuBLAS picks the 16816 kernels
-        const int np = std::min(NBUF, (n + pad - 1) / pad * pad);
+        const int np = gemm_pad_rows(n, NBUF);
+        ck(zero_gemm_padding(v_xh.as<__half>(), n, np, m.cols, stream));
         // int8 only on chunks of >= 1024 tokens: per-chunk weight quantisation does not pay off on the 512-token chunks of
         // 24 GB cards at 256K (3090 192K prompt: int8 641 vs FP16 668 tok/s; 54K: 1760 vs 1445)
         if (i8 && np >= 1024 && m.cols % 4 == 0 && ldo % 4 == 0 && r_off % 4 == 0) {
