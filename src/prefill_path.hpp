@@ -4,6 +4,7 @@
 // (5060 Ti ~254 ms per chunk for the 27B, 3090 ~130 ms). The matvec kernel in batches and the native kernels have no
 // fixed cost but are compute-bound per column, so the crossover differs per GPU: it is measured at load
 // (prefill_crossover on timings of the real weights) instead of a fixed column count.
+#include <algorithm>
 #include <cmath>
 
 namespace tqllm {
