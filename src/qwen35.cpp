@@ -1396,6 +1396,7 @@ private:
                 moe_hot_ids = Buf(NBUF * K * sizeof(int)); moe_cold_ids = Buf(NBUF * K * sizeof(int));
                 moe_counts2 = Buf(cfg.expert_count * sizeof(int)); moe_groups2 = Buf(NBUF * cfg.expert_count * sizeof(int));
                 alloc_moe_stage();
+                alloc_moe_cache();
             }
             if (const char * pf = std::getenv("TQLLM_MOE_PROFILE")) {
                 moe_prof_path = pf; moe_prof = Buf(size_t(cfg.layers) * cfg.expert_count * 8);
@@ -1611,6 +1612,72 @@ private:
     Buf moe_stage_buf[tqllm_cuda::kMoeStageSpans], moe_stage_ids;
     long long moe_stage_bytes[tqllm_cuda::kMoeStageSpans] = {};
     int moe_stage_slots = 0;
+    // --moe-cache-mb: CLOCK cache of host experts in VRAM, one pool per expert layout (slot stride == the kernels' expert
+    // stride), keyed by a global host-expert index (layer base + cold slot)
+    struct MoeCache {
+        long long bytes[tqllm_cuda::kMoeStageSpans] = {};
+        uint32_t types[3] = {};
+        Buf buf[tqllm_cuda::kMoeStageSpans], key, ref, hand;
+        int slots = 0;
+        long weight = 0;
+    };
+    std::vector<MoeCache> moe_cache;
+    std::vector<int> moe_cache_of, moe_cold_base;  // per layer: pool (-1 none), first global host-expert index
+    Buf moe_cache_table, moe_cache_slot, moe_cache_fill;
+    void alloc_moe_cache() {
+        if (opt.moe_cache_mb <= 0 || !moe_stage_slots) return;
+        moe_cache_of.assign(layer.size(), -1), moe_cold_base.assign(layer.size(), 0);
+        int total = 0;
+        for (size_t l = 0; l < layer.size(); ++l) {
+            const auto & L = layer[l];
+            moe_cold_base[l] = total;
+            if (L.n_cold <= 0) continue;
+            total += L.n_cold;
+            MoeCache sig;
+            const Mat * m[3] = {&L.cx_gate, &L.cx_up, &L.cx_down};
+            for (int j = 0; j < 3; ++j) {
+                const long long per = m[j]->rows / L.n_cold;
+                sig.bytes[2 * j] = per * (long long)m[j]->fmt->row_bytes(m[j]->cols);
+                sig.bytes[2 * j + 1] = m[j]->aux ? per * (long long)m[j]->fmt->aux_row_bytes(m[j]->cols) : 0;
+                sig.types[j] = m[j]->type;
+            }
+            int pool = -1;
+            for (size_t i = 0; i < moe_cache.size() && pool < 0; ++i)
+                if (std::equal(sig.bytes, sig.bytes + tqllm_cuda::kMoeStageSpans, moe_cache[i].bytes) &&
+                    std::equal(sig.types, sig.types + 3, moe_cache[i].types)) pool = int(i);
+            if (pool < 0) { pool = int(moe_cache.size()); moe_cache.push_back(std::move(sig)); }
+            moe_cache[size_t(pool)].weight += L.n_cold;
+            moe_cache_of[l] = pool;
+        }
+        long wsum = 0;
+        for (const auto & c : moe_cache) wsum += c.weight;
+        const double budget = double(opt.moe_cache_mb) * 1048576.0;
+        size_t used = 0;
+        for (size_t i = 0; i < moe_cache.size(); ++i) {
+            auto & c = moe_cache[i];
+            long long slot_b = 0;
+            for (long long b : c.bytes) slot_b += b;
+            c.slots = int(budget * double(c.weight) / double(wsum) / double(slot_b));
+            if (c.slots < 2 * moe_stage_slots) {  // too small to keep a step's experts: those layers use the stage
+                for (auto & p : moe_cache_of) if (p == int(i)) p = -1;
+                c.slots = 0;
+                continue;
+            }
+            for (int j = 0; j < tqllm_cuda::kMoeStageSpans; ++j)
+                if (c.bytes[j]) c.buf[j] = Buf(size_t(c.bytes[j]) * c.slots), used += size_t(c.bytes[j]) * c.slots;
+            c.key = Buf(size_t(c.slots) * sizeof(int)); ck(cudaMemset(c.key.p, 0xff, size_t(c.slots) * sizeof(int)));
+            c.ref = Buf(size_t(c.slots) * sizeof(int)); ck(cudaMemset(c.ref.p, 0, size_t(c.slots) * sizeof(int)));
+            c.hand = Buf(sizeof(int)); ck(cudaMemset(c.hand.p, 0, sizeof(int)));
+        }
+        moe_cache_table = Buf(size_t(std::max(1, total)) * sizeof(int));
+        ck(cudaMemset(moe_cache_table.p, 0xff, size_t(std::max(1, total)) * sizeof(int)));
+        moe_cache_slot = Buf(size_t(moe_stage_slots) * sizeof(int));
+        moe_cache_fill = Buf(size_t(moe_stage_slots) * sizeof(int));
+        int slots = 0;
+        for (const auto & c : moe_cache) slots += c.slots;
+        std::fprintf(stderr, "tqllm: MoE host-expert cache: %d slots in %zu pool(s), %.0f MiB of VRAM (--moe-cache-mb)\n", slots,
+                     moe_cache.size(), used / 1048576.0);
+    }
     void alloc_moe_stage() {
         if (std::getenv("TQLLM_MOE_STAGE") && std::string(std::getenv("TQLLM_MOE_STAGE")) == "0") return;
         long long most[tqllm_cuda::kMoeStageSpans] = {};
@@ -2362,7 +2429,26 @@ public:
                 fork();
                 Mat sg = L.cx_gate, su = L.cx_up, sd = L.cx_down;
                 const int * cids = moe_cold_ids.as<int>();
-                if (moe_stage_slots && n * K <= moe_stage_slots) {
+                const int pool = moe_cache_of.empty() ? -1 : moe_cache_of[size_t(&L - layer.data())];
+                if (pool >= 0 && n * K <= moe_stage_slots) {  // cached: copy only the misses, read from the cache slots
+                    auto & c = moe_cache[size_t(pool)];
+                    tqllm_cuda::moe_cache_lookup(moe_cold_ids.as<int>(), n * K, moe_cold_base[size_t(&L - layer.data())],
+                                                 moe_cache_table.as<int>(), {c.key.as<int>(), c.ref.as<int>(), c.hand.as<int>(), c.slots},
+                                                 moe_cache_slot.as<int>(), moe_cache_fill.as<int>(), moe_side);
+                    tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
+                    int ns = 0;
+                    Mat * sm[3] = {&sg, &su, &sd};
+                    for (int j = 0; j < 3; ++j) {
+                        Mat & m = *sm[j];
+                        const long long per = m.rows / L.n_cold;
+                        sp[ns++] = {m.p, c.buf[2 * j].p, c.bytes[2 * j]};
+                        m.p = c.buf[2 * j].p;
+                        if (m.aux) { sp[ns++] = {m.aux, c.buf[2 * j + 1].p, c.bytes[2 * j + 1]}; m.aux = c.buf[2 * j + 1].p; }
+                        m.rows = int(per) * c.slots;
+                    }
+                    tqllm_cuda::moe_cache_fill(sp, ns, moe_cache_fill.as<int>(), moe_cache_slot.as<int>(), n * K, moe_side);
+                    cids = moe_cache_slot.as<int>();
+                } else if (moe_stage_slots && n * K <= moe_stage_slots) {
                     tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
                     int ns = 0;
                     Mat * sm[3] = {&sg, &su, &sd};

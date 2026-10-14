@@ -44,6 +44,7 @@ struct EngineOptions {
                                //   (llama.cpp --n-cpu-moe parity; read over PCIe by the decode kernels)
     long moe_host_mb = 0;      // --moe-host-mb M: the least-routed experts (by --moe-profile) in pinned host memory, about M MiB;
                                //   every layer keeps its hot experts in VRAM (output identical to all-VRAM)
+    long moe_cache_mb = 0;     // --moe-cache-mb C: VRAM cache of recently used host experts (decode), about C MiB, exact
     std::string moe_profile;   // --moe-profile FILE: routing counts (default MODEL.experts); TQLLM_MOE_PROFILE=FILE writes one
     // memory fit (llama.cpp names): -fit on|off, -fitt MiB free after loading, -fitc smallest context it may set
     bool fit = true;

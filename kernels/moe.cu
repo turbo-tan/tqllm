@@ -268,6 +268,70 @@ void moe_stage(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const in
     const int bx = int(std::min<long long>(64, (most / 16 + 1023) / 1024));
     stage_k<<<dim3(unsigned(std::max(1, bx)), unsigned(count), unsigned(nspans)), 256, 0, stream>>>(a, cold_ids, stage_ids);
 }
+__global__ void cache_lookup_k(const int * cold_ids, int count, int base, int * table, MoeCachePool p, int * slot_ids, int * fill_src) {
+    if (threadIdx.x) return;
+    for (int a = 0; a < count; ++a) {  // pin the hits of this step: ref 2 is never evicted
+        const int c = cold_ids[a];
+        if (c >= 0 && table[base + c] >= 0) p.ref[table[base + c]] = 2;
+    }
+    int hand = *p.hand;
+    for (int a = 0; a < count; ++a) {
+        const int c = cold_ids[a];
+        fill_src[a] = -1, slot_ids[a] = -1;
+        if (c < 0) continue;
+        const int key = base + c;
+        int s = table[key];
+        if (s < 0) {
+            for (;;) {
+                if (p.ref[hand] == 2) { hand = (hand + 1) % p.slots; continue; }
+                if (p.ref[hand] == 1) { p.ref[hand] = 0; hand = (hand + 1) % p.slots; continue; }
+                break;
+            }
+            s = hand; hand = (hand + 1) % p.slots;
+            if (p.slot_key[s] >= 0) table[p.slot_key[s]] = -1;
+            p.slot_key[s] = key; table[key] = s; p.ref[s] = 2;
+            fill_src[a] = c;
+        }
+        slot_ids[a] = s;
+    }
+    for (int a = 0; a < count; ++a) if (slot_ids[a] >= 0) p.ref[slot_ids[a]] = 1;
+    *p.hand = hand;
+}
+__global__ void cache_fill_k(MoeStageArgs a, const int * fill_src, const int * slot_ids) {
+    const int slot = blockIdx.y, c = fill_src[slot];
+    if (c < 0) return;
+    const MoeStageSpan sp = a.s[blockIdx.z];
+    const long long n16 = sp.bytes / 16;
+    const uint4 * src = static_cast<const uint4 *>(sp.src) + c * n16;
+    uint4 * dst = static_cast<uint4 *>(sp.dst) + (long long)slot_ids[slot] * n16;
+    constexpr int U = 4;
+    for (long long i = (long long)blockIdx.x * blockDim.x * U + threadIdx.x; i < n16; i += (long long)gridDim.x * blockDim.x * U) {
+        uint4 v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) if (i + u * blockDim.x < n16) v[u] = src[i + u * blockDim.x];
+#pragma unroll
+        for (int u = 0; u < U; ++u) if (i + u * blockDim.x < n16) dst[i + u * blockDim.x] = v[u];
+    }
+}
+void moe_cache_lookup(const int * cold_ids, int count, int base, int * table, MoeCachePool pool, int * slot_ids, int * fill_src,
+                      cudaStream_t stream) {
+    if (count <= 0 || pool.slots < 2 * count) throw std::invalid_argument("moe_cache_lookup: needs at least 2 slots per assignment");
+    cache_lookup_k<<<1, 32, 0, stream>>>(cold_ids, count, base, table, pool, slot_ids, fill_src);
+}
+void moe_cache_fill(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const int * fill_src, const int * slot_ids,
+                    int count, cudaStream_t stream) {
+    if (count <= 0 || nspans <= 0 || nspans > kMoeStageSpans) throw std::invalid_argument("moe_cache_fill: invalid shape");
+    MoeStageArgs a{};
+    long long most = 0;
+    for (int i = 0; i < nspans; ++i) {
+        const auto & sp = spans[i];
+        if (sp.bytes <= 0 || sp.bytes % 16 || reinterpret_cast<uintptr_t>(sp.src) % 16 || reinterpret_cast<uintptr_t>(sp.dst) % 16)
+            throw std::invalid_argument("moe_cache_fill: spans must be 16-byte aligned multiples");
+        a.s[i] = sp; most = std::max(most, sp.bytes);
+    }
+    const int bx = int(std::min<long long>(64, (most / 16 + 1023) / 1024));
+    cache_fill_k<<<dim3(unsigned(std::max(1, bx)), unsigned(count), unsigned(nspans)), 256, 0, stream>>>(a, fill_src, slot_ids);
+}
 void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * act, int count, cudaStream_t stream) {
     swiglu_k<<<(count + 255) / 256, 256, 0, stream>>>(gate, up, act, count);
 }

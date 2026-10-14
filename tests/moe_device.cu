@@ -550,6 +550,85 @@ static void stage_test(unsigned type, int n) {
     std::printf("GGUF %2u (%s) staged cold experts (mapped host -> device) n=%d: bit-identical\n", sp.type, sp.name, n);
 }
 
+// --moe-cache-mb: a CLOCK cache of host experts over many routing steps (evictions included) feeds the unchanged expert
+// kernels the same bytes: every step equals the direct launch on the host set, bit-identical
+static void cache_test(unsigned type) {
+    const FmtSpec & sp = spec_of(type);
+    const auto * wf = tqllm::weight_format(type);
+    const int e = 24, k = 3, n = 2, rows = 32, cols = 256, slots = 2 * n * k, eb = rows * row_blocks(type) * sp.bytes;
+    std::mt19937 gen(307 + type);
+    auto weights = [&] {
+        std::vector<char> raw(size_t(e) * eb);
+        for (size_t b = 0; b < raw.size() / sp.bytes; ++b) {
+            for (int j = 0; j < sp.bytes; ++j) raw[b * sp.bytes + j] = char(gen() % 256);
+            const __half d = __float2half(.001f * (1 + b % 7));
+            std::memcpy(raw.data() + b * sp.bytes, &d, 2);
+            std::memcpy(raw.data() + b * sp.bytes + 2, &d, 2);
+            if (sp.clamp_hi > sp.clamp_lo) {
+                std::memcpy(raw.data() + b * sp.bytes + 208, &d, 2);
+                for (int j = sp.clamp_lo; j < sp.clamp_hi; ++j) raw[b * sp.bytes + j] = char(1 + gen() % 32);
+            }
+        }
+        return raw;
+    };
+    const auto rg = weights(), ru = weights();
+    std::vector<void *> host;
+    tqllm::Upload to_host = [&](const void * h, size_t b) {
+        void * p = nullptr; ck(cudaHostAlloc(&p, b, cudaHostAllocMapped)); std::memcpy(p, h, b); host.push_back(p);
+        void * d = nullptr; ck(cudaHostGetDevicePointer(&d, p, 0)); return static_cast<const void *>(d);
+    };
+    const auto g = wf->load(rg, e * rows, cols, to_host, nullptr), u = wf->load(ru, e * rows, cols, to_host, nullptr);
+    const long long pb = (long long)rows * g.fmt->row_bytes(cols), ab = g.aux ? (long long)rows * g.fmt->aux_row_bytes(cols) : 0;
+    if (g.fmt->u4h_id() < 0 || pb % 16 || ab % 16) {
+        for (void * p : host) ck(cudaFreeHost(p));
+        std::printf("GGUF %2u (%s) cache: not cacheable, skipped\n", sp.type, sp.name);
+        return;
+    }
+    std::vector<Device<char>> buf;
+    buf.reserve(4);  // Device frees in its destructor: no reallocation
+    for (int j = 0; j < 4; ++j) buf.emplace_back(size_t(std::max<long long>(j < 2 ? pb : ab, 16)) * slots);
+    Device<int> key(slots), ref(slots), hand(1), table(e + 5), sid(n * k), fsrc(n * k), di(n * k);
+    key.put(std::vector<int>(slots, -1)); ref.put(std::vector<int>(slots, 0)); hand.put({0}); table.put(std::vector<int>(e + 5, -1));
+    Device<__half> dx(n * cols);
+    Device<__nv_bfloat16> rg_o(n * k * rows), ru_o(n * k * rows), cg_o(n * k * rows), cu_o(n * k * rows);
+    tqllm::Mat cg = g, cu = u;
+    cg.p = buf[0].p; cu.p = buf[1].p;
+    tqllm_cuda::MoeStageSpan spn[tqllm_cuda::kMoeStageSpans];
+    int ns = 0;
+    spn[ns++] = {g.p, buf[0].p, pb}; spn[ns++] = {u.p, buf[1].p, pb};
+    if (g.aux) { spn[ns++] = {g.aux, buf[2].p, ab}; spn[ns++] = {u.aux, buf[3].p, ab}; cg.aux = buf[2].p; cu.aux = buf[3].p; }
+    cg.rows = cu.rows = rows * slots;
+    const std::vector<__nv_bfloat16> zero(n * k * rows, __float2bfloat16(0.f));
+    int fills = 0;
+    for (int step = 0; step < 40; ++step) {
+        std::vector<__half> x(n * cols);
+        for (auto & v : x) v = __float2half(float(int(gen() % 101) - 50) / 100.f);
+        dx.put(x);
+        std::vector<int> ids(n * k);
+        for (int t = 0; t < n; ++t) {  // a skewed pick (a few experts recur), some assignments hot (-1)
+            std::vector<int> pick(e); for (int i = 0; i < e; ++i) pick[i] = i;
+            std::shuffle(pick.begin(), pick.begin() + 8, gen);
+            if (gen() % 3 == 0) std::shuffle(pick.begin(), pick.end(), gen);
+            for (int s2 = 0; s2 < k; ++s2) ids[t * k + s2] = (gen() % 4 == 0) ? -1 : pick[s2];
+        }
+        di.put(ids);
+        for (auto * d : {&rg_o, &ru_o, &cg_o, &cu_o}) d->put(zero);
+        g.fmt->expert_matvec2(g, u, dx.p, rg_o.p, ru_o.p, rows, di.p, n, k, nullptr);
+        tqllm_cuda::moe_cache_lookup(di.p, n * k, 5, table.p, {key.p, ref.p, hand.p, slots}, sid.p, fsrc.p, nullptr);
+        tqllm_cuda::moe_cache_fill(spn, ns, fsrc.p, sid.p, n * k, nullptr);
+        cg.fmt->expert_matvec2(cg, cu, dx.p, cg_o.p, cu_o.p, rows, sid.p, n, k, nullptr);
+        ck(cudaDeviceSynchronize());
+        const auto f = fsrc.get(n * k);
+        for (int v : f) fills += v >= 0;
+        const auto a = cg_o.get(n * k * rows), b = rg_o.get(n * k * rows), c = cu_o.get(n * k * rows), d = ru_o.get(n * k * rows);
+        if (std::memcmp(a.data(), b.data(), a.size() * 2) || std::memcmp(c.data(), d.data(), c.size() * 2))
+            throw std::runtime_error("cached host experts differ from the direct launch at step " + std::to_string(step));
+    }
+    for (void * p : host) ck(cudaFreeHost(p));
+    require(fills > slots, "cache test did not evict");
+    std::printf("GGUF %2u (%s) host-expert cache, 40 steps, %d fills into %d slots: bit-identical\n", sp.type, sp.name, fills, slots);
+}
+
 int main() {
     try {
         route_test();
@@ -563,6 +642,7 @@ int main() {
             for (bool gemm : {false, true}) split_test(sp.type, 5, false, gemm, {4});  // cold set smaller than k
             for (int n : {1, 5}) overlap_test(sp.type, n);
             for (int n : {1, 2}) stage_test(sp.type, n);
+            cache_test(sp.type);
             for (int n : {1, 5}) pair_test(sp.type, n);
         }
         attention_group_test();

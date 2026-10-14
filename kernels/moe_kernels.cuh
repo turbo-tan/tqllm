@@ -35,6 +35,15 @@ struct MoeStageSpan { const void * src = nullptr; void * dst = nullptr; long lon
 constexpr int kMoeStageSpans = 6;
 void moe_stage(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const int * cold_ids, int * stage_ids, int count,
                cudaStream_t stream);
+// --moe-cache-mb: CLOCK cache of host experts, one pool per expert layout. For each assignment a with a host expert
+// (cold_ids[a] = c >= 0, key = base + c): hit -> slot_ids[a] = its slot; miss -> a victim slot (never one used by this
+// step), fill_src[a] = c, slot_ids[a] = victim. Single thread: count = n * topk assignments <= slots / 2.
+struct MoeCachePool { int * slot_key; int * ref; int * hand; int slots; };
+void moe_cache_lookup(const int * cold_ids, int count, int base, int * table, MoeCachePool pool, int * slot_ids, int * fill_src,
+                      cudaStream_t stream);
+// copy the missed experts (fill_src[a] >= 0) of every span into their cache slots (slot_ids[a]); spans as moe_stage
+void moe_cache_fill(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const int * fill_src, const int * slot_ids,
+                    int count, cudaStream_t stream);
 void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * act,
                 int count, cudaStream_t);
 void moe_sum(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared, const float * weights,
