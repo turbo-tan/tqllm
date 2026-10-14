@@ -987,14 +987,17 @@ private:
         const std::string path = opt.moe_profile.empty() ? f.path + ".experts" : opt.moe_profile;
         std::ifstream in(path);
         int pl = 0, pe = 0;
-        if (!(in >> pl >> pe) || pl != L || pe != E)
-            throw std::runtime_error("--moe-host-mb needs a routing profile for this model (" + path + "; write one with TQLLM_MOE_PROFILE=FILE)");
+        const bool have = bool(in >> pl >> pe);
+        if (have && (pl != L || pe != E)) throw std::runtime_error("routing profile " + path + " is for another model");
         std::vector<std::tuple<unsigned long long, int, int>> order;
         unsigned long long total = 0, placed = 0;
+        if (!have)  // no profile: the same share of every layer (rank e of each layer before rank e + 1 of any)
+            std::fprintf(stderr, "tqllm: no MoE routing profile (%s): host experts spread evenly over the layers (TQLLM_MOE_PROFILE=FILE "
+                         "writes one, then --moe-profile FILE)\n", path.c_str());
         for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
             unsigned long long c = 0;
-            if (!(in >> c)) throw std::runtime_error("truncated routing profile " + path);
-            order.emplace_back(c, l, e); total += c;
+            if (have && !(in >> c)) throw std::runtime_error("truncated routing profile " + path);
+            order.emplace_back(have ? c : (unsigned long long)(E - 1 - e), l, e); total += c;
         }
         std::stable_sort(order.begin(), order.end());
         const double want = double(opt.moe_host_mb) * 1048576.0;

@@ -42,9 +42,11 @@ struct EngineOptions {
     int gemm_rows = 0;         // prefill FP16 weight blocks of this many rows (0: whole matrices)
     int n_cpu_moe = 0;         // -ncmoe N: MoE expert weights of the first N layers in pinned host memory
                                //   (llama.cpp --n-cpu-moe parity; read over PCIe by the decode kernels)
-    long moe_host_mb = 0;      // --moe-host-mb M: the least-routed experts (by --moe-profile) in pinned host memory, about M MiB;
+    long moe_host_mb = 0;      // --moe-host-mb M: the least-routed experts (by --moe-profile) in pinned host memory, about M MiB
+                               //   (auto, -1: what the file needs beyond the free device memory);
                                //   every layer keeps its hot experts in VRAM (output identical to all-VRAM)
-    long moe_cache_mb = 0;     // --moe-cache-mb C: VRAM cache of recently used host experts (decode), about C MiB, exact
+    long moe_cache_mb = -1;    // --moe-cache-mb C: VRAM cache of recently used host experts (decode), about C MiB, exact;
+                               //   auto (-1): 12 % of the host experts (256..1536 MiB), the host share raised by the same
     std::string moe_profile;   // --moe-profile FILE: routing counts (default MODEL.experts); TQLLM_MOE_PROFILE=FILE writes one
     // memory fit (llama.cpp names): -fit on|off, -fitt MiB free after loading, -fitc smallest context it may set
     bool fit = true;

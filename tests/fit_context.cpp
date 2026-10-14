@@ -116,6 +116,26 @@ int main() {
     expect("give back with 3.3 GB spare", tqllm::fit_try_return(size_t(4.05 * GB), size_t(0.77 * GB)));
     expect("no give-back with 0.18 GB spare", !tqllm::fit_try_return(size_t(0.95 * GB), size_t(0.77 * GB)));
     expect("no give-back with the fit off", !tqllm::fit_try_return(size_t(4.0 * GB), 0));
+    // --moe-host-mb / --moe-cache-mb auto: 3090 held at a 16 GB card (15.22 GiB free), MiniCPM-V-4.7 Q5_K_M (24728583072 B):
+    // by hand 10000 MiB host was the smallest that loaded; the gated cache arm was 11200 host + 1200 cache
+    {
+        const uint64_t q5 = 24728583072ull;
+        const double GiB = 1073741824.0;
+        const auto c16 = tqllm::moe_auto_place(q5, size_t(15.22 * GiB), -1, -1);
+        expect("16 GB: auto host near the hand-picked 10000 + cache", c16.host_mb > 10800 && c16.host_mb < 11600);
+        expect("16 GB: auto cache ~12 % of the host share", c16.cache_mb > 1100 && c16.cache_mb < 1300);
+        const auto f24 = tqllm::moe_auto_place(q5, size_t(23.3 * GiB), -1, -1);
+        expect("24 GB: small host share, floor cache", f24.host_mb > 1500 && f24.host_mb < 2500 && f24.cache_mb == 256);
+        expect("fits on the device: nothing on host, no cache", tqllm::moe_auto_place(15ull << 30, size_t(23.3 * GiB), -1, -1).host_mb == 0 &&
+               tqllm::moe_auto_place(15ull << 30, size_t(23.3 * GiB), -1, -1).cache_mb == 0);
+        const auto given = tqllm::moe_auto_place(q5, 0, 10000, -1);
+        expect("explicit host + auto cache: host raised by the cache", given.cache_mb == 1200 && given.host_mb == 11200);
+        const auto off = tqllm::moe_auto_place(q5, 0, 10000, 0);
+        expect("--moe-cache-mb 0: no cache, host as given", off.cache_mb == 0 && off.host_mb == 10000);
+        const auto cap = tqllm::moe_auto_place(q5, 0, 40000, -1);
+        expect("cache capped at 1536 MiB", cap.cache_mb == 1536 && cap.host_mb == 41536);
+        expect("no host experts: an explicit cache is dropped", tqllm::moe_auto_place(q5, 0, 0, 800).cache_mb == 0);
+    }
     if (bad) return 1;
     std::printf("PASS fit_context (5060 Ti case -> %u)\n", c);
     return 0;
