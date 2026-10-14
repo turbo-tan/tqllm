@@ -56,9 +56,8 @@ start. Apple Metal is not supported.
 Place a supported model at `models/model.gguf` (the tokenizer is read from the GGUF). Supported: Qwen3.5 /
 Qwen3.8 dense models (hybrid attention + Gated DeltaNet) and qwen35moe mixture-of-experts models such as MiniCPM-V 4.7
 35B-A3B (text; `--moe-host-mb N` keeps the least-used experts in system RAM when the file is larger than the GPU), in
-TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, F16 and BF16 tensors (so
-Q4_K_M, Q5_K_M, Q6_K and Q8_0 files load). Files with IQ2_*, IQ1_* or Q2_K tensors (some Unsloth UD quants) do not
-load yet.
+TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, Q2_K, IQ2_S, IQ2_XS, IQ2_XXS,
+IQ1_S, F16 and BF16 tensors (so Q4_K_M, Q5_K_M, Q6_K, Q8_0 and 2-bit Unsloth UD files load). IQ1_M does not load yet.
 
 Then run:
 
