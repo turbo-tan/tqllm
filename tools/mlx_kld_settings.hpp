@@ -12,7 +12,7 @@ class KldKernelSettings {
         "TQLLM_MLX_TILED_TQ3_FP16", "TQLLM_MLX_TILED_TQ3_FP32",
         "TQLLM_MLX_TILED_TQ4_FP16", "TQLLM_MLX_TILED_TQ4_FP32",
         "TQLLM_MLX_TILED_MIXER_FP16", "TQLLM_MLX_TILED_MIXER_FP32",
-        "TQLLM_MLX_PAIRED_GATE_UP"};
+        "TQLLM_MLX_PAIRED_GATE_UP", "TQLLM_MLX_ATTN_DECODE_ROWS"};
     std::array<std::optional<std::string>,names.size()> values;
 public:
     KldKernelSettings() {
