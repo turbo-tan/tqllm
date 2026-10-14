@@ -1,4 +1,6 @@
 #include "qwen35.hpp"
+#include <cstdio>
+#include <sstream>
 #include "dense_rows.hpp"
 #include "prefill.hpp"
 #include "verify.hpp"
@@ -7,12 +9,16 @@
 #include "draft_head.hpp"
 #include "attention_rows.hpp"
 #include "tq3_tiled.hpp"
+#include "mma8.hpp"
 #include <mlx/compile.h>
+#include <mlx/graph_utils.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -25,11 +31,49 @@ mx::array tail_slice(const mx::array& a,int axis,int begin,int end) {
     starts[axis]=begin;stops[axis]=end;
     return mx::slice(a,starts,stops);
 }
-mx::array bf(const mx::array& a) {return mx::astype(mx::astype(a,mx::bfloat16),mx::float32);}
+bool ablate_small(const char* tag) {
+    static const std::string value=std::getenv("TQLLM_MLX_ABLATE_SMALL")?std::getenv("TQLLM_MLX_ABLATE_SMALL"):"";
+    return !value.empty() && value.find(tag)!=std::string::npos;
+}
+mx::array bf_raw(const mx::array& a) {
+    static const bool skip=ablate_small("bf");
+    return skip?a:mx::astype(mx::astype(a,mx::bfloat16),mx::float32);
+}
 mx::array silu(const mx::array& a) {return mx::multiply(a,mx::sigmoid(a));}
+bool fuse_ew() {static const bool on=std::getenv("TQLLM_MLX_FUSE_EW")!=nullptr;return on;}
+mx::array bf(const mx::array& a) {
+    if(!fuse_ew())return bf_raw(a);
+    static auto fused=mx::compile([](const std::vector<mx::array>& args) {return std::vector<mx::array>{bf_raw(args[0])};},true);
+    return fused({a})[0];
+}
+mx::array add_bf(const mx::array& a,const mx::array& b) {
+    if(!fuse_ew())return bf_raw(mx::add(a,b));
+    static auto fused=mx::compile([](const std::vector<mx::array>& args) {return std::vector<mx::array>{bf_raw(mx::add(args[0],args[1]))};},true);
+    return fused({a,b})[0];
+}
+mx::array gate_mul_bf(const mx::array& out,const mx::array& gate) {
+    if(!fuse_ew())return bf_raw(mx::multiply(bf_raw(out),bf_raw(mx::sigmoid(gate))));
+    static auto fused=mx::compile([](const std::vector<mx::array>& args) {
+        return std::vector<mx::array>{bf_raw(mx::multiply(bf_raw(args[0]),bf_raw(mx::sigmoid(args[1]))))};
+    },true);
+    return fused({out,gate})[0];
+}
+mx::array silu_mul_bf(const mx::array& normed,const mx::array& z) {
+    if(!fuse_ew())return bf_raw(mx::multiply(normed,silu(z)));
+    static auto fused=mx::compile([](const std::vector<mx::array>& args) {
+        return std::vector<mx::array>{bf_raw(mx::multiply(args[0],silu(args[1])))};
+    },true);
+    return fused({normed,z})[0];
+}
 mx::array swiglu(const mx::array& gate,const mx::array& up) {
     static auto fused=mx::compile([](const std::vector<mx::array>& args) {
-        return std::vector<mx::array>{bf(mx::multiply(bf(silu(args[0])),args[1]))};
+        return std::vector<mx::array>{bf_raw(mx::multiply(bf_raw(silu(args[0])),args[1]))};
+    });
+    return fused({gate,up})[0];
+}
+mx::array swiglu_rotated(const mx::array& gate,const mx::array& up) {
+    static auto fused=mx::compile([](const std::vector<mx::array>& args) {
+        return std::vector<mx::array>{tq4_rotate(bf_raw(mx::multiply(bf_raw(silu(args[0])),args[1])))};
     });
     return fused({gate,up})[0];
 }
@@ -46,6 +90,19 @@ struct Qwen35::Impl {
     std::map<std::string,Matrix> matrices;
     std::map<std::string,Tq3Expanded> decoded_ffn;
     std::map<std::string,TqTiledWeights> tiled_projections;
+    std::map<std::string,Mma8Weights> mma8_projections;
+    bool mma8=std::getenv("TQLLM_MLX_MMA8")!=nullptr;
+    bool mma8_untiled_only=std::getenv("TQLLM_MLX_MMA8_UNTILED_ONLY")!=nullptr;
+    std::string ablate_blocks=std::getenv("TQLLM_MLX_ABLATE_BLOCKS")?std::getenv("TQLLM_MLX_ABLATE_BLOCKS"):"";
+    std::vector<std::string> ablate=[]{
+        std::vector<std::string> out;
+        if(const char* v=std::getenv("TQLLM_MLX_ABLATE")) {
+            std::string s(v),item;
+            std::istringstream in(s);
+            while(std::getline(in,item,','))if(!item.empty())out.push_back(item);
+        }
+        return out;
+    }();
     bool tiled_mixer=std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr ||
         std::getenv("TQLLM_MLX_TILED_MIXER_FP16")!=nullptr;
     std::map<std::string,Tq3Affine8> affine_ffn;
@@ -55,6 +112,7 @@ struct Qwen35::Impl {
     bool affine_tq4_fp32=std::getenv("TQLLM_MLX_AFFINE_TQ4_FP32")!=nullptr;
     bool affine_mixer=std::getenv("TQLLM_MLX_AFFINE_MIXER")!=nullptr;
     std::optional<std::pair<mx::array,mx::array>> rotation;
+    std::optional<std::pair<mx::array,mx::array>> rotation_half;
     bool reuse_rotation=std::getenv("TQLLM_MLX_REUSE_ROTATION")!=nullptr;
     std::map<std::string,mx::array> plain;
     std::optional<Q4Embedding> embedding;
@@ -91,12 +149,20 @@ struct Qwen35::Impl {
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
+    int target_head_shortlist=0;
+    bool return_head_ids=false;
     bool paired_gate_up=std::getenv("TQLLM_MLX_PAIRED_GATE_UP")!=nullptr;
+    bool paired_swiglu_rotation=std::getenv("TQLLM_MLX_PAIRED_SWIGLU_ROTATION")!=nullptr;
     bool fused_epilogue=std::getenv("TQLLM_MLX_FUSE_EPILOGUE")!=nullptr;
+    bool fused_swiglu_rotation=std::getenv("TQLLM_MLX_FUSE_SWIGLU_ROTATION")!=nullptr;
+    bool lazy_verify_commit=std::getenv("TQLLM_MLX_LAZY_VERIFY_COMMIT")!=nullptr;
+    bool drop_tiled_originals=std::getenv("TQLLM_MLX_DROP_TILED_ORIGINALS")!=nullptr;
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         if(const char* mode=std::getenv("TQLLM_MLX_PAIRED_GATE_UP"))
             if(std::string_view(mode)!="1")throw std::invalid_argument("TQLLM_MLX_PAIRED_GATE_UP must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_PAIRED_SWIGLU_ROTATION"))
+            if(std::string_view(mode)!="1")throw std::invalid_argument("TQLLM_MLX_PAIRED_SWIGLU_ROTATION must be 1");
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_TQ3_FP16"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_TQ3_FP16 must be 1");
@@ -120,6 +186,13 @@ struct Qwen35::Impl {
         if(const char* mode=std::getenv("TQLLM_MLX_TILED_MIXER_FP32"))
             if(std::string_view(mode)!="1")
                 throw std::invalid_argument("TQLLM_MLX_TILED_MIXER_FP32 must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_LAZY_VERIFY_COMMIT"))
+            if(std::string_view(mode)!="1")throw std::invalid_argument("TQLLM_MLX_LAZY_VERIFY_COMMIT must be 1");
+        if(const char* mode=std::getenv("TQLLM_MLX_TARGET_HEAD_SHORTLIST")) {
+            target_head_shortlist=std::stoi(mode);
+            if(target_head_shortlist<16 || target_head_shortlist>2048)
+                throw std::invalid_argument("TQLLM_MLX_TARGET_HEAD_SHORTLIST must be 16..2048");
+        }
         if(compact_gdn && std::string_view(std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE"))!="1")
             throw std::invalid_argument("TQLLM_MLX_COMPACT_GDN_TAPE must be 1");
         const auto arch=file.kv.at("general.architecture").str;
@@ -194,6 +267,19 @@ struct Qwen35::Impl {
                     tiled_projections.emplace(name,std::move(tiled));
                 }
             }
+            if(mma8 && !(mma8_untiled_only && tiled_projections.contains(name))) {
+                if(auto packed=std::get_if<Tq4Weights>(&w)) {
+                    if(packed->integer_levels && packed->codes.shape(1)%64==0) {
+                        mma8_projections.emplace(name,mma8_pack(*packed));
+                        tiled_projections.erase(name);
+                    }
+                }else if(auto packed=std::get_if<Tq3Weights>(&w)) {
+                    if(!packed->interleaved && name.find("_norm")==std::string::npos) {
+                        mma8_projections.emplace(name,mma8_pack(*packed));
+                        tiled_projections.erase(name);
+                    }
+                }
+            }
             matrices.emplace(name,std::move(w));
         };
         auto scalar=[&](const std::string& name) {
@@ -206,6 +292,11 @@ struct Qwen35::Impl {
             const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
             if (!head) throw std::invalid_argument("Q6 affine head requires Q6_K output weights");
             target_head = q6_affine_split(*head);
+        }
+        if(target_head_shortlist) {
+            const auto* head=std::get_if<Q6Weights>(&matrices.at("output.weight"));
+            if(!head)throw std::invalid_argument("target-head shortlist requires Q6_K output weights");
+            proposal_head=draft_head4(matrices.at("output.weight"));
         }
         for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
@@ -228,9 +319,68 @@ struct Qwen35::Impl {
         }
         caches.resize(layers);
         tapes.resize(layers);
+        if(mma8) {
+            mma8_clear_pack_cache();
+            size_t bytes=0;for(const auto& [n,m]:mma8_projections)bytes+=m.words.nbytes()+m.scales.nbytes();
+            std::fprintf(stderr,"mma8: %zu of %zu matrices packed, %.2f GB\n",mma8_projections.size(),matrices.size(),bytes/1e9);
+        }
     }
-    mx::array mat(const std::string& name,const mx::array& x) {
-        const auto& w=matrices.at(name);
+    bool tiled_active(const std::string& name,const TqTiledWeights& weights,bool& fp32) const {
+        const bool mixer_projection=name.find(".ffn_")==std::string::npos;
+        fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
+            std::getenv(weights.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
+        return fp32 || (mixer_projection && std::getenv("TQLLM_MLX_TILED_MIXER_FP16")) ||
+            (!mixer_projection && std::getenv(weights.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"));
+    }
+    void drop_tiled_original_matrices() {
+        if(!drop_tiled_originals)return;
+        for(const auto& [name,weights]:tiled_projections) {
+            bool fp32=false;
+            if(tiled_active(name,weights,fp32))matrices.erase(name);
+        }
+    }
+    mx::array mat(const std::string& name,const mx::array& x,bool input_rotated=false) {
+        auto rotated=[&]() {
+            if(input_rotated)return x;
+            if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
+            auto value=tq4_rotate(x);
+            if(reuse_rotation)rotation=std::pair{x,value};
+            return value;
+        };
+        if(!ablate.empty() && x.shape(0)<=8)
+            for(const auto& raw_tag:ablate) {
+                const bool keep_input=raw_tag.rfind("r:",0)==0;
+                const std::string tag=keep_input?raw_tag.substr(2):raw_tag;
+                if(name.find(tag)!=std::string::npos) {
+                    int rows=0;
+                    if(auto it=matrices.find(name);it!=matrices.end())
+                        std::visit([&](const auto& w){
+                            if constexpr(std::is_same_v<std::decay_t<decltype(w)>,mx::array>)rows=w.shape(0);
+                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq3Weights>)rows=w.planes.shape(0);
+                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq4Weights>)rows=w.codes.shape(0);
+                            else rows=w.blocks.shape(0);
+                        },it->second);
+                    if(rows) {
+                        auto zero=mx::zeros({x.shape(0),rows},x.dtype());
+                        if(keep_input)zero=mx::add(zero,mx::astype(mx::multiply(mx::sum(rotated()),mx::array(0.0f)),x.dtype()));
+                        return zero;
+                    }
+                }
+            }
+        if(mma8 && x.shape(0)<=8)
+            if(auto found=mma8_projections.find(name);found!=mma8_projections.end()) {
+                if(!rotation_half || !rotation || rotation_half->first.id()!=x.id())
+                    rotation_half=std::pair{x,mma8_input(rotated())};
+                return mma8_matmul(found->second,rotation_half->second,x.shape(0),true);
+            }
+        if(x.shape(0)<=8)
+            if(auto found=tiled_projections.find(name);found!=tiled_projections.end()) {
+                bool fp32=false;
+                if(tiled_active(name,found->second,fp32))return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
+            }
+        auto it=matrices.find(name);
+        if(it==matrices.end())throw std::invalid_argument("matrix has no original weights: "+name);
+        const auto& w=it->second;
         if(capture_prefix && serial_verify_dense && x.shape(0)>1 && std::holds_alternative<mx::array>(w)) {
             if(batch_decode_dense) {
                 if(!dense_input || dense_input->first.id()!=x.id())dense_input=std::pair{x,dense_row_views(x)};
@@ -242,38 +392,26 @@ struct Qwen35::Impl {
                 rows.push_back(bf(linear(w,mx::contiguous(tail_slice(x,0,t,t+1)))));
             return mx::concatenate(rows,0);
         }
-        auto rotated=[&]() {
-            if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
-            auto value=tq4_rotate(x);
-            if(reuse_rotation)rotation=std::pair{x,value};
-            return value;
-        };
-        if(x.shape(0)<=8)
-            if(auto found=tiled_projections.find(name);found!=tiled_projections.end()) {
-                const bool mixer_projection=name.find(".ffn_")==std::string::npos;
-                const bool fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
-                    std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
-                const bool active=fp32 || (mixer_projection && std::getenv("TQLLM_MLX_TILED_MIXER_FP16")) || (!mixer_projection &&
-                    std::getenv(found->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"));
-                if(active)return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
-            }
-        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
+        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>8))
             if(auto found=affine_ffn.find(name);found!=affine_ffn.end()) {
                 const bool fp32=(affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(w)) ||
                     (affine_mixer && name.find(".ffn_")==std::string::npos);
                 return bf(fp32?affine8_matmul(found->second,rotated(),false):tq3_affine8_matmul(found->second,rotated()));
             }
-        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
+        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>8))
             if(auto found=decoded_ffn.find(name);found!=decoded_ffn.end())
                 return bf(tq3_expanded_matmul(found->second,rotated()));
-        if(reuse_rotation && !(gemm_prefill && x.shape(0)>=8)) {
+        if((reuse_rotation || input_rotated) && !(gemm_prefill && x.shape(0)>8)) {
             if(auto packed=std::get_if<Tq3Weights>(&w))return bf(tq3_matmul(*packed,rotated()));
             if(auto packed=std::get_if<Tq4Weights>(&w))
                 return bf(tq4_matmul(*packed,rotated(),1,matmul_columns(x.shape(0)),matmul_simds()));
         }
-        return bf(gemm_prefill && x.shape(0)>=8?prefill_linear(w,x):linear(w,x));
+        return bf(gemm_prefill && x.shape(0)>8?prefill_linear(w,x):linear(w,x));
     }
-    mx::array norm(const mx::array& x,const std::string& name) {return bf(mx::fast::rms_norm(x,plain.at(name),eps));}
+    mx::array norm(const mx::array& x,const std::string& name) {
+        static const bool skip=ablate_small("norm");
+        return skip?x:bf(mx::fast::rms_norm(x,plain.at(name),eps));
+    }
     std::optional<mx::array> paired_ff(const std::string& p,const mx::array& x) {
         if(!paired_gate_up || !std::getenv("TQLLM_MLX_PAIRED_GATE_UP") || x.shape(0)>8)return std::nullopt;
         auto g=tiled_projections.find(p+"ffn_gate.weight"),u=tiled_projections.find(p+"ffn_up.weight");
@@ -282,10 +420,11 @@ struct Qwen35::Impl {
            g->second.rows!=u->second.rows || g->second.columns!=u->second.columns)return std::nullopt;
         const bool fp32=std::getenv(g->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
         if(!fp32 && !std::getenv(g->second.bits==3?"TQLLM_MLX_TILED_TQ3_FP16":"TQLLM_MLX_TILED_TQ4_FP16"))return std::nullopt;
-        return tq_paired_swiglu(g->second,u->second,tq4_rotate(x),fp32);
+        return paired_swiglu_rotation?tq_paired_swiglu_rotated(g->second,u->second,tq4_rotate(x),fp32):
+            tq_paired_swiglu(g->second,u->second,tq4_rotate(x),fp32);
     }
     std::pair<mx::array,mx::array> gate_up(const std::string& p,const mx::array& x) {
-        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>=8))
+        if(x.shape(0)>1 && !(gemm_prefill && x.shape(0)>8))
             if(auto found=affine_gu.find(p);found!=affine_gu.end()) {
                 const bool fp32=affine_tq4_fp32 && std::holds_alternative<Tq4Weights>(matrices.at(p+"ffn_gate.weight"));
                 auto gu=fp32?affine8_matmul(found->second,tq4_rotate(x),false):tq3_affine8_matmul(found->second,tq4_rotate(x));
@@ -307,7 +446,7 @@ struct Qwen35::Impl {
         c.values=c.values?mx::concatenate({*c.values,v},2):v;
         auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
-        out=bf(mx::multiply(bf(out),bf(mx::sigmoid(gate))));
+        out=gate_mul_bf(out,gate);
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
     }
     mx::array gdn(const std::string& p,const mx::array& x,Cache& c,PrefixTape& tape) {
@@ -338,13 +477,54 @@ struct Qwen35::Impl {
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
         auto z=mx::reshape(mat(p+"attn_gate.weight",x),{1,m,vh,dv});
-        auto out=bf(mx::multiply(mx::fast::rms_norm(bf(update[0]),plain.at(p+"ssm_norm.weight"),eps),silu(z)));
+        auto out=silu_mul_bf(mx::fast::rms_norm(bf(update[0]),plain.at(p+"ssm_norm.weight"),eps),z);
         return mat(p+"ssm_out.weight",mx::reshape(out,{m,vh*dv}));
+    }
+    mx::array shortlist_rows(const mx::array& x, int& vocab) const {
+        if(!proposal_head)throw std::invalid_argument("target-head shortlist is not configured");
+        const bool skip_matmul=ablate_blocks.find("hm")!=std::string::npos;
+        auto approximate=skip_matmul?mx::zeros({x.shape(0),248320},mx::float32):draft_head4_matmul(*proposal_head,x);
+        const int m=approximate.shape(0),v=approximate.shape(1),n=std::min(target_head_shortlist,v);
+        vocab=v;
+        if(ablate_blocks.find("ht")!=std::string::npos)
+            return mx::astype(mx::broadcast_to(mx::arange(n),{m,n}),mx::uint32);
+        if(!std::getenv("TQLLM_MLX_TARGET_HEAD_HOST"))
+            return shard_topk_ids(approximate,n);
+        mx::eval(approximate);
+        std::vector<uint32_t> ids(size_t(m)*n);
+        const float* p=approximate.data<float>();
+        std::vector<uint32_t> order(static_cast<size_t>(v));
+        for(int row=0;row<m;++row) {
+            std::iota(order.begin(),order.end(),0);
+            const float* base=p+size_t(row)*v;
+            std::partial_sort(order.begin(),order.begin()+n,order.end(),
+                [&](uint32_t a,uint32_t b) {return base[a]>base[b];});
+            std::copy_n(order.begin(),n,ids.begin()+size_t(row)*n);
+        }
+        return mx::array(ids.data(),{m,n},mx::uint32);
+    }
+    mx::array shortlist_ids(const mx::array& x) const {
+        const auto* head=std::get_if<Q6Weights>(&matrices.at("output.weight"));
+        if(!head)throw std::invalid_argument("target-head shortlist requires Q6_K output weights");
+        int vocab=0;
+        auto rows=shortlist_rows(x,vocab);
+        auto scores=ablate_blocks.find("hq")!=std::string::npos?mx::zeros(rows.shape(),mx::float32):q6_rows_matmul(*head,x,rows);
+        auto best=mx::argmax(scores,1);
+        auto selected=mx::take_along_axis(rows,mx::expand_dims(best,1),1);
+        return mx::reshape(selected,{x.shape(0)});
+    }
+    mx::array shortlist_head(const mx::array& x) const {
+        const auto* head=std::get_if<Q6Weights>(&matrices.at("output.weight"));
+        if(!head)throw std::invalid_argument("target-head shortlist requires Q6_K output weights");
+        int vocab=0;
+        auto rows=shortlist_rows(x,vocab);
+        auto scores=q6_rows_matmul(*head,x,rows);
+        return sparse_logits(rows,scores,vocab);
     }
     mx::array forward(std::span<const uint32_t> tokens,bool all_logits) {
         auto start=std::chrono::steady_clock::now();
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
-        stages.clear();rotation.reset();dense_input.reset();
+        stages.clear();rotation.reset();rotation_half.reset();dense_input.reset();
         auto tick=std::chrono::steady_clock::now();
         auto record=[&](const char* name,const std::vector<mx::array>& arrays) {
             if(!stage_profiling)return;
@@ -359,20 +539,27 @@ struct Qwen35::Impl {
             if(std::binary_search(feature_ids.begin(),feature_ids.end(),l))features.push_back(x);
             const std::string p="blk."+std::to_string(l)+".";
             auto n=norm(x,p+"attn_norm.weight");
-            auto attn=(l+1)%interval==0?full_attention(p,n,caches[l],pos):gdn(p,n,caches[l],tapes[l]);
+            const bool is_attn=(l+1)%interval==0;
+            auto attn=ablate_blocks.find(is_attn?"attn":"gdn")!=std::string::npos?mx::zeros(x.shape(),x.dtype()):
+                is_attn?full_attention(p,n,caches[l],pos):gdn(p,n,caches[l],tapes[l]);
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
                 for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)values.push_back(**a);
                 record((l+1)%interval==0?"attention":"gdn_mixer",values);
             }
-            x=bf(mx::add(x,attn));n=norm(x,p+"post_attention_norm.weight");
+            x=add_bf(x,attn);n=norm(x,p+"post_attention_norm.weight");
             auto paired=paired_ff(p,n);
+            bool ff_rotated=paired && paired_swiglu_rotation;
             auto ff=paired?*paired:[&] {
                 auto [gate,up]=gate_up(p,n);
+                if(fused_swiglu_rotation && x.shape(0)>1) {
+                    ff_rotated=true;
+                    return swiglu_rotated(gate,up);
+                }
                 return fused_epilogue?swiglu(gate,up):bf(mx::multiply(bf(silu(gate)),up));
             }();
             if(stage_profiling)record("ffn_gate_up",{ff});
-            x=bf(mx::add(x,mat(p+"ffn_down.weight",ff)));
+            if(ablate_blocks.find("ffn")==std::string::npos)x=add_bf(x,mat(p+"ffn_down.weight",ff,ff_rotated));
             if(stage_profiling)record("ffn_down",{x});
         }
         last_hidden=x;
@@ -381,23 +568,47 @@ struct Qwen35::Impl {
         if(!all_logits) x=tail_slice(x,0,m-1,m);
         std::vector<mx::array> live={x};
         if(last_features)live.push_back(*last_features);
-        for(const auto& c:caches) {
-            if(c.conv) live.push_back(*c.conv);
-            if(c.state) live.push_back(*c.state);
-            if(c.keys) live.push_back(*c.keys);
-            if(c.values) live.push_back(*c.values);
+        if(!(capture_prefix && lazy_verify_commit)) {
+            for(const auto& c:caches) {
+                if(c.conv) live.push_back(*c.conv);
+                if(c.state) live.push_back(*c.state);
+                if(c.keys) live.push_back(*c.keys);
+                if(c.values) live.push_back(*c.values);
+            }
+            if(capture_prefix)for(const auto& t:tapes)
+                for(const auto* a:{&t.states,&t.keys,&t.decay,&t.deltas})if(*a)live.push_back(**a);
         }
-        if(capture_prefix)for(const auto& t:tapes)
-            for(const auto* a:{&t.states,&t.keys,&t.decay,&t.deltas})if(*a)live.push_back(**a);
         if(profiling) mx::eval(live);
         auto body_end=std::chrono::steady_clock::now();
-        auto logits=target_head && x.shape(0)<=5?q6_affine_matmul(*target_head,x):gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):linear(matrices.at("output.weight"),x);
+        auto logits=return_head_ids && target_head_shortlist && x.shape(0)<=8?shortlist_ids(x):
+            target_head_shortlist && x.shape(0)<=8?shortlist_head(x):
+            target_head && x.shape(0)<=8?q6_affine_matmul(*target_head,x):
+            gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):
+            linear(matrices.at("output.weight"),x);
         live.push_back(logits);
+        if(std::getenv("TQLLM_MLX_COUNT_NODES")) {
+            std::ostringstream dot;mx::export_to_dot(dot,live);
+            size_t nodes=0,pos=0;const std::string text=dot.str();
+            while((pos=text.find("->",pos))!=std::string::npos){++nodes;pos+=2;}
+            size_t prims=0;for(size_t q=0;(q=text.find("shape=rectangle",q))!=std::string::npos;q+=15)++prims;
+            std::fprintf(stderr,"graph primitives m=%d: %zu (edges %zu)\n",m,prims,nodes);
+            std::map<std::string,size_t> histogram;
+            for(size_t at=0;(at=text.find("label =\"",at))!=std::string::npos;) {
+                at+=8;const size_t end=text.find('"',at);
+                if(end==std::string::npos)break;
+                ++histogram[text.substr(at,end-at)];at=end;
+            }
+            std::vector<std::pair<size_t,std::string>> ranked;
+            for(const auto& [name,count]:histogram)ranked.push_back({count,name});
+            std::sort(ranked.rbegin(),ranked.rend());
+            for(size_t i=0;i<ranked.size() && i<28;++i)std::fprintf(stderr,"graph node %-28s %zu\n",ranked[i].second.c_str(),ranked[i].first);
+        }
         mx::eval(live);
+        if(m>=8)drop_tiled_original_matrices();
         auto end=std::chrono::steady_clock::now();
         times={std::chrono::duration<double,std::milli>(body_end-start).count(),
                std::chrono::duration<double,std::milli>(end-body_end).count()};
-        pos+=m;++revision;rotation.reset();dense_input.reset();
+        pos+=m;++revision;rotation.reset();rotation_half.reset();dense_input.reset();
         return logits;
     }
 };
@@ -449,6 +660,32 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
         for(auto& tape:impl_->tapes)tape=PrefixTape{};
         return logits;
     } catch(...) {
+        impl_->capture_prefix=false;
+        for(auto& tape:impl_->tapes)tape=PrefixTape{};
+        restore(before);
+        throw;
+    }
+}
+mx::array Qwen35::verify_choices(std::span<const uint32_t> tokens,Verification& batch) {
+    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
+        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-8 tokens");
+    batch.state_.reset();
+    const auto before=checkpoint();
+    impl_->capture_prefix=true;
+    for(auto& tape:impl_->tapes)tape=PrefixTape{};
+    try {
+        impl_->return_head_ids=true;
+        auto logits=impl_->forward(tokens,true);
+        impl_->return_head_ids=false;
+        batch.state_=std::make_shared<Verification::State>(Verification::State{
+            impl_.get(),impl_->epoch,impl_->revision,before.state_->pos,int(tokens.size()),
+            before.state_->caches,impl_->caches,impl_->tapes,before.state_->hidden,impl_->last_hidden,
+            before.state_->features,impl_->last_features});
+        impl_->capture_prefix=false;
+        for(auto& tape:impl_->tapes)tape=PrefixTape{};
+        return logits;
+    } catch(...) {
+        impl_->return_head_ids=false;
         impl_->capture_prefix=false;
         for(auto& tape:impl_->tapes)tape=PrefixTape{};
         restore(before);
@@ -584,7 +821,7 @@ void Qwen35::draft_inject(std::span<const uint32_t> tokens,const mx::array& hidd
     auto v=mx::transpose(mx::reshape(i.mat(p+"attn_v.weight",x),{1,n,i.kvheads,i.hd}),{0,2,1,3});
     i.mtp_cache.keys=i.mtp_cache.keys?mx::concatenate({*i.mtp_cache.keys,k},2):k;
     i.mtp_cache.values=i.mtp_cache.values?mx::concatenate({*i.mtp_cache.values,v},2):v;
-    mx::eval(*i.mtp_cache.keys,*i.mtp_cache.values);i.mtp_pos+=n;i.mtp_hidden.reset();i.rotation.reset();
+    mx::eval(*i.mtp_cache.keys,*i.mtp_cache.values);i.mtp_pos+=n;i.mtp_hidden.reset();i.rotation.reset();i.rotation_half.reset();
 }
 mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array& hidden,int position,bool logits) {
     auto& i=*impl_;const int n=int(tokens.size());
@@ -606,7 +843,7 @@ mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array
         output=shared_draft_head(normalized);
     }
     mx::eval(output,*i.mtp_cache.keys,*i.mtp_cache.values);
-    i.mtp_pos+=n;i.rotation.reset();
+    i.mtp_pos+=n;i.rotation.reset();i.rotation_half.reset();
     return output;
 }
 Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}

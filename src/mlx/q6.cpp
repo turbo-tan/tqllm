@@ -125,4 +125,123 @@ for(uint m=0;m<MCOLS;++m) {
                   {32, (rows + 1) / 2 * 2, (m + cols - 1) / cols}, {32, 2, 1},
                   {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
+
+mx::array q6_rows_matmul(const Q6Weights& w, const mx::array& x, const mx::array& ids) {
+    if (w.blocks.ndim() != 3 || w.blocks.shape(2) != 210 || w.blocks.dtype() != mx::uint8 ||
+        x.ndim() != 2 || x.dtype() != mx::float32 || ids.ndim() != 2 || ids.dtype() != mx::uint32)
+        throw std::invalid_argument("invalid Q6_K row projection types");
+    const int rows = w.blocks.shape(0), k = w.blocks.shape(1) * 256, m = x.shape(0), n = ids.shape(1);
+    if (rows <= 0 || k <= 0 || m <= 0 || n <= 0 || x.shape(1) != k || ids.shape(0) != m)
+        throw std::invalid_argument("incompatible Q6_K row projection dimensions");
+    static auto kernel = mx::fast::metal_kernel("tqllm_q6_rows_matmul", {"blocks", "x", "ids"}, {"y"}, R"METAL(
+uint lane = thread_position_in_threadgroup.x;
+uint item = threadgroup_position_in_grid.y * threads_per_threadgroup.y + thread_position_in_threadgroup.y;
+if(item>=M*N) return;
+uint col = item / N, idx = item % N, row = ids[item];
+if(row>=R) {
+ if(lane==0) y[item]=-3.4028234663852886e38f;
+ return;
+}
+float acc = 0.0f;
+for(uint b=lane;b<K/256;b+=32) {
+ const device uchar* p=blocks+(row*(K/256)+b)*210;
+ float d=float(as_type<half>(ushort(uint(p[208])|(uint(p[209])<<8))));
+ float part=0.0f;
+ for(uint j=0;j<256;++j) {
+  uint h=j/128,l=j%32,c=(j%128)/32;
+  uint lo=p[h*64+(c&1u)*32+l],hi=p[128+h*32+l];
+  int q=int(((c<2?lo&15u:lo>>4)|(((hi>>(2*c))&3u)<<4)))-32;
+  float s=d*float(as_type<char>(p[192+h*8+c*2+l/16]));
+  part+=float(q)*s*x[col*K+b*256+j];
+ }
+ acc+=part;
+}
+float value=simd_sum(acc);
+if(lane==0) y[item]=value;
+)METAL");
+    return kernel({w.blocks, x, ids}, {{m, n}}, {mx::float32},
+                  {32, (m * n + 1) / 2 * 2, 1}, {32, 2, 1},
+                  {{"R", rows}, {"K", k}, {"M", m}, {"N", n}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
+
+mx::array shard_topk_ids(const mx::array& logits, int candidates) {
+    if (logits.ndim() != 2 || logits.dtype() != mx::float32 || logits.shape(0) <= 0 || logits.shape(1) <= 0 ||
+        candidates < 1 || candidates > logits.shape(1))
+        throw std::invalid_argument("invalid shard top-k logits");
+    const int m = logits.shape(0), v = logits.shape(1);
+    const int per = candidates == 1 ? 1 : 2;
+    const int shards = (candidates + per - 1) / per;
+    static auto kernel = mx::fast::metal_kernel("tqllm_shard_topk_ids", {"logits"}, {"ids"}, R"METAL(
+uint lane = thread_position_in_threadgroup.x;
+uint row = threadgroup_position_in_grid.y;
+uint shard = threadgroup_position_in_grid.z;
+uint span = (uint(V) + uint(SHARDS) - 1u) / uint(SHARDS);
+uint begin = shard * span;
+uint end = min(begin + span, uint(V));
+float best0 = -3.4028234663852886e38f, best1 = -3.4028234663852886e38f;
+uint id0 = uint(V), id1 = uint(V);
+for(uint i = begin + lane; i < end; i += 256u) {
+    float x = logits[row * uint(V) + i];
+    if(x > best0 || (x == best0 && i < id0)) {
+        best1 = best0; id1 = id0; best0 = x; id0 = i;
+    } else if(x > best1 || (x == best1 && i < id1)) {
+        best1 = x; id1 = i;
+    }
+}
+threadgroup float scores0[256], scores1[256];
+threadgroup uint ids0[256], ids1[256];
+scores0[lane] = best0; scores1[lane] = best1; ids0[lane] = id0; ids1[lane] = id1;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for(uint step = 128u; step > 0u; step >>= 1u) {
+    if(lane < step) {
+        float other0 = scores0[lane + step], other1 = scores1[lane + step];
+        uint oid0 = ids0[lane + step], oid1 = ids1[lane + step];
+        float a0 = scores0[lane], a1 = scores1[lane];
+        uint aid0 = ids0[lane], aid1 = ids1[lane];
+        if(other0 > a0 || (other0 == a0 && oid0 < aid0)) {
+            a1 = a0; aid1 = aid0; a0 = other0; aid0 = oid0;
+        } else if(other0 > a1 || (other0 == a1 && oid0 < aid1)) {
+            a1 = other0; aid1 = oid0;
+        }
+        if(other1 > a0 || (other1 == a0 && oid1 < aid0)) {
+            a1 = a0; aid1 = aid0; a0 = other1; aid0 = oid1;
+        } else if(other1 > a1 || (other1 == a1 && oid1 < aid1)) {
+            a1 = other1; aid1 = oid1;
+        }
+        scores0[lane] = a0; scores1[lane] = a1; ids0[lane] = aid0; ids1[lane] = aid1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+if(lane == 0u) {
+    uint base = row * uint(SHARDS * PER) + shard * uint(PER);
+    ids[base] = ids0[0];
+    if(PER == 2) ids[base + 1u] = ids1[0];
+}
+)METAL");
+    return kernel({logits}, {{m, shards * per}}, {mx::uint32}, {256, m, shards}, {256, 1, 1},
+                  {{"V", v}, {"SHARDS", shards}, {"PER", per}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
+mx::array sparse_logits(const mx::array& ids, const mx::array& scores, int vocab) {
+    if (ids.ndim() != 2 || ids.dtype() != mx::uint32 || scores.ndim() != 2 || scores.dtype() != mx::float32 ||
+        ids.shape() != scores.shape() || vocab <= 0)
+        throw std::invalid_argument("invalid sparse logits inputs");
+    const int m = ids.shape(0), n = ids.shape(1);
+    static auto scatter = mx::fast::metal_kernel("tqllm_sparse_logits_scatter", {"ids", "scores"}, {"logits"}, R"METAL(
+uint i=thread_position_in_grid.x;
+if(i>=M*V)return;
+uint row=i/V,tok=i%V;
+float value=-3.4028234663852886e38f;
+for(uint j=0;j<N;++j) {
+ if(ids[row*N+j]==tok) {
+  value=scores[row*N+j];
+  break;
+ }
+}
+logits[i]=value;
+)METAL");
+    return scatter({ids, scores}, {{m, vocab}}, {mx::float32}, {uint32_t(m * vocab), 1, 1}, {256, 1, 1},
+                   {{"M", m}, {"N", n}, {"V", vocab}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
 }

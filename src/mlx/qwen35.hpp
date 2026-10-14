@@ -22,6 +22,7 @@ public:
         friend class Qwen35;
     };
     mlx::core::array verify(std::span<const uint32_t> tokens, Verification& batch);
+    mlx::core::array verify_choices(std::span<const uint32_t> tokens, Verification& batch);
     void accept_prefix(const Verification& batch, size_t count);
     mlx::core::array hidden_states() const;
     void enable_mtp();

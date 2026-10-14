@@ -26,6 +26,7 @@ int main(int argc,char** argv) {
         Qwen35 engine(argv[1],int(prompt.size())+count+16);
         engine.gdn_mode(Qwen35::GdnMode::scan);engine.enable_mtp();engine.verify_tiles(true);
         const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4")!=nullptr;
+        const bool direct_ids=std::getenv("TQLLM_MLX_TARGET_HEAD_IDS")&&std::getenv("TQLLM_MLX_TARGET_HEAD_SHORTLIST");
         if(head4)engine.enable_draft_head4();
         std::vector<uint32_t> reference,first_spec;
         for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
@@ -57,7 +58,7 @@ int main(int argc,char** argv) {
                 draft_ms+=seconds(begin)*1000;
                 std::vector<uint32_t> block{pending};block.insert(block.end(),proposed.begin(),proposed.end());
                 Qwen35::Verification ticket;begin=Clock::now();
-                auto verified=engine.verify(block,ticket);auto choices=mx::argmax(verified,-1);mx::eval(choices);
+                auto choices=direct_ids?engine.verify_choices(block,ticket):mx::argmax(engine.verify(block,ticket),-1);mx::eval(choices);
                 const auto* ids=choices.data<uint32_t>();
                 auto hidden=engine.hidden_states();
                 verify_ms+=seconds(begin)*1000;

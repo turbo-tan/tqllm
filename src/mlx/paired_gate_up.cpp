@@ -1,4 +1,5 @@
 #include "tq3_tiled.hpp"
+#include "tq4.hpp"
 #include <limits>
 #include <mlx/compile.h>
 #include <stdexcept>
@@ -105,5 +106,14 @@ mx::array tq_paired_swiglu(const TqTiledWeights& gate,const TqTiledWeights& up,
     });
     return epilogue({projections.first,projections.second})[0];
 }
-
+mx::array tq_paired_swiglu_rotated(const TqTiledWeights& gate,const TqTiledWeights& up,
+        const mx::array& input,bool fp32,int splits) {
+    auto projections=tq_paired_matmul(gate,up,input,fp32,splits);
+    static auto epilogue=mx::compile([](const std::vector<mx::array>& a) {
+        auto bf=[](const mx::array& x){return mx::astype(mx::astype(x,mx::bfloat16),mx::float32);};
+        auto g=bf(a[0]),u=bf(a[1]);
+        return std::vector<mx::array>{tq4_rotate(bf(mx::multiply(bf(mx::multiply(g,mx::sigmoid(g))),u)))};
+    });
+    return epilogue({projections.first,projections.second})[0];
+}
 }

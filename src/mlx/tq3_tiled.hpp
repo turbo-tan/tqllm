@@ -26,6 +26,8 @@ std::pair<mlx::core::array,mlx::core::array> tq_paired_matmul(
     const mlx::core::array& rotated_input,bool full_precision,int splits = 4);
 mlx::core::array tq_paired_swiglu(const TqTiledWeights& gate,const TqTiledWeights& up,
     const mlx::core::array& rotated_input,bool full_precision,int splits = 4);
+mlx::core::array tq_paired_swiglu_rotated(const TqTiledWeights& gate,const TqTiledWeights& up,
+    const mlx::core::array& rotated_input,bool full_precision,int splits = 4);
 mlx::core::array tq_register_matmul(const TqTiledWeights& weights,
     const mlx::core::array& input, int splits = 4, bool integer_operand = false, bool packed_cache = false, bool compensated_input = false);
 // Lossless int8 code levels, packed four per word in output-coalesced order.

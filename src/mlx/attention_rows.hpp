@@ -1,8 +1,13 @@
 #pragma once
+#include <algorithm>
+#include <string>
+#include <cstdlib>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
+#include <mlx/transforms.h>
 #include <stdexcept>
 #include <vector>
+#include "attention_decode.hpp"
 
 namespace tqllm::mlx_backend {
 inline mlx::core::array fused_decode_attention(const mlx::core::array& q,
@@ -69,9 +74,27 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
     const int n = q.shape(2), past = k.shape(2) - n;
     if (past < 0 || v.shape(2) != k.shape(2))
         throw std::invalid_argument("attention cache shorter than query block");
+    static const bool decode_rows = std::getenv("TQLLM_MLX_ATTN_DECODE_ROWS") != nullptr;
+    if (decode_rows && n <= 8 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
+        k.dtype() == mx::float32 && v.dtype() == mx::float32 && (q.shape(3) == 128 || q.shape(3) == 256) &&
+        q.shape(1) % k.shape(1) == 0)
+        return decode_rows_attention(q, k, v, scale);
     if(fused_rows && (decode_order || n==1) && q.shape(0)==1 && k.shape(2)<1024 &&
        n<=8 && (q.shape(3)==128 || q.shape(3)==256) && q.dtype()==mx::float32)
         return fused_decode_attention(q,k,v,scale);
+    static const int q_chunk = std::getenv("TQLLM_MLX_ATTN_Q_CHUNK") ? std::stoi(std::getenv("TQLLM_MLX_ATTN_Q_CHUNK")) : 0;
+    if (!decode_order && q_chunk > 0 && n > q_chunk) {
+        std::vector<mx::array> blocks;
+        for (int a = 0; a < n; a += q_chunk) {
+            const int b = std::min(n, a + q_chunk);
+            auto query = mx::slice(q, {0, 0, a, 0}, {q.shape(0), q.shape(1), b, q.shape(3)});
+            auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), past + b, k.shape(3)});
+            auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), past + b, v.shape(3)});
+            blocks.push_back(mx::fast::scaled_dot_product_attention(query, keys, values, scale, "causal"));
+            mx::eval(blocks.back());
+        }
+        return mx::concatenate(blocks, 2);
+    }
     if (!decode_order || n == 1)
         return mx::fast::scaled_dot_product_attention(q, k, v, scale, n > 1 ? "causal" : "");
     std::vector<mx::array> output;

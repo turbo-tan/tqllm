@@ -1,3 +1,4 @@
+#include <string>
 #include "tq4.hpp"
 #include <stdexcept>
 #include <cmath>
@@ -107,6 +108,8 @@ mx::array tq4_rotate(const mx::array& x) {
         for (int i = 0; i < 128; ++i) s[i] = 1.0f - 2.0f * ((words[i / 32] >> (i % 32)) & 1);
         return mx::array(s.data(), {128});
     }();
+    static const bool skip = std::getenv("TQLLM_MLX_ABLATE_SMALL") && std::string(std::getenv("TQLLM_MLX_ABLATE_SMALL")).find("rot") != std::string::npos;
+    if (skip) return mx::astype(x, mx::float32);
     auto blocks = mx::reshape(mx::astype(x, mx::float32), {x.shape(0), x.shape(1) / 128, 128});
     return mx::reshape(mx::hadamard_transform(mx::multiply(blocks, signs), 1.0f / std::sqrt(128.0f)), x.shape());
 }

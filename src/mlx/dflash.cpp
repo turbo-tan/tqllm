@@ -1,3 +1,4 @@
+#include <sstream>
 #include "dflash.hpp"
 #include "tq3_tiled.hpp"
 #include "../dequant.hpp"
@@ -33,6 +34,72 @@ mx::array dflash_conv(const mx::array& x,const mx::array& dynamic,const mx::arra
     }
     return bf(result);
 }
+
+mx::array dflash_top16_sharded(const mx::array& logits) {
+    if(logits.ndim()!=2 || logits.dtype()!=mx::float32 || logits.shape(0)<1 || logits.shape(1)<16)
+        throw std::invalid_argument("invalid DFlash logits for sharded top16");
+    const int rows=logits.shape(0),vocab=logits.shape(1),shards=8,keep=16;
+    static auto shard=mx::fast::metal_kernel("tqllm_dflash_top16_shards", {"logits"}, {"ids","values"}, R"METAL(
+uint lane=thread_position_in_threadgroup.x;
+uint row=threadgroup_position_in_grid.y;
+uint shard=threadgroup_position_in_grid.z;
+constexpr uint K=16u;
+constexpr uint Threads=256u;
+threadgroup float scores[Threads*K];
+threadgroup uint tokens[Threads*K];
+for(uint r=0;r<K;++r) {scores[lane*K+r]=-INFINITY;tokens[lane*K+r]=0xffffffffu;}
+uint span=(uint(VOCAB)+uint(SHARDS)-1u)/uint(SHARDS);
+uint begin=shard*span,end=min(begin+span,uint(VOCAB));
+for(uint tok=begin+lane;tok<end;tok+=Threads) {
+ float value=logits[row*uint(VOCAB)+tok];
+ if(value>scores[lane*K+K-1u] || (value==scores[lane*K+K-1u] && tok<tokens[lane*K+K-1u])) {
+  uint pos=K-1u;
+  while(pos>0u && (value>scores[lane*K+pos-1u] || (value==scores[lane*K+pos-1u] && tok<tokens[lane*K+pos-1u]))) {
+   scores[lane*K+pos]=scores[lane*K+pos-1u];
+   tokens[lane*K+pos]=tokens[lane*K+pos-1u];
+   --pos;
+  }
+  scores[lane*K+pos]=value;tokens[lane*K+pos]=tok;
+ }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if(lane==0u) {
+ for(uint rank=0u;rank<K;++rank) {
+  float best=-INFINITY;uint best_id=0xffffffffu,best_index=0u;
+  for(uint i=0u;i<Threads*K;++i) {
+   float value=scores[i];uint tok=tokens[i];
+   if(value>best || (value==best && tok<best_id)) {best=value;best_id=tok;best_index=i;}
+  }
+  uint out=(row*uint(SHARDS)+shard)*K+rank;
+  ids[out]=best_id;values[out]=best;scores[best_index]=-INFINITY;tokens[best_index]=0xffffffffu;
+ }
+}
+)METAL");
+    static auto merge=mx::fast::metal_kernel("tqllm_dflash_top16_merge", {"ids_in","values_in"}, {"ids"}, R"METAL(
+uint lane=thread_position_in_threadgroup.x;
+uint row=threadgroup_position_in_grid.y;
+constexpr uint K=16u;
+constexpr uint Total=128u;
+threadgroup float scores[Total];
+threadgroup uint tokens[Total];
+if(lane<Total) {scores[lane]=values_in[row*Total+lane];tokens[lane]=ids_in[row*Total+lane];}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if(lane==0u) {
+ for(uint rank=0u;rank<K;++rank) {
+  float best=-INFINITY;uint best_id=0xffffffffu,best_index=0u;
+  for(uint i=0u;i<Total;++i) {
+   float value=scores[i];uint tok=tokens[i];
+   if(value>best || (value==best && tok<best_id)) {best=value;best_id=tok;best_index=i;}
+  }
+  ids[row*K+rank]=best_id;scores[best_index]=-INFINITY;tokens[best_index]=0xffffffffu;
+ }
+}
+)METAL");
+    auto partial=shard({logits}, {{rows,shards*keep},{rows,shards*keep}}, {mx::uint32,mx::float32},
+        {256,uint32_t(rows),uint32_t(shards)}, {256,1,1}, {{"VOCAB",vocab},{"SHARDS",shards}}, std::nullopt, false, mx::Device(mx::Device::gpu));
+    return merge({partial[0],partial[1]}, {{rows,keep}}, {mx::uint32}, {256,uint32_t(rows),1}, {256,1,1}, {}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 mx::array dflash_select(const mx::array& mapped,const mx::array& unary,const mx::array& gate,
     const mx::array& successors,const mx::array& predecessors,uint32_t anchor,int count) {
     if(mapped.shape()!=mx::Shape{8,16} || mapped.dtype()!=mx::uint32 ||
@@ -139,6 +206,23 @@ struct DFlash2::Impl {
         caches.resize(layers);target.feature_layers(features);
     }
     mx::array mat(const std::string& name,const mx::array& x) {
+        static const std::string ablate=std::getenv("TQLLM_MLX_DRAFT_ABLATE")?std::getenv("TQLLM_MLX_DRAFT_ABLATE"):"";
+        if(!ablate.empty() && x.shape(0)<=8) {
+            std::istringstream in(ablate);std::string tag;
+            while(std::getline(in,tag,','))
+                if(!tag.empty() && name.find(tag)!=std::string::npos)
+                    if(auto it=matrices.find(name);it!=matrices.end()) {
+                        int rows=0;
+                        std::visit([&](const auto& w){
+                            using W=std::decay_t<decltype(w)>;
+                            if constexpr(std::is_same_v<W,mx::array>)rows=w.shape(0);
+                            else if constexpr(std::is_same_v<W,Tq3Weights>)rows=w.planes.shape(0);
+                            else if constexpr(std::is_same_v<W,Tq4Weights>)rows=w.codes.shape(0);
+                            else rows=w.blocks.shape(0);
+                        },it->second);
+                        return mx::zeros({x.shape(0),rows},x.dtype());
+                    }
+        }
         if(x.shape(0)<=8)if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end()) {
             if(!rotation || rotation->first.id()!=x.id())rotation=std::pair{x,tq4_rotate(x)};
             return bf(tq_tiled_matmul(found->second,rotation->second,4,true,32,true));
@@ -206,8 +290,10 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto normalized=i.norm("output_norm.weight",x);
     auto logits=i.target.shared_draft_head(normalized);
     const int classes=logits.shape(1);
-    auto order=mx::argpartition(logits,classes-16,-1);
-    auto selected=mx::slice(order,{0,classes-16},{i.block,classes});
+    auto selected=std::getenv("TQLLM_MLX_DFLASH_SHARDED_TOP16")?dflash_top16_sharded(logits):[&] {
+        auto order=mx::argpartition(logits,classes-16,-1);
+        return mx::slice(order,{0,classes-16},{i.block,classes});
+    }();
     auto unary=mx::take_along_axis(logits,selected,-1);
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
     auto gate=i.mat("selector_hidden.weight",normalized);
