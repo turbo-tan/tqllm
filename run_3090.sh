@@ -1,6 +1,6 @@
 #!/bin/bash
 # tqLLM on the idle RTX 3090 (GPU1), port 8086. 262,144 context with q4/q4 KV.
-cd /mnt/data_2t_3/github_repos/tqllm
+cd /mnt/data_2t_3/github_repos/azllm
 M=models/Qwen3.8-27B-TQ3_4S-v2.gguf
 D=models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf
 V=models/mtp-vocab/atx_65536.txt
