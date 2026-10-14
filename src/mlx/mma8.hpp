@@ -14,6 +14,8 @@ struct Mma8Weights {
 };
 Mma8Weights mma8_pack(const Tq4Weights& weights);
 Mma8Weights mma8_pack(const Tq3Weights& weights);
+// Rebuilds the FP16 level table for a stored pack (bits is 3 or 4); words/scales are the flat packed arrays.
+Mma8Weights mma8_from_parts(mlx::core::array words, mlx::core::array scales, int rows, int columns, int bits);
 void mma8_clear_pack_cache();
 // Rotated FP32 activations (1..8 rows) as zero-padded [8, K] FP16, shared by every projection of one input.
 mlx::core::array mma8_input(const mlx::core::array& rotated_input);

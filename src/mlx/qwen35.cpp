@@ -10,6 +10,7 @@
 #include "attention_rows.hpp"
 #include "tq3_tiled.hpp"
 #include "mma8.hpp"
+#include "tq_mlx.hpp"
 #include <mlx/compile.h>
 #include <mlx/graph_utils.h>
 #include <algorithm>
@@ -91,7 +92,8 @@ struct Qwen35::Impl {
     std::map<std::string,Tq3Expanded> decoded_ffn;
     std::map<std::string,TqTiledWeights> tiled_projections;
     std::map<std::string,Mma8Weights> mma8_projections;
-    bool mma8=std::getenv("TQLLM_MLX_MMA8")!=nullptr;
+    bool tqmlx=is_tq_mlx_file(file);
+    bool mma8=tqmlx||std::getenv("TQLLM_MLX_MMA8")!=nullptr;
     bool mma8_untiled_only=std::getenv("TQLLM_MLX_MMA8_UNTILED_ONLY")!=nullptr;
     std::string ablate_blocks=std::getenv("TQLLM_MLX_ABLATE_BLOCKS")?std::getenv("TQLLM_MLX_ABLATE_BLOCKS"):"";
     std::vector<std::string> ablate=[]{
@@ -228,6 +230,13 @@ struct Qwen35::Impl {
         key_indices=mx::array(indices.data(),{vh},mx::uint32);
         if(std::getenv("TQLLM_MLX_NATIVE_GDN"))native_head_order=gdn_head_order(kh,vh);
         auto matrix=[&](const std::string& name) {
+            if(const auto& stored=file.tensors.at(name);is_tq_mlx_type(stored.type)) {
+                auto raw=file.read(stored);
+                auto packed=tq_mlx_load(stored,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()});
+                if(auto* tiled=std::get_if<TqTiledWeights>(&packed))tiled_projections.emplace(name,std::move(*tiled));
+                else mma8_projections.emplace(name,std::move(std::get<Mma8Weights>(packed)));
+                return;
+            }
             auto w=load_matrix(file,name);
             std::visit([](const auto& v) {
                 using T=std::decay_t<decltype(v)>;
@@ -326,6 +335,7 @@ struct Qwen35::Impl {
         }
     }
     bool tiled_active(const std::string& name,const TqTiledWeights& weights,bool& fp32) const {
+        if(tqmlx){fp32=false;return true;}
         const bool mixer_projection=name.find(".ffn_")==std::string::npos;
         fp32=mixer_projection?std::getenv("TQLLM_MLX_TILED_MIXER_FP32")!=nullptr:
             std::getenv(weights.bits==3?"TQLLM_MLX_TILED_TQ3_FP32":"TQLLM_MLX_TILED_TQ4_FP32")!=nullptr;
@@ -378,6 +388,12 @@ struct Qwen35::Impl {
                 bool fp32=false;
                 if(tiled_active(name,found->second,fp32))return bf(tq_tiled_matmul(found->second,rotated(),4,true,32,fp32));
             }
+        if(tqmlx) {
+            if(auto found=tiled_projections.find(name);found!=tiled_projections.end())
+                return bf(tq_mlx_prefill(found->second,rotated()));
+            if(auto found=mma8_projections.find(name);found!=mma8_projections.end())
+                return bf(tq_mlx_prefill(found->second,rotated()));
+        }
         auto it=matrices.find(name);
         if(it==matrices.end())throw std::invalid_argument("matrix has no original weights: "+name);
         const auto& w=it->second;
@@ -849,7 +865,18 @@ mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array
     i.mtp_pos+=n;i.rotation.reset();i.rotation_half.reset();
     return output;
 }
-Qwen35::Qwen35(const std::string& path,int context):impl_(std::make_unique<Impl>(path,context)) {}
+namespace {
+// A tq_mlx file selects the adopted kernel set; explicit environment settings still win.
+bool apply_tq_mlx_defaults(const std::string& path) {
+    if(!is_tq_mlx_file(gguf_open(path)))return false;
+    for(const char* name:{"TQLLM_MLX_GDN_SCAN","TQLLM_MLX_SERIAL_VERIFY_ATTENTION","TQLLM_MLX_SERIAL_VERIFY_DENSE",
+        "TQLLM_MLX_COMPACT_GDN_TAPE","TQLLM_MLX_REUSE_ROTATION","TQLLM_MLX_BATCH_DECODE_DENSE","TQLLM_MLX_Q6_AFFINE",
+        "TQLLM_MLX_ATTN_DECODE_ROWS","TQLLM_MLX_HEAD_FRAG","TQLLM_MLX_MMA8_DRAFT"})
+        setenv(name,"1",0);
+    return true;
+}
+}
+Qwen35::Qwen35(const std::string& path,int context):impl_((apply_tq_mlx_defaults(path),std::make_unique<Impl>(path,context))) {}
 Qwen35::~Qwen35()=default;
 void Qwen35::gdn_mode(GdnMode mode) {
     if(impl_->pos!=0)throw std::invalid_argument("cannot change GDN layout during a session");

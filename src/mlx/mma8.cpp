@@ -123,6 +123,17 @@ Mma8Weights finish_pack(const mx::array& nibbles, mx::array scales, const mx::ar
 }
 }
 
+Mma8Weights mma8_from_parts(mx::array words, mx::array scales, int rows, int columns, int bits) {
+    if ((bits != 3 && bits != 4) || rows <= 0 || columns <= 0 || columns % 128)
+        throw std::invalid_argument("invalid stored MMA8 pack");
+    const int rp = (rows + 63) / 64 * 64;
+    if (words.dtype() != mx::uint32 || words.size() != size_t(rp) * columns / 8 ||
+        scales.dtype() != mx::float16 || scales.size() != size_t(rp) * (columns / 128))
+        throw std::invalid_argument("stored MMA8 pack has the wrong sizes");
+    static const mx::array lut4 = level_table(L4, 7, 8), lut3 = level_table(L3, 3, 4);
+    return {words, scales, bits == 4 ? lut4 : lut3, rows, rp, columns};
+}
+
 Mma8Weights mma8_pack(const Tq4Weights& w) {
     if (!w.integer_levels || w.codes.ndim() != 2 || w.codes.dtype() != mx::uint8 || w.scales.dtype() != mx::float16 ||
         w.codes.shape(1) % 64 || w.scales.shape() != mx::Shape{w.codes.shape(0), w.codes.shape(1) / 64})
