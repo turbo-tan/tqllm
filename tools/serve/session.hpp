@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -559,12 +560,67 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// llama.cpp `print_timing` console stats: a pulse every ~3 s while a request generates and one block
+// per finished request. Silence with TQLLM_LOG_TIMINGS=0.
+inline bool log_timings() {
+    static const bool on = [] {
+        const char * e = std::getenv("TQLLM_LOG_TIMINGS");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+inline std::mutex & log_mutex() {
+    static std::mutex m;
+    return m;
+}
+// one block per request, in llama.cpp print_timing shape: prefill / decode / total, then spec acceptance
+inline void print_timing(const DecodeResult & r, uint64_t steps) {
+    if (!log_timings() || !r.error.empty() || (r.prompt_tokens == 0 && r.completion_tokens == 0)) return;
+    char buf[640];
+    const int n = std::snprintf(buf, sizeof buf,
+        "tqserve: prompt eval time = %9.2f ms / %6u tokens (%7.2f ms per token, %8.2f tokens per second)\n"
+        "tqserve:         eval time = %9.2f ms / %6u tokens (%7.2f ms per token, %8.2f tokens per second)\n"
+        "tqserve:        total time = %9.2f ms / %6u tokens\n",
+        r.prefill_ms, r.prompt_tokens, r.prompt_tokens ? r.prefill_ms / r.prompt_tokens : 0.0,
+        r.prefill_ms > 0 ? r.prompt_tokens * 1000.0 / r.prefill_ms : 0.0,
+        r.decode_ms, r.completion_tokens, r.completion_tokens ? r.decode_ms / r.completion_tokens : 0.0,
+        r.decode_ms > 0 ? r.completion_tokens * 1000.0 / r.decode_ms : 0.0,
+        r.prefill_ms + r.decode_ms, r.prompt_tokens + r.completion_tokens);
+    if (r.draft_n > 0 && n > 0 && size_t(n) < sizeof buf)
+        std::snprintf(buf + n, sizeof buf - size_t(n),
+            "tqserve:  draft acceptance = %7.5f (%6llu accepted / %6llu drafted), mean len = %5.2f\n",
+            double(r.draft_accepted) / double(r.draft_n), (unsigned long long)r.draft_accepted,
+            (unsigned long long)r.draft_n, steps ? double(r.completion_tokens) / double(steps) : 0.0);
+    const std::lock_guard<std::mutex> lock(log_mutex());
+    std::cerr << buf;
+}
+// the periodic line: tokens so far, average rate since generation began, rate over the last interval
+struct TimingPulse {
+    void step(uint64_t n_gen) {
+        if (!log_timings() || n_gen <= last_n_) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double el = std::chrono::duration<double>(now - last_).count();
+        if (el < 3.0) return;
+        const double since = std::chrono::duration<double>(now - t0_).count();
+        char buf[192];
+        std::snprintf(buf, sizeof buf, "tqserve: n_gen = %6llu, tg = %6.2f t/s, tg_3s = %6.2f t/s\n",
+                      (unsigned long long)n_gen, since > 0 ? double(n_gen) / since : 0.0,
+                      double(n_gen - last_n_) / el);
+        const std::lock_guard<std::mutex> lock(log_mutex());
+        std::cerr << buf;
+        last_ = now; last_n_ = n_gen;
+    }
+    std::chrono::steady_clock::time_point t0_ = std::chrono::steady_clock::now(), last_ = t0_;
+    uint64_t last_n_ = 0;
+};
+
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
 inline void set_timings(DecodeResult & r, const uint64_t * st) {
     r.draft_n = st[1];
     r.draft_accepted = st[2];
     r.decode_ms = double(st[3]) / 1000.0;
     r.prefill_ms = double(st[4]) / 1000.0;
+    print_timing(r, st[0]);
 }
 
 // Server-wide vision encoder (--mmproj); requests encode under the mutex (the encoder reuses its buffers).
@@ -1041,8 +1097,12 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
     model.spec_begin(prompt, count, draft_length(model.native_mtp()));
     RepeatGuard guard;
+    TimingPulse pulse;
+    uint64_t n_gen = 0;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);
+        n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
+        pulse.step(n_gen);
         if (guard.check(ids) || !on_tokens(ids)) break;
     }
     uint64_t st[5] = {};

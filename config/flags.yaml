@@ -15,6 +15,10 @@ flags:
     kind: debug
     default: "-"
     doc: "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill"
+  - name: TQLLM_LOG_TIMINGS
+    kind: debug
+    default: "on"
+    doc: "0: no llama.cpp-style print_timing lines (per-request prefill / decode / total with draft acceptance, plus the 3 s n_gen pulse)"
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"

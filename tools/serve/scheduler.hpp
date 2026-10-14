@@ -115,11 +115,15 @@ private:
         std::vector<uint32_t> partial;
         uint64_t version = 0;
         RepeatGuard repeat;
+        TimingPulse pulse;   // llama.cpp-style 3 s progress line for this request
+        uint64_t n_gen = 0;
     };
 
     // after a step: the slot's ids go to the stream and through the repeat guard (tripped -> the request ends)
     bool step_done(Job & job, int slot) {
         const auto ids = model_.spec_tokens(slot);
+        job.n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
+        job.pulse.step(job.n_gen);
         const bool tripped = job.repeat.check(ids);
         if (job.stream) publish(job, ids);
         return tripped;
