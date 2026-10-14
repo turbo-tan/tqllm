@@ -7,7 +7,7 @@
   tqllm.py serve           --model FILE.gguf ...   (just the server, until Ctrl+C)
   tqllm.py --list                                  (the model catalog: models.json, local copies marked)
 
---model takes a file, a catalog name (qwen3.8-27b, qwen3.8-27b-s) or nothing (the catalog default for this GPU). Catalog
+--model takes a file, a catalog name (`--list`: qwen3.8-27b, -s, -xs, -l) or nothing (the catalog default for this GPU). Catalog
 files are looked up in ./models, ~/models and $TQLLM_MODELS; missing ones are offered for download from Hugging Face
 (size and sha256 checked), --yes downloads without asking.
 

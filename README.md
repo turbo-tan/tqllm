@@ -80,6 +80,32 @@ curl http://localhost:8086/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Explain a hash map."}],"temperature":0,"max_tokens":128}'
 ```
 
+## tqllm launch: a coding agent on your own GPU
+
+`tools/launch/tqllm.py` starts a local server and runs a coding agent against it, like `ollama launch`. It needs
+Python 3, Docker with the NVIDIA Container Toolkit (or a native `tqserve` build) and the agent itself installed.
+
+```sh
+python3 tools/launch/tqllm.py --list                    # model catalog (local copies are marked)
+python3 tools/launch/tqllm.py launch opencode           # the default model for this GPU, downloaded if missing
+python3 tools/launch/tqllm.py launch codex --model qwen3.8-27b-xs
+python3 tools/launch/tqllm.py launch claude --model models/Qwen3.8-27B-TQ_S.gguf \
+  --drafter models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf --draft-vocab models/mtp-vocab/atx_65536.txt
+python3 tools/launch/tqllm.py serve --model qwen3.8-27b  # just the server, until Ctrl+C
+```
+
+- **Agents:** `opencode`, `codex` and `claude` (Claude Code, through a built-in Anthropic Messages to OpenAI bridge).
+  Arguments after `--` go to the agent, e.g. `launch opencode -- run "fix the failing test"`.
+- **Models:** `--model` takes a GGUF file, a catalog name from `tools/launch/models.json`, or nothing (the default
+  for the GPU's memory). Catalog files are looked up in `./models`, `~/models` and `$TQLLM_MODELS`; missing ones are
+  offered for download from Hugging Face with a size and sha256 check (`--yes` skips the question).
+- **Server:** the Docker image by default, or `--native build/tqserve`. Context defaults to 65536 because agent
+  prompts are long; `--context`, `--port`, `--reasoning` and `--server-arg` (repeatable) pass through. A server already
+  answering on the port is reused and left running; one the command started is stopped when the agent exits or the
+  command gets Ctrl+C / SIGTERM.
+- The agents' own configuration files are never written; each gets its provider through its environment or command
+  line.
+
 ## TQ formats: TQ3_4S, TQ3 and TQ4
 
 All three rotate the weights before quantising (the TurboQuant idea: a rotation spreads outliers so a small codebook fits

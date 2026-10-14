@@ -301,6 +301,7 @@ if(BUILD_TESTING)
   add_test(NAME docker_entrypoint COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_docker_entrypoint.py)
   add_test(NAME dockerfile_licenses COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_dockerfile_licenses.py)
   add_test(NAME no_private_breadcrumbs COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_no_private_paths.py)
+  add_test(NAME launch_catalog COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_catalog.py)
   add_test(NAME flags_registry COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_flags.py --check)
   # Host-only gates for the MoE work. Both are plain C++ (no CUDA, no GPU, no model), so they
   # build and run regardless of TQLLM_CUDA. Sources are compiled directly into the test so they
