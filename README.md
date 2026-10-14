@@ -5,16 +5,16 @@
   </picture>
 </p>
 
-# TQLLM
+# tqLLM
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000)
 
 C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
-with an OpenAI-compatible HTTP server. TQLLM is in beta.
+with an OpenAI-compatible HTTP server. tqLLM is in beta.
 
 ## Credits
 
-TQLLM re-implements ideas from the work below (no code unless listed in NOTICE). Reference = their idea, method or
+tqLLM re-implements ideas from the work below (no code unless listed in NOTICE). Reference = their idea, method or
 weights; improvement = their idea, extended or re-implemented by us.
 
 | Piece | Credit |
@@ -113,20 +113,20 @@ every block), then store codes plus scales. They differ in block size, scales an
 
 | Format | Block | Scales | Bits per weight | Runs in |
 |---|---|---|---:|---|
-| TQ3_4S (GGUF type 46) | 32 weights, 32-point rotation, 8-level code | four 8-bit scales (one per 8 weights) | 4.0 | TQLLM and [llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3) |
-| TQ3 (type 301) | 128 weights, 128-point rotation, 8-level code | one FP16 scale per 128 | 3.125 | TQLLM only |
-| TQ4 (type 300) | 128 weights, 128-point rotation, 16-level code | one FP16 scale per 128 | 4.125 | TQLLM only |
+| TQ3_4S (GGUF type 46) | 32 weights, 32-point rotation, 8-level code | four 8-bit scales (one per 8 weights) | 4.0 | tqLLM and [llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3) |
+| TQ3 (type 301) | 128 weights, 128-point rotation, 8-level code | one FP16 scale per 128 | 3.125 | tqLLM only |
+| TQ4 (type 300) | 128 weights, 128-point rotation, 16-level code | one FP16 scale per 128 | 4.125 | tqLLM only |
 
 TQ3_4S spends a quarter of its bits on scales; TQ3 and TQ4 rotate over a 4x longer block, so one scale per 128 weights
 is enough and the bits go into the codes instead. That is how the 27B fits in 11.85 GB as TQ3 (TQ_XS) against 14.5 GB as
 TQ3_4S-v2, and why TQ4 at about the same size as TQ3_4S is much closer to the original (KLD vs BF16 0.022 for TQ4_L).
 The release files `Qwen3.8-27B-TQ_XS.gguf` (11.85 GB), `TQ_S` (12.55 GB) and `TQ4_L` (14.97 GB) are built from these
 formats. Type ids 300
-and 301 are TQLLM's own (above the ggml range), so these files need TQLLM; llama.cpp cannot load them.
+and 301 are tqLLM's own (above the ggml range), so these files need tqLLM; llama.cpp cannot load them.
 
 ## Fast decoding: about 250 tok/s on an RTX 3090
 
-TQLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
+tqLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
 and commits the ones it would have produced itself. Greedy output is identical, token for token, to decoding without
 the drafter: plain decoding and every verify (tree, chain, MTP) share one attention arithmetic, checked by
 `test-tree`, `test-dflash-exact` and `test-native-mtp` and on long prompts up to 51K tokens. Download into `./models`:
@@ -367,7 +367,7 @@ cmake --build build --target tqserve -j4
 
 Use a sufficiently recent CUDA toolkit; CUDA 12.9 was tested on RTX 3090.
 Model downloads are not included. Model weights and bundled third-party source
-retain their own licenses. TQLLM itself is licensed under Apache-2.0 (see LICENSE and NOTICE).
+retain their own licenses. tqLLM itself is licensed under Apache-2.0 (see LICENSE and NOTICE).
 
 ### Request sampling numbers
 
