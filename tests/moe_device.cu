@@ -629,8 +629,49 @@ static void cache_test(unsigned type) {
     std::printf("GGUF %2u (%s) host-expert cache, 40 steps, %d fills into %d slots: bit-identical\n", sp.type, sp.name, fills, slots);
 }
 
+// decode with the shared expert fused: ids widened to k + 1 per token (hot / cold maps, shared slot last) and the strided
+// sum over [routed k | shared] rows == moe_sum with the shared rows apart, bit-identical
+static void fused_shared_test() {
+    const int e = 10, k = 3, n = 4, h = 64, extra = 7;
+    std::mt19937 gen(401);
+    std::vector<int> ids(n * k), hs(e), cs(e);
+    for (int i = 0; i < e; ++i) hs[i] = i % 2 ? -1 : i / 2, cs[i] = i % 2 ? i / 2 : -1;
+    for (auto & v : ids) v = int(gen() % e);
+    Device<int> di(ids.size()), dh(e), dc(e), oh(n * (k + 1)), oc(n * (k + 1)), op(n * (k + 1));
+    di.put(ids); dh.put(hs); dc.put(cs);
+    tqllm_cuda::moe_extend_ids(di.p, dh.p, dc.p, oh.p, oc.p, k, n, extra, nullptr);
+    tqllm_cuda::moe_extend_ids(di.p, nullptr, nullptr, op.p, nullptr, k, n, extra, nullptr);
+    const auto a = oh.get(n * (k + 1)), b = oc.get(n * (k + 1)), c = op.get(n * (k + 1));
+    for (int t = 0; t < n; ++t)
+        for (int s2 = 0; s2 <= k; ++s2) {
+            const int i = t * (k + 1) + s2, id = s2 < k ? ids[t * k + s2] : -1;
+            require(a[i] == (s2 < k ? hs[id] : extra) && b[i] == (s2 < k ? cs[id] : -1) && c[i] == (s2 < k ? id : extra),
+                    "moe_extend_ids: wrong mapping");
+        }
+    std::vector<__nv_bfloat16> rt(n * (k + 1) * h), sep(n * k * h), sh(n * h);
+    std::vector<float> w(n * k), sw(n);
+    for (auto & v : w) v = float(gen() % 1000) / 997.f;
+    for (auto & v : sw) v = float(gen() % 1000) / 991.f;
+    for (int t = 0; t < n; ++t)
+        for (int s2 = 0; s2 <= k; ++s2)
+            for (int j = 0; j < h; ++j) {
+                const auto v = __float2bfloat16(float(int(gen() % 2001) - 1000) / 333.f);
+                rt[(t * (k + 1) + s2) * h + j] = v;
+                if (s2 < k) sep[(t * k + s2) * h + j] = v; else sh[t * h + j] = v;
+            }
+    Device<__nv_bfloat16> drt(rt.size()), dsep(sep.size()), dsh(sh.size()), o1(n * h), o2(n * h);
+    Device<float> dw(w.size()), dsw(sw.size());
+    drt.put(rt); dsep.put(sep); dsh.put(sh); dw.put(w); dsw.put(sw);
+    tqllm_cuda::moe_sum(dsep.p, dsh.p, dw.p, dsw.p, o1.p, h, k, n, nullptr);
+    tqllm_cuda::moe_sum_strided(drt.p, k + 1, drt.p + size_t(k) * h, (k + 1) * h, dw.p, dsw.p, o2.p, h, k, n, nullptr);
+    const auto y1 = o1.get(n * h), y2 = o2.get(n * h);
+    require(std::memcmp(y1.data(), y2.data(), y1.size() * 2) == 0, "moe_sum_strided differs from moe_sum");
+    std::printf("fused shared expert: widened ids and strided sum == moe_sum, bit-identical\n");
+}
+
 int main() {
     try {
+        fused_shared_test();
         route_test();
         // Decode (grouped matvec) and prefill (grouped GEMM) for every format with grouped-expert
         // support -- not just the three that were wired first.

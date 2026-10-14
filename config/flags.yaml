@@ -3,6 +3,10 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_MOE_FUSE_SHARED
+    kind: debug
+    default: "on"
+    doc: "0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches"
   - name: TQLLM_MOE_STAGE
     kind: debug
     default: "on"

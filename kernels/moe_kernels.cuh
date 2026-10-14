@@ -48,4 +48,11 @@ void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * a
                 int count, cudaStream_t);
 void moe_sum(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared, const float * weights,
              const float * shared_weights, __nv_bfloat16 * out, int hidden, int topk, int n, cudaStream_t);
+// decode with the shared expert fused as assignment k of every token: out[t * (k + 1) + s] = s < k ? map(ids[t * k + s])
+// : extra (map = hot_slot when given, else the id); cold_out[...] = cold_slot[id] for s < k, -1 for the shared slot
+void moe_extend_ids(const int * ids, const int * hot_slot, const int * cold_slot, int * out, int * cold_out, int k, int n,
+                    int extra, cudaStream_t stream);
+// moe_sum with `slots` routed rows per token (the first topk weighted) and the shared rows `shared_ld` elements apart
+void moe_sum_strided(const __nv_bfloat16 * routed, int slots, const __nv_bfloat16 * shared, int shared_ld, const float * weights,
+                     const float * shared_weights, __nv_bfloat16 * out, int hidden, int topk, int n, cudaStream_t);
 }  // namespace tqllm_cuda

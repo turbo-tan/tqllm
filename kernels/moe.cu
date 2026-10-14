@@ -182,6 +182,32 @@ __global__ void swiglu_k(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, _
     }
 }
 
+__global__ void sum_strided_k(const __nv_bfloat16 * routed, int slots, const __nv_bfloat16 * shared, int shared_ld,
+                              const float * weights, const float * shared_weights, __nv_bfloat16 * out, int h, int k, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const int token = i / h, j = i % h;
+        float sum = 0.f;
+        for (int s = 0; s < k; ++s)
+            sum += weights[int64_t(token) * k + s] * __bfloat162float(routed[(int64_t(token) * slots + s) * h + j]);
+        sum += shared_weights[token] * __bfloat162float(shared[int64_t(token) * shared_ld + j]);
+        out[i] = __float2bfloat16_rn(sum);
+    }
+}
+__global__ void extend_ids_k(const int * ids, const int * hot_slot, const int * cold_slot, int * out, int * cold_out, int k, int count,
+                             int extra) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int t = i / (k + 1), s = i % (k + 1);
+    if (s == k) {
+        out[i] = extra;
+        if (cold_out) cold_out[i] = -1;
+        return;
+    }
+    const int e = ids[t * k + s];
+    out[i] = hot_slot ? hot_slot[e] : e;
+    if (cold_out) cold_out[i] = cold_slot[e];
+}
 __global__ void sum_k(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared, const float * weights,
                       const float * shared_weights, __nv_bfloat16 * out, int h, int k, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -331,6 +357,18 @@ void moe_cache_fill(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, con
     }
     const int bx = int(std::min<long long>(64, (most / 16 + 1023) / 1024));
     cache_fill_k<<<dim3(unsigned(std::max(1, bx)), unsigned(count), unsigned(nspans)), 256, 0, stream>>>(a, fill_src, slot_ids);
+}
+void moe_extend_ids(const int * ids, const int * hot_slot, const int * cold_slot, int * out, int * cold_out, int k, int n,
+                    int extra, cudaStream_t stream) {
+    if (k <= 0 || n <= 0 || (cold_out && !cold_slot)) throw std::invalid_argument("moe_extend_ids: invalid shape");
+    const int count = n * (k + 1);
+    extend_ids_k<<<(count + 255) / 256, 256, 0, stream>>>(ids, hot_slot, cold_slot, out, cold_out, k, count, extra);
+}
+void moe_sum_strided(const __nv_bfloat16 * routed, int slots, const __nv_bfloat16 * shared, int shared_ld, const float * weights,
+                     const float * shared_weights, __nv_bfloat16 * out, int hidden, int topk, int n, cudaStream_t stream) {
+    const int count = hidden * n;
+    sum_strided_k<<<(count + 255) / 256, 256, 0, stream>>>(routed, slots, shared, shared_ld, weights, shared_weights, out, hidden,
+                                                           topk, count);
 }
 void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * act, int count, cudaStream_t stream) {
     swiglu_k<<<(count + 255) / 256, 256, 0, stream>>>(gate, up, act, count);

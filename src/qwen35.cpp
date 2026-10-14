@@ -193,6 +193,7 @@ struct Layer {
     Mat w_ba;  // W4A16: [b|a] kept BF16 (w_mix = [qkv|z] u4h), interleaved into the mix rows after the matmuls
     // qwen35moe: router [E][H]; routed experts stacked per projection (expert e = rows [e*ff, (e+1)*ff)); shared expert
     Mat ex_gate, ex_up, ex_down, sh_gu, sh_down;
+    int sh_slot = -1;  // decode: the shared expert's index in ex_gate / ex_up / ex_down (-1: dense shared path)
     // --moe-host-mb: cx_* hold this layer's least-routed experts in pinned host memory and ex_* the rest (VRAM);
     // hot_slot / cold_slot [E] map an expert to its row block in either set (-1 in the other)
     Mat cx_gate, cx_up, cx_down;
@@ -933,15 +934,20 @@ private:
 
     // 3-D MoE expert tensor [cols, rows, E] loaded as ONE stacked matrix of E * rows rows (the expert index is the outermost
     // dimension, so expert e is the contiguous row range [e * rows, (e + 1) * rows)); expert_rows() views one expert.
+    // `extra`: a 2-D tensor of the same type and expert shape appended as expert `experts` (the fused shared expert)
     Mat g_exps(const GgufFile & f, const std::string & name, int experts, int rows, int cols,
-               bool to_host = false) {
+               bool to_host = false, const std::string & extra = {}) {
         const auto & t = gt(f, name);
         if (t.ne.size() != 3 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(rows) || t.ne[2] != uint64_t(experts))
             throw std::runtime_error("unexpected expert tensor shape for " + name);
         const auto * wf = weight_format(t.type);
         if (!wf) throw std::runtime_error("no weight format for expert tensor type " + std::to_string(t.type) + " (" + name + ")");
-        const auto host = f.read(t);
-        Mat m = adopt(wf->load(host, experts * rows, cols, to_host ? host_uploader() : uploader(), stream));
+        auto host = f.read(t);
+        if (!extra.empty()) {
+            const auto x = f.read(gt(f, extra));
+            host.insert(host.end(), x.begin(), x.end());
+        }
+        Mat m = adopt(wf->load(host, (experts + !extra.empty()) * rows, cols, to_host ? host_uploader() : uploader(), stream));
         if (!m.fmt || !m.fmt->has_expert_matvec())
             throw std::runtime_error(name + ": its device format has no grouped expert projection");
         return m;
@@ -949,7 +955,7 @@ private:
     // g_exps with the experts flagged in `cold` loaded into pinned host memory (UVA) and the others into VRAM, each set
     // stacked in expert order; returns {hot, cold}
     std::pair<Mat, Mat> g_exps_split(const GgufFile & f, const std::string & name, int experts, int rows, int cols,
-                                     const std::vector<char> & cold) {
+                                     const std::vector<char> & cold, const std::string & extra = {}) {
         const auto & t = gt(f, name);
         if (t.ne.size() != 3 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(rows) || t.ne[2] != uint64_t(experts))
             throw std::runtime_error("unexpected expert tensor shape for " + name);
@@ -962,7 +968,11 @@ private:
             auto & dst = cold[size_t(e)] ? cb : hb;
             dst.insert(dst.end(), host.begin() + long(size_t(e) * eb), host.begin() + long(size_t(e + 1) * eb));
         }
-        const int nc = int(cb.size() / eb), nh = experts - nc;
+        if (!extra.empty()) {
+            const auto x = f.read(gt(f, extra));
+            hb.insert(hb.end(), x.begin(), x.end());
+        }
+        const int nc = int(cb.size() / eb), nh = experts - nc + !extra.empty();
         Mat hot = adopt(wf->load(hb, nh * rows, cols, uploader(), stream));
         Mat cm = adopt(wf->load(cb, nc * rows, cols, host_uploader(), stream));
         for (const Mat * m : {&hot, &cm})
@@ -1123,20 +1133,35 @@ private:
                 L.router = g_f32(f, p + "ffn_gate_inp.weight", uint64_t(E) * H);
                 const auto & cold = cold_of[l];
                 const int nc = int(std::count(cold.begin(), cold.end(), char(1)));
-                if (nc == 0 || nc == E || int(l) < opt.n_cpu_moe) {
-                    const bool host = nc == E || int(l) < opt.n_cpu_moe;
-                    L.ex_gate = g_exps(f, p + "ffn_gate_exps.weight", E, FE, H, host);
-                    L.ex_up = g_exps(f, p + "ffn_up_exps.weight", E, FE, H, host);
-                    L.ex_down = g_exps(f, p + "ffn_down_exps.weight", E, H, FE, host);
+                const bool host = nc == E || int(l) < opt.n_cpu_moe;
+                // the shared expert joins the VRAM experts for decode when its matrices have the experts' type and shape
+                // (TQLLM_MOE_FUSE_SHARED=0: off); prefill keeps its dense path
+                auto same = [&](const char * sh, const char * ex, int rows, int cols) {
+                    if (!f.tensors.count(p + sh)) return false;
+                    const auto & a = gt(f, p + sh);
+                    const auto & b = gt(f, p + ex);
+                    return a.type == b.type && a.ne.size() == 2 && a.ne[0] == uint64_t(cols) && a.ne[1] == uint64_t(rows) && FS == FE;
+                };
+                const char * fz = std::getenv("TQLLM_MOE_FUSE_SHARED");
+                const bool fuse = !host && !(fz && fz[0] == '0') && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
+                                  same("ffn_up_shexp.weight", "ffn_up_exps.weight", FE, H) &&
+                                  same("ffn_down_shexp.weight", "ffn_down_exps.weight", H, FE);
+                auto x = [&](const char * sh) { return fuse ? p + sh : std::string(); };
+                if (nc == 0 || host) {
+                    L.ex_gate = g_exps(f, p + "ffn_gate_exps.weight", E, FE, H, host, x("ffn_gate_shexp.weight"));
+                    L.ex_up = g_exps(f, p + "ffn_up_exps.weight", E, FE, H, host, x("ffn_up_shexp.weight"));
+                    L.ex_down = g_exps(f, p + "ffn_down_exps.weight", E, H, FE, host, x("ffn_down_shexp.weight"));
+                    if (fuse) L.sh_slot = E;
                 } else {
-                    std::tie(L.ex_gate, L.cx_gate) = g_exps_split(f, p + "ffn_gate_exps.weight", E, FE, H, cold);
-                    std::tie(L.ex_up, L.cx_up) = g_exps_split(f, p + "ffn_up_exps.weight", E, FE, H, cold);
-                    std::tie(L.ex_down, L.cx_down) = g_exps_split(f, p + "ffn_down_exps.weight", E, H, FE, cold);
+                    std::tie(L.ex_gate, L.cx_gate) = g_exps_split(f, p + "ffn_gate_exps.weight", E, FE, H, cold, x("ffn_gate_shexp.weight"));
+                    std::tie(L.ex_up, L.cx_up) = g_exps_split(f, p + "ffn_up_exps.weight", E, FE, H, cold, x("ffn_up_shexp.weight"));
+                    std::tie(L.ex_down, L.cx_down) = g_exps_split(f, p + "ffn_down_exps.weight", E, H, FE, cold, x("ffn_down_shexp.weight"));
                     std::vector<int> hs(size_t(E), -1), cs(size_t(E), -1);
                     for (int e = 0; e < E; ++e) {
                         if (cold[size_t(e)]) cs[size_t(e)] = L.n_cold++;
                         else hs[size_t(e)] = L.n_hot++;
                     }
+                    if (fuse) L.sh_slot = L.n_hot;  // after the hot routed experts
                     L.hot_slot = static_cast<const int *>(put(hs.data(), hs.size() * sizeof(int)));
                     L.cold_slot = static_cast<const int *>(put(cs.data(), cs.size() * sizeof(int)));
                 }
@@ -1392,8 +1417,9 @@ private:
             moe_ids = Buf(NBUF * K * sizeof(int));
             moe_counts = Buf(cfg.expert_count * sizeof(int));
             moe_groups = Buf(NBUF * cfg.expert_count * sizeof(int));
+            moe_xids = Buf(NBUF * (K + 1) * sizeof(int));
             if (opt.moe_host_mb > 0) {
-                moe_hot_ids = Buf(NBUF * K * sizeof(int)); moe_cold_ids = Buf(NBUF * K * sizeof(int));
+                moe_hot_ids = Buf(NBUF * (K + 1) * sizeof(int)); moe_cold_ids = Buf(NBUF * (K + 1) * sizeof(int));
                 moe_counts2 = Buf(cfg.expert_count * sizeof(int)); moe_groups2 = Buf(NBUF * cfg.expert_count * sizeof(int));
                 alloc_moe_stage();
                 alloc_moe_cache();
@@ -1404,10 +1430,10 @@ private:
             }
             moe_weights = Buf(NBUF * K * 4);
             moe_shared_weights = Buf(NBUF * 4);
-            moe_gate = Buf(NBUF * K * FE * 2);
-            moe_up = Buf(NBUF * K * FE * 2);
-            moe_act = Buf(NBUF * K * FE * 2);
-            moe_out = Buf(NBUF * K * H * 2);
+            moe_gate = Buf(NBUF * (K + 1) * FE * 2);
+            moe_up = Buf(NBUF * (K + 1) * FE * 2);
+            moe_act = Buf(NBUF * (K + 1) * FE * 2);
+            moe_out = Buf(NBUF * (K + 1) * H * 2);
             moe_shared = Buf(NBUF * H * 2);
         }
         v_xf = Buf(NBUF * H * 4);
@@ -1607,6 +1633,7 @@ private:
     Buf moe_counts, moe_groups;
     Buf moe_logits, moe_ids, moe_weights, moe_shared_weights, moe_gate, moe_up, moe_act, moe_out, moe_shared;
     Buf moe_hot_ids, moe_cold_ids, moe_counts2, moe_groups2;  // --moe-host-mb split
+    Buf moe_xids;  // decode ids widened by the fused shared expert (no split)
     // --moe-host-mb decode: routed cold experts copied to the device (gate, up, down; weights and scales) before their
     // projections, stage_slots assignments at most; empty when a format's per-expert bytes are not 16-byte multiples
     Buf moe_stage_buf[tqllm_cuda::kMoeStageSpans], moe_stage_ids;
@@ -1693,7 +1720,7 @@ private:
             }
         }
         if (!most[0]) return;
-        moe_stage_slots = 2 * int(cfg.expert_used);
+        moe_stage_slots = 2 * (int(cfg.expert_used) + 1);  // two tokens, routed + fused shared expert
         size_t total = 0;
         for (int i = 0; i < tqllm_cuda::kMoeStageSpans; ++i)
             if (most[i]) { moe_stage_buf[i] = Buf(size_t(most[i]) * moe_stage_slots); total += size_t(most[i]) * moe_stage_slots; }
@@ -2393,23 +2420,35 @@ public:
                 if (li + 1 == long(cfg.layers)) moe_profile_write();
             }
             const bool split = L.n_cold > 0;
-            if (split) tqllm_cuda::moe_split_ids(moe_ids.as<int>(), L.hot_slot, L.cold_slot, moe_hot_ids.as<int>(),
-                                                 moe_cold_ids.as<int>(), n * K, stream);
             const bool grouped_gemm = n > NVER && segs.empty() && !wide_mm;
+            // decode: the shared expert rides the routed launches as assignment K of every token (appended to the hot
+            // experts at load; same rows and kernels as its dense matvec), ids widened to K + 1 per token
+            const bool fuse = L.sh_slot >= 0 && !grouped_gemm;
+            const int KV = fuse ? K + 1 : K;
+            const int * IDS = moe_ids.as<int>();
+            if (fuse) {
+                tqllm_cuda::moe_extend_ids(moe_ids.as<int>(), split ? L.hot_slot : nullptr, split ? L.cold_slot : nullptr,
+                                           split ? moe_hot_ids.as<int>() : moe_xids.as<int>(), split ? moe_cold_ids.as<int>() : nullptr,
+                                           K, n, L.sh_slot, stream);
+                if (!split) IDS = moe_xids.as<int>();
+            } else if (split) {
+                tqllm_cuda::moe_split_ids(moe_ids.as<int>(), L.hot_slot, L.cold_slot, moe_hot_ids.as<int>(), moe_cold_ids.as<int>(),
+                                          n * K, stream);
+            }
             if (grouped_gemm && !split)
-                tqllm_cuda::moe_group(moe_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), E, n, K, stream);
+                tqllm_cuda::moe_group(moe_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), E, n, KV, stream);
             if (grouped_gemm && split) {
-                tqllm_cuda::moe_group(moe_hot_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), L.n_hot, n, K, stream);
-                tqllm_cuda::moe_group(moe_cold_ids.as<int>(), moe_counts2.as<int>(), moe_groups2.as<int>(), L.n_cold, n, K, stream);
+                tqllm_cuda::moe_group(moe_hot_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), L.n_hot, n, KV, stream);
+                tqllm_cuda::moe_group(moe_cold_ids.as<int>(), moe_counts2.as<int>(), moe_groups2.as<int>(), L.n_cold, n, KV, stream);
             }
             auto one = [&](const Mat & mat, const int * ids, int experts, const Buf & counts, const Buf & groups,
                            const __half * input, bf16 * output, int rows, bool per_expert) {
                 if (grouped_gemm && mat.fmt->expert_gemm(mat, input, output, rows, counts.as<int>(),
                                                         groups.as<int>(), n, experts, K, per_expert, stream)) return;
-                mat.fmt->expert_matvec(mat, input, output, rows, ids, n, K, per_expert, stream);
+                mat.fmt->expert_matvec(mat, input, output, rows, ids, n, KV, per_expert, stream);
             };
             auto project = [&](const Mat & mat, const Mat & cold, const __half * input, bf16 * output, int rows, bool per_expert) {
-                if (!split) { one(mat, moe_ids.as<int>(), E, moe_counts, moe_groups, input, output, rows, per_expert); return; }
+                if (!split) { one(mat, IDS, E, moe_counts, moe_groups, input, output, rows, per_expert); return; }
                 one(mat, moe_hot_ids.as<int>(), L.n_hot, moe_counts, moe_groups, input, output, rows, per_expert);
                 one(cold, moe_cold_ids.as<int>(), L.n_cold, moe_counts2, moe_groups2, input, output, rows, per_expert);
             };
@@ -2430,9 +2469,9 @@ public:
                 Mat sg = L.cx_gate, su = L.cx_up, sd = L.cx_down;
                 const int * cids = moe_cold_ids.as<int>();
                 const int pool = moe_cache_of.empty() ? -1 : moe_cache_of[size_t(&L - layer.data())];
-                if (pool >= 0 && n * K <= moe_stage_slots) {  // cached: copy only the misses, read from the cache slots
+                if (pool >= 0 && n * KV <= moe_stage_slots) {  // cached: copy only the misses, read from the cache slots
                     auto & c = moe_cache[size_t(pool)];
-                    tqllm_cuda::moe_cache_lookup(moe_cold_ids.as<int>(), n * K, moe_cold_base[size_t(&L - layer.data())],
+                    tqllm_cuda::moe_cache_lookup(moe_cold_ids.as<int>(), n * KV, moe_cold_base[size_t(&L - layer.data())],
                                                  moe_cache_table.as<int>(), {c.key.as<int>(), c.ref.as<int>(), c.hand.as<int>(), c.slots},
                                                  moe_cache_slot.as<int>(), moe_cache_fill.as<int>(), moe_side);
                     tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
@@ -2446,9 +2485,9 @@ public:
                         if (m.aux) { sp[ns++] = {m.aux, c.buf[2 * j + 1].p, c.bytes[2 * j + 1]}; m.aux = c.buf[2 * j + 1].p; }
                         m.rows = int(per) * c.slots;
                     }
-                    tqllm_cuda::moe_cache_fill(sp, ns, moe_cache_fill.as<int>(), moe_cache_slot.as<int>(), n * K, moe_side);
+                    tqllm_cuda::moe_cache_fill(sp, ns, moe_cache_fill.as<int>(), moe_cache_slot.as<int>(), n * KV, moe_side);
                     cids = moe_cache_slot.as<int>();
-                } else if (moe_stage_slots && n * K <= moe_stage_slots) {
+                } else if (moe_stage_slots && n * KV <= moe_stage_slots) {
                     tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
                     int ns = 0;
                     Mat * sm[3] = {&sg, &su, &sd};
@@ -2463,36 +2502,41 @@ public:
                         }
                         m.rows = int(per) * moe_stage_slots;
                     }
-                    tqllm_cuda::moe_stage(sp, ns, moe_cold_ids.as<int>(), moe_stage_ids.as<int>(), n * K, moe_side);
+                    tqllm_cuda::moe_stage(sp, ns, moe_cold_ids.as<int>(), moe_stage_ids.as<int>(), n * KV, moe_side);
                     cids = moe_stage_ids.as<int>();
                 }
-                sg.fmt->expert_matvec2(sg, su, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE, cids, n, K, moe_side);
+                sg.fmt->expert_matvec2(sg, su, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE, cids, n, KV, moe_side);
                 L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
-                                              moe_hot_ids.as<int>(), n, K, stream);
+                                              moe_hot_ids.as<int>(), n, KV, stream);
                 join();
-                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * KV * FE, stream);
                 fork();
-                sd.fmt->expert_matvec(sd, moe_act.as<__half>(), moe_out.as<bf16>(), H, cids, n, K, true, moe_side);
-                L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, K,
+                sd.fmt->expert_matvec(sd, moe_act.as<__half>(), moe_out.as<bf16>(), H, cids, n, KV, true, moe_side);
+                L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, KV,
                                              true, stream);
                 join();
             } else if (!grouped_gemm && !split && paired(L.ex_gate, L.ex_up)) {
                 L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
-                                              moe_ids.as<int>(), n, K, stream);
+                                              IDS, n, KV, stream);
             } else {
                 project(L.ex_gate, L.cx_gate, XH, moe_gate.as<bf16>(), FE, false);
                 project(L.ex_up, L.cx_up, XH, moe_up.as<bf16>(), FE, false);
             }
             if (!overlap) {
-                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * KV * FE, stream);
                 project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
             }
-            mm_h(L.sh_gu, T, n);
-            tqllm_cuda::swiglu_multi(T, n, FS, ACT, stream);
-            rot_h(ACT, XH, FS, n);
-            mm_h(L.sh_down, moe_shared.as<bf16>(), n);
-            tqllm_cuda::moe_sum(moe_out.as<bf16>(), moe_shared.as<bf16>(), moe_weights.as<float>(),
-                                moe_shared_weights.as<float>(), X, H, K, n, stream);
+            if (fuse) {
+                tqllm_cuda::moe_sum_strided(moe_out.as<bf16>(), KV, moe_out.as<bf16>() + size_t(K) * H, KV * H, moe_weights.as<float>(),
+                                            moe_shared_weights.as<float>(), X, H, K, n, stream);
+            } else {
+                mm_h(L.sh_gu, T, n);
+                tqllm_cuda::swiglu_multi(T, n, FS, ACT, stream);
+                rot_h(ACT, XH, FS, n);
+                mm_h(L.sh_down, moe_shared.as<bf16>(), n);
+                tqllm_cuda::moe_sum(moe_out.as<bf16>(), moe_shared.as<bf16>(), moe_weights.as<float>(),
+                                    moe_shared_weights.as<float>(), X, H, K, n, stream);
+            }
             tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
             return;
         }
