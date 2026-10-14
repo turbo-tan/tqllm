@@ -2,6 +2,7 @@
 #include "serve/http.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/session.hpp"
+#include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
 #include "src/gguf.hpp"
 #include "src/flags_gen.hpp"
@@ -349,10 +350,19 @@ int main(int argc, char ** argv) {
                 body = "{\"object\":\"list\",\"data\":[{\"id\":";
                 tqserve::jstr(body, name);
                 body += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
-            } else if (request.method == "POST" &&
-                       (request.path == "/v1/chat/completions" || request.path == "/v1/completions")) {
-                const bool chat = request.path == "/v1/chat/completions";
-                auto parsed = tqserve::parse_request(std::string(request.body.begin(), request.body.end()), max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs);
+            } else if (request.method == "POST" && request.path == "/v1/messages/count_tokens") {
+                body = "{\"input_tokens\":" + std::to_string(request.body.size() / 4) + "}";  // estimate (Claude Code asks)
+            } else if (request.method == "POST" && tqserve::api_for_path(request.path) != tqserve::Api::None) {
+                // /v1/responses and /v1/messages are rewritten into a chat-completions request and their answers back
+                const auto api = tqserve::api_for_path(request.path);
+                const bool chat = api != tqserve::Api::Completions;
+                std::string in(request.body.begin(), request.body.end()), adapt_error;
+                if (api == tqserve::Api::Responses) in = tqserve::responses_to_chat(in, adapt_error);
+                else if (api == tqserve::Api::Messages) in = tqserve::messages_to_chat(in, adapt_error);
+                auto parsed = adapt_error.empty()
+                    ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
+                    : tqserve::ChatRequest{};
+                if (!adapt_error.empty()) { parsed.ok = false; parsed.error = adapt_error; }
                 if (parsed.ok && parsed.thinking) {
                     if (!parsed.budget_set) parsed.thinking_budget = thinking_budget;
                     if (!parsed.message_set) parsed.budget_message = budget_message;
@@ -371,7 +381,12 @@ int main(int argc, char ** argv) {
                 } else if (parsed.stream) {
                     send_all(client, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                                      "Connection: close\r\n\r\n");
-                    auto send = [&](const std::string & d) { return send_all(client, d); };
+                    auto raw = [&](const std::string & d) { return send_all(client, d); };
+                    std::unique_ptr<tqserve::ResponsesSse> rsse;
+                    std::unique_ptr<tqserve::MessagesSse> msse;
+                    if (api == tqserve::Api::Responses) { rsse = std::make_unique<tqserve::ResponsesSse>(name, raw); rsse->begin(); }
+                    if (api == tqserve::Api::Messages) { msse = std::make_unique<tqserve::MessagesSse>(name, raw); msse->begin(); }
+                    auto send = [&](const std::string & d) { return rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d); };
                     auto run_stream = [&](const tqserve::ChatRequest & r, tqserve::StreamWriter & w) {
                         auto on_tokens = [&](const std::vector<uint32_t> & ids) { return w.update(ids); };
                         return guarded([&] {
@@ -455,12 +470,16 @@ int main(int argc, char ** argv) {
                     if (!generated.error.empty()) {
                         status = generated.error.rfind(kFailed, 0) == 0 ? 500 : 400;
                         body = tqserve::json_error(generated.error, status == 500 ? "server_error" : "invalid_request_error");
-                    } else body = tqserve::completion_json(name, generated, chat);
+                    } else {
+                        body = tqserve::completion_json(name, generated, chat);
+                        if (api == tqserve::Api::Responses) body = tqserve::chat_to_responses(body, name);
+                        else if (api == tqserve::Api::Messages) body = tqserve::chat_to_messages(body, name);
+                    }
                 }
+                if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
                 const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" ||
-                    request.path == "/v1/models/" + name || request.path == "/v1/chat/completions" ||
-                    request.path == "/v1/completions";
+                    request.path == "/v1/models/" + name || tqserve::api_for_path(request.path) != tqserve::Api::None;
                 status = known_path ? 405 : 404;
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");
             }

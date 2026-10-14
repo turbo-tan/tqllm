@@ -9,16 +9,21 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - MoE: `--moe-cache-mb C` keeps recently used host-memory experts in a VRAM cache, managed on the GPU inside the decode
   graph. On a 16 GB budget, MiniCPM-V 4.7 35B-A3B Q5_K_M goes from 71.9 / 112.5 / 54.9 to 96.2 / 146.3 / 85.9 tok/s
   (RTX 3090 capped to 16 GB; llama.cpp `-ncmoe 19`: 62.6 / 62.8 / 62.8). Output identical.
-- In progress: native OpenAI Responses API (`/v1/responses`) so Codex connects directly; native Anthropic Messages API
-  (`/v1/messages`) for Claude Code.
+- Native OpenAI Responses API (`POST /v1/responses`, streaming and not, with tool calls): Codex CLI connects straight to
+  the server with standard settings (`wire_api = "responses"`, no key). Tested with Codex 0.162.1 on an RTX 3090.
+- Native Anthropic Messages API (`POST /v1/messages`, plus `/v1/messages/count_tokens`): Claude Code connects straight
+  to the server (`ANTHROPIC_BASE_URL`). `tqllm launch codex` / `claude` now point the agent at the server directly.
 
 ### Changed
+- `tqllm launch`: a model given as a file that matches a catalog model also gets that model's DFlash2 drafter, downloaded automatically if missing (`--no-drafter` to opt out).
 - MoE decode runs the shared expert inside the routed expert launches. MiniCPM-V 4.7 35B-A3B on one RTX 3090:
   IQ3_S 207.8 -> 220.1 tok/s, Q5_K_M (2000 MiB experts in host memory) 176.5 -> 187.1 tok/s. Output identical.
 
-### Known issues
-- `tqllm launch codex` fails with Codex CLI 0.16x: Codex now requires the Responses API (`wire_api = "responses"`).
-  Fixed by the native `/v1/responses` above.
+### Fixed
+- `tqllm launch codex` failed with Codex CLI 0.16x, which no longer accepts `wire_api = "chat"`; it now uses the native
+  Responses API.
+- A request without `max_tokens` was cut at 64 tokens; it now gets the server's `--max-tokens` (OpenAI clients such as
+  Codex leave it out).
 
 ## 1.0.0 - 2026-10-14
 

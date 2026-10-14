@@ -132,6 +132,15 @@ void test_jinja_images() {
     check(!bad.ok, "jinja path refuses images outside user messages");
 }
 
+void test_default_max_tokens() {
+    const auto none = tqserve::parse_request(R"({"messages":[{"role":"user","content":"Hi"}]})", 8192, "", true);
+    check(none.ok && none.max_tokens == 8192, "a request without max_tokens gets the server default (--max-tokens)");
+    const auto set = tqserve::parse_request(R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":100})", 8192, "", true);
+    check(set.ok && set.max_tokens == 100, "max_tokens from the request");
+    const auto big = tqserve::parse_request(R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":100000})", 8192, "", true);
+    check(big.ok && big.max_tokens == 8192, "max_tokens capped at the server default");
+}
+
 void test_chat_prompt() {
     const auto off = tqserve::parse_request(
         R"({"messages":[{"role":"user","content":"Hello"}]})", 512,
@@ -245,6 +254,7 @@ int main(int argc, char ** argv) {
     test_split();
     test_reader();
     test_chat_prompt();
+    test_default_max_tokens();
     (void) argc; (void) argv;
     test_jinja_images();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }

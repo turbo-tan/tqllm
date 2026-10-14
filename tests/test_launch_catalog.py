@@ -69,5 +69,44 @@ class LaunchServe(unittest.TestCase):
                 self.fail("the server is still listening after the launcher got SIGTERM")
 
 
+class LaunchDrafter(unittest.TestCase):
+    """A model given as a file that is a catalog model's file gets that model's drafter; downloaded when missing."""
+    def _load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tqllm_launch", os.path.join(LAUNCH, "tqllm.py"))
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+
+    def _args(self, model, **kw):
+        import argparse
+        return argparse.Namespace(model=model, drafter=None, draft_vocab=None, no_drafter=False, yes=False, models_dir=None, **kw)
+
+    def test_file_model_gets_catalog_drafter_downloaded(self):
+        mod = self._load()
+        cat = json.load(open(os.path.join(LAUNCH, "models.json")))
+        name = next(k for k, v in cat["models"].items() if "drafter" in v)
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, os.path.basename(cat["models"][name]["file"]["path"])); open(model, "w").close()
+            got = []
+            def fake_download(entry, dest):
+                p = os.path.join(dest, os.path.basename(entry["path"])); open(p, "w").close(); got.append(entry["path"]); return p
+            mod.download = fake_download
+            os.environ["TQLLM_MODELS"] = os.path.join(d, "dl"); os.makedirs(os.environ["TQLLM_MODELS"])
+            mod.model_dirs = lambda: [os.environ["TQLLM_MODELS"]]
+            a = self._args(model); mod.resolve_model(a)
+            self.assertEqual(a.model, model)
+            self.assertTrue(a.drafter and a.drafter.endswith(os.path.basename(cat["models"][name]["drafter"]["path"])))
+            self.assertTrue(a.draft_vocab)
+            self.assertEqual(len(got), 2)  # drafter + vocab, no prompt (stdin is not a terminal here)
+            b = self._args(model); b.no_drafter = True; mod.resolve_model(b)
+            self.assertIsNone(b.drafter)
+
+    def test_unknown_file_runs_without_drafter(self):
+        mod = self._load()
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "my-own-model.gguf"); open(model, "w").close()
+            a = self._args(model); mod.resolve_model(a)
+            self.assertEqual(a.model, model); self.assertIsNone(a.drafter)
+
+
 if __name__ == "__main__":
     unittest.main()
