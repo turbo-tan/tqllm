@@ -7,10 +7,15 @@
 
 # tqLLM
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000) [![GoFundMe](https://img.shields.io/badge/GoFundMe-support%20TQLLM-00B964?logo=gofundme&logoColor=white)](https://gofund.me/0f79d4274)
 
 C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
 with an OpenAI-compatible HTTP server.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and where new models, weight formats and KV caches plug in, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
 
 ## Credits
 
@@ -32,6 +37,11 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Token-tree verification (our hybrid Gated DeltaNet tree kernels build on it) | SpecInfer, Miao et al. ([arXiv 2305.09781](https://arxiv.org/abs/2305.09781)); [Medusa](https://github.com/FasterDecoding/Medusa), Cai et al.; [EAGLE](https://github.com/SafeAILab/EAGLE), Li et al. |
 | Prompt-lookup drafting (`--lookup`) | Apoorv Saxena, [prompt-lookup-decoding](https://github.com/apoorvumang/prompt-lookup-decoding) |
 | Comparison baselines | [Unsloth](https://huggingface.co/unsloth) UD quants; [HyperQwen](https://github.com/syv-ai/HyperQwen); [ExLlamaV3](https://github.com/turboderp-org/exllamav3), turboderp; [vLLM](https://github.com/vllm-project/vllm); Strata, Niko1221; LocalMaxxing |
+
+### Testers
+
+Thank you to the testers from X who ran tqLLM on their own hardware and reported back: 0x443, Ricky Spanish,
+lackonendes and GandalfOne.
 
 ## Get the image
 
