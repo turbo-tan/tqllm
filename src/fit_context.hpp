@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace tqllm {
 // Largest context (multiple of `align`) that keeps `margin` bytes free, from two loads: ctx_short left free_short
@@ -62,5 +64,37 @@ inline size_t fit_free(bool wsl, size_t driver_free, size_t total, size_t used_b
     const size_t slack = size_t(192) << 20;  // cuBLAS / cuBLASLt workspaces, CUDA graphs, allocator rounding
     const size_t used = used_before + engine_bytes + slack;
     return used >= total ? 0 : total - used;
+}
+// Parallel slots a load can serve: each needs at least min_ctx positions (slot_ctx: the context per slot the load
+// got; a shorter one is re-split over fewer slots) and slot_b bytes of the memory
+// left free after loading (its batched-verify / draft graphs, ~12 MB each), on top of `margin`. Returns np when they fit,
+// else the largest count that does (at least 1: one slot is the plain fit). tqserve refuses to start rather than fail
+// requests mid-run.
+inline uint32_t fit_slots(uint32_t np, uint32_t slot_ctx, uint32_t min_ctx, size_t free_b, size_t margin, size_t slot_b) {
+    if (np <= 1) return np;
+    const uint32_t by_ctx = !min_ctx || slot_ctx >= min_ctx ? np : uint32_t(uint64_t(slot_ctx) * np / min_ctx);
+    uint32_t by_mem = np;
+    if (slot_b) by_mem = free_b <= margin ? 0 : uint32_t(std::min<uint64_t>(np, (free_b - margin) / slot_b));
+    return std::max(1u, std::min({np, by_ctx, by_mem}));
+}
+// What the fit changed that alters results (not just where weights live): a different KV codec, a context below the
+// one asked for, or a different prefill split (buffer tokens, FP16 weight blocks: a long prompt is cut and summed
+// differently: .77 10-13, 1 of 8 answers changed with each). Moving the embeddings, the LM head or KV positions to host memory gives the same answers (.77, 10-13).
+// Empty when the load serves exactly what was asked. Without -fitl on, tqserve refuses such a load.
+struct FitSetting { std::string kv; uint32_t ctx = 0; long ubatch = 0; long gemm_rows = 0; };
+inline std::string fit_result_changes(const FitSetting & asked, const FitSetting & used) {
+    std::string out;
+    auto add = [&](const std::string & s) { out += (out.empty() ? "" : ", ") + s; };
+    if (used.kv != asked.kv) add("KV cache " + used.kv + " (asked " + asked.kv + ")");
+    if (used.ctx < asked.ctx) add("context " + std::to_string(used.ctx) + " per slot (asked " + std::to_string(asked.ctx) + ")");
+    if (used.ubatch != asked.ubatch) add("prefill buffers -ub " + std::to_string(used.ubatch));
+    if (used.gemm_rows != asked.gemm_rows) add("prefill FP16 weight blocks of " + std::to_string(used.gemm_rows) + " rows");
+    return out;
+}
+// F1 give-back: after a load that met the margin, a placement step the fit applied (LM head or embeddings in host
+// memory: slower prefill / decode) is undone when the load left at least min_spare above the margin. Beta tester 3090,
+// 256K (10-13): 4.05 GB free against a 0.77 GB margin with the LM head still in host memory.
+inline bool fit_try_return(size_t free_b, size_t margin, size_t min_spare = size_t(512) << 20) {
+    return margin && free_b > margin && free_b - margin >= min_spare;
 }
 }  // namespace tqllm

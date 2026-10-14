@@ -400,6 +400,7 @@ namespace {
 // graphs; ~0.4 GB measured on a 3090 at 32K). A shortfall or an out-of-memory load applies the next step and reloads:
 // embeddings, then the int8 LM head to host memory, smaller prefill buffers, the turbo3 V cache, prefill weight blocks,
 // then half the context (not below -fitc). Options the user set are left alone; -fit off loads once.
+std::string g_fit_note;  // settings the memory fit chose instead of the defaults (empty: none); Model::fit_note, /health
 std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string & tok, uint32_t ctx, int slots,
                                     EngineOptions opt) {
     // WSL / Windows (WDDM): cudaMemGetInfo reads ~0 near the budget, and 0.30 GB free at 262K ran at full speed with
@@ -410,7 +411,12 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
         std::getline(v, l);
         return l.find("icrosoft") != std::string::npos;
     }();
-    const size_t margin = fit_margin(opt.fit, opt.fit_target_mb, wsl);
+    // parallel slots: each needs --slot-reserve MiB free after loading (its batched-verify / draft graphs); the fit makes
+    // that room first (host placement, KV to host, context), then refuses an --np the memory cannot carry
+    const size_t base_margin = fit_margin(opt.fit, opt.fit_target_mb, wsl);
+    const size_t slot_b = slots > 1 ? size_t(std::max(0L, opt.slot_reserve_mb)) << 20 : 0;
+    const size_t margin = base_margin ? base_margin + size_t(slots) * slot_b : 0;
+    if (wsl) opt.graph_keep_mb = 0;  // the driver reads ~0 near the budget: the graph cache bounds itself by count only
     // in use before loading (CUDA context, desktop, other processes): read while far from the budget, so reliable on WSL too
     size_t free0 = 0, total0 = 0;
     if (cudaMemGetInfo(&free0, &total0) != cudaSuccess) free0 = total0 = 0;
@@ -428,7 +434,37 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                          double(fr) / 1e9);
         return true;
     };
+    const FitSetting asked{opt.kv_format(), ctx, long(opt.ubatch), long(opt.gemm_rows)};
+    auto finish = [&](std::unique_ptr<Engine> en) {
+        if (!en) return en;
+        // the fit may move weights and KV between device and host (same results). Settings that change the arithmetic (KV
+        // codec, context, prefill buffers, weight blocks) are applied automatically and announced (also in /health); an
+        // explicit --kv / -ub / --gemm-rows / --context is never overridden. -fitl off refuses them instead.
+        if (const std::string lossy = fit_result_changes(asked, {opt.kv_format(), en->context(), long(opt.ubatch), long(opt.gemm_rows)});
+            !lossy.empty()) {
+            if (!opt.fit_lossy)
+                throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
+                                         " per slot, KV " + asked.kv + "): it would need " + lossy +
+                                         ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
+            g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
+            std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
+                         g_fit_note.c_str());
+        }
+        if (slots <= 1) return en;
+        size_t fr = 0, tot = 0;
+        if (!measure(fr, tot)) return en;
+        const uint32_t ok = fit_slots(uint32_t(slots), en->context(), opt.fit_min_ctx, fr, base_margin, slot_b);
+        if (ok >= uint32_t(slots)) return en;
+        char msg[512];
+        std::snprintf(msg, sizeof msg,
+                      "--np %d does not fit: %.2f GB free after loading, context %u per slot; each slot needs %u positions "
+                      "(-fitc) and %ld MiB (--slot-reserve) above the %.2f GB margin. Largest that fits: --np %u "
+                      "(or a smaller --context)", slots, double(fr) / 1e9, en->context(), opt.fit_min_ctx, opt.slot_reserve_mb,
+                      double(base_margin) / 1e9, ok);
+        throw std::runtime_error(msg);
+    };
     const bool user_pf = opt.ubatch != 0, user_kv = opt.kv_format() != "bf16";
+    const bool user_head = opt.head_host, user_embed = opt.embed_host;  // asked for: never given back
     const size_t floor_b = size_t(256) << 20;
     const bool host_auto = opt.kv_host < 0;
     int host_tries = 0;         // KV-to-host steps applied so far
@@ -481,7 +517,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                     if (e2 && measure(fr2, tot) && fr2 >= margin) {
                         std::fprintf(stderr, "tqllm: fit: %ld positions back on the GPU (%u in host memory), %.2f GB free\n",
                                      prev - long(h), h, double(fr2) / 1e9);
-                        return e2;
+                        return finish(std::move(e2));
                     }
                     h = uint32_t(prev) - (uint32_t(prev) - h) / 2 / 1024 * 1024;
                 }
@@ -513,21 +549,50 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                 if (e2 && fr2 >= margin) {
                     std::fprintf(stderr, "tqllm: fit: context %u (interpolated), %.2f GB free after %d step(s)\n", best,
                                  double(fr2) / 1e9, step + 1 + k);
-                    return e2;
+                    return finish(std::move(e2));
                 }
                 std::fprintf(stderr, "tqllm: fit: interpolated context %u left %.2f GB; refining\n", best, double(fr2) / 1e9);
                 if (!e2) break;  // out of memory: no measurement to refine with
                 ctx_short = best, free_short = fr2;
             }
-            if (reloaded) e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+            if (reloaded) {
+                e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                if (!e || !measure(fr, tot)) throw std::runtime_error("fit: reload at the interpolated context");
+            }
+            // give back placement steps that cost speed while the load leaves room for them (LM head first: every token)
+            struct Back { bool * on; bool user; const char * what; };
+            for (const Back & b : {Back{&opt.head_host, user_head, "int8 LM head back on the GPU"},
+                                   Back{&opt.embed_host, user_embed, "token embeddings back on the GPU"}}) {
+                if (!*b.on || b.user || !fit_try_return(fr, margin)) continue;
+                e.reset();
+                *b.on = false;
+                std::unique_ptr<Engine> e2;
+                try {
+                    e2 = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                } catch (const std::exception & ex) {
+                    if (!std::strstr(ex.what(), "out of memory")) throw;
+                }
+                size_t fr2 = 0;
+                if (e2 && measure(fr2, tot) && fr2 >= margin) {
+                    std::fprintf(stderr, "tqllm: fit: %s, %.2f GB free\n", b.what, double(fr2) / 1e9);
+                    e = std::move(e2);
+                    fr = fr2;
+                    continue;
+                }
+                e2.reset();
+                *b.on = true;
+                e = make_qwen35_engine(path, tok, ok_ctx, slots, opt);
+                if (!e || !measure(fr, tot)) throw std::runtime_error("fit: reload after a failed give-back");
+                break;
+            }
             if (step) std::fprintf(stderr, "tqllm: fit: %.2f GB free after %d step(s)\n", double(fr) / 1e9, step);
-            return e;
+            return finish(std::move(e));
         }
         // every memory step applied (or all KV already in host memory): keep the context if the floor is free
         if (e && fr >= floor_b && (step >= 8 || (host_auto && opt.kv_host >= long(ctx)))) {
             std::fprintf(stderr, "tqllm: fit: WARNING %.2f GB free (< %.2f GB margin) after %d step(s); keeping context %u\n",
                          double(fr) / 1e9, double(margin) / 1e9, step, ctx);
-            return e;
+            return finish(std::move(e));
         }
         const bool loaded = bool(e);
         const size_t token_b = e ? e->kv_token_bytes() : 0;
@@ -539,7 +604,8 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
             case 1: if (!opt.head_host) { opt.head_host = true; what = "int8 LM head to host memory"; applied = true; } break;
             case 2: if (!user_pf) { opt.ubatch = 1024; what = "prefill buffers 1024"; applied = true; } break;
             case 3: if (!user_pf) { opt.ubatch = 512; what = "prefill buffers 512"; applied = true; } break;
-            case 4: if (!user_kv) { opt.kv = "t4k-turbo3v"; what = "KV cache t4k-turbo3v"; applied = true; } break;
+            // q4 K + trellis 2-bit V: lowest KLD of the compact caches at 64K-200K (results/20261006_kv_longctx_kld)
+            case 4: if (!user_kv) { opt.kv = "q4/tcq2"; what = "KV cache q4/tcq2"; applied = true; } break;
             case 5: if (!opt.gemm_rows) { opt.gemm_rows = 2048; what = "prefill FP16 weight blocks of 2048 rows"; applied = true; } break;
             case 6:  // KV tail to host memory (exact; decode reads it over PCIe) before giving up context
             case 7:  // refine while each step frees memory (the per-token estimate undershoots: buffers grow with the tail)
@@ -567,7 +633,7 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                         throw std::runtime_error("model does not fit in device memory (even at context " + std::to_string(ctx) + ")");
                     std::fprintf(stderr, "tqllm: fit: WARNING only %.2f GB free at the smallest setting; long prompts may "
                                          "fail (-fitt lowers the margin)\n", double(fr) / 1e9);
-                    return make_qwen35_engine(path, tok, ctx, slots, opt);
+                    return finish(make_qwen35_engine(path, tok, ctx, slots, opt));
                 }
                 if (loaded) ctx_short = ctx, free_short = fr;
                 if (host_auto) opt.kv_host = -1, measuring = false, host_tries = 0;  // host memory did not make room: weights and buffers are too big
@@ -582,11 +648,17 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 }
 }  // namespace
 
+namespace { FlashNextFactory g_flashnext = nullptr; }
+void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
 // `weights` is either DIR/weights.tqbin (converted Qwen2) or a checkpoint directory / any file inside it.
 Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots, const EngineOptions & o)
     : impl_(std::make_unique<Impl>()) {
     const std::filesystem::path p(w);
     const auto dir = std::filesystem::is_directory(p) ? p : p.parent_path();
+    if (p.extension() == ".tqfn") {
+        if (!g_flashnext) throw std::invalid_argument("this binary has no Flash-Next engine (use tqserve)");
+        impl_->e = g_flashnext(p.string(), t, c, slots, o); return;
+    }
     if (slots != 1 && p.extension() != ".gguf") throw std::invalid_argument("multiple slots need a qwen35 GGUF model");
     if (p.extension() == ".gguf") impl_->e = load_fitted(p.string(), t, c, slots, o);  // qwen35 GGUF (llama.cpp-tq3)
     else if (model_type(dir) == "qwen3_5") impl_->e = make_qwen35_engine(dir.string(), t, c, 1, o);
@@ -605,6 +677,8 @@ uint32_t Model::context() const { return impl_->e->context(); }
 bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
+bool Model::native_mtp() const { return impl_->e->native_mtp(); }
+std::string Model::fit_note() const { return g_fit_note; }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
 void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft) {

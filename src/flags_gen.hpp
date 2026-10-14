@@ -12,6 +12,9 @@ struct Flag {
     const char * replaced_by;
 };
 inline constexpr Flag ALL[] = {
+    {"TQLLM_MOE_FUSE_SHARED", Kind::Debug, "on", "0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches", ""},
+    {"TQLLM_MOE_STAGE", Kind::Debug, "on", "0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics)", ""},
+    {"TQLLM_MOE_PROFILE", Kind::Debug, "-", "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill", ""},
     {"TQLLM_DEBUG", Kind::Debug, "off", "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)", ""},
     {"TQLLM_MATVEC_RULE", Kind::User, "-", "override the matvec kernel rule table (kernels/formats/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)", ""},
     {"TQLLM_ATTN_NBUF", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
@@ -136,7 +139,6 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_TENSOR_SPLIT", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tensor split override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_TENSOR_TRANSPOSE", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tensor transpose override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_TENSOR_WIDE", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tensor wide override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
-    {"TQLLM_MLX_TARGET_HEAD_SHORTLIST", Kind::Debug, "unset (full target head)", "Experimental Apple MLX target-head accelerator: proposal head selects K vocabulary rows and the original Q6_K head re-scores only those rows. Requires exact-output gates before use.", ""},
     {"TQLLM_MLX_TILED_DFLASH_FP32", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tiled dflash fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_TILED_MIXER_FP32", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tiled mixer fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_TILED_TQ3_FP16", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tiled tq3 fp16 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
@@ -147,7 +149,8 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_TILED_TQ4_FP16", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes.", ""},
     {"TQLLM_MLX_PAIRED_GATE_UP", Kind::Debug, "unset (separate projections)", "Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required.", ""},
     {"TQLLM_MLX_TILED_MIXER_FP16", Kind::Debug, "unset (backend default)", "Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates.", ""},
-    {"TQLLM_MLX_WIRED_MIB", Kind::Debug, "unset (retain MLX default)", "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings.", ""}
+    {"TQLLM_MLX_WIRED_MIB", Kind::Debug, "unset (retain MLX default)", "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings.", ""},
+    {"TQLLM_MOE_DEV", Kind::Retired, "-", "removed", "nothing: qwen35moe (MoE) models load by default"}
 };
 inline const Flag * find(const char * name) {
     for (const auto & f : ALL)

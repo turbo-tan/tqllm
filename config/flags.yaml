@@ -3,6 +3,18 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_MOE_FUSE_SHARED
+    kind: debug
+    default: "on"
+    doc: "0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches"
+  - name: TQLLM_MOE_STAGE
+    kind: debug
+    default: "on"
+    doc: "0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics)"
+  - name: TQLLM_MOE_PROFILE
+    kind: debug
+    default: "-"
+    doc: "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill"
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"
@@ -629,3 +641,8 @@ flags:
     kind: debug
     default: "unset (retain MLX default)"
     doc: "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings."
+  - name: TQLLM_MOE_DEV
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "nothing: qwen35moe (MoE) models load by default"

@@ -42,6 +42,26 @@ int main() {
     expect("free_ok below margin", tqllm::fit_context(65536, 100 * MB, 32768, 500 * MB, 768 * MB) == 32768);
     expect("non-increasing free", tqllm::fit_context(65536, 900 * MB, 32768, 900 * MB, 768 * MB) == 32768);
     expect("ctx order", tqllm::fit_context(32768, 100 * MB, 65536, 2000 * MB, 768 * MB) == 65536);
+    // the loader's refinement loop against a linear memory model: an attempt that falls short becomes the new upper point.
+    // 5060 Ti, -fitt 256 (2026-10-07): 204800 left 0.05 GB, 102400 left 1.57 GB, 188416 left 0.26 GB (10 MB short) - the
+    // first fix fell back to 102400; refining must land within a few thousand tokens of the true limit.
+    {
+        const double free0 = 1.57 * GB, per = (1.57 - 0.05) * GB / (204800 - 102400) * 1.035;  // slightly steeper than measured
+        auto free_at = [&](uint32_t c) { return free0 - (double(c) - 102400) * per; };
+        const size_t mg = 256 * MB;
+        uint32_t cs = 204800, ok = 102400;
+        size_t fs = size_t(std::max(0.0, free_at(cs))), fo = size_t(free_at(ok));
+        uint32_t got = ok;
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t b = tqllm::fit_context(cs, fs, ok, fo, mg);
+            if (b <= ok) break;
+            if (free_at(b) >= double(mg)) { got = b; break; }
+            cs = b, fs = size_t(std::max(0.0, free_at(b)));
+        }
+        const double limit = 102400 + (free0 - mg) / per;
+        expect("refinement lands near the true limit", got > 102400 && got <= limit && limit - got < 12288);
+        std::printf("refined: %u (true limit %.0f)\n", got, limit);
+    }
     expect("zero alignment", tqllm::fit_context(65536, 100 * MB, 32768, 2000 * MB, 768 * MB, 0) == 32768);
     // the loader's refinement loop against a linear memory model: an attempt that falls short becomes the new upper point.
     // 5060 Ti, -fitt 256 (2026-10-07): 204800 left 0.05 GB, 102400 left 1.57 GB, 188416 left 0.26 GB (10 MB short) - the
@@ -92,6 +112,10 @@ int main() {
         expect("never below zero", tqllm::fit_host_return(2048, size_t(4.0 * GB), size_t(0.27 * GB), tok16) == 0);
         expect("unknown token size: unchanged", tqllm::fit_host_return(4096, size_t(1.0 * GB), size_t(0.27 * GB), 0) == 4096);
     }
+    // F1 give-back: tester 3090 256K (10-13) ended 4.05 GB free against a 0.77 GB margin with the LM head in host memory
+    expect("give back with 3.3 GB spare", tqllm::fit_try_return(size_t(4.05 * GB), size_t(0.77 * GB)));
+    expect("no give-back with 0.18 GB spare", !tqllm::fit_try_return(size_t(0.95 * GB), size_t(0.77 * GB)));
+    expect("no give-back with the fit off", !tqllm::fit_try_return(size_t(4.0 * GB), 0));
     if (bad) return 1;
     std::printf("PASS fit_context (5060 Ti case -> %u)\n", c);
     return 0;

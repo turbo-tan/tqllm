@@ -23,14 +23,17 @@
 namespace tqserve {
 
 struct ServeOptions {
-    int draft_max = 7;            // --draft-max N: DFlash2 drafts per step (1..15)
+    int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
     return o;
 }
-inline int draft_length() { return serve_options().draft_max; }
+inline int draft_length(bool native_mtp = false) {
+    const int d = serve_options().draft_max;
+    return d ? d : native_mtp ? 4 : 0;  // --mtp 4: best of depths 1-5 and 7 at 1.6K-51K (.77 3090, 10-13); 0: the drafter's default
+}
 inline uint32_t repeat_limit() { return serve_options().repeat_limit; }
 
 // Degenerate output guard. Under memory pressure the sampler can pin on one token (">" ...) until max_tokens, which
@@ -725,7 +728,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
-        model.spec_begin(prompt, count, draft_length());
+        model.spec_begin(prompt, count, draft_length(model.native_mtp()));
         RepeatGuard guard;
         while (model.spec_advance())
             if (guard.check(model.spec_tokens(0))) break;
@@ -1014,7 +1017,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
-    model.spec_begin(prompt, count, draft_length());
+    model.spec_begin(prompt, count, draft_length(model.native_mtp()));
     RepeatGuard guard;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);

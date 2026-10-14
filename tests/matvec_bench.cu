@@ -31,7 +31,9 @@ int main(int argc, char ** argv) {
     for (auto [rows0, cols] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
         const int rows = rows0 * rs;
         for (auto [ty, bb] : {std::pair{46u, 128}, std::pair{300u, 132}, std::pair{301u, 100}, std::pair{23u, 136}, std::pair{21u, 110},
-                              std::pair{18u, 98}, std::pair{12u, 144}}) {
+                              std::pair{18u, 98}, std::pair{12u, 144}, std::pair{13u, 176}, std::pair{14u, 210},
+                              std::pair{8u, 272}, std::pair{20u, 144}, std::pair{10u, 84}, std::pair{16u, 66}, std::pair{17u, 74},
+                              std::pair{22u, 82}, std::pair{19u, 50}}) {
             if (only && ty != only) continue;
             std::vector<char> raw(size_t(rows) * cols / 256 * bb);
             for (auto & c : raw) c = char(g() & 255);
@@ -39,7 +41,13 @@ int main(int argc, char ** argv) {
                 const __half d = __float2half(0.001f);
                 if (ty == 300) std::memcpy(raw.data() + b * bb, &d, 2), std::memcpy(raw.data() + b * bb + 66, &d, 2);
                 if (ty == 301) std::memcpy(raw.data() + b * bb, &d, 2), std::memcpy(raw.data() + b * bb + 50, &d, 2);
-                if (ty == 23 || ty == 21 || ty == 18 || ty == 12) std::memcpy(raw.data() + b * bb, &d, 2);  // ggml super-block d at offset 0
+                if (ty == 23 || ty == 21 || ty == 18 || ty == 12 || ty == 13 || ty == 16 || ty == 17 || ty == 22 || ty == 19)
+                    std::memcpy(raw.data() + b * bb, &d, 2);  // ggml super-block d at offset 0
+                if (ty == 12 || ty == 13) std::memcpy(raw.data() + b * bb + 2, &d, 2);  // dmin
+                if (ty == 14) std::memcpy(raw.data() + b * bb + 208, &d, 2);
+                if (ty == 10) std::memcpy(raw.data() + b * bb + 80, &d, 2), std::memcpy(raw.data() + b * bb + 82, &d, 2);
+                if (ty == 8 || ty == 20)  // 32-weight blocks: 8 per 256 (Q8_0 34 B, IQ4_NL 18 B)
+                    for (int q = 0; q < 8; ++q) std::memcpy(raw.data() + b * bb + q * (ty == 8 ? 34 : 18), &d, 2);
             }
             const tqllm::Upload up = [](const void * h, size_t n) { void * p = nullptr; cudaMalloc(&p, n); cudaMemcpy(p, h, n, cudaMemcpyHostToDevice); return static_cast<const void *>(p); };
             const auto m = tqllm::weight_format(ty)->load(raw, rows, cols, up, nullptr);
@@ -50,6 +58,9 @@ int main(int argc, char ** argv) {
                 if (ty == 300 && (var == 10 || var == 11)) tqllm_cuda::tq4_matvec_i8_bf16(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, nullptr, var == 11 ? 1 : 2);
                 else if (ty == 301 && var) tqllm_cuda::tq4b3_matvec_variant(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, var, nullptr);
                 else if (ty == 300 && var) tqllm_cuda::tq4_matvec_variant(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, var, nullptr);
+                else if (var >= 20 && (ty == 23 || ty == 20 || ty == 8))  // u4h kernel, var 20 + mt (1, 2, 4, 5)
+                    tqllm_cuda::u4h_family_matvec_bf16(ty == 23 ? 13 : ty == 20 ? 14 : 15, static_cast<const uint8_t *>(m.p), m.aux, dx, dy,
+                                                       rows, cols, nc, nullptr, 0, var - 20);
                 else m.fmt->matvec(m, dx, dy, nc, nullptr);
             };
             for (int i = 0; i < 10; ++i) call();

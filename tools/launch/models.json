@@ -1,0 +1,92 @@
+{
+  "default": {
+    "24": "qwen3.8-27b",
+    "16": "qwen3.8-27b-s"
+  },
+  "models": {
+    "qwen3.8-27b": {
+      "description": "Qwen3.8 27B, TQ3_4S-v2 (24 GB cards: RTX 3090 / 4090, GB10)",
+      "min_vram_gb": 20,
+      "file": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ3_4S",
+        "path": "Qwen3.8-27B-TQ3_4S-v2.gguf",
+        "size": 14495191008,
+        "sha256": "52ef4a8b947aeb9b4df1d0478b03999380e963aa1151f4bd079973f2fdb64074"
+      },
+      "drafter": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "drafters/Qwen3.8-27B-DFlash2-TQ3.gguf",
+        "size": 785487488,
+        "sha256": "7f12a657b8c039f6748eb665c650fd0de47284cd8975847fa4e6757cf77a07bd"
+      },
+      "draft_vocab": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "mtp-vocab/atx_65536.txt",
+        "size": 389623
+      }
+    },
+    "qwen3.8-27b-s": {
+      "description": "Qwen3.8 27B, TQ_S (16 GB cards: RTX 5060 Ti / 4080)",
+      "min_vram_gb": 15,
+      "file": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "Qwen3.8-27B-TQ_S.gguf",
+        "size": 12549615424,
+        "sha256": "9b039d4ce426e3048fa312105c90422af03831b2f638257d4a4a3986fb4a784d"
+      },
+      "drafter": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "drafters/Qwen3.8-27B-DFlash2-TQ3.gguf",
+        "size": 785487488,
+        "sha256": "7f12a657b8c039f6748eb665c650fd0de47284cd8975847fa4e6757cf77a07bd"
+      },
+      "draft_vocab": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "mtp-vocab/atx_65536.txt",
+        "size": 389623
+      }
+    },
+    "qwen3.8-27b-xs": {
+      "description": "Qwen3.8 27B, TQ_XS (smallest; 16 GB cards with long context)",
+      "min_vram_gb": 15,
+      "file": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "Qwen3.8-27B-TQ_XS.gguf",
+        "size": 11853623104,
+        "sha256": "e7e691c07a67e9986c1247cd3cf55ba7d5c12366b73bd915a8d3981a9c6f798a"
+      },
+      "drafter": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "drafters/Qwen3.8-27B-DFlash2-TQ3.gguf",
+        "size": 785487488,
+        "sha256": "7f12a657b8c039f6748eb665c650fd0de47284cd8975847fa4e6757cf77a07bd"
+      },
+      "draft_vocab": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "mtp-vocab/atx_65536.txt",
+        "size": 389623
+      }
+    },
+    "qwen3.8-27b-l": {
+      "description": "Qwen3.8 27B, TQ_L (closest to BF16; 24 GB cards)",
+      "min_vram_gb": 20,
+      "file": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "Qwen3.8-27B-TQ_L.gguf",
+        "size": 14721469184,
+        "sha256": "0ab0f05816b595e34bcafd25bbbe0c3d247cab056a7aab99ccab7e5454e6e4b2"
+      },
+      "drafter": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "drafters/Qwen3.8-27B-DFlash2-TQ3.gguf",
+        "size": 785487488,
+        "sha256": "7f12a657b8c039f6748eb665c650fd0de47284cd8975847fa4e6757cf77a07bd"
+      },
+      "draft_vocab": {
+        "repo": "YTan2000/Qwen3.8-27B-TQ",
+        "path": "mtp-vocab/atx_65536.txt",
+        "size": 389623
+      }
+    }
+  }
+}

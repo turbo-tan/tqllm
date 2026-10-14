@@ -1,6 +1,6 @@
 services:
   tqllm:
-    image: ${TQLLM_IMAGE:-ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13}
+    image: ${TQLLM_IMAGE:-ghcr.io/turbo-tan/tqllm:1.0.0}
     build:
       context: .
       args:

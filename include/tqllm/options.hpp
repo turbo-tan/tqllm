@@ -26,6 +26,9 @@ struct EngineOptions {
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
                         // decides (0 when the context fits, else the fewest that do)
     std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (none: native MTP heads when the model has them)
+    uint32_t mtp_from = 0;     // --mtp-from N with -md: prompts of N+ tokens draft with MTP, shorter ones with DFlash2
+    int mtp_depth = 4;         // --mtp-depth N: MTP drafts per step when DFlash2 is loaded too (else --draft-max)
+    bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 4 by default)
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
     int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
     int draft_retrieve = 0;    // --draft-retrieve C: C x 16 positions of the drafter window are far chunks it retrieves (one slot)
@@ -37,10 +40,22 @@ struct EngineOptions {
     bool embed_host = false;   // token embeddings in host memory
     bool head_host = false;    // int8 LM head in host memory
     int gemm_rows = 0;         // prefill FP16 weight blocks of this many rows (0: whole matrices)
+    int n_cpu_moe = 0;         // -ncmoe N: MoE expert weights of the first N layers in pinned host memory
+                               //   (llama.cpp --n-cpu-moe parity; read over PCIe by the decode kernels)
+    long moe_host_mb = 0;      // --moe-host-mb M: the least-routed experts (by --moe-profile) in pinned host memory, about M MiB;
+                               //   every layer keeps its hot experts in VRAM (output identical to all-VRAM)
+    long moe_cache_mb = 0;     // --moe-cache-mb C: VRAM cache of recently used host experts (decode), about C MiB, exact
+    std::string moe_profile;   // --moe-profile FILE: routing counts (default MODEL.experts); TQLLM_MOE_PROFILE=FILE writes one
     // memory fit (llama.cpp names): -fit on|off, -fitt MiB free after loading, -fitc smallest context it may set
     bool fit = true;
     long fit_target_mb = -1;  // -1: 768, or 256 under WSL (WDDM; measured 2026-10-08, results/20261008_kv_host_tail)
     uint32_t fit_min_ctx = 4096;
+    bool fit_lossy = true;  // -fitl off: refuse a load that needs another KV codec / context / prefill split (default: apply and announce)
+    // parallel slots (tqserve --np): --slot-reserve MiB free per slot after loading, else the load refuses the --np and
+    // names the largest that fits; --graph-cache N captured CUDA graphs kept (~12 MB each, least recently used evicted)
+    long slot_reserve_mb = 128;
+    int graph_cache = 256;
+    long graph_keep_mb = 384;  // a graph miss also evicts while less than this is free; the fit sets 0 under WSL
 
     std::string kv_format() const;  // the KV format name these options select ("bf16" when none)
 };

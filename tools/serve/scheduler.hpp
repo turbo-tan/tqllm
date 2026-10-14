@@ -194,7 +194,7 @@ private:
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     model_.spec_begin(job->prompt, job->count, draft_length());
                 } catch (const std::exception & e) {
-                    job->result.error = e.what();
+                    job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);
                 }
             }
@@ -215,7 +215,7 @@ private:
                     model_.select_slot(ids[0]);
                     if (!model_.spec_advance() || step_done(*job, ids[0])) finish_slot(ids[0]);
                 } catch (const std::exception & e) {
-                    job->result.error = e.what();
+                    job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);
                 }
             } else if (!ids.empty()) {  // batched: one verify pass over all slots
@@ -230,7 +230,7 @@ private:
                     for (int id : ids) {
                         auto & job = active_[size_t(id)];
                         if (!job) continue;
-                        job->result.error = e.what();
+                        job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                         complete(job);
                     }
                 }

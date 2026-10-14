@@ -705,6 +705,20 @@ void attention_gen128(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const _
     attn_gen_merge_k<128><<<dim3(h, nq), 128, 0, s>>>(part, y, nsplit, h);
 }
 
+void attention_gen256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
+                      float * part, const int * dpos, int nq, int max_seq, int h, int kh, float scale, bool causal,
+                      cudaStream_t s) {
+    if (h % kh || h / kh > ATT_MAXG) throw std::invalid_argument("attention_gen256: <= 8 query heads per KV head");
+    const int nsplit = (max_seq + att_chunk<256>() - 1) / att_chunk<256>();
+    attn_gen_split_k<256><<<dim3(kh, nsplit, nq), 128, 0, s>>>(q, kc, vc, part, dpos, nq, h, kh, scale, nsplit,
+                                                               causal ? 1 : 0, 0, 0);
+    attn_gen_merge_k<256><<<dim3(h, nq), 256, 0, s>>>(part, y, nsplit, h);
+}
+
+int attention_gen256_partial_floats(int heads, int context, int nq) {
+    return nq * heads * ((context + att_chunk<256>() - 1) / att_chunk<256>()) * (256 + 2);
+}
+
 void attention_merge256(const float * part, __nv_bfloat16 * y, int nsplit, int heads, int nq, cudaStream_t s) {
     attn_gen_merge_k<256><<<dim3(heads, nq), 256, 0, s>>>(part, y, nsplit, heads);
 }
@@ -1606,7 +1620,8 @@ template <bool Q8, bool TURBO3V>
 void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const __half * ksc, const __half * vsc,
                __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit,
                cudaStream_t s, int query_offset, const int * par = nullptr, const int * dep = nullptr) {
-    if (h % kh || ((h / kh) * nq > MQ_MAXROWS && !par)) throw std::invalid_argument("attention_mq256: nq * group must be <= 48");
+    if (h <= 0 || kh <= 0 || h % kh || h / kh > MQ_MAXROWS || nq <= 0)
+        throw std::invalid_argument("attention_mq256: invalid head or query count");
     constexpr int DIM = 256, KS = DIM + 8;
     constexpr bool Q8V = Q8 && !TURBO3V;
     constexpr size_t V3B = (DIM / 128) * 50;
@@ -1635,9 +1650,14 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
                                                     scale, nsplit, nsplit + 1, y);
         return;
     }
-    attn_mq_k<DIM, Q8, TURBO3V><<<dim3(kh, nsplit), DIM, smem, s>>>(q, kc, vc, ksc, vsc, part, dseq0, nq, h, kh, scale, nsplit,
-                                                                    query_offset, nsplit, 0);
-    attn_gen_merge_k<DIM><<<dim3(h, nq), DIM, 0, s>>>(part, y, nsplit, h);
+    const int qmax = MQ_MAXROWS / (h / kh);
+    for (int z0 = 0; z0 < nq; z0 += qmax) {
+        const int nz = std::min(qmax, nq - z0);
+        const int64_t offset = int64_t(z0) * h * DIM;
+        attn_mq_k<DIM, Q8, TURBO3V><<<dim3(kh, nsplit), DIM, smem, s>>>(
+            q + offset, kc, vc, ksc, vsc, part, dseq0, nz, h, kh, scale, nsplit, query_offset + z0, nsplit, 0);
+        attn_gen_merge_k<DIM><<<dim3(h, nz), DIM, 0, s>>>(part, y + offset, nsplit, h);
+    }
 }
 
 void attention_mq256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,

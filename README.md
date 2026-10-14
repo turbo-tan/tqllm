@@ -1,13 +1,25 @@
-# TQLLM
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tqllm-logo-dark.png">
+    <img src="docs/assets/tqllm-logo.png" alt="tqllm" width="360">
+  </picture>
+</p>
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000)
+# tqLLM
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000) [![GoFundMe](https://img.shields.io/badge/GoFundMe-support%20TQLLM-00B964?logo=gofundme&logoColor=white)](https://gofund.me/0f79d4274)
 
 C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
-with an OpenAI-compatible HTTP server. TQLLM is in beta.
+with an OpenAI-compatible HTTP server.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and where new models, weight formats and KV caches plug in, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
 
 ## Credits
 
-TQLLM re-implements ideas from the work below (no code unless listed in NOTICE). Reference = their idea, method or
+tqLLM re-implements ideas from the work below (no code unless listed in NOTICE). Reference = their idea, method or
 weights; improvement = their idea, extended or re-implemented by us.
 
 | Piece | Credit |
@@ -26,18 +38,23 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Prompt-lookup drafting (`--lookup`) | Apoorv Saxena, [prompt-lookup-decoding](https://github.com/apoorvumang/prompt-lookup-decoding) |
 | Comparison baselines | [Unsloth](https://huggingface.co/unsloth) UD quants; [HyperQwen](https://github.com/syv-ai/HyperQwen); [ExLlamaV3](https://github.com/turboderp-org/exllamav3), turboderp; [vLLM](https://github.com/vllm-project/vllm); Strata, Niko1221; LocalMaxxing |
 
+### Testers
+
+Thank you to the testers from X who ran tqLLM on their own hardware and reported back: 0x443, Ricky Spanish,
+lackonendes and GandalfOne.
+
 ## Get the image
 
-The prebuilt image is `ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13` on the GitHub container registry. During the beta
-it is private: you can pull it once your GitHub account has read access to the `tqllm` package.
-
-1. Create a GitHub token (classic) with only the `read:packages` scope.
-2. Log in and pull:
+The prebuilt image is public on the GitHub container registry and on Docker Hub. One multi-platform tag covers x86-64
+(RTX 30 / 40 / 50) and arm64 (GB10 / DGX Spark); `docker pull` picks the right one.
 
 ```sh
-echo <your_token> | docker login ghcr.io -u <your_github_user> --password-stdin
-docker pull ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13
+docker pull ghcr.io/turbo-tan/tqllm:1.0.0
+# or
+docker pull ytan2000/tqllm:1.0.0
 ```
+
+`latest` always points to the newest release.
 
 ## Docker quick start
 
@@ -47,9 +64,10 @@ GB10 / DGX Spark systems (121); `docker pull` picks the right platform and the e
 start. Apple Metal is not supported.
 
 Place a supported model at `models/model.gguf` (the tokenizer is read from the GGUF). Supported: Qwen3.5 /
-Qwen3.8 dense models (hybrid attention + Gated DeltaNet) in TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0,
-IQ4_XS, IQ3_S, IQ3_XXS, F16 and BF16 tensors. Files with other tensor types (IQ2_*, IQ1_*, IQ4_NL, Q2_K, used by some
-Unsloth UD quants) do not load yet.
+Qwen3.8 dense models (hybrid attention + Gated DeltaNet) and qwen35moe mixture-of-experts models such as MiniCPM-V 4.7
+35B-A3B (text; `--moe-host-mb N` keeps the least-used experts in system RAM when the file is larger than the GPU), in
+TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, Q2_K, IQ2_S, IQ2_XS, IQ2_XXS,
+IQ1_S, F16 and BF16 tensors (so Q4_K_M, Q5_K_M, Q6_K, Q8_0 and 2-bit Unsloth UD files load). IQ1_M does not load yet.
 
 Then run:
 
@@ -73,6 +91,32 @@ curl http://localhost:8086/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Explain a hash map."}],"temperature":0,"max_tokens":128}'
 ```
 
+## tqllm launch: a coding agent on your own GPU
+
+`tools/launch/tqllm.py` starts a local server and runs a coding agent against it, like `ollama launch`. It needs
+Python 3, Docker with the NVIDIA Container Toolkit (or a native `tqserve` build) and the agent itself installed.
+
+```sh
+python3 tools/launch/tqllm.py --list                    # model catalog (local copies are marked)
+python3 tools/launch/tqllm.py launch opencode           # the default model for this GPU, downloaded if missing
+python3 tools/launch/tqllm.py launch codex --model qwen3.8-27b-xs
+python3 tools/launch/tqllm.py launch claude --model models/Qwen3.8-27B-TQ_S.gguf \
+  --drafter models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf --draft-vocab models/mtp-vocab/atx_65536.txt
+python3 tools/launch/tqllm.py serve --model qwen3.8-27b  # just the server, until Ctrl+C
+```
+
+- **Agents:** `opencode`, `codex` and `claude` (Claude Code, through a built-in Anthropic Messages to OpenAI bridge).
+  Arguments after `--` go to the agent, e.g. `launch opencode -- run "fix the failing test"`.
+- **Models:** `--model` takes a GGUF file, a catalog name from `tools/launch/models.json`, or nothing (the default
+  for the GPU's memory). Catalog files are looked up in `./models`, `~/models` and `$TQLLM_MODELS`; missing ones are
+  offered for download from Hugging Face with a size and sha256 check (`--yes` skips the question).
+- **Server:** the Docker image by default, or `--native build/tqserve`. Context defaults to 65536 because agent
+  prompts are long; `--context`, `--port`, `--reasoning` and `--server-arg` (repeatable) pass through. A server already
+  answering on the port is reused and left running; one the command started is stopped when the agent exits or the
+  command gets Ctrl+C / SIGTERM.
+- The agents' own configuration files are never written; each gets its provider through its environment or command
+  line.
+
 ## TQ formats: TQ3_4S, TQ3 and TQ4
 
 All three rotate the weights before quantising (the TurboQuant idea: a rotation spreads outliers so a small codebook fits
@@ -80,22 +124,23 @@ every block), then store codes plus scales. They differ in block size, scales an
 
 | Format | Block | Scales | Bits per weight | Runs in |
 |---|---|---|---:|---|
-| TQ3_4S (GGUF type 46) | 32 weights, 32-point rotation, 8-level code | four 8-bit scales (one per 8 weights) | 4.0 | TQLLM and [llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3) |
-| TQ3 (type 301) | 128 weights, 128-point rotation, 8-level code | one FP16 scale per 128 | 3.125 | TQLLM only |
-| TQ4 (type 300) | 128 weights, 128-point rotation, 16-level code | one FP16 scale per 128 | 4.125 | TQLLM only |
+| TQ3_4S (GGUF type 46) | 32 weights, 32-point rotation, 8-level code | four 8-bit scales (one per 8 weights) | 4.0 | tqLLM and [llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3) |
+| TQ3 (type 301) | 128 weights, 128-point rotation, 8-level code | one FP16 scale per 128 | 3.125 | tqLLM only |
+| TQ4 (type 300) | 128 weights, 128-point rotation, 16-level code | one FP16 scale per 128 | 4.125 | tqLLM only |
 
 TQ3_4S spends a quarter of its bits on scales; TQ3 and TQ4 rotate over a 4x longer block, so one scale per 128 weights
 is enough and the bits go into the codes instead. That is how the 27B fits in 11.85 GB as TQ3 (TQ_XS) against 14.5 GB as
 TQ3_4S-v2, and why TQ4 at about the same size as TQ3_4S is much closer to the original (KLD vs BF16 0.022 for TQ4_L).
 The release files `Qwen3.8-27B-TQ_XS.gguf` (11.85 GB), `TQ_S` (12.55 GB) and `TQ4_L` (14.97 GB) are built from these
 formats. Type ids 300
-and 301 are TQLLM's own (above the ggml range), so these files need TQLLM; llama.cpp cannot load them.
+and 301 are tqLLM's own (above the ggml range), so these files need tqLLM; llama.cpp cannot load them.
 
 ## Fast decoding: about 250 tok/s on an RTX 3090
 
-TQLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
-and commits tokens that match its target verifier. Our greedy hash checks validate this configuration empirically;
-they do not prove agreement with a full-vocabulary head for every prompt. Download into `./models`:
+tqLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
+and commits the ones it would have produced itself. Greedy output is identical, token for token, to decoding without
+the drafter: plain decoding and every verify (tree, chain, MTP) share one attention arithmetic, checked by
+`test-tree`, `test-dflash-exact` and `test-native-mtp` and on long prompts up to 51K tokens. Download into `./models`:
 
 | file | Hugging Face repo |
 |---|---|
@@ -116,7 +161,7 @@ docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" \
   -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
   -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
   -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-  ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13
+  ghcr.io/turbo-tan/tqllm:1.0.0
 ```
 
 With Compose, set the same names: `DRAFT_NAME=drafters/Qwen3.8-27B-DFlash2-TQ3.gguf
@@ -126,6 +171,13 @@ What to expect: on the LocalMaxxing reasoning prompt (32K context, 320 output to
 with this drafter (TQ3 and Q4_K_M builds measure the same). The server reports tok/s for every
 request. Speed depends on how often the drafter's guesses are accepted, so it varies with the text: predictable text
 (reasoning, prose) runs fastest, code and long contexts slower.
+
+Long prompts: `--draft-retrieve 32` lets the drafter also read 32 far passages of the prompt (RTX 3090, 64K context:
+31K / 40K / 51K-token prompts 158 / 143 / 137 -> 176 / 156 / 148 tok/s, short prompts -2 %). It keeps the drafter's
+cache for the whole context (about 20 KB per token), so it is off by default.
+
+No drafter file: `--mtp` drafts with the model's own prediction head (one user, greedy; same output as plain decoding):
+155 tok/s at 1.6K and 125 tok/s at 51K tokens on an RTX 3090, against 57 and 47 without drafting.
 
 ### Recommended settings
 
@@ -206,7 +258,6 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--draft-max N` | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there |
 | `--no-tree` | tree on | verify a single draft chain instead of a token tree |
 | `--draft-window N` | GGUF value | drafter attention window over the context (0 = whole context) |
-| `--draft-retrieve C` | 0 | prototype, one slot: C x 16 of the drafter window are far-context chunks it retrieves |
 | `--lookup L [--lookup-first K]` | off | prompt-lookup drafts (copies of earlier text) next to the tree; shares the verify budget |
 
 ### KV cache and long context (TqCache)
@@ -227,10 +278,39 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 |---|---|---|
 | `-fit on\|off` | on | load, measure, and step down until the margin is free, in this order: token embeddings and the LM head to host memory, smaller prefill buffers, a smaller KV format (when `--kv` is not set), prefill weight blocks, the KV tail to system RAM, then a shorter context |
 | `-fitt MiB` | 768 (256 under WSL) | free memory to leave on the GPU (64 MiB floor) |
-| `-fitc N` | 4096 | smallest context the fit may choose |
+| `-fitc N` | 4096 | smallest context the fit may choose (with `--np`: the smallest context per slot) |
+| `-fitl on\|off` | on | on: when the requested context / users do not fit at full settings, pick a compact KV cache (q4/tcq2), smaller prefill buffers or weight blocks, or a shorter context, and say so at start-up (and in `/health`); off: refuse instead |
+| `--gemm-rows N` | 0 (fit) | prefill FP16 weight blocks of N rows (less VRAM); the memory fit picks 2048 when needed and says so |
+| `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 4, `--draft-max N`) |
+| `--draft-retrieve N` | 0 (off) | with `-md`: N far chunks of 16 positions in the drafter window; long prompts get faster (32: +8-12 % at 31K-51K on a 3090) but the drafter keeps K/V for the whole context (~20 KB / token: 1.25 GiB at 64K, 3.9 GiB at 200K), so turn it on when memory allows |
+| `--mtp-from N` | 0 | with `-md` and `--mtp`: prompts of N or more tokens draft with the MTP head (`--mtp-depth D`, default 4), shorter ones with DFlash2 |
+| `--slot-reserve MiB` | 128 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
+| `--graph-cache N` | 256 | captured CUDA graphs kept (~12 MB each); least recently used are evicted, also when free memory runs low |
 | `-ub N` | automatic | prefill chunk (ubatch) size |
 | `--prefill-fp8 on\|off` | off | FP8 prefill GEMMs (sm_89+): about +40 % prefill on GB10 but KLD ~0.01 vs FP16 prefill, so opt-in; slower on 16 GB cards |
 | `--prefill-int8 on\|off` | on for RTX 30 / 40 / 50 | int8 prefill GEMMs (RTX 50: +11-13 % prefill on a 5060 Ti; RTX 40 by analogy) |
+
+### Memory fit: what it does and how to override it
+
+You normally pass only `--context` (and `--np`). If that does not fit at full settings, the server picks what fits and
+prints one line, for example:
+
+```
+tqserve: fit: to fit 1 slot(s) x 131072 in GPU memory: KV cache q4/tcq2 (asked bf16), prefill buffers -ub 512,
+prefill FP16 weight blocks of 2048 rows (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)
+```
+
+`GET /health` reports the same in its `fit` field. Your own settings always win; examples:
+
+| you want | add |
+|---|---|
+| full-quality BF16 KV, accept a shorter context if needed | `--kv bf16` |
+| a specific compact cache | `--kv q4/tcq2` (trellis V, lowest KLD of the compact caches), `--kv q8/q8`, `--kv tq3` (`--list-kv`) |
+| bigger prompt buffers (faster prefill, more memory) | `-ub 2048` |
+| full weight matrices for prefill (faster, more memory) | `--gemm-rows 0` |
+| exactly what you asked for, or an error | `-fitl off` |
+| several users at a long context (e.g. 4 x 32K) | `--np 4 --context 131072` (the context is split across `--np`) |
+| keep more free memory for other programs | `-fitt 2048` (MiB left free) |
 
 ### Diagnostics
 
@@ -298,7 +378,7 @@ cmake --build build --target tqserve -j4
 
 Use a sufficiently recent CUDA toolkit; CUDA 12.9 was tested on RTX 3090.
 Model downloads are not included. Model weights and bundled third-party source
-retain their own licenses. TQLLM itself is licensed under Apache-2.0 (see LICENSE and NOTICE).
+retain their own licenses. tqLLM itself is licensed under Apache-2.0 (see LICENSE and NOTICE).
 
 ### Request sampling numbers
 

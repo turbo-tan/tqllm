@@ -45,6 +45,22 @@ struct WeightFormat {
     // Output rows ldy apart (y [n][ldy], first m.rows written); false: not supported (callers copy instead).
     virtual bool matvec_ld(const Mat &, const __half *, __nv_bfloat16 *, int, int, cudaStream_t) const { return false; }
     virtual bool has_matvec_ld() const { return false; }
+    virtual bool expert_gemm(const Mat &, const __half *, __nv_bfloat16 *, int,
+                              const int *, const int *, int, int,
+                              int, bool, cudaStream_t) const { return false; }
+    virtual bool has_expert_matvec() const { return false; }
+    // Stacked weights [experts * rows][cols], device IDs [n][topk], output [n * topk][rows].
+    virtual void expert_matvec(const Mat &, const __half *, __nv_bfloat16 *, int rows,
+                               const int *, int n, int topk, bool per_expert_input, cudaStream_t) const;
+    // u4h-family kernel id (-1: none). Dedup: one block per unique expert, map layout in quant_kernels.cuh.
+    virtual int u4h_id() const { return -1; }
+    bool has_expert_dedup() const { return u4h_id() >= 0; }
+    void expert_matvec_dedup(const Mat &, const __half *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
+    // two matrices of this format (gate, up) over the same dedup map in one launch
+    void expert_matvec_dedup2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
+    // two stacked matrices of this format (gate, up) over the same device IDs in one launch; per row expert_matvec
+    void expert_matvec2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * ids, int n,
+                        int topk, cudaStream_t) const;
     // FP16 [rows][cols] in basis(), for the cuBLAS prefill GEMM.
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
     // Device bytes per row of the data / aux arrays when rows are stored contiguously (a row range is then a Mat of its
@@ -53,7 +69,13 @@ struct WeightFormat {
     virtual size_t aux_row_bytes(int /*cols*/) const { return 0; }
     // Optional kernel for max_matvec_cols() < n < the cuBLAS threshold; false = use dequant + GEMM.
     virtual bool gemm(const Mat &, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t) const { return false; }
-    virtual bool has_gemm() const { return false; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
+    virtual bool has_gemm() const { return fused_gemm_cols() > 0; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
+    // y [n][rows] F32 through the u4h-family GEMM (weights read once per 64 columns); false: no GEMM for this format
+    bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;
+    // gemm() also replaces the dequant + cuBLAS prefill up to this many columns (0: only below the cuBLAS threshold).
+    virtual int fused_gemm_cols() const { return 0; }
+    // gemm() with output rows ldy apart (y [n][ldy]); false: not supported.
+    virtual bool gemm_ld(const Mat &, const __half *, __nv_bfloat16 *, int, int, cudaStream_t) const { return false; }
     // Row blocks of a composite matrix (non-null only for composite_format); each is a matrix of its own format.
     virtual const std::vector<Mat> * parts() const { return nullptr; }
 };

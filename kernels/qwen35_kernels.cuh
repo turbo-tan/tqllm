@@ -246,6 +246,7 @@ void sigmoid_gate_rot_h(__nv_bfloat16 * o, const __nv_bfloat16 * qg0, int ts, in
 // Embedding rows for n tokens whose ids are on the device (graph-capturable). Table TQ3_4S or Q6_K.
 void embed_multi_tq3(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void embed_multi_q6k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
+void embed_multi_iq3s(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 // Per-head gated RMSNorm: y = bf16(w * bf16(x * rsqrt(mean(x^2)+eps)) * silu(z)), w FP32. [heads][dim].
 void gated_rms(const __nv_bfloat16 * x, const __nv_bfloat16 * z, const float * w, __nv_bfloat16 * y, int heads, int dim,
                float eps, cudaStream_t);

@@ -11,6 +11,8 @@ using tqllm_cuda::Turbo4K256;
 void need256(int hd, const char * name) {
     if (hd != 256) throw std::runtime_error(std::string("KV format ") + name + " requires head_dim 256");
 }
+// queries per CTV launch: the kernel holds at most 48 query rows (queries x GQA group), e.g. 8 for group 6, 6 for group 8
+int ctv_chunk(int heads, int kvheads) { return std::clamp(48 / std::max(1, heads / kvheads), 1, 8); }
 
 // int8 K (FP16 scale per 32) + Turbo3 V (3-bit, 128-value blocks). Fails the free-running quality gate.
 struct KvQ8Turbo3V final : KvFormat {
@@ -29,10 +31,10 @@ struct KvQ8Turbo3V final : KvFormat {
         auto * v3 = static_cast<Turbo3V256 *>(a.vc);
         tqllm_cuda::cache_write_multi_q8_turbo3v(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, k8, ks, v3, a.dpos,
                                                  a.kvheads, a.head_dim, a.stream);
-        for (int off = 0; off < a.n; off += 8) {
+        for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {
             const size_t qoff = size_t(off) * a.heads * a.head_dim;
             tqllm_cuda::attention_mq256_q8_turbo3v(a.q + qoff, k8, v3, ks, a.o + qoff, a.part, a.dpos + 1,
-                                                   std::min(8, a.n - off), a.heads, a.kvheads, a.scale, a.split, a.stream, off);
+                                                   std::min(c, a.n - off), a.heads, a.kvheads, a.scale, a.split, a.stream, off);
         }
     }
 };
@@ -52,9 +54,9 @@ struct KvT4kTurbo3V final : KvFormat {
         auto * v3 = static_cast<Turbo3V256 *>(a.vc);
         tqllm_cuda::cache_write_multi_t4k_turbo3v(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, k4, v3, a.dpos, a.kvheads,
                                                   a.head_dim, a.stream);
-        for (int off = 0; off < a.n; off += 8) {
+        for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {
             const size_t qoff = size_t(off) * a.heads * a.head_dim;
-            tqllm_cuda::attention_mq256_t4k_turbo3v(a.q + qoff, k4, v3, a.o + qoff, a.part, a.dpos + 1, std::min(8, a.n - off),
+            tqllm_cuda::attention_mq256_t4k_turbo3v(a.q + qoff, k4, v3, a.o + qoff, a.part, a.dpos + 1, std::min(c, a.n - off),
                                                     a.heads, a.kvheads, a.scale, a.split, a.stream, off);
         }
     }
@@ -80,9 +82,9 @@ struct KvT4kv final : KvFormat {
                                                      ns, a.stream);
             return;
         }
-        for (int off = 0; off < a.n; off += 8) {
+        for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {
             const size_t qoff = size_t(off) * a.heads * a.head_dim;
-            tqllm_cuda::attention_mq256_t4kv(a.q + qoff, k4, v4, a.o + qoff, a.part, a.dpos + 1, std::min(8, a.n - off),
+            tqllm_cuda::attention_mq256_t4kv(a.q + qoff, k4, v4, a.o + qoff, a.part, a.dpos + 1, std::min(c, a.n - off),
                                              a.heads, a.kvheads, a.scale, a.split, a.stream, off);
         }
     }

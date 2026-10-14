@@ -792,6 +792,110 @@ int main() {
         cudaFree(out);
         for (auto * p : keep) cudaFree(p);
     }
+    // UD types (IQ4_NL, ...): loader dequant and matvec (1..16 columns) vs the host dequantiser of the GGUF type
+    auto ud_case = [&](const char * nm, uint32_t type, int be, int bb, int qr, int qc, auto fill) {
+        std::vector<char> raw(size_t(qr) * qc / be * bb);
+        for (size_t b = 0; b < raw.size() / bb; ++b) fill(reinterpret_cast<uint8_t *>(raw.data() + b * bb));
+        std::vector<float> ref(size_t(qr) * qc);
+        tqllm::dequantize_host(type, raw.data(), ref.data(), int64_t(ref.size()));
+        std::vector<void *> keep;
+        const tqllm::Upload up = [&](const void * h, size_t n) {
+            void * p = nullptr;
+            cudaMalloc(&p, n);
+            cudaMemcpy(p, h, n, cudaMemcpyHostToDevice);
+            keep.push_back(p);
+            return static_cast<const void *>(p);
+        };
+        const auto m = tqllm::weight_format(type)->load(raw, qr, qc, up, nullptr);
+        __half * out = nullptr;
+        cudaMalloc(&out, ref.size() * 2);
+        m.fmt->dequant_h(m, out, nullptr);
+        const auto hv = host(out, ref.size());
+        std::vector<float> got(ref.size());
+        std::vector<double> rd(ref.begin(), ref.end());
+        for (size_t i = 0; i < got.size(); ++i) got[i] = __half2float(hv[i]);
+        char cn[48];
+        std::snprintf(cn, sizeof(cn), "%s_dequant", nm);
+        check(cn, got, rd, 2e-3);
+        for (int nc : {1, 3, 8, 12, 16}) {
+            std::vector<__half> x(size_t(nc) * qc);
+            for (auto & v : x) v = __float2half(nd(g));
+            std::vector<double> ref2(size_t(nc) * qr);
+            for (int n = 0; n < nc; ++n)
+                for (int r = 0; r < qr; ++r) {
+                    double acc = 0;
+                    for (int i = 0; i < qc; ++i) acc += double(ref[size_t(r) * qc + i]) * __half2float(x[size_t(n) * qc + i]);
+                    ref2[size_t(n) * qr + r] = acc;
+                }
+            auto * dx = dev(x);
+            bf16 * dy = nullptr;
+            cudaMalloc(&dy, ref2.size() * 2);
+            m.fmt->matvec(m, dx, dy, nc, nullptr);
+            const auto yb = host(dy, ref2.size());
+            std::vector<float> yv(yb.size());
+            for (size_t i = 0; i < yv.size(); ++i) yv[i] = __bfloat162float(yb[i]);
+            std::snprintf(cn, sizeof(cn), "%s_matvec_n%d", nm, nc);
+            check(cn, yv, ref2, 5e-3);
+            cudaFree(dx);
+            cudaFree(dy);
+        }
+        for (int nc : {40, 200}) {  // fused prefill GEMM (formats with fused_gemm_cols())
+            if (m.fmt->fused_gemm_cols() < nc) continue;
+            std::vector<__half> x(size_t(nc) * qc);
+            for (auto & v : x) v = __float2half(nd(g));
+            std::vector<double> ref2(size_t(nc) * qr);
+            for (int n = 0; n < nc; ++n)
+                for (int r = 0; r < qr; ++r) {
+                    double acc = 0;
+                    for (int i = 0; i < qc; ++i) acc += double(ref[size_t(r) * qc + i]) * __half2float(x[size_t(n) * qc + i]);
+                    ref2[size_t(n) * qr + r] = acc;
+                }
+            auto * dx = dev(x);
+            bf16 * dy = nullptr;
+            cudaMalloc(&dy, ref2.size() * 2);
+            m.fmt->gemm(m, dx, dy, nc, nullptr);
+            const auto yb = host(dy, ref2.size());
+            std::vector<float> yv(yb.size());
+            for (size_t i = 0; i < yv.size(); ++i) yv[i] = __bfloat162float(yb[i]);
+            std::snprintf(cn, sizeof(cn), "%s_gemm_n%d", nm, nc);
+            check(cn, yv, ref2, 5e-3);
+            cudaFree(dx);
+            cudaFree(dy);
+        }
+        cudaFree(out);
+        for (auto * p : keep) cudaFree(p);
+    };
+    ud_case("iq4nl_IQ4L", 20, 32, 18, 40, 768, [&](uint8_t * blk) {
+        const __half d = __float2half(0.002f * (1 + byte(g) % 40) * (byte(g) % 2 ? 1 : -1));
+        std::memcpy(blk, &d, 2);
+        for (int i = 2; i < 18; ++i) blk[i] = uint8_t(byte(g));
+    });
+    ud_case("q5k_K5", 13, 256, 176, 40, 768, [&](uint8_t * blk) {
+        const __half d = __float2half(0.0004f * (1 + byte(g) % 40)), dm = __float2half(0.0006f * (1 + byte(g) % 40));
+        std::memcpy(blk, &d, 2);
+        std::memcpy(blk + 2, &dm, 2);
+        for (int i = 4; i < 176; ++i) blk[i] = uint8_t(byte(g));
+    });
+    ud_case("q6k_K6", 14, 256, 210, 40, 768, [&](uint8_t * blk) {
+        for (int i = 0; i < 208; ++i) blk[i] = uint8_t(byte(g));
+        const __half d = __float2half(0.0002f * (1 + byte(g) % 40));
+        std::memcpy(blk + 208, &d, 2);
+    });
+    auto ud_fill = [&](int bb, int doff) {
+        return [&, bb, doff](uint8_t * blk) {
+            for (int i = 0; i < bb; ++i) blk[i] = uint8_t(byte(g));
+            const __half d = __float2half(0.0004f * (1 + byte(g) % 40));
+            std::memcpy(blk + doff, &d, 2);
+            if (doff == 80) std::memcpy(blk + 82, &d, 2);  // Q2_K dmin
+        };
+    };
+    ud_case("iq2xxs_IQ2X", 16, 256, 66, 40, 768, ud_fill(66, 0));
+    ud_case("iq2xs_IQ2W", 17, 256, 74, 40, 768, ud_fill(74, 0));
+    ud_case("iq2s_IQ2S", 22, 256, 82, 40, 768, ud_fill(82, 0));
+    ud_case("iq1s_IQ1S", 19, 256, 50, 40, 768, ud_fill(50, 0));
+    ud_case("q2k_K2", 10, 256, 84, 40, 768, ud_fill(84, 80));
+    ud_case("iq4xs_IQ4N", 23, 256, 136, 40, 768, ud_fill(136, 0));
+    ud_case("q80_I8H", 8, 32, 34, 40, 768, ud_fill(34, 0));
     {  // IQ4_XS loader (GGUF 23 -> IQ4): dequant and matvec vs the host IQ4_XS dequantiser
         const int qr = 40, qc = 768;
         std::vector<char> raw(size_t(qr) * qc / 256 * 136);
@@ -982,7 +1086,7 @@ int main() {
         std::vector<float> got(ref.size());
         std::vector<double> rd(ref.begin(), ref.end());
         for (size_t i = 0; i < got.size(); ++i) got[i] = __half2float(hv[i]);
-        check("q6k_loader_i8h", got, rd, 2e-3);
+        check("q6k_loader_k6", got, rd, 2e-3);
         cudaFree(out);
         for (auto * p : keep) cudaFree(p);
     }
@@ -997,9 +1101,10 @@ int main() {
             return static_cast<const void *>(p);
         };
         auto make = [&](uint32_t ty, int r) {  // random blocks with sane FP16 scales
-            const int bs = ty == 12 ? 144 : ty == 11 ? 110 : ty == 23 ? 136 : ty == 21 ? 110 : ty == 18 ? 98 : 210;
+            const int bs = ty == 12 ? 144 : ty == 13 ? 176 : ty == 20 ? 18 : ty == 11 ? 110 : ty == 23 ? 136 : ty == 21 ? 110 : ty == 18 ? 98 : 210;
+            const int be = ty == 20 ? 32 : 256;
             const int doff = ty == 11 ? 108 : ty == 14 ? 208 : 0;
-            std::vector<char> raw(size_t(r) * qc / 256 * bs);
+            std::vector<char> raw(size_t(r) * qc / be * bs);
             for (size_t b = 0; b < raw.size() / bs; ++b) {
                 char * blk = raw.data() + b * bs;
                 for (int i = 0; i < bs; ++i) blk[i] = char(byte(g));
@@ -1007,7 +1112,7 @@ int main() {
                     for (int i = 192; i < 208; ++i) blk[i] = char(byte(g) % 128 - 64);
                 const __half d = __float2half(0.0005f * (1 + byte(g) % 40));
                 std::memcpy(blk + doff, &d, 2);
-                if (ty == 12) std::memcpy(blk + 2, &d, 2);  // dmin
+                if (ty == 12 || ty == 13) std::memcpy(blk + 2, &d, 2);  // dmin
             }
             return tqllm::weight_format(ty)->load(raw, r, qc, up, nullptr);
         };
@@ -1018,7 +1123,7 @@ int main() {
             return b;
         };
         int bad = 0;
-        for (uint32_t ty : {12u, 11u, 23u, 21u, 18u, 14u}) {
+        for (uint32_t ty : {12u, 13u, 11u, 23u, 20u, 21u, 18u, 14u}) {
             const int qr = 40, ld = qr + 24;
             const auto m = make(ty, qr);
             if (!m.fmt->has_matvec_ld()) { std::printf("FAIL ld_%u: no matvec_ld\n", ty); ++bad; continue; }
@@ -1044,12 +1149,12 @@ int main() {
                 cudaFree(y1);
             }
         }
-        {  // composite K4 (Q4_K) + IQ3 (IQ3_S) + I8H (Q6_K): matvec / dequant equal to the parts', in row order
+        {  // composite K4 (Q4_K) + IQ3 (IQ3_S) + K6 (Q6_K): matvec / dequant equal to the parts', in row order
             const std::vector<tqllm::Mat> parts = {make(12, 48), make(21, 32), make(14, 16)};
             auto c = tqllm::composite_format(parts);
             const auto cm = tqllm::composite_mat(*c);
             const int R = cm.rows;
-            if (R != 96 || c->max_batch_cols() != 8 || std::string(c->name()) != "K4+IQ3+I8H") {
+            if (R != 96 || c->max_batch_cols() != 32 || std::string(c->name()) != "K4+IQ3+K6") {
                 std::printf("FAIL composite shape: rows %d batch %d name %s\n", R, c->max_batch_cols(), c->name());
                 ++bad;
             }
@@ -1150,6 +1255,44 @@ int main() {
         cudaFree(d5);
         cudaFree(w8);
         cudaFree(s8);
+    }
+    {  // IQ3_S embedding rows: GPU iq3s_row / embed_multi_iq3s vs the host iq3s reference, bitwise in bf16
+        const int qc = 1024, nr = 12;
+        int bad = 0;
+        std::vector<char> q3s(size_t(nr) * qc / 256 * 110);
+        for (size_t b = 0; b < q3s.size() / 110; ++b) {
+            for (int i = 0; i < 110; ++i) q3s[b * 110 + i] = char(byte(g));
+            const __half d = __float2half(0.0005f * (1 + byte(g) % 40));
+            std::memcpy(q3s.data() + b * 110, &d, 2);
+        }
+        std::vector<float> r3s(size_t(nr) * qc);
+        tqllm::dequantize_host(21, q3s.data(), r3s.data(), int64_t(r3s.size()));
+        auto * d3s = dev(q3s);
+        // single-row path (decode step)
+        bf16 * yr = nullptr;
+        cudaMalloc(&yr, qc * 2);
+        tqllm_cuda::iq3s_row(d3s, 7, yr, qc, nullptr);
+        const auto hr = host(yr, qc);
+        for (int i = 0; i < qc; ++i)
+            if (__bfloat162float(hr[i]) != __bfloat162float(__float2bfloat16_rn(r3s[size_t(7) * qc + i]))) ++bad;
+        // multi-token path (prefill), ids on the device (graph-capturable shape)
+        const std::vector<uint32_t> toks = {7, 0, 11, 3};
+        auto * dt = dev(toks);
+        bf16 * ye = nullptr;
+        cudaMalloc(&ye, toks.size() * qc * 2);
+        tqllm_cuda::embed_multi_iq3s(d3s, dt, int(toks.size()), ye, qc, nullptr);
+        const auto he = host(ye, toks.size() * qc);
+        for (size_t n = 0; n < toks.size(); ++n)
+            for (int i = 0; i < qc; ++i) {
+                const float want = __bfloat162float(__float2bfloat16_rn(r3s[size_t(toks[n]) * qc + i]));
+                if (__bfloat162float(he[n * qc + i]) != want) ++bad;
+            }
+        std::printf("%s iq3s_embed (single-row + multi-token, %d failures)\n", bad ? "FAIL" : "ok  ", bad);
+        failures += bad;
+        cudaFree(d3s);
+        cudaFree(dt);
+        cudaFree(yr);
+        cudaFree(ye);
     }
     {  // interleaved M-RoPE: t = h = w = p bitwise equal to the 1-D rotation; image positions vs a host reference
         const int n = 5, heads = 3, dim = 256, rot = 64, ts = heads * dim;

@@ -36,6 +36,7 @@ struct Engine {
     // (false once done) and spec_finish returns the generated ids. generate_spec = begin + advance* + finish.
     virtual int slots() const { return 1; }
     virtual bool has_drafter() const { return false; }
+    virtual bool native_mtp() const { return false; }  // --mtp drafts with the model's own nextn head
     virtual bool incremental() const { return false; }  // spec_begin / spec_advance work (chunked prefill), drafter or not
     virtual void select_slot(int s) {
         if (s != 0) throw std::runtime_error("this model has a single slot");
@@ -80,6 +81,11 @@ struct Engine {
 
 // Qwen3.5 dense hybrid (Gated DeltaNet + gated attention), BF16 weights read from safetensors in `dir`.
 // `slots` sequences share the weights; each gets `context` positions.
+// Flash-Next (qwen4exp) engine: compiled into tqserve with tools/tqfn_stage.cpp (TQFN_SERVE_ENGINE), which registers it;
+// a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects it.
+using FlashNextFactory = std::unique_ptr<Engine> (*)(const std::string & manifest, const std::string & tokenizer, uint32_t context,
+                                                     int slots, const EngineOptions & options);
+void register_flashnext_engine(FlashNextFactory factory);
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

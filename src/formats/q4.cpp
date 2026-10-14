@@ -6,16 +6,54 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace tqllm::formats {
 namespace {
+// Grouped-expert entry points of the u4h kernel family. `fmt` is the family index
+// (0 u4h, 1 k4, 2 k3, 4 iq3, 5 iq3x, 6 k5, 7 k6, 8-12 UD types, 13 iq4n, 14 iq4l, 15 i8h) --
+// the same index this format's dense gemm()/matvec() already pass, which is what keeps grouped
+// output bit-identical to a row-sliced dense call (tests/moe_device.cu).
+inline bool expert_gemm_u4h(int fmt, const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                            const int * counts, const int * groups, int capacity, int experts,
+                            int topk, bool per_expert_input, cudaStream_t s) {
+    tqllm_cuda::k_expert_gemm(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols,
+                              counts, groups, capacity, experts, topk, per_expert_input, s);
+    return true;
+}
+inline void expert_matvec_u4h(int fmt, const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                              const int * ids, int n, int topk, bool per_expert_input,
+                              cudaStream_t s) {
+    tqllm_cuda::k_expert_matvec(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols,
+                                ids, n, topk, per_expert_input, s);
+}
 constexpr uint32_t ID_U4H = 1001, ID_W4S = 1002, ID_K4 = 1003, ID_K3 = 1004, /* 1005: retired IQ4 */ ID_IQ3 = 1006, ID_IQ3X = 1007,
-                   ID_IQ4N = 1008, ID_K5 = 1010;
+                   ID_IQ4N = 1008, ID_IQ4L = 1009, ID_K5 = 1010, ID_K6 = 1011, ID_UDQ = 1012 /* 1012..1016: UD types, see Udq */;
 
 // u4h (engine id 1001): 4-bit codes in 16-groups (element 4u + j -> byte (u / 2) * 4 + j, nibble u % 2),
 // FP16 (scale, min) per 32. Produced from Q4_K (drafter) or non-uniform Q4_0.
 struct U4h final : WeightFormat {
     const char * name() const override { return "U4H"; }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        return expert_gemm_u4h(0, m, x, y, rows, counts, groups, capacity, experts,
+                               topk, per_expert_input, stream);
+    }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input,
+                       cudaStream_t stream) const override {
+        expert_matvec_u4h(0, m, x, y, rows, ids, n, topk, per_expert_input, stream);
+    }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(0, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 640; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
     size_t aux_row_bytes(int cols) const override { return size_t(cols) / 32 * sizeof(__half2); }
     int max_batch_cols() const override { return 32; }
@@ -45,7 +83,31 @@ struct U4h final : WeightFormat {
 // K4 (engine id 1003): native Q4_K, u4h codes + the raw 16-byte Q4_K superblock header (d, dmin, 6-bit scales / mins)
 // per 256 weights: 4.5 bpw on the device instead of u4h's 5.0.
 struct K4 final : WeightFormat {
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(1, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols,
+                                 counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
+
+    int u4h_id() const override { return 1; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(1, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                   rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+
     const char * name() const override { return "K4"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(1, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 640; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 32; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
@@ -74,7 +136,29 @@ struct K4 final : WeightFormat {
 
 // IQ3X (engine id 1007): native IQ3_XXS, per 32 weights 12 B (grid-index bytes + scale/sign word) + 4 B per 256 (d).
 struct Iq3x final : WeightFormat {
+    int u4h_id() const override { return 5; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(5, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                  rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(5, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                rows, m.cols, counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
     const char * name() const override { return "IQ3X"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(5, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 704; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 32; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 32 * 12; }
@@ -135,7 +219,29 @@ struct IQ3_XXS final : WeightFormat {
 // IQ3 (engine id 1006): native IQ3_S, per 32 weights 12 B (grid-index low bytes, sign bytes) + per 256 a 16-byte record
 // (d, qh[8], scales[4], pad): 3.5 bpw on the device.
 struct Iq3 final : WeightFormat {
+    int u4h_id() const override { return 4; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(4, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                  rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(4, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                rows, m.cols, counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
     const char * name() const override { return "IQ3"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(4, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 576; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 32; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 32 * 12; }
@@ -214,28 +320,46 @@ struct IQ3_S final : WeightFormat {
 // unchanged 8-byte record per 256 weights (d, scales_h, scales_l), on the 16-row split-K kernel (<= 16 columns; wider
 // batches dequantise to FP16). 4.25 bpw on the device, same as the file.
 struct Iq4n final : WeightFormat {
+    int u4h_id() const override { return 13; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(13, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                  rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(13, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                rows, m.cols, counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
     const char * name() const override { return "IQ4N"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(13, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 416; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 16; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
     size_t aux_row_bytes(int cols) const override { return size_t(cols) / 256 * 8; }
-    static int pf(const Mat & m, int n) { return tqllm_cuda::mvr::choose(14, m.rows, m.cols, n).pf; }  // matvec_rules.hpp
     Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
         throw std::runtime_error("IQ4N is produced by the IQ4_XS loader");
     }
     void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
-        tqllm_cuda::iq4n_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
-                                     m.cols, n, pf(m, n), s);
+        tqllm_cuda::u4h_family_matvec_bf16(13, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
     }
     bool has_matvec_ld() const override { return true; }
     bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
-        tqllm_cuda::iq4n_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
-                                     m.cols, n, pf(m, n), s, ldy);
+        tqllm_cuda::u4h_family_matvec_bf16(13, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
         return true;
     }
     void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
-        tqllm_cuda::iq4n_matvec(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
-                                m.cols, n, pf(m, n), s);
+        tqllm_cuda::u4h_family_matvec_f32(13, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
     }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::iq4n_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows,
@@ -243,13 +367,91 @@ struct Iq4n final : WeightFormat {
     }
 };
 
+// IQ4L (engine id 1009): IQ4_NL in natural nibble order (16 B per 32 weights) + one FP16 scale per 32 weights (aux).
+struct Iq4l final : WeightFormat {
+    int u4h_id() const override { return 14; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(14, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                  rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(14, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                rows, m.cols, counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
+    const char * name() const override { return "IQ4L"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(14, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 896; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
+    int max_batch_cols() const override { return 16; }
+    Basis basis() const override { return Basis::Plain; }
+    size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
+    size_t aux_row_bytes(int cols) const override { return size_t(cols) / 32 * 2; }
+    Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
+        throw std::runtime_error("IQ4L is produced by the IQ4_NL loader");
+    }
+    void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_bf16(14, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    bool has_matvec_ld() const override { return true; }
+    bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_bf16(14, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_f32(14, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
+        tqllm_cuda::iq4l_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), out, m.rows,
+                                   m.cols, s);
+    }
+};
+// IQ4_NL (GGUF 20) loader -> IQ4L: block d, qs[16] (weight j low nibble of qs[j], weight 16 + j high nibble).
+struct IQ4_NL final : WeightFormat {
+    const WeightFormat * iq4l;
+    explicit IQ4_NL(const WeightFormat * f) : iq4l(f) {}
+    const char * name() const override { return "IQ4_NL"; }
+    Basis basis() const override { return Basis::Plain; }
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
+        if (cols % 128) throw std::runtime_error("IQ4_NL needs a multiple of 128 columns");
+        const int64_t nb = int64_t(rows) * cols / 32;
+        std::vector<uint8_t> w(size_t(nb) * 16);
+        std::vector<uint16_t> d(static_cast<size_t>(nb));
+        for (int64_t b = 0; b < nb; ++b) {
+            const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 18;
+            std::memcpy(&d[size_t(b)], blk, 2);
+            const uint8_t * qs = blk + 2;
+            auto q = [&](int e) { return e < 16 ? qs[e] & 0xF : qs[e - 16] >> 4; };
+            for (int j = 0; j < 16; ++j) w[size_t(b) * 16 + j] = uint8_t(q(2 * j) | (q(2 * j + 1) << 4));
+        }
+        const void * p = up(w.data(), w.size());
+        const void * a = up(d.data(), d.size() * 2);
+        tqllm_cuda::u4h_family_tune(14, static_cast<const uint8_t *>(p), a, rows, cols, s);
+        return {p, ID_IQ4L, rows, cols, a, iq4l};
+    }
+    void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
+        throw std::runtime_error("IQ4_NL is a loader; matrices run as IQ4L");
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error("IQ4_NL is a loader; matrices run as IQ4L");
+    }
+};
 // IQ4_XS (GGUF 23) loader -> IQ4N.
 struct IQ4_XS final : WeightFormat {
     const WeightFormat * iq4n;
     explicit IQ4_XS(const WeightFormat * f) : iq4n(f) {}
     const char * name() const override { return "IQ4_XS"; }
     Basis basis() const override { return Basis::Plain; }
-    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t) const override {
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
         if (cols % 256) throw std::runtime_error("IQ4_XS needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         // natural nibble order for the split-K kernel; the record stays as stored
@@ -265,6 +467,7 @@ struct IQ4_XS final : WeightFormat {
         }
         const void * p = up(w.data(), w.size());
         const void * a = up(rec.data(), rec.size());
+        tqllm_cuda::u4h_family_tune(13, static_cast<const uint8_t *>(p), a, rows, cols, s);
         return {p, ID_IQ4N, rows, cols, a, iq4n};
     }
     void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
@@ -279,6 +482,26 @@ struct IQ4_XS final : WeightFormat {
 // scales, FP16 d): 3.6 bpw on the device. Matvec / dequant: the u4h kernels with FMT 2.
 struct K3 final : WeightFormat {
     const char * name() const override { return "K3"; }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        return expert_gemm_u4h(2, m, x, y, rows, counts, groups, capacity, experts,
+                               topk, per_expert_input, stream);
+    }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input,
+                       cudaStream_t stream) const override {
+        expert_matvec_u4h(2, m, x, y, rows, ids, n, topk, per_expert_input, stream);
+    }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(2, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 576; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 32; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 32 * 12; }
@@ -439,10 +662,130 @@ struct Q4_K final : WeightFormat {
         throw std::runtime_error("Q4_K is a loader; matrices run as U4H");
     }
 };
+}  // namespace
+
+// K6 (engine id 1011): native Q6_K. Per 32 weights 16 nibble bytes in K4 order + 2 words of 2-bit highs; aux = per 256
+// weights the 20-byte K3 record (16 int8 scales, FP16 d); value d * scale * (code - 32).
+struct K6 final : WeightFormat {
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(7, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols,
+                                 counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
+
+    int u4h_id() const override { return 7; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(7, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                   rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+
+    const char * name() const override { return "K6"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(7, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 256; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
+    int max_batch_cols() const override { return 32; }
+    Basis basis() const override { return Basis::Plain; }
+    size_t row_bytes(int cols) const override { return size_t(cols) / 32 * 24; }
+    size_t aux_row_bytes(int cols) const override { return size_t(cols) / 256 * 20; }
+    Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
+        throw std::runtime_error("K6 is produced by the Q6_K loader");
+    }
+    void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::k6_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
+                                   m.cols, n, s);
+    }
+    bool has_matvec_ld() const override { return true; }
+    bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::k6_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::k6_matvec(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows, m.cols,
+                              n, s);
+    }
+    void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
+        tqllm_cuda::k6_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows,
+                                 m.cols, s);
+    }
+};
+// Q6_K (GGUF 14) loader -> K6: block ql[128], qh[64], scales[16], d; per 128 weights (h) element l + 32 q of ql / qh.
+struct Q6_K final : WeightFormat {
+    const WeightFormat * k6;
+    explicit Q6_K(const WeightFormat * c) : k6(c) {}
+    const char * name() const override { return "Q6_K"; }
+    Basis basis() const override { return Basis::Plain; }
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
+        if (cols % 256) throw std::runtime_error("Q6_K needs a multiple of 256 columns");
+        const int64_t nb = int64_t(rows) * cols / 256;
+        std::vector<uint8_t> w6(size_t(nb) * 192, 0), kr(size_t(nb) * 20, 0);
+        uint8_t v[256];
+        for (int64_t b = 0; b < nb; ++b) {
+            const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 210;
+            std::memcpy(kr.data() + b * 20, blk + 192, 18);
+            const uint8_t * ql = blk, * qh = blk + 128;
+            for (int h = 0; h < 2; ++h, ql += 64, qh += 32)
+                for (int l = 0; l < 32; ++l) {
+                    v[128 * h + l] = uint8_t((ql[l] & 0xF) | ((qh[l] & 3) << 4));
+                    v[128 * h + l + 32] = uint8_t((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4));
+                    v[128 * h + l + 64] = uint8_t((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4));
+                    v[128 * h + l + 96] = uint8_t((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4));
+                }
+            for (int e = 0; e < 256; ++e) {
+                uint8_t * out = w6.data() + size_t(b) * 192 + (e / 32) * 24;
+                const int h = (e % 32) / 16, ei = e % 16, u = ei / 4, j = ei % 4;
+                out[h * 8 + (u / 2) * 4 + j] |= uint8_t((v[e] & 0xF) << ((u % 2) * 4));
+                out[16 + 4 * h + (2 * ei) / 8] |= uint8_t(((v[e] >> 4) & 3) << ((2 * ei) % 8));
+            }
+        }
+        const void * p = up(w6.data(), w6.size());
+        const void * a = up(kr.data(), kr.size());
+        tqllm_cuda::k6_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
+        return {p, ID_K6, rows, cols, a, k6};
+    }
+    void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
+        throw std::runtime_error("Q6_K is a loader; matrices run as K6");
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error("Q6_K is a loader; matrices run as K6");
+    }
+};
 // K5 (engine id 1010): native Q5_K. Per 32 weights 16 nibble bytes in K4 order + one word of high code bits; aux = the
 // 16-byte Q5_K header (d, dmin, scales) per 256 weights per row.
 struct K5 final : WeightFormat {
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(6, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols,
+                                 counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
+
+    int u4h_id() const override { return 6; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(6, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                   rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+
     const char * name() const override { return "K5"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(6, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override { return 352; }  // fused vs dequant + cuBLAS crossover (GB10 gemm-bench)
     int max_batch_cols() const override { return 32; }
     Basis basis() const override { return Basis::Plain; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 32 * 20; }
@@ -451,7 +794,8 @@ struct K5 final : WeightFormat {
         throw std::runtime_error("K5 is produced by the Q5_K loader");
     }
     void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
-        tqllm_cuda::k5_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows, m.cols, n, s);
+        tqllm_cuda::k5_matvec_bf16(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
+                                   m.cols, n, s);
     }
     bool has_matvec_ld() const override { return true; }
     bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
@@ -459,10 +803,12 @@ struct K5 final : WeightFormat {
         return true;
     }
     void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
-        tqllm_cuda::k5_matvec(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows, m.cols, n, s);
+        tqllm_cuda::k5_matvec(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows, m.cols,
+                              n, s);
     }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
-        tqllm_cuda::k5_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows, m.cols, s);
+        tqllm_cuda::k5_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows,
+                                 m.cols, s);
     }
 };
 // Q5_K (GGUF 13) loader -> K5: block d, dmin, scales[12], qh[32], qs[128]; element e: nibble of qs[(e / 64) * 32 + e % 32]
@@ -501,8 +847,127 @@ struct Q5_K final : WeightFormat {
         throw std::runtime_error("Q5_K is a loader; matrices run as K5");
     }
 };
-}  // namespace
-
+// UD low-bit types (engine ids 1012..1016, kernel fmt 8..12) on the u4h kernel: per 32 weights the GGUF block's code
+// bytes, per row and 256 weights a record of its scalars (kernels/quant_kernels.cuh, udq_*).
+struct Udq final : WeightFormat {
+    int u4h_id() const override { return fmt == 10 ? 10 : -1; }
+    bool has_expert_matvec() const override { return true; }  // every UD format (grouped kernels cover u4h fmt 0..15)
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                  rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y,
+                                rows, m.cols, counts, groups, capacity, experts, topk, per_expert_input, stream);
+        return true;
+    }
+    const char * nm;
+    int fmt, bpb, rb;
+    Udq(const char * n, int f, int b, int r) : nm(n), fmt(f), bpb(b), rb(r) {}
+    const char * name() const override { return nm; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(m, x, y, n, m.rows, s);
+    }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int fused_gemm_cols() const override {  // crossover vs dequant + cuBLAS (GB10 gemm-bench), fmt 8..12
+        static const int c[5] = {832, 768, 576, 384, 768};
+        return c[fmt - 8];
+    }
+    int max_batch_cols() const override { return 32; }
+    Basis basis() const override { return Basis::Plain; }
+    size_t row_bytes(int cols) const override { return size_t(cols) / 32 * bpb; }
+    size_t aux_row_bytes(int cols) const override { return size_t(cols) / 256 * rb; }
+    Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
+        throw std::runtime_error(std::string(nm) + " is produced by its GGUF loader");
+    }
+    void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::udq_matvec_bf16(fmt, static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
+                                    m.cols, n, s);
+    }
+    bool has_matvec_ld() const override { return true; }
+    bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::udq_matvec_bf16(fmt, static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
+                                    m.cols, n, s, ldy);
+        return true;
+    }
+    void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::udq_matvec(fmt, static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), x, y, m.rows,
+                               m.cols, n, s);
+    }
+    void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
+        tqllm_cuda::udq_dequant_h(fmt, static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows,
+                                  m.cols, s);
+    }
+};
+// GGUF loaders for the UD types: split each 256-weight block into per-32 code bytes and the record.
+struct UdqLoader final : WeightFormat {
+    const WeightFormat * fmt;
+    const char * nm;
+    uint32_t id;
+    int gguf_type, block_bytes, bpb, rb;
+    UdqLoader(const WeightFormat * f, const char * n, uint32_t i, int t, int bb, int b, int r)
+        : fmt(f), nm(n), id(i), gguf_type(t), block_bytes(bb), bpb(b), rb(r) {}
+    const char * name() const override { return nm; }
+    Basis basis() const override { return Basis::Plain; }
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
+        if (cols % 256) throw std::runtime_error(std::string(nm) + " needs a multiple of 256 columns");
+        const int64_t nb = int64_t(rows) * cols / 256;
+        std::vector<uint8_t> w(size_t(nb) * 8 * bpb, 0), rec(size_t(nb) * rb, 0);
+        for (int64_t b = 0; b < nb; ++b) {
+            const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * block_bytes;
+            uint8_t * o = w.data() + size_t(b) * 8 * bpb, * r = rec.data() + size_t(b) * rb;
+            switch (gguf_type) {
+                case 16:  // IQ2_XXS: d, qs[64] (8 bytes per 32)
+                    std::memcpy(r, blk, 2);
+                    std::memcpy(o, blk + 2, 64);
+                    break;
+                case 17:  // IQ2_XS: d, qs[64] (8 bytes per 32), scales[8]
+                    std::memcpy(r, blk, 2);
+                    std::memcpy(r + 4, blk + 66, 8);
+                    std::memcpy(o, blk + 2, 64);
+                    break;
+                case 22:  // IQ2_S: d, qs[32] grid low bytes, signs[32], qh[8], scales[8]
+                    std::memcpy(r, blk, 2);
+                    std::memcpy(r + 2, blk + 66, 16);
+                    for (int ib = 0; ib < 8; ++ib) {
+                        std::memcpy(o + ib * 8, blk + 2 + ib * 4, 4);
+                        std::memcpy(o + ib * 8 + 4, blk + 34 + ib * 4, 4);
+                    }
+                    break;
+                case 19:  // IQ1_S: d, qs[32] (4 bytes per 32), qh[8] x uint16
+                    std::memcpy(r, blk, 2);
+                    std::memcpy(r + 2, blk + 34, 16);
+                    std::memcpy(o, blk + 2, 32);
+                    break;
+                case 10:  // Q2_K: scales[16], qs[64], d, dmin; code of weight e: qs[(e / 128) * 32 + e % 32] >> 2 ((e % 128) / 32)
+                    std::memcpy(r, blk, 16);
+                    std::memcpy(r + 16, blk + 80, 4);
+                    for (int e = 0; e < 256; ++e) {
+                        const uint32_t q = (blk[16 + (e / 128) * 32 + e % 32] >> (2 * ((e % 128) / 32))) & 3;
+                        const int word = (e / 32) * 2 + (e % 32) / 16, ei = e % 16;
+                        o[word * 4 + (2 * ei) / 8] |= uint8_t(q << ((2 * ei) % 8));
+                    }
+                    break;
+            }
+        }
+        const void * p = up(w.data(), w.size());
+        const void * a = up(rec.data(), rec.size());
+        tqllm_cuda::udq_tune(int(id - ID_UDQ) + 8, static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
+        return {p, id, rows, cols, a, fmt};
+    }
+    void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
+        throw std::runtime_error(std::string(nm) + " is a loader");
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error(std::string(nm) + " is a loader");
+    }
+};
 void register_q4() {  // no weight_format() lookups here: registration runs inside the registry's call_once
     auto u4h = std::make_unique<U4h>();
     auto w4s = std::make_unique<W4s>();
@@ -515,24 +980,43 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     auto iq3s = std::make_unique<IQ3_S>(iq3.get());
     auto iq4n = std::make_unique<Iq4n>();
     auto iq4xs = std::make_unique<IQ4_XS>(iq4n.get());
+    auto iq4l = std::make_unique<Iq4l>();
+    auto iq4nl = std::make_unique<IQ4_NL>(iq4l.get());
     auto q3k = std::make_unique<Q3_K>(k3.get());
     auto q4k = std::make_unique<Q4_K>(k4.get());
     auto k5 = std::make_unique<K5>();
+    auto k6 = std::make_unique<K6>();
+    auto q6k = std::make_unique<Q6_K>(k6.get());
     auto q5k = std::make_unique<Q5_K>(k5.get());
     register_weight_format(ID_U4H, std::move(u4h));
     register_weight_format(ID_W4S, std::move(w4s));
     register_weight_format(ID_K4, std::move(k4));
     register_weight_format(ID_K3, std::move(k3));
     register_weight_format(ID_IQ4N, std::move(iq4n));
+    register_weight_format(ID_IQ4L, std::move(iq4l));
     register_weight_format(ID_IQ3, std::move(iq3));
     register_weight_format(ID_IQ3X, std::move(iq3x));
     register_weight_format(18, std::move(iq3xxs));
     register_weight_format(21, std::move(iq3s));
     register_weight_format(23, std::move(iq4xs));
+    register_weight_format(20, std::move(iq4nl));
     register_weight_format(11, std::move(q3k));
     register_weight_format(2, std::move(q40));
     register_weight_format(12, std::move(q4k));
     register_weight_format(ID_K5, std::move(k5));
     register_weight_format(13, std::move(q5k));
+    register_weight_format(ID_K6, std::move(k6));
+    register_weight_format(14, std::move(q6k));
+    struct UdType { const char * fmt_name, * gguf_name; int gguf_type, block_bytes, bpb, rb; };
+    static const UdType ud[] = {{"IQ2X", "IQ2_XXS", 16, 66, 8, 4}, {"IQ2W", "IQ2_XS", 17, 74, 8, 12},
+                                {"IQ2S", "IQ2_S", 22, 82, 8, 20}, {"IQ1S", "IQ1_S", 19, 50, 4, 20},
+                                {"K2", "Q2_K", 10, 84, 8, 20}};
+    for (int i = 0; i < 5; ++i) {
+        const auto & t = ud[i];
+        auto f = std::make_unique<Udq>(t.fmt_name, 8 + i, t.bpb, t.rb);
+        auto l = std::make_unique<UdqLoader>(f.get(), t.gguf_name, ID_UDQ + i, t.gguf_type, t.block_bytes, t.bpb, t.rb);
+        register_weight_format(ID_UDQ + i, std::move(f));
+        register_weight_format(uint32_t(t.gguf_type), std::move(l));
+    }
 }
 }  // namespace tqllm::formats

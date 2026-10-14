@@ -37,7 +37,13 @@ int attention_gen_partial_floats(int heads, int context, int nq);
 void attention_gen128(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
                       float * part, const int * dpos, int nq, int max_seq, int heads, int kvheads, float scale,
                       bool causal, int window, cudaStream_t, int ring = 0);
-// Multi-query verify attention for head_dim 256 (nq * group <= 64): query z sees keys [0, *dseq0 + z). K/V tiles are
+// The same for head_dim 256 (DSpark drafter), full context (no window / ring); part: attention_gen256_partial_floats.
+void attention_gen256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
+                      float * part, const int * dpos, int nq, int max_seq, int heads, int kvheads, float scale,
+                      bool causal, cudaStream_t);
+int attention_gen256_partial_floats(int heads, int context, int nq);
+// Multi-query attention for head_dim 256: query z sees keys [0, *dseq0 + z). Linear blocks are split to fit 48 rows.
+// K/V tiles are
 // loaded once per block for all queries; fixed split count (no context-dependent grid). part: attention_mq_partial_floats.
 int attention_mq_partial_floats(int heads, int nq, int nsplit);
 // par (device, nq entries, parent column or -1): two-part tree attention (BF16 K/V; partials need nsplit + 1 splits)

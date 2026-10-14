@@ -14,6 +14,9 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
+| `TQLLM_MOE_FUSE_SHARED` | on | 0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches |  |
+| `TQLLM_MOE_STAGE` | on | 0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics) |  |
+| `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
 | `TQLLM_MLX_AFFINE_FFN` | unset (backend default) | Experimental Apple MLX affine ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
 | `TQLLM_MLX_AFFINE_GU` | unset (backend default) | Experimental Apple MLX affine gu override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
@@ -153,3 +156,4 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_TREE_TEMP` | - | removed | removed (1.0) |
 | `TQLLM_U4H` | - | removed | removed |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
+| `TQLLM_MOE_DEV` | - | removed | nothing: qwen35moe (MoE) models load by default |

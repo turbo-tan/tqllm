@@ -50,6 +50,23 @@ struct Composite final : WeightFormat {
             r0 += m.rows;
         }
     }
+    int fused_gemm_cols() const override {
+        int c = ps[0].fmt->fused_gemm_cols();
+        for (const auto & m : ps) c = std::min(c, m.fmt->fused_gemm_cols());
+        return c;
+    }
+    bool gemm(const Mat & c, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        return gemm_ld(c, x, y, n, c.rows, s);
+    }
+    bool gemm_ld(const Mat &, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        if (fused_gemm_cols() < n) return false;  // every part must take the fused path
+        int r0 = 0;
+        for (const auto & m : ps) {
+            if (!m.fmt->gemm_ld(m, x, y + r0, n, ldy, s)) throw std::runtime_error(std::string(m.fmt->name()) + ": no strided gemm");
+            r0 += m.rows;
+        }
+        return true;
+    }
     const std::vector<Mat> * parts() const override { return &ps; }
 };
 }  // namespace

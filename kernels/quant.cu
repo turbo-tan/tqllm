@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <cstring>
 #include "../src/debug.hpp"
 #include <cstdio>
 #include <utility>
@@ -8,6 +10,7 @@
 #include <cuda_fp16.h>
 
 #include <cmath>
+#include <climits>
 #include <math_constants.h>
 #include <stdexcept>
 #include <type_traits>
@@ -44,6 +47,47 @@ __global__ void tq3_rotate_k(const __nv_bfloat16 * x, float * xr, int total_bloc
     if (warp >= total_blocks) return;
     const int64_t i = int64_t(warp) * 32 + lane;
     xr[i] = wht32(__bfloat162float(x[i]) * TQ3_SIGNS[lane], lane);
+}
+
+__global__ void tq3_rotate_f32_k(const float * x, float * xr, int total_blocks) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    if (warp >= total_blocks) return;
+    const int64_t i = int64_t(warp) * 32 + lane;
+    xr[i] = wht32(x[i] * TQ3_SIGNS[lane], lane);
+}
+
+template<bool Repacked>
+__global__ void tq3_matvec_f32_raw_k(const uint4 * weights, const float * xr, float * y, int rows, int k) {
+    const int row = blockIdx.x, token = blockIdx.y, blocks = k / 32;
+    const float * x = xr + int64_t(token) * k;
+    float sum = 0.f;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const uint4 q = weights[int64_t(row) * blocks + b];
+        const uint32_t groups[4] = {q.y, (q.y >> 24) | (q.z << 8), (q.z >> 16) | (q.w << 16), q.w >> 8};
+        for (int g = 0; g < 4; ++g) {
+            float part = 0.f;
+            for (int j = 0; j < 8; ++j) {
+                uint32_t index;
+                if constexpr (Repacked) {
+                    const uint32_t words[3] = {q.y, q.z, q.w};
+                    index = g < 3 ? (words[g] >> (4 * j)) & 7u :
+                        ((q.y >> (4 * j + 3)) & 1u) | (((q.z >> (4 * j + 3)) & 1u) << 1) |
+                        (((q.w >> (4 * j + 3)) & 1u) << 2);
+                } else index = (groups[g] >> (3 * j)) & 7u;
+                part += TQ3_CODEBOOK[index] * x[b * 32 + g * 8 + j];
+            }
+            sum += e3m5((q.x >> (8 * g)) & 255) * part;
+        }
+    }
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+    __shared__ float partial[8];
+    if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.f;
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        if (threadIdx.x == 0) y[int64_t(token) * rows + row] = sum;
+    }
 }
 
 __global__ void tq3_row_k(const uint4 * w, int row, __nv_bfloat16 * y, int nblk, const uint32_t * dtok = nullptr) {
@@ -442,9 +486,16 @@ __device__ __forceinline__ uint32_t hfma2u(uint32_t a, uint32_t b, uint32_t c) {
 // MMA u (0..7) takes, from lane t, elements 4u..4u+3 of lane t's block, so the activation fragment of lane t is
 // simply the 32 halves of that block. Decode: int8 codebook (+128) -> PRMT into fp16 (1024 + u) -> HFMA2 with
 // (s, -1152 s), exact for E3M5 scales.
-template <int NCOL>
+template <int NCOL, bool EXPERT = false>
 __global__ void __launch_bounds__(256) tq3_matvec_h_k(const uint4 * w, const __half * xh, __nv_bfloat16 * y, int rows,
-                                                      int k, uint32_t cblo_u, uint32_t cbhi_u) {
+                                                      int k, uint32_t cblo_u, uint32_t cbhi_u,
+                                                      const int * ids = nullptr, int topk = 1, bool per_expert = false) {
+    if constexpr (EXPERT) {
+        const int assignment = blockIdx.y;
+        w += int64_t(ids[assignment]) * rows * (k / 32);
+        xh += int64_t(per_expert ? assignment : assignment / topk) * k;
+        y += int64_t(assignment) * rows;
+    }
     constexpr int NACC = NCOL > 8 ? 8 : 4;
     __shared__ float red[8][32][NACC];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
@@ -1166,17 +1217,356 @@ __device__ __forceinline__ __half2 iq3x_sm(const uint8_t * rec, uint32_t a) {
     return __floats2half2_rn(db, -64.f * db);
 }
 
-template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0>
-__global__ void __launch_bounds__(256) u4h_matvec_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
+// UD low-bit types on the u4h kernel (FMT 8 IQ2_XXS, 9 IQ2_XS, 10 IQ2_S, 11 IQ1_S, 12 Q2_K): per 32 weights 1-2 code
+// words as stored in the GGUF block, per row and 256 weights a record of the block's scalars. Grids: llama.cpp (MIT),
+// used only to read these files (see NOTICE).
+__device__ const uint64_t iq2xxs_grid_d[256] = {
+#include "iq2xxs_grid.inc"
+};
+__device__ const uint64_t iq2xs_grid_d[512] = {
+#include "iq2xs_grid.inc"
+};
+__device__ const uint64_t iq2s_grid_d[1024] = {
+#include "iq2s_grid.inc"
+};
+__device__ const uint64_t iq1s_grid_d[2048] = {
+#include "iq1s_grid.inc"
+};
+__host__ __device__ constexpr int ud_bpb(int f) { return f == 11 ? 4 : 8; }    // code bytes per 32 weights
+__host__ __device__ constexpr int ud_rb(int f) { return f == 8 ? 4 : f == 9 ? 12 : 20; }  // record bytes per 256
+__host__ __device__ constexpr int ud_grid_words(int f) {
+    return f == 4 ? 512 : f == 5 ? 256 : f == 8 ? 512 : f == 9 ? 1024 : f == 10 ? 2048 : f == 11 ? 4096 : 1;
+}
+template <int FMT>
+__device__ __forceinline__ const uint32_t * ud_grid_src() {
+    if constexpr (FMT == 8) return reinterpret_cast<const uint32_t *>(iq2xxs_grid_d);
+    else if constexpr (FMT == 9) return reinterpret_cast<const uint32_t *>(iq2xs_grid_d);
+    else if constexpr (FMT == 10) return reinterpret_cast<const uint32_t *>(iq2s_grid_d);
+    else return reinterpret_cast<const uint32_t *>(iq1s_grid_d);
+}
+// codes (one byte per weight, value = code * s + m) of 16-group h of 32-block s; c[u] holds weights 4u..4u+3 of the group
+template <int FMT>
+__device__ __forceinline__ void ud_group(uint32_t w0, uint32_t w1, const uint8_t * rec, int s, int h, const uint32_t * grid,
+                                         uint32_t c[4], __half2 & sm) {
+    if constexpr (FMT == 12) {  // Q2_K: 2-bit codes of group h at bits 2 e of word h; record scales[16], d, dmin
+        const uint8_t sc = __ldg(rec + (s % 8) * 2 + h);
+        const float d = __half2float(__ldg(reinterpret_cast<const __half *>(rec + 16)));
+        const float dm = __half2float(__ldg(reinterpret_cast<const __half *>(rec + 18)));
+        const uint32_t v = h ? w1 : w0;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const uint32_t x = (v >> (8 * u)) & 0xFF;
+            c[u] = (x & 3u) | ((x & 0xCu) << 6) | ((x & 0x30u) << 12) | ((x & 0xC0u) << 18);
+        }
+        sm = __floats2half2_rn(d * float(sc & 0xF), -dm * float(sc >> 4));
+        return;
+    }
+    const float d = __half2float(__ldg(reinterpret_cast<const __half *>(rec)));
+    if constexpr (FMT == 11) {  // IQ1_S: 11-bit index (qs byte, 3 qh bits), grid -1 / 0 / 1; code 8 g + 16 +- 1
+        const uint32_t qh = __ldg(reinterpret_cast<const uint16_t *>(rec + 2) + s % 8);
+        const float dl = d * float(2 * ((qh >> 12) & 7) + 1);
+        const uint32_t add = (qh & 0x8000u) ? 0x07070707u : 0x09090909u;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int w = 4 * h + u, l = w / 2;
+            const uint32_t idx = ((w0 >> (8 * l)) & 0xFF) | (((qh >> (3 * l)) & 7) << 8);
+            c[u] = (__vadd4(grid[2 * idx + (w & 1)], 0x01010101u) << 3) + add;
+        }
+        sm = __floats2half2_rn(0.125f * dl, -2.f * dl);
+        return;
+    }
+    float db;
+    if constexpr (FMT == 8) {  // IQ2_XXS: 4 grid bytes (w0); w1 = 4 x 7-bit sign index + 4-bit scale
+        db = d * (0.5f + float(w1 >> 28)) * 0.25f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int w = 4 * h + u;
+            c[u] = iq3x_code(grid[2 * ((w0 >> (8 * (w / 2))) & 0xFF) + (w & 1)], iq3x_signs(w1, w));
+        }
+    } else if constexpr (FMT == 9) {  // IQ2_XS: 4 x uint16 (9-bit index, 7-bit sign index); record d, pad, scales[8]
+        const uint8_t sc = __ldg(rec + 4 + s % 8);
+        db = d * (0.5f + float(h ? sc >> 4 : sc & 0xF)) * 0.25f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int w = 4 * h + u, l = w / 2;
+            const uint32_t q = ((l < 2 ? w0 : w1) >> (16 * (l & 1))) & 0xFFFF, i7 = q >> 9;
+            const uint32_t sg = i7 | ((__popc(i7) & 1) << 7);
+            c[u] = iq3x_code(grid[2 * (q & 511) + (w & 1)], (sg >> (4 * (w & 1))) & 0xF);
+        }
+    } else {  // IQ2_S: 4 grid low bytes (w0), 4 sign bytes (w1); record d, qh[8], scales[8]
+        const uint32_t qh = __ldg(rec + 2 + s % 8);
+        const uint8_t sc = __ldg(rec + 10 + s % 8);
+        db = d * (0.5f + float(h ? sc >> 4 : sc & 0xF)) * 0.25f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int w = 4 * h + u, l = w / 2;
+            const uint32_t idx = ((w0 >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
+            c[u] = iq3x_code(grid[2 * idx + (w & 1)], ((w1 >> (8 * l)) >> (4 * (w & 1))) & 0xF);
+        }
+    }
+    sm = __floats2half2_rn(db, -64.f * db);
+}
+
+// IQ4_NL codebook (llama.cpp kvalues_iq4nl, MIT; see NOTICE) as level + 128 bytes: 4 nibbles -> 4 code bytes
+__device__ __forceinline__ uint32_t iq4nl_codes(uint32_t c) {
+    constexpr uint32_t L0 = 0x3F2D1801u, L1 = 0x766A5D4Fu, L2 = 0xA6998D81u, L3 = 0xF1D9C5B5u;
+    const uint32_t sel = c & 0x7777u;
+    return __byte_perm(__byte_perm(L0, L1, sel), __byte_perm(L2, L3, sel), 0x3210u | ((c >> 1) & 0x4444u));
+}
+// One lane's 32-weight block s of rows ra and rb in the u4h-family layout: load() reads its codes and (scale, min) pairs,
+// codes(h) returns the code bytes of 16-group h (value = code * scale + min). Shared by u4h_matvec_k and u4h_gemm_k.
+// TQFN_TILED expert banks: the code bytes of 16-row x 4-block tiles are stored lane-contiguous (row-in-tile major, then
+// block-in-quad), so the 32 lanes of a warp load one contiguous run instead of 8 strided row pieces. Same bytes, same math.
+__constant__ int c_tiled_experts = 0;
+__host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
+__device__ __forceinline__ int64_t u4h_block_off(int r, int s, int nb, int bpb, bool tiled) {
+    if (!tiled) return (int64_t(r) * nb + s) * bpb;
+    return (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
+}
+template <int FMT, bool GROUPED = false>
+struct U4hTile {
+    uint4 wa = make_uint4(0, 0, 0, 0), wb = make_uint4(0, 0, 0, 0);
+    uint32_t ha = 0, hb = 0, ha2 = 0, hb2 = 0;  // k5: the block's 32 high code bits; k6: 2 high bits per code (2 words)
+    const uint8_t * ua = nullptr, * ub = nullptr;  // UD types: the 32-block's record
+    uint32_t sa[2] = {}, ma[2] = {}, sb[2] = {}, mb[2] = {};
+    uint4 wa2 = make_uint4(0, 0, 0, 0), wb2 = make_uint4(0, 0, 0, 0);  // i8h: the block's second 16 codes
+    static __device__ __forceinline__ void pk(__half2 p, uint32_t & sv, uint32_t & mv) {
+        const __half2 s2 = __low2half2(p), m2 = __high2half2(p);
+        sv = *reinterpret_cast<const uint32_t *>(&s2);
+        mv = *reinterpret_cast<const uint32_t *>(&m2);
+    }
+    __device__ __forceinline__ void load(const uint8_t * w4, const __half2 * sm, int k, int ra, int rb, int s, int nb, bool ok) {
+        if (ok) {
+            const bool tl = GROUPED && tiled_bpb(FMT) && c_tiled_experts;
+            if constexpr (FMT == 13 || FMT == 14) {  // IQ4N / IQ4L: 16 B natural nibbles per 32 weights
+                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(ra, s, nb, 16, tl)));
+                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(rb, s, nb, 16, tl)));
+                float fa, fb;
+                if constexpr (FMT == 13) {  // 8-byte record per 256: d, scales_h, scales_l[4]; scale d * (ls - 32)
+                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                    auto sc = [&](int r) {
+                        const uint2 rr = __ldg(reinterpret_cast<const uint2 *>(kh + (int64_t(r) * (k / 256) + s / 8) * 8));
+                        const int sub = s % 8;
+                        const int ls = int((rr.y >> (4 * sub)) & 0xF) | int((((rr.x >> 16) >> (2 * sub)) & 3) << 4);
+                        return __half2float(__ushort_as_half(uint16_t(rr.x & 0xFFFFu))) * float(ls - 32);
+                    };
+                    fa = sc(ra), fb = sc(rb);
+                } else {  // FP16 scale per 32
+                    const auto * sh = reinterpret_cast<const __half *>(sm);
+                    fa = __half2float(__ldg(sh + int64_t(ra) * nb + s)), fb = __half2float(__ldg(sh + int64_t(rb) * nb + s));
+                }
+                pk(__floats2half2_rn(fa, -128.f * fa), sa[0], ma[0]);
+                pk(__floats2half2_rn(fb, -128.f * fb), sb[0], mb[0]);
+                sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
+            } else if constexpr (FMT == 15) {  // I8H: 32 int8 per 32 weights, FP16 scale per 16
+                const auto * pa = reinterpret_cast<const uint4 *>(w4 + int64_t(ra) * k + int64_t(s) * 32);
+                const auto * pb = reinterpret_cast<const uint4 *>(w4 + int64_t(rb) * k + int64_t(s) * 32);
+                wa = __ldg(pa), wa2 = __ldg(pa + 1), wb = __ldg(pb), wb2 = __ldg(pb + 1);
+                const auto * sh = reinterpret_cast<const __half *>(sm);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float fa = __half2float(__ldg(sh + int64_t(ra) * (k / 16) + 2 * s + h));
+                    const float fb = __half2float(__ldg(sh + int64_t(rb) * (k / 16) + 2 * s + h));
+                    pk(__floats2half2_rn(fa, -128.f * fa), sa[h], ma[h]);
+                    pk(__floats2half2_rn(fb, -128.f * fb), sb[h], mb[h]);
+                }
+            } else if constexpr (FMT == 5) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(ra, s, nb, 12, tl));
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(rb, s, nb, 12, tl));
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), 0);
+                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), 0);
+                pk(iq3x_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 4, wa.z), sa[0], ma[0]);
+                pk(iq3x_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 4, wb.z), sb[0], mb[0]);
+                sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
+            } else if constexpr (FMT == 4) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(ra, s, nb, 12, tl));
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(rb, s, nb, 12, tl));
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 16, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 16;
+                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(rca + 2 + s % 8));
+                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(rcb + 2 + s % 8));
+                pk(iq3_sm(rca, s % 8), sa[0], ma[0]);
+                pk(iq3_sm(rcb, s % 8), sb[0], mb[0]);
+                sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
+            } else if constexpr (FMT == 2) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 12);
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 12);
+                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), 0);
+                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), 0);
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 20, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 20;
+                const float da = __half2float(__ldg(reinterpret_cast<const __half *>(rca + 16)));
+                const float db = __half2float(__ldg(reinterpret_cast<const __half *>(rcb + 16)));
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float fa = da * float(int8_t(__ldg(rca + (s % 8) * 2 + h)));
+                    const float fb = db * float(int8_t(__ldg(rcb + (s % 8) * 2 + h)));
+                    pk(__floats2half2_rn(fa, -4.f * fa), sa[h], ma[h]);
+                    pk(__floats2half2_rn(fb, -4.f * fb), sb[h], mb[h]);
+                }
+            } else if constexpr (FMT >= 8) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(ra, s, nb, ud_bpb(FMT), tl));
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(rb, s, nb, ud_bpb(FMT), tl));
+                wa.x = __ldg(wpa), wb.x = __ldg(wpb);
+                if constexpr (ud_bpb(FMT) == 8) wa.y = __ldg(wpa + 1), wb.y = __ldg(wpb + 1);
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                ua = kh + (int64_t(ra) * (k / 256) + s / 8) * ud_rb(FMT);
+                ub = kh + (int64_t(rb) * (k / 256) + s / 8) * ud_rb(FMT);
+            } else if constexpr (FMT == 7) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 24);
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 24);
+                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(wpa + 3));
+                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(wpb + 3));
+                ha = __ldg(wpa + 4), ha2 = __ldg(wpa + 5), hb = __ldg(wpb + 4), hb2 = __ldg(wpb + 5);
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 20, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 20;
+                const float da = __half2float(__ldg(reinterpret_cast<const __half *>(rca + 16)));
+                const float db = __half2float(__ldg(reinterpret_cast<const __half *>(rcb + 16)));
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float fa = da * float(int8_t(__ldg(rca + (s % 8) * 2 + h)));
+                    const float fb = db * float(int8_t(__ldg(rcb + (s % 8) * 2 + h)));
+                    pk(__floats2half2_rn(fa, -32.f * fa), sa[h], ma[h]);
+                    pk(__floats2half2_rn(fb, -32.f * fb), sb[h], mb[h]);
+                }
+            } else if constexpr (FMT == 6) {
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 20);
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 20);
+                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(wpa + 3));
+                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(wpb + 3));
+                ha = __ldg(wpa + 4), hb = __ldg(wpb + 4);
+                const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                pk(k4_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 16, s % 8), sa[0], ma[0]);
+                pk(k4_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 16, s % 8), sb[0], mb[0]);
+                sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
+            } else {
+                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(ra) * (k / 2) + int64_t(s) * 16));
+                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(rb) * (k / 2) + int64_t(s) * 16));
+                __half2 pa, pb;
+                if constexpr (FMT == 1) {
+                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
+                    pa = k4_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 16, s % 8);
+                    pb = k4_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 16, s % 8);
+                } else {
+                    pa = sm[int64_t(ra) * nb + s], pb = sm[int64_t(rb) * nb + s];
+                }
+                pk(pa, sa[0], ma[0]);
+                pk(pb, sb[0], mb[0]);
+                sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
+            }
+        }
+    }
+    __device__ __forceinline__ void codes(int h, int s, bool ok, const uint32_t * grid, uint32_t wa4[4], uint32_t wb4[4]) {
+        if constexpr (FMT == 13 || FMT == 14) {  // weights 16h + 4u .. + 3: nibbles of 16-bit half (u & 1) of word 2h + u / 2
+            const uint32_t a2[2] = {h ? wa.z : wa.x, h ? wa.w : wa.y}, b2[2] = {h ? wb.z : wb.x, h ? wb.w : wb.y};
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                wa4[u] = iq4nl_codes((a2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                wb4[u] = iq4nl_codes((b2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+            }
+            return;
+        } else if constexpr (FMT == 15) {  // int8 -> code + 128
+            const uint4 qa = h ? wa2 : wa, qb = h ? wb2 : wb;
+            wa4[0] = qa.x ^ 0x80808080u, wa4[1] = qa.y ^ 0x80808080u, wa4[2] = qa.z ^ 0x80808080u, wa4[3] = qa.w ^ 0x80808080u;
+            wb4[0] = qb.x ^ 0x80808080u, wb4[1] = qb.y ^ 0x80808080u, wb4[2] = qb.z ^ 0x80808080u, wb4[3] = qb.w ^ 0x80808080u;
+            return;
+        }
+        if constexpr (FMT >= 8) {
+            __half2 pa = __floats2half2_rn(0.f, 0.f), pb = pa;
+            if (ok) {
+                ud_group<FMT>(wa.x, wa.y, ua, s, h, grid, wa4, pa);
+                ud_group<FMT>(wb.x, wb.y, ub, s, h, grid, wb4, pb);
+            } else {
+#pragma unroll
+                for (int u = 0; u < 4; ++u) wa4[u] = wb4[u] = 0;
+            }
+            pk(pa, sa[h], ma[h]);
+            pk(pb, sb[h], mb[h]);
+        } else if constexpr (FMT == 5) {
+            const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int w = 4 * h + u;
+                wa4[u] = iq3x_code(grid[(qa >> (8 * u)) & 0xFF], iq3x_signs(wa.z, w));
+                wb4[u] = iq3x_code(grid[(qb >> (8 * u)) & 0xFF], iq3x_signs(wb.z, w));
+            }
+        } else if constexpr (FMT == 4) {  // words 4h + u: index = qs byte | qh bit << 8; signs nibble of byte (4h + u) / 2
+            const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int w = 4 * h + u;
+                const uint32_t ia = ((qa >> (8 * u)) & 0xFF) | (((wa.w >> w) & 1) << 8);
+                const uint32_t ib2 = ((qb >> (8 * u)) & 0xFF) | (((wb.w >> w) & 1) << 8);
+                wa4[u] = iq3_code(grid[ia], (wa.z >> (4 * w)) & 0xF);
+                wb4[u] = iq3_code(grid[ib2], (wb.z >> (4 * w)) & 0xF);
+            }
+        } else if constexpr (FMT == 2) {
+            const uint32_t la = h ? wa.y : wa.x, lb = h ? wb.y : wb.x;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                wa4[u] = ((la >> (2 * u)) & 0x03030303u) | (((wa.z >> (u + 4 * h)) & 0x01010101u) << 2);
+                wb4[u] = ((lb >> (2 * u)) & 0x03030303u) | (((wb.z >> (u + 4 * h)) & 0x01010101u) << 2);
+            }
+        } else {
+            const uint32_t a0 = h ? wa.z : wa.x, a1 = h ? wa.w : wa.y, b0 = h ? wb.z : wb.x, b1 = h ? wb.w : wb.y;
+            wa4[0] = a0 & 0x0F0F0F0Fu, wa4[1] = (a0 >> 4) & 0x0F0F0F0Fu, wa4[2] = a1 & 0x0F0F0F0Fu, wa4[3] = (a1 >> 4) & 0x0F0F0F0Fu;
+            wb4[0] = b0 & 0x0F0F0F0Fu, wb4[1] = (b0 >> 4) & 0x0F0F0F0Fu, wb4[2] = b1 & 0x0F0F0F0Fu, wb4[3] = (b1 >> 4) & 0x0F0F0F0Fu;
+            if constexpr (FMT == 7) {  // high 2 bits of code 4u + j (group h): bits 2 (4u + j) of word h
+                auto spread2 = [](uint32_t v) {  // 4 x 2 bits -> bits 4-5 of 4 bytes
+                    return ((v & 3u) | ((v & 0xCu) << 6) | ((v & 0x30u) << 12) | ((v & 0xC0u) << 18)) << 4;
+                };
+                const uint32_t xa = h ? ha2 : ha, xb = h ? hb2 : hb;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    wa4[u] |= spread2((xa >> (8 * u)) & 0xFF);
+                    wb4[u] |= spread2((xb >> (8 * u)) & 0xFF);
+                }
+            }
+            if constexpr (FMT == 6) {  // high bit of code 4u + j (group h) is bit 16 h + 4 u + j
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    wa4[u] |= ((((ha >> (16 * h + 4 * u)) & 0xF) * 0x00204081u) & 0x01010101u) << 4;
+                    wb4[u] |= ((((hb >> (16 * h + 4 * u)) & 0xF) * 0x00204081u) & 0x01010101u) << 4;
+                }
+            }
+        }
+    }
+};
+
+#ifndef U4H_DENSE_MINB
+#define U4H_DENSE_MINB 1
+#endif
+template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false>
+__global__ void __launch_bounds__(256, GROUPED ? 4 : U4H_DENSE_MINB) u4h_matvec_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                     OUT * y, int rows, int k, int nc, const uint32_t * rid = nullptr,
-                                                    int ldy = 0) {
+                                                    int ldy = 0, const int * expert_ids = nullptr, int topk = 1, bool per_expert_input = false,
+                                                    const uint8_t * w4b = nullptr, const __half2 * smb = nullptr, OUT * yb = nullptr) {
+    if (blockIdx.z) { w4 = w4b; sm = smb; y = yb; }  // second matrix of a paired launch (gate + up)
+    int source_row = 0;
+    // Dedup (GROUPED, NCOL > 1): expert_ids holds kDedupStride ints per unique expert: slot, columns, input rows[4],
+    // output assignments[4]; the expert's weights are read once for all assignments that use it.
+    constexpr bool DEDUP = GROUPED && NCOL > 1;
+    const int * dmap = nullptr;
+    if constexpr (DEDUP) {
+        dmap = expert_ids + int64_t(blockIdx.y) * tqllm_cuda::kDedupStride;
+        if (dmap[0] < 0) return;
+        source_row = dmap[0] * rows;
+        nc = dmap[1];
+    } else if constexpr (GROUPED) {
+        const int group = blockIdx.y;
+        if (expert_ids[group] < 0) return;  // assignment skipped by this launch (whole block, before any barrier)
+        source_row = expert_ids[group] * rows;
+        xh += int64_t(per_expert_input ? group : group / topk) * k;
+        y += int64_t(group) * rows;
+    }
     const int64_t ld = ldy ? ldy : rows;  // output column stride
     // rid: output row r reads source row rid[r] (a row subset of a larger matrix, results as for a gathered copy)
     // NT tiles of 8 columns share each decoded weight fragment; MT row tiles of 16 per CTA share each activation load
     // (per row the k split, MMA order and 8-warp reduction do not depend on MT: bit-identical results)
     constexpr int NT = (NCOL + 7) / 8;
     __shared__ float red[8][32][4 * NT];
-    __shared__ uint32_t grid[FMT == 4 ? 512 : FMT == 5 ? 256 : 1];
+    __shared__ uint32_t grid[ud_grid_words(FMT)];
     if constexpr (FMT == 4) {
         for (int i = threadIdx.x; i < 512; i += blockDim.x) grid[i] = iq3s_grid_d[i];
         __syncthreads();
@@ -1185,145 +1575,82 @@ __global__ void __launch_bounds__(256) u4h_matvec_k(const uint8_t * w4, const __
         for (int i = threadIdx.x; i < 256; i += blockDim.x) grid[i] = iq3xxs_grid_d[i];
         __syncthreads();
     }
+    if constexpr (FMT >= 8 && FMT <= 11) {
+        const uint32_t * src = ud_grid_src<FMT>();
+        for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) grid[i] = src[i];
+        __syncthreads();
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     const int row0 = blockIdx.x * 16 * MT;
     const uint32_t NEG1024 = 0xE400E400u;
     const int nb = k / 32;  // a lane owns one 32-weight block (16 B codes + one (s, m) pair) per iteration
     float c[MT][NT][4] = {};
-    for (int s0 = warp * 4; s0 < nb; s0 += 32) {
-        const int s = s0 + t;
-        const bool ok = s < nb;
-        uint4 x[NT][4] = {};
+    auto loadx = [&](int s, bool ok, uint4 (&x)[NT][4]) {
+#pragma unroll
+        for (int tt = 0; tt < NT; ++tt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x[tt][i] = make_uint4(0, 0, 0, 0);
         if (ok) {
 #pragma unroll
             for (int tt = 0; tt < NT; ++tt)
                 if (8 * tt + g < nc) {
-                    const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(8 * tt + g) * k + int64_t(s) * 32);
+                    const int64_t col = DEDUP ? dmap[2 + 8 * tt + g] : 8 * tt + g;
+                    const uint4 * xp = reinterpret_cast<const uint4 *>(xh + col * k + int64_t(s) * 32);
 #pragma unroll
                     for (int i = 0; i < 4; ++i) x[tt][i] = __ldg(&xp[i]);
                 }
+        }
+    };
+    // PF (MT 1 only): the next block's codes and activations are loaded before this block computes (same math order)
+    uint4 xn[PF ? NT : 1][4];
+    U4hTile<FMT, GROUPED> qn;
+    int ra0 = min(row0 + g, rows - 1), rb0 = min(row0 + g + 8, rows - 1);
+    if (rid) ra0 = int(rid[ra0]), rb0 = int(rid[rb0]);
+    ra0 += source_row;
+    rb0 += source_row;
+    if constexpr (PF) {
+        const int s = warp * 4 + t;
+        loadx(s, s < nb, xn);
+        qn.load(w4, sm, k, ra0, rb0, s, nb, s < nb);
+    }
+    for (int s0 = warp * 4; s0 < nb; s0 += 32) {
+        const int s = s0 + t;
+        const bool ok = s < nb;
+        uint4 x[NT][4];
+        U4hTile<FMT, GROUPED> qpf;
+        if constexpr (PF) {
+#pragma unroll
+            for (int tt = 0; tt < NT; ++tt)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) x[tt][i] = xn[tt][i];
+            qpf = qn;
+            const int sn = s + 32;
+            loadx(sn, sn < nb, xn);
+            qn = U4hTile<FMT, GROUPED>();
+            qn.load(w4, sm, k, ra0, rb0, sn, nb, sn < nb);
+        } else {
+            loadx(s, ok, x);
         }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
             int ra = min(row0 + 16 * m + g, rows - 1), rb = min(row0 + 16 * m + g + 8, rows - 1);
             if (rid) ra = int(rid[ra]), rb = int(rid[rb]);
-            uint4 wa = make_uint4(0, 0, 0, 0), wb = make_uint4(0, 0, 0, 0);
-            uint32_t ha = 0, hb = 0;  // FMT 6: the block's 32 high code bits
-            uint32_t sa[2] = {}, ma[2] = {}, sb[2] = {}, mb[2] = {};
-            auto pk = [](__half2 p, uint32_t & sv, uint32_t & mv) {
-                const __half2 s2 = __low2half2(p), m2 = __high2half2(p);
-                sv = *reinterpret_cast<const uint32_t *>(&s2);
-                mv = *reinterpret_cast<const uint32_t *>(&m2);
-            };
-            if (ok) {
-                if constexpr (FMT == 5) {
-                    const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 12);
-                    const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 12);
-                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
-                    wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), 0);
-                    wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), 0);
-                    pk(iq3x_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 4, wa.z), sa[0], ma[0]);
-                    pk(iq3x_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 4, wb.z), sb[0], mb[0]);
-                    sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
-                } else if constexpr (FMT == 4) {
-                    const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 12);
-                    const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 12);
-                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
-                    const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 16, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 16;
-                    wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(rca + 2 + s % 8));
-                    wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(rcb + 2 + s % 8));
-                    pk(iq3_sm(rca, s % 8), sa[0], ma[0]);
-                    pk(iq3_sm(rcb, s % 8), sb[0], mb[0]);
-                    sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
-                } else if constexpr (FMT == 2) {
-                    const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 12);
-                    const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 12);
-                    wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), 0);
-                    wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), 0);
-                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
-                    const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 20, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 20;
-                    const float da = __half2float(__ldg(reinterpret_cast<const __half *>(rca + 16)));
-                    const float db = __half2float(__ldg(reinterpret_cast<const __half *>(rcb + 16)));
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const float fa = da * float(int8_t(__ldg(rca + (s % 8) * 2 + h)));
-                        const float fb = db * float(int8_t(__ldg(rcb + (s % 8) * 2 + h)));
-                        pk(__floats2half2_rn(fa, -4.f * fa), sa[h], ma[h]);
-                        pk(__floats2half2_rn(fb, -4.f * fb), sb[h], mb[h]);
-                    }
-                } else if constexpr (FMT == 6) {  // K5: 16 nibble bytes (K4 order) + one word of high bits per 32 weights
-                    const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 20);
-                    const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 20);
-                    wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(wpa + 3));
-                    wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(wpb + 3));
-                    ha = __ldg(wpa + 4), hb = __ldg(wpb + 4);
-                    const auto * kh = reinterpret_cast<const uint8_t *>(sm);
-                    pk(k4_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 16, s % 8), sa[0], ma[0]);
-                    pk(k4_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 16, s % 8), sb[0], mb[0]);
-                    sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
-                } else {
-                    wa = __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(ra) * (k / 2) + int64_t(s) * 16));
-                    wb = __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(rb) * (k / 2) + int64_t(s) * 16));
-                    __half2 pa, pb;
-                    if constexpr (FMT == 1) {
-                        const auto * kh = reinterpret_cast<const uint8_t *>(sm);
-                        pa = k4_sm(kh + (int64_t(ra) * (k / 256) + s / 8) * 16, s % 8);
-                        pb = k4_sm(kh + (int64_t(rb) * (k / 256) + s / 8) * 16, s % 8);
-                    } else {
-                        pa = sm[int64_t(ra) * nb + s], pb = sm[int64_t(rb) * nb + s];
-                    }
-                    pk(pa, sa[0], ma[0]);
-                    pk(pb, sb[0], mb[0]);
-                    sa[1] = sa[0], ma[1] = ma[0], sb[1] = sb[0], mb[1] = mb[0];
-                }
-            }
+            ra += source_row;
+            rb += source_row;
+            U4hTile<FMT, GROUPED> q;
+            if constexpr (PF) q = qpf;
+            else q.load(w4, sm, k, ra, rb, s, nb, ok);
             auto deq = [&](uint32_t w, uint32_t sel, uint32_t su, uint32_t mu) {
                 return hfma2u(hadd2u(__byte_perm(w, 0x64646464u, sel), NEG1024), su, mu);
             };
 #pragma unroll
             for (int h = 0; h < 2; ++h) {  // the block's two 16-weight groups
                 uint32_t wa4[4], wb4[4];
-                if constexpr (FMT == 5) {
-                    const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x;
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        const int w = 4 * h + u;
-                        wa4[u] = iq3x_code(grid[(qa >> (8 * u)) & 0xFF], iq3x_signs(wa.z, w));
-                        wb4[u] = iq3x_code(grid[(qb >> (8 * u)) & 0xFF], iq3x_signs(wb.z, w));
-                    }
-                } else if constexpr (FMT == 4) {  // words 4h + u: index = qs byte | qh bit << 8; signs nibble of byte (4h + u) / 2
-                    const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x;
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        const int w = 4 * h + u;
-                        const uint32_t ia = ((qa >> (8 * u)) & 0xFF) | (((wa.w >> w) & 1) << 8);
-                        const uint32_t ib2 = ((qb >> (8 * u)) & 0xFF) | (((wb.w >> w) & 1) << 8);
-                        wa4[u] = iq3_code(grid[ia], (wa.z >> (4 * w)) & 0xF);
-                        wb4[u] = iq3_code(grid[ib2], (wb.z >> (4 * w)) & 0xF);
-                    }
-                } else if constexpr (FMT == 2) {
-                    const uint32_t la = h ? wa.y : wa.x, lb = h ? wb.y : wb.x;
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        wa4[u] = ((la >> (2 * u)) & 0x03030303u) | (((wa.z >> (u + 4 * h)) & 0x01010101u) << 2);
-                        wb4[u] = ((lb >> (2 * u)) & 0x03030303u) | (((wb.z >> (u + 4 * h)) & 0x01010101u) << 2);
-                    }
-                } else {
-                    const uint32_t a0 = h ? wa.z : wa.x, a1 = h ? wa.w : wa.y, b0 = h ? wb.z : wb.x, b1 = h ? wb.w : wb.y;
-                    wa4[0] = a0 & 0x0F0F0F0Fu, wa4[1] = (a0 >> 4) & 0x0F0F0F0Fu, wa4[2] = a1 & 0x0F0F0F0Fu, wa4[3] = (a1 >> 4) & 0x0F0F0F0Fu;
-                    wb4[0] = b0 & 0x0F0F0F0Fu, wb4[1] = (b0 >> 4) & 0x0F0F0F0Fu, wb4[2] = b1 & 0x0F0F0F0Fu, wb4[3] = (b1 >> 4) & 0x0F0F0F0Fu;
-                }
-                if constexpr (FMT == 6) {  // high bit of code 4u + j (group h) is bit 16 h + 4 u + j
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        wa4[u] |= ((((ha >> (16 * h + 4 * u)) & 0xF) * 0x00204081u) & 0x01010101u) << 4;
-                        wb4[u] |= ((((hb >> (16 * h + 4 * u)) & 0xF) * 0x00204081u) & 0x01010101u) << 4;
-                    }
-                }
+                q.codes(h, s, ok, grid, wa4, wb4);
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
-                    const uint32_t d0 = deq(wa4[u], 0x5140, sa[h], ma[h]), d1 = deq(wb4[u], 0x5140, sb[h], mb[h]),
-                                   d2 = deq(wa4[u], 0x5342, sa[h], ma[h]), d3 = deq(wb4[u], 0x5342, sb[h], mb[h]);
+                    const uint32_t d0 = deq(wa4[u], 0x5140, q.sa[h], q.ma[h]), d1 = deq(wb4[u], 0x5140, q.sb[h], q.mb[h]),
+                                   d2 = deq(wa4[u], 0x5342, q.sa[h], q.ma[h]), d3 = deq(wb4[u], 0x5342, q.sb[h], q.mb[h]);
 #pragma unroll
                     for (int tt = 0; tt < NT; ++tt) {
                         const uint4 xa = x[tt][2 * h], xb = x[tt][2 * h + 1];
@@ -1353,16 +1680,143 @@ __global__ void __launch_bounds__(256) u4h_matvec_k(const uint8_t * w4, const __
 #pragma unroll
                 for (int i = 0; i < 4; ++i) v[i] += red[w2][lane][4 * tt + i];
             const int n0 = 8 * tt + 2 * t, n1 = n0 + 1, r = row0 + 16 * m + g;
+            const int64_t o0 = DEDUP ? (n0 < nc ? dmap[6 + n0] : 0) : n0, o1 = DEDUP ? (n1 < nc ? dmap[6 + n1] : 0) : n1;
             if (r < rows) {
-                if (n0 < nc) put(int64_t(n0) * ld + r, v[0]);
-                if (n1 < nc) put(int64_t(n1) * ld + r, v[1]);
+                if (n0 < nc) put(o0 * ld + r, v[0]);
+                if (n1 < nc) put(o1 * ld + r, v[1]);
             }
             if (r + 8 < rows) {
-                if (n0 < nc) put(int64_t(n0) * ld + r + 8, v[2]);
-                if (n1 < nc) put(int64_t(n1) * ld + r + 8, v[3]);
+                if (n0 < nc) put(o0 * ld + r + 8, v[2]);
+                if (n1 < nc) put(o1 * ld + r + 8, v[3]);
             }
         }
     }
+}
+
+// Prefill GEMM on the u4h-family formats without a dequantised copy: 64 rows x 64 columns per CTA, warp w takes row tile
+// w & 3 and k half w >> 2. Each lane decodes its 32-weight block once (U4hTile, the matvec decode) and reuses the
+// fragments across 8 n-tiles, so the weights are read once per 64 columns. FP32 accumulate.
+template <int FMT, bool GROUPED = false, typename OUT = __nv_bfloat16>
+__global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
+                                                  OUT * y, int rows, int k, int ncols, int ldy, const int * counts = nullptr, const int * groups = nullptr,
+                                                  int capacity = 0, int topk = 1, bool per_expert_input = false) {
+    int source_row = 0;
+    if constexpr (GROUPED) {
+        const int expert = blockIdx.z;
+        ncols = counts[expert];
+        if (int(blockIdx.y) * 64 >= ncols) return;
+        groups += int64_t(expert) * capacity;
+        source_row = expert * rows;
+    }
+    constexpr int NT = 8, XS = 33;  // x tile: 64 columns x 256 k (32 uint4), row stride padded to 33 uint4
+    constexpr bool GRID_SMEM = ud_grid_words(FMT) > 1 && ud_grid_words(FMT) <= 2048;  // IQ1_S's 16 KB grid stays in L1
+    __shared__ uint4 xt[64 * XS];
+    __shared__ uint32_t gsm[GRID_SMEM ? ud_grid_words(FMT) : 1];
+    const uint32_t * grid = gsm;
+    if constexpr (FMT == 4) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) gsm[i] = iq3s_grid_d[i];
+    } else if constexpr (FMT == 5) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) gsm[i] = iq3xxs_grid_d[i];
+    } else if constexpr (FMT >= 8 && FMT <= 11) {
+        if constexpr (GRID_SMEM) {
+            const uint32_t * src = ud_grid_src<FMT>();
+            for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) gsm[i] = src[i];
+        } else {
+            grid = ud_grid_src<FMT>();
+        }
+    }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+    const int rt = warp & 3, ks = warp >> 2;
+    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * 64, nb = k / 32;
+    const int ra = source_row + min(row0 + g, rows - 1), rb = source_row + min(row0 + g + 8, rows - 1);
+    const uint32_t NEG1024 = 0xE400E400u;
+    auto deq = [&](uint32_t w, uint32_t sel, uint32_t su, uint32_t mu) {
+        return hfma2u(hadd2u(__byte_perm(w, 0x64646464u, sel), NEG1024), su, mu);
+    };
+    float c[NT][4] = {};
+    for (int base = 0; base < nb; base += 8) {  // 8 blocks (256 k) per step: warps ks = 0 / 1 take blocks base + 4 ks + t
+        __syncthreads();  // previous step's tile reads are done
+        for (int i = threadIdx.x; i < 64 * 32; i += 256) {
+            const int col = i / 32, q = i % 32, blk = base + q / 4;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (col0 + col < ncols && blk < nb) {
+                int input_col = col0 + col;
+                if constexpr (GROUPED) {
+                    input_col = groups[input_col];
+                    if (!per_expert_input) input_col /= topk;
+                }
+                v = __ldg(reinterpret_cast<const uint4 *>(xh + int64_t(input_col) * k + int64_t(base) * 32) + q);
+            }
+            xt[col * XS + q] = v;
+        }
+        __syncthreads();
+        const int s = base + ks * 4 + t;
+        const bool ok = s < nb;
+        U4hTile<FMT, GROUPED> qd;
+        qd.load(w4, sm, k, ra, rb, s, nb, ok);
+        uint32_t af[8][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint32_t wa4[4], wb4[4];
+            qd.codes(h, s, ok, grid, wa4, wb4);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                af[4 * h + u][0] = deq(wa4[u], 0x5140, qd.sa[h], qd.ma[h]);
+                af[4 * h + u][1] = deq(wb4[u], 0x5140, qd.sb[h], qd.mb[h]);
+                af[4 * h + u][2] = deq(wa4[u], 0x5342, qd.sa[h], qd.ma[h]);
+                af[4 * h + u][3] = deq(wb4[u], 0x5342, qd.sb[h], qd.mb[h]);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const uint4 * xp = xt + (nt * 8 + g) * XS + (ks * 4 + t) * 4;
+            uint4 x4[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x4[i] = xp[i];
+            const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) mma_f16(c[nt], af[u][0], af[u][1], af[u][2], af[u][3], xw[2 * u], xw[2 * u + 1]);
+        }
+    }
+    __syncthreads();
+    float (*red)[32][NT * 4] = reinterpret_cast<float (*)[32][NT * 4]>(xt);  // 16 KB of the 33.8 KB tile
+    if (ks == 1)
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) red[rt][lane][nt * 4 + i] = c[nt][i];
+    __syncthreads();
+    if (ks == 0) {
+        const int r = row0 + g;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int n0 = col0 + nt * 8 + 2 * t, n1 = n0 + 1;
+            const float v0 = c[nt][0] + red[rt][lane][nt * 4 + 0], v1 = c[nt][1] + red[rt][lane][nt * 4 + 1];
+            const float v2 = c[nt][2] + red[rt][lane][nt * 4 + 2], v3 = c[nt][3] + red[rt][lane][nt * 4 + 3];
+            const auto put = [&](int col, int row, float value) {
+                if (col < ncols) {
+                    if constexpr (GROUPED) col = groups[col];
+                    if constexpr (std::is_same_v<OUT, float>) y[int64_t(col) * ldy + row] = value;
+                    else y[int64_t(col) * ldy + row] = __float2bfloat16_rn(value);
+                }
+            };
+            if (r < rows) {
+                put(n0, r, v0);
+                put(n1, r, v1);
+            }
+            if (r + 8 < rows) {
+                put(n0, r + 8, v2);
+                put(n1, r + 8, v3);
+            }
+        }
+    }
+}
+template <int FMT, typename OUT = __nv_bfloat16>
+static void u4h_gemm_launch(const uint8_t * w4, const void * sm, const __half * xh, OUT * y, int rows, int k,
+                            int ncols, cudaStream_t s, int ldy) {
+    if (k % 64) throw std::invalid_argument("u4h_gemm: k must be a multiple of 64");
+    const dim3 grid((rows + 63) / 64, (ncols + 63) / 64);
+    u4h_gemm_k<FMT, false, OUT><<<grid, 256, 0, s>>>(w4, reinterpret_cast<const __half2 *>(sm), xh, y, rows, k, ncols, ldy ? ldy : rows);
 }
 
 // i8h -> u4h (draft-only copies): per 32 weights, asymmetric min / max 4-bit, codes in the u4h nibble order.
@@ -1390,9 +1844,17 @@ __global__ void u4h_from_i8h_k(const int8_t * w8, const __half * sc, uint8_t * w
 // Prefill GEMM over the repacked TQ3_4S layout: y[n][r] for up to 64 columns per grid.y slice. CTA = 64 rows (warp w:
 // row tile w & 3, k half w >> 2). Weight decode is exactly tq3_matvec_h_k's (same numerics per weight); each lane
 // decodes its block once and reuses the A fragments across 8 n-tiles, so the weight stream is read once per 64 columns.
-template <bool ACC16>
+template <bool ACC16, bool EXPERT = false>
 __global__ void __launch_bounds__(256) tq3_gemm_h_k(const uint4 * w, const __half * xh, __nv_bfloat16 * y, int rows,
-                                                    int k, int ncols, uint32_t cblo_u, uint32_t cbhi_u) {
+                                                    int k, int ncols, uint32_t cblo_u, uint32_t cbhi_u,
+                                                    const int * counts = nullptr, const int * groups = nullptr,
+                                                    int capacity = 0, int topk = 1, bool per_expert = false) {
+    if constexpr (EXPERT) {
+        ncols = counts[blockIdx.z];
+        if (int(blockIdx.y) * 64 >= ncols) return;
+        w += int64_t(blockIdx.z) * rows * (k / 32);
+        groups += int64_t(blockIdx.z) * capacity;
+    }
     constexpr int NT = 8;  // n-tiles of 8 columns
     __shared__ float red[4][32][NT * 4];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
@@ -1439,7 +1901,9 @@ __global__ void __launch_bounds__(256) tq3_gemm_h_k(const uint4 * w, const __hal
             const int col = col0 + nt * 8 + g;
             uint4 x4[4] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
             if (ok && col < ncols) {
-                const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(col) * k + int64_t(b) * 32);
+                int input_col = col;
+                if constexpr (EXPERT) input_col = per_expert ? groups[col] : groups[col] / topk;
+                const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(input_col) * k + int64_t(b) * 32);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) x4[i] = __ldg(&xp[i]);
             }
@@ -1473,15 +1937,20 @@ __global__ void __launch_bounds__(256) tq3_gemm_h_k(const uint4 * w, const __hal
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int n0 = col0 + nt * 8 + 2 * t, n1 = n0 + 1;
+            int out0 = n0, out1 = n1;
+            if constexpr (EXPERT) {
+                if (n0 < ncols) out0 = groups[n0];
+                if (n1 < ncols) out1 = groups[n1];
+            }
             const float v0 = (c[nt][0] + red[rt][lane][nt * 4 + 0]) * inv, v1 = (c[nt][1] + red[rt][lane][nt * 4 + 1]) * inv;
             const float v2 = (c[nt][2] + red[rt][lane][nt * 4 + 2]) * inv, v3 = (c[nt][3] + red[rt][lane][nt * 4 + 3]) * inv;
             if (r < rows) {
-                if (n0 < ncols) y[int64_t(n0) * rows + r] = __float2bfloat16_rn(v0);
-                if (n1 < ncols) y[int64_t(n1) * rows + r] = __float2bfloat16_rn(v1);
+                if (n0 < ncols) y[int64_t(out0) * rows + r] = __float2bfloat16_rn(v0);
+                if (n1 < ncols) y[int64_t(out1) * rows + r] = __float2bfloat16_rn(v1);
             }
             if (r + 8 < rows) {
-                if (n0 < ncols) y[int64_t(n0) * rows + r + 8] = __float2bfloat16_rn(v2);
-                if (n1 < ncols) y[int64_t(n1) * rows + r + 8] = __float2bfloat16_rn(v3);
+                if (n0 < ncols) y[int64_t(out0) * rows + r + 8] = __float2bfloat16_rn(v2);
+                if (n1 < ncols) y[int64_t(out1) * rows + r + 8] = __float2bfloat16_rn(v3);
             }
         }
     }
@@ -1652,6 +2121,216 @@ void q6k_launch(const void * w, const float * x, float * y, int rows, int k, cud
 } // namespace
 
 namespace tqllm_cuda {
+void k_expert_matvec(int fmt, const uint8_t * w, const void * aux, const __half * x,
+                     __nv_bfloat16 * y, int rows, int cols, const int * ids, int n, int topk,
+                     bool per_expert_input, cudaStream_t stream) {
+    if (!w || !aux || !x || !y || !ids || rows <= 0 || cols <= 0 ||
+        cols % (fmt == 14 ? 128 : fmt == 15 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
+        throw std::invalid_argument("k_expert_matvec: invalid shape");
+    const dim3 grid(unsigned((rows + 15) / 16), unsigned(n * topk));
+    const auto * scales = static_cast<const __half2 *>(aux);
+    // Whole u4h family, not just K4/K5/K6: GROUPED is an indexing change in the same
+    // template the dense kernels use (NCOL 1, MT 1, PF 0), so grouped decode stays
+    // bit-identical to a row-sliced dense matvec (tests/moe_device.cu).
+    switch (fmt) {
+    case 0: u4h_matvec_k<1, __nv_bfloat16, 1, 0, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 1: u4h_matvec_k<1, __nv_bfloat16, 1, 1, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 2: u4h_matvec_k<1, __nv_bfloat16, 1, 2, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 4: u4h_matvec_k<1, __nv_bfloat16, 1, 4, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 5: u4h_matvec_k<1, __nv_bfloat16, 1, 5, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 6: u4h_matvec_k<1, __nv_bfloat16, 1, 6, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 7: u4h_matvec_k<1, __nv_bfloat16, 1, 7, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 8: u4h_matvec_k<1, __nv_bfloat16, 1, 8, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 9: u4h_matvec_k<1, __nv_bfloat16, 1, 9, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 10: u4h_matvec_k<1, __nv_bfloat16, 1, 10, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 11: u4h_matvec_k<1, __nv_bfloat16, 1, 11, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 12: u4h_matvec_k<1, __nv_bfloat16, 1, 12, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 13: u4h_matvec_k<1, __nv_bfloat16, 1, 13, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 14: u4h_matvec_k<1, __nv_bfloat16, 1, 14, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 15: u4h_matvec_k<1, __nv_bfloat16, 1, 15, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    default: throw std::invalid_argument("k_expert_matvec: unsupported format");
+    }
+}
+
+
+void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
+                           int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
+    if (!w || !aux || !x || !y || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 ? 128 : fmt == 15 ? 64 : 256) || groups <= 0 || groups > 65535)
+        throw std::invalid_argument("k_expert_matvec_dedup: invalid shape");
+    // One 16-row tile per block: the expert's weights are streamed once, the activations are shared.
+    const dim3 grid(unsigned((rows + 15) / 16), unsigned(groups));
+    const auto * sc = static_cast<const __half2 *>(aux);
+#define TQ_DEDUP(F) u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(w, sc, x, y, rows, cols, 0, nullptr, 0, dmap)
+    switch (fmt) {
+        case 1: TQ_DEDUP(1); break;
+        case 4: TQ_DEDUP(4); break;
+        case 5: TQ_DEDUP(5); break;
+        case 6: TQ_DEDUP(6); break;
+        case 7: TQ_DEDUP(7); break;
+        case 10: TQ_DEDUP(10); break;
+        case 13: TQ_DEDUP(13); break;
+        case 14: TQ_DEDUP(14); break;
+        case 15: TQ_DEDUP(15); break;
+        default: throw std::invalid_argument("k_expert_matvec_dedup: unsupported format");
+    }
+#undef TQ_DEDUP
+}
+
+void set_tiled_experts(bool on) { const int v = on ? 1 : 0; cudaMemcpyToSymbol(c_tiled_experts, &v, sizeof v); }
+int tiled_block_bytes(int fmt) { return tiled_bpb(fmt); }
+void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb) {
+    const int nb = k / 32;
+    for (int r = 0; r < rows; ++r)
+        for (int s = 0; s < nb; ++s) {
+            const int64_t to = (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
+            std::memcpy(dst + to, src + (int64_t(r) * nb + s) * bpb, size_t(bpb));
+        }
+}
+// gate and up in one launch (grid z = 2): same blocks, same per-row math as two k_expert_matvec_dedup calls
+void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                      __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * ids, int n, int topk, cudaStream_t stream) {
+    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !ids || rows <= 0 || cols <= 0 ||
+        cols % (fmt == 14 ? 128 : fmt == 15 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
+        throw std::invalid_argument("k_expert_matvec2: invalid shape");
+    const dim3 grid(unsigned((rows + 15) / 16), unsigned(n * topk), 2u);
+    const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
+#define TQ_PAIR(F) u4h_matvec_k<1, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 1, nullptr, 0, ids, topk, false, wb, sb, yb)
+    switch (fmt) {
+        case 0: TQ_PAIR(0); break;
+        case 1: TQ_PAIR(1); break;
+        case 2: TQ_PAIR(2); break;
+        case 4: TQ_PAIR(4); break;
+        case 5: TQ_PAIR(5); break;
+        case 6: TQ_PAIR(6); break;
+        case 7: TQ_PAIR(7); break;
+        case 8: TQ_PAIR(8); break;
+        case 9: TQ_PAIR(9); break;
+        case 10: TQ_PAIR(10); break;
+        case 11: TQ_PAIR(11); break;
+        case 12: TQ_PAIR(12); break;
+        case 13: TQ_PAIR(13); break;
+        case 14: TQ_PAIR(14); break;
+        case 15: TQ_PAIR(15); break;
+        default: throw std::invalid_argument("k_expert_matvec2: unsupported format");
+    }
+#undef TQ_PAIR
+}
+
+void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                            __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
+    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 ? 128 : fmt == 15 ? 64 : 256) || groups <= 0 || groups > 65535)
+        throw std::invalid_argument("k_expert_matvec_dedup2: invalid shape");
+    const dim3 grid(unsigned((rows + 15) / 16), unsigned(groups), 2u);
+    const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
+#define TQ_DEDUP2(F) u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb)
+    switch (fmt) {
+        case 1: TQ_DEDUP2(1); break;
+        case 4: TQ_DEDUP2(4); break;
+        case 5: TQ_DEDUP2(5); break;
+        case 6: TQ_DEDUP2(6); break;
+        case 7: TQ_DEDUP2(7); break;
+        case 10: TQ_DEDUP2(10); break;
+        case 13: TQ_DEDUP2(13); break;
+        case 14: TQ_DEDUP2(14); break;
+        case 15: TQ_DEDUP2(15); break;
+        default: throw std::invalid_argument("k_expert_matvec_dedup2: unsupported format");
+    }
+#undef TQ_DEDUP2
+}
+
+void k_expert_gemm(int fmt, const uint8_t * w, const void * aux, const __half * x,
+                   __nv_bfloat16 * y, int rows, int cols, const int * counts, const int * groups,
+                   int capacity, int experts, int topk, bool per_expert_input, cudaStream_t stream) {
+    if (!w || !aux || !x || !y || !counts || !groups || rows <= 0 || cols <= 0 ||
+        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
+        experts <= 0 || experts > 65535 || topk <= 0)
+        throw std::invalid_argument("k_expert_gemm: invalid shape");
+    const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
+    const auto * scales = static_cast<const __half2 *>(aux);
+    // Same family coverage as k_expert_matvec: u4h_gemm_k<FMT, GROUPED> is generic in FMT
+    // (its GROUPED branch only reads counts/groups and offsets source_row), so prefill
+    // stays bit-identical to a row-sliced dense gemm().
+    switch (fmt) {
+    case 0: u4h_gemm_k<0, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 1: u4h_gemm_k<1, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 2: u4h_gemm_k<2, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 4: u4h_gemm_k<4, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 5: u4h_gemm_k<5, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 6: u4h_gemm_k<6, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 7: u4h_gemm_k<7, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 8: u4h_gemm_k<8, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 9: u4h_gemm_k<9, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 10: u4h_gemm_k<10, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 11: u4h_gemm_k<11, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 12: u4h_gemm_k<12, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 13: u4h_gemm_k<13, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 14: u4h_gemm_k<14, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 15: u4h_gemm_k<15, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    default: throw std::invalid_argument("k_expert_gemm: unsupported format");
+    }
+}
+
+// fmt: 0 u4h, 1 k4, 2 k3, 4 iq3, 5 iq3x, 6 k5, 7 k6, 8-12 UD types (u4h_matvec_k's FMT); gemm only: 13 iq4n, 14 iq4l, 15 i8h
+void u4h_family_gemm(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                     int ncols, cudaStream_t s, int ldy) {
+    switch (fmt) {
+        case 0: u4h_gemm_launch<0>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 1: u4h_gemm_launch<1>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 2: u4h_gemm_launch<2>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 4: u4h_gemm_launch<4>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 5: u4h_gemm_launch<5>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 6: u4h_gemm_launch<6>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 7: u4h_gemm_launch<7>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 8: u4h_gemm_launch<8>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 9: u4h_gemm_launch<9>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 10: u4h_gemm_launch<10>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 11: u4h_gemm_launch<11>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 12: u4h_gemm_launch<12>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 13: u4h_gemm_launch<13>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 14: u4h_gemm_launch<14>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 15: u4h_gemm_launch<15>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        default: throw std::invalid_argument("u4h_family_gemm: unknown format");
+    }
+}
+// Same, F32 output (prefill projections that feed F32 activations); false: format without a GEMM kernel.
+bool u4h_family_gemm_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k,
+                     int ncols, cudaStream_t s, int ldy) {
+    switch (fmt) {
+        case 0: u4h_gemm_launch<0, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 1: u4h_gemm_launch<1, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 2: u4h_gemm_launch<2, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 4: u4h_gemm_launch<4, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 5: u4h_gemm_launch<5, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 6: u4h_gemm_launch<6, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 7: u4h_gemm_launch<7, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 8: u4h_gemm_launch<8, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 9: u4h_gemm_launch<9, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 10: u4h_gemm_launch<10, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 11: u4h_gemm_launch<11, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 12: u4h_gemm_launch<12, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 13: u4h_gemm_launch<13, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 14: u4h_gemm_launch<14, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 15: u4h_gemm_launch<15, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        default: return false;
+    }
+    return true;
+}
+
 
 void tq3_repack(void * w, int64_t nblocks, cudaStream_t s) {
     tq3_repack_k<<<int((nblocks + 255) / 256), 256, 0, s>>>(static_cast<uint4 *>(w), nblocks);
@@ -1673,6 +2352,29 @@ void tq3_matvec_i8(const void * w, const int8_t * xq, const float * xs, __nv_bfl
 void tq3_rotate(const __nv_bfloat16 * x, float * xr, int k, int ncols, cudaStream_t s) {
     const int blocks = k / 32 * ncols;
     tq3_rotate_k<<<(blocks * 32 + 255) / 256, 256, 0, s>>>(x, xr, blocks);
+}
+
+void tq3_rotate_f32(const float * x, float * xr, int k, int ncols, cudaStream_t s) {
+    if (!x || !xr || k <= 0 || k % 32 || ncols <= 0 || int64_t(k) * ncols > INT_MAX)
+        throw std::invalid_argument("tq3_rotate_f32: invalid pointer or shape");
+    const int blocks = k / 32 * ncols;
+    tq3_rotate_f32_k<<<(int64_t(blocks) * 32 + 255) / 256, 256, 0, s>>>(x, xr, blocks);
+}
+
+void tq3_matvec_f32_raw(const void * w, const float * xr, float * y, int rows, int k, int ncols, cudaStream_t s) {
+    if (!w || !xr || !y || rows <= 0 || k <= 0 || k % 32 || ncols <= 0 || ncols > 65535 ||
+        int64_t(k) * ncols > INT_MAX || int64_t(rows) * ncols > INT_MAX)
+        throw std::invalid_argument("tq3_matvec_f32_raw: invalid pointer or shape");
+    tq3_matvec_f32_raw_k<false><<<dim3(unsigned(rows), unsigned(ncols)), 256, 0, s>>>(
+        static_cast<const uint4 *>(w), xr, y, rows, k);
+}
+
+void tq3_matvec_f32_repacked(const void * w, const float * xr, float * y, int rows, int k, int ncols, cudaStream_t s) {
+    if (!w || !xr || !y || rows <= 0 || k <= 0 || k % 32 || ncols <= 0 || ncols > 65535 ||
+        int64_t(k) * ncols > INT_MAX || int64_t(rows) * ncols > INT_MAX)
+        throw std::invalid_argument("tq3_matvec_f32_repacked: invalid pointer or shape");
+    tq3_matvec_f32_raw_k<true><<<dim3(unsigned(rows), unsigned(ncols)), 256, 0, s>>>(
+        static_cast<const uint4 *>(w), xr, y, rows, k);
 }
 
 void tq3_matvec(const void * w, const float * xr, __nv_bfloat16 * y, int rows, int k, int ncols, cudaStream_t s) {
@@ -1745,6 +2447,39 @@ void argmax_big(const float * x, int n, uint32_t * out, void * scratch, cudaStre
 
 void q6k_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t s) {
     q6k_row_k<<<(k + 255) / 256, 256, 0, s>>>(static_cast<const uint8_t *>(w), row, y, k);
+}
+
+// One thread per element of one IQ3_S row (raw GGUF layout: 110 bytes per 256 weights).
+// Block: d(FP16,0:2) | qs[64](2:66) | qh[8](66:74) | signs[32](74:106) | scales[4](106:110).
+// Decode mirrors the proven iq3_dequant_h_k path: value = db * (iq3_code(grid, signs) - 16),
+// db = d * (1 + 2 * scale_nibble).  Dual-mode: dtok==nullptr → single row; else multi-token.
+__global__ void iq3s_row_k(const uint8_t * w, int row, __nv_bfloat16 * y, int k, const uint32_t * dtok = nullptr) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    if (dtok) {  // multi-token: blockIdx.y selects the token, id read on the device
+        row = int(dtok[blockIdx.y]);
+        y += int64_t(blockIdx.y) * k;
+    }
+    const int nblk = k / 256;
+    const int b = i / 256, e = i % 256;
+    const int ib = e / 32, wi = (e % 32) / 4, j = e % 4;
+    const uint8_t * blk = w + (int64_t(row) * nblk + b) * 110;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk));  // offset 0: 2-byte aligned (110 % 2 == 0)
+    const uint32_t qs_byte = blk[2 + ib * 8 + wi];
+    const uint32_t qh_bit  = (blk[66 + ib] >> wi) & 1u;
+    // signs word assembled from bytes: raw GGUF blocks are 110-byte-strided, so blk+74+4*ib is
+    // NOT 4-byte aligned — a uint32_t load here would fault. Byte loads are always safe.
+    const uint32_t sg = uint32_t(blk[74 + ib * 4]) | (uint32_t(blk[75 + ib * 4]) << 8) |
+                        (uint32_t(blk[76 + ib * 4]) << 16) | (uint32_t(blk[77 + ib * 4]) << 24);
+    const uint32_t sc_nib  = (blk[106 + ib / 2] >> (4 * (ib % 2))) & 0xFu;
+    const float db = d * float(1 + 2 * sc_nib);
+    const uint32_t c = iq3_code(iq3s_grid_d[qs_byte | (qh_bit << 8)], (sg >> (4 * wi)) & 0xFu);
+    const int code = int((c >> (8 * j)) & 0xFFu) - 16;
+    y[i] = __float2bfloat16_rn(db * float(code));
+}
+
+void iq3s_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    iq3s_row_k<<<(k + 255) / 256, 256, 0, s>>>(static_cast<const uint8_t *>(w), row, y, k);
 }
 
 void tq3_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t s) {
@@ -1939,6 +2674,33 @@ void embed_multi_q4k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16
     embed_multi_q4k_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
 }
 
+// Q5_K rows (176-byte blocks: d, dmin, scales[12], qh[32], qs[128]) as in q5k_to_i8_k / src/dequant.cpp q5k:
+// 5-bit value = low/high nibble of qs[32 * (j / 2) + l] plus the qh[l] bit of sub-block j; affine with per-
+// sub-block scale (s) and min (m), value = d * s * c - dmin * m
+__global__ void embed_multi_q5k_k(const uint8_t * w, const uint32_t * dtok, __nv_bfloat16 * y, int k) {
+    const int n = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const uint8_t * blk = w + (int64_t(dtok[n]) * (k / 256) + i / 256) * 176;
+    const int e = i % 256, j = e / 32, l = e % 32;
+    const uint8_t * sc = blk + 4;
+    int s, m;
+    if (j < 4) {
+        s = sc[j] & 63;
+        m = sc[j + 4] & 63;
+    } else {
+        s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+    const int q = blk[48 + 32 * (j / 2) + l];
+    const int c = (j & 1 ? q >> 4 : q & 0xF) + ((blk[16 + l] >> j) & 1) * 16;
+    const float d = __half2float(reinterpret_cast<const __half *>(blk)[0]);
+    const float dmin = __half2float(reinterpret_cast<const __half *>(blk)[1]);
+    y[int64_t(n) * k + i] = __float2bfloat16_rn(d * float(s) * float(c) - dmin * float(m));
+}
+void embed_multi_q5k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    embed_multi_q5k_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
+}
+
 void norm_h(const __nv_bfloat16 * x, const float * w, const float * partial, float eps, __half * xh, int k, int ncols,
             cudaStream_t s) {
     norm_h_k<<<dim3((k + 255) / 256, ncols), 256, 0, s>>>(x, w, partial, (k + 255) / 256, eps, xh, k);
@@ -1964,6 +2726,66 @@ void k3_dequant_h(const uint8_t * w3, const uint8_t * kr, __half * out, int rows
     k3_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w3, kr, out, ng, k);
 }
 
+// UD types: one thread per 16-weight group, the matvec kernel's decoder with the grid read from global memory
+template <int FMT>
+__global__ void udq_dequant_h_k(const uint8_t * w, const uint8_t * kr, __half * out, int64_t ngroups, int k) {
+    const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (g >= ngroups) return;
+    const int64_t blk = g / 2, row = blk / (k / 32);
+    const int h = int(g % 2), sblk = int(blk % (k / 32));
+    const auto * wp = reinterpret_cast<const uint32_t *>(w + blk * ud_bpb(FMT));
+    const uint32_t w0 = wp[0], w1 = ud_bpb(FMT) == 8 ? wp[1] : 0u;
+    const uint8_t * rec = kr + (row * (k / 256) + sblk / 8) * ud_rb(FMT);
+    const uint32_t * grid = nullptr;
+    if constexpr (FMT <= 11) grid = ud_grid_src<FMT>();
+    uint32_t c[4];
+    __half2 sm;
+    ud_group<FMT>(w0, w1, rec, sblk, h, grid, c, sm);
+    __align__(16) __half v[16];
+#pragma unroll
+    for (int e = 0; e < 16; ++e) v[e] = __hfma(__int2half_rn(int((c[e / 4] >> (8 * (e % 4))) & 0xFF)), __low2half(sm), __high2half(sm));
+    reinterpret_cast<uint4 *>(out)[g * 2] = reinterpret_cast<const uint4 *>(v)[0];
+    reinterpret_cast<uint4 *>(out)[g * 2 + 1] = reinterpret_cast<const uint4 *>(v)[1];
+}
+void udq_dequant_h(int fmt, const uint8_t * w, const uint8_t * rec, __half * out, int rows, int k, cudaStream_t s) {
+    const int64_t ng = int64_t(rows) * k / 16;
+    const unsigned nbk = unsigned((ng + 255) / 256);
+    switch (fmt) {
+        case 8: udq_dequant_h_k<8><<<nbk, 256, 0, s>>>(w, rec, out, ng, k); break;
+        case 9: udq_dequant_h_k<9><<<nbk, 256, 0, s>>>(w, rec, out, ng, k); break;
+        case 10: udq_dequant_h_k<10><<<nbk, 256, 0, s>>>(w, rec, out, ng, k); break;
+        case 11: udq_dequant_h_k<11><<<nbk, 256, 0, s>>>(w, rec, out, ng, k); break;
+        case 12: udq_dequant_h_k<12><<<nbk, 256, 0, s>>>(w, rec, out, ng, k); break;
+        default: throw std::invalid_argument("udq_dequant_h: unknown format");
+    }
+}
+// k6: per 32 weights 16 nibble bytes (k4 order) + 2 words of 2-bit highs; 20-byte record (16 int8 scales, d) per 256
+__global__ void k6_dequant_h_k(const uint8_t * w6, const uint8_t * kr, __half * out, int64_t ngroups, int k) {
+    const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (g >= ngroups) return;
+    const int64_t blk = g / 2;
+    const int h = int(g % 2);
+    const uint8_t * b = w6 + blk * 24 + h * 8;
+    const uint32_t hi = *reinterpret_cast<const uint32_t *>(w6 + blk * 24 + 16 + 4 * h);
+    const int64_t row = blk / (k / 32);
+    const int sblk = int(blk % (k / 32));
+    const uint8_t * rc = kr + (row * (k / 256) + sblk / 8) * 20;
+    const float f = __half2float(*reinterpret_cast<const __half *>(rc + 16)) * float(int8_t(rc[(sblk % 8) * 2 + h]));
+    const __half sc = __float2half_rn(f), mn = __float2half_rn(-32.f * f);
+    __align__(16) __half v[16];
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const int u = e / 4, j = e % 4;
+        const int q = ((b[(u / 2) * 4 + j] >> ((u % 2) * 4)) & 0xF) | int(((hi >> (2 * e)) & 3) << 4);
+        v[e] = __hfma(__int2half_rn(q), sc, mn);
+    }
+    reinterpret_cast<uint4 *>(out)[g * 2] = reinterpret_cast<const uint4 *>(v)[0];
+    reinterpret_cast<uint4 *>(out)[g * 2 + 1] = reinterpret_cast<const uint4 *>(v)[1];
+}
+void k6_dequant_h(const uint8_t * w6, const uint8_t * kr, __half * out, int rows, int k, cudaStream_t s) {
+    const int64_t ng = int64_t(rows) * k / 16;
+    k6_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w6, kr, out, ng, k);
+}
 // k5: per 32 weights 16 nibble bytes (k4 order) + the 32 high bits; one thread per 16-weight group
 __global__ void k5_dequant_h_k(const uint8_t * w5, const uint8_t * kh, __half * out, int64_t ngroups, int k) {
     const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1989,6 +2811,7 @@ void k5_dequant_h(const uint8_t * w5, const uint8_t * kh, __half * out, int rows
     const int64_t ng = int64_t(rows) * k / 16;
     k5_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w5, kh, out, ng, k);
 }
+
 void k4_dequant_h(const uint8_t * w4, const uint8_t * kh, __half * out, int rows, int k, cudaStream_t s) {
     const int64_t ng = int64_t(rows) * k / 16;
     k4_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w4, kh, out, ng, k);
@@ -2115,6 +2938,10 @@ void embed_multi_tq3(const void * w, const uint32_t * dtok, int n, __nv_bfloat16
 
 void embed_multi_q6k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
     q6k_row_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), 0, y, k, dtok);
+}
+
+void embed_multi_iq3s(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    iq3s_row_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), 0, y, k, dtok);
 }
 
 // Q5_K -> int8 + FP16 scale per 16 (symmetric, max-abs / 127): the affine Q5_K values are not exactly representable,
@@ -2282,28 +3109,9 @@ void i8h_matvec_bf16(const int8_t * w8, const __half * sc, const __half * xh, __
     }
 }
 
-// Per-shape row tiling for <= 8 columns (u4h_tune; bit-identical for every MT).
-static std::map<std::pair<int, int>, int> & iq3x_tuned() {
-    static std::map<std::pair<int, int>, int> m;
-    return m;
-}
-static std::map<std::pair<int, int>, int> & iq3_tuned() {
-    static std::map<std::pair<int, int>, int> m;
-    return m;
-}
-static std::map<std::pair<int, int>, int> & k3_tuned() {
-    static std::map<std::pair<int, int>, int> m;
-    return m;
-}
-static std::map<std::pair<int, int>, int> & k4_tuned() {
-    static std::map<std::pair<int, int>, int> m;
-    return m;
-}
-static std::map<std::pair<int, int>, int> & k5_tuned() {
-    static std::map<std::pair<int, int>, int> m;
-    return m;
-}
-static std::map<std::pair<int, int>, int> & u4h_tuned() {
+// Per-shape row tiling for <= 8 columns (u4h_tune; bit-identical for every MT), one map per format.
+template <int FMT>
+static std::map<std::pair<int, int>, int> & tuned() {
     static std::map<std::pair<int, int>, int> m;
     return m;
 }
@@ -2313,9 +3121,13 @@ static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh
                        cudaStream_t s, int mt = -1, const uint32_t * rid = nullptr, int ldy = 0) {
     if (k % 64) throw std::invalid_argument("u4h_matvec: k must be a multiple of 64");
     if (mt < 0 && ncols <= 8) {
-        auto & tm = FMT == 5 ? iq3x_tuned() : FMT == 4 ? iq3_tuned() : FMT == 2 ? k3_tuned() : FMT == 1 ? k4_tuned() : FMT == 6 ? k5_tuned() : u4h_tuned();
+        auto & tm = tuned<FMT>();
         const auto it = tm.find({rows, k});
         mt = it == tm.end() ? 1 : it->second;
+    }
+    if (ncols <= 8 && mt == 5) {  // MT 1 with prefetch
+        u4h_matvec_k<8, OUT, 1, FMT, 1><<<(rows + 15) / 16, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        return;
     }
     if (ncols <= 8 && mt > 1) {
         if (mt >= 4) u4h_matvec_k<8, OUT, 4, FMT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
@@ -2375,14 +3187,6 @@ void k3_matvec(const uint8_t * w3, const uint8_t * kr, const __half * xh, float 
     u4h_launch<float, 2>(w3, reinterpret_cast<const __half2 *>(kr), xh, y, rows, k, ncols, s);
 }
 
-void k5_matvec_bf16(const uint8_t * w5, const uint8_t * kh, const __half * xh, __nv_bfloat16 * y, int rows, int k,
-                    int ncols, cudaStream_t s, int ldy) {
-    u4h_launch<__nv_bfloat16, 6>(w5, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s, -1, nullptr, ldy);
-}
-void k5_matvec(const uint8_t * w5, const uint8_t * kh, const __half * xh, float * y, int rows, int k, int ncols,
-               cudaStream_t s) {
-    u4h_launch<float, 6>(w5, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s);
-}
 void k4_matvec_bf16(const uint8_t * w4, const uint8_t * kh, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                     int ncols, cudaStream_t s, int ldy) {
     u4h_launch<__nv_bfloat16, 1>(w4, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s, -1, nullptr, ldy);
@@ -2390,6 +3194,51 @@ void k4_matvec_bf16(const uint8_t * w4, const uint8_t * kh, const __half * xh, _
 void k4_matvec(const uint8_t * w4, const uint8_t * kh, const __half * xh, float * y, int rows, int k, int ncols,
                cudaStream_t s) {
     u4h_launch<float, 1>(w4, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s);
+}
+
+template <int FMT>
+static void ud_dispatch_bf16(const uint8_t * w, const uint8_t * rec, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                             int ncols, cudaStream_t s, int ldy) {
+    u4h_launch<__nv_bfloat16, FMT>(w, reinterpret_cast<const __half2 *>(rec), xh, y, rows, k, ncols, s, -1, nullptr, ldy);
+}
+void udq_matvec_bf16(int fmt, const uint8_t * w, const uint8_t * rec, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                     int ncols, cudaStream_t s, int ldy) {
+    switch (fmt) {
+        case 8: ud_dispatch_bf16<8>(w, rec, xh, y, rows, k, ncols, s, ldy); break;
+        case 9: ud_dispatch_bf16<9>(w, rec, xh, y, rows, k, ncols, s, ldy); break;
+        case 10: ud_dispatch_bf16<10>(w, rec, xh, y, rows, k, ncols, s, ldy); break;
+        case 11: ud_dispatch_bf16<11>(w, rec, xh, y, rows, k, ncols, s, ldy); break;
+        case 12: ud_dispatch_bf16<12>(w, rec, xh, y, rows, k, ncols, s, ldy); break;
+        default: throw std::invalid_argument("udq_matvec: unknown format");
+    }
+}
+void udq_matvec(int fmt, const uint8_t * w, const uint8_t * rec, const __half * xh, float * y, int rows, int k, int ncols,
+                cudaStream_t s) {
+    const auto * r = reinterpret_cast<const __half2 *>(rec);
+    switch (fmt) {
+        case 8: u4h_launch<float, 8>(w, r, xh, y, rows, k, ncols, s); break;
+        case 9: u4h_launch<float, 9>(w, r, xh, y, rows, k, ncols, s); break;
+        case 10: u4h_launch<float, 10>(w, r, xh, y, rows, k, ncols, s); break;
+        case 11: u4h_launch<float, 11>(w, r, xh, y, rows, k, ncols, s); break;
+        case 12: u4h_launch<float, 12>(w, r, xh, y, rows, k, ncols, s); break;
+        default: throw std::invalid_argument("udq_matvec: unknown format");
+    }
+}
+void k6_matvec_bf16(const uint8_t * w6, const uint8_t * kr, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                    int ncols, cudaStream_t s, int ldy) {
+    u4h_launch<__nv_bfloat16, 7>(w6, reinterpret_cast<const __half2 *>(kr), xh, y, rows, k, ncols, s, -1, nullptr, ldy);
+}
+void k6_matvec(const uint8_t * w6, const uint8_t * kr, const __half * xh, float * y, int rows, int k, int ncols,
+               cudaStream_t s) {
+    u4h_launch<float, 7>(w6, reinterpret_cast<const __half2 *>(kr), xh, y, rows, k, ncols, s);
+}
+void k5_matvec_bf16(const uint8_t * w5, const uint8_t * kh, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                    int ncols, cudaStream_t s, int ldy) {
+    u4h_launch<__nv_bfloat16, 6>(w5, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s, -1, nullptr, ldy);
+}
+void k5_matvec(const uint8_t * w5, const uint8_t * kh, const __half * xh, float * y, int rows, int k, int ncols,
+               cudaStream_t s) {
+    u4h_launch<float, 6>(w5, reinterpret_cast<const __half2 *>(kh), xh, y, rows, k, ncols, s);
 }
 
 void u4h_matvec_bf16(const uint8_t * w4, const __half2 * sm, const __half * xh, __nv_bfloat16 * y, int rows, int k,
@@ -2413,7 +3262,7 @@ void u4h_matvec_mt(const uint8_t * w4, const __half2 * sm, const __half * xh, __
 
 template <int FMT>
 static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) {
-    if ((FMT == 5 ? iq3x_tuned() : FMT == 4 ? iq3_tuned() : FMT == 2 ? k3_tuned() : FMT == 1 ? k4_tuned() : FMT == 6 ? k5_tuned() : u4h_tuned()).count({rows, k})) return;
+    if (tuned<FMT>().count({rows, k})) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
     cudaMalloc(&x, size_t(8) * k * 2);
@@ -2424,7 +3273,7 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
     cudaEventCreate(&e1);
     int best = 1;
     float best_ms = 1e30f;
-    for (int mt : {1, 2, 4}) {
+    for (int mt : {1, 2, 4, 5}) {  // 5: MT 1 with prefetch
         for (int i = 0; i < 10; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, 8, s, mt);
         cudaEventRecord(e0, s);
         for (int i = 0; i < 30; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, 8, s, mt);
@@ -2438,8 +3287,8 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
     cudaEventDestroy(e1);
     cudaFree(x);
     cudaFree(y);
-    (FMT == 5 ? iq3x_tuned() : FMT == 4 ? iq3_tuned() : FMT == 2 ? k3_tuned() : FMT == 1 ? k4_tuned() : FMT == 6 ? k5_tuned() : u4h_tuned())[{rows, k}] = best;
-    if (tqllm::debug_on("tune")) std::fprintf(stderr, FMT ? "k4/k3_tune %d x %d -> MT %d (%.1f us)\n" : "u4h_tune %d x %d -> MT %d (%.1f us)\n", rows, k, best, best_ms * 1000.f / 30.f);
+    tuned<FMT>()[{rows, k}] = best;
+    if (tqllm::debug_on("tune")) std::fprintf(stderr, "u4h_tune fmt %d %d x %d -> MT %d (%.1f us)\n", FMT, rows, k, best, best_ms * 1000.f / 30.f);
 }
 
 void u4h_tune(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) { tune_impl<0>(w4, sm, rows, k, s); }
@@ -2449,11 +3298,57 @@ void iq3x_tune(const uint8_t * w3, const uint8_t * rec, int rows, int k, cudaStr
 void iq3_tune(const uint8_t * w3, const uint8_t * rec, int rows, int k, cudaStream_t s) {
     tune_impl<4>(w3, reinterpret_cast<const __half2 *>(rec), rows, k, s);
 }
-void k5_tune(const uint8_t * w5, const uint8_t * kh, int rows, int k, cudaStream_t s) {
-    tune_impl<6>(w5, reinterpret_cast<const __half2 *>(kh), rows, k, s);
-}
 void k4_tune(const uint8_t * w4, const uint8_t * kh, int rows, int k, cudaStream_t s) {
     tune_impl<1>(w4, reinterpret_cast<const __half2 *>(kh), rows, k, s);
+}
+// matvec through the u4h kernel for any u4h-family fmt (incl. 13 iq4n, 14 iq4l, 15 i8h); mt as u4h_launch (-1: tuned)
+void u4h_family_matvec_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k,
+                           int ncols, cudaStream_t s) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    switch (fmt) {
+        case 13: u4h_launch<float, 13>(w, a, xh, y, rows, k, ncols, s); break;
+        case 14: u4h_launch<float, 14>(w, a, xh, y, rows, k, ncols, s); break;
+        case 15: u4h_launch<float, 15>(w, a, xh, y, rows, k, ncols, s); break;
+        default: throw std::invalid_argument("u4h_family_matvec_f32: fmt not wired");
+    }
+}
+void u4h_family_tune(int fmt, const uint8_t * w, const void * aux, int rows, int k, cudaStream_t s) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    switch (fmt) {
+        case 13: tune_impl<13>(w, a, rows, k, s); break;
+        case 14: tune_impl<14>(w, a, rows, k, s); break;
+        case 15: tune_impl<15>(w, a, rows, k, s); break;
+        default: throw std::invalid_argument("u4h_family_tune: fmt not wired");
+    }
+}
+void u4h_family_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows,
+                            int k, int ncols, cudaStream_t s, int ldy, int mt) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    switch (fmt) {
+        case 13: u4h_launch<__nv_bfloat16, 13>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
+        case 14: u4h_launch<__nv_bfloat16, 14>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
+        case 15: u4h_launch<__nv_bfloat16, 15>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
+        case 6: u4h_launch<__nv_bfloat16, 6>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
+        default: throw std::invalid_argument("u4h_family_matvec: fmt not wired");
+    }
+}
+
+void udq_tune(int fmt, const uint8_t * w, const uint8_t * rec, int rows, int k, cudaStream_t s) {
+    const auto * r = reinterpret_cast<const __half2 *>(rec);
+    switch (fmt) {
+        case 8: tune_impl<8>(w, r, rows, k, s); break;
+        case 9: tune_impl<9>(w, r, rows, k, s); break;
+        case 10: tune_impl<10>(w, r, rows, k, s); break;
+        case 11: tune_impl<11>(w, r, rows, k, s); break;
+        case 12: tune_impl<12>(w, r, rows, k, s); break;
+        default: throw std::invalid_argument("udq_tune: unknown format");
+    }
+}
+void k6_tune(const uint8_t * w6, const uint8_t * kr, int rows, int k, cudaStream_t s) {
+    tune_impl<7>(w6, reinterpret_cast<const __half2 *>(kr), rows, k, s);
+}
+void k5_tune(const uint8_t * w5, const uint8_t * kh, int rows, int k, cudaStream_t s) {
+    tune_impl<6>(w5, reinterpret_cast<const __half2 *>(kh), rows, k, s);
 }
 void k3_tune(const uint8_t * w3, const uint8_t * kr, int rows, int k, cudaStream_t s) {
     tune_impl<2>(w3, reinterpret_cast<const __half2 *>(kr), rows, k, s);
@@ -2468,6 +3363,30 @@ void tq3_gemm_h(const void * w, const __half * xh, __nv_bfloat16 * y, int rows, 
     static const Tq3CodebookU cb = tq3_codebook_u8();
     const dim3 grid((rows + 63) / 64, (ncols + 63) / 64);
     tq3_gemm_h_k<true><<<grid, 256, 0, s>>>(static_cast<const uint4 *>(w), xh, y, rows, k, ncols, cb.lo, cb.hi);
+}
+
+void tq3_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                       const int * ids, int n, int topk, bool per_expert, cudaStream_t s) {
+    if (!w || !x || !y || !ids || rows <= 0 || k <= 0 || k % 32 || n <= 0 || topk <= 0 ||
+        int64_t(n) * topk > 65535)
+        throw std::invalid_argument("tq3_expert_matvec: invalid shape or pointer");
+    static const Tq3CodebookU cb = tq3_codebook_u8();
+    const dim3 grid((rows + 15) / 16, n * topk);
+    tq3_matvec_h_k<1, true><<<grid, 256, 0, s>>>(static_cast<const uint4 *>(w), x, y, rows, k,
+                                               cb.lo, cb.hi, ids, topk, per_expert);
+}
+
+void tq3_expert_gemm(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert, cudaStream_t s) {
+    if (!w || !x || !y || !counts || !groups || rows <= 0 || k <= 0 || k % 32 || capacity <= 0 ||
+        experts <= 0 || experts > 65535 || topk <= 0 ||
+        (int64_t(capacity) + 63) / 64 > 65535)
+        throw std::invalid_argument("tq3_expert_gemm: invalid shape or pointer");
+    static const Tq3CodebookU cb = tq3_codebook_u8();
+    const dim3 grid((rows + 63) / 64, (capacity + 63) / 64, experts);
+    tq3_gemm_h_k<true, true><<<grid, 256, 0, s>>>(static_cast<const uint4 *>(w), x, y, rows, k, capacity,
+                                               cb.lo, cb.hi, counts, groups, capacity, topk, per_expert);
 }
 
 void tq3_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t s) {

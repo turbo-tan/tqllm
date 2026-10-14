@@ -9,14 +9,17 @@
 #include "gguf.hpp"
 #include "prefill_chunk.hpp"
 #include "gemm_buffer.hpp"
+#include "gemm_pad.hpp"
 #include "prefill_path.hpp"
 #include "graph_capture.hpp"
+#include "graph_lru.hpp"
 #include "tree_columns.hpp"
 #include "dev_alloc.cuh"
 #include "fp8_gemm.cuh"
 #include "int8_gemm.cuh"
 #include "qwen35_kernels.cuh"
 #include "quant_kernels.cuh"
+#include "moe_kernels.cuh"
 #include "vision_kernels.cuh"
 #include "safetensors.hpp"
 #include "dequant.hpp"
@@ -112,6 +115,18 @@ struct Config {
     bool tiled = false;      // GGUF stores Gated DeltaNet value heads in tiled order
     int msec[3] = {0, 0, 0};  // interleaved M-RoPE sections (t, h, w rotary pairs) for image tokens
     std::vector<bool> full;  // per layer: true = full attention, false = Gated DeltaNet
+    // Mixture-of-experts (arch `qwen35moe`). Every block is MoE in that file - there is no
+    // dense-vs-MoE layer split - so `moe` alone selects the path and `layers` still counts blocks.
+    // Defaults keep the dense qwen35 config untouched: both construction sites value-init
+    // `Config c{}` and then assign by name, so these fields are 0/false on the dense path.
+    bool moe = false;
+    uint32_t expert_count = 0;      // qwen35moe.expert_count           (256)
+    uint32_t expert_used = 0;       // qwen35moe.expert_used_count      (top-8)
+    uint32_t expert_ff = 0;         // qwen35moe.expert_feed_forward_length (512, per expert)
+    uint32_t shared_ff = 0;         // qwen35moe.expert_shared_feed_forward_length (512)
+    // A dense qwen35 file declares `qwen35.feed_forward_length`; the MoE file does not - it has
+    // only the two expert FFN lengths above. `ffn` therefore means "per-expert FFN" when moe is
+    // set, and the shared expert uses `shared_ff`.
 };
 
 uint32_t u32(const Json & o, const char * k) {
@@ -176,6 +191,17 @@ struct Layer {
     // w_mix = [q|k|v] (attention) or [qkv|z|b|a] (Gated DeltaNet); w_gu = [gate|up].
     Mat w_mix, w_gu;
     Mat w_ba;  // W4A16: [b|a] kept BF16 (w_mix = [qkv|z] u4h), interleaved into the mix rows after the matmuls
+    // qwen35moe: router [E][H]; routed experts stacked per projection (expert e = rows [e*ff, (e+1)*ff)); shared expert
+    Mat ex_gate, ex_up, ex_down, sh_gu, sh_down;
+    int sh_slot = -1;  // decode: the shared expert's index in ex_gate / ex_up / ex_down (-1: dense shared path)
+    // --moe-host-mb: cx_* hold this layer's least-routed experts in pinned host memory and ex_* the rest (VRAM);
+    // hot_slot / cold_slot [E] map an expert to its row block in either set (-1 in the other)
+    Mat cx_gate, cx_up, cx_down;
+    const int * hot_slot = nullptr;
+    const int * cold_slot = nullptr;
+    int n_hot = 0, n_cold = 0;
+    const float * router = nullptr;
+    const float * sh_gate = nullptr;  // ffn_gate_inp_shexp [H]: sigmoid gate of the shared expert output
 };
 
 struct MtpHead {
@@ -197,6 +223,11 @@ struct DFlashLayer {
 // affects acceptance; the target verifies every token).
 struct DFlash {
     bool present = false;
+    // DSpark (DFlash + Markov head, anchor-first): nb tokens [anchor, MASK x (nb - 1)] predict positions pos + 1 ..
+    // pos + nb, laid out as lattice rows 1 .. nb (block = nb + 1); sel_prev / sel_next = markov_w1 / markov_w2, gate 1
+    bool dspark = false;
+    int nb = 0, ffn = 0;
+    float theta = 0.f;
     int heads = 0, kvheads = 0, hd = 0, block = 0, group = 0, window = 0, topk = 0, rank = 0, ring = 0;
     int retr = 0, recent = 0;  // retrieval window: retr chunks of 16 far positions + `recent` latest positions
     uint32_t mask_id = 0;
@@ -207,14 +238,29 @@ struct DFlash {
     std::vector<DFlashLayer> L;
 };
 
+// Arch strings this engine can parse. `qwen35` is the dense hybrid; `qwen35moe` is the same
+// hybrid with a mixture-of-experts FFN in every block. Anything else must be rejected here: a
+// silently mis-parsed arch produces a model that loads, runs, and emits fluent wrong text.
+bool arch_supported(const std::string & a) { return a == "qwen35" || a == "qwen35moe"; }
+
 Config config_from_gguf(const GgufFile & f) {
-    const std::string A = "qwen35.";
+    // The metadata namespace comes from the file, not from a hardcoded prefix. The dense and MoE
+    // variants use different ones (`qwen35.` vs `qwen35moe.`), and the MoE file contains no
+    // `qwen35.` key at all - reading it with the dense prefix failed as
+    // "GGUF missing key qwen35.block_count", which named the wrong key rather than the real cause.
+    std::string arch;
+    if (f.has("general.architecture")) arch = f.str("general.architecture");
+    if (arch.empty() || !arch_supported(arch))
+        throw std::runtime_error("unsupported GGUF architecture '" + arch +
+                                 "' (this engine parses qwen35 and qwen35moe only)");
+    const std::string A = arch + ".";
     Config c{};
+    c.moe = arch == "qwen35moe";
     const uint32_t blocks = uint32_t(f.num(A + "block_count"));
     const uint32_t nextn = uint32_t(f.num(A + "nextn_predict_layers", 0));
+    if (nextn > blocks) throw std::runtime_error("nextn_predict_layers exceeds block_count");
     c.layers = blocks - nextn;
     c.hidden = uint32_t(f.num(A + "embedding_length"));
-    c.ffn = uint32_t(f.num(A + "feed_forward_length"));
     c.heads = uint32_t(f.num(A + "attention.head_count"));
     c.kvheads = uint32_t(f.num(A + "attention.head_count_kv"));
     c.head_dim = uint32_t(f.num(A + "attention.key_length"));
@@ -233,6 +279,64 @@ Config config_from_gguf(const GgufFile & f) {
     c.lin_dv = uint32_t(f.num(A + "ssm.inner_size")) / c.lin_vheads;
     c.conv_k = uint32_t(f.num(A + "ssm.conv_kernel"));
     c.full_interval = uint32_t(f.num(A + "full_attention_interval"));
+
+    if (!c.moe) {
+        c.ffn = uint32_t(f.num(A + "feed_forward_length"));
+    } else {
+        // The MoE file declares no `feed_forward_length` - only the per-expert and shared-expert
+        // widths. `ffn` carries the per-expert width so the existing FFN plumbing keeps meaning
+        // "the intermediate width of the FFN being applied".
+        c.expert_count = uint32_t(f.num(A + "expert_count"));
+        c.expert_used = uint32_t(f.num(A + "expert_used_count"));
+        c.expert_ff = uint32_t(f.num(A + "expert_feed_forward_length"));
+        c.shared_ff = uint32_t(f.num(A + "expert_shared_feed_forward_length"));
+        c.ffn = std::max(c.expert_ff, c.shared_ff);  // per-token FFN buffers serve the routed and the shared expert
+        if (c.expert_count == 0 || c.expert_used == 0 || c.expert_used > c.expert_count)
+            throw std::runtime_error("qwen35moe: expert_count/expert_used_count inconsistent (" +
+                                     std::to_string(c.expert_count) + " experts, top-" +
+                                     std::to_string(c.expert_used) + ")");
+        if (c.expert_ff == 0 || c.shared_ff == 0)
+            throw std::runtime_error("qwen35moe: zero expert FFN width");
+
+        // Cross-check the metadata against the tensor table. The expert tensors are 3-D with the
+        // expert index last (ne[2]); gate/up are [hidden, expert_ff, n_expert] and down is
+        // [expert_ff, hidden, n_expert]. If the metadata disagrees with the file's own shapes the
+        // router would index experts that do not exist, so refuse rather than continue.
+        auto check = [&](const char * name, uint64_t n0, uint64_t n1) {
+            const auto it = f.tensors.find(name);
+            if (it == f.tensors.end())
+                throw std::runtime_error(std::string("qwen35moe: missing expert tensor ") + name);
+            const GgufTensor & t = it->second;
+            if (t.ne.size() != 3 || t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != c.expert_count)
+                throw std::runtime_error(std::string("qwen35moe: ") + name + " expected [" +
+                                         std::to_string(n0) + "," + std::to_string(n1) + "," +
+                                         std::to_string(c.expert_count) + "] but the file declares " +
+                                         gguf_shape_string(t));
+        };
+        check("blk.0.ffn_gate_exps.weight", c.hidden, c.expert_ff);
+        check("blk.0.ffn_up_exps.weight", c.hidden, c.expert_ff);
+        check("blk.0.ffn_down_exps.weight", c.expert_ff, c.hidden);
+        // The shared expert is 2-D and uses the shared width, not the per-expert width.
+        for (const char * n : {"blk.0.ffn_gate_shexp.weight", "blk.0.ffn_up_shexp.weight"}) {
+            const auto it = f.tensors.find(n);
+            if (it == f.tensors.end())
+                throw std::runtime_error(std::string("qwen35moe: missing shared expert tensor ") + n);
+            if (it->second.ne.size() != 2 || it->second.ne[0] != c.hidden ||
+                it->second.ne[1] != c.shared_ff)
+                throw std::runtime_error(std::string("qwen35moe: ") + n + " expected [" +
+                                         std::to_string(c.hidden) + "," + std::to_string(c.shared_ff) +
+                                         "] but the file declares " + gguf_shape_string(it->second));
+        }
+        // Every block must be MoE in this arch; a block without expert tensors would mean the
+        // layer count or the arch string is wrong.
+        for (uint32_t l = 0; l < c.layers; ++l) {
+            const std::string p = "blk." + std::to_string(l) + ".ffn_gate_exps.weight";
+            if (!f.tensors.count(p))
+                throw std::runtime_error("qwen35moe: block " + std::to_string(l) +
+                                         " has no ffn_gate_exps.weight; expected every block to be MoE");
+        }
+    }
+
     const auto & emb = f.tensors.at("token_embd.weight");
     c.vocab = uint32_t(emb.ne[1]);
     c.tied = !f.tensors.count("output.weight");
@@ -246,6 +350,8 @@ public:
     // `path`: a checkpoint directory (safetensors, BF16) or a .gguf file (TQ3_4S / Q6_K / F32).
     Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o)
         : opt(o), context_(ctx) {
+        glru.set_cap(size_t(std::max(1, opt.graph_cache)));
+        graph_keep = size_t(std::max(0L, opt.graph_keep_mb)) << 20;
         if (slots < 1 || slots > 64) throw std::invalid_argument("slots must be in 1..64");
         if (!context_) throw std::invalid_argument("context must be positive");
         const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
@@ -309,10 +415,8 @@ public:
     // runs out of memory must hand back the mapped host blocks: on WSL they count against the device budget, so
     // tqserve's auto-fit retries would otherwise lose ~2 GB per attempt)
     void release_raw() {
-        for (auto & [k, g] : graphs) cudaGraphExecDestroy(g);
-        for (auto & [k, g] : bgraphs) cudaGraphExecDestroy(g);
-        for (auto & [k, g] : dgraphs) cudaGraphExecDestroy(g);
-        for (auto & [k, g] : cgraphs) cudaGraphExecDestroy(g);
+        if (stream) cudaStreamSynchronize(stream);
+        glru.clear([](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
         if (side) cudaStreamDestroy(side);
         if (kv_side) cudaStreamDestroy(kv_side);
         if (solver) cusolverDnDestroy(solver);
@@ -322,6 +426,10 @@ public:
         kv_side = nullptr, kv_fork = kv_ready[0] = kv_ready[1] = kv_done[0] = kv_done[1] = nullptr;
         if (ev_fork) cudaEventDestroy(ev_fork);
         if (ev_join) cudaEventDestroy(ev_join);
+        if (moe_fork) cudaEventDestroy(moe_fork);
+        if (moe_join) cudaEventDestroy(moe_join);
+        if (moe_side) cudaStreamDestroy(moe_side);
+        moe_side = nullptr, moe_fork = moe_join = nullptr;
         for (auto st : seg_side) cudaStreamDestroy(st);
         for (auto ev : seg_join) cudaEventDestroy(ev);
         if (seg_fork) cudaEventDestroy(seg_fork);
@@ -332,7 +440,7 @@ public:
         if (h_rpos) cudaFreeHost(h_rpos);
         if (blas) cublasDestroy(blas);
         if (stream) cudaStreamDestroy(stream);
-        graphs.clear(), bgraphs.clear(), dgraphs.clear(), cgraphs.clear(), host_blocks.clear(), seg_side.clear(), seg_join.clear();
+        host_blocks.clear(), seg_side.clear(), seg_join.clear();
         side = nullptr, ev_fork = ev_join = seg_fork = nullptr, h_tok = nullptr, h8_host = nullptr, h_pos = nullptr;
         h_rpos = nullptr;
         blas = nullptr, stream = nullptr;
@@ -343,7 +451,7 @@ public:
         {  // weights the single-token path cannot read (TQ4, W4A16, ...): one-column verify + commit, the same
            // per-column arithmetic as verify(n) (tqverify then checks verify(n) against this chain)
             const Mat & probe = layer[0].w_gu.p ? layer[0].w_gu : layer[0].w_down;
-            if (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16) {
+            if (cfg.moe || (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16)) {
                 if (capture) throw std::runtime_error("hidden-state capture needs TQ3_4S / BF16 weights");
                 uint32_t next = 0;
                 verify(&id, 1, pos, &next);
@@ -361,6 +469,7 @@ public:
 
         if (embed.type == GGML_TQ3_4S) tqllm_cuda::tq3_row(embed.p, int(id), xp, H, stream);
         else if (embed.type == GGML_Q6_K) tqllm_cuda::q6k_row(embed.p, int(id), xp, H, stream);
+        else if (embed.type == GGML_IQ3_S) tqllm_cuda::iq3s_row(embed.p, int(id), xp, H, stream);
         else tqllm_cuda::gather(static_cast<const bf16 *>(embed.p), xp, int(id), H, stream);
         if (quantized) tqllm_cuda::sumsq(xp, part_x.as<float>(), H, stream);
         uint32_t attn_i = 0, lin_i = 0;
@@ -421,6 +530,7 @@ public:
             else tqllm_cuda::residual(mp, rp, H, stream);
 
             norm_prep(mp, L.post_norm, part_m.as<float>(), np, H);
+            if (cfg.moe) throw std::runtime_error("qwen35moe: expert FFN forward is not implemented yet (C2 step 2)");
             const bf16 *gp = gate.as<bf16>(), *upp = up.as<bf16>();
             if (L.w_gu.p) {
                 mm(L.w_gu, np, t_in.as<bf16>());
@@ -437,7 +547,10 @@ public:
             else tqllm_cuda::residual(xp, mp, H, stream);
             if (capture && l + 1 < cfg.layers) to_host(xp, H, capture + size_t(l) * H);
         }
-        if (!sample) return 0;
+        if (!sample) {
+            sync_ck();
+            return 0;
+        }
 
         tqllm_cuda::rms_f(xp, 0, out_norm, np, 0, H, 1, cfg.eps, stream);
         if (capture) to_host(np, H, capture + size_t(cfg.layers - 1) * H);
@@ -551,6 +664,8 @@ private:
     cudaStream_t stream{};
     cudaStream_t side{};                // parallel branch for small independent matvecs (GDN b / a), graph-captured
     cudaEvent_t ev_fork{}, ev_join{};
+    cudaStream_t moe_side{};             // --moe-host-mb decode: cold (host) experts overlap the hot ones, graph-captured
+    cudaEvent_t moe_fork{}, moe_join{};
     std::vector<cudaStream_t> seg_side;  // batched verify: one branch per extra segment (per-slot GDN / attention)
     std::vector<cudaEvent_t> seg_join;
     cudaEvent_t seg_fork{};
@@ -760,6 +875,39 @@ private:
         return out;
     }
 
+    // F16 GGUF matrices (llama-quantize COPY mode keeps ssm_alpha / ssm_beta in F16) also run as BF16.
+    // F16 -> F32 by pure IEEE-754 bit manipulation (no <cmath> dependency in this TU), then round to BF16.
+    static inline float f16_bits_to_f32(uint16_t h) {
+        const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+        const uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+        uint32_t f32;
+        if (exp == 0) {
+            if (man == 0) f32 = sign;                       // +-0
+            else {                                          // subnormal: normalise man into 1.xxx
+                uint32_t m = man, e = 127 - 15 + 1;         // exponent once leading 1 is implicit
+                while (!(m & 0x400u)) { m <<= 1; --e; }     // shift until bit 10 set
+                f32 = sign | (e << 23) | ((m & 0x3FFu) << 13);
+            }
+        } else if (exp == 31) {
+            f32 = sign | 0x7F800000u | (man << 13);         // inf (man==0) or nan
+        } else {
+            f32 = sign | ((exp + 112u) << 23) | (man << 13);  // normal: bias -15 -> +127 is +112
+        }
+        float out;
+        std::memcpy(&out, &f32, 4);
+        return out;
+    }
+    static std::vector<char> f16_to_bf16_host(const std::vector<char> & raw) {
+        std::vector<char> out(raw.size());  // 2 bytes in -> 2 bytes out
+        for (size_t i = 0; i < raw.size() / 2; ++i) {
+            uint16_t h;
+            std::memcpy(&h, raw.data() + 2 * i, 2);
+            const __nv_bfloat16 b = __float2bfloat16_rn(f16_bits_to_f32(h));
+            std::memcpy(out.data() + 2 * i, &b, 2);
+        }
+        return out;
+    }
+
     // Matmul matrices load through their weight format (src/formats); `repack` = false loads raw bytes (embeddings).
     Mat g_mat(const GgufFile & f, const std::string & name, int rows, int cols, bool repack = true) {
         const auto & t = gt(f, name);
@@ -770,13 +918,104 @@ private:
             const auto b = f32_to_bf16_host(host);
             return {put(b.data(), b.size()), GGML_BF16, rows, cols};
         }
+        if (t.type == GGML_F16) {
+            const auto b = f16_to_bf16_host(host);
+            return {put(b.data(), b.size()), GGML_BF16, rows, cols};
+        }
         if (repack)
             if (const auto * wf = weight_format(t.type)) return adopt(wf->load(host, rows, cols, uploader(), stream));
         if (t.type != GGML_TQ3_4S && t.type != GGML_Q6_K && t.type != GGML_BF16 &&
-            !((t.type == GGML_Q8_0 || t.type == GGML_Q4_K || t.type == GGML_Q3_K || t.type == GGML_Q5_K) && !repack))
+            !((t.type == GGML_Q8_0 || t.type == GGML_Q4_K || t.type == GGML_Q3_K || t.type == GGML_Q5_K ||
+               t.type == GGML_IQ3_S) && !repack))
             throw std::runtime_error("unsupported matrix type " + std::to_string(t.type) + " for " + name);
         if (t.type == GGML_TQ3_4S) quantized = true;
         return {put(host.data(), host.size()), t.type, rows, cols};
+    }
+
+    // 3-D MoE expert tensor [cols, rows, E] loaded as ONE stacked matrix of E * rows rows (the expert index is the outermost
+    // dimension, so expert e is the contiguous row range [e * rows, (e + 1) * rows)); expert_rows() views one expert.
+    // `extra`: a 2-D tensor of the same type and expert shape appended as expert `experts` (the fused shared expert)
+    Mat g_exps(const GgufFile & f, const std::string & name, int experts, int rows, int cols,
+               bool to_host = false, const std::string & extra = {}) {
+        const auto & t = gt(f, name);
+        if (t.ne.size() != 3 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(rows) || t.ne[2] != uint64_t(experts))
+            throw std::runtime_error("unexpected expert tensor shape for " + name);
+        const auto * wf = weight_format(t.type);
+        if (!wf) throw std::runtime_error("no weight format for expert tensor type " + std::to_string(t.type) + " (" + name + ")");
+        auto host = f.read(t);
+        if (!extra.empty()) {
+            const auto x = f.read(gt(f, extra));
+            host.insert(host.end(), x.begin(), x.end());
+        }
+        Mat m = adopt(wf->load(host, (experts + !extra.empty()) * rows, cols, to_host ? host_uploader() : uploader(), stream));
+        if (!m.fmt || !m.fmt->has_expert_matvec())
+            throw std::runtime_error(name + ": its device format has no grouped expert projection");
+        return m;
+    }
+    // g_exps with the experts flagged in `cold` loaded into pinned host memory (UVA) and the others into VRAM, each set
+    // stacked in expert order; returns {hot, cold}
+    std::pair<Mat, Mat> g_exps_split(const GgufFile & f, const std::string & name, int experts, int rows, int cols,
+                                     const std::vector<char> & cold, const std::string & extra = {}) {
+        const auto & t = gt(f, name);
+        if (t.ne.size() != 3 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(rows) || t.ne[2] != uint64_t(experts))
+            throw std::runtime_error("unexpected expert tensor shape for " + name);
+        const auto * wf = weight_format(t.type);
+        if (!wf) throw std::runtime_error("no weight format for expert tensor type " + std::to_string(t.type) + " (" + name + ")");
+        const auto host = f.read(t);
+        const size_t eb = host.size() / size_t(experts);
+        std::vector<char> hb, cb;
+        for (int e = 0; e < experts; ++e) {
+            auto & dst = cold[size_t(e)] ? cb : hb;
+            dst.insert(dst.end(), host.begin() + long(size_t(e) * eb), host.begin() + long(size_t(e + 1) * eb));
+        }
+        if (!extra.empty()) {
+            const auto x = f.read(gt(f, extra));
+            hb.insert(hb.end(), x.begin(), x.end());
+        }
+        const int nc = int(cb.size() / eb), nh = experts - nc + !extra.empty();
+        Mat hot = adopt(wf->load(hb, nh * rows, cols, uploader(), stream));
+        Mat cm = adopt(wf->load(cb, nc * rows, cols, host_uploader(), stream));
+        for (const Mat * m : {&hot, &cm})
+            if (!m->fmt || !m->fmt->has_expert_matvec()) throw std::runtime_error(name + ": its device format has no grouped expert projection");
+        return {hot, cm};
+    }
+    // --moe-host-mb: the least-routed experts over all layers (counts from the profile) until about M MiB are placed
+    std::vector<std::vector<char>> moe_placement(const GgufFile & f) {
+        const int L = int(cfg.layers), E = int(cfg.expert_count);
+        std::vector<std::vector<char>> cold(size_t(L), std::vector<char>(size_t(E), 0));
+        if (opt.moe_host_mb <= 0) return cold;
+        const std::string path = opt.moe_profile.empty() ? f.path + ".experts" : opt.moe_profile;
+        std::ifstream in(path);
+        int pl = 0, pe = 0;
+        if (!(in >> pl >> pe) || pl != L || pe != E)
+            throw std::runtime_error("--moe-host-mb needs a routing profile for this model (" + path + "; write one with TQLLM_MOE_PROFILE=FILE)");
+        std::vector<std::tuple<unsigned long long, int, int>> order;
+        unsigned long long total = 0, placed = 0;
+        for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+            unsigned long long c = 0;
+            if (!(in >> c)) throw std::runtime_error("truncated routing profile " + path);
+            order.emplace_back(c, l, e); total += c;
+        }
+        std::stable_sort(order.begin(), order.end());
+        const double want = double(opt.moe_host_mb) * 1048576.0;
+        double bytes = 0; int n = 0;
+        for (const auto & [c, l, e] : order) {
+            if (bytes >= want) break;
+            const auto p = "blk." + std::to_string(l) + ".";
+            for (const char * w : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+                bytes += double(gt(f, p + w).bytes) / E;
+            cold[size_t(l)][size_t(e)] = 1; placed += c; ++n;
+        }
+        std::fprintf(stderr, "tqllm: MoE experts in host memory: %d of %d (%.0f MiB), %.1f %% of the profiled routing (%s)\n", n, L * E,
+                     bytes / 1048576.0, total ? 100.0 * double(placed) / double(total) : 0.0, path.c_str());
+        return cold;
+    }
+    static Mat expert_rows(const Mat & m, int e, int rows) {
+        Mat v = m;
+        v.p = static_cast<const char *>(m.p) + size_t(e) * rows * m.fmt->row_bytes(m.cols);
+        if (m.aux) v.aux = static_cast<const char *>(m.aux) + size_t(e) * rows * m.fmt->aux_row_bytes(m.cols);
+        v.rows = rows;
+        return v;
     }
 
     // Row-concatenation of same-width matrices into one device matrix: one buffer when the types agree, else a composite
@@ -793,7 +1032,7 @@ private:
             type = t.type;
         }
         // types whose loaders produce Plain-basis formats with strided output
-        static const std::set<uint32_t> ok = {GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q6_K, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS};
+        static const std::set<uint32_t> ok = {GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS, GGML_IQ4_NL, GGML_Q2_K, GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ1_S};
         const bool combinable =
             std::all_of(parts.begin(), parts.end(), [&](const auto & pr) { return ok.count(gt(f, pr.first).type) > 0; });
         if (mixed && !combinable) return {};
@@ -817,6 +1056,10 @@ private:
             const auto b = f32_to_bf16_host(host);
             return {put(b.data(), b.size()), GGML_BF16, rows, cols};
         }
+        if (type == GGML_F16 && !mixed) {  // e.g. llama-quantize COPY keeps ssm_alpha / ssm_beta in F16
+            const auto b = f16_to_bf16_host(host);
+            return {put(b.data(), b.size()), GGML_BF16, rows, cols};
+        }
         if (const auto * wf = weight_format(type)) return adopt(wf->load(host, rows, cols, uploader(), stream));
         return {};
     }
@@ -838,7 +1081,8 @@ private:
         lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
         if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
         const auto mp = "blk." + std::to_string(cfg.layers) + ".";
-        if (f.tensors.count(mp + "nextn.eh_proj.weight") && opt.draft_model.empty()) {  // DFlash2 drafts instead
+        // the MTP head drafts without -md, or beside DFlash2 with --mtp (--mtp-from N: prompts of N+ tokens use MTP)
+        if (f.tensors.count(mp + "nextn.eh_proj.weight") && (opt.draft_model.empty() || opt.native_mtp) && !cfg.moe) {  // MoE MTP is not wired yet
             mtp.present = true;
             mtp.eh_proj = g_mat(f, mp + "nextn.eh_proj.weight", H, 2 * H);
             mtp.enorm = g_f32(f, mp + "nextn.enorm.weight", H);
@@ -877,18 +1121,65 @@ private:
             }
         }
         layer.resize(cfg.layers);
+        const auto cold_of = cfg.moe ? moe_placement(f) : std::vector<std::vector<char>>();
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             const auto p = "blk." + std::to_string(l) + ".";
             auto & L = layer[l];
             L = {};
             L.in_norm = g_f32(f, p + "attn_norm.weight", H);
             L.post_norm = g_f32(f, p + "post_attention_norm.weight", H);
-            L.w_gu = g_cat(f, {{p + "ffn_gate.weight", F}, {p + "ffn_up.weight", F}}, H);
-            if (!L.w_gu.p) {
-                L.w_gate = g_mat(f, p + "ffn_gate.weight", F, H);
-                L.w_up = g_mat(f, p + "ffn_up.weight", F, H);
+            if (cfg.moe) {
+                const int E = int(cfg.expert_count), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
+                L.router = g_f32(f, p + "ffn_gate_inp.weight", uint64_t(E) * H);
+                const auto & cold = cold_of[l];
+                const int nc = int(std::count(cold.begin(), cold.end(), char(1)));
+                const bool host = nc == E || int(l) < opt.n_cpu_moe;
+                // the shared expert joins the VRAM experts for decode when its matrices have the experts' type and shape
+                // (TQLLM_MOE_FUSE_SHARED=0: off); prefill keeps its dense path
+                auto same = [&](const char * sh, const char * ex, int rows, int cols) {
+                    if (!f.tensors.count(p + sh)) return false;
+                    const auto & a = gt(f, p + sh);
+                    const auto & b = gt(f, p + ex);
+                    return a.type == b.type && a.ne.size() == 2 && a.ne[0] == uint64_t(cols) && a.ne[1] == uint64_t(rows) && FS == FE;
+                };
+                const char * fz = std::getenv("TQLLM_MOE_FUSE_SHARED");
+                const bool fuse = !host && !(fz && fz[0] == '0') && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
+                                  same("ffn_up_shexp.weight", "ffn_up_exps.weight", FE, H) &&
+                                  same("ffn_down_shexp.weight", "ffn_down_exps.weight", H, FE);
+                auto x = [&](const char * sh) { return fuse ? p + sh : std::string(); };
+                if (nc == 0 || host) {
+                    L.ex_gate = g_exps(f, p + "ffn_gate_exps.weight", E, FE, H, host, x("ffn_gate_shexp.weight"));
+                    L.ex_up = g_exps(f, p + "ffn_up_exps.weight", E, FE, H, host, x("ffn_up_shexp.weight"));
+                    L.ex_down = g_exps(f, p + "ffn_down_exps.weight", E, H, FE, host, x("ffn_down_shexp.weight"));
+                    if (fuse) L.sh_slot = E;
+                } else {
+                    std::tie(L.ex_gate, L.cx_gate) = g_exps_split(f, p + "ffn_gate_exps.weight", E, FE, H, cold, x("ffn_gate_shexp.weight"));
+                    std::tie(L.ex_up, L.cx_up) = g_exps_split(f, p + "ffn_up_exps.weight", E, FE, H, cold, x("ffn_up_shexp.weight"));
+                    std::tie(L.ex_down, L.cx_down) = g_exps_split(f, p + "ffn_down_exps.weight", E, H, FE, cold, x("ffn_down_shexp.weight"));
+                    std::vector<int> hs(size_t(E), -1), cs(size_t(E), -1);
+                    for (int e = 0; e < E; ++e) {
+                        if (cold[size_t(e)]) cs[size_t(e)] = L.n_cold++;
+                        else hs[size_t(e)] = L.n_hot++;
+                    }
+                    if (fuse) L.sh_slot = L.n_hot;  // after the hot routed experts
+                    L.hot_slot = static_cast<const int *>(put(hs.data(), hs.size() * sizeof(int)));
+                    L.cold_slot = static_cast<const int *>(put(cs.data(), cs.size() * sizeof(int)));
+                }
+                L.sh_gu = g_cat(f, {{p + "ffn_gate_shexp.weight", FS}, {p + "ffn_up_shexp.weight", FS}}, H);
+                if (!L.sh_gu.p) throw std::runtime_error(p + "ffn_{gate,up}_shexp: types cannot be fused");
+                L.sh_down = g_mat(f, p + "ffn_down_shexp.weight", H, FS);
+                L.sh_gate = g_f32(f, p + "ffn_gate_inp_shexp.weight", H);
+                for (const Mat * m : {&L.ex_gate, &L.ex_up, &L.ex_down, &L.cx_gate, &L.cx_up, &L.cx_down})
+                    if (m->p && (!m->fmt->has_expert_matvec() || m->fmt->basis() != Basis::Plain))
+                        throw std::runtime_error(p + "unsupported grouped expert format: " + m->fmt->name());
+            } else {
+                L.w_gu = g_cat(f, {{p + "ffn_gate.weight", F}, {p + "ffn_up.weight", F}}, H);
+                if (!L.w_gu.p) {
+                    L.w_gate = g_mat(f, p + "ffn_gate.weight", F, H);
+                    L.w_up = g_mat(f, p + "ffn_up.weight", F, H);
+                }
+                L.w_down = g_mat(f, p + "ffn_down.weight", H, F);
             }
-            L.w_down = g_mat(f, p + "ffn_down.weight", H, F);
             if (cfg.full[l]) {
                 L.w_mix = g_cat(f, {{p + "attn_q.weight", 2 * int(cfg.heads) * hd}, {p + "attn_k.weight", int(cfg.kvheads) * hd},
                                     {p + "attn_v.weight", int(cfg.kvheads) * hd}}, H);
@@ -906,7 +1197,7 @@ private:
                 L.w_mix = g_cat(f, {{p + "attn_qkv.weight", qkvd}, {p + "attn_gate.weight", lv},
                                     {p + "ssm_beta.weight", vh}, {p + "ssm_alpha.weight", vh}}, H);
                 const auto bt = gt(f, p + "ssm_beta.weight").type;
-                if (!L.w_mix.p && (bt == GGML_BF16 || bt == GGML_F32) && weight_format(gt(f, p + "attn_qkv.weight").type)) {
+                if (!L.w_mix.p && (bt == GGML_BF16 || bt == GGML_F32 || bt == GGML_F16) && weight_format(gt(f, p + "attn_qkv.weight").type)) {
                     L.w_mix = g_cat(f, {{p + "attn_qkv.weight", qkvd}, {p + "attn_gate.weight", lv}}, H);
                     L.w_ba = g_cat(f, {{p + "ssm_beta.weight", vh}, {p + "ssm_alpha.weight", vh}}, H);
                     if (!L.w_mix.p || L.w_ba.type != GGML_BF16) throw std::runtime_error("W4A16: unexpected Gated DeltaNet types");
@@ -1120,6 +1411,31 @@ private:
         v_core = Buf(NBUF * lv * 2);
         v_act = Buf(NBUF * F * 2);
         v_xh = Buf(NBUF * widest * 2);
+        if (cfg.moe) {
+            const size_t K = cfg.expert_used, FE = cfg.expert_ff;
+            moe_logits = Buf(NBUF * (cfg.expert_count + 1) * 4);
+            moe_ids = Buf(NBUF * K * sizeof(int));
+            moe_counts = Buf(cfg.expert_count * sizeof(int));
+            moe_groups = Buf(NBUF * cfg.expert_count * sizeof(int));
+            moe_xids = Buf(NBUF * (K + 1) * sizeof(int));
+            if (opt.moe_host_mb > 0) {
+                moe_hot_ids = Buf(NBUF * (K + 1) * sizeof(int)); moe_cold_ids = Buf(NBUF * (K + 1) * sizeof(int));
+                moe_counts2 = Buf(cfg.expert_count * sizeof(int)); moe_groups2 = Buf(NBUF * cfg.expert_count * sizeof(int));
+                alloc_moe_stage();
+                alloc_moe_cache();
+            }
+            if (const char * pf = std::getenv("TQLLM_MOE_PROFILE")) {
+                moe_prof_path = pf; moe_prof = Buf(size_t(cfg.layers) * cfg.expert_count * 8);
+                ck(cudaMemset(moe_prof.p, 0, size_t(cfg.layers) * cfg.expert_count * 8));
+            }
+            moe_weights = Buf(NBUF * K * 4);
+            moe_shared_weights = Buf(NBUF * 4);
+            moe_gate = Buf(NBUF * (K + 1) * FE * 2);
+            moe_up = Buf(NBUF * (K + 1) * FE * 2);
+            moe_act = Buf(NBUF * (K + 1) * FE * 2);
+            moe_out = Buf(NBUF * (K + 1) * H * 2);
+            moe_shared = Buf(NBUF * H * 2);
+        }
         v_xf = Buf(NBUF * H * 4);
         v_px = Buf(NBUF * ((H + 255) / 256) * 4);
         v_pm = Buf(NBUF * ((H + 255) / 256) * 4);
@@ -1152,14 +1468,15 @@ private:
         v_cat = Buf(NVER * 2 * H * 2);
         mtp_h = Buf(H * 2);
         if (mtp.present) {
-            mtp_kc = Buf(size_t(context_) * cfg.kvheads * hd * 2);
-            mtp_vc = Buf(size_t(context_) * cfg.kvheads * hd * 2);
+            mtp_kc = Buf(kvf->key_bytes(context_, int(cfg.kvheads), int(hd)));
+            mtp_vc = Buf(kvf->value_bytes(context_, int(cfg.kvheads), int(hd)));
         }
         v_tokens = Buf(NBUF * 4);
         d_tpar = Buf(size_t(NB) * 4);
         d_tdep = Buf(size_t(NB) * 4);
         d_tcols = Buf(size_t(NB) * 4);
         d_chain = Buf(size_t(NB) * 4);
+        d_cdep = Buf(size_t(NB) * 4);  // chain depths 0, 1, ...: two-part attention of chains longer than 8 queries
         d_gdesc = Buf(256 * sizeof(tqllm_cuda::PathGather));
         d_pend = Buf(sizeof(int));
         ck(cudaMemset(d_pend.p, 0, sizeof(int)));
@@ -1171,7 +1488,11 @@ private:
             ck(cudaMemcpy(d_tpar.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
             for (int i = 0; i < NB; ++i) ch[size_t(i)] = i;
             ck(cudaMemcpy(d_tdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
+            ck(cudaMemcpy(d_cdep.p, ch.data(), ch.size() * 4, cudaMemcpyHostToDevice));
         }
+        if (opt.native_mtp && nslots != 1)  // refused at start-up, not per request
+            throw std::runtime_error("--mtp drafts for one slot only for now: use --np 1 (or -md for --np > 1)");
+        chain2 = kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
         // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
         if (opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
             if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)
@@ -1219,6 +1540,8 @@ private:
             else if (embed.type == GGML_Q6_K) bytes = n / 256 * 210;
             else if (embed.type == GGML_Q8_0) bytes = n / 32 * 34;
             else if (embed.type == GGML_Q3_K) bytes = n / 256 * 110;
+            else if (embed.type == GGML_Q5_K) bytes = n / 256 * 176;
+            else if (embed.type == GGML_IQ3_S) bytes = n / 256 * 110;
             if (bytes) {
                 const void * old = embed.p;
                 embed.p = const_cast<void *>(to_mapped_host(old, bytes));
@@ -1231,19 +1554,17 @@ private:
             size_t mx = 0, mr = 0;
             for (const auto & L : layer)
                 for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
-                                      &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
+                                      &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu, &L.sh_gu, &L.sh_down})
                     if (m->p && m->fmt) {
                         mx = std::max(mx, size_t(m->rows) * m->cols);
                         mr = std::max(mr, size_t(m->rows));
                     }
             if (mx) {
                 // gemm_rows caps the FP16 weight buffer (row blocks of row-sliceable formats; tqserve's fit sets it)
-                int gemm_rows_req = opt.gemm_rows;
-                if (const std::string * v = tqllm::debug_value("gemm_rows"); v && !v->empty()) gemm_rows_req = std::stoi(*v);
-                if (gemm_rows_req) {
+                if (const int gemm_rows_req = opt.gemm_rows) {
                     size_t mc = 0;
                     for (const auto & L : layer)
-                        for (const Mat * m : {&L.w_down, &L.w_gu, &L.w_mix, &L.wo, &L.w_out})
+                        for (const Mat * m : {&L.w_down, &L.w_gu, &L.w_mix, &L.wo, &L.w_out, &L.sh_gu, &L.sh_down})
                             if (m->p && m->fmt) mc = std::max(mc, size_t(m->cols));
                     std::vector<GemmMat> mats;
                     for (const auto & L : layer)
@@ -1309,6 +1630,120 @@ private:
     }
 
     Buf v_x, v_m, v_r, v_np, v_in, v_o, v_core, v_act, v_xh, v_xf, v_px, v_pm, v_logits, v_tok, v_amax, v_q, v_qkvc, v_part;
+    Buf moe_counts, moe_groups;
+    Buf moe_logits, moe_ids, moe_weights, moe_shared_weights, moe_gate, moe_up, moe_act, moe_out, moe_shared;
+    Buf moe_hot_ids, moe_cold_ids, moe_counts2, moe_groups2;  // --moe-host-mb split
+    Buf moe_xids;  // decode ids widened by the fused shared expert (no split)
+    // --moe-host-mb decode: routed cold experts copied to the device (gate, up, down; weights and scales) before their
+    // projections, stage_slots assignments at most; empty when a format's per-expert bytes are not 16-byte multiples
+    Buf moe_stage_buf[tqllm_cuda::kMoeStageSpans], moe_stage_ids;
+    long long moe_stage_bytes[tqllm_cuda::kMoeStageSpans] = {};
+    int moe_stage_slots = 0;
+    // --moe-cache-mb: CLOCK cache of host experts in VRAM, one pool per expert layout (slot stride == the kernels' expert
+    // stride), keyed by a global host-expert index (layer base + cold slot)
+    struct MoeCache {
+        long long bytes[tqllm_cuda::kMoeStageSpans] = {};
+        uint32_t types[3] = {};
+        Buf buf[tqllm_cuda::kMoeStageSpans], key, ref, hand;
+        int slots = 0;
+        long weight = 0;
+    };
+    std::vector<MoeCache> moe_cache;
+    std::vector<int> moe_cache_of, moe_cold_base;  // per layer: pool (-1 none), first global host-expert index
+    Buf moe_cache_table, moe_cache_slot, moe_cache_fill;
+    void alloc_moe_cache() {
+        if (opt.moe_cache_mb <= 0 || !moe_stage_slots) return;
+        moe_cache_of.assign(layer.size(), -1), moe_cold_base.assign(layer.size(), 0);
+        int total = 0;
+        for (size_t l = 0; l < layer.size(); ++l) {
+            const auto & L = layer[l];
+            moe_cold_base[l] = total;
+            if (L.n_cold <= 0) continue;
+            total += L.n_cold;
+            MoeCache sig;
+            const Mat * m[3] = {&L.cx_gate, &L.cx_up, &L.cx_down};
+            for (int j = 0; j < 3; ++j) {
+                const long long per = m[j]->rows / L.n_cold;
+                sig.bytes[2 * j] = per * (long long)m[j]->fmt->row_bytes(m[j]->cols);
+                sig.bytes[2 * j + 1] = m[j]->aux ? per * (long long)m[j]->fmt->aux_row_bytes(m[j]->cols) : 0;
+                sig.types[j] = m[j]->type;
+            }
+            int pool = -1;
+            for (size_t i = 0; i < moe_cache.size() && pool < 0; ++i)
+                if (std::equal(sig.bytes, sig.bytes + tqllm_cuda::kMoeStageSpans, moe_cache[i].bytes) &&
+                    std::equal(sig.types, sig.types + 3, moe_cache[i].types)) pool = int(i);
+            if (pool < 0) { pool = int(moe_cache.size()); moe_cache.push_back(std::move(sig)); }
+            moe_cache[size_t(pool)].weight += L.n_cold;
+            moe_cache_of[l] = pool;
+        }
+        long wsum = 0;
+        for (const auto & c : moe_cache) wsum += c.weight;
+        const double budget = double(opt.moe_cache_mb) * 1048576.0;
+        size_t used = 0;
+        for (size_t i = 0; i < moe_cache.size(); ++i) {
+            auto & c = moe_cache[i];
+            long long slot_b = 0;
+            for (long long b : c.bytes) slot_b += b;
+            c.slots = int(budget * double(c.weight) / double(wsum) / double(slot_b));
+            if (c.slots < 2 * moe_stage_slots) {  // too small to keep a step's experts: those layers use the stage
+                for (auto & p : moe_cache_of) if (p == int(i)) p = -1;
+                c.slots = 0;
+                continue;
+            }
+            for (int j = 0; j < tqllm_cuda::kMoeStageSpans; ++j)
+                if (c.bytes[j]) c.buf[j] = Buf(size_t(c.bytes[j]) * c.slots), used += size_t(c.bytes[j]) * c.slots;
+            c.key = Buf(size_t(c.slots) * sizeof(int)); ck(cudaMemset(c.key.p, 0xff, size_t(c.slots) * sizeof(int)));
+            c.ref = Buf(size_t(c.slots) * sizeof(int)); ck(cudaMemset(c.ref.p, 0, size_t(c.slots) * sizeof(int)));
+            c.hand = Buf(sizeof(int)); ck(cudaMemset(c.hand.p, 0, sizeof(int)));
+        }
+        moe_cache_table = Buf(size_t(std::max(1, total)) * sizeof(int));
+        ck(cudaMemset(moe_cache_table.p, 0xff, size_t(std::max(1, total)) * sizeof(int)));
+        moe_cache_slot = Buf(size_t(moe_stage_slots) * sizeof(int));
+        moe_cache_fill = Buf(size_t(moe_stage_slots) * sizeof(int));
+        int slots = 0;
+        for (const auto & c : moe_cache) slots += c.slots;
+        std::fprintf(stderr, "tqllm: MoE host-expert cache: %d slots in %zu pool(s), %.0f MiB of VRAM (--moe-cache-mb)\n", slots,
+                     moe_cache.size(), used / 1048576.0);
+    }
+    void alloc_moe_stage() {
+        if (std::getenv("TQLLM_MOE_STAGE") && std::string(std::getenv("TQLLM_MOE_STAGE")) == "0") return;
+        long long most[tqllm_cuda::kMoeStageSpans] = {};
+        for (const auto & L : layer) {
+            if (L.n_cold <= 0) continue;
+            const Mat * m[3] = {&L.cx_gate, &L.cx_up, &L.cx_down};
+            for (int j = 0; j < 3; ++j) {
+                const long long per = m[j]->rows / L.n_cold;
+                const long long pb = per * (long long)m[j]->fmt->row_bytes(m[j]->cols);
+                const long long ab = m[j]->aux ? per * (long long)m[j]->fmt->aux_row_bytes(m[j]->cols) : 0;
+                if (pb % 16 || ab % 16) return;
+                most[2 * j] = std::max(most[2 * j], pb), most[2 * j + 1] = std::max(most[2 * j + 1], ab);
+            }
+        }
+        if (!most[0]) return;
+        moe_stage_slots = 2 * (int(cfg.expert_used) + 1);  // two tokens, routed + fused shared expert
+        size_t total = 0;
+        for (int i = 0; i < tqllm_cuda::kMoeStageSpans; ++i)
+            if (most[i]) { moe_stage_buf[i] = Buf(size_t(most[i]) * moe_stage_slots); total += size_t(most[i]) * moe_stage_slots; }
+        moe_stage_ids = Buf(size_t(moe_stage_slots) * sizeof(int));
+        std::fprintf(stderr, "tqllm: MoE host experts staged through %.0f MiB of VRAM (%d assignments)\n", total / 1048576.0,
+                     moe_stage_slots);
+    }
+    Buf moe_prof; std::string moe_prof_path;  // TQLLM_MOE_PROFILE: routing counts [L][E]
+    void moe_profile_write() {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        ck(cudaStreamIsCapturing(stream, &cs));
+        if (cs != cudaStreamCaptureStatusNone) return;
+        const size_t n = size_t(cfg.layers) * cfg.expert_count;
+        std::vector<unsigned long long> c(n);
+        ck(cudaMemcpyAsync(c.data(), moe_prof.p, n * 8, cudaMemcpyDeviceToHost, stream));
+        ck(cudaStreamSynchronize(stream));
+        const std::string tmp = moe_prof_path + ".tmp";
+        if (FILE * o = std::fopen(tmp.c_str(), "w")) {
+            std::fprintf(o, "%u %u\n", unsigned(cfg.layers), unsigned(cfg.expert_count));
+            for (size_t i = 0; i < n; ++i) std::fprintf(o, "%llu%c", c[i], (i + 1) % cfg.expert_count ? ' ' : '\n');
+            std::fclose(o); std::rename(tmp.c_str(), moe_prof_path.c_str());
+        }
+    }
     // per Gated DeltaNet layer: [n][mix rows] projected inputs of a verify (replayed at commit), double-buffered so a
     // deferred commit (tree mode) can replay the previous step's path while the next verify writes the other buffer
     std::vector<Buf> v_stash2[2];
@@ -1341,6 +1776,8 @@ private:
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
+        std::vector<uint32_t> mtp_draft;
+        bool native_mtp = false;
         uint32_t P = 0, count = 0, pos = 0, pending = 0;
         int D = 0;
         int rdelta = 0;  // KV position - RoPE position: an image spans nx * ny cells but max(nx, ny) positions
@@ -1374,14 +1811,13 @@ private:
     int cur_of(int s) const { return s == active ? cur : parked[size_t(s)].cur; }
     std::vector<Buf> & dkc_of(int s) { return s == active ? dfl_kc : parked[size_t(s)].dfl_kc; }
     std::vector<Buf> & dvc_of(int s) { return s == active ? dfl_vc : parked[size_t(s)].dfl_vc; }
-    std::map<uint64_t, cudaGraphExec_t> dgraphs;  // batched drafts, keyed by the slot list
-    std::map<uint64_t, cudaGraphExec_t> cgraphs;  // tree step commit + drafter inject, keyed by k and the slot state
     bool wide_mm = false;                          // mm_h: chunk columns by the format's batch width (batched drafts)
     // Tree verification (TQLLM_TREE=1, a tree_ok KV format, greedy): the verify block is a token tree (column parents d_tpar,
     // depths d_tdep, parent < child). Every verify and replay then runs the tree-capable kernels (chains included), so a
     // node's result is exactly that of its path verified as a chain: outputs never depend on the drafts.
     bool tree_mode = false;
-    Buf d_tpar, d_tdep, d_chain, d_tcols, d_gdesc;
+    bool chain2 = false;  // KV format with two-part attention: every verify-sized block uses it (see vpar)
+    Buf d_tpar, d_tdep, d_chain, d_cdep, d_tcols, d_gdesc;
     const int * vpar = nullptr, * vdep = nullptr;
     bool tree_step = false;  // the current verify block is a drafted tree (d_tpar / d_tdep)
     void swap_seq(SeqState & s) {
@@ -1418,6 +1854,7 @@ private:
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
     Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > NVER): run the LM head only on the final chunk
     Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_topk;
+    Buf dfl_part, ds_t, ds_act, ds_q, ds_o;  // DSpark drafter attention partials and block scratch
     uint32_t * h_tok = nullptr;  // pinned staging for the graph inputs
     int * h_pos = nullptr;
     // RoPE positions (v_pos minus the slot's rdelta; same layout), and for prefill chunks with image tokens the per-column
@@ -1437,7 +1874,19 @@ private:
         ck(cudaMemcpyAsync(v_rpos.p, h_rpos, 2 * size_t(nseg) * sizeof(int), cudaMemcpyHostToDevice, stream));
     }
     int rdelta_of(int slot) const { return slot == active ? gen.rdelta : parked[size_t(slot)].gen.rdelta; }
-    std::map<uint64_t, cudaGraphExec_t> graphs, bgraphs;  // bgraphs: batched verify, keyed by the segment layout
+    // captured graphs, one bounded cache (src/graph_lru.hpp): verify per slot / shape, batched verify keyed by the segment
+    // layout, batched drafts keyed by the slot list, tree commit + drafter inject keyed by k and the slot state
+    enum : int { kGraphVerify, kGraphBatch, kGraphDraft, kGraphCommit };
+    tqllm::GraphLru<cudaGraphExec_t> glru;
+    size_t graph_keep = 0;  // a miss evicts while less than this is free (0: by count only, e.g. WSL reads ~0 free)
+    template <class Body>
+    cudaGraphExec_t cached_graph(int family, uint64_t key, Body && body) {
+        if (cudaGraphExec_t e = glru.find(family, key)) return e;
+        return glru.insert(
+            family, key, [&] { return tqllm::instantiate_graph(tqllm::capture_graph(stream, body)); },
+            [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
+            [&] { cudaStreamSynchronize(stream); }, [](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
+    }
     // TQLLM_DEBUG=stageprof: verify blocks run eagerly with a stream sync after every stage; per-stage wall time (kernel +
     // its launch latency in isolation) is printed with the per-step profile. Perturbs the step; for attribution only.
     const bool stage_prof = tqllm::debug_on("stageprof");
@@ -1603,8 +2052,8 @@ private:
     // rows of m into rows [r_off, r_off + m.rows) of gemm_c ([n][ldo], FP16)
     void gemm_c_rows(const Mat & m, int n, int ldo, int r_off) {
         const size_t rb = m.fmt->row_bytes(m.cols), ab = m.fmt->aux_row_bytes(m.cols);
-        constexpr int pad = 8;  // n % 8: cuBLAS picks the 16816 kernels
-        const int np = std::min(NBUF, (n + pad - 1) / pad * pad);
+        const int np = gemm_pad_rows(n, NBUF);
+        ck(zero_gemm_padding(v_xh.as<__half>(), n, np, m.cols, stream));
         // int8 only on chunks of >= 1024 tokens: per-chunk weight quantisation does not pay off on the 512-token chunks of
         // 24 GB cards at 256K (3090 192K prompt: int8 641 vs FP16 668 tok/s; 54K: 1760 vs 1445)
         if (i8 && np >= 1024 && m.cols % 4 == 0 && ldo % 4 == 0 && r_off % 4 == 0) {
@@ -1792,9 +2241,11 @@ public:
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
         if (!(defer && tree_step && n <= NVER)) flush_pending();
-        // tree mode: every verify block (n <= NVER) goes through the tree kernels; a chain unless the caller drafted a tree
-        vpar = tree_mode && n <= NVER ? (tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
-        vdep = tree_mode && n <= NVER && tree_step ? d_tdep.as<int>() : nullptr;
+        // every verify-sized block (decode included) goes through the two-part attention when the KV format has it: a tree
+        // with its parents, anything else as a chain. One arithmetic for plain decode, chain / MTP / tree verify, so greedy
+        // speculative output equals plain decoding (one-part causal attention groups the sums differently: tests/tree.cu)
+        vpar = n <= NVER && chain2 ? (tree_mode && tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
+        vdep = !vpar ? nullptr : tree_mode && tree_step ? d_tdep.as<int>() : d_cdep.as<int>();
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
         bucket = std::min(bucket, context_);
@@ -1825,13 +2276,7 @@ public:
             // bound (~12 MB each; a 2-slot server OOMed after ~800 requests), and launch cost is negligible at this size
             verify_body(n, int(bucket));
         } else {
-            auto it = graphs.find(key);
-            if (it == graphs.end()) {
-                cudaGraph_t g = tqllm::capture_graph(stream, [&] { verify_body(n, int(bucket)); });
-                cudaGraphExec_t exec = tqllm::instantiate_graph(g);
-                it = graphs.emplace(key, exec).first;
-            }
-            ck(cudaGraphLaunch(it->second, stream));
+            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
         }
         if (next) {
             const auto * src = v_tok.as<uint32_t>() + (copy_all || n > NVER ? 0 : n - 1);
@@ -1862,8 +2307,8 @@ public:
                 const auto & g = segs[i];
                 attn_core(L, T + size_t(g.col0) * rows, rows, Q + size_t(g.col0) * nh * hd, O + size_t(g.col0) * nh * hd,
                           kc_of(g.slot)[size_t(li)].as<bf16>(), vc_of(g.slot)[size_t(li)].as<bf16>(), g.n,
-                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : tree_mode ? d_chain.as<int>() : nullptr,
-                          g.tree ? d_tdep.as<int>() + g.col0 : nullptr,
+                          v_pos.as<int>() + 2 * i, g.tree ? d_tpar.as<int>() + g.col0 : chain2 ? d_chain.as<int>() : nullptr,
+                          g.tree ? d_tdep.as<int>() + g.col0 : chain2 ? d_cdep.as<int>() : nullptr,
                           fuse ? XH + size_t(g.col0) * nh * hd : nullptr, part_of(i), v_rpos.as<int>() + 2 * i);
             });
         }
@@ -1963,6 +2408,138 @@ public:
         auto * XH = v_xh.as<__half>();
         tqllm_cuda::add_sumsq(M, resid ? resid : R, v_pm.as<float>(), n * H, stream);
         nrot_h(M, L.post_norm, v_pm.as<float>(), XH, H, n);
+        if (cfg.moe) {
+            const int E = int(cfg.expert_count), K = int(cfg.expert_used), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
+            tqllm_cuda::moe_router(L.router, L.sh_gate, XH, moe_logits.as<float>(), H, E, n, stream);
+            tqllm_cuda::moe_topk(moe_logits.as<float>(), moe_ids.as<int>(), moe_weights.as<float>(),
+                                 moe_shared_weights.as<float>(), E, K, n, 1.f, stream);
+            const long li = &L - layer.data();
+            if (moe_prof.p && li >= 0 && li < long(cfg.layers)) {
+                tqllm_cuda::moe_count(moe_ids.as<int>(), moe_prof.as<unsigned long long>() + size_t(li) * E, n * K, stream);
+                // decode replays a captured graph (the count kernel runs, host code does not): write on uncaptured calls
+                if (li + 1 == long(cfg.layers)) moe_profile_write();
+            }
+            const bool split = L.n_cold > 0;
+            const bool grouped_gemm = n > NVER && segs.empty() && !wide_mm;
+            // decode: the shared expert rides the routed launches as assignment K of every token (appended to the hot
+            // experts at load; same rows and kernels as its dense matvec), ids widened to K + 1 per token
+            const bool fuse = L.sh_slot >= 0 && !grouped_gemm;
+            const int KV = fuse ? K + 1 : K;
+            const int * IDS = moe_ids.as<int>();
+            if (fuse) {
+                tqllm_cuda::moe_extend_ids(moe_ids.as<int>(), split ? L.hot_slot : nullptr, split ? L.cold_slot : nullptr,
+                                           split ? moe_hot_ids.as<int>() : moe_xids.as<int>(), split ? moe_cold_ids.as<int>() : nullptr,
+                                           K, n, L.sh_slot, stream);
+                if (!split) IDS = moe_xids.as<int>();
+            } else if (split) {
+                tqllm_cuda::moe_split_ids(moe_ids.as<int>(), L.hot_slot, L.cold_slot, moe_hot_ids.as<int>(), moe_cold_ids.as<int>(),
+                                          n * K, stream);
+            }
+            if (grouped_gemm && !split)
+                tqllm_cuda::moe_group(moe_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), E, n, KV, stream);
+            if (grouped_gemm && split) {
+                tqllm_cuda::moe_group(moe_hot_ids.as<int>(), moe_counts.as<int>(), moe_groups.as<int>(), L.n_hot, n, KV, stream);
+                tqllm_cuda::moe_group(moe_cold_ids.as<int>(), moe_counts2.as<int>(), moe_groups2.as<int>(), L.n_cold, n, KV, stream);
+            }
+            auto one = [&](const Mat & mat, const int * ids, int experts, const Buf & counts, const Buf & groups,
+                           const __half * input, bf16 * output, int rows, bool per_expert) {
+                if (grouped_gemm && mat.fmt->expert_gemm(mat, input, output, rows, counts.as<int>(),
+                                                        groups.as<int>(), n, experts, K, per_expert, stream)) return;
+                mat.fmt->expert_matvec(mat, input, output, rows, ids, n, KV, per_expert, stream);
+            };
+            auto project = [&](const Mat & mat, const Mat & cold, const __half * input, bf16 * output, int rows, bool per_expert) {
+                if (!split) { one(mat, IDS, E, moe_counts, moe_groups, input, output, rows, per_expert); return; }
+                one(mat, moe_hot_ids.as<int>(), L.n_hot, moe_counts, moe_groups, input, output, rows, per_expert);
+                one(cold, moe_cold_ids.as<int>(), L.n_cold, moe_counts2, moe_groups2, input, output, rows, per_expert);
+            };
+            const auto paired = [](const Mat & g, const Mat & u) { return g.fmt == u.fmt && g.fmt->u4h_id() >= 0; };
+            // decode with host experts: the cold set (PCIe reads) runs on a side branch beside the hot set. Both write
+            // disjoint assignments (the u4h-family expert kernels leave id -1 untouched), joined before each consumer.
+            const bool overlap = split && !grouped_gemm && paired(L.ex_gate, L.ex_up) && paired(L.cx_gate, L.cx_up) &&
+                                 L.ex_down.fmt->u4h_id() >= 0 && L.cx_down.fmt->u4h_id() >= 0;
+            if (overlap) {
+                if (!moe_side) {
+                    ck(cudaStreamCreateWithFlags(&moe_side, cudaStreamNonBlocking));
+                    ck(cudaEventCreateWithFlags(&moe_fork, cudaEventDisableTiming));
+                    ck(cudaEventCreateWithFlags(&moe_join, cudaEventDisableTiming));
+                }
+                auto fork = [&] { ck(cudaEventRecord(moe_fork, stream)); ck(cudaStreamWaitEvent(moe_side, moe_fork, 0)); };
+                auto join = [&] { ck(cudaEventRecord(moe_join, moe_side)); ck(cudaStreamWaitEvent(stream, moe_join, 0)); };
+                fork();
+                Mat sg = L.cx_gate, su = L.cx_up, sd = L.cx_down;
+                const int * cids = moe_cold_ids.as<int>();
+                const int pool = moe_cache_of.empty() ? -1 : moe_cache_of[size_t(&L - layer.data())];
+                if (pool >= 0 && n * KV <= moe_stage_slots) {  // cached: copy only the misses, read from the cache slots
+                    auto & c = moe_cache[size_t(pool)];
+                    tqllm_cuda::moe_cache_lookup(moe_cold_ids.as<int>(), n * KV, moe_cold_base[size_t(&L - layer.data())],
+                                                 moe_cache_table.as<int>(), {c.key.as<int>(), c.ref.as<int>(), c.hand.as<int>(), c.slots},
+                                                 moe_cache_slot.as<int>(), moe_cache_fill.as<int>(), moe_side);
+                    tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
+                    int ns = 0;
+                    Mat * sm[3] = {&sg, &su, &sd};
+                    for (int j = 0; j < 3; ++j) {
+                        Mat & m = *sm[j];
+                        const long long per = m.rows / L.n_cold;
+                        sp[ns++] = {m.p, c.buf[2 * j].p, c.bytes[2 * j]};
+                        m.p = c.buf[2 * j].p;
+                        if (m.aux) { sp[ns++] = {m.aux, c.buf[2 * j + 1].p, c.bytes[2 * j + 1]}; m.aux = c.buf[2 * j + 1].p; }
+                        m.rows = int(per) * c.slots;
+                    }
+                    tqllm_cuda::moe_cache_fill(sp, ns, moe_cache_fill.as<int>(), moe_cache_slot.as<int>(), n * KV, moe_side);
+                    cids = moe_cache_slot.as<int>();
+                } else if (moe_stage_slots && n * KV <= moe_stage_slots) {
+                    tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
+                    int ns = 0;
+                    Mat * sm[3] = {&sg, &su, &sd};
+                    for (int j = 0; j < 3; ++j) {
+                        Mat & m = *sm[j];
+                        const long long per = m.rows / L.n_cold;
+                        sp[ns++] = {m.p, moe_stage_buf[2 * j].p, per * (long long)m.fmt->row_bytes(m.cols)};
+                        m.p = moe_stage_buf[2 * j].p;
+                        if (m.aux) {
+                            sp[ns++] = {m.aux, moe_stage_buf[2 * j + 1].p, per * (long long)m.fmt->aux_row_bytes(m.cols)};
+                            m.aux = moe_stage_buf[2 * j + 1].p;
+                        }
+                        m.rows = int(per) * moe_stage_slots;
+                    }
+                    tqllm_cuda::moe_stage(sp, ns, moe_cold_ids.as<int>(), moe_stage_ids.as<int>(), n * KV, moe_side);
+                    cids = moe_stage_ids.as<int>();
+                }
+                sg.fmt->expert_matvec2(sg, su, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE, cids, n, KV, moe_side);
+                L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
+                                              moe_hot_ids.as<int>(), n, KV, stream);
+                join();
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * KV * FE, stream);
+                fork();
+                sd.fmt->expert_matvec(sd, moe_act.as<__half>(), moe_out.as<bf16>(), H, cids, n, KV, true, moe_side);
+                L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, KV,
+                                             true, stream);
+                join();
+            } else if (!grouped_gemm && !split && paired(L.ex_gate, L.ex_up)) {
+                L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
+                                              IDS, n, KV, stream);
+            } else {
+                project(L.ex_gate, L.cx_gate, XH, moe_gate.as<bf16>(), FE, false);
+                project(L.ex_up, L.cx_up, XH, moe_up.as<bf16>(), FE, false);
+            }
+            if (!overlap) {
+                tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * KV * FE, stream);
+                project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
+            }
+            if (fuse) {
+                tqllm_cuda::moe_sum_strided(moe_out.as<bf16>(), KV, moe_out.as<bf16>() + size_t(K) * H, KV * H, moe_weights.as<float>(),
+                                            moe_shared_weights.as<float>(), X, H, K, n, stream);
+            } else {
+                mm_h(L.sh_gu, T, n);
+                tqllm_cuda::swiglu_multi(T, n, FS, ACT, stream);
+                rot_h(ACT, XH, FS, n);
+                mm_h(L.sh_down, moe_shared.as<bf16>(), n);
+                tqllm_cuda::moe_sum(moe_out.as<bf16>(), moe_shared.as<bf16>(), moe_weights.as<float>(),
+                                    moe_shared_weights.as<float>(), X, H, K, n, stream);
+            }
+            tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
+            return;
+        }
         if (!L.w_gu.p) throw std::runtime_error("multi-token path needs fused gate/up weights");
         if (basis_ == Basis::Tq4Rot128 && prefill_gemm(L.w_gu, n) && L.w_gu.fmt->basis() == basis_) {
             gemm_rows(L.w_gu, nullptr, n, L.w_gu.rows);  // FP16 gate / up straight into the fused SwiGLU + rotation
@@ -2082,7 +2659,9 @@ public:
         else if (embed.type == GGML_Q8_0) tqllm_cuda::embed_multi_q8_0(embed.p, dtok, n, Y, H, stream);
         else if (embed.type == GGML_Q4_K) tqllm_cuda::embed_multi_q4k(embed.p, dtok, n, Y, H, stream);
         else if (embed.type == GGML_Q3_K) tqllm_cuda::embed_multi_q3k(embed.p, dtok, n, Y, H, stream);
-        else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K or Q3_K embedding table");
+        else if (embed.type == GGML_IQ3_S) tqllm_cuda::embed_multi_iq3s(embed.p, dtok, n, Y, H, stream);
+        else if (embed.type == GGML_Q5_K) tqllm_cuda::embed_multi_q5k(embed.p, dtok, n, Y, H, stream);
+        else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K, Q3_K, Q5_K or IQ3_S embedding table");
     }
 
     void verify_body(int n, int max_seq) {
@@ -2329,6 +2908,19 @@ public:
         return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
     }
 
+    // [rows][rank] table (GGUF ne = {rank, rows}) as BF16 [cfg.vocab][rank], rows past the file's vocabulary zero
+    const bf16 * vocab_table(const GgufFile & f, const std::string & name, int rank) {
+        const auto & t = gt(f, name);
+        if (int(t.ne[0]) != rank || t.ne[1] > cfg.vocab) throw std::runtime_error(name + ": unexpected shape");
+        const uint64_t n = uint64_t(t.ne[0]) * t.ne[1];
+        std::vector<float> v(n);
+        const auto raw = f.read(t);
+        dequantize_host(t.type, raw.data(), v.data(), int64_t(n));
+        std::vector<bf16> b(uint64_t(cfg.vocab) * rank, __float2bfloat16_rn(0.f));
+        for (uint64_t i = 0; i < n; ++i) b[i] = __float2bfloat16_rn(v[i]);
+        return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
+    }
+
     // Drafter K/V of the active slot: the sliding-window ring, else the full context.
     void alloc_dfl_state() {
         const size_t kd = size_t(dfl.kvheads) * dfl.hd, rows = dfl.ring ? size_t(dfl.ring) : context_;
@@ -2341,13 +2933,23 @@ public:
     void load_dflash(const std::string & path) {
         const auto f = gguf_open(path);
         const std::string A = "dflash.";
-        const int H = int(cfg.hidden), F = int(cfg.ffn);
+        const int H = int(cfg.hidden);
         if (int(f.num(A + "embedding_length")) != H) throw std::runtime_error("DFlash drafter hidden size mismatch");
+        dfl.dspark = f.tensors.count("markov_w1.weight") > 0;
+        dfl.ffn = int(f.num(A + "feed_forward_length"));
+        dfl.theta = dfl.dspark ? float(f.num(A + "rope.freq_base", cfg.theta)) : cfg.theta;  // DFlash2: the target's, as before
+        const int F = dfl.ffn;
         dfl.heads = int(f.num(A + "attention.head_count"));
         dfl.kvheads = int(f.num(A + "attention.head_count_kv"));
         dfl.hd = int(f.num(A + "attention.key_length"));
         dfl.block = int(f.num(A + "block_size"));
-        dfl.group = int(f.num(A + "conv_group_size"));
+        dfl.nb = dfl.block;
+        if (dfl.dspark) {
+            if (!f.num(A + "sample_from_anchor", 1)) throw std::runtime_error("DSpark drafter: only sample_from_anchor is supported");
+            dfl.nb = std::min(dfl.nb, NVER - 1);  // a runtime block may be shorter than the trained one; lattice <= verify width
+            dfl.block = dfl.nb + 1;
+        }
+        dfl.group = dfl.dspark ? 0 : int(f.num(A + "conv_group_size"));
         dfl.window = int(f.num(A + "attention.sliding_window", 0));
         if (opt.draft_window >= 0) {
             std::fprintf(stderr, "tqllm: drafter window %d -> %d (--draft-window)\n", dfl.window, opt.draft_window);
@@ -2359,20 +2961,26 @@ public:
             std::fprintf(stderr, "tqllm: drafter retrieval window: %d far chunks of 16 + %d recent positions (--draft-retrieve)\n",
                          dfl.retr, dfl.recent);
         }
-        dfl.topk = int(f.num(A + "selector_top_k"));
-        dfl.rank = int(f.num(A + "selector_rank"));
+        dfl.topk = dfl.dspark ? 16 : int(f.num(A + "selector_top_k"));
+        dfl.rank = dfl.dspark ? int(gt(f, "markov_w1.weight").ne[0]) : int(f.num(A + "selector_rank"));
         dfl.mask_id = uint32_t(f.num("tokenizer.ggml.mask_token_id"));
         for (double v : f.kv.at(A + "target_layers").arr) dfl.target_ids.push_back(int(v));
         const int nl = int(f.num(A + "block_count"));
-        if (dfl.hd != 128 || dfl.topk != 16 || int(f.num(A + "conv_kernel_size")) != 2 || int(f.num(A + "feed_forward_length")) != F)
-            throw std::runtime_error("unsupported DFlash2 drafter shape");
+        if (dfl.dspark ? dfl.hd != 256 || dfl.rank != 256 || dfl.heads / dfl.kvheads > 8
+                       : dfl.hd != 128 || dfl.topk != 16 || int(f.num(A + "conv_kernel_size")) != 2 || F != int(cfg.ffn))
+            throw std::runtime_error(dfl.dspark ? "unsupported DSpark drafter shape" : "unsupported DFlash2 drafter shape");
         const int nf = int(dfl.target_ids.size()), qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         dfl.fc = to_tq3(f, {"fc.weight"}, nf * H);
         dfl.enc_norm = f32_of(f, "enc.output_norm.weight", H);
         dfl.out_norm = f32_of(f, "output_norm.weight", H);
-        dfl.sel_hidden = to_tq3(f, {"selector_hidden.weight"}, H);
-        dfl.sel_prev = bf16_table(f, "selector_predecessor.weight", uint64_t(cfg.vocab) * dfl.rank);
-        dfl.sel_next = bf16_table(f, "selector_successor.weight", uint64_t(cfg.vocab) * dfl.rank);
+        if (dfl.dspark) {
+            dfl.sel_prev = vocab_table(f, "markov_w1.weight", dfl.rank);
+            dfl.sel_next = vocab_table(f, "markov_w2.weight", dfl.rank);
+        } else {
+            dfl.sel_hidden = to_tq3(f, {"selector_hidden.weight"}, H);
+            dfl.sel_prev = bf16_table(f, "selector_predecessor.weight", uint64_t(cfg.vocab) * dfl.rank);
+            dfl.sel_next = bf16_table(f, "selector_successor.weight", uint64_t(cfg.vocab) * dfl.rank);
+        }
         std::vector<std::string> kv_names;
         for (int l = 0; l < nl; ++l) {
             const auto p = "blk." + std::to_string(l) + ".";
@@ -2381,10 +2989,12 @@ public:
             L.q_norm = f32_of(f, p + "attn_q_norm.weight", dfl.hd);
             L.k_norm = f32_of(f, p + "attn_k_norm.weight", dfl.hd);
             L.ffn_norm = f32_of(f, p + "ffn_norm.weight", H);
-            L.attn_conv_base = f32_of(f, p + "attn_conv_base", uint64_t(H) * 4);
-            L.ffn_conv_base = f32_of(f, p + "ffn_conv_base", uint64_t(H) * 4);
-            L.conv_attn = to_tq3(f, {p + "attn_conv_proj.weight"}, H);
-            L.conv_ffn = to_tq3(f, {p + "ffn_conv_proj.weight"}, H);
+            if (!dfl.dspark) {
+                L.attn_conv_base = f32_of(f, p + "attn_conv_base", uint64_t(H) * 4);
+                L.ffn_conv_base = f32_of(f, p + "ffn_conv_base", uint64_t(H) * 4);
+                L.conv_attn = to_tq3(f, {p + "attn_conv_proj.weight"}, H);
+                L.conv_ffn = to_tq3(f, {p + "ffn_conv_proj.weight"}, H);
+            }
             L.w_qkv = to_tq3(f, {p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"}, H);
             L.wo = to_tq3(f, {p + "attn_output.weight"}, qd);
             L.w_gu = to_tq3(f, {p + "ffn_gate.weight", p + "ffn_up.weight"}, H);
@@ -2419,6 +3029,11 @@ public:
         d_dynf = Buf(B * size_t(L_conv_rows()) * 2);
         d_te = Buf(B * H * 2);
         d_gate = Buf(B * dfl.rank * 2);
+        if (dfl.dspark) {  // Markov head: unit gate on every rank; head-dim-256 drafter attention partials
+            const std::vector<bf16> ones(B * dfl.rank, __float2bfloat16_rn(1.f));
+            ck(cudaMemcpy(d_gate.p, ones.data(), ones.size() * 2, cudaMemcpyHostToDevice));
+            dfl_part = Buf(size_t(tqllm_cuda::attention_gen256_partial_floats(dfl.heads, int(context_), dfl.nb)) * 4);
+        }
         d_vals = Buf(B * 16 * 4);
         d_idx = Buf(B * 16 * 4);
         d_cand = Buf(B * 16 * 4);
@@ -2483,6 +3098,10 @@ public:
             dsub_rows = int(nd);
         }
         if (!head4.p && head8.p) build_head4();
+        if (dfl.dspark && tree_mode) {  // tree verify is not yet greedy-identical to plain decode on this path (GB10 MoE)
+            std::fprintf(stderr, "tqllm: DSpark drafter: chain verify (tree verify off)\n");
+            tree_mode = defer = false;
+        }
         dfl.present = true;
     }
     // 4-bit copy of head8: the two-stage verify head's first pass and the DFlash2 full-vocabulary draft head
@@ -2514,6 +3133,21 @@ public:
         void * d = nullptr;
         ck(cudaHostGetDevicePointer(&d, h, 0));
         return d;
+    }
+    // Pinned mapped-host copy of raw bytes, returning the device-accessible (UVA) pointer: the -ncmoe
+    // expert loader. The weight-format load() repack kernel and the decode expert kernels read m.p / m.aux
+    // through this pointer over PCIe (same mechanism as embed_host / head8_to_host); no kernel changes.
+    const void * host_put(const void * host, size_t bytes) {
+        void * h = nullptr;
+        ck(cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memcpy(h, host, bytes);
+        host_blocks.push_back(h);
+        void * d = nullptr;
+        ck(cudaHostGetDevicePointer(&d, h, 0));
+        return d;
+    }
+    Upload host_uploader() {
+        return [this](const void * h, size_t b) { return host_put(h, b); };
     }
     std::vector<void *> host_blocks;
 
@@ -2573,7 +3207,7 @@ public:
         for (int l = 0; l < nl; ++l) {
             bf16 * K = KV + size_t(l) * 2 * kd;
             tqllm_cuda::rms_f_multi(K, ts, dfl.hd, dfl.L[l].k_norm, K, ts, dfl.hd, dfl.hd, dfl.kvheads, n, cfg.eps, stream);
-            tqllm_cuda::rope_partial_multi(K, ts, n, dfl.kvheads, dfl.hd, dfl.hd, d_pos.as<int>(), cfg.theta, stream);
+            tqllm_cuda::rope_partial_multi(K, ts, n, dfl.kvheads, dfl.hd, dfl.hd, d_pos.as<int>(), dfl.theta, stream);
             tqllm_cuda::cache_write_multi(K, K + kd, ts, n, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), d_pos.as<int>(),
                                           dfl.kvheads, dfl.hd, stream, dfl.ring);
         }
@@ -2590,7 +3224,7 @@ public:
     bool dflash_draft_batch(const std::vector<DraftReq> & rq, std::vector<std::vector<uint32_t>> & out,
                             const std::vector<int> * tree_cols = nullptr, const std::vector<int> * chain_cols = nullptr) {
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        if (rq.size() < 2 || dfl.ring <= 0 || subset || !(dsub_rows || head4.p || lm_head.fmt))
+        if (rq.size() < 2 || dfl.ring <= 0 || dfl.dspark || subset || !(dsub_rows || head4.p || lm_head.fmt))
             return false;
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         const int ns = int(rq.size()), DB = ns * B;
@@ -2630,8 +3264,8 @@ public:
                 for (int i = 0; i < ns; ++i) {
                     const int sl = rq[size_t(i)].slot;
                     bf16 *Qi = Q + size_t(i) * B * qd, *Ki = K0 + size_t(i) * B * rows, *Oi = O + size_t(i) * B * qd;
-                    tqllm_cuda::rope_partial_multi(Qi, qd, B, dfl.heads, dfl.hd, dfl.hd, dp + 2 * i, cfg.theta, stream);
-                    tqllm_cuda::rope_partial_multi(Ki, rows, B, dfl.kvheads, dfl.hd, dfl.hd, dp + 2 * i, cfg.theta, stream);
+                    tqllm_cuda::rope_partial_multi(Qi, qd, B, dfl.heads, dfl.hd, dfl.hd, dp + 2 * i, dfl.theta, stream);
+                    tqllm_cuda::rope_partial_multi(Ki, rows, B, dfl.kvheads, dfl.hd, dfl.hd, dp + 2 * i, dfl.theta, stream);
                     bf16 *kc = dkc_of(sl)[l].as<bf16>(), *vc = dvc_of(sl)[l].as<bf16>();
                     tqllm_cuda::cache_write_multi(Ki, Ki + kd, rows, B, kc, vc, dp + 2 * i, dfl.kvheads, dfl.hd, stream,
                                                   dfl.ring);
@@ -2684,17 +3318,11 @@ public:
         };
         uint64_t key = 1469598103934665603ull;
         for (const auto & r : rq) key = (key ^ uint64_t(r.slot + 1)) * 1099511628211ull;
-        auto it = dgraphs.find(key);
-        if (it == dgraphs.end()) {
-            cudaGraph_t g = tqllm::capture_graph(stream, [&] {
-                wide_mm = true;
-                struct Reset { bool & f; ~Reset() { f = false; } } reset{wide_mm};
-                body();
-            });
-            cudaGraphExec_t exec = tqllm::instantiate_graph(g);
-            it = dgraphs.emplace(key, exec).first;
-        }
-        ck(cudaGraphLaunch(it->second, stream));
+        ck(cudaGraphLaunch(cached_graph(kGraphDraft, key, [&] {
+            wide_mm = true;
+            struct Reset { bool & f; ~Reset() { f = false; } } reset{wide_mm};
+            body();
+        }), stream));
         if (tree_cols) {
             for (int i = 0; i < ns; ++i) {
                 const int c0 = (*tree_cols)[size_t(i)];
@@ -2730,18 +3358,81 @@ public:
     }
 
     // launch_only: queue the draft (lattice left in d_idx / d_score) and return without synchronising
+    // DSpark drafter forward of the nb-token block at d_pos (tokens in d_tok) -> the lattice rows 1 .. nb (top-16 ids /
+    // logits in d_idx / d_vals, Markov scores in d_score); bidirectional attention over [0, pos + nb).
+    void dspark_forward(uint32_t pos) {
+        const int H = int(cfg.hidden), NB = dfl.nb, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
+        const int qkv = qd + 2 * kd, F = dfl.ffn;
+        if (!ds_t.p) {
+            ds_t = Buf(size_t(NB) * std::max(qkv, 2 * F) * 2);
+            ds_act = Buf(size_t(NB) * F * 2);
+            ds_q = Buf(size_t(NB) * qd * 2);
+            ds_o = Buf(size_t(NB) * qd * 2);
+        }
+        auto *X = d_x.as<bf16>(), *R = d_r.as<bf16>(), *A = d_a.as<bf16>(), *Bb = d_b.as<bf16>();
+        auto *T = ds_t.as<bf16>(), *ACT = ds_act.as<bf16>(), *Q = ds_q.as<bf16>(), *O = ds_o.as<bf16>();
+        embed_multi(d_tok.as<uint32_t>(), NB, X);
+        uint32_t bucket = 256;
+        while (bucket < pos + NB) bucket *= 2;
+        bucket = std::min(bucket, context_);
+        for (size_t l = 0; l < dfl.L.size(); ++l) {
+            const auto & L = dfl.L[l];
+            ck(cudaMemcpyAsync(R, X, size_t(NB) * H * 2, cudaMemcpyDeviceToDevice, stream));
+            tqllm_cuda::rms_f_multi(X, H, 0, L.attn_norm, A, H, 0, H, 1, NB, cfg.eps, stream);
+            mmx(L.w_qkv, A, T, NB);
+            bf16 * K0 = T + qd;
+            tqllm_cuda::rms_f_multi(T, qkv, dfl.hd, L.q_norm, Q, qd, dfl.hd, dfl.hd, dfl.heads, NB, cfg.eps, stream);
+            tqllm_cuda::rms_f_multi(K0, qkv, dfl.hd, L.k_norm, K0, qkv, dfl.hd, dfl.hd, dfl.kvheads, NB, cfg.eps, stream);
+            tqllm_cuda::rope_partial_multi(Q, qd, NB, dfl.heads, dfl.hd, dfl.hd, d_pos.as<int>(), dfl.theta, stream);
+            tqllm_cuda::rope_partial_multi(K0, qkv, NB, dfl.kvheads, dfl.hd, dfl.hd, d_pos.as<int>(), dfl.theta, stream);
+            tqllm_cuda::cache_write_multi(K0, K0 + kd, qkv, NB, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), d_pos.as<int>(),
+                                          dfl.kvheads, dfl.hd, stream, 0);
+            tqllm_cuda::attention_gen256(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), O, dfl_part.as<float>(),
+                                         d_pos.as<int>(), NB, int(bucket), dfl.heads, dfl.kvheads,
+                                         1.f / std::sqrt(float(dfl.hd)), false, stream);
+            mmx(L.wo, O, Bb, NB);
+            tqllm_cuda::residual(Bb, R, NB * H, stream);  // Bb = ffn_inp
+            tqllm_cuda::rms_f_multi(Bb, H, 0, L.ffn_norm, A, H, 0, H, 1, NB, cfg.eps, stream);
+            mmx(L.w_gu, A, T, NB);
+            tqllm_cuda::swiglu_multi(T, NB, F, ACT, stream);
+            mmx(L.down, ACT, X, NB);
+            tqllm_cuda::residual(X, Bb, NB * H, stream);
+        }
+        auto * TE = d_te.as<bf16>();
+        tqllm_cuda::rms_f_multi(X, H, 0, dfl.out_norm, TE, H, 0, H, 1, NB, cfg.eps, stream);
+        const int head_rows = lm_head.rows;
+        tqllm_cuda::bf16_to_h(TE, v_xh.as<__half>(), NB * H, stream);
+        if (head4.p)
+            tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(),
+                                   head_rows, H, NB, stream);
+        else if (lm_head.fmt)
+            head_mv(TE, NB);
+        else
+            tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>(), v_logits.as<float>(), head_rows, H, NB, stream);
+        // block row r predicts position pos + 1 + r: lattice row r + 1 (row 0 is the anchor)
+        tqllm_cuda::topk16_big(v_logits.as<float>(), head_rows, NB, d_vals.as<float>() + 16, d_idx.as<uint32_t>() + 16,
+                               d_topk.p, stream);
+        tqllm_cuda::dflash_lattice(d_idx.as<uint32_t>(), d_vals.as<float>(), d_gate.as<bf16>(), dfl.rank, dfl.sel_next,
+                                   dfl.sel_prev, 0, dfl.block, dfl.rank, d_score.as<float>(), stream, d_tok.as<uint32_t>());
+    }
+
     std::vector<uint32_t> dflash_draft(uint32_t anchor, uint32_t pos, int want, std::vector<uint32_t> * idx_out = nullptr,
                                        std::vector<float> * score_out = nullptr, bool launch_only = false) {
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         set_dpos(pos);
-        std::vector<uint32_t> blk(size_t(B), dfl.mask_id);
+        const int NT = dfl.dspark ? dfl.nb : B;  // drafter tokens in the block
+        std::vector<uint32_t> blk(size_t(NT), dfl.mask_id);
         blk[0] = anchor;
-        ck(cudaMemcpyAsync(d_tok.p, blk.data(), size_t(B) * 4, cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(d_tok.p, blk.data(), size_t(NT) * 4, cudaMemcpyHostToDevice, stream));
         // Device-resident body (positions in d_pos, tokens / anchor in d_tok): with the K/V ring the kernel grids do not
         // depend on pos, so the whole draft is captured once as a CUDA graph and replayed.
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
         const bool graph = dfl.ring > 0 && !subset;
         auto body = [&] {
+        if (dfl.dspark) {
+            dspark_forward(pos);
+            return;
+        }
         auto *X = d_x.as<bf16>(), *R = d_r.as<bf16>(), *A = d_a.as<bf16>(), *Bb = d_b.as<bf16>();
         auto *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *Q = v_q.as<bf16>(), *ACT = v_act.as<bf16>();
         auto *DYN = d_dyn.as<bf16>(), *DYNF = d_dynf.as<bf16>();
@@ -2761,13 +3452,13 @@ public:
             bf16 * K0 = T + qd;
             tqllm_cuda::rms_f_multi(T, rows, dfl.hd, L.q_norm, Q, qd, dfl.hd, dfl.hd, dfl.heads, B, cfg.eps, stream);
             tqllm_cuda::rms_f_multi(K0, rows, dfl.hd, L.k_norm, K0, rows, dfl.hd, dfl.hd, dfl.kvheads, B, cfg.eps, stream);
-            tqllm_cuda::rope_partial_multi(Q, qd, B, dfl.heads, dfl.hd, dfl.hd, d_pos.as<int>(), cfg.theta, stream);
-            tqllm_cuda::rope_partial_multi(K0, rows, B, dfl.kvheads, dfl.hd, dfl.hd, d_pos.as<int>(), cfg.theta, stream);
+            tqllm_cuda::rope_partial_multi(Q, qd, B, dfl.heads, dfl.hd, dfl.hd, d_pos.as<int>(), dfl.theta, stream);
+            tqllm_cuda::rope_partial_multi(K0, rows, B, dfl.kvheads, dfl.hd, dfl.hd, d_pos.as<int>(), dfl.theta, stream);
             tqllm_cuda::cache_write_multi(K0, K0 + kd, rows, B, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(),
                                           d_pos.as<int>(), dfl.kvheads, dfl.hd, stream, dfl.ring);
             const int rr = dfl.retr && int(pos) > dfl.recent + 16
                                ? tqllm_cuda::dflash_retrieve_build(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), kd, dfl.heads,
-                                                                   dfl.kvheads, int(pos), B, dfl.recent, dfl.retr, cfg.theta,
+                                                                   dfl.kvheads, int(pos), B, dfl.recent, dfl.retr, dfl.theta,
                                                                    dfl_rscore.as<float>(), dfl_rsel.as<int>(), dfl_rk.as<bf16>(),
                                                                    dfl_rv.as<bf16>(), stream)
                                : -1;
@@ -2888,9 +3579,27 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) {
         const auto P = uint32_t(prompt.size());
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
+        // --mtp with DFlash2 loaded: MTP for prompts of --mtp-from tokens or more, at --mtp-depth drafts
+        // sampled or image requests decode without MTP (exact either way), so no request fails for asking for them
+        const bool use_mtp = opt.native_mtp && mtp.present && !sampling() && mm_pending.empty() &&
+                             (!dfl.present || (opt.mtp_from > 0 && P >= opt.mtp_from));
+        const bool dfl_on = dfl.present && !use_mtp;
+        if (use_mtp && dfl.present) D = opt.mtp_depth;
+        if (use_mtp) {
+            if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
+            if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");
+            if (D < 1 || D >= NVER) throw std::runtime_error("MTP draft length exceeds verify capacity");
+        }
         // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
-        D = dfl.present ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : 0;
-        if (P == 0 || P + count + dfl.block + 1 > context_) throw std::runtime_error("request exceeds context capacity");
+        if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
+        D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
+        const int reserve = use_mtp ? D + 1 : dfl.block + 1;
+        if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
+            throw std::runtime_error("request exceeds context capacity");
+        if (use_mtp) {
+            ck(cudaMemsetAsync(mtp_kc.p, 0, kvf->key_bytes(context_, int(cfg.kvheads), int(cfg.head_dim)), stream));
+            ck(cudaMemsetAsync(mtp_vc.p, 0, kvf->value_bytes(context_, int(cfg.kvheads), int(cfg.head_dim)), stream));
+        }
         gen.rdelta = 0;
         // image prompt: per-token table (source row, t, h, w); an image takes nx * ny cache cells but advances the RoPE
         // position by max(nx, ny) (Qwen3-VL / llama.cpp mtmd)
@@ -2934,6 +3643,7 @@ public:
         if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
         // Queue prefill chunks on one stream and read back only the final next token.
         uint32_t next = 0;
+        uint32_t first_draft = 0;
         {
             // TQLLM_DEBUG=tf_dump:FILE: teacher-forced argmax at every prompt position ("pos argmax next_prompt_token")
             const std::string * tf_dump = tqllm::debug_value("tf_dump");
@@ -2968,7 +3678,21 @@ public:
                                  m, t, final ? h_tok : nullptr, false);
                     if (tf_host) ck(cudaMemcpyAsync(tf_host + t, v_tok.p, size_t(m) * 4, cudaMemcpyDeviceToHost, stream));
                     commit(m);
-                    for (int off = 0; off < m && dfl.present; off += 8) {
+                    if (use_mtp) {
+                        if (final) {
+                            sync_ck();
+                            next = h_tok[0];
+                        }
+                        const int pairs = int(std::min<uint32_t>(uint32_t(m), P - t - 1));
+                        for (int off = 0; off < pairs; off += NVER) {
+                            const int n = std::min(NVER, pairs - off);
+                            mtp_run(prompt.data() + t + uint32_t(off) + 1,
+                                    v_hid.as<bf16>() + size_t(off) * H, n, t + uint32_t(off) + 1, false);
+                        }
+                        if (final && count > 1 && next != eos_)
+                            first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
+                    }
+                    for (int off = 0; off < m && dfl_on; off += 8) {
                         const int count = std::min(8, m - off);
                         if (t + uint32_t(off + count) <= inj0) continue;
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
@@ -2994,7 +3718,7 @@ public:
                     std::fclose(f);
                 }
             }
-            next = h_tok[0];
+            if (!use_mtp) next = h_tok[0];
             if (sampling()) {  // the final chunk's head wrote column 0's top-16
                 ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
                 ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
@@ -3015,6 +3739,8 @@ public:
         gen.P = P;
         gen.count = count;
         gen.D = D;
+        gen.native_mtp = use_mtp;
+        if (use_mtp && count > 1 && next != eos_) gen.mtp_draft.assign(1, first_draft);
         gen.pos = P;
         gen.rdelta = rdelta;
         gen.pending = next;
@@ -3078,13 +3804,7 @@ public:
         for (const auto & g : segs) kv_track(g.pos, g.n);
         uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40);
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-        auto it = bgraphs.find(key);
-        if (it == bgraphs.end()) {
-            cudaGraph_t g = tqllm::capture_graph(stream, [&] { verify_body(col, int(context_)); });
-            cudaGraphExec_t exec = tqllm::instantiate_graph(g);
-            it = bgraphs.emplace(key, exec).first;
-        }
-        ck(cudaGraphLaunch(it->second, stream));
+        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         const size_t ncol = static_cast<size_t>(col);
         std::vector<uint32_t> res(ncol, 0u), in(ncol, 0u);
         std::vector<int> tpar(ncol, 0);
@@ -3250,13 +3970,7 @@ public:
         for (const auto & g : segs) kv_track(g.pos, g.n);
         uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-        auto it = bgraphs.find(key);
-        if (it == bgraphs.end()) {
-            cudaGraph_t g = tqllm::capture_graph(stream, [&] { verify_body(col, int(context_)); });
-            cudaGraphExec_t exec = tqllm::instantiate_graph(g);
-            it = bgraphs.emplace(key, exec).first;
-        }
-        ck(cudaGraphLaunch(it->second, stream));
+        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         std::vector<uint32_t> res(size_t(col) + 1);
         ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
         if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -3459,16 +4173,10 @@ public:
                 set_dpos(pos);
                 const uint64_t key = uint64_t(k) | (uint64_t(k < last_n) << 8) | (uint64_t(cur) << 16) |
                                      (uint64_t(sp) << 24) | (uint64_t(active) << 32);
-                auto it = cgraphs.find(key);
-                if (it == cgraphs.end()) {
-                    cudaGraph_t g = tqllm::capture_graph(stream, [&] {
-                        if (k < last_n) commit_body(k);
-                        dflash_inject_body(v_feat.as<bf16>(), k);
-                    });
-                    cudaGraphExec_t exec = tqllm::instantiate_graph(g);
-                    it = cgraphs.emplace(key, exec).first;
-                }
-                ck(cudaGraphLaunch(it->second, stream));
+                ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, [&] {
+                    if (k < last_n) commit_body(k);
+                    dflash_inject_body(v_feat.as<bf16>(), k);
+                }), stream));
                 cur = (cur + 1) % NSLOT;
                 last_n = 0;
             } else {
@@ -3574,8 +4282,15 @@ public:
     // x = eh_proj([enorm(embed(t)) ; hnorm(h)]), one full-attention decoder layer with its own KV cache, then the
     // shared LM head on shared_head_norm(x). Returns the greedy token after the last pair (the next draft) and keeps
     // the last pre-norm output as the hidden for chaining. `hidden`: device [n][H] (nullptr = chain from last MTP).
-    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos) {
+    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample = true) {
         if (!mtp.present) throw std::runtime_error("model has no MTP head");
+        struct RestoreBasis {
+            Basis & current;
+            Basis saved;
+            ~RestoreBasis() { current = saved; }
+        } restore{basis_, basis_};
+        // The nextn block can retain plain Q6_K weights beside a rotated TQ4 target.
+        basis_ = mtp.eh_proj.fmt ? mtp.eh_proj.fmt->basis() : Basis::Plain;
         const int H = int(cfg.hidden);
         auto *X = v_x.as<bf16>(), *R = v_r.as<bf16>(), *CAT = v_cat.as<bf16>(), *E = v_np.as<bf16>();
         auto * XH = v_xh.as<__half>();
@@ -3592,14 +4307,20 @@ public:
         tqllm_cuda::rms_f_multi(E, H, 0, mtp.enorm, CAT, 2 * H, 0, H, 1, n, cfg.eps, stream);
         tqllm_cuda::rms_f_multi(hidden ? hidden : mtp_h.as<bf16>(), H, 0, mtp.hnorm, CAT + H, 2 * H, 0, H, 1, n, cfg.eps,
                                 stream);
-        tqllm_cuda::tq3_rotate_h(CAT, XH, 2 * H, n, stream);
+        rot_h(CAT, XH, 2 * H, n);
         mm_h(mtp.eh_proj, X, n);
         tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
         ck(cudaMemcpyAsync(R, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
-        tqllm_cuda::norm_rotate_h(X, mtp.layer.in_norm, v_px.as<float>(), cfg.eps, XH, H, n, stream);
+        nrot_h(X, mtp.layer.in_norm, v_px.as<float>(), XH, H, n);
+        vpar = chain2 && n <= NVER ? d_chain.as<int>() : nullptr;  // the MTP layer's attention: two-part chain like the verify
+        vdep = vpar ? d_cdep.as<int>() : nullptr;                   // (> 8 queries need depths; tree mode crashed here)
         attn_mixer(mtp.layer, mtp_kc.as<bf16>(), mtp_vc.as<bf16>(), n, int(bucket));
         ffn_block(mtp.layer, n);
         ck(cudaMemcpyAsync(mtp_h.p, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+        if (!sample) {
+            sync_ck();
+            return 0;
+        }
         if (mtp.draft_head.p) {  // argmax over the draft vocabulary only (the verifier still sees the full vocab)
             auto * NP = v_np.as<bf16>();
             tqllm_cuda::rms_f(X + size_t(n - 1) * H, H, mtp.shared_norm, NP, H, H, 1, cfg.eps, stream);
@@ -3611,7 +4332,8 @@ public:
             sync_ck();
             return mtp.draft_ids[h_tok[0]];
         }
-        head_argmax(mtp.shared_norm, n);
+        // Only the final repaired hidden state proposes the next draft token.
+        head_argmax(mtp.shared_norm, 1, n - 1);
         ck(cudaMemcpyAsync(h_tok, v_tok.as<uint32_t>() + (n - 1), 4, cudaMemcpyDeviceToHost, stream));
         sync_ck();
         return h_tok[0];
@@ -3620,6 +4342,7 @@ public:
     int slots() const override { return nslots; }
     bool incremental() const override { return fmt_target; }
     bool has_drafter() const override { return dfl.present; }
+    bool native_mtp() const override { return opt.native_mtp && mtp.present && !dfl.present; }  // MTP only (no -md)
     void select_slot(int s) override {
         if (s < 0 || s >= nslots) throw std::out_of_range("slot out of range");
         if (s == active) return;
@@ -3649,18 +4372,82 @@ public:
         }
         sync_ck();
     }
+    bool mtp_advance() {
+        if (gen.done || gen.out.size() >= gen.count || gen.pending == eos_) {
+            gen.done = true;
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto & draft = gen.mtp_draft;
+        int D = gen.D;
+        // --lookup L: a match of the last tokens earlier in prompt + output that runs longer than the MTP chain (or >= K
+        // with --lookup-first K) is the draft instead; the MTP cache is rebuilt from the verified tokens either way
+        if (opt.lookup > 0) {
+            uint32_t lk[NVER];
+            const int n = lookup(lk, std::min(opt.lookup, NVER - 1));
+            if (n >= (opt.lookup_first > 0 ? opt.lookup_first : D + 1)) {
+                draft.assign(lk, lk + n);
+                D = n;
+            }
+        }
+        while (int(draft.size()) < D)
+            draft.push_back(mtp_run(&draft.back(), nullptr, 1, gen.pos + uint32_t(draft.size())));
+        const auto t1 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> in{gen.pending}, res(size_t(D) + 1);
+        in.insert(in.end(), draft.begin(), draft.end());
+        verify(in.data(), int(in.size()), gen.pos, res.data());
+        const auto t2 = std::chrono::steady_clock::now();
+        int j = 0;
+        while (j < D && draft[size_t(j)] == res[size_t(j)]) ++j;
+        ++gen.steps;
+        gen.drafted += uint64_t(D);
+        gen.accepted += uint64_t(j);
+        for (int i = 0; i < j && gen.out.size() < gen.count; ++i) {
+            gen.out.push_back(draft[size_t(i)]);
+            if (draft[size_t(i)] == eos_) {
+                gen.done = true;
+                break;
+            }
+        }
+        if (!gen.done && gen.out.size() < gen.count) gen.out.push_back(res[size_t(j)]);
+        commit(j + 1);
+        const uint32_t repair_pos = gen.pos + 1;
+        gen.pos += uint32_t(j + 1);
+        gen.pending = res[size_t(j)];
+        gen.done |= gen.out.size() >= gen.count || gen.pending == eos_;
+        if (!gen.done) {
+            std::vector<uint32_t> repaired(draft.begin(), draft.begin() + j);
+            repaired.push_back(gen.pending);
+            // Pair each committed token with the target hidden of its preceding position.
+            const uint32_t next = mtp_run(repaired.data(), verify_hidden(), int(repaired.size()), repair_pos);
+            draft.assign(1, next);
+        } else sync_ck();
+        const auto t3 = std::chrono::steady_clock::now();
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        gen.t_draft += ms(t0, t1);
+        gen.t_verify += ms(t1, t2);
+        gen.t_tail += ms(t2, t3);
+        return !gen.done;
+    }
+
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) override {
         if (!fmt_target) throw std::runtime_error("incremental decoding needs a quantized GGUF model");
         dflash_begin(prompt, count, D);
     }
     bool spec_advance() override {
+        if (gen.native_mtp) return mtp_advance();  // per request: an MTP request with DFlash2 loaded too
         if (dfl.present) return dflash_advance();
         bool done = false;
         const int s = active;
         dflash_step(&s, 1, &done);
         return !done;
     }
-    void spec_step(const int * slots, int n, bool * done) override { dflash_step(slots, n, done); }
+    void spec_step(const int * slots, int n, bool * done) override {
+        if (gen.native_mtp) {
+            if (n != 1 || slots[0] != active) throw std::runtime_error("MTP step needs the active single slot");
+            done[0] = !mtp_advance();
+        } else dflash_step(slots, n, done);
+    }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override { return dflash_finish(stats); }
     std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {
@@ -3712,6 +4499,11 @@ public:
     std::vector<uint32_t> generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int D,
                                         uint64_t * stats) override {
         if (dfl.present) return generate_dflash(prompt, count, D, stats);
+        if (opt.native_mtp) {
+            spec_begin(prompt, count, D);
+            while (spec_advance()) {}
+            return spec_finish(stats);
+        }
         if (!mtp.present) throw std::runtime_error("model has no MTP head");
         if (D < 1 || D > NVER - 1) throw std::runtime_error("draft length exceeds verify capacity");
         const auto P = uint32_t(prompt.size());
