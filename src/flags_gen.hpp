@@ -12,6 +12,7 @@ struct Flag {
     const char * replaced_by;
 };
 inline constexpr Flag ALL[] = {
+    {"TQLLM_MOE_STAGE", Kind::Debug, "on", "0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics)", ""},
     {"TQLLM_MOE_PROFILE", Kind::Debug, "-", "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill", ""},
     {"TQLLM_DEBUG", Kind::Debug, "off", "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)", ""},
     {"TQLLM_MATVEC_RULE", Kind::User, "-", "override the matvec kernel rule table (kernels/formats/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)", ""},

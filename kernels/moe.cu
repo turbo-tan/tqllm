@@ -235,6 +235,39 @@ void moe_count(const int * ids, unsigned long long * counts, int count, cudaStre
     if (count <= 0) return;
     count_k<<<(count + 255) / 256, 256, 0, stream>>>(ids, counts, count);
 }
+struct MoeStageArgs { MoeStageSpan s[kMoeStageSpans]; };
+// wide coalesced reads: zero-copy loads of host memory reach PCIe bandwidth only as long contiguous runs
+__global__ void stage_k(MoeStageArgs a, const int * cold_ids, int * stage_ids) {
+    const int slot = blockIdx.y, c = cold_ids[slot];
+    if (blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0) stage_ids[slot] = c >= 0 ? slot : -1;
+    if (c < 0) return;
+    const MoeStageSpan sp = a.s[blockIdx.z];
+    const long long n16 = sp.bytes / 16;
+    const uint4 * src = static_cast<const uint4 *>(sp.src) + c * n16;
+    uint4 * dst = static_cast<uint4 *>(sp.dst) + slot * n16;
+    constexpr int U = 4;
+    for (long long i = (long long)blockIdx.x * blockDim.x * U + threadIdx.x; i < n16; i += (long long)gridDim.x * blockDim.x * U) {
+        uint4 v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) if (i + u * blockDim.x < n16) v[u] = src[i + u * blockDim.x];
+#pragma unroll
+        for (int u = 0; u < U; ++u) if (i + u * blockDim.x < n16) dst[i + u * blockDim.x] = v[u];
+    }
+}
+void moe_stage(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const int * cold_ids, int * stage_ids, int count,
+               cudaStream_t stream) {
+    if (count <= 0 || nspans <= 0 || nspans > kMoeStageSpans) throw std::invalid_argument("moe_stage: invalid shape");
+    MoeStageArgs a{};
+    long long most = 0;
+    for (int i = 0; i < nspans; ++i) {
+        const auto & sp = spans[i];
+        if (sp.bytes <= 0 || sp.bytes % 16 || reinterpret_cast<uintptr_t>(sp.src) % 16 || reinterpret_cast<uintptr_t>(sp.dst) % 16)
+            throw std::invalid_argument("moe_stage: spans must be 16-byte aligned multiples");
+        a.s[i] = sp; most = std::max(most, sp.bytes);
+    }
+    const int bx = int(std::min<long long>(64, (most / 16 + 1023) / 1024));
+    stage_k<<<dim3(unsigned(std::max(1, bx)), unsigned(count), unsigned(nspans)), 256, 0, stream>>>(a, cold_ids, stage_ids);
+}
 void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * act, int count, cudaStream_t stream) {
     swiglu_k<<<(count + 255) / 256, 256, 0, stream>>>(gate, up, act, count);
 }

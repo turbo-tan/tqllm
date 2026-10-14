@@ -28,6 +28,13 @@ void moe_split_ids(const int * ids, const int * hot_slot, const int * cold_slot,
                    int count, cudaStream_t stream);
 // counts[ids[i]] += 1 (routing profile)
 void moe_count(const int * ids, unsigned long long * counts, int count, cudaStream_t stream);
+// --moe-host-mb: copy the routed host (cold) experts of one layer into a device stage, one slot per assignment.
+// span z: expert c of src (c = cold_ids[a] >= 0) -> dst slot a, `bytes` per expert (16-byte multiples, 16-byte aligned).
+// stage_ids[a] = a when cold_ids[a] >= 0, else -1: the ids of the staged copy for the unchanged expert kernels.
+struct MoeStageSpan { const void * src = nullptr; void * dst = nullptr; long long bytes = 0; };
+constexpr int kMoeStageSpans = 6;
+void moe_stage(const MoeStageSpan (&spans)[kMoeStageSpans], int nspans, const int * cold_ids, int * stage_ids, int count,
+               cudaStream_t stream);
 void moe_swiglu(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * act,
                 int count, cudaStream_t);
 void moe_sum(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared, const float * weights,

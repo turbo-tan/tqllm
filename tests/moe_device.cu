@@ -474,6 +474,82 @@ static void overlap_test(unsigned type, int n) {
     std::printf("GGUF %2u (%s) hot/cold paired gate+up on two streams n=%d: bit-identical\n", sp.type, sp.name, n);
 }
 
+// --moe-host-mb staging: routed cold experts copied (weights + scales) into per-assignment slots, then the unchanged expert
+// kernels on the copy with stage ids == the direct launch on the cold set (bit-identical; the cold set in mapped host memory)
+static void stage_test(unsigned type, int n) {
+    const FmtSpec & sp = spec_of(type);
+    const auto * wf = tqllm::weight_format(type);
+    const int e = 5, k = 3, rows = 32, cols = 256, eb = rows * row_blocks(type) * sp.bytes;  // engine experts: 512 / 2048 rows
+    std::mt19937 gen(211 + type);
+    auto weights = [&] {
+        std::vector<char> raw(size_t(e) * eb);
+        for (size_t b = 0; b < raw.size() / sp.bytes; ++b) {
+            for (int j = 0; j < sp.bytes; ++j) raw[b * sp.bytes + j] = char(gen() % 256);
+            const __half d = __float2half(.001f * (1 + b % 7));
+            std::memcpy(raw.data() + b * sp.bytes, &d, 2);
+            std::memcpy(raw.data() + b * sp.bytes + 2, &d, 2);
+            if (sp.clamp_hi > sp.clamp_lo) {
+                std::memcpy(raw.data() + b * sp.bytes + 208, &d, 2);
+                for (int j = sp.clamp_lo; j < sp.clamp_hi; ++j) raw[b * sp.bytes + j] = char(1 + gen() % 32);
+            }
+        }
+        return raw;
+    };
+    const auto rg = weights(), ru = weights();
+    std::vector<void *> dev, host;
+    tqllm::Upload to_host = [&](const void * h, size_t b) {
+        void * p = nullptr; ck(cudaHostAlloc(&p, b, cudaHostAllocMapped)); std::memcpy(p, h, b); host.push_back(p);
+        void * d = nullptr; ck(cudaHostGetDevicePointer(&d, p, 0)); return static_cast<const void *>(d);
+    };
+    const auto g = wf->load(rg, e * rows, cols, to_host, nullptr), u = wf->load(ru, e * rows, cols, to_host, nullptr);
+    if (g.fmt->u4h_id() < 0) {
+        for (void * p : host) ck(cudaFreeHost(p));
+        std::printf("GGUF %2u (%s) stage: not u4h-family, skipped\n", sp.type, sp.name);
+        return;
+    }
+    const long long pb = (long long)rows * g.fmt->row_bytes(cols), ab = g.aux ? (long long)rows * g.fmt->aux_row_bytes(cols) : 0;
+    if (pb % 16 || ab % 16) {
+        for (void * p : host) ck(cudaFreeHost(p));
+        std::printf("GGUF %2u (%s) stage: per-expert bytes not 16-byte multiples, engine reads directly\n", sp.type, sp.name);
+        return;
+    }
+    std::vector<__half> x(n * cols);
+    for (auto & v : x) v = __float2half(float(int(gen() % 101) - 50) / 100.f);
+    std::vector<int> ids(n * k);  // cold ids: some assignments in the other set (-1)
+    for (int t = 0; t < n; ++t) {
+        std::vector<int> pick(e); for (int i = 0; i < e; ++i) pick[i] = i;
+        std::shuffle(pick.begin(), pick.end(), gen);
+        for (int s2 = 0; s2 < k; ++s2) ids[t * k + s2] = (t + s2) % 2 ? -1 : pick[s2];
+    }
+    const int slots = n * k;
+    Device<__half> dx(x.size()); dx.put(x);
+    Device<int> di(ids.size()), dsid(slots);
+    di.put(ids);
+    std::vector<Device<char>> stg;
+    stg.reserve(4);  // Device frees in its destructor: no reallocation
+    stg.emplace_back(size_t(pb) * slots); stg.emplace_back(size_t(pb) * slots);
+    stg.emplace_back(size_t(std::max<long long>(ab, 16)) * slots); stg.emplace_back(size_t(std::max<long long>(ab, 16)) * slots);
+    Device<__nv_bfloat16> rg_o(n * k * rows), ru_o(n * k * rows), sg_o(n * k * rows), su_o(n * k * rows);
+    std::vector<__nv_bfloat16> zero(n * k * rows, __float2bfloat16(0.f));
+    for (auto * d : {&rg_o, &ru_o, &sg_o, &su_o}) d->put(zero);
+    g.fmt->expert_matvec2(g, u, dx.p, rg_o.p, ru_o.p, rows, di.p, n, k, nullptr);
+    tqllm_cuda::MoeStageSpan spn[tqllm_cuda::kMoeStageSpans];
+    int ns = 0;
+    tqllm::Mat sg = g, su = u;
+    spn[ns++] = {g.p, stg[0].p, pb}; sg.p = stg[0].p;
+    spn[ns++] = {u.p, stg[1].p, pb}; su.p = stg[1].p;
+    if (g.aux) { spn[ns++] = {g.aux, stg[2].p, ab}; sg.aux = stg[2].p; spn[ns++] = {u.aux, stg[3].p, ab}; su.aux = stg[3].p; }
+    sg.rows = su.rows = rows * slots;
+    tqllm_cuda::moe_stage(spn, ns, di.p, dsid.p, slots, nullptr);
+    sg.fmt->expert_matvec2(sg, su, dx.p, sg_o.p, su_o.p, rows, dsid.p, n, k, nullptr);
+    ck(cudaDeviceSynchronize());
+    const auto a = sg_o.get(n * k * rows), b = rg_o.get(n * k * rows), c = su_o.get(n * k * rows), d = ru_o.get(n * k * rows);
+    if (std::memcmp(a.data(), b.data(), a.size() * 2) || std::memcmp(c.data(), d.data(), c.size() * 2))
+        throw std::runtime_error("staged cold experts differ from the direct launch");
+    for (void * p : host) ck(cudaFreeHost(p));
+    std::printf("GGUF %2u (%s) staged cold experts (mapped host -> device) n=%d: bit-identical\n", sp.type, sp.name, n);
+}
+
 int main() {
     try {
         route_test();
@@ -486,6 +562,7 @@ int main() {
             for (int n : {5, 65, 129}) for (bool per : {false, true}) split_test(sp.type, n, per, true);
             for (bool gemm : {false, true}) split_test(sp.type, 5, false, gemm, {4});  // cold set smaller than k
             for (int n : {1, 5}) overlap_test(sp.type, n);
+            for (int n : {1, 2}) stage_test(sp.type, n);
             for (int n : {1, 5}) pair_test(sp.type, n);
         }
         attention_group_test();

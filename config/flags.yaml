@@ -3,6 +3,10 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_MOE_STAGE
+    kind: debug
+    default: "on"
+    doc: "0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics)"
   - name: TQLLM_MOE_PROFILE
     kind: debug
     default: "-"

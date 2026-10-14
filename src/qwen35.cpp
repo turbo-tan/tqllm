@@ -1395,6 +1395,7 @@ private:
             if (opt.moe_host_mb > 0) {
                 moe_hot_ids = Buf(NBUF * K * sizeof(int)); moe_cold_ids = Buf(NBUF * K * sizeof(int));
                 moe_counts2 = Buf(cfg.expert_count * sizeof(int)); moe_groups2 = Buf(NBUF * cfg.expert_count * sizeof(int));
+                alloc_moe_stage();
             }
             if (const char * pf = std::getenv("TQLLM_MOE_PROFILE")) {
                 moe_prof_path = pf; moe_prof = Buf(size_t(cfg.layers) * cfg.expert_count * 8);
@@ -1605,6 +1606,34 @@ private:
     Buf moe_counts, moe_groups;
     Buf moe_logits, moe_ids, moe_weights, moe_shared_weights, moe_gate, moe_up, moe_act, moe_out, moe_shared;
     Buf moe_hot_ids, moe_cold_ids, moe_counts2, moe_groups2;  // --moe-host-mb split
+    // --moe-host-mb decode: routed cold experts copied to the device (gate, up, down; weights and scales) before their
+    // projections, stage_slots assignments at most; empty when a format's per-expert bytes are not 16-byte multiples
+    Buf moe_stage_buf[tqllm_cuda::kMoeStageSpans], moe_stage_ids;
+    long long moe_stage_bytes[tqllm_cuda::kMoeStageSpans] = {};
+    int moe_stage_slots = 0;
+    void alloc_moe_stage() {
+        if (std::getenv("TQLLM_MOE_STAGE") && std::string(std::getenv("TQLLM_MOE_STAGE")) == "0") return;
+        long long most[tqllm_cuda::kMoeStageSpans] = {};
+        for (const auto & L : layer) {
+            if (L.n_cold <= 0) continue;
+            const Mat * m[3] = {&L.cx_gate, &L.cx_up, &L.cx_down};
+            for (int j = 0; j < 3; ++j) {
+                const long long per = m[j]->rows / L.n_cold;
+                const long long pb = per * (long long)m[j]->fmt->row_bytes(m[j]->cols);
+                const long long ab = m[j]->aux ? per * (long long)m[j]->fmt->aux_row_bytes(m[j]->cols) : 0;
+                if (pb % 16 || ab % 16) return;
+                most[2 * j] = std::max(most[2 * j], pb), most[2 * j + 1] = std::max(most[2 * j + 1], ab);
+            }
+        }
+        if (!most[0]) return;
+        moe_stage_slots = 2 * int(cfg.expert_used);
+        size_t total = 0;
+        for (int i = 0; i < tqllm_cuda::kMoeStageSpans; ++i)
+            if (most[i]) { moe_stage_buf[i] = Buf(size_t(most[i]) * moe_stage_slots); total += size_t(most[i]) * moe_stage_slots; }
+        moe_stage_ids = Buf(size_t(moe_stage_slots) * sizeof(int));
+        std::fprintf(stderr, "tqllm: MoE host experts staged through %.0f MiB of VRAM (%d assignments)\n", total / 1048576.0,
+                     moe_stage_slots);
+    }
     Buf moe_prof; std::string moe_prof_path;  // TQLLM_MOE_PROFILE: routing counts [L][E]
     void moe_profile_write() {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -2331,15 +2360,33 @@ public:
                 auto fork = [&] { ck(cudaEventRecord(moe_fork, stream)); ck(cudaStreamWaitEvent(moe_side, moe_fork, 0)); };
                 auto join = [&] { ck(cudaEventRecord(moe_join, moe_side)); ck(cudaStreamWaitEvent(stream, moe_join, 0)); };
                 fork();
-                L.cx_gate.fmt->expert_matvec2(L.cx_gate, L.cx_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
-                                              moe_cold_ids.as<int>(), n, K, moe_side);
+                Mat sg = L.cx_gate, su = L.cx_up, sd = L.cx_down;
+                const int * cids = moe_cold_ids.as<int>();
+                if (moe_stage_slots && n * K <= moe_stage_slots) {
+                    tqllm_cuda::MoeStageSpan sp[tqllm_cuda::kMoeStageSpans];
+                    int ns = 0;
+                    Mat * sm[3] = {&sg, &su, &sd};
+                    for (int j = 0; j < 3; ++j) {
+                        Mat & m = *sm[j];
+                        const long long per = m.rows / L.n_cold;
+                        sp[ns++] = {m.p, moe_stage_buf[2 * j].p, per * (long long)m.fmt->row_bytes(m.cols)};
+                        m.p = moe_stage_buf[2 * j].p;
+                        if (m.aux) {
+                            sp[ns++] = {m.aux, moe_stage_buf[2 * j + 1].p, per * (long long)m.fmt->aux_row_bytes(m.cols)};
+                            m.aux = moe_stage_buf[2 * j + 1].p;
+                        }
+                        m.rows = int(per) * moe_stage_slots;
+                    }
+                    tqllm_cuda::moe_stage(sp, ns, moe_cold_ids.as<int>(), moe_stage_ids.as<int>(), n * K, moe_side);
+                    cids = moe_stage_ids.as<int>();
+                }
+                sg.fmt->expert_matvec2(sg, su, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE, cids, n, K, moe_side);
                 L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
                                               moe_hot_ids.as<int>(), n, K, stream);
                 join();
                 tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * K * FE, stream);
                 fork();
-                L.cx_down.fmt->expert_matvec(L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_cold_ids.as<int>(), n, K,
-                                             true, moe_side);
+                sd.fmt->expert_matvec(sd, moe_act.as<__half>(), moe_out.as<bf16>(), H, cids, n, K, true, moe_side);
                 L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, K,
                                              true, stream);
                 join();
