@@ -456,13 +456,16 @@ struct Qwen35::Impl {
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
-        auto result=native_gdn_prep?gdn_convolve_native(joined,weights):gdn_convolve(joined,weights,compiled_gdn);
+        auto result=ablate_blocks.find("gconv")!=std::string::npos?tail_slice(joined,0,conv-1,conv-1+m):
+            native_gdn_prep?gdn_convolve_native(joined,weights):gdn_convolve(joined,weights,compiled_gdn);
         c.conv=mx::contiguous(tail_slice(joined,0,m,m+conv-1));
         auto q=mx::reshape(tail_slice(result,1,0,kh*dk),{1,m,kh,dk});
         auto k=mx::reshape(tail_slice(result,1,kh*dk,2*kh*dk),{1,m,kh,dk});
         auto v=mx::reshape(tail_slice(result,1,2*kh*dk,width),{1,m,vh,dv});
-        q=gdn_normalize(q,1.0f/std::sqrt(float(dk)),compiled_gdn);
-        k=gdn_normalize(k,1,compiled_gdn);
+        if(ablate_blocks.find("gnorm")==std::string::npos) {
+            q=gdn_normalize(q,1.0f/std::sqrt(float(dk)),compiled_gdn);
+            k=gdn_normalize(k,1,compiled_gdn);
+        }
         if(!native_head_order && !scan_gdn) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
         auto a=mat(p+"ssm_alpha.weight",x),b=mat(p+"ssm_beta.weight",x);
         auto gates=native_gdn_prep?gdn_gates_native(a,b,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a")):

@@ -1,6 +1,7 @@
 #include <sstream>
 #include "dflash.hpp"
 #include "tq3_tiled.hpp"
+#include "mma8.hpp"
 #include "../dequant.hpp"
 #include <algorithm>
 #include <cmath>
@@ -151,6 +152,8 @@ struct DFlash2::Impl {
     std::vector<int> features;
     std::map<std::string,Matrix> matrices;
     std::map<std::string,TqTiledWeights> tiled_ffn;
+    std::map<std::string,Mma8Weights> mma8_attn;
+    std::optional<std::pair<mx::array,mx::array>> rotation_half;
     std::optional<std::pair<mx::array,mx::array>> rotation;
     std::map<std::string,mx::array> plain;
     struct Kv {std::optional<mx::array> k,v;};
@@ -223,6 +226,20 @@ struct DFlash2::Impl {
                         return mx::zeros({x.shape(0),rows},x.dtype());
                     }
         }
+        static const bool mma8=std::getenv("TQLLM_MLX_MMA8_DRAFT")!=nullptr;
+        if(mma8 && x.shape(0)<=8 && name.find("attn_")!=std::string::npos && name.find("conv")==std::string::npos) {
+            auto found=mma8_attn.find(name);
+            if(found==mma8_attn.end())
+                if(auto it=matrices.find(name);it!=matrices.end()) {
+                    if(auto* t3=std::get_if<Tq3Weights>(&it->second))found=mma8_attn.emplace(name,mma8_pack(*t3)).first;
+                    else if(auto* t4=std::get_if<Tq4Weights>(&it->second))found=mma8_attn.emplace(name,mma8_pack(*t4)).first;
+                }
+            if(found!=mma8_attn.end()) {
+                if(!rotation || rotation->first.id()!=x.id())rotation=std::pair{x,tq4_rotate(x)};
+                if(!rotation_half || rotation_half->first.id()!=x.id())rotation_half=std::pair{x,mma8_input(rotation->second)};
+                return mma8_matmul(found->second,rotation_half->second,x.shape(0),true);
+            }
+        }
         if(x.shape(0)<=8)if(auto found=tiled_ffn.find(name);found!=tiled_ffn.end()) {
             if(!rotation || rotation->first.id()!=x.id())rotation=std::pair{x,tq4_rotate(x)};
             return bf(tq_tiled_matmul(found->second,rotation->second,4,true,32,true));
@@ -242,7 +259,7 @@ struct DFlash2::Impl {
 DFlash2::DFlash2(const std::string& path,Qwen35& target):impl_(std::make_unique<Impl>(path,target)) {}
 DFlash2::~DFlash2()=default;
 const std::vector<int>& DFlash2::feature_layers() const {return impl_->features;}
-void DFlash2::reset() {impl_->end=0;impl_->rotation.reset();for(auto& c:impl_->caches)c=Impl::Kv{};}
+void DFlash2::reset() {impl_->end=0;impl_->rotation.reset();impl_->rotation_half.reset();for(auto& c:impl_->caches)c=Impl::Kv{};}
 void DFlash2::inject(const mx::array& features,int position) {
     auto& i=*impl_;const int n=features.shape(0);
     if(position!=i.end || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1)
@@ -264,7 +281,7 @@ void DFlash2::inject(const mx::array& features,int position) {
 }
 std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
-    i.rotation.reset();
+    i.rotation.reset();i.rotation_half.reset();
     if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
         throw std::invalid_argument("invalid DFlash draft request");
     std::vector<uint32_t> tokens(i.block,i.mask);tokens[0]=anchor;

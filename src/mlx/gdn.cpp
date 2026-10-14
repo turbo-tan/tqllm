@@ -112,6 +112,9 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     auto initial=state?*state:mx::zeros({1,vh,128,128});
     if(initial.shape()!=mx::Shape{1,vh,128,128} || initial.dtype()!=mx::float32)
         throw std::invalid_argument("invalid GDN scan state");
+    static const bool skip_scan=std::getenv("TQLLM_MLX_ABLATE_BLOCKS") && std::string_view(std::getenv("TQLLM_MLX_ABLATE_BLOCKS")).find("gscan")!=std::string_view::npos;
+    if(skip_scan && compact)
+        return {mx::zeros({1,m,vh,128}),initial,std::nullopt,std::optional<mx::array>(mx::zeros({m,vh,128}))};
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states","deltas"},R"METAL(
 uint lane=thread_position_in_threadgroup.x;
 uint row=thread_position_in_grid.y,head=thread_position_in_grid.z;
