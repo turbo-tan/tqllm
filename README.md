@@ -38,6 +38,11 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Prompt-lookup drafting (`--lookup`) | Apoorv Saxena, [prompt-lookup-decoding](https://github.com/apoorvumang/prompt-lookup-decoding) |
 | Comparison baselines | [Unsloth](https://huggingface.co/unsloth) UD quants; [HyperQwen](https://github.com/syv-ai/HyperQwen); [ExLlamaV3](https://github.com/turboderp-org/exllamav3), turboderp; [vLLM](https://github.com/vllm-project/vllm); Strata, Niko1221; LocalMaxxing |
 
+### Testers
+
+Thank you to the testers from X who ran TQLLM on their own hardware and reported back: 0x443, Ricky Spanish,
+lackonendes and GandalfOne.
+
 ## Get the image
 
 The prebuilt image is public on the GitHub container registry and on Docker Hub. One multi-platform tag covers x86-64
