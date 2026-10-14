@@ -1,4 +1,5 @@
 #include "dequant.hpp"
+#include "gguf.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -183,11 +184,173 @@ void q6k(const uint8_t * b, float * y) {  // 210 bytes: ql[128], qh[64], scales[
         }
 }
 
+
+// ---- 2-bit IQ family, Q2_K, IQ1_M, IQ4_NL: ports of ggml's dequantize_row_* (llama.cpp, MIT licence); tables in kernels/*.inc ----
+const uint64_t iq2xxs_grid[256] = {
+#include "../kernels/iq2xxs_grid.inc"
+};
+const uint64_t iq2xs_grid[512] = {
+#include "../kernels/iq2xs_grid.inc"
+};
+const uint64_t iq2s_grid[1024] = {
+#include "../kernels/iq2s_grid.inc"
+};
+const uint64_t iq1s_grid[2048] = {
+#include "../kernels/iq1s_grid.inc"
+};
+const uint8_t ksigns_iq2xs[128] = {
+#include "../kernels/ksigns_iq2xs.inc"
+};
+const int8_t kvalues_iq4nl[16] = {
+#include "../kernels/kvalues_iq4nl.inc"
+};
+const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+// IQ2_XXS 66 bytes: d, 32 x uint16 (per 32 weights: 4 grid-index bytes, then 4 x 7-bit sign index + 4-bit scale in a uint32).
+void iq2xxs(const uint8_t * b, float * y) {
+    uint16_t hd;
+    std::memcpy(&hd, b, 2);
+    const float d = half_to_float(hd);
+    for (int ib = 0; ib < 8; ++ib) {
+        uint32_t a[2];
+        std::memcpy(a, b + 2 + 8 * ib, 8);
+        const uint8_t * a8 = reinterpret_cast<const uint8_t *>(a);
+        const float db = d * (0.5f + float(a[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq2xxs_grid[a8[l]];
+            const uint8_t sg = ksigns_iq2xs[(a[1] >> (7 * l)) & 127];
+            for (int j = 0; j < 8; ++j) y[j] = db * float((g >> (8 * j)) & 0xff) * ((sg & kmask_iq2xs[j]) ? -1.f : 1.f);
+            y += 8;
+        }
+    }
+}
+
+// IQ2_XS 74 bytes: d, 32 x uint16 (9-bit grid index, 7-bit sign index), 8 scale bytes (two 4-bit scales per 32 weights).
+void iq2xs(const uint8_t * b, float * y) {
+    uint16_t hd;
+    std::memcpy(&hd, b, 2);
+    const float d = half_to_float(hd);
+    const uint8_t * sc = b + 66;
+    for (int ib = 0; ib < 8; ++ib) {
+        const float db[2] = {d * (0.5f + float(sc[ib] & 0xf)) * 0.25f, d * (0.5f + float(sc[ib] >> 4)) * 0.25f};
+        for (int l = 0; l < 4; ++l) {
+            uint16_t q;
+            std::memcpy(&q, b + 2 + 2 * (4 * ib + l), 2);
+            const uint64_t g = iq2xs_grid[q & 511];
+            const uint8_t sg = ksigns_iq2xs[q >> 9];
+            for (int j = 0; j < 8; ++j) y[j] = db[l / 2] * float((g >> (8 * j)) & 0xff) * ((sg & kmask_iq2xs[j]) ? -1.f : 1.f);
+            y += 8;
+        }
+    }
+}
+
+// IQ2_S 82 bytes: d, qs[64] (32 grid-index low bytes, then 32 sign bytes), qh[8], scales[8].
+void iq2s(const uint8_t * b, float * y) {
+    uint16_t hd;
+    std::memcpy(&hd, b, 2);
+    const float d = half_to_float(hd);
+    const uint8_t * qs = b + 2, * qh = b + 66, * sc = b + 74;
+    const uint8_t * signs = qs + 32;
+    for (int ib = 0; ib < 8; ++ib) {
+        const float db[2] = {d * (0.5f + float(sc[ib] & 0xf)) * 0.25f, d * (0.5f + float(sc[ib] >> 4)) * 0.25f};
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq2s_grid[qs[l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+            for (int j = 0; j < 8; ++j) y[j] = db[l / 2] * float((g >> (8 * j)) & 0xff) * ((signs[l] & kmask_iq2xs[j]) ? -1.f : 1.f);
+            y += 8;
+        }
+        qs += 4;
+        signs += 4;
+    }
+}
+
+// Q2_K 84 bytes: scales[16] (4-bit scale, 4-bit min), qs[64], d, dmin.
+void q2k(const uint8_t * b, float * y) {
+    uint16_t hd, hm;
+    std::memcpy(&hd, b + 80, 2);
+    std::memcpy(&hm, b + 82, 2);
+    const float d = half_to_float(hd), mn = half_to_float(hm);
+    const uint8_t * q = b + 16;
+    int is = 0;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t sc = b[is++];
+                const float dl = d * float(sc & 0xF), ml = mn * float(sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * float((q[l + 16 * half] >> shift) & 3) - ml;
+            }
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+// IQ1_S 50 bytes: d, qs[32], qh[8] x uint16 (3 index bits per group of 8, 3-bit scale, delta sign).
+void iq1s(const uint8_t * b, float * y) {
+    const float d = half_to_float(uint16_t(b[0] | (b[1] << 8)));
+    const uint8_t * qs = b + 2;
+    for (int ib = 0; ib < 8; ++ib) {
+        const uint16_t qh = uint16_t(b[34 + 2 * ib] | (b[35 + 2 * ib] << 8));
+        const float dl = d * float(2 * ((qh >> 12) & 7) + 1), delta = (qh & 0x8000) ? -0.125f : 0.125f;
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq1s_grid[qs[l] | (((qh >> (3 * l)) & 7) << 8)];
+            for (int j = 0; j < 8; ++j) y[j] = dl * (float(int8_t((g >> (8 * j)) & 0xff)) + delta);
+            y += 8;
+        }
+        qs += 4;
+    }
+}
+// IQ1_M 56 bytes: qs[32], qh[16], scales[8] (FP16 d scattered over the four top nibbles + 3-bit sub-block scales).
+void iq1m(const uint8_t * b, float * y) {
+    uint16_t sc[4];
+    std::memcpy(sc, b + 48, 8);
+    const uint16_t u = uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    const float d = half_to_float(u);
+    const uint8_t * qs = b, * qh = b + 32;
+    for (int ib = 0; ib < 8; ++ib) {
+        const float dl1 = d * float(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+        const float dl2 = d * float(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+        const uint16_t idx[4] = {uint16_t(qs[0] | ((qh[0] << 8) & 0x700)), uint16_t(qs[1] | ((qh[0] << 4) & 0x700)),
+                                 uint16_t(qs[2] | ((qh[1] << 8) & 0x700)), uint16_t(qs[3] | ((qh[1] << 4) & 0x700))};
+        const float delta[4] = {(qh[0] & 0x08) ? -0.125f : 0.125f, (qh[0] & 0x80) ? -0.125f : 0.125f,
+                                (qh[1] & 0x08) ? -0.125f : 0.125f, (qh[1] & 0x80) ? -0.125f : 0.125f};
+        for (int l = 0; l < 4; ++l) {
+            const float dl = l < 2 ? dl1 : dl2;
+            const uint64_t g = iq1s_grid[idx[l]];
+            for (int j = 0; j < 8; ++j) y[j] = dl * (float(int8_t((g >> (8 * j)) & 0xff)) + delta[l]);
+            y += 8;
+        }
+        qs += 4;
+        qh += 2;
+    }
+}
+
+// IQ4_NL 18 bytes per 32 weights: d, 16 bytes of two 4-bit indices into a non-linear table.
+void iq4nl(const uint8_t * b, float * y) {
+    uint16_t hd;
+    std::memcpy(&hd, b, 2);
+    const float d = half_to_float(hd);
+    for (int j = 0; j < 16; ++j) {
+        y[j] = d * float(kvalues_iq4nl[b[2 + j] & 0xf]);
+        y[j + 16] = d * float(kvalues_iq4nl[b[2 + j] >> 4]);
+    }
+}
+
 } // namespace
 
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
     const auto * s = static_cast<const uint8_t *>(src);
     switch (type) {
+        case GGML_GSQ_Q2_0:
+            if (n < 0 || n % 64) break;
+            for (int64_t b = 0; b < n / 64; ++b) {
+                uint16_t scale;
+                std::memcpy(&scale, s + b * 18, 2);
+                const float d = half_to_float(scale);
+                for (int j = 0; j < 64; ++j)
+                    dst[b * 64 + j] = (int((s[b * 18 + 2 + j / 4] >> (2 * (j % 4))) & 3) - 1) * d;
+            }
+            return;
         case 0: std::memcpy(dst, src, size_t(n) * 4); return;
         case 1:
             for (int64_t i = 0; i < n; ++i) {
@@ -201,6 +364,42 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
                 uint32_t bits = uint32_t(s[2 * i] | (s[2 * i + 1] << 8)) << 16;
                 std::memcpy(&dst[i], &bits, 4);
             }
+            return;
+        case 10:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) q2k(s + b * 84, dst + b * 256);
+            return;
+        case 16:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) iq2xxs(s + b * 66, dst + b * 256);
+            return;
+        case 17:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) iq2xs(s + b * 74, dst + b * 256);
+            return;
+        case 20:
+            if (n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) iq4nl(s + b * 18, dst + b * 32);
+            return;
+        case 8:  // Q8_0: d, 32 int8
+            if (n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                const uint8_t * q = s + b * 34;
+                const float d = half_to_float(uint16_t(q[0] | (q[1] << 8)));
+                for (int j = 0; j < 32; ++j) dst[b * 32 + j] = d * float(int8_t(q[2 + j]));
+            }
+            return;
+        case 19:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) iq1s(s + b * 50, dst + b * 256);
+            return;
+        case 22:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) iq2s(s + b * 82, dst + b * 256);
+            return;
+        case 29:
+            if (n % 256) break;
+            for (int64_t b = 0; b < n / 256; ++b) iq1m(s + b * 56, dst + b * 256);
             return;
         case 18:
             if (n % 256) break;

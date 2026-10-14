@@ -111,7 +111,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
-                 "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default 7)] "
+                 "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
@@ -261,7 +261,9 @@ int main(int argc, char ** argv) {
             if (!tf) { std::cerr << "tqserve: cannot read " << template_file << "\n"; return 2; }
             src.assign(std::istreambuf_iterator<char>(tf), std::istreambuf_iterator<char>());
         } else if (!model_path.empty()) {
-            const auto g = tqllm::gguf_open(model_path);
+            // a .tqfn manifest has no metadata of its own: the chat template comes from the tokenizer GGUF
+            const bool manifest = model_path.size() > 5 && model_path.compare(model_path.size() - 5, 5, ".tqfn") == 0;
+            const auto g = tqllm::gguf_open(manifest ? tokenizer_path : model_path);
             if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
         } else if (!model_dir.empty()) {
             std::ifstream tf(model_dir + "/chat_template.jinja", std::ios::binary);

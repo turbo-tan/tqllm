@@ -1,5 +1,6 @@
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
+#include <stdexcept>
 
 namespace tqllm::formats {
 namespace {
@@ -10,6 +11,8 @@ struct Tq3_4s final : WeightFormat {
     int max_matvec_cols() const override { return 12; }
     int max_batch_cols() const override { return 32; }
     Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
+        if (rows <= 0 || cols <= 0 || cols % 32 || raw.size() != size_t(rows) * (cols / 32) * 16)
+            throw std::invalid_argument("TQ3_4S: invalid matrix shape or byte count");
         const void * p = up(raw.data(), raw.size());
         tqllm_cuda::tq3_repack(const_cast<void *>(p), int64_t(raw.size() / 16), s);
         tqllm_cuda::tq3_tune(p, rows, cols, s);
@@ -18,6 +21,22 @@ struct Tq3_4s final : WeightFormat {
     }
     void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
         tqllm_cuda::tq3_matvec_h(m.p, x, y, m.rows, m.cols, n, s);
+    }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert, cudaStream_t s) const override {
+        if (rows <= 0 || m.rows % rows || topk <= 0 || topk > m.rows / rows)
+            throw std::invalid_argument("TQ3_4S: invalid stacked experts");
+        tqllm_cuda::tq3_expert_matvec(m.p, x, y, rows, m.cols, ids, n, topk, per_expert, s);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert, cudaStream_t s) const override {
+        if (rows <= 0 || int64_t(rows) * experts != m.rows)
+            throw std::invalid_argument("TQ3_4S: invalid stacked experts");
+        tqllm_cuda::tq3_expert_gemm(m.p, x, y, rows, m.cols, counts, groups, capacity, experts,
+                                  topk, per_expert, s);
+        return true;
     }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::tq3_dequant_h(m.p, out, m.rows, m.cols, s);

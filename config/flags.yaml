@@ -3,6 +3,14 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_MOE_DEV
+    kind: debug
+    default: "off"
+    doc: "allow experimental qwen35moe loading and forward correctness gates; not a release readiness flag"
+  - name: TQLLM_MOE_PROFILE
+    kind: debug
+    default: "-"
+    doc: "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill"
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"

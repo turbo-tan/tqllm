@@ -391,6 +391,8 @@ __global__ void __launch_bounds__(256) tq3b_matvec_h_k(const uint32_t * w3, cons
                 } else if constexpr (BITS == 14) {  // IQ4N: 8-byte record per 256 weights
                     const uint8_t * rec = reinterpret_cast<const uint8_t *>(sc) + (int64_t(rr[m][h]) * (nb / 8) + b / 8) * 8;
                     q.s[m][h] = ok ? tq4k::iq4_scale(rec, b % 8) : __float2half(0.f);
+                } else if constexpr (BITS == 15) {  // IQ4L: FP16 scale per 32 weights
+                    q.s[m][h] = ok ? sc[int64_t(rr[m][h]) * nb + b] : __float2half(0.f);
                 } else {
                     q.s[m][h] = ok ? sc[int64_t(rr[m][h]) * ng + b / 4] : __float2half(0.f);
                 }
@@ -447,7 +449,7 @@ __global__ void __launch_bounds__(256) tq3b_matvec_h_k(const uint32_t * w3, cons
                 } else if constexpr (BITS == 3) {
                     ua = __byte_perm(tq4k::TQ3_CB_LO, tq4k::TQ3_CB_HI, fa & 0x7777u);
                     ub = __byte_perm(tq4k::TQ3_CB_LO, tq4k::TQ3_CB_HI, fb & 0x7777u);
-                } else if constexpr (BITS == 14) {
+                } else if constexpr (BITS == 14 || BITS == 15) {
                     ua = tq4k::iq4_levels(fa);
                     ub = tq4k::iq4_levels(fb);
                 } else {
@@ -899,6 +901,36 @@ void iq4n_matvec(const uint8_t * w, const uint8_t * rec, const __half * xh, floa
                  cudaStream_t s) {
     iq4n_launch(w, rec, xh, y, rows, k, ncols, pf, s, rows);
 }
+// IQ4L (engine format 1009): IQ4_NL in natural nibble order (16 B per 32 weights) + one FP16 scale per 32 weights, on the
+// 16-row split-K kernel; <= 16 columns. pf: 0 / 1 / 2 prefetch mode (same results).
+template <class OUT>
+static void iq4l_launch(const uint8_t * w, const __half * sc, const __half * xh, OUT * y, int rows, int k, int ncols, int pf,
+                        cudaStream_t s, int ldy) {
+    if (ncols < 1 || ncols > 16) throw std::invalid_argument("iq4l_matvec: 1..16 columns");
+    if (k % 128) throw std::invalid_argument("iq4l_matvec: k must be a multiple of 128");
+    if (ldy <= 0) ldy = rows;
+    const auto * w32 = reinterpret_cast<const uint32_t *>(w);
+    const int grid = (rows + 15) / 16;
+    auto go = [&](auto ncol_c, auto pf_c) {
+        constexpr int NC = decltype(ncol_c)::value, P = decltype(pf_c)::value;
+        tq3b_matvec_h_k<NC, OUT, P, 1, false, 15><<<grid, 256, 0, s>>>(w32, sc, xh, y, rows, k, ncols, ldy);
+    };
+    auto by_pf = [&](auto ncol_c) {
+        if (pf == 2) go(ncol_c, std::integral_constant<int, 2>{});
+        else if (pf == 1) go(ncol_c, std::integral_constant<int, 1>{});
+        else go(ncol_c, std::integral_constant<int, 0>{});
+    };
+    if (ncols <= 8) by_pf(std::integral_constant<int, 8>{});
+    else by_pf(std::integral_constant<int, 16>{});
+}
+void iq4l_matvec_bf16(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
+                      int pf, cudaStream_t s, int ldy) {
+    iq4l_launch(w, sc, xh, y, rows, k, ncols, pf, s, ldy);
+}
+void iq4l_matvec(const uint8_t * w, const __half * sc, const __half * xh, float * y, int rows, int k, int ncols, int pf,
+                 cudaStream_t s) {
+    iq4l_launch(w, sc, xh, y, rows, k, ncols, pf, s, rows);
+}
 // IQ3 (engine format 1006, IQ3_S: 12 B per 32 weights + 16 B record per 256) on the 16-row split-K kernel, <= 16 columns
 template <class OUT>
 static void iq3s_launch(const uint8_t * w, const uint8_t * rec, const __half * xh, OUT * y, int rows, int k, int ncols,
@@ -930,27 +962,54 @@ void iq3_matvec_split(const uint8_t * w, const uint8_t * rec, const __half * xh,
     iq3s_launch(w, rec, xh, y, rows, k, ncols, pf, s, rows);
 }
 
-// dequantise IQ4N to FP16 [rows][k] (prefill GEMM operand); one thread per 32-weight block
-__global__ void iq4n_dequant_h_k(const uint8_t * w, const uint8_t * rec, __half * out, int64_t nblocks, int k) {
-    const int64_t blk = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (blk >= nblocks) return;
-    const int nb = k / 32;
+// dequantise IQ4N to FP16 [rows][k] (prefill GEMM operand); one thread per 16-weight group, two 16-byte stores
+__global__ void iq4n_dequant_h_k(const uint8_t * w, const uint8_t * rec, __half * out, int64_t ngroups, int k) {
+    const int64_t gi = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gi >= ngroups) return;
+    const int64_t blk = gi / 2;
+    const int h = int(gi % 2), nb = k / 32;
     const int64_t row = blk / nb;
     const int b = int(blk % nb);
     const __half sc = tq4k::iq4_scale(rec + (row * (nb / 8) + b / 8) * 8, b % 8);
-    const uint4 q = *reinterpret_cast<const uint4 *>(w + blk * 16);
-    const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
-    __half * o = out + blk * 32;
+    const uint2 q = *reinterpret_cast<const uint2 *>(w + blk * 16 + h * 8);
+    const uint32_t qw[2] = {q.x, q.y};
+    __align__(16) __half v[16];
 #pragma unroll
-    for (int u = 0; u < 8; ++u) {
+    for (int u = 0; u < 4; ++u) {
         const uint32_t lv = tq4k::iq4_levels((u & 1) ? qw[u / 2] >> 16 : qw[u / 2]);
 #pragma unroll
-        for (int e = 0; e < 4; ++e) o[4 * u + e] = __hmul(__int2half_rn(int((lv >> (8 * e)) & 0xFF) - 128), sc);
+        for (int e = 0; e < 4; ++e) v[4 * u + e] = __hmul(__int2half_rn(int((lv >> (8 * e)) & 0xFF) - 128), sc);
     }
+    reinterpret_cast<uint4 *>(out)[gi * 2] = reinterpret_cast<const uint4 *>(v)[0];
+    reinterpret_cast<uint4 *>(out)[gi * 2 + 1] = reinterpret_cast<const uint4 *>(v)[1];
 }
 void iq4n_dequant_h(const uint8_t * w, const uint8_t * rec, __half * out, int rows, int k, cudaStream_t s) {
-    const int64_t n = int64_t(rows) * (k / 32);
+    const int64_t n = int64_t(rows) * (k / 16);
     iq4n_dequant_h_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(w, rec, out, n, k);
+}
+
+// dequantise IQ4L to FP16 [rows][k]; one thread per 16-weight group, two 16-byte stores
+__global__ void iq4l_dequant_h_k(const uint8_t * w, const __half * sc, __half * out, int64_t ngroups) {
+    const int64_t gi = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gi >= ngroups) return;
+    const int64_t blk = gi / 2;
+    const int h = int(gi % 2);
+    const __half d = sc[blk];
+    const uint2 q = *reinterpret_cast<const uint2 *>(w + blk * 16 + h * 8);
+    const uint32_t qw[2] = {q.x, q.y};
+    __align__(16) __half v[16];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const uint32_t lv = tq4k::iq4_levels((u & 1) ? qw[u / 2] >> 16 : qw[u / 2]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) v[4 * u + e] = __hmul(__int2half_rn(int((lv >> (8 * e)) & 0xFF) - 128), d);
+    }
+    reinterpret_cast<uint4 *>(out)[gi * 2] = reinterpret_cast<const uint4 *>(v)[0];
+    reinterpret_cast<uint4 *>(out)[gi * 2 + 1] = reinterpret_cast<const uint4 *>(v)[1];
+}
+void iq4l_dequant_h(const uint8_t * w, const __half * sc, __half * out, int rows, int k, cudaStream_t s) {
+    const int64_t n = int64_t(rows) * (k / 16);
+    iq4l_dequant_h_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(w, sc, out, n);
 }
 
 void tq4_matvec_bf16(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,

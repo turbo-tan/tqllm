@@ -7,6 +7,26 @@
 #include <cstdint>
 
 namespace tqllm_cuda {
+void k_expert_gemm(int fmt, const uint8_t *, const void *, const __half *, __nv_bfloat16 *,
+                   int rows, int cols, const int * counts, const int * groups,
+                   int capacity, int experts, int topk, bool per_expert_input, cudaStream_t);
+// Stacked K4/K5/K6 experts selected entirely on device; output [n * topk][rows].
+// Dedup grouped matvec: per unique expert kDedupStride ints = slot, columns (<= kDedupCols), input rows, output rows.
+constexpr int kDedupCols = 4, kDedupStride = 2 + 2 * kDedupCols;
+void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
+                           int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
+// TQFN_TILED: grouped expert kernels read lane-contiguous tiles (16 rows x 4 blocks); tile_expert_rows writes them.
+void set_tiled_experts(bool on);
+int tiled_block_bytes(int fmt);  // code bytes per 32 weights of a tileable u4h format, else 0
+void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb);
+void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                            __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
+void k_expert_matvec(int fmt, const uint8_t *, const void *, const __half *, __nv_bfloat16 *,
+                     int rows, int cols, const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
+// gate + up of the same format in one launch (grid.z selects the matrix); per row the k_expert_matvec kernel
+void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                      __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * ids, int n, int topk, cudaStream_t);
+
 
 constexpr int TQ3_BLOCK = 32;          // weights per TQ3_4S block
 constexpr int TQ3_BLOCK_BYTES = 16;    // 4 scale bytes + 12 bytes of 3-bit indices
@@ -17,12 +37,18 @@ constexpr int QMAX_COLS = 8;
 // xr[n][k] = RHT_forward(x[n][k]) per 32-element block (sign flip, Walsh-Hadamard, 1/sqrt(32)); x: [n][k] BF16.
 // TQ3_4S stores weights in the rotated basis, so dot(x, dequant(w)) = dot(xr, codes * scale).
 void tq3_rotate(const __nv_bfloat16 * x, float * xr, int k, int ncols, cudaStream_t);
+// F32 HC projections retain the residual precision. Weights use the original GGUF layout, not PRMT repacking.
+void tq3_rotate_f32(const float * x, float * xr, int k, int ncols, cudaStream_t);
+void tq3_matvec_f32_raw(const void * w, const float * xr, float * y, int rows, int k, int ncols, cudaStream_t);
+// PRMT layout with the same exact centroids and F32 arithmetic as the raw path.
+void tq3_matvec_f32_repacked(const void * w, const float * xr, float * y, int rows, int k, int ncols, cudaStream_t);
 // y[n][r] = sum_k W[r][k] x[n][k]; W: TQ3_4S [rows][k/32 blocks]; xr from tq3_rotate. y BF16.
 void tq3_matvec(const void * w, const float * xr, __nv_bfloat16 * y, int rows, int k, int ncols, cudaStream_t);
 // y[k] = dequant(W[row]) as BF16 (embedding lookup from a TQ3_4S table).
 void tq3_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
 // y[k] = dequant(W[row]) as BF16 (embedding lookup from a Q6_K table).
 void q6k_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
+void iq3s_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
 // Q6_K: y[n][r] = sum_k W[r][k] x[n][k]; x FP32 [n][k]; y FP32 (used for the LM head -> logits).
 void q6k_matvec(const void * w, const float * x, float * y, int rows, int k, int ncols, cudaStream_t);
 // ---- int8 fast path (single column) ----
@@ -59,6 +85,12 @@ void tq3_matvec_h_variant(const void * w, const __half * xh, __nv_bfloat16 * y, 
 void tq3_tune(const void * w, int rows, int k, cudaStream_t);
 // Prefill GEMM: same as tq3_matvec_h for any number of columns (weights read once per 64 columns).
 void tq3_gemm_h(const void * w, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols, cudaStream_t);
+// Stacked TQ3_4S experts; input is already in Tq3Rot32 basis. Assignment maps stay on device.
+void tq3_expert_matvec(const void *, const __half *, __nv_bfloat16 *, int rows, int k,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
+void tq3_expert_gemm(const void *, const __half *, __nv_bfloat16 *, int rows, int k,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t);
 // TQ3_4S (repacked) -> FP16 [rows][k] (rotated basis, true scale); large prefill chunks run these through cuBLAS.
 void tq3_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t);
 // W4A16 models (u4h weights, un-rotated activations): norm_rotate_h without the rotation; u4h -> FP16 [rows][k];
@@ -94,13 +126,43 @@ void k4_matvec(const uint8_t * w4, const uint8_t * kh, const __half * xh, float 
                cudaStream_t);
 void k4_tune(const uint8_t * w4, const uint8_t * kh, int rows, int k, cudaStream_t);
 void k4_dequant_h(const uint8_t * w4, const uint8_t * kh, __half * out, int rows, int k, cudaStream_t);
-// K5 (native Q5_K): per 32 weights 16 nibble bytes in K4 order + one word of high code bits; kh = Q5_K headers.
+// k5 (native Q5_K): per 32 weights 16 nibble bytes in k4 order + one word of high code bits (bit 16 h + e of 16-group h),
+// per row and 256 weights the Q5_K header (d, dmin, 12 scale / min bytes)
 void k5_matvec_bf16(const uint8_t * w5, const uint8_t * kh, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                     int ncols, cudaStream_t, int ldy = 0);
 void k5_matvec(const uint8_t * w5, const uint8_t * kh, const __half * xh, float * y, int rows, int k, int ncols,
                cudaStream_t);
 void k5_tune(const uint8_t * w5, const uint8_t * kh, int rows, int k, cudaStream_t);
 void k5_dequant_h(const uint8_t * w5, const uint8_t * kh, __half * out, int rows, int k, cudaStream_t);
+// k6 (native Q6_K): per 32 weights 16 nibble bytes in k4 order + 2 words of 2-bit highs (code 4u + j of 16-group h at bits
+// 2 (4u + j) of word h); per row and 256 weights the k3 record (16 int8 scales, FP16 d); value d * scale * (code - 32)
+void k6_matvec_bf16(const uint8_t * w6, const uint8_t * kr, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                    int ncols, cudaStream_t, int ldy = 0);
+void k6_matvec(const uint8_t * w6, const uint8_t * kr, const __half * xh, float * y, int rows, int k, int ncols,
+               cudaStream_t);
+void k6_tune(const uint8_t * w6, const uint8_t * kr, int rows, int k, cudaStream_t);
+void k6_dequant_h(const uint8_t * w6, const uint8_t * kr, __half * out, int rows, int k, cudaStream_t);
+// Prefill GEMM on any u4h-family format (fmt: 0 u4h, 1 k4, 2 k3, 4 iq3, 5 iq3x, 6 k5, 7 k6, 8-12 UD types, 13 iq4n,
+// 14 iq4l, 15 i8h) straight from
+// the quantised weights: y[n][ldy] (bf16) for n = ncols columns of xh [n][k]; the weights are read once per 64 columns.
+void u4h_family_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows,
+                            int k, int ncols, cudaStream_t, int ldy = 0, int mt = -1);
+void u4h_family_matvec_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k,
+                           int ncols, cudaStream_t);
+void u4h_family_tune(int fmt, const uint8_t * w, const void * aux, int rows, int k, cudaStream_t);  // row tiling per shape
+void u4h_family_gemm(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                     int ncols, cudaStream_t, int ldy = 0);
+bool u4h_family_gemm_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k,
+                         int ncols, cudaStream_t s, int ldy);
+// UD low-bit types on the u4h kernel, fmt 8 IQ2_XXS, 9 IQ2_XS, 10 IQ2_S, 11 IQ1_S, 12 Q2_K: per 32 weights the GGUF
+// block's code bytes (8; IQ1_S 4), per row and 256 weights a record of its scalars (IQ2_XXS 4 B: d; IQ2_XS 12: d, pad,
+// scales[8]; IQ2_S 20: d, qh[8], scales[8]; IQ1_S 20: d, qh[8] x uint16; Q2_K 20: scales[16], d, dmin)
+void udq_matvec_bf16(int fmt, const uint8_t * w, const uint8_t * rec, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                     int ncols, cudaStream_t, int ldy = 0);
+void udq_matvec(int fmt, const uint8_t * w, const uint8_t * rec, const __half * xh, float * y, int rows, int k, int ncols,
+                cudaStream_t);
+void udq_tune(int fmt, const uint8_t * w, const uint8_t * rec, int rows, int k, cudaStream_t);
+void udq_dequant_h(int fmt, const uint8_t * w, const uint8_t * rec, __half * out, int rows, int k, cudaStream_t);
 void i8h_dequant_h(const int8_t * w8, const __half * sc, __half * out, int rows, int k, cudaStream_t);
 // y[n][rows] = W x[n] for BF16 W [rows][k] (k % 256 == 0), FP32 accumulation in a fixed order: each column is
 // bit-identical for any ncols (small matrices where a cuBLAS GEMM would change algorithm with the column count).
@@ -120,6 +182,12 @@ void iq4n_matvec_bf16(const uint8_t * w, const uint8_t * rec, const __half * xh,
                       int ncols, int pf, cudaStream_t, int ldy = 0);
 void iq4n_matvec(const uint8_t * w, const uint8_t * rec, const __half * xh, float * y, int rows, int k, int ncols, int pf,
                  cudaStream_t);
+// IQ4L: IQ4_NL in natural nibble order + FP16 scale per 32 weights, on the 16-row split-K kernel (<= 16 columns)
+void iq4l_matvec_bf16(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
+                      int pf, cudaStream_t, int ldy = 0);
+void iq4l_matvec(const uint8_t * w, const __half * sc, const __half * xh, float * y, int rows, int k, int ncols, int pf,
+                 cudaStream_t);
+void iq4l_dequant_h(const uint8_t * w, const __half * sc, __half * out, int rows, int k, cudaStream_t);
 // IQ3 (IQ3_S) on the 16-row split-K kernel (<= 16 columns)
 void iq3_matvec_split_bf16(const uint8_t * w, const uint8_t * rec, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                            int ncols, int pf, cudaStream_t, int ldy = 0);
@@ -139,11 +207,6 @@ void tq4b3_matvec(const uint8_t * w3, const __half * sc, const __half * xh, floa
 void tq4b3_matvec_variant(const uint8_t * w3, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                           int ncols, int v, cudaStream_t);
 void tq4b3_dequant_h(const uint8_t * w3, const __half * sc, __half * out, int rows, int k, cudaStream_t);
-// prefill GEMM on TQ4 / TQ3 weights (no FP16 copy of the matrix): y[c][r] (row stride ldy) = W xh[c], c < n; k % 128 == 0
-void tq4_gemm_h(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
-                cudaStream_t);
-void tq4b3_gemm_h(const uint8_t * w3, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
-                  cudaStream_t);
 // TQ4 matvec variants (row tiles / prefetch, bit-identical per column) and the per-shape pick made at load
 void tq4_matvec_variant(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                         int ncols, int variant, cudaStream_t);
@@ -165,6 +228,7 @@ void tq4_norm_rotate_h(const __nv_bfloat16 * x, const float * w, const float * p
 void embed_multi_q8_0(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void embed_multi_q4k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void embed_multi_q3k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
+void embed_multi_q5k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void f32_to_bf16(const float * x, __nv_bfloat16 * y, int64_t n, cudaStream_t);
 void h_to_bf16(const __half * x, __nv_bfloat16 * y, int64_t n, cudaStream_t);
 // Per-column two-stage argmax: out[n] = argmax(x[n][0..len)).

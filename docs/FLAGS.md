@@ -14,6 +14,8 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
+| `TQLLM_MOE_DEV` | off | allow experimental qwen35moe loading and forward correctness gates; not a release readiness flag |  |
+| `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
 
 ## Retired (the tool stops; use the replacement)

@@ -62,51 +62,107 @@ uint64_t checked_mul(uint64_t a, uint64_t b, const std::string & name) {
 }
 
 uint64_t tensor_bytes(uint32_t type, uint64_t n, const std::string & name) {
-    switch (type) {
-        case GGML_F32: return checked_mul(n, 4, name);
-        case GGML_F16:
-        case GGML_BF16: return checked_mul(n, 2, name);
-        case GGML_Q6_K:
-            if (n % 256) break;
-            return checked_mul(n / 256, 210, name);
-        case GGML_TQ3_4S:
-            if (n % 32) break;
-            return checked_mul(n / 32, 16, name);
-        case GGML_TQ4:  // TQLLM TQ4: FP16 scale + 64 bytes of 4-bit codes per 128
-            if (n % 128) break;
-            return checked_mul(n / 128, 66, name);
-        case GGML_TQ3:  // TQLLM TQ3: FP16 scale + 48 bytes of 3-bit code planes per 128
-            if (n % 128) break;
-            return checked_mul(n / 128, 50, name);
-        case GGML_Q4_0:
-            if (n % 32) break;
-            return checked_mul(n / 32, 18, name);
-        case GGML_Q8_0:
-            if (n % 32) break;
-            return checked_mul(n / 32, 34, name);
-        case 18:  // IQ3_XXS
-            if (n % 256) break;
-            return checked_mul(n / 256, 98, name);
-        case 21:  // IQ3_S
-            if (n % 256) break;
-            return checked_mul(n / 256, 110, name);
-        case 23:  // IQ4_XS
-            if (n % 256) break;
-            return checked_mul(n / 256, 136, name);
-        case 11:  // Q3_K
-            if (n % 256) break;
-            return checked_mul(n / 256, 110, name);
-        case 12:  // Q4_K
-            if (n % 256) break;
-            return checked_mul(n / 256, 144, name);
-        case 13:  // Q5_K
-            if (n % 256) break;
-            return checked_mul(n / 256, 176, name);
-    }
-    throw std::runtime_error("unsupported GGUF tensor type " + std::to_string(type) + " for " + name);
+    uint64_t blk, bpb;
+    if (!gguf_block_layout(type, blk, bpb))
+        throw std::runtime_error("unsupported GGUF tensor type " + std::to_string(type) + " for " + name);
+    if (n % blk)
+        throw std::runtime_error("GGUF tensor " + name + ": " + std::to_string(n) +
+                                 " elements is not a multiple of the " + std::to_string(blk) +
+                                 "-element block of type " + std::to_string(type));
+    return checked_mul(n / blk, bpb, name);
 }
 
 } // namespace
+
+bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
+    // elems = weights per block, bytes = encoded size of one block.
+    // The 2-bit K-quants (Q2_K, IQ2_S) carry MoE expert tensors - GLM-5.3-Flash uses
+    // IQ2_S for ffn_gate_exps / ffn_up_exps and Q2_K for ffn_down_exps. Their block sizes
+    // were verified 2026-09-29 against the real 4-shard GGUF on .55, not assumed: all 1412
+    // tensors divide evenly, none is out of bounds, and per-shard byte sums match the file
+    // payload to within alignment padding (560/480/480/280 B, 0.0000%). Table in
+    // docs/MOE_PLAN.md 3b.
+    switch (type) {
+        case GGML_F32:    elems = 1;   bytes = 4;   return true;
+        case GGML_F16:
+        case GGML_BF16:   elems = 1;   bytes = 2;   return true;
+        case GGML_Q4_0:   elems = 32;  bytes = 18;  return true;
+        case GGML_Q8_0:   elems = 32;  bytes = 34;  return true;
+        case GGML_GSQ_Q2_0: elems = 64; bytes = 18; return true;
+        case GGML_TQ3_4S: elems = 32;  bytes = 16;  return true;
+        case GGML_Q2_K:   elems = 256; bytes = 84;  return true;
+        case GGML_Q3_K:   elems = 256; bytes = 110; return true;
+        case GGML_Q4_K:   elems = 256; bytes = 144; return true;
+        case GGML_Q5_K:   elems = 256; bytes = 176; return true;
+        case GGML_Q6_K:   elems = 256; bytes = 210; return true;
+        case GGML_IQ2_XXS:elems = 256; bytes = 66;  return true;
+        case GGML_IQ2_XS: elems = 256; bytes = 74;  return true;
+        case GGML_IQ1_S:  elems = 256; bytes = 50;  return true;
+        case GGML_IQ4_NL: elems = 32;  bytes = 18;  return true;
+        case GGML_IQ1_M:  elems = 256; bytes = 56;  return true;
+        case GGML_IQ3_XXS:elems = 256; bytes = 98;  return true;
+        case GGML_IQ3_S:  elems = 256; bytes = 110; return true;
+        case GGML_IQ2_S:  elems = 256; bytes = 82;  return true;
+        case GGML_IQ4_XS: elems = 256; bytes = 136; return true;
+        case GGML_TQ4:    elems = 128; bytes = 66;  return true;  // TQLLM: FP16 scale + 64 B of 4-bit codes
+        case GGML_TQ3:    elems = 128; bytes = 50;  return true;  // TQLLM: FP16 scale + 48 B of 3-bit planes
+        default: return false;
+    }
+}
+
+uint64_t gguf_expert_count(const GgufTensor & t) {
+    return t.ne.size() == 3 ? t.ne[2] : 0;
+}
+
+std::string gguf_shape_string(const GgufTensor & t) {
+    std::string s = "[";
+    for (size_t i = 0; i < t.ne.size(); ++i) {
+        if (i) s += ",";
+        s += std::to_string(t.ne[i]);
+    }
+    return s + "]";
+}
+
+GgufTensor gguf_expert_slice(const GgufTensor & t, uint64_t idx, const std::string & name) {
+    if (t.ne.size() != 3)
+        throw std::runtime_error(name + ": not a 3-D expert tensor (ne.size()=" +
+                                 std::to_string(t.ne.size()) + ")");
+    const uint64_t n_experts = t.ne[2];
+    if (n_experts == 0)
+        throw std::runtime_error(name + ": expert tensor with zero experts");
+    if (idx >= n_experts)
+        throw std::runtime_error(name + ": expert index " + std::to_string(idx) +
+                                 " out of range (" + std::to_string(n_experts) + " experts)");
+
+    uint64_t blk, bpb;
+    if (!gguf_block_layout(t.type, blk, bpb))
+        throw std::runtime_error(name + ": unsupported expert tensor type " + std::to_string(t.type));
+
+    // One expert is the [cols, rows] matrix t.ne[0] x t.ne[1]. Its element count must divide
+    // into whole quant blocks, otherwise the expert boundary would fall inside a block and no
+    // slice could address it independently.
+    const uint64_t per_expert_elems = t.ne[0] * t.ne[1];
+    if (per_expert_elems == 0 || per_expert_elems % blk)
+        throw std::runtime_error(name + ": per-expert element count " +
+                                 std::to_string(per_expert_elems) + " is not a multiple of the " +
+                                 std::to_string(blk) + "-element block of type " +
+                                 std::to_string(t.type));
+    const uint64_t per_expert_bytes = per_expert_elems / blk * bpb;
+
+    // Cross-check against the whole-tensor byte count computed at open time. If these disagree
+    // the layout assumption is wrong and every expert would be read from the wrong place.
+    if (per_expert_bytes * n_experts != t.bytes)
+        throw std::runtime_error(name + ": expert slice bytes (" + std::to_string(per_expert_bytes) +
+                                 " x " + std::to_string(n_experts) + ") != tensor bytes (" +
+                                 std::to_string(t.bytes) + ")");
+
+    GgufTensor s;
+    s.type = t.type;
+    s.ne = {t.ne[0], t.ne[1]};
+    s.offset = t.offset + idx * per_expert_bytes;
+    s.bytes = per_expert_bytes;
+    return s;
+}
 
 double GgufFile::num(const std::string & key) const {
     const auto it = kv.find(key);
@@ -119,6 +175,19 @@ double GgufFile::num(const std::string & key, double fallback) const {
     return it == kv.end() ? fallback : it->second.num;
 }
 
+// String KV. `value()` stores strings in GgufValue::str and leaves it empty for numeric values, so
+// an empty result for a PRESENT key means the key is not a string - report that distinctly rather
+// than returning "" and letting a caller branch on an empty arch as if the file declared none.
+std::string GgufFile::str(const std::string & key) const {
+    const auto it = kv.find(key);
+    if (it == kv.end()) throw std::runtime_error("GGUF missing key " + key);
+    if (it->second.str.empty())
+        throw std::runtime_error("GGUF key " + key + " is present but holds no string value");
+    return it->second.str;
+}
+
+bool GgufFile::has(const std::string & key) const { return kv.count(key) != 0; }
+
 std::vector<char> GgufFile::read(const GgufTensor & t) const {
     std::ifstream in(path, std::ios::binary);
     std::vector<char> buf(t.bytes);
@@ -128,7 +197,7 @@ std::vector<char> GgufFile::read(const GgufTensor & t) const {
     return buf;
 }
 
-GgufFile gguf_open(const std::string & path) {
+GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
     GgufFile f;
     f.path = path;
     Reader r{std::ifstream(path, std::ios::binary)};
@@ -158,7 +227,9 @@ GgufFile gguf_open(const std::string & path) {
                 throw std::runtime_error("invalid GGUF tensor extent: " + name);
             n = checked_mul(n, t.ne.back(), name);
         }
+        t.type_header_offset = uint64_t(r.in.tellg());
         t.type = r.get<uint32_t>();
+        if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
         t.offset = r.get<uint64_t>();
         t.bytes = tensor_bytes(t.type, n, name);
         infos.emplace_back(std::move(name), std::move(t));

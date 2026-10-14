@@ -248,6 +248,7 @@ int main(int argc, char ** argv) {
     (void) argc; (void) argv;
     test_jinja_images();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
+    test_jinja_images();
     std::cout << "PASS\n";
     return 0;
 }
