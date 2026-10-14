@@ -70,19 +70,25 @@ def download(entry, dest_dir):
 
 
 def resolve_model(a):
-    """--model as a file, a catalog name, or nothing (the default for this GPU); offers to download what is missing."""
-    if a.model and os.path.isfile(a.model): return
+    """--model as a file, a catalog name, or nothing (the default for this GPU); offers to download what is missing.
+    A file that is a catalog model's file also gets that model's drafter (downloaded if missing) unless --no-drafter."""
     cat = json.load(open(CATALOG))
-    name = a.model
-    if not name:
+    if a.model and os.path.isfile(a.model):
+        name = next((k for k, v in cat["models"].items() if os.path.basename(v["file"]["path"]) == os.path.basename(a.model)), None)
+        if name is None or a.drafter or a.no_drafter: return
+        m = dict(cat["models"][name]); m["file"] = None
+    else:
+        name, m = a.model, None
+    if m is None and not name:
         vram = gpu_vram_gb() or 24
         name = cat["default"]["24"] if vram >= 20 else cat["default"]["16"]
-    m = cat["models"].get(name)
+    if m is None: m = cat["models"].get(name)
     if m is None:
         print(f"tqllm: model '{name}' not found as a file or catalog name. Available:", file=sys.stderr)
         for k, v in cat["models"].items(): print(f"  {k:16s} {v['file']['size'] / 1e9:5.1f} GB  {v['description']}", file=sys.stderr)
         sys.exit(1)
-    need = [(k, m[k]) for k in ("file", "drafter", "draft_vocab") if k in m]
+    keys = ("file",) + (() if a.no_drafter else ("drafter", "draft_vocab"))
+    need = [(k, m[k]) for k in keys if m.get(k)]
     local = {k: find_local(e["path"]) for k, e in need}
     missing = [(k, e) for k, e in need if not local[k]]
     if missing:
@@ -90,11 +96,11 @@ def resolve_model(a):
         dest = a.models_dir or (os.environ.get("TQLLM_MODELS") or os.path.abspath("models"))
         print(f"tqllm: {name} ({m['description']}) needs {gb:.1f} GB from Hugging Face into {dest}:", file=sys.stderr)
         for _, e in missing: print(f"  {e['repo']}/{e['path']} ({e.get('size', 0) / 1e9:.2f} GB)", file=sys.stderr)
-        if not a.yes:
+        if not a.yes and any(k == "file" for k, _ in missing):  # the drafter alone (< 1 GB) downloads without asking
             if not sys.stdin.isatty(): sys.exit("tqllm: run again with --yes to download (no terminal to ask)")
             if input("Download now? [y/N] ").strip().lower() not in ("y", "yes"): sys.exit(1)
         for k, e in missing: local[k] = download(e, dest)
-    a.model = local["file"]
+    if local.get("file"): a.model = local["file"]
     if not a.drafter and local.get("drafter"): a.drafter, a.draft_vocab = local["drafter"], local.get("draft_vocab")
     print(f"tqllm: {name}: {a.model}" + (f" + drafter {os.path.basename(a.drafter)}" if a.drafter else ""), file=sys.stderr)
 
@@ -207,6 +213,7 @@ def main():
     p.add_argument("--yes", action="store_true", help="download missing catalog files without asking")
     p.add_argument("--list", action="store_true", help="print the model catalog and exit")
     p.add_argument("--drafter"); p.add_argument("--draft-vocab")
+    p.add_argument("--no-drafter", action="store_true", help="run without the catalog model's drafter")
     p.add_argument("--context", type=int, default=65536, help="tokens (default 65536: agent prompts are long)")
     p.add_argument("--max-tokens", type=int, default=8192); p.add_argument("--reasoning", default="on")
     p.add_argument("--port", type=int, default=8086); p.add_argument("--image", default=IMAGE)
