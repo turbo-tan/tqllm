@@ -294,6 +294,9 @@ if(BUILD_TESTING)
   add_executable(test-runtime tests/runtime.cpp)
   target_link_libraries(test-runtime PRIVATE tqllm)
   add_test(NAME runtime COMMAND test-runtime)
+  add_executable(test-api-adapters tests/api_adapters.cpp)  # /v1/responses and /v1/messages on the chat path (no CUDA)
+  target_include_directories(test-api-adapters PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
+  add_test(NAME api_adapters COMMAND test-api-adapters)
   if(TQLLM_CUDA)  # session.hpp includes cuda_runtime.h
     add_executable(test-jinja tests/jinja_parity.cpp)
     target_include_directories(test-jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
@@ -310,6 +313,7 @@ if(BUILD_TESTING)
   add_test(NAME dockerfile_licenses COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_dockerfile_licenses.py)
   add_test(NAME no_private_breadcrumbs COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_no_private_paths.py)
   add_test(NAME launch_catalog COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_catalog.py)
+  add_test(NAME launch_codex COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_codex.py)
   add_test(NAME flags_registry COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_flags.py --check)
   # Host-only gates for the MoE work. Both are plain C++ (no CUDA, no GPU, no model), so they
   # build and run regardless of TQLLM_CUDA. Sources are compiled directly into the test so they
