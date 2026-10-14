@@ -1,6 +1,6 @@
-# Contributing to TQLLM
+# Contributing to tqLLM
 
-Thank you for helping. TQLLM is a C++/CUDA inference engine for open-weight models, tuned for one person on one GPU.
+Thank you for helping. tqLLM is a C++/CUDA inference engine for open-weight models, tuned for one person on one GPU.
 This guide covers how to build and test, where new pieces plug in, and what a pull request needs.
 
 Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
@@ -55,7 +55,7 @@ Weight formats turn a GGUF tensor into a device matrix and supply its kernels. T
    `matvec_ld()` and `row_bytes()` when the format can do them.
 2. Put its CUDA kernels in `kernels/formats/<name>.cu`.
 3. Register it: add `register_<name>()` to the list in [src/formats/registry.cpp](src/formats/registry.cpp) with the
-   GGUF type id it loads. Ids of 300 and above are reserved for TQLLM-only formats; pick the next free one and say so in
+   GGUF type id it loads. Ids of 300 and above are reserved for tqLLM-only formats; pick the next free one and say so in
    the PR.
 4. If the format has more than one decode kernel, add rows to the rule table in
    [kernels/formats/matvec_rules.hpp](kernels/formats/matvec_rules.hpp). Each rule cites the measurement that justified
@@ -145,4 +145,4 @@ understood them, will be closed.
 
 ## Licence
 
-TQLLM is Apache-2.0. By contributing you agree that your contribution is licensed under the same terms.
+tqLLM is Apache-2.0. By contributing you agree that your contribution is licensed under the same terms.

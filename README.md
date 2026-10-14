@@ -40,7 +40,7 @@ weights; improvement = their idea, extended or re-implemented by us.
 
 ### Testers
 
-Thank you to the testers from X who ran TQLLM on their own hardware and reported back: 0x443, Ricky Spanish,
+Thank you to the testers from X who ran tqLLM on their own hardware and reported back: 0x443, Ricky Spanish,
 lackonendes and GandalfOne.
 
 ## Get the image
