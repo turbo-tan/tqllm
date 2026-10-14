@@ -1,6 +1,6 @@
-# Private release candidate container
+# tqLLM container
 
-Build from this source tree with `docker build --build-arg CUDA_ARCHITECTURES=86 -t tqllm:rc3-candidate .`.
+Build from this source tree with `docker build --build-arg CUDA_ARCHITECTURES=86 -t tqllm:local .`.
 This image includes binaries and the conversion script, with no weights or research artifacts.
 Mount models read-only at `/models`; set `MODEL_FILE` and `TOKENIZER_FILE` to container paths.
 Set `DRAFT_MODEL_FILE`, `DRAFT_VOCAB_FILE`, and `KV_FORMAT` for optional accelerated decoding.

@@ -10,7 +10,7 @@
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000)
 
 C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
-with an OpenAI-compatible HTTP server. tqLLM is in beta.
+with an OpenAI-compatible HTTP server.
 
 ## Credits
 
@@ -35,16 +35,16 @@ weights; improvement = their idea, extended or re-implemented by us.
 
 ## Get the image
 
-The prebuilt image is `ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13` on the GitHub container registry. During the beta
-it is private: you can pull it once your GitHub account has read access to the `tqllm` package.
-
-1. Create a GitHub token (classic) with only the `read:packages` scope.
-2. Log in and pull:
+The prebuilt image is public on the GitHub container registry and on Docker Hub. One multi-platform tag covers x86-64
+(RTX 30 / 40 / 50) and arm64 (GB10 / DGX Spark); `docker pull` picks the right one.
 
 ```sh
-echo <your_token> | docker login ghcr.io -u <your_github_user> --password-stdin
-docker pull ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13
+docker pull ghcr.io/turbo-tan/tqllm:1.0.0
+# or
+docker pull ytan2000/tqllm:1.0.0
 ```
+
+`latest` always points to the newest release.
 
 ## Docker quick start
 
@@ -54,9 +54,11 @@ GB10 / DGX Spark systems (121); `docker pull` picks the right platform and the e
 start. Apple Metal is not supported.
 
 Place a supported model at `models/model.gguf` (the tokenizer is read from the GGUF). Supported: Qwen3.5 /
-Qwen3.8 dense models (hybrid attention + Gated DeltaNet) in TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0,
-IQ4_XS, IQ3_S, IQ3_XXS, F16 and BF16 tensors. Files with other tensor types (IQ2_*, IQ1_*, IQ4_NL, Q2_K, used by some
-Unsloth UD quants) do not load yet.
+Qwen3.8 dense models (hybrid attention + Gated DeltaNet) and qwen35moe mixture-of-experts models such as MiniCPM-V 4.7
+35B-A3B (text; `--moe-host-mb N` keeps the least-used experts in system RAM when the file is larger than the GPU), in
+TQ3, TQ4, TQ3_4S, Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q4_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, F16 and BF16 tensors (so
+Q4_K_M, Q5_K_M, Q6_K and Q8_0 files load). Files with IQ2_*, IQ1_* or Q2_K tensors (some Unsloth UD quants) do not
+load yet.
 
 Then run:
 
@@ -150,7 +152,7 @@ docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" \
   -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
   -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
   -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-  ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13
+  ghcr.io/turbo-tan/tqllm:1.0.0
 ```
 
 With Compose, set the same names: `DRAFT_NAME=drafters/Qwen3.8-27B-DFlash2-TQ3.gguf

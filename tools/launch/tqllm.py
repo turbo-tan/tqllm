@@ -18,7 +18,7 @@ The agents' own configuration files are never written: each gets its provider th
 import argparse, hashlib, json, os, shutil, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-IMAGE = "ghcr.io/turbo-tan/tqllm:beta-5ae1388-cu13"
+IMAGE = "ghcr.io/turbo-tan/tqllm:1.0.0"
 NAME = "tqllm"
 
 
