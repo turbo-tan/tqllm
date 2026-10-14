@@ -13,8 +13,10 @@ permissions:
 
 env:
   IMAGE: ghcr.io/turbo-tan/tqllm
+  HUB_IMAGE: docker.io/ytan2000/tqllm
 
-# Images are pushed to ghcr.io only for a v* tag; pushes to main, pull requests and manual runs only build.
+# Images are published only for a v* tag (vX.Y.Z -> X.Y.Z, X.Y.Z-cu13 and latest on ghcr.io and Docker Hub);
+# pushes to main, pull requests and manual runs only build. Run the GPU smoke tests before pushing the tag.
 
 jobs:
   # Builds the Docker image natively on x86-64 and arm64 runners.
@@ -56,8 +58,8 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
-  # Combines the two per-arch images into one multi-platform tag,
-  # e.g. ghcr.io/turbo-tan/tqllm:beta-<sha>-cu13
+  # Combines the two per-arch images into one multi-platform tag on both registries,
+  # e.g. ghcr.io/turbo-tan/tqllm:1.0.1 and ytan2000/tqllm:1.0.1
   publish:
     if: github.ref_type == 'tag'
     needs: build
@@ -71,14 +73,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
+          images: |
+            ${{ env.IMAGE }}
+            ${{ env.HUB_IMAGE }}
+          flavor: latest=false
           tags: |
-            type=sha,prefix=beta-,suffix=-cu13
-            type=ref,event=tag
-            type=raw,value=beta,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},suffix=-cu13
+            type=raw,value=latest
 
       - name: Create multi-platform tags
         run: |
