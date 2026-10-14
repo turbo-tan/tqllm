@@ -12,6 +12,11 @@
 C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
 with an OpenAI-compatible HTTP server.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and where new models, weight formats and KV caches plug in, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
+
 ## Credits
 
 tqLLM re-implements ideas from the work below (no code unless listed in NOTICE). Reference = their idea, method or
