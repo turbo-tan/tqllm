@@ -357,17 +357,6 @@ public:
         if (gguf) {
             gf = std::make_unique<GgufFile>(gguf_open(path));
             cfg = config_from_gguf(*gf);
-            // C1 lands arch detection + config parsing + validation. The expert FFN itself (C2)
-            // is not wired yet: the dense per-block load below looks for `ffn_gate.weight` /
-            // `ffn_up.weight` / `ffn_down.weight`, which a qwen35moe file does not have (it has
-            // `*_exps` 3-D tensors plus `*_shexp`). Refuse here with an honest message instead of
-            // letting the load fail on a missing tensor that looks like a corrupt checkpoint - or,
-            // worse, letting a fallback path build a model that runs and emits fluent wrong text.
-            if (cfg.moe && !std::getenv("TQLLM_MOE_DEV"))
-                throw std::runtime_error(
-                    "qwen35moe (" + std::to_string(cfg.expert_count) + " experts, top-" +
-                    std::to_string(cfg.expert_used) + ") is recognised and its config validated, "
-                    "but the expert FFN path is not implemented in this engine yet (C2)");
         } else {
             cfg = read_config(path);
         }
@@ -1537,9 +1526,7 @@ private:
                     }
             if (mx) {
                 // gemm_rows caps the FP16 weight buffer (row blocks of row-sliceable formats; tqserve's fit sets it)
-                int gemm_rows_req = opt.gemm_rows;
-                if (const std::string * v = tqllm::debug_value("gemm_rows"); v && !v->empty()) gemm_rows_req = std::stoi(*v);
-                if (gemm_rows_req) {
+                if (const int gemm_rows_req = opt.gemm_rows) {
                     size_t mc = 0;
                     for (const auto & L : layer)
                         for (const Mat * m : {&L.w_down, &L.w_gu, &L.w_mix, &L.wo, &L.w_out, &L.sh_gu, &L.sh_down})

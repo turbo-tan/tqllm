@@ -1,7 +1,7 @@
 # Native Qwen35 MoE development
 
 The `feat/moe-rc3-20261007` lane includes rc3 `4d9bc14` and native UD formats
-`be99d2e`. Enable the experimental forward with `TQLLM_MOE_DEV=1`.
+`be99d2e`. MoE models load by default (TQLLM_MOE_DEV is retired).
 
 Implemented:
 

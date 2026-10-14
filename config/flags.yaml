@@ -3,10 +3,6 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
-  - name: TQLLM_MOE_DEV
-    kind: debug
-    default: "off"
-    doc: "allow experimental qwen35moe loading and forward correctness gates; not a release readiness flag"
   - name: TQLLM_MOE_PROFILE
     kind: debug
     default: "-"
@@ -439,3 +435,8 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "-fitt MiB (-fit on|off)"
+  - name: TQLLM_MOE_DEV
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "nothing: qwen35moe (MoE) models load by default"
