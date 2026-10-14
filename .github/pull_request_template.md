@@ -18,3 +18,4 @@ GPU, model and drafter files, context, prompt type, and the results.jsonl lines 
 - [ ] New environment flags are in `config/flags.yaml` (docs regenerated)
 - [ ] Borrowed ideas credited in README; copied code listed in NOTICE
 - [ ] AI assistance disclosed if it wrote a meaningful part of the change
+- [ ] CHANGELOG.md "Unreleased" updated for user-visible changes

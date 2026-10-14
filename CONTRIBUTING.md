@@ -81,7 +81,8 @@ KV formats own the record size, the cache writer and the attention for verify an
 
 Each architecture is an engine behind `tqllm::Model`. The interface is [src/engine.hpp](src/engine.hpp): `step()` for
 one token, `verify()` and `commit()` for speculative decoding, and optional multi-slot and drafter methods. Today's
-engine is [src/qwen35.cpp](src/qwen35.cpp) (Qwen3.5 / Qwen3.8 hybrid attention + Gated DeltaNet).
+engine is [src/qwen35.cpp](src/qwen35.cpp): Qwen3.5 / Qwen3.8 hybrid attention + Gated DeltaNet, dense and mixture-of-experts
+(`qwen35moe`, grouped expert kernels in [kernels/moe.cu](kernels/moe.cu)).
 
 1. Add `src/<arch>.cpp` with an `Engine` subclass and a `make_<arch>_engine()` factory. Reuse the weight and KV formats
    through their registries rather than calling kernels directly.
@@ -135,6 +136,7 @@ Before you open one:
 - [ ] Exactness stated: identical tokens, or the measured quality cost.
 - [ ] Speed claims include base and branch numbers from the same session, with GPU, files and settings.
 - [ ] New environment flags are in `config/flags.yaml`; borrowed ideas are credited.
+- [ ] User-visible changes have a line under "Unreleased" in [CHANGELOG.md](CHANGELOG.md).
 
 ## AI-assisted contributions
 
