@@ -156,6 +156,17 @@ struct Mul1Codec {
     static constexpr bool supports_gemv_x3v = (bits == 2 || bits == 3 || bits == 4 || frac);
     static __host__ __device__ constexpr int loads(int WNT) { return WNT * u32words / ld_stride; }
 
+    // ---- sq path (int8 dp4a): windows x codebook magic, then dp4a against int8 activations ----
+    static constexpr bool supports_sq = true;
+    static __host__ __device__ constexpr int row_u32(int size_n) {
+        return frac ? size_n / 16 * (words / 2) : size_n * bits / 2;
+    }
+    __device__ static void sq_windows(const uint32_t* ptr, int t0, uint32_t (&w)[8]) {
+        mul1_extract8<KH>(ptr, t0, w);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] *= 0x83DCD12Du;
+    }
+
     // 8 weights of tile `t` for `lane`, from the warp's loaded words bw (x3v_dq8_regs_* ported).
     __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
         const uint32_t full = 0xffffffffu;
