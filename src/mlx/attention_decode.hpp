@@ -274,10 +274,155 @@ out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
                  {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
 }
 
+
+// v3: one threadgroup per (KV head, 512-key partition) streams 16-key chunks of K, then V, into threadgroup memory
+// once (coalesced) and every 8-query tile of that KV head (rows x GROUP queries, one simdgroup each) works from that
+// copy: S^T = K.Q^T and O^T = O^T.diag(r) + V^T.P^T on 8x8 simdgroup matrices; each query's online softmax runs in one
+// lane in key order. All orders depend on the key position only, never on the row count or a query's tile slot.
+inline mlx::core::array decode_rows_attention_v3(const mlx::core::array& q, const mlx::core::array& k,
+                                                 const mlx::core::array& v, float scale, int valid = -1) {
+    namespace mx = mlx::core;
+    constexpr int SG = 8, KC = 16, PB = 512;
+    check_decode_rows_shape(q, k, v, valid);
+    const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = valid > 0 ? valid : k.shape(2);
+    const int group = heads / kvheads, parts = (length + PB - 1) / PB, qtiles = (n * group + 7) / 8;
+    if (qtiles > SG) throw std::invalid_argument("decode rows v3: more than 64 queries per KV head");
+    const uint32_t layout[] = {uint32_t(length), uint32_t(n), uint32_t(parts), uint32_t(k.shape(2)), uint32_t(qtiles)};
+    const auto layout_array = mx::array(layout, {5}, mx::uint32);
+    static auto partial = mx::fast::metal_kernel("tqllm_decode_rows_partial_v3", {"q", "k", "v", "layout", "scale"},
+                                                 {"ms", "ls", "accs"}, R"METAL(
+const uint sg = simdgroup_index_in_threadgroup;
+const uint lane = thread_index_in_simdgroup;
+const uint tid = thread_position_in_threadgroup.x;
+const uint part = threadgroup_position_in_grid.x;
+const uint g = threadgroup_position_in_grid.y;
+const uint length = layout[0], rows = layout[1], parts = layout[2], stride = layout[3], qtiles = layout[4];
+const uint nq = rows * uint(GROUP);
+constexpr uint DB = DIM / 8u;
+threadgroup float kv[KC * DIM];
+threadgroup float st[SG * KC * 8];
+threadgroup float dg[SG * 64];
+const bool active = sg < qtiles;
+threadgroup float* s_t = st + sg * (KC * 8);
+threadgroup float* d_t = dg + sg * 64;
+// stage each tile's queries (row-major [8 queries][DIM], scaled) through kv and load Q^T fragments
+simdgroup_float8x8 qf[DB];
+for (uint t = 0; t < qtiles; t += 2u) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 16u * uint(DIM); i += SG * 32u) {
+        const uint qi = t * 8u + i / uint(DIM), d = i % uint(DIM);
+        kv[i] = qi < nq ? scale * q[((g * uint(GROUP) + qi % uint(GROUP)) * rows + qi / uint(GROUP)) * uint(DIM) + d] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == t || sg == t + 1u)
+        for (uint d = 0; d < DB; ++d) simdgroup_load(qf[d], kv + (sg - t) * 8u * uint(DIM) + d * 8u, DIM, ulong2(0, 0), true);
+}
+simdgroup_float8x8 o[DB];
+for (uint d = 0; d < DB; ++d) o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+// lane j < 8 owns query sg*8 + j: running max, mass and visible length
+const uint qi = sg * 8u + lane;
+const uint vis = (lane < 8u && qi < nq) ? length - rows + qi / uint(GROUP) + 1u : 0u;
+float m = -INFINITY, l = 0.0f;
+if (lane < 8u) for (uint j = 0; j < 8u; ++j) d_t[lane * 8u + j] = 0.0f;
+const device KT* kh = k + (size_t)g * stride * uint(DIM);
+const device KT* vh = v + (size_t)g * stride * uint(DIM);
+const uint begin = part * uint(PB), end = min(begin + uint(PB), length);
+for (uint c0 = begin; c0 < end; c0 += uint(KC)) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(KC * DIM); i += SG * 32u) {
+        const uint key = c0 + i / uint(DIM);
+        kv[i] = key < length ? float(kh[(size_t)key * uint(DIM) + i % uint(DIM)]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active) {
+        simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint d = 0; d < DB; ++d) {
+            simdgroup_float8x8 k0, k1;
+            simdgroup_load(k0, kv + d * 8u, DIM);
+            simdgroup_load(k1, kv + 8u * uint(DIM) + d * 8u, DIM);
+            simdgroup_multiply_accumulate(s0, k0, qf[d], s0);
+            simdgroup_multiply_accumulate(s1, k1, qf[d], s1);
+        }
+        simdgroup_store(s0, s_t, 8);
+        simdgroup_store(s1, s_t + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {
+            float peak = m;
+            for (uint j = 0; j < uint(KC); ++j) if (c0 + j < vis) peak = max(peak, s_t[j * 8u + lane]);
+            const float r = peak == -INFINITY ? 1.0f : fast::exp(m - peak);
+            float mass = l * r;
+            for (uint j = 0; j < uint(KC); ++j) {
+                const float p = (c0 + j < vis && peak != -INFINITY) ? fast::exp(s_t[j * 8u + lane] - peak) : 0.0f;
+                s_t[j * 8u + lane] = p;
+                mass += p;
+            }
+            m = peak; l = mass;
+            d_t[lane * 8u + lane] = r;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(KC * DIM); i += SG * 32u) {
+        const uint key = c0 + i / uint(DIM);
+        kv[i] = key < length ? float(vh[(size_t)key * uint(DIM) + i % uint(DIM)]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active) {
+        simdgroup_float8x8 df, p0, p1;
+        simdgroup_load(df, d_t, 8);
+        simdgroup_load(p0, s_t, 8);
+        simdgroup_load(p1, s_t + 64, 8);
+        for (uint d = 0; d < DB; ++d) {
+            simdgroup_float8x8 v0, v1;
+            simdgroup_load(v0, kv + d * 8u, DIM, ulong2(0, 0), true);
+            simdgroup_load(v1, kv + 8u * uint(DIM) + d * 8u, DIM, ulong2(0, 0), true);
+            simdgroup_multiply(o[d], o[d], df);
+            simdgroup_multiply_accumulate(o[d], v0, p0, o[d]);
+            simdgroup_multiply_accumulate(o[d], v1, p1, o[d]);
+        }
+    }
+}
+if (!active) return;
+const uint slot = ((g * parts + part) * qtiles + sg) * 8u;
+if (lane < 8u) {ms[slot + lane] = m; ls[slot + lane] = l;}
+for (uint d = 0; d < DB; ++d) simdgroup_store(o[d], accs + (size_t)slot * uint(DIM) + d * 8u, DIM, ulong2(0, 0), true);
+)METAL");
+    static auto merge = mx::fast::metal_kernel("tqllm_decode_rows_merge_v3", {"ms", "ls", "accs", "layout"}, {"out"}, R"METAL(
+uint d = thread_position_in_threadgroup.x;
+uint y = threadgroup_position_in_grid.y;
+uint rows = layout[1], parts = layout[2], qtiles = layout[4];
+uint g = y / (qtiles * 8u), qi = y % (qtiles * 8u);
+if (qi >= rows * uint(GROUP)) return;
+uint r = qi / uint(GROUP), h = qi % uint(GROUP);
+float peak = -INFINITY;
+for (uint p = 0; p < parts; ++p) peak = max(peak, ms[((g * parts + p) * qtiles) * 8u + qi]);
+float total = 0.0f, numerator = 0.0f;
+for (uint p = 0; p < parts; ++p) {
+    uint slot = ((g * parts + p) * qtiles) * 8u + qi;
+    float mp = ms[slot];
+    if (mp == -INFINITY) continue;
+    float factor = fast::exp(mp - peak);
+    total += ls[slot] * factor;
+    numerator += accs[slot * uint(DIM) + d] * factor;
+}
+out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
+)METAL");
+    const auto stream = mx::Device(mx::Device::gpu);
+    auto scratch = partial({mx::contiguous(q), mx::contiguous(k), mx::contiguous(v), layout_array, mx::array(scale)},
+                           {{kvheads, parts, qtiles, 8}, {kvheads, parts, qtiles, 8}, {kvheads, parts, qtiles, 8, dim}},
+                           {mx::float32, mx::float32, mx::float32}, {parts * SG * 32, kvheads, 1}, {SG * 32, 1, 1},
+                           {{"DIM", dim}, {"GROUP", group}, {"PB", PB}, {"SG", SG}, {"KC", KC}, {"KT", k.dtype()}},
+                           std::nullopt, false, stream);
+    return merge({scratch[0], scratch[1], scratch[2], layout_array}, {q.shape()}, {mx::float32}, {dim, kvheads * qtiles * 8, 1},
+                 {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
+}
+
 inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int valid = -1) {
     // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
-    static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr;
-    return v2 ? decode_rows_attention_v2(q, k, v, scale, valid) : decode_rows_attention_v1(q, k, v, scale, valid);
+    static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr, v3 = std::getenv("TQLLM_MLX_ATTN_DECODE_V3") != nullptr;
+    return v3 ? decode_rows_attention_v3(q, k, v, scale, valid)
+         : v2 ? decode_rows_attention_v2(q, k, v, scale, valid) : decode_rows_attention_v1(q, k, v, scale, valid);
 }
 }  // namespace tqllm::mlx_backend
