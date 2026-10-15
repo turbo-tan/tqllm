@@ -368,6 +368,34 @@ struct Qwen35::Impl {
         return embedding8?affine8_embedding(*embedding8,tokens):q4_embedding(*embedding,tokens);
     }
     mx::array mat(const std::string& name,const mx::array& x,bool input_rotated=false) {
+        auto rotated=[&]() {
+            if(input_rotated)return x;
+            if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
+            auto value=tq4_rotate(x);
+            if(reuse_rotation)rotation=std::pair{x,value};
+            return value;
+        };
+        if(!ablate.empty() && x.shape(0)<=8)
+            for(const auto& raw_tag:ablate) {
+                const bool keep_input=raw_tag.rfind("r:",0)==0;
+                const std::string tag=keep_input?raw_tag.substr(2):raw_tag;
+                if(name.find(tag)!=std::string::npos) {
+                    int rows=0;
+                    if(auto f=nax.find(name);f!=nax.end())rows=f->second.rows;
+                    else if(auto it=matrices.find(name);it!=matrices.end())
+                        std::visit([&](const auto& w){
+                            if constexpr(std::is_same_v<std::decay_t<decltype(w)>,mx::array>)rows=w.shape(0);
+                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq3Weights>)rows=w.planes.shape(0);
+                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq4Weights>)rows=w.codes.shape(0);
+                            else rows=w.blocks.shape(0);
+                        },it->second);
+                    if(rows) {
+                        auto zero=mx::zeros({x.shape(0),rows},x.dtype());
+                        if(keep_input)zero=mx::add(zero,mx::astype(mx::multiply(mx::sum(rotated()),mx::array(0.0f)),x.dtype()));
+                        return zero;
+                    }
+                }
+            }
         if(auto found=nax.find(name);found!=nax.end()) {
             auto y=nax_affine_matmul(found->second,x,true);
             if(std::getenv("TQLLM_MLX_NAX_ROW_CHECK") && x.shape(0)>1) {
@@ -385,33 +413,6 @@ struct Qwen35::Impl {
             }
             return y;
         }
-        auto rotated=[&]() {
-            if(input_rotated)return x;
-            if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
-            auto value=tq4_rotate(x);
-            if(reuse_rotation)rotation=std::pair{x,value};
-            return value;
-        };
-        if(!ablate.empty() && x.shape(0)<=8)
-            for(const auto& raw_tag:ablate) {
-                const bool keep_input=raw_tag.rfind("r:",0)==0;
-                const std::string tag=keep_input?raw_tag.substr(2):raw_tag;
-                if(name.find(tag)!=std::string::npos) {
-                    int rows=0;
-                    if(auto it=matrices.find(name);it!=matrices.end())
-                        std::visit([&](const auto& w){
-                            if constexpr(std::is_same_v<std::decay_t<decltype(w)>,mx::array>)rows=w.shape(0);
-                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq3Weights>)rows=w.planes.shape(0);
-                            else if constexpr(std::is_same_v<std::decay_t<decltype(w)>,Tq4Weights>)rows=w.codes.shape(0);
-                            else rows=w.blocks.shape(0);
-                        },it->second);
-                    if(rows) {
-                        auto zero=mx::zeros({x.shape(0),rows},x.dtype());
-                        if(keep_input)zero=mx::add(zero,mx::astype(mx::multiply(mx::sum(rotated()),mx::array(0.0f)),x.dtype()));
-                        return zero;
-                    }
-                }
-            }
         if(mma8 && x.shape(0)<=8)
             if(auto found=mma8_projections.find(name);found!=mma8_projections.end()) {
                 if(!rotation_half || !rotation || rotation_half->first.id()!=x.id())
