@@ -809,6 +809,7 @@ void Qwen35::enable_mtp() {
 void Qwen35::draft_shortlist(const mx::array& logits,int count) {
     if(count<1 || count>impl_->vocab || logits.shape()!=mx::Shape{1,impl_->vocab})
         throw std::invalid_argument("invalid MTP shortlist");
+    if(impl_->nax.contains("output.weight"))return;  // NAX head: the drafter scores the full vocabulary
     const auto* head=std::get_if<Q6Weights>(&impl_->matrices.at("output.weight"));
     if(!head)throw std::invalid_argument("MTP shortlist requires Q6_K target head");
     auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
