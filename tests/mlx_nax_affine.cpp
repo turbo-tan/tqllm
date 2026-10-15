@@ -1,6 +1,7 @@
 #include "nax_affine.hpp"
 #include <mlx/random.h>
 #include "tq4.hpp"
+#include "q6.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -211,6 +212,32 @@ bool run_rotate(std::mt19937& rng) {
     }
     return ok;
 }
+
+// Q6_K head repacked for the matrix unit matches q6_matmul (FP32 reference) up to FP16 weight/input rounding; rows independent
+bool run_q6(int rows, int k, std::mt19937& rng) {
+    std::vector<uint8_t> blocks(size_t(rows) * (k / 256) * 210);
+    for (size_t i = 0; i < blocks.size(); ++i) blocks[i] = uint8_t(rng());
+    for (size_t b = 0; b < blocks.size() / 210; ++b) {
+        const mx::float16_t d(0.0005f + float(rng() % 100) * 1e-5f);
+        std::memcpy(&blocks[b * 210 + 208], &d, 2);
+    }
+    auto w = load_q6_blocks(blocks, rows, k);
+    auto n = nax_from_q6(w);
+    const int m = 9;
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(float(int(rng() % 2001) - 1000) * 1e-3f));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto got = rows_of(nax_affine_matmul(n, X)), ref = rows_of(q6_matmul(w, X));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < got.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - got[i])));}
+    size_t mismatches = 0;
+    for (int r = 0; r < m; ++r) {
+        auto one = rows_of(nax_affine_matmul(n, mx::array(x.data() + size_t(r) * k, {1, k}, mx::float32)));
+        mismatches += std::memcmp(one.data(), &got[size_t(r) * rows], size_t(rows) * 4) != 0;
+    }
+    std::printf("NAX Q6 head rows=%d k=%d rel_err_vs_q6_matmul=%.3e row_mismatches=%zu\n", rows, k, worst / peak, mismatches);
+    return worst / peak < 2e-3 && mismatches == 0;
+}
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
@@ -235,7 +262,7 @@ bool run_embedding(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");

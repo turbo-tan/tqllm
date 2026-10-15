@@ -1,5 +1,6 @@
 #include "nax_affine.hpp"
 #include "tq4.hpp"
+#include "q6.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -10,8 +11,8 @@ namespace mx = mlx::core;
 namespace tqllm::mlx_backend {
 namespace {
 void check_shape(uint64_t rows, uint64_t columns, int bits, int group) {
-    if ((bits != 4 && bits != 6) || (group != 64 && group != 128) || rows == 0 || rows % 128 || columns % group)
-        throw std::invalid_argument("nax affine needs 4/6 bits, group 64/128, rows % 128 == 0, columns % group == 0");
+    if ((bits != 4 && bits != 6) || (group != 16 && group != 64 && group != 128) || rows == 0 || rows % 128 || columns % group)
+        throw std::invalid_argument("nax affine needs 4/6 bits, group 16/64/128, rows % 128 == 0, columns % group == 0");
 }
 // Lane layout of one 16x16 fragment (MLX steel NAX): element i of lane l sits at row fm + (i/4)*8, column fn + i%4.
 inline int lane_fm(int lane) {return ((lane >> 2) & 4) | ((lane >> 1) & 3);}
@@ -55,16 +56,19 @@ const char* kSource = R"METAL(
 #endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
     const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
-    const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device ushort* sp = S + (Q6 ? 2 : 1) * (((size_t)blk * (K / GS) + split * (KS / GS)) * 32);
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
     const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
     for (int g = 0; g < KS / GS; g++) {
-        const float4 s0 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
+        // Q6: FP32 scales (Q6_K d * sub-block scale, exact), codes 0..63 with the implied bias -32 * scale
+        const float4 s0 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + fn))
+                        : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
                               : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
-        const float4 s1 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn)))
+        const float4 s1 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + 16 + fn))
+                        : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn)))
                               : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
-        const float4 b0 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
-        const float4 b1 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
+        const float4 b0 = Q6 ? -32.0f * s0 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
+        const float4 b1 = Q6 ? -32.0f * s1 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
         for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
             half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
@@ -262,11 +266,12 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
     return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
                     {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
-                     {"BF", round_bf16}, {"TQ4", w.tq4}},
+                     {"BF", round_bf16}, {"TQ4", w.tq4}, {"Q6", w.q6}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
 mx::array nax_affine_dequant(const NaxAffine& w) {
+    if (w.q6) throw std::invalid_argument("nax affine dequant: Q6 mode not supported");
     static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_dequant", {"W", "H", "S", "Bz"}, {"Y"}, kDequant, kHeader);
     const int blocks = w.rows / 32, steps = w.columns / 16, gpr = w.columns / w.group;
     return kernel({w.words, w.high, w.scales, w.biases}, {{w.rows, w.columns}}, {mx::float16}, {blocks * steps * 32, 1, 1},
@@ -351,6 +356,41 @@ NaxAffine nax_from_tq4(const Tq4Weights& t) {
     out.biases = mx::zeros({64}, mx::uint16);
     mx::eval(out.biases);
     out.tq4 = true;
+    return out;
+}
+
+NaxAffine nax_from_q6(const Q6Weights& q) {
+    if (q.blocks.ndim() != 3 || q.blocks.shape(2) != 210 || q.blocks.dtype() != mx::uint8)
+        throw std::invalid_argument("nax q6: needs Q6_K blocks");
+    const int rows = q.blocks.shape(0), columns = q.blocks.shape(1) * 256, gpr = columns / 16;
+    auto blocks = mx::contiguous(q.blocks);
+    mx::eval(blocks);
+    const uint8_t* b = blocks.data<uint8_t>();
+    std::vector<uint8_t> codes(size_t(rows) * columns);
+    std::vector<float> scale(size_t(rows) * gpr);
+    for (size_t r = 0; r < size_t(rows); ++r)
+        for (int sb = 0; sb < columns / 256; ++sb) {
+            const uint8_t* p = b + (r * (columns / 256) + sb) * 210;
+            uint16_t dbits = uint16_t(p[208] | (p[209] << 8));
+            const float d = float(mx::float16_t(*reinterpret_cast<const mx::float16_t*>(&dbits)));
+            for (int w = 0; w < 256; ++w) {
+                const int h = w / 128, l = w % 32, c = (w % 128) / 32;
+                const uint8_t lo = p[h * 64 + (c & 1) * 32 + l], hi = p[128 + h * 32 + l];
+                codes[r * columns + sb * 256 + w] = uint8_t((c < 2 ? lo & 15u : lo >> 4) | (((hi >> (2 * c)) & 3u) << 4));
+            }
+            for (int j = 0; j < 16; ++j) scale[r * gpr + sb * 16 + j] = d * float(int8_t(p[192 + j]));
+        }
+    std::vector<uint16_t> zero(size_t(rows) * gpr, 0);
+    auto out = nax_affine_load(nax_affine_pack(codes, zero, zero, rows, columns, 6, 16), rows, columns, 6, 16);
+    // scales in the kernel's [blocks, groups, 32] order, FP32 (two uint16 words each)
+    std::vector<float> ordered(scale.size());
+    for (int blk = 0; blk < rows / 32; ++blk)
+        for (int g = 0; g < gpr; ++g)
+            for (int j = 0; j < 32; ++j) ordered[(size_t(blk) * gpr + g) * 32 + j] = scale[size_t(blk * 32 + j) * gpr + g];
+    out.scales = mx::array(reinterpret_cast<const uint16_t*>(ordered.data()), {rows / 32, gpr, 64}, mx::uint16);
+    out.biases = mx::zeros({64}, mx::uint16);
+    mx::eval(out.scales, out.biases);
+    out.q6 = true;
     return out;
 }
 

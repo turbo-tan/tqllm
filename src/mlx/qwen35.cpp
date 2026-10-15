@@ -331,7 +331,11 @@ struct Qwen35::Impl {
         };
         matrix("output.weight");scalar("output_norm.weight");
         if(file.tensors.contains("output_draft.weight") && std::getenv("TQLLM_MLX_NAX_DRAFT_HEAD4"))matrix("output_draft.weight");
-        if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
+        if (std::getenv("TQLLM_MLX_NAX_Q6_HEAD")) {
+            const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
+            if (!head) throw std::invalid_argument("NAX Q6 head requires Q6_K output weights");
+            nax.emplace("output.weight", nax_from_q6(*head));
+        } else if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
             const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
             if (!head) throw std::invalid_argument("Q6 affine head requires Q6_K output weights");
             target_head = q6_affine_split(*head);

@@ -276,7 +276,8 @@ out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
 
 inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int valid = -1) {
-    static const bool v1 = std::getenv("TQLLM_MLX_ATTN_DECODE_V1") != nullptr;
-    return v1 ? decode_rows_attention_v1(q, k, v, scale, valid) : decode_rows_attention_v2(q, k, v, scale, valid);
+    // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
+    static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr;
+    return v2 ? decode_rows_attention_v2(q, k, v, scale, valid) : decode_rows_attention_v1(q, k, v, scale, valid);
 }
 }  // namespace tqllm::mlx_backend
