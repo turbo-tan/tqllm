@@ -665,7 +665,7 @@ struct Qwen35::Impl {
                 is_attn?full_attention(p,n,caches[l],pos,l):gdn(p,n,caches[l],tapes[l]);
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
-                for(const auto* a:{&c.conv,&c.state,&kv_keys[l],&kv_values[l]})if(*a)values.push_back(**a);
+                for(const std::optional<mx::array>* a:{&c.conv,&c.state,&kv_keys[l],&kv_values[l]})if(*a)values.push_back(**a);
                 record((l+1)%interval==0?"attention":"gdn_mixer",values);
             }
             x=add_bf(x,attn);n=norm(x,p+"post_attention_norm.weight");
