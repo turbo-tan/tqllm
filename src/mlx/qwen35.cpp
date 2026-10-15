@@ -34,6 +34,11 @@ mx::array tail_slice(const mx::array& a,int axis,int begin,int end) {
     starts[axis]=begin;stops[axis]=end;
     return mx::slice(a,starts,stops);
 }
+// matrix-unit defaults (j576): on unless the variable is set to 0
+bool env_default_on(const char* name) {
+    const char* v=std::getenv(name);
+    return !v || std::string(v)!="0";
+}
 bool ablate_small(const char* tag) {
     static const std::string value=std::getenv("TQLLM_MLX_ABLATE_SMALL")?std::getenv("TQLLM_MLX_ABLATE_SMALL"):"";
     return !value.empty() && value.find(tag)!=std::string::npos;
@@ -273,7 +278,7 @@ struct Qwen35::Impl {
                 else if constexpr(std::is_same_v<T,Tq4Weights>) mx::eval(v.codes,v.scales);
                 else mx::eval(v.blocks);
             },w);
-            if(std::getenv("TQLLM_MLX_NAX_TQ4"))
+            if(env_default_on("TQLLM_MLX_NAX_TQ4"))
                 if(auto packed=std::get_if<Tq4Weights>(&w);packed && packed->integer_levels && packed->codes.shape(0)%128==0) {
                     nax_tq4.emplace(name,nax_from_tq4(*packed));
                     return;  // the repacked copy replaces the original
@@ -331,10 +336,9 @@ struct Qwen35::Impl {
         };
         matrix("output.weight");scalar("output_norm.weight");
         if(file.tensors.contains("output_draft.weight") && std::getenv("TQLLM_MLX_NAX_DRAFT_HEAD4"))matrix("output_draft.weight");
-        if (std::getenv("TQLLM_MLX_NAX_Q6_HEAD")) {
-            const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
-            if (!head) throw std::invalid_argument("NAX Q6 head requires Q6_K output weights");
-            nax.emplace("output.weight", nax_from_q6(*head));
+        const auto* q6_head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
+        if (q6_head && env_default_on("TQLLM_MLX_NAX_Q6_HEAD") && !target_head_shortlist) {
+            nax.emplace("output.weight", nax_from_q6(*q6_head));
         } else if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
             const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
             if (!head) throw std::invalid_argument("Q6 affine head requires Q6_K output weights");
