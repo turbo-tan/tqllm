@@ -3,6 +3,7 @@
 #include "tqllm/tokenizer.hpp"
 #include <src/json.hpp>
 #include <src/vision.hpp>
+#include <src/debug.hpp>
 #include "json_out.hpp"
 
 #include <cuda_runtime.h>
@@ -831,6 +832,15 @@ inline void usage_timings(std::string & out, const DecodeResult & result) {
     out += ",\"predicted_n\":" + std::to_string(n) + ",\"predicted_ms\":" + num(result.decode_ms);
     out += ",\"predicted_per_second\":" + num(result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0);
     out += ",\"draft_n\":" + std::to_string(result.draft_n) + ",\"draft_n_accepted\":" + std::to_string(result.draft_accepted) + "}";
+    // TQLLM_DEBUG=reqlog: one line per finished request with the same tok/s the client gets (llama.cpp-style:
+    // decode rate excludes the first token, which the prefill produced).
+    if (tqllm::debug_on("reqlog")) {
+        const double pre_tps = result.prefill_ms > 0 ? result.prompt_tokens * 1000.0 / result.prefill_ms : 0;
+        const double dec_tps = result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0;
+        std::fprintf(stderr, "reqlog: prompt %u tokens %.1f ms (%.1f tok/s) | decode %u tokens %.1f ms (%.1f tok/s) | draft %llu/%llu\n",
+                     result.prompt_tokens, result.prefill_ms, pre_tps, n, result.decode_ms, dec_tps,
+                     (unsigned long long) result.draft_accepted, (unsigned long long) result.draft_n);
+    }
 }
 
 // SSE output of one request. update() sends what the ids generated so far add to the reasoning / content texts that

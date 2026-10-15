@@ -1,6 +1,6 @@
 #pragma once
 // TQLLM_DEBUG=key[:value],key2,... - the single diagnostics switch (see config/flags.yaml). Keys: memlog, profile,
-// steps, stageprof, matvec, tune, prefill, draft, tree_chain, tf_dump:FILE, fakeq_k:N, fakeq_v:N.
+// steps, stageprof, matvec, tune, prefill, draft, reqlog, tree_chain, tf_dump:FILE, fakeq_k:N, fakeq_v:N.
 #include <cstdlib>
 #include <map>
 #include <string>
