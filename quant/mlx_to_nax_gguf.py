@@ -36,7 +36,7 @@ def lane_coords():
 
 
 def nax_pack(q, s, b, bits, gs):
-    # q [N,K] uint8, s/b [N,K/gs] float16 -> payload bytes (same layout as nax_affine_pack in C++)
+    # q [N,K] uint8, s/b [N,K/gs] BF16 bits (uint16) -> payload bytes (same layout as nax_affine_pack in C++)
     N, K = q.shape
     fm, fn = lane_coords()
     words = np.zeros((N // 32, K // 16, 32, 2), np.uint32)
@@ -49,8 +49,12 @@ def nax_pack(q, s, b, bits, gs):
             if bits == 6: hi |= (qq >> 4) << (w * 8 + 2 * (i & 3) + 16 * (i >> 2))
     S = np.ascontiguousarray(s.reshape(N // 32, 32, K // gs).transpose(0, 2, 1))
     B = np.ascontiguousarray(b.reshape(N // 32, 32, K // gs).transpose(0, 2, 1))
-    parts = [words.tobytes()] + ([hi.tobytes()] if bits == 6 else []) + [S.astype(np.float16).tobytes(), B.astype(np.float16).tobytes()]
+    parts = [words.tobytes()] + ([hi.tobytes()] if bits == 6 else []) + [S.astype(np.uint16).tobytes(), B.astype(np.uint16).tobytes()]
     return np.frombuffer(b"".join(parts), np.uint8)
+
+
+def bf16_float(bits):
+    return (bits.astype(np.uint32) << 16).view(np.float32)
 
 
 def v_perm(n, num_k, per_k, head):
@@ -77,9 +81,42 @@ def main():
     hk, hv = tc["linear_key_head_dim"], tc["linear_value_head_dim"]
     per_k = nv // nk
 
+    reader = gguf.GGUFReader(a.bf16_gguf)
+    by_name = {t.name: t for t in reader.tensors}
+    worst = 0.0
+
+    def convert(name, codes, s, b, bits, gs):
+        # gate against the BF16 GGUF, then pack; only the packed payload is kept
+        nonlocal worst
+        t = by_name[name]
+        N, K = codes.shape
+        raw = np.asarray(t.data)
+        bf16 = t.tensor_type == gguf.GGMLQuantizationType.BF16
+        raw = raw.view(np.uint16).reshape(N, K) if bf16 else raw.reshape(N, K)
+        sf, bf = bf16_float(s), bf16_float(b)
+        err = 0.0
+        for r0 in range(0, N, 4096):   # row blocks keep the FP32 temporaries small
+            r1 = min(N, r0 + 4096)
+            ref = (raw[r0:r1].astype(np.uint32) << 16).view(np.float32) if bf16 else raw[r0:r1].astype(np.float32)
+            q = codes[r0:r1].astype(np.float32).reshape(r1 - r0, K // gs, gs)
+            deq = (q * sf[r0:r1, :, None] + bf[r0:r1, :, None]).reshape(r1 - r0, K)
+            # the BF16 GGUF was dequantized in BF16, so it carries one BF16 rounding of code * scale and of the sum
+            mag = (q * np.abs(sf[r0:r1, :, None]) + np.abs(bf[r0:r1, :, None])).reshape(r1 - r0, K)
+            err = max(err, float(np.max(np.abs(deq - ref) / (mag * 2.0 ** -7 + 1e-9))))
+        worst = max(worst, err)
+        if err > 1.0: raise SystemExit(f"{name}: converted tensor differs from the BF16 GGUF ({err:.3g} BF16 steps)")
+        if name == "token_embd.weight":
+            if (bits, gs) != (8, 64): raise SystemExit("token embedding must be 8-bit group 64")
+            data, ty = np.frombuffer(codes.tobytes() + s.tobytes() + b.tobytes(), np.uint8), EMBED8
+        else:
+            ty = TYPES[(bits, gs)]
+            data = nax_pack(codes, s, b, bits, gs)
+        blk, ts = BLOCK[ty]
+        return data.reshape(N, K // blk * ts), ty
+
     idx = json.load(open(os.path.join(a.mlx, "model.safetensors.index.json")))["weight_map"]
     shards = sorted(set(idx.values()))
-    quant = {}   # gguf name -> (codes uint8 [N,K], scales f16, biases f16, bits, group)
+    quant = {}   # gguf name -> (payload uint8, GGUF type)
     for sh in shards:
         arrs = mx.load(os.path.join(a.mlx, sh))
         for k in [k for k in arrs if k.endswith(".scales")]:
@@ -91,8 +128,8 @@ def main():
             w = arrs[module + ".weight"]
             ones = mx.ones(arrs[k].shape, mx.float32)
             codes = np.array(mx.dequantize(w, ones, mx.zeros_like(ones), group_size=gs, bits=bits)).astype(np.uint8)
-            s = np.array(arrs[k].astype(mx.float32)).astype(np.float16)
-            b = np.array(arrs[module + ".biases"].astype(mx.float32)).astype(np.float16)
+            s = np.array(arrs[k].astype(mx.bfloat16).view(mx.uint16))
+            b = np.array(arrs[module + ".biases"].astype(mx.bfloat16).view(mx.uint16))
             if "linear_attn" in module and nk != nv:
                 if module.endswith("in_proj_qkv"):
                     v0 = 2 * nk * hk
@@ -106,11 +143,11 @@ def main():
                     codes = codes[:, v_perm(codes.shape[1], nk, per_k, hv)]
                     gp = v_perm(s.shape[1], nk, per_k, hv // gs)
                     s, b = s[:, gp], b[:, gp]
-            quant[name] = (codes, s, b, bits, gs)
+            if name not in by_name: raise SystemExit(f"{name}: not in the BF16 GGUF")
+            quant[name] = convert(name, codes, s, b, bits, gs)
         del arrs
-    print("quantized matrices", len(quant), flush=True)
+        print(sh, "converted", len(quant), "worst", round(worst, 3), flush=True)
 
-    reader = gguf.GGUFReader(a.bf16_gguf)
     arch = reader.fields["general.architecture"].contents()
     writer = gguf.GGUFWriter(a.out, arch)
     for field in reader.fields.values():
@@ -119,28 +156,10 @@ def main():
         sub = field.types[-1] if vt == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(field.name, field.contents(), vt, sub_type=sub)
     writer.add_uint32("tq_mlx.nax_version", 1)
-
-    worst = 0.0
     payloads = []
     for t in reader.tensors:
         if t.name in quant:
-            codes, s, b, bits, gs = quant.pop(t.name)
-            N, K = codes.shape
-            ref = np.asarray(t.data)
-            ref = (ref.view(np.uint16).astype(np.uint32) << 16).view(np.float32) if t.tensor_type == gguf.GGMLQuantizationType.BF16 else ref.astype(np.float32)
-            ref = ref.reshape(N, K)
-            deq = (codes.astype(np.float32).reshape(N, K // gs, gs) * s.astype(np.float32)[:, :, None] + b.astype(np.float32)[:, :, None]).reshape(N, K)
-            err = float(np.max(np.abs(deq - ref) / (np.abs(ref) + np.abs(s.astype(np.float32)).max(axis=1, keepdims=True).repeat(K, 1) * 0.5 + 1e-12)))
-            worst = max(worst, err)
-            if err > 0.02: raise SystemExit(f"{t.name}: converted tensor differs from the BF16 GGUF (rel {err:.3g})")
-            if t.name == "token_embd.weight":
-                if (bits, gs) != (8, 64): raise SystemExit("token embedding must be 8-bit group 64")
-                data, ty = np.frombuffer(codes.tobytes() + s.tobytes() + b.tobytes(), np.uint8), EMBED8
-            else:
-                ty = TYPES[(bits, gs)]
-                data = nax_pack(codes, s, b, bits, gs)
-            blk, ts = BLOCK[ty]
-            data = data.reshape(N, K // blk * ts)
+            data, ty = quant.pop(t.name)
             writer.add_tensor_info(t.name, data.shape, data.dtype, data.nbytes, ty)
             payloads.append(data)
         else:

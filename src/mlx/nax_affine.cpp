@@ -17,6 +17,8 @@ inline int lane_fn(int lane) {return ((((lane >> 2) & 2) | (lane & 1)) * 4);}
 const char* kHeader = R"METAL(
 #include <metal_simdgroup>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+inline float4 bf16x4(ushort4 v) {return float4(as_type<float>(uint(v.x) << 16), as_type<float>(uint(v.y) << 16),
+                                               as_type<float>(uint(v.z) << 16), as_type<float>(uint(v.w) << 16));}
 )METAL";
 
 const char* kSource = R"METAL(
@@ -39,12 +41,12 @@ const char* kSource = R"METAL(
     for (short i = 0; i < 16; i++) { cc[i] = 0.0f; cc2[i] = 0.0f; }
     const device uint2* wp = (const device uint2*)W + (size_t)blk * (K / 16) * 32 + lane;
     const device uint* hp = H + (BITS == 6 ? (size_t)blk * (K / 16) * 32 + lane : 0);
-    const device half* sp = S + (size_t)blk * (K / GS) * 32;
-    const device half* bp = Bz + (size_t)blk * (K / GS) * 32;
+    const device ushort* sp = S + (size_t)blk * (K / GS) * 32;
+    const device ushort* bp = Bz + (size_t)blk * (K / GS) * 32;
     const device half* xs = X + (size_t)(row0 + fm) * K + fn;
     for (int g = 0; g < K / GS; g++) {
-        half4 s0 = *(const device half4*)(sp + g * 32 + fn), s1 = *(const device half4*)(sp + g * 32 + 16 + fn);
-        half4 b0 = *(const device half4*)(bp + g * 32 + fn), b1 = *(const device half4*)(bp + g * 32 + 16 + fn);
+        const float4 s0 = bf16x4(*(const device ushort4*)(sp + g * 32 + fn)), s1 = bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
+        const float4 b0 = bf16x4(*(const device ushort4*)(bp + g * 32 + fn)), b1 = bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
         for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
             half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
@@ -58,10 +60,10 @@ const char* kSource = R"METAL(
                     l0 |= ((h >> (2 * p)) & 0x00030003u) << 4;
                     l1 |= ((h >> (8 + 2 * p)) & 0x00030003u) << 4;
                 }
-                half2 q0 = as_type<half2>(l0 | 0x64006400u) - half2(1024.0h);
-                half2 q1 = as_type<half2>(l1 | 0x64006400u) - half2(1024.0h);
-                half2 v0 = fma(q0, half2(s0[p]), half2(b0[p]));
-                half2 v1 = fma(q1, half2(s1[p]), half2(b1[p]));
+                const float2 q0 = float2(as_type<half2>(l0 | 0x64006400u)) - 1024.0f;
+                const float2 q1 = float2(as_type<half2>(l1 | 0x64006400u)) - 1024.0f;
+                const half2 v0 = half2(fma(q0, float2(s0[p]), float2(b0[p])));
+                const half2 v1 = half2(fma(q1, float2(s1[p]), float2(b1[p])));
                 cb[p] = v0.x; cb[p + 4] = v0.y; cb[8 + p] = v1.x; cb[12 + p] = v1.y;
             }
             op.run(ca, cb, cc);
@@ -139,8 +141,8 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
                                       {blocks, steps, 32}, mx::uint32)
                           : mx::zeros({64}, mx::uint32);
     const size_t sb = size_t(blocks) * gpr * 32 * 2;
-    auto scales = mx::array(reinterpret_cast<const mx::float16_t*>(take(sb)), {blocks, gpr, 32}, mx::float16);
-    auto biases = mx::array(reinterpret_cast<const mx::float16_t*>(take(sb)), {blocks, gpr, 32}, mx::float16);
+    auto scales = mx::array(reinterpret_cast<const uint16_t*>(take(sb)), {blocks, gpr, 32}, mx::uint16);
+    auto biases = mx::array(reinterpret_cast<const uint16_t*>(take(sb)), {blocks, gpr, 32}, mx::uint16);
     mx::eval(words, high, scales, biases);
     return {words, high, scales, biases, rows, columns, bits, group};
 }
@@ -172,9 +174,9 @@ Affine8Embedding affine8_embedding_load(std::span<const uint8_t> payload, int ro
     auto codes = mx::array(at, {rows, columns}, mx::uint8);
     at += size_t(rows) * columns;
     const int g = columns / 64;
-    auto scales = mx::array(reinterpret_cast<const mx::float16_t*>(at), {rows, g}, mx::float16);
+    auto scales = mx::array(reinterpret_cast<const mx::bfloat16_t*>(at), {rows, g}, mx::bfloat16);
     at += size_t(rows) * g * 2;
-    auto biases = mx::array(reinterpret_cast<const mx::float16_t*>(at), {rows, g}, mx::float16);
+    auto biases = mx::array(reinterpret_cast<const mx::bfloat16_t*>(at), {rows, g}, mx::bfloat16);
     mx::eval(codes, scales, biases);
     return {codes, scales, biases, rows, columns};
 }

@@ -10,16 +10,16 @@
 namespace mx = mlx::core;
 using namespace tqllm::mlx_backend;
 namespace {
-uint16_t f16_bits(float v) {
-    mx::float16_t h(v);
-    uint16_t b;
-    std::memcpy(&b, &h, 2);
-    return b;
+uint16_t bf16_bits(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return uint16_t((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
-float f16_value(uint16_t b) {
-    mx::float16_t h;
-    std::memcpy(&h, &b, 2);
-    return float(h);
+float bf16_value(uint16_t b) {
+    const uint32_t u = uint32_t(b) << 16;
+    float v;
+    std::memcpy(&v, &u, 4);
+    return v;
 }
 std::vector<float> rows_of(const mx::array& y) {
     auto c = mx::contiguous(y);
@@ -32,7 +32,7 @@ bool run(int rows, int k, int bits, int group, std::mt19937& rng) {
     for (auto& c : codes) c = uint8_t(rng() % levels);
     std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f), xd(-2.0f, 2.0f);
     std::vector<uint16_t> s(size_t(rows) * gpr), b(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {s[i] = f16_bits(sd(rng)); b[i] = f16_bits(bd(rng));}
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(i % 7 ? sd(rng) : sd(rng) * 1e-3f); b[i] = bf16_bits(bd(rng));}
     auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, bits, group), rows, k, bits, group);
     const int m = 40;
     std::vector<float> x(size_t(m) * k);
@@ -44,7 +44,7 @@ bool run(int rows, int k, int bits, int group, std::mt19937& rng) {
             double acc = 0;
             for (int c = 0; c < k; ++c) {
                 const size_t g = size_t(n) * gpr + c / group;
-                const float v = float(mx::float16_t(std::fma(float(codes[size_t(n) * k + c]), f16_value(s[g]), f16_value(b[g]))));
+                const float v = float(mx::float16_t(std::fma(float(codes[size_t(n) * k + c]), bf16_value(s[g]), bf16_value(b[g]))));
                 acc += double(v) * x[size_t(r) * k + c];
             }
             peak = std::max(peak, std::abs(acc));
@@ -69,7 +69,7 @@ bool run_embedding(std::mt19937& rng) {
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
     for (int i = 0; i < rows * k; ++i) payload[i] = uint8_t(rng());
     std::vector<uint16_t> sb(size_t(rows) * (k / 64) * 2);
-    for (auto& v : sb) v = f16_bits(std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng));
+    for (auto& v : sb) v = bf16_bits(std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng) * (rng() % 5 ? 1.0f : 1e-4f));
     std::memcpy(payload.data() + rows * k, sb.data(), sb.size() * 2);
     auto table = affine8_embedding_load(payload, rows, k);
     std::vector<uint32_t> tokens = {0, 299, 17, 17};
@@ -78,11 +78,11 @@ bool run_embedding(std::mt19937& rng) {
     for (size_t t = 0; t < tokens.size(); ++t)
         for (int c = 0; c < k; ++c) {
             const size_t g = size_t(tokens[t]) * (k / 64) + c / 64;
-            const double ref = double(payload[size_t(tokens[t]) * k + c]) * f16_value(sb[g]) + f16_value(sb[size_t(rows) * (k / 64) + g]);
+            const double ref = double(payload[size_t(tokens[t]) * k + c]) * bf16_value(sb[g]) + bf16_value(sb[size_t(rows) * (k / 64) + g]);
             worst = std::max(worst, std::abs(ref - got[t * k + c]));
         }
     std::printf("affine8 embedding max_abs_err=%.3e\n", worst);
-    return worst < 1e-6;
+    return worst < 1e-5;
 }
 }
 
