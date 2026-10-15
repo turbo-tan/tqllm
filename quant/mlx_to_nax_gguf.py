@@ -68,6 +68,7 @@ def main():
     ap.add_argument("--bf16-gguf", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--gguf-py", default=os.path.expanduser("~/code/llama.cpp-tq3/gguf-py"))
+    ap.add_argument("--draft-head", action="store_true", help="also write output_draft.weight (4-bit g64) for the drafter")
     a = ap.parse_args()
     sys.path.insert(0, a.gguf_py)
     import gguf
@@ -145,6 +146,17 @@ def main():
                     s, b = s[:, gp], b[:, gp]
             if name not in by_name: raise SystemExit(f"{name}: not in the BF16 GGUF")
             quant[name] = convert(name, codes, s, b, bits, gs)
+            if name == "output.weight" and a.draft_head:
+                # drafter-only copy of the head at 4-bit group 64 (MLX rounding of the dequantized head); verify keeps 6-bit
+                N, K = codes.shape
+                deq = (codes.astype(np.float32).reshape(N, K // gs, gs) * bf16_float(s)[:, :, None] + bf16_float(b)[:, :, None]).reshape(N, K)
+                wq, s4, b4 = mx.quantize(mx.array(deq).astype(mx.bfloat16), group_size=64, bits=4)
+                del deq
+                ones = mx.ones(s4.shape, mx.float32)
+                c4 = np.array(mx.dequantize(wq, ones, mx.zeros_like(ones), group_size=64, bits=4)).astype(np.uint8)
+                data = nax_pack(c4, np.array(s4.astype(mx.bfloat16).view(mx.uint16)), np.array(b4.astype(mx.bfloat16).view(mx.uint16)), 4, 64)
+                blk, ts = BLOCK[317]
+                quant["output_draft.weight"] = (data.reshape(N, K // blk * ts), 317)
         del arrs
         print(sh, "converted", len(quant), "worst", round(worst, 3), flush=True)
 
@@ -165,6 +177,10 @@ def main():
         else:
             writer.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
             payloads.append(t.data)
+        if t.name == "output.weight" and "output_draft.weight" in quant:
+            data, ty = quant.pop("output_draft.weight")
+            writer.add_tensor_info("output_draft.weight", data.shape, data.dtype, data.nbytes, ty)
+            payloads.append(data)
     if quant: raise SystemExit(f"export matrices with no GGUF tensor: {sorted(quant)[:5]}")
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

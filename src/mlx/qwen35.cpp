@@ -320,6 +320,7 @@ struct Qwen35::Impl {
             mx::eval(w);plain.emplace(name,std::move(w));
         };
         matrix("output.weight");scalar("output_norm.weight");
+        if(file.tensors.contains("output_draft.weight") && !std::getenv("TQLLM_MLX_NAX_NO_DRAFT_HEAD"))matrix("output_draft.weight");
         if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
             const auto* head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
             if (!head) throw std::invalid_argument("Q6 affine head requires Q6_K output weights");
@@ -830,6 +831,7 @@ mx::array Qwen35::shared_draft_head(const mx::array& x) const {
         throw std::invalid_argument("invalid shared draft-head input");
     if(impl_->proposal_head)return draft_head4_matmul(*impl_->proposal_head,x);
     if(impl_->draft_nax_head)return nax_affine_matmul(*impl_->draft_nax_head,x);
+    if(auto found=impl_->nax.find("output_draft.weight");found!=impl_->nax.end())return nax_affine_matmul(found->second,x);
     if(auto found=impl_->nax.find("output.weight");found!=impl_->nax.end())return nax_affine_matmul(found->second,x);
     return impl_->mtp_head?q6_matmul(*impl_->mtp_head,x):linear(impl_->matrices.at("output.weight"),x);
 }
