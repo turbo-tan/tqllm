@@ -4,6 +4,8 @@
   tqllm.py launch opencode --model FILE.gguf [--drafter FILE --draft-vocab FILE] [--context 65536] [-- agent args]
   tqllm.py launch codex    --model FILE.gguf ...
   tqllm.py launch claude   --model FILE.gguf ...   (Claude Code, through the server's Anthropic Messages API)
+  tqllm.py launch pi       --model FILE.gguf ...   (pi coding agent)
+  tqllm.py launch dsh      --model FILE.gguf ...   (DeepSeek Harness: `web` or `headless`)
   tqllm.py serve           --model FILE.gguf ...   (just the server, until Ctrl+C)
   tqllm.py --list                                  (the model catalog: models.json, local copies marked)
 
@@ -15,7 +17,7 @@ The server comes from the Docker image (default) or a native build (--native PAT
 on --port with the same model name is reused and left running; one this command started is stopped when the agent exits.
 The agents' own configuration files are never written: each gets its provider through environment / command line.
 """
-import argparse, hashlib, json, os, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
+import argparse, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 IMAGE = "ghcr.io/turbo-tan/tqllm:1.0.0"
 NAME = "tqllm"
@@ -203,22 +205,68 @@ def agent_command(a, base, env):
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL": NAME, "ANTHROPIC_SMALL_FAST_MODEL": NAME,
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
         cmd = ["claude"] + extra
+    elif tool == "pi":  # pi reads providers from models.json in $PI_CODING_AGENT_DIR; a temp dir holds ours
+        d = tempfile.mkdtemp(prefix="tqllm-pi-")
+        env["PI_CODING_AGENT_DIR"] = d
+        with open(os.path.join(d, "models.json"), "w") as f:
+            json.dump({"providers": {NAME: {"baseUrl": base + "/v1", "api": "openai-completions", "apiKey": "tqllm-local",
+                                             "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
+                                             "models": [{"id": NAME, "name": "tqLLM (local)", "reasoning": True,
+                                                         "contextWindow": a.context, "maxTokens": a.max_tokens}]}}}, f)
+        a.temp = d
+        cmd = ["pi", "--provider", NAME, "--model", NAME] + extra
+    elif tool == "dsh":  # dsh boots a profile; a temp YAML patch list carries the provider
+        fd, f = tempfile.mkstemp(prefix="tqllm-dsh-", suffix=".yml"); os.close(fd)
+        yaml = (
+            "- id: llm-pi-ai\n"
+            "  config:\n"
+            "    providers:\n"
+            f"      {NAME}:\n"
+            "        displayName: tqLLM (local)\n"
+            "        api: openai-completions\n"
+            f"        baseURL: {base}/v1\n"
+            "        apiKeyEnv: TQLLM_API_KEY\n"
+            "        models:\n"
+            f"          - id: {NAME}\n"
+            "            name: tqLLM (local)\n"
+            f"            contextWindow: {a.context}\n"
+            "- id: agent-default-model\n"
+            "  config:\n"
+            f"    provider: {NAME}\n"
+            f"    model: {NAME}\n"
+        )
+        with open(f, "w") as fh: fh.write(yaml)
+        env["TQLLM_API_KEY"] = "tqllm-local"
+        profile, rest = "web", list(extra)
+        if extra and extra[0] in ("web", "headless"):
+            profile, rest = extra[0], list(extra[1:])
+        a.temp = f
+        cmd = ["dsh", profile, "--patch", f] + rest
     return cmd
 
 
 def run_agent(a, base):
     tool, env = a.agent, dict(os.environ)
     cmd = agent_command(a, base, env)
-    if not shutil.which(cmd[0]): sys.exit(f"tqllm: {cmd[0]} is not installed")
-    if tool in ("codex", "claude") and not api_ok(base, "/v1/responses" if tool == "codex" else "/v1/messages"):
-        sys.exit(f"tqllm: the server on {base} has no {'Responses' if tool == 'codex' else 'Messages'} API; start it from a native build (--native build/tqserve) or a newer image")
-    return subprocess.call(cmd, env=env)
+    temp = getattr(a, "temp", None)
+    try:
+        if not shutil.which(cmd[0]): sys.exit(f"tqllm: {cmd[0]} is not installed")
+        if tool in ("codex", "claude") and not api_ok(base, "/v1/responses" if tool == "codex" else "/v1/messages"):
+            sys.exit(f"tqllm: the server on {base} has no {'Responses' if tool == 'codex' else 'Messages'} API; start it from a native build (--native build/tqserve) or a newer image")
+        return subprocess.call(cmd, env=env)
+    finally:
+        if temp:
+            try:
+                if os.path.isdir(temp): shutil.rmtree(temp, ignore_errors=True)
+                else: os.remove(temp)
+            except OSError:
+                pass
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["launch", "serve"])
-    p.add_argument("agent", nargs="?", choices=["opencode", "codex", "claude"])
+    p.add_argument("agent", nargs="?", choices=["opencode", "codex", "claude", "pi", "dsh"])
     p.add_argument("--model", help="GGUF file or catalog name (models.json); default: the catalog default for this GPU")
     p.add_argument("--models-dir", help="where downloads go (default ./models, or $TQLLM_MODELS)")
     p.add_argument("--yes", action="store_true", help="download missing catalog files without asking")
@@ -242,7 +290,7 @@ def main():
         return 0
     a, rest = p.parse_known_args()
     a.agent_args = rest[1:] if rest[:1] == ["--"] else rest
-    if a.command == "launch" and not a.agent: p.error("launch needs an agent: opencode, codex or claude")
+    if a.command == "launch" and not a.agent: p.error("launch needs an agent: opencode, codex, claude, pi or dsh")
     resolve_model(a)
     if a.drafter and not a.draft_vocab: p.error("--drafter needs --draft-vocab")
     def interrupt(*_): raise KeyboardInterrupt
