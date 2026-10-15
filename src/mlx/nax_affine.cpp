@@ -54,13 +54,22 @@ const char* kSource = R"METAL(
     for (int g = 0; g < KS / GS; g++) {
         const float4 s0 = bf16x4(*(const device ushort4*)(sp + g * 32 + fn)), s1 = bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
         const float4 b0 = bf16x4(*(const device ushort4*)(bp + g * 32 + fn)), b1 = bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
+        // PF: issue the whole group's weight loads before using them (more loads in flight per lane)
+        uint2 wv[GS / 16];
+        uint hv[GS / 16];
+        if (PF) {
+            for (short t = 0; t < GS / 16; t++) {
+                wv[t] = wp[(g * (GS / 16) + t) * 32];
+                hv[t] = BITS == 6 ? hp[(g * (GS / 16) + t) * 32] : 0u;
+            }
+        }
         for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
             half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
             half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + ks * 16) : half4(0.0h);
             for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
-            uint2 w = wp[ks * 32];
-            uint h = BITS == 6 ? hp[ks * 32] : 0u;
+            const uint2 w = PF ? wv[t] : wp[ks * 32];
+            const uint h = PF ? hv[t] : (BITS == 6 ? hp[ks * 32] : 0u);
             for (short p = 0; p < 4; p++) {
                 uint l0 = (w.x >> (4 * p)) & 0x000F000Fu, l1 = (w.y >> (4 * p)) & 0x000F000Fu;
                 if (BITS == 6) {
@@ -169,6 +178,11 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
 // K splits for one matrix: enough simdgroups to keep the memory system busy when each matmul waits for the previous
 // one (N/32 simdgroups per split), each split a whole number of groups. Depends only on the shape, never on the row
 // count, so a single row and a verify batch sum the same partial products in the same order.
+int nax_prefetch() {
+    static const int pf = std::getenv("TQLLM_MLX_NAX_PF") ? std::atoi(std::getenv("TQLLM_MLX_NAX_PF")) : 1;
+    return pf ? 1 : 0;
+}
+
 int nax_affine_splits(const NaxAffine& w) {
     static const int cap = std::getenv("TQLLM_MLX_NAX_MAX_SPLIT") ? std::atoi(std::getenv("TQLLM_MLX_NAX_MAX_SPLIT")) : 8;
     int split = 1;
@@ -189,7 +203,7 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
     return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
                     {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
-                     {"BF", round_bf16}},
+                     {"BF", round_bf16}, {"PF", nax_prefetch()}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
