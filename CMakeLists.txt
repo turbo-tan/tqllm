@@ -36,7 +36,13 @@ target_link_libraries(test-tokenizer-gguf PRIVATE tqllm)
 add_test(NAME tokenizer-gguf COMMAND test-tokenizer-gguf)
 add_executable(tqmoe-info tools/tqmoe_info.cpp src/gguf.cpp src/qwen4exp.cpp)
 target_include_directories(tqmoe-info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# chat templates and the serve session are host code: built in CPU-only builds too (tests run in the PR CI)
+add_library(tqjinja STATIC third_party/jinja/jinja/lexer.cpp third_party/jinja/jinja/parser.cpp third_party/jinja/jinja/runtime.cpp
+            third_party/jinja/jinja/string.cpp third_party/jinja/jinja/value.cpp tools/serve/jinja_template.cpp)
+target_include_directories(tqjinja PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
+set_target_properties(tqjinja PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
 if(TQLLM_CUDA)
+  add_compile_definitions(TQLLM_WITH_CUDA=1)  # session.hpp: image input (vision encoder) only in CUDA builds
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -75,10 +81,6 @@ if(TQLLM_CUDA)
   target_include_directories(tqfeat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
   target_link_libraries(tqfeat PRIVATE tqllm CUDA::cudart)
   endif()
-  add_library(tqjinja STATIC third_party/jinja/jinja/lexer.cpp third_party/jinja/jinja/parser.cpp third_party/jinja/jinja/runtime.cpp
-              third_party/jinja/jinja/string.cpp third_party/jinja/jinja/value.cpp tools/serve/jinja_template.cpp)
-  target_include_directories(tqjinja PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
-  set_target_properties(tqjinja PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
   # engine commit: src/COMMIT is filled in by git archive (export-subst); a checkout asks git, anything else is "dev"
   file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/src/COMMIT TQLLM_COMMIT LIMIT_COUNT 1)
   if(NOT TQLLM_COMMIT OR TQLLM_COMMIT MATCHES "Format")
@@ -297,17 +299,15 @@ if(BUILD_TESTING)
   add_executable(test-api-adapters tests/api_adapters.cpp)  # /v1/responses and /v1/messages on the chat path (no CUDA)
   target_include_directories(test-api-adapters PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
   add_test(NAME api_adapters COMMAND test-api-adapters)
-  if(TQLLM_CUDA)  # session.hpp includes cuda_runtime.h
-    add_executable(test-jinja tests/jinja_parity.cpp)
-    target_include_directories(test-jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
-                               ${CUDAToolkit_INCLUDE_DIRS})  # session.hpp -> vision.hpp -> cuda_runtime.h
-    target_link_libraries(test-jinja PRIVATE tqjinja)
-    add_test(NAME jinja COMMAND test-jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/qwen38_chat_template.jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/cases.json)
-    add_executable(test-serve tests/serve.cpp)
-    target_include_directories(test-serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
-                               ${CUDAToolkit_INCLUDE_DIRS})  # session.hpp -> vision.hpp -> cuda_runtime.h
-    add_test(NAME serve COMMAND test-serve)
-  endif()
+  add_executable(test-jinja tests/jinja_parity.cpp)
+  target_include_directories(test-jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
+                             ${CUDAToolkit_INCLUDE_DIRS})  # CUDA builds: session.hpp -> vision.hpp -> cuda_runtime.h
+  target_link_libraries(test-jinja PRIVATE tqjinja)
+  add_test(NAME jinja COMMAND test-jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/qwen38_chat_template.jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/cases.json)
+  add_executable(test-serve tests/serve.cpp)
+  target_include_directories(test-serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
+                             ${CUDAToolkit_INCLUDE_DIRS})
+  add_test(NAME serve COMMAND test-serve)
   add_test(NAME capability_probe COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_capability_probe.py)
   add_test(NAME docker_entrypoint COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_docker_entrypoint.py)
   add_test(NAME dockerfile_licenses COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_dockerfile_licenses.py)

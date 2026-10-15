@@ -2,10 +2,14 @@
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include <src/json.hpp>
+#if TQLLM_WITH_CUDA
 #include <src/vision.hpp>
+#endif
 #include "json_out.hpp"
 
+#if TQLLM_WITH_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -510,9 +514,11 @@ inline void set_timings(DecodeResult & r, const uint64_t * st) {
 
 // Server-wide vision encoder (--mmproj); requests encode under the mutex (the encoder reuses its buffers).
 struct Vision {
+#if TQLLM_WITH_CUDA
     std::unique_ptr<tqllm::VisionEncoder> enc;
-    std::mutex mu;
     cudaStream_t stream = nullptr;
+#endif
+    std::mutex mu;
     uint32_t pad_id = 0;  // <|image_pad|>
 };
 inline Vision *& vision() {
@@ -554,6 +560,10 @@ inline bool base64_decode(const std::string & in, size_t from, std::vector<uint8
 
 // Each <|image_pad|> of the prompt becomes the image's nx * ny placeholders; embeddings land in `images`.
 inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> & prompt, PreparedImages & images) {
+#if !TQLLM_WITH_CUDA
+    (void) req; (void) prompt; (void) images;
+    return "image input needs a CUDA build of tqserve";
+#else
     auto * v = vision();
     if (!v) return "this server has no vision encoder (start tqserve with --mmproj)";
     std::vector<size_t> pads;
@@ -600,6 +610,7 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
     }
     prompt = std::move(out);
     return {};
+#endif
 }
 
 // Tokenizes the prompt and sets the generation budget; result.error is set when the request cannot run.
