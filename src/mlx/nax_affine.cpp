@@ -210,6 +210,39 @@ NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
     return out;
 }
 
+NaxAffine nax_affine_select_rows(std::span<const uint8_t> payload, int rows, int columns, int bits, int group,
+                                 std::span<const uint32_t> keep) {
+    if (payload.size() != nax_affine_bytes(rows, columns, bits, group) || keep.empty() || keep.size() % 128)
+        throw std::invalid_argument("nax affine select rows: bad payload or row count");
+    const int blocks = rows / 32, steps = columns / 16, gpr = columns / group, n = int(keep.size());
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(payload.data());
+    const uint32_t* high = words + size_t(blocks) * steps * 32 * 2;
+    const uint16_t* scales = reinterpret_cast<const uint16_t*>(payload.data() + size_t(rows) * columns * bits / 8);
+    const uint16_t* biases = scales + size_t(blocks) * gpr * 32;
+    std::vector<uint8_t> codes(size_t(n) * columns);
+    std::vector<uint16_t> s(size_t(n) * gpr), b(s.size());
+    for (int out = 0; out < n; ++out) {
+        const uint32_t r = keep[out];
+        if (r >= uint32_t(rows)) throw std::invalid_argument("nax affine select rows: row out of range");
+        const int blk = int(r / 32), w = int(r % 32) / 16, nin = int(r % 16), q = nin >> 2, e = nin & 3;
+        for (int c = 0; c < columns; ++c) {
+            const int ks = c / 16, kk = c % 16, f = kk & 7, i = (kk >> 3) * 4 + e;
+            const int lane = ((f >> 2) << 4) | ((q >> 1) << 3) | (((f >> 1) & 1) << 2) | ((f & 1) << 1) | (q & 1);
+            const size_t at = (size_t(blk) * steps + ks) * 32 + lane;
+            uint32_t code = (words[at * 2 + w] >> (4 * i)) & 15u;
+            if (bits == 6) code |= ((high[at] >> (w * 8 + 2 * (i & 3) + 16 * (i >> 2))) & 3u) << 4;
+            codes[size_t(out) * columns + c] = uint8_t(code);
+        }
+        for (int g = 0; g < gpr; ++g) {
+            const size_t from = (size_t(blk) * gpr + g) * 32 + (r % 32);
+            s[size_t(out) * gpr + g] = scales[from];
+            b[size_t(out) * gpr + g] = biases[from];
+        }
+    }
+    auto packed = nax_affine_pack(codes, s, b, n, columns, bits, group);
+    return nax_affine_load(packed, n, columns, bits, group);
+}
+
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {
     if (rows == 0 || columns % 64) throw std::invalid_argument("affine8 embedding needs columns % 64 == 0");
     return rows * columns + rows * (columns / 64) * 4;

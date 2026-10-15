@@ -27,6 +27,9 @@ int nax_affine_splits(const NaxAffine& weights);
 // Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that
 // share an input).
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts);
+// Rows `keep` (in that order, a multiple of 128) of a stored payload, repacked as their own matrix.
+NaxAffine nax_affine_select_rows(std::span<const uint8_t> payload, int rows, int columns, int bits, int group,
+                                 std::span<const uint32_t> keep);
 
 // 8-bit affine, group 64, row-major codes: a token-embedding table read by gather.
 struct Affine8Embedding {

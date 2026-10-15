@@ -122,6 +122,8 @@ struct Qwen35::Impl {
     std::optional<Q4Embedding> embedding;
     std::optional<Affine8Embedding> embedding8;
     std::map<std::string,NaxAffine> nax;
+    std::vector<uint8_t> nax_head_payload;   // host copy of the NAX head, for the drafter's shortlist head
+    std::optional<NaxAffine> draft_nax_head;
     // projections sharing an input run as one NAX launch; members read column views of the shared result
     struct NaxGroup {NaxAffine weights;std::vector<std::pair<int,int>> parts;std::optional<std::pair<mx::array,mx::array>> last;};
     std::map<std::string,NaxGroup> nax_groups;
@@ -248,6 +250,7 @@ struct Qwen35::Impl {
                 const int bits=stored.type==GGML_NAX_A6_G64?6:4,group=stored.type==GGML_NAX_A4_G128?128:64;
                 nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
                                                  int(stored.ne[1]),int(stored.ne[0]),bits,group));
+                if(name=="output.weight")nax_head_payload.assign(reinterpret_cast<const uint8_t*>(raw.data()),reinterpret_cast<const uint8_t*>(raw.data())+raw.size());
                 return;
             }
             if(const auto& stored=file.tensors.at(name);is_tq_mlx_type(stored.type)) {
@@ -826,6 +829,7 @@ mx::array Qwen35::shared_draft_head(const mx::array& x) const {
     if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
         throw std::invalid_argument("invalid shared draft-head input");
     if(impl_->proposal_head)return draft_head4_matmul(*impl_->proposal_head,x);
+    if(impl_->draft_nax_head)return nax_affine_matmul(*impl_->draft_nax_head,x);
     if(auto found=impl_->nax.find("output.weight");found!=impl_->nax.end())return nax_affine_matmul(found->second,x);
     return impl_->mtp_head?q6_matmul(*impl_->mtp_head,x):linear(impl_->matrices.at("output.weight"),x);
 }
@@ -865,7 +869,16 @@ void Qwen35::enable_mtp() {
 void Qwen35::draft_shortlist(const mx::array& logits,int count) {
     if(count<1 || count>impl_->vocab || logits.shape()!=mx::Shape{1,impl_->vocab})
         throw std::invalid_argument("invalid MTP shortlist");
-    if(impl_->nax.contains("output.weight"))return;  // NAX head: the drafter scores the full vocabulary
+    if(auto head=impl_->nax.find("output.weight");head!=impl_->nax.end()) {
+        // the drafter scores only the target's `count` most likely tokens for this prompt (proposals only; verify uses the full head)
+        if(std::getenv("TQLLM_MLX_NAX_FULL_DRAFT_HEAD") || count%128)return;
+        auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
+        impl_->mtp_ids=mx::contiguous(mx::astype(tail_slice(ordered,0,impl_->vocab-count,impl_->vocab),mx::uint32));mx::eval(*impl_->mtp_ids);
+        const auto& h=head->second;
+        impl_->draft_nax_head=nax_affine_select_rows(impl_->nax_head_payload,h.rows,h.columns,h.bits,h.group,
+            {impl_->mtp_ids->data<uint32_t>(),size_t(count)});
+        return;
+    }
     const auto* head=std::get_if<Q6Weights>(&impl_->matrices.at("output.weight"));
     if(!head)throw std::invalid_argument("MTP shortlist requires Q6_K target head");
     auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});

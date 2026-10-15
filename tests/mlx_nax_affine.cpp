@@ -86,6 +86,32 @@ bool run_invariance(int rows, int k, std::mt19937& rng) {
     std::printf("NAX affine invariance rows=%d k=%d splits=%d row_mismatches=%zu\n", rows, k, nax_affine_splits(w), mismatches);
     return mismatches == 0;
 }
+// rows picked from a stored payload give the same products as those rows of the full matrix
+bool run_select(int bits, int group, std::mt19937& rng) {
+    const int rows = 512, k = 512, gpr = k / group;
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() % (1u << bits));
+    std::vector<uint16_t> s(size_t(rows) * gpr), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(0.01f + float(rng() % 100) * 1e-4f); b[i] = bf16_bits(float(int(rng() % 200) - 100) * 1e-3f);}
+    auto payload = nax_affine_pack(codes, s, b, rows, k, bits, group);
+    auto full = nax_affine_load(payload, rows, k, bits, group);
+    std::vector<uint32_t> keep(128);
+    for (auto& r : keep) r = uint32_t(rng() % rows);
+    auto sub = nax_affine_select_rows(payload, rows, k, bits, group, keep);
+    std::vector<float> x(size_t(3) * k);
+    for (auto& v : x) v = float(int(rng() % 2001) - 1000) * 1e-3f;
+    auto yf = rows_of(nax_affine_matmul(full, mx::array(x.data(), {3, k}, mx::float32)));
+    auto ys = rows_of(nax_affine_matmul(sub, mx::array(x.data(), {3, k}, mx::float32)));
+    double worst = 0, peak = 0;
+    for (int m = 0; m < 3; ++m)
+        for (int j = 0; j < 128; ++j) {
+            const double a = yf[size_t(m) * rows + keep[j]], c = ys[size_t(m) * 128 + j];
+            peak = std::max(peak, std::abs(a));
+            worst = std::max(worst, std::abs(a - c));
+        }
+    std::printf("NAX affine select rows bits=%d group=%d rel_err=%.3e\n", bits, group, worst / peak);
+    return worst / peak < 1e-5;
+}
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
@@ -110,7 +136,7 @@ bool run_embedding(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_embedding(rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
     return ok ? 0 : 1;
 }
