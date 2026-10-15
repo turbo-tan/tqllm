@@ -4,6 +4,7 @@
 // ggml/src/ggml-cuda/paw-x3.cu (hadamard_inner.cuh).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 
 namespace tqllm {
 namespace x3 {
