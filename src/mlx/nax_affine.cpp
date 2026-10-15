@@ -171,7 +171,10 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input) {
                     {w.rows, (m + mr - 1) / mr, split}, {128, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
-    return split == 1 ? mx::reshape(y, {m, w.rows}) : mx::sum(y, 0);
+    // element-wise adds in split order: a reduction kernel may pick its summation order from the row count
+    auto sum = mx::reshape(mx::slice(y, {0, 0, 0}, {1, m, w.rows}), {m, w.rows});
+    for (int i = 1; i < split; ++i) sum = mx::add(sum, mx::reshape(mx::slice(y, {i, 0, 0}, {i + 1, m, w.rows}), {m, w.rows}));
+    return sum;
 }
 
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {
