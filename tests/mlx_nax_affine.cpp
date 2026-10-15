@@ -167,7 +167,7 @@ bool run_gemm(int rows, int k, int bits, int group, std::mt19937& rng) {
     double worst = 0, peak = 0;
     for (size_t i = 0; i < ref.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - got[i])));}
     std::printf("NAX gemm rows=%d k=%d bits=%d group=%d dequant_mismatches=%zu rel_err_vs_row_kernel=%.3e\n", rows, k, bits, group, bad, worst / peak);
-    return bad == 0 && worst / peak < 5e-3;
+    return bad == 0 && worst / peak < 1e-2;  // FP16 GEMM output vs the row kernel's FP32 accumulate
 }
 // microseconds per 1024-row chunk at the FFN-down shape: row kernel vs dequantize + GEMM
 void bench_gemm(int rows, int k, std::mt19937& rng) {
@@ -187,6 +187,29 @@ void bench_gemm(int rows, int k, std::mt19937& rng) {
         std::printf("NAX_PREFILL_BENCH %s rows=%d k=%d m=1024 %.0f us (%.1f GB/s weight-equivalent at 4 bit)\n",
                     path ? "gemm" : "row_kernel", rows, k, us, double(rows) * k * 0.5 / us * 1e-3);
     }
+}
+
+// fused FP16 rotation equals tq4_rotate rounded to FP16 (to an FP16 ulp: summation order differs), rows independent
+bool run_rotate(std::mt19937& rng) {
+    bool ok = true;
+    for (int m : {1, 8, 40}) for (int k : {128, 5120, 17408}) {
+        std::vector<float> x(size_t(m) * k);
+        std::uniform_real_distribution<float> xd(-3.0f, 3.0f);
+        for (auto& v : x) v = xd(rng);
+        auto X = mx::array(x.data(), {m, k}, mx::float32);
+        auto ref = rows_of(mx::astype(tq4_rotate(X), mx::float32));
+        auto got = rows_of(mx::astype(tq4_rotate_half(X), mx::float32));
+        double worst = 0;
+        for (size_t i = 0; i < ref.size(); ++i) worst = std::max(worst, std::abs(ref[i] - got[i]) / (std::abs(ref[i]) * 9.8e-4 + 6e-5));
+        size_t mismatches = 0;
+        if (m > 1) {
+            auto one = rows_of(mx::astype(tq4_rotate_half(mx::array(x.data() + k, {1, k}, mx::float32)), mx::float32));
+            mismatches = std::memcmp(one.data(), &got[size_t(k)], size_t(k) * 4) != 0;
+        }
+        std::printf("TQ4 rotate_half m=%d k=%d worst_fp16_ulps=%.2f row_mismatch=%zu\n", m, k, worst, mismatches);
+        ok = ok && worst <= 1.01 && mismatches == 0;
+    }
+    return ok;
 }
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
@@ -212,7 +235,7 @@ bool run_embedding(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");

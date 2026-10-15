@@ -455,6 +455,11 @@ struct Qwen35::Impl {
             if(auto found=nax.find(name);found!=nax.end())return nax_affine_gemm(found->second,x,true);
         }
         if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
+            static const bool fused_rotation=std::getenv("TQLLM_MLX_TQ4_ROTATE_UNFUSED")==nullptr;
+            if(fused_rotation && !input_rotated) {
+                if(!nax_rotated_input || nax_rotated_input->first.id()!=x.id())nax_rotated_input=std::pair{x,tq4_rotate_half(x)};
+                return nax_affine_matmul(found->second,nax_rotated_input->second,true);
+            }
             auto xr=rotated();
             if(!nax_rotated_input || nax_rotated_input->first.id()!=xr.id())
                 nax_rotated_input=std::pair{xr,mx::contiguous(mx::astype(xr,mx::float16))};

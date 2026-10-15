@@ -171,7 +171,8 @@ for (uint t = 0; t < uint(NSUB); ++t) {
         simdgroup_multiply_accumulate(s1, k1, qf[d], s1);
     }
     // online softmax per query (a fragment column): lanes sharing fn differ in bits 1, 2 and 4
-    float2 e0 = s0.thread_elements(), e1 = s1.thread_elements();
+    float2 e0 = float2(s0.thread_elements()[0], s0.thread_elements()[1]);
+    float2 e1 = float2(s1.thread_elements()[0], s1.thread_elements()[1]);
     e0.x = key0 < visa ? e0.x : -INFINITY; e0.y = key0 < visb ? e0.y : -INFINITY;
     e1.x = key1 < visa ? e1.x : -INFINITY; e1.y = key1 < visb ? e1.y : -INFINITY;
     float xa = max(e0.x, e1.x), xb = max(e0.y, e1.y);

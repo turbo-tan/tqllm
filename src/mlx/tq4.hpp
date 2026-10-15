@@ -14,6 +14,8 @@ struct Tq4Weights {
 Tq4Weights load_tq4_blocks(std::span<const uint8_t> blocks, int rows, int columns);
 Affine8Weights tq4_affine8(const Tq4Weights& weights);
 mlx::core::array tq4_rotate(const mlx::core::array& input);
+// tq4_rotate fused into one kernel, FP16 result (input of the matrix-unit TQ4 path).
+mlx::core::array tq4_rotate_half(const mlx::core::array& input);
 // Packed codebook weights in the rotated basis; input is already rotated.
 mlx::core::array tq4_matmul(const mlx::core::array& codes,
                           const mlx::core::array& scales,

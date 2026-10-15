@@ -114,6 +114,41 @@ mx::array tq4_rotate(const mx::array& x) {
     return mx::reshape(mx::hadamard_transform(mx::multiply(blocks, signs), 1.0f / std::sqrt(128.0f)), x.shape());
 }
 
+// tq4_rotate in one launch, FP16 out (the matrix-unit kernel's input): one simdgroup per 128-column block, lane l
+// holds columns 4l..4l+3; signs, then the Sylvester-order Walsh-Hadamard butterflies (bits 0-1 in registers, bits
+// 2-6 across lanes), then the 1/sqrt(128) scale. Per-row work only, so every row is independent of the batch.
+mx::array tq4_rotate_half(const mx::array& x) {
+    if (x.ndim() != 2 || x.shape(0) <= 0 || x.shape(1) <= 0 || x.shape(1) % 128 ||
+        (x.dtype() != mx::float32 && x.dtype() != mx::float16 && x.dtype() != mx::bfloat16))
+        throw std::invalid_argument("TQ4 rotation requires floating point matrices with 128-column blocks");
+    static auto kernel = mx::fast::metal_kernel("tqllm_tq4_rotate_half", {"x"}, {"y"}, R"METAL(
+const uint lane = thread_index_in_simdgroup;
+const uint block = threadgroup_position_in_grid.x * 4u + simdgroup_index_in_threadgroup;
+const uint row = threadgroup_position_in_grid.y;
+if (block >= uint(K / 128)) return;
+constexpr uint W[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+const size_t base = (size_t)row * K + block * 128u + lane * 4u;
+float v[4];
+for (uint e = 0; e < 4u; ++e) {
+    const uint i = lane * 4u + e;
+    const float sign = ((W[i / 32u] >> (i % 32u)) & 1u) ? -1.0f : 1.0f;
+    v[e] = float(x[base + e]) * sign;
+}
+float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+for (uint m = 1u; m < 32u; m <<= 1u)
+    for (uint e = 0; e < 4u; ++e) {
+        const float other = simd_shuffle_xor(v[e], ushort(m));
+        v[e] = (lane & m) ? other - v[e] : v[e] + other;
+    }
+const float scale = 0.08838834764831845f;
+for (uint e = 0; e < 4u; ++e) y[base + e] = half(v[e] * scale);
+)METAL");
+    const int blocks = x.shape(1) / 128;
+    return kernel({mx::contiguous(x)}, {x.shape()}, {mx::float16}, {((blocks + 3) / 4) * 128, x.shape(0), 1}, {128, 1, 1},
+                  {{"K", x.shape(1)}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 mx::array tq4_matmul(const mx::array& codes, const mx::array& scales,
                     const mx::array& x, int rps, int cols, int simds, bool integer_levels) {
     if (codes.ndim() != 2 || scales.ndim() != 2 || x.ndim() != 2 ||
