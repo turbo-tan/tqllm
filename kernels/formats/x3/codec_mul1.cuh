@@ -120,6 +120,16 @@ __device__ __forceinline__ void mul1_extract8(const uint32_t* ptr, int t_offset,
     }
 }
 
+// Decode 8 windows (w0..w7) into 4 half2 (f0[0],f0[1],f1[0],f1[1]) via the mul1 codebook.
+__device__ __forceinline__ void mul1_decode8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
+                                             uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7,
+                                             FragB& f0, FragB& f1) {
+    f0[0] = mul1_decode_2(w0 * 0x83DCD12Du, w1 * 0x83DCD12Du);
+    f0[1] = mul1_decode_2(w2 * 0x83DCD12Du, w3 * 0x83DCD12Du);
+    f1[0] = mul1_decode_2(w4 * 0x83DCD12Du, w5 * 0x83DCD12Du);
+    f1[1] = mul1_decode_2(w6 * 0x83DCD12Du, w7 * 0x83DCD12Du);
+}
+
 // The mul1 codec. K = KH/2 (KH in {2,3,4,5,6,7,8}); `words` and `lanes` are what the skeletons need.
 template <int KH>
 struct Mul1Codec {
@@ -134,6 +144,73 @@ struct Mul1Codec {
         w[1] = mul1_decode_2(x[2] * 0x83DCD12Du, x[3] * 0x83DCD12Du);
         w[2] = mul1_decode_2(x[4] * 0x83DCD12Du, x[5] * 0x83DCD12Du);
         w[3] = mul1_decode_2(x[6] * 0x83DCD12Du, x[7] * 0x83DCD12Du);
+    }
+
+    // ---- register path (gemv_x3v) ----
+    static constexpr int  bits     = mul1_bits(KH);   // 1..4 or 15/25/35
+    static constexpr bool frac     = mul1_frac(KH);
+    static constexpr int  ka       = mul1_ka(KH);
+    static constexpr int  u32words = words / 2;                       // uint32 per 16x16 tile
+    static constexpr int  ld_stride = frac ? u32words : (bits == 3 ? 24 : 32);
+    static constexpr int  ld_lanes  = frac ? u32words : (bits == 3 ? 24 : 32);
+    static constexpr bool supports_gemv_x3v = (bits == 2 || bits == 3 || bits == 4 || frac);
+    static __host__ __device__ constexpr int loads(int WNT) { return WNT * u32words / ld_stride; }
+
+    // 8 weights of tile `t` for `lane`, from the warp's loaded words bw (x3v_dq8_regs_* ported).
+    __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
+        const uint32_t full = 0xffffffffu;
+        if constexpr (bits == 4) {
+            const uint32_t b = bw[t];
+            const uint32_t a = __shfl_sync(full, b, (lane + 31) & 31);
+            uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
+            FSHF_IMM(s, b, a, 20);
+            w7 = b & 0xffff;
+            BFE16_IMM(w6, b, 4); BFE16_IMM(w5, b, 8); BFE16_IMM(w4, b, 12); BFE16_IMM(w3, b, 16);
+            w2 = s & 0xffff; BFE16_IMM(w1, s, 4); BFE16_IMM(w0, s, 8);
+            mul1_decode8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+        } else if constexpr (bits == 2) {
+            const uint32_t w = bw[t >> 1];
+            const int base = (t & 1) << 4;
+            const int i1 = lane >> 1;
+            const uint32_t bwv = __shfl_sync(full, w, base + i1);
+            const uint32_t awv = __shfl_sync(full, w, base + ((i1 + 15) & 15));
+            const uint32_t b = fshift(bwv, awv, ((~uint32_t(lane << 3)) & 8) << 1);
+            uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+            w7 = b & 0xffff;
+            BFE16_IMM(w6, b, 2); BFE16_IMM(w5, b, 4); BFE16_IMM(w4, b, 6);
+            BFE16_IMM(w3, b, 8); BFE16_IMM(w2, b, 10); BFE16_IMM(w1, b, 12); BFE16_IMM(w0, b, 14);
+            mul1_decode8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+        } else if constexpr (frac) {
+            constexpr int P = 2 * ka + 1;
+            uint32_t w[8];
+            #pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int e = lane * (4 * P) + (g + 1) * (2 * P);
+                const int i2 = (e - 1) >> 5;
+                const uint32_t awv = __shfl_sync(full, bw[t], i2 == 0 ? u32words - 1 : i2 - 1);
+                const uint32_t bwv = __shfl_sync(full, bw[t], i2);
+                const uint32_t v = __funnelshift_r(bwv, awv, ((i2 + 1) << 5) - e);
+                w[4 * g + 3] = v & 0xffff;
+                w[4 * g + 2] = (v >> (ka + 1)) & 0xffff;
+                w[4 * g + 1] = (v >> P) & 0xffff;
+                w[4 * g + 0] = (v >> (P + ka + 1)) & 0xffff;
+            }
+            mul1_decode8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], f0, f1);
+        } else {  // bits == 3
+            const int t_offset = lane << 3;
+            const int b1 = (t_offset + 257) * 3;
+            const int b2 = b1 + 21;
+            const int i0 = (b1 - 16) / 32;
+            const int i2 = (b2 - 1) / 32;
+            const int x_s2 = (i2 + 1) * 32 - b2;
+            const uint32_t awv = __shfl_sync(full, bw[t], i0 % 24);
+            const uint32_t bwv = __shfl_sync(full, bw[t], i2 % 24);
+            uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+            w7 = fshift(bwv, awv, x_s2); w6 = w7 >> 3; w5 = w6 >> 3; w4 = w5 >> 3;
+            w3 = fshift(bwv, awv, x_s2 + 12); w2 = w3 >> 3; w1 = w2 >> 3; w0 = w1 >> 3;
+            mul1_decode8(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
+                         w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+        }
     }
 };
 

@@ -2,11 +2,20 @@
 // ptx.cuh: the raw PTX / ldmatrix / funnel-shift primitives the X3 kernels build on. Ported
 // verbatim from llama-paw-k25 ggml/src/ggml-cuda/paw-x3.cu (source line comments kept) so the
 // integer windows decode bit-identically to the fork.
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
 namespace tqllm {
 namespace x3 {
+
+// A fragment of 4 half2 = 8 decoded weights; the unit a codec decode() fills and the mma consumes.
+struct FragB { half2 v[2]; __device__ half2 & operator[](int i) { return v[i]; } };
+
+// An fp16-accumulator output fragment (m16n8k16), one per (n-tile, frag).
+struct FragCh { half2 v[2]; __device__ half2 & operator[](int i) { return v[i]; } };
+
+__host__ __device__ constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
     int d;
