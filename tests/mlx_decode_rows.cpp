@@ -45,6 +45,15 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
         mx::eval(one, full);
         exact = std::memcmp(one.data<float>(), full.data<float>(), one.size() * sizeof(float)) == 0;
     }
+    // a KV buffer longer than the filled length (in-place cache) gives the same bits as the exact-length arrays
+    {
+        const int cap = length + 77;
+        auto kb = mx::concatenate({k, random_array(rng, {1, kvheads, cap - length, dim}, 1.0f)}, 2);
+        auto vb = mx::concatenate({v, random_array(rng, {1, kvheads, cap - length, dim}, 1.0f)}, 2);
+        auto yb = mx::contiguous(decode_rows_attention(q, kb, vb, scale, length));
+        mx::eval(yb);
+        exact = exact && std::memcmp(yb.data<float>(), y.data<float>(), y.size() * sizeof(float)) == 0;
+    }
     std::printf("DECODE_ROWS heads=%d kv=%d dim=%d length=%d n=%d rel=%.2e batch_invariant=%d %s\n", heads, kvheads, dim,
                 length, n, worst / peak, int(exact), ok && exact ? "PASS" : "FAIL");
     return ok && exact;

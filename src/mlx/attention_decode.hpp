@@ -10,25 +10,26 @@ namespace tqllm::mlx_backend {
 // Decode attention for 1-8 query rows. Keys are split into fixed partitions and merged in partition order, so a
 // row's result does not depend on how many rows share the call (AR and the 8-row verify agree bit for bit).
 inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const mlx::core::array& k,
-                                              const mlx::core::array& v, float scale) {
+                                              const mlx::core::array& v, float scale, int valid = -1) {
     namespace mx = mlx::core;
     constexpr int PB = 64;
     if (q.ndim() != 4 || k.ndim() != 4 || q.shape(0) != 1 || k.shape(0) != 1 || q.shape(2) < 1 || q.shape(2) > 8 ||
-        k.shape(2) < q.shape(2) || v.shape() != k.shape() || q.shape(1) % k.shape(1) ||
+        (valid > 0 ? valid : k.shape(2)) < q.shape(2) || valid > k.shape(2) || v.shape() != k.shape() || q.shape(1) % k.shape(1) ||
         (q.shape(3) != 128 && q.shape(3) != 256) || k.shape(3) != q.shape(3) || q.dtype() != mx::float32 ||
         k.dtype() != mx::float32 || v.dtype() != mx::float32)
         throw std::invalid_argument("unsupported decode rows attention shape");
-    const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = k.shape(2);
+    const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = valid > 0 ? valid : k.shape(2);
     const int group = heads / kvheads, parts = (length + PB - 1) / PB;
-    const uint32_t layout[] = {uint32_t(length), uint32_t(n), uint32_t(parts)};
-    const auto layout_array = mx::array(layout, {3}, mx::uint32);
+    // k / v may be a KV buffer longer than `length`: rows are addressed with the buffer's own head stride
+    const uint32_t layout[] = {uint32_t(length), uint32_t(n), uint32_t(parts), uint32_t(k.shape(2))};
+    const auto layout_array = mx::array(layout, {4}, mx::uint32);
     static auto partial = mx::fast::metal_kernel("tqllm_decode_rows_partial", {"q", "k", "v", "layout", "scale"},
                                                  {"ms", "ls", "accs"}, R"METAL(
 uint sg = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint p = threadgroup_position_in_grid.x;
 uint g = threadgroup_position_in_grid.y;
-uint length = layout[0], rows = layout[1], parts = layout[2];
+uint length = layout[0], rows = layout[1], parts = layout[2], stride = layout[3];
 if (sg >= rows) return;
 uint vis = length - rows + sg + 1u;
 uint start = p * uint(PB);
@@ -46,8 +47,8 @@ for (uint h = 0; h < uint(GROUP); ++h) {
     m[h] = -INFINITY; l[h] = 0.0f;
 }
 for (uint j = start; j < end; ++j) {
-    const device float* kp = k + (g * length + j) * uint(DIM) + lane * E;
-    const device float* vp = v + (g * length + j) * uint(DIM) + lane * E;
+    const device float* kp = k + (g * stride + j) * uint(DIM) + lane * E;
+    const device float* vp = v + (g * stride + j) * uint(DIM) + lane * E;
     float kr[E], vr[E];
     for (uint e = 0; e < E; ++e) {kr[e] = kp[e]; vr[e] = vp[e];}
     for (uint h = 0; h < uint(GROUP); ++h) {

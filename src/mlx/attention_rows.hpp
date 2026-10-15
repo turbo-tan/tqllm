@@ -69,16 +69,21 @@ for(uint j=0;j<elements;++j) {
 }
 inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
         const mlx::core::array& k, const mlx::core::array& v, float scale,
-        bool decode_order, bool kv_views = false,bool fused_rows = false) {
+        bool decode_order, bool kv_views = false,bool fused_rows = false, int kv_valid = -1) {
     namespace mx = mlx::core;
-    const int n = q.shape(2), past = k.shape(2) - n;
-    if (past < 0 || v.shape(2) != k.shape(2))
+    // kv_valid > 0: k / v are KV buffers whose first kv_valid positions are filled
+    const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2), past = length - n;
+    if (past < 0 || v.shape(2) != k.shape(2) || length > k.shape(2))
         throw std::invalid_argument("attention cache shorter than query block");
     const bool decode_rows = std::getenv("TQLLM_MLX_ATTN_DECODE_ROWS") != nullptr;
     if (decode_rows && n <= 8 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
         k.dtype() == mx::float32 && v.dtype() == mx::float32 && (q.shape(3) == 128 || q.shape(3) == 256) &&
         q.shape(1) % k.shape(1) == 0)
-        return decode_rows_attention(q, k, v, scale);
+        return decode_rows_attention(q, k, v, scale, length);
+    if (kv_valid > 0 && kv_valid < k.shape(2))
+        return causal_attention_rows(q, mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}),
+                                     mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}),
+                                     scale, decode_order, kv_views, fused_rows);
     if(fused_rows && (decode_order || n==1) && q.shape(0)==1 && k.shape(2)<1024 &&
        n<=8 && (q.shape(3)==128 || q.shape(3)==256) && q.dtype()==mx::float32)
         return fused_decode_attention(q,k,v,scale);

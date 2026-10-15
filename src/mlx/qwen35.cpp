@@ -81,7 +81,8 @@ mx::array swiglu_rotated(const mx::array& gate,const mx::array& up) {
     return fused({gate,up})[0];
 }
 struct Cache {
-    std::optional<mx::array> conv,state,keys,values;
+    std::optional<mx::array> conv,state,keys,values;  // keys/values: MTP cache only
+    int kv_len=0;  // full-attention positions filled in the layer's KV buffer (Impl::kv_keys / kv_values)
 };
 struct PrefixTape {
     std::optional<mx::array> conv_inputs,states;
@@ -130,6 +131,8 @@ struct Qwen35::Impl {
     std::optional<std::pair<mx::array,mx::array>> nax_input;  // last matmul input and its FP16 copy (same-input projections)
     std::map<std::string,std::pair<std::string,int>> nax_member;
     std::vector<Cache> caches;
+    // full-attention KV buffers, written in place; never snapshotted (a snapshot keeps only Cache::kv_len)
+    std::vector<std::optional<mx::array>> kv_keys,kv_values;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
     bool serial_verify_attention=std::getenv("TQLLM_MLX_SERIAL_VERIFY_ATTENTION")!=nullptr;
@@ -375,6 +378,7 @@ struct Qwen35::Impl {
                 }
             }
         caches.resize(layers);
+        kv_keys.resize(layers);kv_values.resize(layers);
         tapes.resize(layers);
         if(mma8) {
             mma8_clear_pack_cache();
@@ -527,7 +531,7 @@ struct Qwen35::Impl {
             }
         return {mat(p+"ffn_gate.weight",x),mat(p+"ffn_up.weight",x)};
     }
-    mx::array full_attention(const std::string& p,const mx::array& x,Cache& c,int offset) {
+    mx::array full_attention(const std::string& p,const mx::array& x,Cache& c,int offset,int layer) {
         const int m=x.shape(0);
         auto qg=mx::reshape(mat(p+"attn_q.weight",x),{m,heads,2*hd});
         auto q=tail_slice(qg,2,0,hd),gate=tail_slice(qg,2,hd,2*hd);
@@ -536,9 +540,29 @@ struct Qwen35::Impl {
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
         auto v=mx::transpose(mx::reshape(mat(p+"attn_v.weight",x),{1,m,kvheads,hd}),{0,2,1,3});
         q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
-        c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
-        c.values=c.values?mx::concatenate({*c.values,v},2):v;
-        auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows);
+        if(layer<0) {  // MTP cache: appended by concatenation (its inject path does the same)
+            c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
+            c.values=c.values?mx::concatenate({*c.values,v},2):v;
+            auto out=causal_attention_rows(q,*c.keys,*c.values,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows);
+            out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
+            out=gate_mul_bf(out,gate);
+            return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
+        }
+        auto& kb=kv_keys[layer];auto& vb=kv_values[layer];
+        const int need=c.kv_len+m;
+        if(!kb || kb->shape(2)<need || kb->dtype()!=k.dtype()) {
+            const int cap=(need+255)/256*256+256;
+            auto nk=mx::zeros({1,kvheads,cap,hd},k.dtype()),nv=mx::zeros({1,kvheads,cap,hd},v.dtype());
+            if(kb && c.kv_len>0) {
+                nk=mx::slice_update(nk,mx::slice(*kb,{0,0,0,0},{1,kvheads,c.kv_len,hd}),{0,0,0,0},{1,kvheads,c.kv_len,hd});
+                nv=mx::slice_update(nv,mx::slice(*vb,{0,0,0,0},{1,kvheads,c.kv_len,hd}),{0,0,0,0},{1,kvheads,c.kv_len,hd});
+            }
+            kb=nk;vb=nv;
+        }
+        kb=mx::slice_update(*kb,k,{0,0,c.kv_len,0},{1,kvheads,need,hd});
+        vb=mx::slice_update(*vb,v,{0,0,c.kv_len,0},{1,kvheads,need,hd});
+        c.kv_len=need;
+        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows,need);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         out=gate_mul_bf(out,gate);
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
@@ -638,10 +662,10 @@ struct Qwen35::Impl {
             auto n=norm(x,p+"attn_norm.weight");
             const bool is_attn=(l+1)%interval==0;
             auto attn=ablate_blocks.find(is_attn?"attn":"gdn")!=std::string::npos?mx::zeros(x.shape(),x.dtype()):
-                is_attn?full_attention(p,n,caches[l],pos):gdn(p,n,caches[l],tapes[l]);
+                is_attn?full_attention(p,n,caches[l],pos,l):gdn(p,n,caches[l],tapes[l]);
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
-                for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)values.push_back(**a);
+                for(const auto* a:{&c.conv,&c.state,&kv_keys[l],&kv_values[l]})if(*a)values.push_back(**a);
                 record((l+1)%interval==0?"attention":"gdn_mixer",values);
             }
             x=add_bf(x,attn);n=norm(x,p+"post_attention_norm.weight");
@@ -669,9 +693,8 @@ struct Qwen35::Impl {
             for(const auto& c:caches) {
                 if(c.conv) live.push_back(*c.conv);
                 if(c.state) live.push_back(*c.state);
-                if(c.keys) live.push_back(*c.keys);
-                if(c.values) live.push_back(*c.values);
             }
+            for(const auto* kv:{&kv_keys,&kv_values})for(const auto& a:*kv)if(a)live.push_back(*a);
             if(capture_prefix)for(const auto& t:tapes)
                 for(const auto* a:{&t.states,&t.keys,&t.decay,&t.deltas})if(*a)live.push_back(**a);
         }
@@ -799,8 +822,7 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     if(count && count<size_t(s->count))for(int l=0;l<impl_->layers;++l) {
         auto& c=caches[l];const auto& tape=s->tapes[l];
         if((l+1)%impl_->interval==0) {
-            c.keys=mx::contiguous(tail_slice(*c.keys,2,0,s->start+int(count)));
-            c.values=mx::contiguous(tail_slice(*c.values,2,0,s->start+int(count)));
+            c.kv_len=s->start+int(count);  // positions past the length are rewritten by the next append
         } else {
             c.conv=mx::contiguous(tail_slice(*tape.conv_inputs,0,int(count),int(count)+impl_->conv-1));
             c.state=tape.deltas?gdn_replay_prefix(*tape.keys,*tape.decay,*tape.deltas,s->before[l].state,int(count)):
@@ -808,7 +830,7 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
         }
     }
     std::vector<mx::array> live;
-    for(const auto& c:caches)for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)live.push_back(**a);
+    for(const auto& c:caches)for(const auto* a:{&c.conv,&c.state})if(*a)live.push_back(**a);
     mx::eval(live);
     impl_->caches=std::move(caches);impl_->pos=s->start+int(count);++impl_->revision;
     impl_->last_hidden=count?std::optional<mx::array>(tail_slice(*s->hidden_after,0,int(count)-1,int(count))):s->hidden_before;
@@ -943,7 +965,7 @@ mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array
     auto embedded=bf(i.embed(tokens));
     auto joined=mx::concatenate({i.norm(embedded,p+"nextn.enorm.weight"),i.norm(hidden,p+"nextn.hnorm.weight")},1);
     auto x=i.mat(p+"nextn.eh_proj.weight",joined);
-    x=bf(mx::add(x,i.full_attention(p,i.norm(x,p+"attn_norm.weight"),i.mtp_cache,position)));
+    x=bf(mx::add(x,i.full_attention(p,i.norm(x,p+"attn_norm.weight"),i.mtp_cache,position,-1)));
     auto normed=i.norm(x,p+"post_attention_norm.weight");
     auto [gate,up]=i.gate_up(p,normed);
     x=bf(mx::add(x,i.mat(p+"ffn_down.weight",bf(mx::multiply(bf(silu(gate)),up)))));

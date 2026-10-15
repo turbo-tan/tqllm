@@ -52,7 +52,7 @@ int main(int argc,char** argv) {
             if(mode) {if(!head4)engine.draft_shortlist(logits,shortlist);if(!(prefill_chunk>0 && int(prompt.size())>prefill_chunk))drafter.inject(engine.feature_states(),0);}
             const double prefill=seconds(begin);uint32_t pending=mx::argmax(logits).item<uint32_t>();
             std::vector<uint32_t> output{pending};int steps=0,drafted=0,accepted_total=0;
-            double draft_ms=0,verify_ms=0,commit_ms=0,build_ms=0,step_ms=0;const auto start=Clock::now();
+            double draft_ms=0,verify_ms=0,commit_ms=0,build_ms=0,step_ms=0,accept_ms=0;const auto start=Clock::now();
             while(output.size()<size_t(count) && output.back()!=tokenizer.eos_id()) {
                 if(!mode) {logits=engine.forward({&pending,1});pending=mx::argmax(logits).item<uint32_t>();output.push_back(pending);continue;}
                 const int pos=engine.position(),want=std::min(width,int(count-output.size()));
@@ -76,6 +76,7 @@ int main(int argc,char** argv) {
                 }
                 if(output.size()<size_t(count) && output.back()!=tokenizer.eos_id())output.push_back(ids[accepted]);
                 pending=ids[accepted];begin=Clock::now();engine.accept_prefix(ticket,accepted+1);
+                if(std::getenv("TQLLM_MLX_SPLIT_COMMIT_TIMING")){mx::synchronize();}accept_ms+=seconds(begin)*1000;
                 drafter.inject(rows(features,0,accepted+1),pos);commit_ms+=seconds(begin)*1000;step_ms+=seconds(step_begin)*1000;
             }
             const double decode=seconds(start);if(run<0)continue;
@@ -87,7 +88,7 @@ int main(int argc,char** argv) {
                      <<",\"output_tokens\":"<<output.size()<<",\"decode_tok_s\":"<<(output.size()-1)/decode
                      <<",\"ttft_ms\":"<<prefill*1000<<",\"steps\":"<<steps<<",\"drafted\":"<<drafted<<",\"accepted\":"<<accepted_total
                      <<",\"draft_ms\":"<<draft_ms<<",\"verify_ms\":"<<verify_ms<<",\"commit_ms\":"<<commit_ms<<",\"verify_build_ms\":"<<build_ms
-                     <<",\"step_ms\":"<<step_ms<<",\"decode_ms\":"<<decode*1000
+                     <<",\"step_ms\":"<<step_ms<<",\"accept_ms\":"<<accept_ms<<",\"decode_ms\":"<<decode*1000
                      <<",\"ar_equal_prefix\":"<<equal<<",\"active_bytes\":"<<mx::get_active_memory()<<",\"token_ids\":[";
             for(size_t j=0;j<output.size();++j)std::cout<<(j?",":"")<<output[j];std::cout<<"]}"<<std::endl;
             std::cerr<<"GENERATED_TEXT mode="<<(mode?"spec":"ar")<<' '<<tokenizer.decode(output)<<'\n';
