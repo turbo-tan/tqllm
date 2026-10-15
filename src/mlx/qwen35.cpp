@@ -345,11 +345,15 @@ struct Qwen35::Impl {
                 for(const auto* name:{"ssm_conv1d.weight","ssm_a","ssm_dt.bias","ssm_norm.weight"}) scalar(p+name);
             }
         }
-        if(!(std::getenv("TQLLM_MLX_NAX_FUSE") && std::string_view(std::getenv("TQLLM_MLX_NAX_FUSE"))=="0"))
+        const std::string fuse=std::getenv("TQLLM_MLX_NAX_FUSE")?std::getenv("TQLLM_MLX_NAX_FUSE"):"";
+        std::vector<std::vector<std::string>> fused_sets;
+        if(fuse.find("ffn")!=std::string::npos)fused_sets.push_back({"ffn_gate.weight","ffn_up.weight"});
+        if(fuse.find("mixer")!=std::string::npos)fused_sets.push_back({"attn_qkv.weight","attn_gate.weight"});
+        if(fuse.find("attn")!=std::string::npos)fused_sets.push_back({"attn_q.weight","attn_k.weight","attn_v.weight"});
+        if(!fused_sets.empty())
             for(int l=0;l<layers;++l) {
                 const std::string p="blk."+std::to_string(l)+".";
-                for(const auto& members:std::vector<std::vector<std::string>>{{"ffn_gate.weight","ffn_up.weight"},
-                        {"attn_qkv.weight","attn_gate.weight"},{"attn_q.weight","attn_k.weight","attn_v.weight"}}) {
+                for(const auto& members:fused_sets) {
                     std::vector<const NaxAffine*> parts;
                     for(const auto& m:members)if(auto f=nax.find(p+m);f!=nax.end())parts.push_back(&f->second);
                     if(parts.size()!=members.size())continue;
