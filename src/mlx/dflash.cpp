@@ -287,7 +287,7 @@ void DFlash2::inject(const mx::array& features,int position) {
         }
         live.push_back(*c.k);live.push_back(*c.v);
     }
-    static const bool lazy=std::getenv("TQLLM_MLX_LAZY_INJECT")!=nullptr;  // evaluated with the next draft
+    static const bool lazy=std::getenv("TQLLM_MLX_EAGER_COMMIT")==nullptr;  // evaluated with the next draft
     if(!lazy)mx::eval(live);
     i.end+=n;
 }
