@@ -871,7 +871,7 @@ void Qwen35::draft_shortlist(const mx::array& logits,int count) {
         throw std::invalid_argument("invalid MTP shortlist");
     if(auto head=impl_->nax.find("output.weight");head!=impl_->nax.end()) {
         // the drafter scores only the target's `count` most likely tokens for this prompt (proposals only; verify uses the full head)
-        if(std::getenv("TQLLM_MLX_NAX_FULL_DRAFT_HEAD") || count%128)return;
+        if(!std::getenv("TQLLM_MLX_NAX_DRAFT_SHORTLIST") || count%128)return;
         auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
         impl_->mtp_ids=mx::contiguous(mx::astype(tail_slice(ordered,0,impl_->vocab-count,impl_->vocab),mx::uint32));mx::eval(*impl_->mtp_ids);
         const auto& h=head->second;
