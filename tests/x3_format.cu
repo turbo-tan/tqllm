@@ -111,6 +111,36 @@ void test_row(const x3::X3Codec* c, int rows, int cols) {
         if (d_locks) cudaFree(d_locks);
     }
 
+    // Width independence: the x3v path processes batch columns independently, so column j of an
+    // n=7 call must equal column j of an n=4 call on the same input.
+    if (c->has_x3v) {
+        const int n7 = 7, n4 = 4;
+        std::vector<half> x(size_t(cols) * n7);
+        for (auto& v : x) v = __float2half(rnd());
+        auto run = [&](int n) {
+            std::vector<float> A(size_t(n) * cols);
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < cols; ++i) A[size_t(j) * cols + i] = __half2float(x[size_t(i) * n7 + j]);
+            float* dA = dev_up(A);
+            float* dC = nullptr; cudaMalloc(&dC, size_t(n) * rows * 4);
+            half* dH = nullptr; cudaMalloc(&dH, size_t(n) * cols * 2);
+            std::vector<float> C(size_t(n) * rows);
+            c->gemv(dA, d_t, dC, n, cols, rows, d_suh, dH, d_svh, nullptr, 0);
+            cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost);
+            cudaFree(dA); cudaFree(dC); cudaFree(dH);
+            return C;
+        };
+        const std::vector<float> C7 = run(n7), C4 = run(n4);
+        bool eq = true; double mx = 0.0;
+        for (int j = 0; j < n4; ++j)
+            for (int r = 0; r < rows; ++r) {
+                const double d = std::fabs(double(C7[size_t(j) * rows + r]) - double(C4[size_t(j) * rows + r]));
+                if (C7[size_t(j) * rows + r] != C4[size_t(j) * rows + r]) eq = false;
+                if (d > mx) mx = d;
+            }
+        check(eq, std::string(c->name) + ": width independence n=4 col == n=7 col (maxdiff=" + std::to_string(mx) + ")");
+    }
+
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W);
 }
 
