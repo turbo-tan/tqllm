@@ -70,6 +70,8 @@ def main():
     ap.add_argument("--config", help="RCO allocation .txt")
     ap.add_argument("--uniform-bw", type=int)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--embed-bits", type=int, default=0)
+    ap.add_argument("--head-bits", type=int, default=0)
     a = ap.parse_args()
     assign = read_assignment(a.config) if a.config else {}
     model, layers, out = Path(a.model), Path(a.layer_dir), Path(a.out)
@@ -79,6 +81,8 @@ def main():
             continue
         if f.is_file():
             shutil.copy(f, out / f.name)
+    for old in out.glob("model-*.safetensors"):
+        old.unlink()
     quant_cfg = {"group_size": 128, "bits": 4}
     shard, pending, pending_bytes, shards = 0, {}, 0, []
 
@@ -103,9 +107,12 @@ def main():
     for st in sorted(model.glob("*.safetensors")):
         with safe_open(st, "pt") as f:
             for key in f.keys():
+                if key.startswith("mtp."):
+                    continue
                 module = key[: -len(".weight")] if key.endswith(".weight") else None
-                bits = assign.get(module, a.uniform_bw) if module else None
-                qfile = layers / module / f"{bits}_qparams.pt" if bits else None
+                dbname = module.replace("model.language_model.", "model.", 1) if module else None
+                bits = assign.get(dbname, a.uniform_bw) if module else None
+                qfile = layers / dbname / f"{bits}_qparams.pt" if bits else None
                 if qfile is not None and qfile.exists():
                     bundle = torch.load(qfile, map_location="cpu", weights_only=False)
                     q, scales, biases = affine_from_qparams(bundle)
@@ -113,6 +120,15 @@ def main():
                     add(module + ".scales", bf16(scales), "BF16")
                     add(module + ".biases", bf16(biases), "BF16")
                     quant_cfg[module] = {"group_size": 128, "bits": bits}
+                elif (key.endswith("embed_tokens.weight") and a.embed_bits) or (key.endswith("lm_head.weight") and a.head_bits):
+                    import mlx.core as mx
+                    b = a.embed_bits if "embed_tokens" in key else a.head_bits
+                    t = f.get_tensor(key).to(torch.float32).numpy()
+                    wq, sc, bi = mx.quantize(mx.array(t), group_size=64, bits=b)
+                    add(key, np.array(wq), "U32")
+                    add(module + ".scales", np.array(sc.astype(mx.bfloat16).view(mx.int16)), "BF16")
+                    add(module + ".biases", np.array(bi.astype(mx.bfloat16).view(mx.int16)), "BF16")
+                    quant_cfg[module] = {"group_size": 64, "bits": b}
                 else:
                     t = f.get_tensor(key)
                     if t.dtype == torch.bfloat16:

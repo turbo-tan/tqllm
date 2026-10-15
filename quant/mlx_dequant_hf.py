@@ -43,6 +43,8 @@ def main():
         weights.update(mx.load(str(st)))
     result = {}
     for key, w in weights.items():
+        if key.startswith("mtp."):
+            continue
         if key.endswith(".scales") or key.endswith(".biases"):
             continue
         module = key[:-7] if key.endswith(".weight") else None
