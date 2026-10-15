@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 
 namespace mx = mlx::core;
@@ -41,11 +42,14 @@ const char* kSource = R"METAL(
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
-    auto ca2 = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
     auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    for (short i = 0; i < 16; i++) cc[i] = 0.0f;
+#if NAX_WIDE
+    auto ca2 = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    for (short i = 0; i < 16; i++) { cc[i] = 0.0f; cc2[i] = 0.0f; }
+    for (short i = 0; i < 16; i++) cc2[i] = 0.0f;
+#endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
     const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
     const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
@@ -74,23 +78,31 @@ const char* kSource = R"METAL(
                 cb[p] = v0.x; cb[p + 4] = v0.y; cb[8 + p] = v1.x; cb[12 + p] = v1.y;
             }
             op.run(ca, cb, cc);
-            if (MR > 16) {
+#if NAX_WIDE
+            {
                 half4 a2 = fm + 16 < rows ? *(const device half4*)(xs + 16 * K + ks * 16) : half4(0.0h);
                 half4 a3 = fm + 24 < rows ? *(const device half4*)(xs + 24 * K + ks * 16) : half4(0.0h);
                 for (short i = 0; i < 4; i++) { ca2[i] = a2[i]; ca2[4 + i] = a3[i]; }
                 op.run(ca2, cb, cc2);
             }
+#endif
         }
     }
     if (SPLIT > 1) {
         // partials meet in threadgroup memory; split 0 adds them in split order, so the sum order is fixed per element
         threadgroup float* mine = part + ((local * SPLIT + split) * 32 + lane) * E;
-        for (short i = 0; i < 16; i++) { mine[i] = cc[i]; if (MR > 16) mine[16 + i] = cc2[i]; }
+        for (short i = 0; i < 16; i++) mine[i] = cc[i];
+#if NAX_WIDE
+        for (short i = 0; i < 16; i++) mine[16 + i] = cc2[i];
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (split != 0) return;
         for (int p = 1; p < SPLIT; p++) {
             const threadgroup float* other = part + ((local * SPLIT + p) * 32 + lane) * E;
-            for (short i = 0; i < 16; i++) { cc[i] = cc[i] + other[i]; if (MR > 16) cc2[i] = cc2[i] + other[16 + i]; }
+            for (short i = 0; i < 16; i++) cc[i] = cc[i] + other[i];
+#if NAX_WIDE
+            for (short i = 0; i < 16; i++) cc2[i] = cc2[i] + other[16 + i];
+#endif
         }
     }
     const uint col0 = blk * 32 + fn;
@@ -99,7 +111,9 @@ const char* kSource = R"METAL(
         const uint c = col0 + (i >> 3) * 16 + (i & 3);
         const float v = BF ? float(bfloat16_t(float(cc[i]))) : float(cc[i]);
         if (r < rows) Y[(size_t)(row0 + r) * N + c] = v;
-        if (MR > 16 && r + 16 < rows) Y[(size_t)(row0 + r + 16) * N + c] = BF ? float(bfloat16_t(float(cc2[i]))) : float(cc2[i]);
+#if NAX_WIDE
+        if (r + 16 < rows) Y[(size_t)(row0 + r + 16) * N + c] = BF ? float(bfloat16_t(float(cc2[i]))) : float(cc2[i]);
+#endif
     }
 )METAL";
 }
@@ -179,9 +193,13 @@ int nax_affine_splits(const NaxAffine& w) {
 mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool round_bf16) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine matmul: input must be [m, columns]");
-    static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
-                                                kSource, kHeader);
+    // the 16-row kernel does not declare the second row tile, so it holds fewer registers per simdgroup
+    static auto kernel16 = mx::fast::metal_kernel("tqllm_nax_affine16", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
+                                                  std::string("#define NAX_WIDE 0\n") + kSource, kHeader);
+    static auto kernel32 = mx::fast::metal_kernel("tqllm_nax_affine32", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
+                                                  std::string("#define NAX_WIDE 1\n") + kSource, kHeader);
     const int m = input.shape(0), mr = m <= 16 ? 16 : 32, split = nax_affine_splits(w);
+    auto& kernel = mr == 16 ? kernel16 : kernel32;
     auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);
     auto count = mx::array(&m32, {1}, mx::uint32);
