@@ -36,6 +36,8 @@ int main(int argc,char** argv) {
         const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4")!=nullptr;
         if(head4)engine.enable_draft_head4();
         std::vector<uint32_t> reference,first_spec;
+        const bool rank_stats=std::getenv("TQLLM_MLX_DFLASH_RANKSTATS")!=nullptr;
+        std::vector<long> rank_hist(17,0),chosen_hist(17,0),rejection_at(8,0);long rejections=0;
         for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             engine.reset();drafter.reset();auto begin=Clock::now();mx::array logits=mx::array(0.0f);
             if(prefill_chunk>0 && int(prompt.size())>prefill_chunk) {
@@ -61,6 +63,12 @@ int main(int argc,char** argv) {
                 mx::eval(choices);const auto* ids=choices.data<uint32_t>();
                 auto features=engine.feature_states();verify_ms+=seconds(begin)*1000;build_ms+=engine.timings().first;
                 int accepted=0;while(accepted<want && proposed[accepted]==ids[accepted])++accepted;
+                if(rank_stats && mode && run>=0 && accepted<want) {
+                    const auto& c=drafter.candidates();int rank=16;
+                    for(int j=0;j<16 && accepted<int(c.size());++j)if(c[accepted][j]==ids[accepted]){rank=j;break;}
+                    int chosen=16;for(int j=0;j<16 && accepted<int(c.size());++j)if(c[accepted][j]==proposed[accepted]){chosen=j;break;}
+                    ++rank_hist[rank];++chosen_hist[chosen];++rejections;rejection_at[accepted]++;
+                }
                 ++steps;drafted+=want;accepted_total+=accepted;
                 for(int j=0;j<accepted && output.size()<size_t(count);++j) {
                     output.push_back(proposed[j]);if(output.back()==tokenizer.eos_id())break;
@@ -81,6 +89,13 @@ int main(int argc,char** argv) {
                      <<",\"ar_equal_prefix\":"<<equal<<",\"active_bytes\":"<<mx::get_active_memory()<<",\"token_ids\":[";
             for(size_t j=0;j<output.size();++j)std::cout<<(j?",":"")<<output[j];std::cout<<"]}"<<std::endl;
             std::cerr<<"GENERATED_TEXT mode="<<(mode?"spec":"ar")<<' '<<tokenizer.decode(output)<<'\n';
+        }
+        if(rank_stats) {
+            std::cout<<"{\"kind\":\"dflash_rank_stats\",\"rejections\":"<<rejections<<",\"target_rank\":[";
+            for(int j=0;j<17;++j)std::cout<<(j?",":"")<<rank_hist[j];
+            std::cout<<"],\"chosen_rank\":[";for(int j=0;j<17;++j)std::cout<<(j?",":"")<<chosen_hist[j];
+            std::cout<<"],\"rejection_position\":[";for(int j=0;j<8;++j)std::cout<<(j?",":"")<<rejection_at[j];
+            std::cout<<"]}"<<std::endl;
         }
     } catch(const std::exception& e) {std::cerr<<"DFLASH_ERROR "<<e.what()<<'\n';return 1;}
 }

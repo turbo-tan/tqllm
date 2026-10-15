@@ -153,6 +153,7 @@ struct DFlash2::Impl {
     std::vector<int> features;
     std::map<std::string,Matrix> matrices;
     std::map<std::string,NaxAffine> nax;
+    std::vector<std::vector<uint32_t>> candidates;
     std::map<std::string,TqTiledWeights> tiled_ffn;
     std::map<std::string,Mma8Weights> mma8_attn;
     std::optional<std::pair<mx::array,mx::array>> rotation_half;
@@ -266,6 +267,7 @@ struct DFlash2::Impl {
 };
 DFlash2::DFlash2(const std::string& path,Qwen35& target):impl_(std::make_unique<Impl>(path,target)) {}
 DFlash2::~DFlash2()=default;
+const std::vector<std::vector<uint32_t>>& DFlash2::candidates() const {return impl_->candidates;}
 const std::vector<int>& DFlash2::feature_layers() const {return impl_->features;}
 void DFlash2::reset() {impl_->end=0;impl_->rotation.reset();impl_->rotation_half.reset();for(auto& c:impl_->caches)c=Impl::Kv{};}
 void DFlash2::inject(const mx::array& features,int position) {
@@ -321,6 +323,16 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     }();
     auto unary=mx::take_along_axis(logits,selected,-1);
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
+    if(std::getenv("TQLLM_MLX_DFLASH_RANKSTATS")) {
+        auto ids=mx::contiguous(mx::astype(mapped,mx::uint32));auto score=mx::contiguous(mx::astype(unary,mx::float32));mx::eval(ids,score);
+        i.candidates.assign(count,{});
+        for(int n=1;n<=count;++n) {
+            std::vector<int> order(16);for(int j=0;j<16;++j)order[j]=j;
+            const float* sc=score.data<float>()+n*16;
+            std::sort(order.begin(),order.end(),[&](int a,int b){return sc[a]>sc[b];});
+            for(int j:order)i.candidates[n-1].push_back(ids.data<uint32_t>()[n*16+j]);
+        }
+    }
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
     if(std::getenv("TQLLM_MLX_DEVICE_SELECTOR")) {

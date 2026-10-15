@@ -17,6 +17,8 @@ public:
     void reset();
     void inject(const mlx::core::array& features,int position);
     std::vector<uint32_t> draft(uint32_t anchor,int position,int count);
+    // with TQLLM_MLX_DFLASH_RANKSTATS: the last draft's 16 candidates per proposed token, best unary score first
+    const std::vector<std::vector<uint32_t>>& candidates() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
