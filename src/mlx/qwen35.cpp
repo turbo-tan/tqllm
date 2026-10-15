@@ -125,6 +125,7 @@ struct Qwen35::Impl {
     // projections sharing an input run as one NAX launch; members read column views of the shared result
     struct NaxGroup {NaxAffine weights;std::vector<std::pair<int,int>> parts;std::optional<std::pair<mx::array,mx::array>> last;};
     std::map<std::string,NaxGroup> nax_groups;
+    std::optional<std::pair<mx::array,mx::array>> nax_input;  // last matmul input and its FP16 copy (same-input projections)
     std::map<std::string,std::pair<std::string,int>> nax_member;
     std::vector<Cache> caches;
     std::vector<PrefixTape> tapes;
@@ -432,7 +433,9 @@ struct Qwen35::Impl {
             return mx::slice(g.last->second,{0,off},{x.shape(0),off+rows});
         }
         if(auto found=nax.find(name);found!=nax.end()) {
-            auto y=nax_affine_matmul(found->second,x,true);
+            if(!std::getenv("TQLLM_MLX_NAX_NO_INPUT_CACHE") && (!nax_input || nax_input->first.id()!=x.id()))
+                nax_input=std::pair{x,mx::contiguous(mx::astype(x,mx::float16))};
+            auto y=nax_affine_matmul(found->second,std::getenv("TQLLM_MLX_NAX_NO_INPUT_CACHE")?x:nax_input->second,true);
             if(std::getenv("TQLLM_MLX_NAX_ROW_CHECK") && x.shape(0)>1) {
                 auto full=mx::contiguous(y);mx::eval(full,x);
                 const auto xf=mx::astype(x,mx::float32);mx::eval(xf);
