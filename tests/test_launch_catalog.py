@@ -108,6 +108,61 @@ class LaunchDrafter(unittest.TestCase):
             self.assertEqual(a.model, model); self.assertIsNone(a.drafter)
 
 
+class LaunchPiAndDsh(unittest.TestCase):
+    """pi and dsh get their provider through a temp dir/file the launcher creates and deletes."""
+    def _load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tqllm_launch_pd", os.path.join(LAUNCH, "tqllm.py"))
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+
+    def _args(self, agent, extra=()):
+        import types
+        return types.SimpleNamespace(agent=agent, agent_args=list(extra), model="/models/m.gguf",
+                                     context=65536, max_tokens=32768)
+
+    def test_pi_command_and_models_json(self):
+        mod = self._load()
+        a = self._args("pi"); env = {}
+        cmd = mod.agent_command(a, "http://127.0.0.1:8086", env)
+        self.assertEqual(cmd, ["pi", "--provider", "tqllm", "--model", "tqllm"])
+        d = env["PI_CODING_AGENT_DIR"]
+        try:
+            cfg = json.load(open(os.path.join(d, "models.json")))
+            p = cfg["providers"]["tqllm"]
+            self.assertEqual(p["baseUrl"], "http://127.0.0.1:8086/v1")
+            self.assertEqual(p["models"][0]["id"], "tqllm")
+            self.assertEqual(p["models"][0]["contextWindow"], 65536)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dsh_web_command_and_patch(self):
+        mod = self._load()
+        a = self._args("dsh"); env = {}
+        cmd = mod.agent_command(a, "http://127.0.0.1:8086", env)
+        f = a.temp
+        try:
+            self.assertEqual(cmd, ["dsh", "web", "--patch", f])
+            self.assertEqual(env["TQLLM_API_KEY"], "tqllm-local")
+            text = open(f).read()
+            self.assertIn("baseURL: http://127.0.0.1:8086/v1", text)
+            self.assertIn("agent-default-model", text)
+            self.assertIn("provider: tqllm", text)
+        finally:
+            if os.path.exists(f): os.remove(f)
+
+    def test_dsh_headless_profile_is_consumed(self):
+        mod = self._load()
+        a = self._args("dsh", ["headless", "fix it"]); env = {}
+        cmd = mod.agent_command(a, "http://127.0.0.1:8086", env)
+        f = a.temp
+        try:
+            self.assertEqual(cmd, ["dsh", "headless", "--patch", f, "fix it"])
+            self.assertEqual(env["TQLLM_API_KEY"], "tqllm-local")
+        finally:
+            if os.path.exists(f): os.remove(f)
+
+
 if __name__ == "__main__":
     unittest.main()
 
