@@ -1,4 +1,5 @@
 #include "nax_affine.hpp"
+#include "tq4.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,8 @@ inline int lane_fn(int lane) {return ((((lane >> 2) & 2) | (lane & 1)) * 4);}
 const char* kHeader = R"METAL(
 #include <metal_simdgroup>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+constant half TQ4_LEVEL[16] = {6.0h, 18.0h, 31.0h, 44.0h, 58.0h, 75.0h, 96.0h, 127.0h,
+                                -6.0h, -18.0h, -31.0h, -44.0h, -58.0h, -75.0h, -96.0h, -127.0h};
 inline float4 bf16x4(ushort4 v) {return float4(as_type<float>(uint(v.x) << 16), as_type<float>(uint(v.y) << 16),
                                                as_type<float>(uint(v.z) << 16), as_type<float>(uint(v.w) << 16));}
 )METAL";
@@ -56,8 +59,12 @@ const char* kSource = R"METAL(
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
     const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
     for (int g = 0; g < KS / GS; g++) {
-        const float4 s0 = bf16x4(*(const device ushort4*)(sp + g * 32 + fn)), s1 = bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
-        const float4 b0 = bf16x4(*(const device ushort4*)(bp + g * 32 + fn)), b1 = bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
+        const float4 s0 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
+                              : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
+        const float4 s1 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn)))
+                              : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
+        const float4 b0 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
+        const float4 b1 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
         for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
             half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
@@ -65,6 +72,13 @@ const char* kSource = R"METAL(
             for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
             uint2 w = wp[ks * 32];
             uint h = BITS == 6 ? hp[ks * 32] : 0u;
+            if (TQ4) {
+                for (short i = 0; i < 8; i++) {
+                    const float sa = s0[i & 3], sb = s1[i & 3];
+                    cb[i] = half(float(TQ4_LEVEL[(w.x >> (4 * i)) & 15u]) * sa);
+                    cb[8 + i] = half(float(TQ4_LEVEL[(w.y >> (4 * i)) & 15u]) * sb);
+                }
+            } else
             for (short p = 0; p < 4; p++) {
                 uint l0 = (w.x >> (4 * p)) & 0x000F000Fu, l1 = (w.y >> (4 * p)) & 0x000F000Fu;
                 if (BITS == 6) {
@@ -207,7 +221,7 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
     return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
                     {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
-                     {"BF", round_bf16}},
+                     {"BF", round_bf16}, {"TQ4", w.tq4}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
@@ -259,6 +273,28 @@ NaxAffine nax_affine_select_rows(std::span<const uint8_t> payload, int rows, int
     }
     auto packed = nax_affine_pack(codes, s, b, n, columns, bits, group);
     return nax_affine_load(packed, n, columns, bits, group);
+}
+
+NaxAffine nax_from_tq4(const Tq4Weights& t) {
+    if (!t.integer_levels || t.codes.ndim() != 2 || t.codes.dtype() != mx::uint8 || t.scales.dtype() != mx::float16)
+        throw std::invalid_argument("nax tq4: needs integer-level TQ4 weights");
+    const int rows = t.codes.shape(0), columns = t.codes.shape(1) * 2;
+    auto codes = mx::contiguous(t.codes), scales = mx::contiguous(t.scales);
+    mx::eval(codes, scales);
+    if (scales.shape(1) != columns / 128) throw std::invalid_argument("nax tq4: expected one scale per 128 columns");
+    const uint8_t* packed = codes.data<uint8_t>();
+    std::vector<uint8_t> unpacked(size_t(rows) * columns);
+    for (size_t i = 0; i < unpacked.size(); ++i) {
+        const uint8_t byte = packed[i / 2];
+        unpacked[i] = (i % 2 ? byte >> 4 : byte) & 15u;
+    }
+    const uint16_t* sbits = reinterpret_cast<const uint16_t*>(scales.data<mx::float16_t>());
+    std::vector<uint16_t> s(sbits, sbits + scales.size()), b(s.size(), 0);
+    auto out = nax_affine_load(nax_affine_pack(unpacked, s, b, rows, columns, 4, 128), rows, columns, 4, 128);
+    out.biases = mx::zeros({64}, mx::uint16);
+    mx::eval(out.biases);
+    out.tq4 = true;
+    return out;
 }
 
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {

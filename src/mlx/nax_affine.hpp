@@ -13,6 +13,7 @@ struct NaxAffine {
     mlx::core::array scales;  // [rows/32, columns/group, 32] BF16 bits (uint16)
     mlx::core::array biases;  // [rows/32, columns/group, 32] BF16 bits (uint16)
     int rows, columns, bits, group;
+    bool tq4 = false;  // TQLLM TQ4 codebook: value = FP16 scale * signed level (scales hold FP16 bits, no biases)
 };
 uint64_t nax_affine_bytes(uint64_t rows, uint64_t columns, int bits, int group);
 NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int columns, int bits, int group);
@@ -26,6 +27,10 @@ mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::ar
 int nax_affine_splits(const NaxAffine& weights);
 // Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that
 // share an input).
+// TQ4 (GGUF type 300, integer levels, rotated basis) repacked into the matrix-unit lane order; the input must be
+// tq4_rotate()d like for every TQ4 kernel.
+struct Tq4Weights;
+NaxAffine nax_from_tq4(const Tq4Weights& weights);
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts);
 // Rows `keep` (in that order, a multiple of 128) of a stored payload, repacked as their own matrix.
 NaxAffine nax_affine_select_rows(std::span<const uint8_t> payload, int rows, int columns, int bits, int group,

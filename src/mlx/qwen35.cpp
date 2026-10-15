@@ -123,6 +123,8 @@ struct Qwen35::Impl {
     std::optional<Q4Embedding> embedding;
     std::optional<Affine8Embedding> embedding8;
     std::map<std::string,NaxAffine> nax;
+    std::map<std::string,NaxAffine> nax_tq4;  // TQ4 matrices repacked for the matrix unit (rotated inputs)
+    std::optional<std::pair<mx::array,mx::array>> nax_rotated_input;
     std::vector<uint8_t> nax_head_payload;   // host copy of the NAX head, for the drafter's shortlist head
     std::optional<NaxAffine> draft_nax_head;
     // projections sharing an input run as one NAX launch; members read column views of the shared result
@@ -271,6 +273,11 @@ struct Qwen35::Impl {
                 else if constexpr(std::is_same_v<T,Tq4Weights>) mx::eval(v.codes,v.scales);
                 else mx::eval(v.blocks);
             },w);
+            if(std::getenv("TQLLM_MLX_NAX_TQ4"))
+                if(auto packed=std::get_if<Tq4Weights>(&w);packed && packed->integer_levels && packed->codes.shape(0)%128==0) {
+                    nax_tq4.emplace(name,nax_from_tq4(*packed));
+                    return;  // the repacked copy replaces the original
+                }
             if((std::getenv("TQLLM_MLX_AFFINE_FFN") || joined_gu) && name.find(".ffn_")!=std::string::npos)
                 if(auto packed=std::get_if<Tq3Weights>(&w))affine_ffn.emplace(name,tq3_affine8(*packed));
             if(affine_tq4 && name.find(".ffn_")!=std::string::npos)
@@ -419,6 +426,7 @@ struct Qwen35::Impl {
                 if(name.find(tag)!=std::string::npos) {
                     int rows=0;
                     if(auto f=nax.find(name);f!=nax.end())rows=f->second.rows;
+                    else if(auto f=nax_tq4.find(name);f!=nax_tq4.end())rows=f->second.rows;
                     else if(auto f=nax_member.find(name);f!=nax_member.end())rows=nax_groups.at(f->second.first).parts[f->second.second].second;
                     else if(auto it=matrices.find(name);it!=matrices.end())
                         std::visit([&](const auto& w){
@@ -434,6 +442,12 @@ struct Qwen35::Impl {
                     }
                 }
             }
+        if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
+            auto xr=rotated();
+            if(!nax_rotated_input || nax_rotated_input->first.id()!=xr.id())
+                nax_rotated_input=std::pair{xr,mx::contiguous(mx::astype(xr,mx::float16))};
+            return nax_affine_matmul(found->second,nax_rotated_input->second,true);
+        }
         if(auto member=nax_member.find(name);member!=nax_member.end()) {
             auto& g=nax_groups.at(member->second.first);
             if(!g.last || g.last->first.id()!=x.id())g.last=std::pair{x,nax_affine_matmul(g.weights,x,true)};

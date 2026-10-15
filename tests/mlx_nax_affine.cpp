@@ -1,4 +1,5 @@
 #include "nax_affine.hpp"
+#include "tq4.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -112,6 +113,30 @@ bool run_select(int bits, int group, std::mt19937& rng) {
     std::printf("NAX affine select rows bits=%d group=%d rel_err=%.3e\n", bits, group, worst / peak);
     return worst / peak < 1e-5;
 }
+// TQ4 codebook weights on the matrix unit equal the existing TQ4 kernel, and stay row-independent
+bool run_tq4(int rows, int k, std::mt19937& rng) {
+    std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+    for (auto& c : codes) c = uint8_t(rng());
+    std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+    for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+    Tq4Weights t{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true};
+    auto w = nax_from_tq4(t);
+    const int m = 9;
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(float(int(rng() % 2001) - 1000) * 1e-3f));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto got = rows_of(nax_affine_matmul(w, X));
+    auto ref = rows_of(tq4_matmul(t, X));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < got.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - got[i])));}
+    size_t mismatches = 0;
+    for (int r = 0; r < m; ++r) {
+        auto one = rows_of(nax_affine_matmul(w, mx::array(x.data() + size_t(r) * k, {1, k}, mx::float32)));
+        mismatches += std::memcmp(one.data(), &got[size_t(r) * rows], size_t(rows) * 4) != 0;
+    }
+    std::printf("NAX TQ4 rows=%d k=%d rel_err_vs_tq4_matmul=%.3e row_mismatches=%zu\n", rows, k, worst / peak, mismatches);
+    return worst / peak < 2e-3 && mismatches == 0;
+}
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
@@ -136,7 +161,7 @@ bool run_embedding(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_embedding(rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
     return ok ? 0 : 1;
 }
