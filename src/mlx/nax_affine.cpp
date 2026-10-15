@@ -1,5 +1,6 @@
 #include "nax_affine.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -153,8 +154,9 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
 // one (N/32 simdgroups per split), each split a whole number of groups. Depends only on the shape, never on the row
 // count, so a single row and a verify batch sum the same partial products in the same order.
 int nax_affine_splits(const NaxAffine& w) {
+    static const int cap = std::getenv("TQLLM_MLX_NAX_MAX_SPLIT") ? std::atoi(std::getenv("TQLLM_MLX_NAX_MAX_SPLIT")) : 8;
     int split = 1;
-    while (split < 8 && (w.rows / 32) * split < 512 && (w.columns / w.group) % (split * 2) == 0) split *= 2;
+    while (split < cap && (w.rows / 32) * split < 512 && (w.columns / w.group) % (split * 2) == 0) split *= 2;
     return split;
 }
 
