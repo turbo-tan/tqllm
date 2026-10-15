@@ -25,6 +25,7 @@ const char* kSource = R"METAL(
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint blk = threadgroup_position_in_grid.x * 4 + sg;
+    const int split = int(threadgroup_position_in_grid.z), KS = K / SPLIT;
     const int row0 = int(threadgroup_position_in_grid.y) * MR;
     const int rows = min(int(R[0]) - row0, MR);
     const short qid = lane >> 2;
@@ -39,12 +40,12 @@ const char* kSource = R"METAL(
     auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
     auto cc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
     for (short i = 0; i < 16; i++) { cc[i] = 0.0f; cc2[i] = 0.0f; }
-    const device uint2* wp = (const device uint2*)W + (size_t)blk * (K / 16) * 32 + lane;
-    const device uint* hp = H + (BITS == 6 ? (size_t)blk * (K / 16) * 32 + lane : 0);
-    const device ushort* sp = S + (size_t)blk * (K / GS) * 32;
-    const device ushort* bp = Bz + (size_t)blk * (K / GS) * 32;
-    const device half* xs = X + (size_t)(row0 + fm) * K + fn;
-    for (int g = 0; g < K / GS; g++) {
+    const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
+    const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
+    const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
+    for (int g = 0; g < KS / GS; g++) {
         const float4 s0 = bf16x4(*(const device ushort4*)(sp + g * 32 + fn)), s1 = bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
         const float4 b0 = bf16x4(*(const device ushort4*)(bp + g * 32 + fn)), b1 = bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
         for (short t = 0; t < GS / 16; t++) {
@@ -76,11 +77,12 @@ const char* kSource = R"METAL(
         }
     }
     const uint col0 = blk * 32 + fn;
+    device float* out = Y + (size_t)split * int(R[0]) * N;
     for (short i = 0; i < 16; i++) {
         const short r = fm + ((i & 7) >> 2) * 8;
         const uint c = col0 + (i >> 3) * 16 + (i & 3);
-        if (r < rows) Y[(size_t)(row0 + r) * N + c] = cc[i];
-        if (MR > 16 && r + 16 < rows) Y[(size_t)(row0 + r + 16) * N + c] = cc2[i];
+        if (r < rows) out[(size_t)(row0 + r) * N + c] = cc[i];
+        if (MR > 16 && r + 16 < rows) out[(size_t)(row0 + r + 16) * N + c] = cc2[i];
     }
 )METAL";
 }
@@ -147,19 +149,29 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
     return {words, high, scales, biases, rows, columns, bits, group};
 }
 
+// K splits for one matrix: enough simdgroups to keep the memory system busy when each matmul waits for the previous
+// one (N/32 simdgroups per split), each split a whole number of groups. Depends only on the shape, never on the row
+// count, so a single row and a verify batch sum the same partial products in the same order.
+int nax_affine_splits(const NaxAffine& w) {
+    int split = 1;
+    while (split < 8 && (w.rows / 32) * split < 512 && (w.columns / w.group) % (split * 2) == 0) split *= 2;
+    return split;
+}
+
 mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine matmul: input must be [m, columns]");
     static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
                                                 kSource, kHeader);
-    const int m = input.shape(0), mr = m <= 16 ? 16 : 32;
+    const int m = input.shape(0), mr = m <= 16 ? 16 : 32, split = nax_affine_splits(w);
     auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);
     auto count = mx::array(&m32, {1}, mx::uint32);
-    return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
-                  {w.rows, (m + mr - 1) / mr, 1}, {128, 1, 1},
-                  {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}},
-                  std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    auto y = kernel({w.words, w.high, w.scales, w.biases, x, count}, {{split, m, w.rows}}, {mx::float32},
+                    {w.rows, (m + mr - 1) / mr, split}, {128, 1, 1},
+                    {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split}},
+                    std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    return split == 1 ? mx::reshape(y, {m, w.rows}) : mx::sum(y, 0);
 }
 
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {
