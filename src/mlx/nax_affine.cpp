@@ -25,8 +25,13 @@ inline float4 bf16x4(ushort4 v) {return float4(as_type<float>(uint(v.x) << 16), 
 const char* kSource = R"METAL(
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const uint blk = threadgroup_position_in_grid.x * 4 + sg;
-    const int split = int(threadgroup_position_in_grid.z), KS = K / SPLIT;
+    // BPT 32-column blocks per threadgroup, SPLIT simdgroups per block, each over K / SPLIT
+    constexpr int BPT = SPLIT >= 4 ? 1 : 4 / SPLIT, KS = K / SPLIT;
+    const uint local = sg / SPLIT;
+    const int split = int(sg % SPLIT);
+    const uint blk = threadgroup_position_in_grid.x * BPT + local;
+    constexpr int E = MR > 16 ? 32 : 16;
+    threadgroup float part[SPLIT > 1 ? BPT * SPLIT * 32 * E : 1];
     const int row0 = int(threadgroup_position_in_grid.y) * MR;
     const int rows = min(int(R[0]) - row0, MR);
     const short qid = lane >> 2;
@@ -77,13 +82,23 @@ const char* kSource = R"METAL(
             }
         }
     }
+    if (SPLIT > 1) {
+        // partials meet in threadgroup memory; split 0 adds them in split order, so the sum order is fixed per element
+        threadgroup float* mine = part + ((local * SPLIT + split) * 32 + lane) * E;
+        for (short i = 0; i < 16; i++) { mine[i] = cc[i]; if (MR > 16) mine[16 + i] = cc2[i]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (split != 0) return;
+        for (int p = 1; p < SPLIT; p++) {
+            const threadgroup float* other = part + ((local * SPLIT + p) * 32 + lane) * E;
+            for (short i = 0; i < 16; i++) { cc[i] = cc[i] + other[i]; if (MR > 16) cc2[i] = cc2[i] + other[16 + i]; }
+        }
+    }
     const uint col0 = blk * 32 + fn;
-    device float* out = Y + (size_t)split * int(R[0]) * N;
     for (short i = 0; i < 16; i++) {
         const short r = fm + ((i & 7) >> 2) * 8;
         const uint c = col0 + (i >> 3) * 16 + (i & 3);
-        if (r < rows) out[(size_t)(row0 + r) * N + c] = cc[i];
-        if (MR > 16 && r + 16 < rows) out[(size_t)(row0 + r + 16) * N + c] = cc2[i];
+        if (r < rows) Y[(size_t)(row0 + r) * N + c] = cc[i];
+        if (MR > 16 && r + 16 < rows) Y[(size_t)(row0 + r + 16) * N + c] = cc2[i];
     }
 )METAL";
 }
@@ -169,14 +184,11 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input) {
     auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);
     auto count = mx::array(&m32, {1}, mx::uint32);
-    auto y = kernel({w.words, w.high, w.scales, w.biases, x, count}, {{split, m, w.rows}}, {mx::float32},
-                    {w.rows, (m + mr - 1) / mr, split}, {128, 1, 1},
+    const int bpt = split >= 4 ? 1 : 4 / split, threads = 32 * bpt * split;
+    return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
+                    {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
-    // element-wise adds in split order: a reduction kernel may pick its summation order from the row count
-    auto sum = mx::reshape(mx::slice(y, {0, 0, 0}, {1, m, w.rows}), {m, w.rows});
-    for (int i = 1; i < split; ++i) sum = mx::add(sum, mx::reshape(mx::slice(y, {i, 0, 0}, {i + 1, m, w.rows}), {m, w.rows}));
-    return sum;
 }
 
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {
