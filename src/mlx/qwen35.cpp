@@ -11,6 +11,7 @@
 #include "tq3_tiled.hpp"
 #include "mma8.hpp"
 #include "tq_mlx.hpp"
+#include "nax_affine.hpp"
 #include <mlx/compile.h>
 #include <mlx/graph_utils.h>
 #include <algorithm>
@@ -118,6 +119,8 @@ struct Qwen35::Impl {
     bool reuse_rotation=std::getenv("TQLLM_MLX_REUSE_ROTATION")!=nullptr;
     std::map<std::string,mx::array> plain;
     std::optional<Q4Embedding> embedding;
+    std::optional<Affine8Embedding> embedding8;
+    std::map<std::string,NaxAffine> nax;
     std::vector<Cache> caches;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
@@ -219,17 +222,28 @@ struct Qwen35::Impl {
         if(file.num(a+"rope.scaling.factor",1)!=1)
             throw std::invalid_argument("experimental MLX forward does not implement RoPE scaling");
         const auto& emb=file.tensors.at("token_embd.weight");
-        if(emb.type!=GGML_Q4_K||emb.ne.size()!=2||emb.ne[0]!=uint64_t(hidden)||emb.ne[1]>uint64_t(INT32_MAX))
-            throw std::invalid_argument("experimental MLX forward requires Q4_K embeddings");
+        if((emb.type!=GGML_Q4_K&&emb.type!=GGML_AFF8_G64)||emb.ne.size()!=2||emb.ne[0]!=uint64_t(hidden)||emb.ne[1]>uint64_t(INT32_MAX))
+            throw std::invalid_argument("experimental MLX forward requires Q4_K or 8-bit affine embeddings");
         vocab=int(emb.ne[1]);global_ids=mx::arange(vocab,mx::uint32);mx::eval(global_ids);
         auto data=file.read(emb);
-        embedding=load_q4_embedding({reinterpret_cast<const uint8_t*>(data.data()),data.size()},vocab,hidden);
-        mx::eval(embedding->blocks);data.clear();data.shrink_to_fit();
+        if(emb.type==GGML_AFF8_G64)embedding8=affine8_embedding_load({reinterpret_cast<const uint8_t*>(data.data()),data.size()},vocab,hidden);
+        else {
+            embedding=load_q4_embedding({reinterpret_cast<const uint8_t*>(data.data()),data.size()},vocab,hidden);
+            mx::eval(embedding->blocks);
+        }
+        data.clear();data.shrink_to_fit();
         std::vector<uint32_t> indices(vh);
         for(int h=0;h<vh;++h) indices[h]=uint32_t(h%kh);
         key_indices=mx::array(indices.data(),{vh},mx::uint32);
         if(std::getenv("TQLLM_MLX_NATIVE_GDN"))native_head_order=gdn_head_order(kh,vh);
         auto matrix=[&](const std::string& name) {
+            if(const auto& stored=file.tensors.at(name);stored.type==GGML_NAX_A4_G128||stored.type==GGML_NAX_A6_G64||stored.type==GGML_NAX_A4_G64) {
+                auto raw=file.read(stored);
+                const int bits=stored.type==GGML_NAX_A6_G64?6:4,group=stored.type==GGML_NAX_A4_G128?128:64;
+                nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
+                                                 int(stored.ne[1]),int(stored.ne[0]),bits,group));
+                return;
+            }
             if(const auto& stored=file.tensors.at(name);is_tq_mlx_type(stored.type)) {
                 auto raw=file.read(stored);
                 auto packed=tq_mlx_load(stored,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()});
@@ -349,7 +363,11 @@ struct Qwen35::Impl {
             if(tiled_active(name,weights,fp32))matrices.erase(name);
         }
     }
+    mx::array embed(std::span<const uint32_t> tokens) const {
+        return embedding8?affine8_embedding(*embedding8,tokens):q4_embedding(*embedding,tokens);
+    }
     mx::array mat(const std::string& name,const mx::array& x,bool input_rotated=false) {
+        if(auto found=nax.find(name);found!=nax.end())return bf(nax_affine_matmul(found->second,x));
         auto rotated=[&]() {
             if(input_rotated)return x;
             if(reuse_rotation && rotation && rotation->first.id()==x.id())return rotation->second;
@@ -551,7 +569,7 @@ struct Qwen35::Impl {
             auto now=std::chrono::steady_clock::now();
             stages[name]+=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;
         };
-        const int m=int(tokens.size());auto x=bf(q4_embedding(*embedding,tokens));
+        const int m=int(tokens.size());auto x=bf(embed(tokens));
         std::vector<mx::array> features;
         if(stage_profiling)record("embedding",{x});
         for(int l=0;l<layers;++l) {
@@ -602,6 +620,7 @@ struct Qwen35::Impl {
         auto logits=return_head_ids && target_head_shortlist && x.shape(0)<=8?shortlist_ids(x):
             target_head_shortlist && x.shape(0)<=8?shortlist_head(x):
             target_head && x.shape(0)<=8?q6_affine_matmul(*target_head,x):
+            nax.contains("output.weight")?nax_affine_matmul(nax.at("output.weight"),x):
             gemm_verify && x.shape(0)>1 && x.shape(0)<=8?verify_tiled(matrices.at("output.weight"),x):
             linear(matrices.at("output.weight"),x);
         live.push_back(logits);
@@ -746,11 +765,12 @@ mx::array Qwen35::feature_states() const {
     if(!impl_->last_features)throw std::invalid_argument("no target features captured");
     return *impl_->last_features;
 }
-mx::array Qwen35::embed_tokens(std::span<const uint32_t> tokens) const {return bf(q4_embedding(*impl_->embedding,tokens));}
+mx::array Qwen35::embed_tokens(std::span<const uint32_t> tokens) const {return bf(impl_->embed(tokens));}
 mx::array Qwen35::shared_draft_head(const mx::array& x) const {
     if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
         throw std::invalid_argument("invalid shared draft-head input");
     if(impl_->proposal_head)return draft_head4_matmul(*impl_->proposal_head,x);
+    if(auto found=impl_->nax.find("output.weight");found!=impl_->nax.end())return nax_affine_matmul(found->second,x);
     return impl_->mtp_head?q6_matmul(*impl_->mtp_head,x):linear(impl_->matrices.at("output.weight"),x);
 }
 void Qwen35::enable_draft_head4() {
@@ -831,7 +851,7 @@ void Qwen35::draft_inject(std::span<const uint32_t> tokens,const mx::array& hidd
        hidden.shape()!=mx::Shape{n,i.hidden} || hidden.dtype()!=mx::float32)
         throw std::invalid_argument("invalid MTP injection batch or position");
     const std::string p="blk."+std::to_string(i.layers)+".";
-    auto embedded=bf(q4_embedding(*i.embedding,tokens));
+    auto embedded=bf(i.embed(tokens));
     auto joined=mx::concatenate({i.norm(embedded,p+"nextn.enorm.weight"),i.norm(hidden,p+"nextn.hnorm.weight")},1);
     auto x=i.norm(i.mat(p+"nextn.eh_proj.weight",joined),p+"attn_norm.weight");
     auto k=mx::reshape(i.mat(p+"attn_k.weight",x),{1,n,i.kvheads,i.hd});
@@ -848,7 +868,7 @@ mx::array Qwen35::draft_forward(std::span<const uint32_t> tokens,const mx::array
        hidden.shape()!=mx::Shape{n,i.hidden} || hidden.dtype()!=mx::float32)
         throw std::invalid_argument("invalid MTP token/hidden batch or position");
     const std::string p="blk."+std::to_string(i.layers)+".";
-    auto embedded=bf(q4_embedding(*i.embedding,tokens));
+    auto embedded=bf(i.embed(tokens));
     auto joined=mx::concatenate({i.norm(embedded,p+"nextn.enorm.weight"),i.norm(hidden,p+"nextn.hnorm.weight")},1);
     auto x=i.mat(p+"nextn.eh_proj.weight",joined);
     x=bf(mx::add(x,i.full_attention(p,i.norm(x,p+"attn_norm.weight"),i.mtp_cache,position)));

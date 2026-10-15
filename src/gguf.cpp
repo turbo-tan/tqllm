@@ -73,6 +73,15 @@ uint64_t tensor_bytes(uint32_t type, uint64_t n, const std::string & name, const
             const uint64_t rp = (ne[1] + 63) / 64 * 64;
             return checked_mul(rp, ne[0] / 2 + ne[0] / 64, name);
         }
+        case GGML_NAX_A4_G128: case GGML_NAX_A6_G64: case GGML_NAX_A4_G64: {  // codes, high bits, FP16 scales, biases
+            const uint64_t bits = type == GGML_NAX_A6_G64 ? 6 : 4, group = type == GGML_NAX_A4_G128 ? 128 : 64;
+            if (ne.size() != 2 || ne[0] % group || ne[1] % 128) break;
+            return checked_mul(ne[1], ne[0] * bits / 8 + ne[0] / group * 4, name);
+        }
+        case GGML_AFF8_G64: {  // row-major 8-bit codes, then FP16 scales and biases
+            if (ne.size() != 2 || ne[0] % 64) break;
+            return checked_mul(ne[1], ne[0] + ne[0] / 16, name);
+        }
         default: break;
     }
     uint64_t blk, bpb;
