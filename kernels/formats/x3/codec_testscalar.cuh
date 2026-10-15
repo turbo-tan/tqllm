@@ -41,9 +41,16 @@ struct TestScalarCodec {
 
     __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
         const uint32_t full = 0xffffffffu;
+        // Load l holds tile word (l*32 + lane). A lane needs words 2*lane and 2*lane+1; the shfl
+        // operand must be uniform across lanes, so fetch both loads and select.
         const int ia = lane * 2, ib = lane * 2 + 1;
-        const uint32_t wa = __shfl_sync(full, bw[2 * t + ia / 32], ia % 32);
-        const uint32_t wb = __shfl_sync(full, bw[2 * t + ib / 32], ib % 32);
+        // Call both shuffles unconditionally (a divergent __shfl_sync is undefined) then select.
+        const uint32_t a0 = __shfl_sync(full, bw[2 * t + 0], ia % 32);
+        const uint32_t a1 = __shfl_sync(full, bw[2 * t + 1], ia % 32);
+        const uint32_t b0 = __shfl_sync(full, bw[2 * t + 0], ib % 32);
+        const uint32_t b1w = __shfl_sync(full, bw[2 * t + 1], ib % 32);
+        const uint32_t wa = (ia < 32) ? a0 : a1;
+        const uint32_t wb = (ib < 32) ? b0 : b1w;
         const uint8_t b[8] = {
             uint8_t(wa), uint8_t(wa >> 8), uint8_t(wa >> 16), uint8_t(wa >> 24),
             uint8_t(wb), uint8_t(wb >> 8), uint8_t(wb >> 16), uint8_t(wb >> 24)};

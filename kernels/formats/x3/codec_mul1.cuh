@@ -52,8 +52,8 @@ template <int KA>
 __device__ __forceinline__ void ext8w_frac(const uint32_t* ptr, int t0, uint32_t (&w)[8]) {
     constexpr int P = 2 * KA + 1;
     const int e = (t0 >> 3) * (4 * P);
-    ext4_frac<KA>(ptr, e + 2 * P, w[7], w[6], w[5], w[4]);
-    ext4_frac<KA>(ptr, e + 4 * P, w[3], w[2], w[1], w[0]);
+    ext4_frac<KA>(ptr, e + 2 * P, w[0], w[1], w[2], w[3]);
+    ext4_frac<KA>(ptr, e + 4 * P, w[4], w[5], w[6], w[7]);
 }
 
 template <int bits>
@@ -102,11 +102,10 @@ __device__ __forceinline__ void mul1_extract8(const uint32_t* ptr, int t_offset,
         const int b1 = (t_offset + 257) * bits;
         const int b0 = b1 - 16;
         const int b2 = b1 + bits * 7;
-        const uint32_t i0 = uint32_t(b0 / 32) % uint32_t(bits * 256 / 32);
-        const uint32_t i2 = uint32_t((b2 - 1) / 32) % uint32_t(bits * 256 / 32);
-        const int s2 = (int(i2) + 1) * 32 - b2;
-        const uint32_t a = ptr[i0];
-        const uint32_t b = ptr[i2];
+        const int i0r = b0 / 32, i2r = (b2 - 1) / 32;   // raw indices: s2 uses these, ptr uses the wrapped ones
+        const int s2 = (i2r + 1) * 32 - b2;
+        const uint32_t a = ptr[uint32_t(i0r) % uint32_t(bits * 256 / 32)];
+        const uint32_t b = ptr[uint32_t(i2r) % uint32_t(bits * 256 / 32)];
         w[7] = fshift(b, a, s2);
         w[6] = w[7] >> bits;
         w[5] = w[6] >> bits;

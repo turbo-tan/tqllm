@@ -5,6 +5,7 @@
 //                           W = diag(suh) . H128 . W_hat . H128 . diag(svh) per 128x128 tile.
 // x3_reconstruct_plain_kernel : dequant + tensor-core-layout shuffle only (TRANSFORMED basis).
 #include "had128.cuh"
+#include "x3_layout.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -41,8 +42,8 @@ void reconstruct_had_kernel(half* __restrict__ g_unpacked, const uint16_t* __res
     for (int u = t; u < 8 * 8 * j_int4; u += X3_RH_THREADS) {
         int j = u / (8 * j_int4);
         int r = u % (8 * j_int4);
-        const uint16_t* gp = g_packed +
-            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+        const size_t tix_lin = (size_t) x3_tile_offset(kb * 8 + j, n, packed_blocks_n) + packed_n_offset;
+        const uint16_t* gp = g_packed + tix_lin * packed_size;
         ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
     }
     __syncthreads();

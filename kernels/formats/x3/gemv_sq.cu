@@ -7,6 +7,7 @@
 // dp4a. The k splits write per-slice partials; the ksplit-th contributor runs the fixed-order
 // epilogue. Templated on Codec: only codecs with supports_sq (mul1-family) instantiate this.
 #include "had128.cuh"
+#include "x3_layout.hpp"
 #include "ptx.cuh"
 
 #include <cuda_runtime.h>
@@ -120,7 +121,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow(const uint16_t* __restrict
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
     const int row_stride = Codec::row_u32(size_n);
-    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * Codec::words;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) x3_tile_offset(kb0, nbp * 2, row_stride / (Codec::words / 2)) * (Codec::words / 2);
     int c2 = 2 * (lane & 3);
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
@@ -147,7 +148,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem(const uint16_t* __restrict__
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
     const int row_stride = Codec::row_u32(size_n);
-    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) x3_tile_offset(kb0, nbp * 2, row_stride / (pairwords / 2)) * (pairwords / 2);
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
     auto stage_row = [&](int kb) {

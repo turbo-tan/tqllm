@@ -9,6 +9,7 @@
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention sizes; CFG 1
 // ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes.
 #include "had128.cuh"
+#include "x3_layout.hpp"
 #include "ptx.cuh"
 #include <cooperative_groups.h>
 
@@ -98,7 +99,7 @@ void x3v_gemv_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B,
     __shared__ float sh_red[WK][ROWS][COLS];
 
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
-        const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+        const uint32_t* bp = B32 + (size_t) x3_tile_offset(ks0, group * WNT, ntiles) * TWORDS + lane;
 
         auto ld_b = [&](int i, int l) -> uint32_t {
             if constexpr (Codec::ld_lanes < 32)

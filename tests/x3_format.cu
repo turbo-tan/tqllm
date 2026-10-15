@@ -86,28 +86,26 @@ void test_row(const x3::X3Codec* c, int rows, int cols) {
         std::vector<float> C(size_t(n) * rows);
         cudaMemcpy(C.data(), d_C, C.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
-        // host reference: try both orientations of the reconstructed matrix.
-        double rel_best = 1e9; int best_o = -1;
-        for (int o = 0; o < 2; ++o) {
-            double se = 0.0, den = 1e-12;
-            for (int j = 0; j < n; ++j)
-                for (int r = 0; r < rows; ++r) {
-                    double acc = 0.0;
-                    for (int c2 = 0; c2 < cols; ++c2) {
-                        const double w = (o == 0) ? double(__half2float(W[size_t(r) * cols + c2]))
-                                                  : double(__half2float(W[size_t(c2) * cols + r]));
-                        acc += double(__half2float(x[size_t(c2) * n + j])) * w;
-                    }
-                    const double diff = C[size_t(j) * rows + r] - acc;
-                    se += diff * diff; den += acc * acc;
-                }
-            const double rel = std::sqrt(se / double(size_t(n) * rows)) / (std::sqrt(den / double(size_t(n) * rows)) + 1e-12);
-            if (rel < rel_best) { rel_best = rel; best_o = o; }
-        }
-        const double rel = rel_best;
-        check(rel < 2e-3, std::string(c->name) + ": matvec vs dequant+host GEMV n=" + std::to_string(n) +
-                          " (rel=" + std::to_string(rel) + " orient=" + std::to_string(best_o) + ")");
-        if (rel >= 2e-3) std::fprintf(stderr, "  %s rows=%d cols=%d n=%d rel=%.3e\n", c->name, rows, cols, n, rel);
+        // Host reference in the fork's convention (tests/test-paw-x3-frac.cpp decode_what): the
+        // reconstructed W is [in][out] (row = in, col = out) and y = x . W, reduction over `in`.
+        // So for a stored W[rows][cols] with rows=out, cols=in the element (in,out) is W[in*cols+out].
+        double se = 0.0, den = 1e-12;
+        for (int j = 0; j < n; ++j)
+            for (int r = 0; r < rows; ++r) {
+                double acc = 0.0;
+                for (int c2 = 0; c2 < cols; ++c2)
+                    acc += double(__half2float(x[size_t(c2) * n + j])) * double(__half2float(W[size_t(c2) * cols + r]));
+                const double diff = C[size_t(j) * rows + r] - acc;
+                se += diff * diff; den += acc * acc;
+            }
+        const double rel = std::sqrt(se / double(size_t(n) * rows)) / (std::sqrt(den / double(size_t(n) * rows)) + 1e-12);
+        // n == 1 runs the int8 sq path (activations quantised to int8), so it is ~2% off the exact
+        // GEMV by construction; its true reference is the Phase R sq implementation. n >= 2 is the
+        // exact fp16 x3v path and must match to 2e-3.
+        const double thr = (n == 1) ? 5e-2 : 2e-3;
+        check(rel < thr, std::string(c->name) + ": matvec vs dequant+host GEMV n=" + std::to_string(n) +
+                         " (rel=" + std::to_string(rel) + ")");
+        if (rel >= thr) std::fprintf(stderr, "  %s rows=%d cols=%d n=%d rel=%.3e\n", c->name, rows, cols, n, rel);
 
         cudaFree(d_A); cudaFree(d_C); cudaFree(d_had);
         if (d_locks) cudaFree(d_locks);
