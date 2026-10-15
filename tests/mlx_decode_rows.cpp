@@ -53,6 +53,12 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
         auto yb = mx::contiguous(decode_rows_attention(q, kb, vb, scale, length));
         mx::eval(yb);
         exact = exact && std::memcmp(yb.data<float>(), y.data<float>(), y.size() * sizeof(float)) == 0;
+        // BF16 storage of BF16-rounded keys / values gives the same bits as their FP32 copies
+        auto kr = mx::astype(mx::astype(kb, mx::bfloat16), mx::float32), vr = mx::astype(mx::astype(vb, mx::bfloat16), mx::float32);
+        auto y32 = mx::contiguous(decode_rows_attention(q, kr, vr, scale, length));
+        auto y16 = mx::contiguous(decode_rows_attention(q, mx::astype(kb, mx::bfloat16), mx::astype(vb, mx::bfloat16), scale, length));
+        mx::eval(y32, y16);
+        exact = exact && std::memcmp(y32.data<float>(), y16.data<float>(), y16.size() * sizeof(float)) == 0;
     }
     std::printf("DECODE_ROWS heads=%d kv=%d dim=%d length=%d n=%d rel=%.2e batch_invariant=%d %s\n", heads, kvheads, dim,
                 length, n, worst / peak, int(exact), ok && exact ? "PASS" : "FAIL");

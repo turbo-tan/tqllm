@@ -16,7 +16,7 @@ inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const m
     if (q.ndim() != 4 || k.ndim() != 4 || q.shape(0) != 1 || k.shape(0) != 1 || q.shape(2) < 1 || q.shape(2) > 8 ||
         (valid > 0 ? valid : k.shape(2)) < q.shape(2) || valid > k.shape(2) || v.shape() != k.shape() || q.shape(1) % k.shape(1) ||
         (q.shape(3) != 128 && q.shape(3) != 256) || k.shape(3) != q.shape(3) || q.dtype() != mx::float32 ||
-        k.dtype() != mx::float32 || v.dtype() != mx::float32)
+        (k.dtype() != mx::float32 && k.dtype() != mx::bfloat16) || v.dtype() != k.dtype())
         throw std::invalid_argument("unsupported decode rows attention shape");
     const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = valid > 0 ? valid : k.shape(2);
     const int group = heads / kvheads, parts = (length + PB - 1) / PB;
@@ -47,10 +47,10 @@ for (uint h = 0; h < uint(GROUP); ++h) {
     m[h] = -INFINITY; l[h] = 0.0f;
 }
 for (uint j = start; j < end; ++j) {
-    const device float* kp = k + (g * stride + j) * uint(DIM) + lane * E;
-    const device float* vp = v + (g * stride + j) * uint(DIM) + lane * E;
+    const device KT* kp = k + (g * stride + j) * uint(DIM) + lane * E;
+    const device KT* vp = v + (g * stride + j) * uint(DIM) + lane * E;
     float kr[E], vr[E];
-    for (uint e = 0; e < E; ++e) {kr[e] = kp[e]; vr[e] = vp[e];}
+    for (uint e = 0; e < E; ++e) {kr[e] = float(kp[e]); vr[e] = float(vp[e]);}
     for (uint h = 0; h < uint(GROUP); ++h) {
         float s = 0.0f;
         for (uint e = 0; e < E; ++e) s += qv[h][e] * kr[e];
@@ -90,7 +90,7 @@ out[(hg * rows + t) * uint(DIM) + d] = numerator / total;
     auto scratch = partial({mx::contiguous(q), mx::contiguous(k), mx::contiguous(v), layout_array, mx::array(scale)},
                            {{kvheads, parts, n, group}, {kvheads, parts, n, group}, {kvheads, parts, n, group, dim}},
                            {mx::float32, mx::float32, mx::float32}, {parts * 256, kvheads, 1}, {256, 1, 1},
-                           {{"DIM", dim}, {"GROUP", group}, {"PB", PB}}, std::nullopt, false, stream);
+                           {{"DIM", dim}, {"GROUP", group}, {"PB", PB}, {"KT", k.dtype()}}, std::nullopt, false, stream);
     return merge({scratch[0], scratch[1], scratch[2], layout_array}, {q.shape()}, {mx::float32}, {dim, heads, n},
                  {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
 }

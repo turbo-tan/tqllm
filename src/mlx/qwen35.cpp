@@ -564,6 +564,9 @@ struct Qwen35::Impl {
         }
         auto& kb=kv_keys[layer];auto& vb=kv_values[layer];
         const int need=c.kv_len+m;
+        // keys and values are already BF16-rounded, so BF16 storage is exact and halves the cache
+        static const auto kv_type=std::getenv("TQLLM_MLX_KV_F32")?mx::float32:mx::bfloat16;
+        k=mx::astype(k,kv_type);v=mx::astype(v,kv_type);
         if(!kb || kb->shape(2)<need || kb->dtype()!=k.dtype()) {
             const int cap=(need+255)/256*256+256;
             auto nk=mx::zeros({1,kvheads,cap,hd},k.dtype()),nv=mx::zeros({1,kvheads,cap,hd},v.dtype());

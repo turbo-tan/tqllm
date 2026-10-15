@@ -77,13 +77,16 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
         throw std::invalid_argument("attention cache shorter than query block");
     const bool decode_rows = std::getenv("TQLLM_MLX_ATTN_DECODE_ROWS") != nullptr;
     if (decode_rows && n <= 8 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
-        k.dtype() == mx::float32 && v.dtype() == mx::float32 && (q.shape(3) == 128 || q.shape(3) == 256) &&
-        q.shape(1) % k.shape(1) == 0)
+        (k.dtype() == mx::float32 || k.dtype() == mx::bfloat16) && v.dtype() == k.dtype() &&
+        (q.shape(3) == 128 || q.shape(3) == 256) && q.shape(1) % k.shape(1) == 0)
         return decode_rows_attention(q, k, v, scale, length);
-    if (kv_valid > 0 && kv_valid < k.shape(2))
-        return causal_attention_rows(q, mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}),
-                                     mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}),
-                                     scale, decode_order, kv_views, fused_rows);
+    if (kv_valid > 0 && (kv_valid < k.shape(2) || k.dtype() != q.dtype())) {
+        // other paths read float32 views of the filled positions (BF16 storage holds BF16-rounded values: exact)
+        auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)});
+        auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)});
+        if (keys.dtype() != q.dtype()) {keys = mx::astype(keys, q.dtype()); values = mx::astype(values, q.dtype());}
+        return causal_attention_rows(q, keys, values, scale, decode_order, kv_views, fused_rows);
+    }
     if(fused_rows && (decode_order || n==1) && q.shape(0)==1 && k.shape(2)<1024 &&
        n<=8 && (q.shape(3)==128 || q.shape(3)==256) && q.dtype()==mx::float32)
         return fused_decode_attention(q,k,v,scale);
