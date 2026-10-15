@@ -282,7 +282,9 @@ out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
 inline mlx::core::array decode_rows_attention_v3(const mlx::core::array& q, const mlx::core::array& k,
                                                  const mlx::core::array& v, float scale, int valid = -1) {
     namespace mx = mlx::core;
-    constexpr int SG = 8, KC = 16, PB = 512;
+    constexpr int SG = 8, KC = 16;
+    static const int PB = std::getenv("TQLLM_MLX_ATTN_V3_PB") ? std::atoi(std::getenv("TQLLM_MLX_ATTN_V3_PB")) : 128;
+    if (PB < KC || PB % KC) throw std::invalid_argument("TQLLM_MLX_ATTN_V3_PB must be a multiple of 16");
     check_decode_rows_shape(q, k, v, valid);
     const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = valid > 0 ? valid : k.shape(2);
     const int group = heads / kvheads, parts = (length + PB - 1) / PB, qtiles = (n * group + 7) / 8;
@@ -329,9 +331,10 @@ const device KT* vh = v + (size_t)g * stride * uint(DIM);
 const uint begin = part * uint(PB), end = min(begin + uint(PB), length);
 for (uint c0 = begin; c0 < end; c0 += uint(KC)) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < uint(KC * DIM); i += SG * 32u) {
+    for (uint i = tid * 4u; i < uint(KC * DIM); i += SG * 128u) {
         const uint key = c0 + i / uint(DIM);
-        kv[i] = key < length ? float(kh[(size_t)key * uint(DIM) + i % uint(DIM)]) : 0.0f;
+        const float4 x = key < length ? float4(*(const device vec<KT, 4>*)(kh + (size_t)key * uint(DIM) + i % uint(DIM))) : float4(0.0f);
+        *(threadgroup float4*)(kv + i) = x;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (active) {
@@ -347,25 +350,40 @@ for (uint c0 = begin; c0 < end; c0 += uint(KC)) {
         simdgroup_store(s0, s_t, 8);
         simdgroup_store(s1, s_t + 64, 8);
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < 8u) {
-            float peak = m;
-            for (uint j = 0; j < uint(KC); ++j) if (c0 + j < vis) peak = max(peak, s_t[j * 8u + lane]);
-            const float r = peak == -INFINITY ? 1.0f : fast::exp(m - peak);
-            float mass = l * r;
-            for (uint j = 0; j < uint(KC); ++j) {
-                const float p = (c0 + j < vis && peak != -INFINITY) ? fast::exp(s_t[j * 8u + lane] - peak) : 0.0f;
-                s_t[j * 8u + lane] = p;
+        {
+            // lane = query (lane % 8) x key quarter (lane / 8, keys 4q..4q+3); quarters meet through xor-8/16 shuffles
+            const uint j = lane % 8u, quarter = lane / 8u;
+            const uint qj = sg * 8u + j;
+            const uint vj = qj < nq ? length - rows + qj / uint(GROUP) + 1u : 0u;
+            const float mj = simd_shuffle(m, ushort(j)), lj = simd_shuffle(l, ushort(j));
+            float e[4], peak = -INFINITY;
+            for (uint t = 0; t < 4u; ++t) {
+                const uint key = quarter * 4u + t;
+                e[t] = c0 + key < vj ? s_t[key * 8u + j] : -INFINITY;
+                peak = max(peak, e[t]);
+            }
+            peak = max(peak, simd_shuffle_xor(peak, ushort(8)));
+            peak = max(peak, simd_shuffle_xor(peak, ushort(16)));
+            peak = max(peak, mj);
+            float mass = 0.0f;
+            for (uint t = 0; t < 4u; ++t) {
+                const float p = (e[t] == -INFINITY) ? 0.0f : fast::exp(e[t] - peak);
+                s_t[(quarter * 4u + t) * 8u + j] = p;
                 mass += p;
             }
-            m = peak; l = mass;
-            d_t[lane * 8u + lane] = r;
+            // fixed tree: (q0 + q1) + (q2 + q3), the same for every lane of a query
+            mass += simd_shuffle_xor(mass, ushort(8));
+            mass += simd_shuffle_xor(mass, ushort(16));
+            const float r = peak == -INFINITY ? 1.0f : fast::exp(mj - peak);
+            if (lane < 8u) {m = peak; l = lj * r + mass; d_t[lane * 8u + lane] = r;}
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < uint(KC * DIM); i += SG * 32u) {
+    for (uint i = tid * 4u; i < uint(KC * DIM); i += SG * 128u) {
         const uint key = c0 + i / uint(DIM);
-        kv[i] = key < length ? float(vh[(size_t)key * uint(DIM) + i % uint(DIM)]) : 0.0f;
+        const float4 x = key < length ? float4(*(const device vec<KT, 4>*)(vh + (size_t)key * uint(DIM) + i % uint(DIM))) : float4(0.0f);
+        *(threadgroup float4*)(kv + i) = x;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (active) {
