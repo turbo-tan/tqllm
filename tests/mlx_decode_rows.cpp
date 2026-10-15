@@ -1,4 +1,5 @@
 #include "attention_decode.hpp"
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -64,15 +65,37 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
                 length, n, worst / peak, int(exact), ok && exact ? "PASS" : "FAIL");
     return ok && exact;
 }
+
+// microseconds per call of the v1 and v2 kernels on a BF16 KV buffer of `length` keys
+void bench(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) {
+    auto q = random_array(rng, {1, heads, n, dim}, 1.0f);
+    auto k = mx::astype(random_array(rng, {1, kvheads, length, dim}, 1.0f), mx::bfloat16);
+    auto v = mx::astype(random_array(rng, {1, kvheads, length, dim}, 1.0f), mx::bfloat16);
+    mx::eval(q, k, v);
+    const float scale = 1.0f / std::sqrt(float(dim));
+    for (int version : {1, 2}) {
+        auto call = [&] { return version == 1 ? decode_rows_attention_v1(q, k, v, scale) : decode_rows_attention_v2(q, k, v, scale); };
+        mx::eval(call());
+        const int reps = 20;
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) mx::eval(call());
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / reps;
+        std::printf("DECODE_ROWS_BENCH v%d length=%d n=%d %.1f us\n", version, length, n, us);
+    }
+}
 }  // namespace
 
 int main() {
     std::mt19937 rng(7);
     bool ok = true;
-    for (int length : {8, 63, 64, 65, 300, 1900})
+    for (int length : {8, 63, 64, 65, 255, 256, 257, 300, 1900, 4100})
         for (int n : {1, 3, 8})
             if (length >= n) ok &= run(24, 4, 256, length, n, rng);
     ok &= run(8, 2, 128, 200, 8, rng);
+    ok &= run(8, 2, 128, 3000, 1, rng);
+    ok &= run(24, 4, 256, 16384, 8, rng);
+    for (int length : {300, 2048, 16384})
+        for (int n : {1, 8}) bench(24, 4, 256, length, n, rng);
     std::printf(ok ? "DECODE_ROWS_PASS\n" : "DECODE_ROWS_FAIL\n");
     return ok ? 0 : 1;
 }
