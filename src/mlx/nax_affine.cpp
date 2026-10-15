@@ -130,6 +130,47 @@ const char* kSource = R"METAL(
 #endif
     }
 )METAL";
+
+// One thread per (32-row block, 16-column step, lane): the 16 codes of its matmul fragment, written as FP16 values
+// exactly as the matmul kernel decodes them (half(fma(code, scale, bias)) or half(level * scale)).
+const char* kDequant = R"METAL(
+    const uint t = thread_position_in_grid.x;
+    const uint lane = t % 32u;
+    const uint ks = (t / 32u) % uint(STEPS);
+    const uint blk = t / 32u / uint(STEPS);
+    if (blk >= uint(BLOCKS)) return;
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+    const uint2 w = ((const device uint2*)W)[((size_t)blk * STEPS + ks) * 32 + lane];
+    const uint h = BITS == 6 ? H[((size_t)blk * STEPS + ks) * 32 + lane] : 0u;
+    const int g = int(ks * 16u) / GS;
+    const device ushort* sp = S + ((size_t)blk * GPR + g) * 32;
+    const device ushort* bp = Bz + ((size_t)blk * GPR + g) * 32;
+    device half* out = Y + (size_t)(blk * 32 + fn) * K + ks * 16u + fm;
+    for (short p = 0; p < 4; p++) {
+        float sa, sb, ba = 0.0f, bb = 0.0f;
+        if (TQ4) {
+            sa = float(as_type<half>(sp[fn + p])); sb = float(as_type<half>(sp[16 + fn + p]));
+        } else {
+            sa = as_type<float>(uint(sp[fn + p]) << 16); sb = as_type<float>(uint(sp[16 + fn + p]) << 16);
+            ba = as_type<float>(uint(bp[fn + p]) << 16); bb = as_type<float>(uint(bp[16 + fn + p]) << 16);
+        }
+        for (short j = 0; j < 2; j++) {
+            const short i = p + 4 * j;
+            uint qa = (w.x >> (4 * i)) & 15u, qb = (w.y >> (4 * i)) & 15u;
+            half va, vb;
+            if (TQ4) {
+                va = half(float(TQ4_LEVEL[qa]) * sa); vb = half(float(TQ4_LEVEL[qb]) * sb);
+            } else {
+                if (BITS == 6) {qa |= ((h >> (2 * p + 16 * j)) & 3u) << 4; qb |= ((h >> (8 + 2 * p + 16 * j)) & 3u) << 4;}
+                va = half(fma(float(qa), sa, ba)); vb = half(fma(float(qb), sb, bb));
+            }
+            out[(size_t)p * K + 8 * j] = va;
+            out[(size_t)(16 + p) * K + 8 * j] = vb;
+        }
+    }
+)METAL";
 }
 
 uint64_t nax_affine_bytes(uint64_t rows, uint64_t columns, int bits, int group) {
@@ -223,6 +264,22 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
                      {"BF", round_bf16}, {"TQ4", w.tq4}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
+mx::array nax_affine_dequant(const NaxAffine& w) {
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_dequant", {"W", "H", "S", "Bz"}, {"Y"}, kDequant, kHeader);
+    const int blocks = w.rows / 32, steps = w.columns / 16, gpr = w.columns / w.group;
+    return kernel({w.words, w.high, w.scales, w.biases}, {{w.rows, w.columns}}, {mx::float16}, {blocks * steps * 32, 1, 1},
+                  {256, 1, 1}, {{"K", w.columns}, {"STEPS", steps}, {"BLOCKS", blocks}, {"GPR", gpr}, {"BITS", w.bits},
+                  {"GS", w.group}, {"TQ4", w.tq4}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
+mx::array nax_affine_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16) {
+    if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
+        throw std::invalid_argument("nax affine gemm: input must be [m, columns]");
+    auto x = mx::astype(input, mx::float16);
+    auto y = mx::astype(mx::matmul(x, mx::transpose(nax_affine_dequant(w))), mx::float32);
+    return round_bf16 ? mx::astype(mx::astype(y, mx::bfloat16), mx::float32) : y;
 }
 
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {

@@ -25,6 +25,11 @@ std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<c
 // row, so one row and a verify batch give bitwise equal results.
 mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 int nax_affine_splits(const NaxAffine& weights);
+// The stored matrix as FP16 [rows, columns], the values the matmul kernel multiplies.
+mlx::core::array nax_affine_dequant(const NaxAffine& weights);
+// Prefill: dequantize once, then one FP16 GEMM (FP32 accumulate, FP16 output) for many input rows. Not row-invariant
+// with nax_affine_matmul (accumulation order), so decode and verify keep the row kernel.
+mlx::core::array nax_affine_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 // Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that
 // share an input).
 // TQ4 (GGUF type 300, integer levels, rotated basis) repacked into the matrix-unit lane order; the input must be

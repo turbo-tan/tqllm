@@ -442,6 +442,18 @@ struct Qwen35::Impl {
                     }
                 }
             }
+        // prefill chunks: dequantize once and run one GEMM instead of re-decoding the matrix per 32-row tile
+        static const int gemm_rows=std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")?std::atoi(std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")):0;
+        if(gemm_rows>0 && x.shape(0)>=gemm_rows) {
+            if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return nax_affine_gemm(found->second,rotated(),true);
+            if(auto member=nax_member.find(name);member!=nax_member.end()) {
+                auto& g=nax_groups.at(member->second.first);
+                if(!g.last || g.last->first.id()!=x.id())g.last=std::pair{x,nax_affine_gemm(g.weights,x,true)};
+                const auto [off,rows]=g.parts[member->second.second];
+                return mx::slice(g.last->second,{0,off},{x.shape(0),off+rows});
+            }
+            if(auto found=nax.find(name);found!=nax.end())return nax_affine_gemm(found->second,x,true);
+        }
         if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
             auto xr=rotated();
             if(!nax_rotated_input || nax_rotated_input->first.id()!=xr.id())

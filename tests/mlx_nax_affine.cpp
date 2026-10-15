@@ -1,8 +1,10 @@
 #include "nax_affine.hpp"
+#include <mlx/random.h>
 #include "tq4.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -137,6 +139,55 @@ bool run_tq4(int rows, int k, std::mt19937& rng) {
     std::printf("NAX TQ4 rows=%d k=%d rel_err_vs_tq4_matmul=%.3e row_mismatches=%zu\n", rows, k, worst / peak, mismatches);
     return worst / peak < 2e-3 && mismatches == 0;
 }
+
+// dequantized FP16 values equal the host decode bitwise; the GEMM path matches the row kernel on a prefill chunk
+bool run_gemm(int rows, int k, int bits, int group, std::mt19937& rng) {
+    const int levels = 1 << bits, gpr = k / group;
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() % levels);
+    std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f), xd(-2.0f, 2.0f);
+    std::vector<uint16_t> s(size_t(rows) * gpr), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+    auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, bits, group), rows, k, bits, group);
+    auto deq = mx::contiguous(nax_affine_dequant(w));
+    mx::eval(deq);
+    size_t bad = 0;
+    const auto* dq = deq.data<mx::float16_t>();
+    for (int n = 0; n < rows; ++n)
+        for (int c = 0; c < k; ++c) {
+            const size_t g = size_t(n) * gpr + c / group;
+            const auto expect = mx::float16_t(std::fma(float(codes[size_t(n) * k + c]), bf16_value(s[g]), bf16_value(b[g])));
+            bad += std::memcmp(&expect, &dq[size_t(n) * k + c], 2) != 0;
+        }
+    const int m = 64;
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto ref = rows_of(nax_affine_matmul(w, X, true)), got = rows_of(nax_affine_gemm(w, X, true));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - got[i])));}
+    std::printf("NAX gemm rows=%d k=%d bits=%d group=%d dequant_mismatches=%zu rel_err_vs_row_kernel=%.3e\n", rows, k, bits, group, bad, worst / peak);
+    return bad == 0 && worst / peak < 5e-3;
+}
+// microseconds per 1024-row chunk at the FFN-down shape: row kernel vs dequantize + GEMM
+void bench_gemm(int rows, int k, std::mt19937& rng) {
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() & 15u);
+    std::vector<uint16_t> s(size_t(rows) * (k / 128)), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(0.01f); b[i] = bf16_bits(-0.05f);}
+    auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 128), rows, k, 4, 128);
+    auto X = mx::random::normal({1024, k});
+    mx::eval(X);
+    for (int path : {0, 1}) {
+        auto call = [&] {return path ? nax_affine_gemm(w, X, true) : nax_affine_matmul(w, X, true);};
+        mx::eval(call());
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) mx::eval(call());
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 5;
+        std::printf("NAX_PREFILL_BENCH %s rows=%d k=%d m=1024 %.0f us (%.1f GB/s weight-equivalent at 4 bit)\n",
+                    path ? "gemm" : "row_kernel", rows, k, us, double(rows) * k * 0.5 / us * 1e-3);
+    }
+}
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
@@ -161,7 +212,9 @@ bool run_embedding(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
+    bench_gemm(17408, 5120, rng);
+    bench_gemm(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
     return ok ? 0 : 1;
 }
