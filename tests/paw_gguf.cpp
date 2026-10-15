@@ -140,6 +140,7 @@ int main() {
         std::memcpy(&rec, data.data(), sizeof(rec));
         check(x3_record_valid(rec) && rec.rows == rows && rec.cols == cols && rec.words == words,
               "record header decodes");
+        check(rec.codec == X3_CODEC_MUL1, "record codec = mul1");
         // bytes after the header must equal the original trellis + suh + svh blobs.
         const Spec * tr = nullptr, * suh = nullptr, * svh = nullptr;
         for (const Spec & s : specs) {

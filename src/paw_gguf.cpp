@@ -3,17 +3,33 @@
 #include "formats/x3_record.hpp"
 
 #include <cstring>
-#include <map>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tqllm {
 
 namespace {
 
-constexpr const char * kArchPaw = "paw-dense";
-constexpr const char * kArchQwen35 = "qwen35";
+// A metadata-key prefix rename applied when an arch is adapted (paw-dense.* -> qwen35.*).
+struct KeyAlias {
+    const char * from;
+    const char * to;
+};
+
+// Builds the virtual tensors an arch's file exposes to the engine. May throw on a malformed file.
+using TensorMapFn = void (*)(GgufFile &);
+
+// One row per PAW checkpoint family: its file arch, the arch the engine sees, the key renames and
+// the tensor rewrite. Adding a family (e.g. paw-moe) is a new row plus one map function.
+struct PawArch {
+    const char * paw_arch;
+    const char * tq_arch;
+    std::span<const KeyAlias> aliases;
+    TensorMapFn map;
+};
 
 bool ends_with(const std::string & s, const char * suf) {
     const size_t n = std::strlen(suf);
@@ -24,37 +40,37 @@ std::string strip_suffix(const std::string & s, const char * suf) {
     return s.substr(0, s.size() - std::strlen(suf));
 }
 
-} // namespace
+// Rename every metadata key with prefix `from` to prefix `to` (in place).
+void prefix_rename(std::map<std::string, GgufValue> & kv, const char * from, const char * to) {
+    const std::string f(from), t(to);
+    std::vector<std::pair<std::string, GgufValue>> moved;
+    for (auto it = kv.begin(); it != kv.end();) {
+        if (it->first.rfind(f, 0) == 0) {
+            moved.emplace_back(t + it->first.substr(f.size()), it->second);
+            it = kv.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto & [k, v] : moved) kv[k] = std::move(v);
+}
 
-void paw_adapt(GgufFile & f) {
-    if (!f.has("general.architecture")) return;
-    if (f.str("general.architecture") != kArchPaw) return;
-
+// paw-dense map: an `m3_trellis` / `m3_suh` / `m3_svh` triple becomes one GGML_X3 virtual tensor.
+void map_m3_x3(GgufFile & f) {
     // Refuse files the x3 codec cannot read.
     for (const auto & [name, t] : f.tensors) {
         (void) t;
         if (ends_with(name, ".rt_trellis"))
             throw std::runtime_error("paw_adapt: " + f.path +
-                                     " uses the legacy rt codec (rt_trellis); only x3 (mul1-v1) is supported");
+                                     " uses the legacy rt codec (rt_trellis); only x3 is supported");
     }
 
     if (int(f.num("paw.format_version", 0)) != 3)
         throw std::runtime_error("paw_adapt: " + f.path + " is not paw.format_version 3");
-    if (f.str("paw.x3_rewrite") != "mul1-v1")
-        throw std::runtime_error("paw_adapt: " + f.path + " has paw.x3_rewrite != mul1-v1");
-
-    // Alias paw-dense.* metadata to qwen35.* and switch the arch so the engine sees a qwen35 file.
-    const std::string prefix = std::string(kArchPaw) + ".";
-    for (auto it = f.kv.begin(); it != f.kv.end();) {
-        if (it->first.rfind(prefix, 0) == 0) {
-            f.kv["qwen35." + it->first.substr(prefix.size())] = it->second;
-            it = f.kv.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    f.kv["general.architecture"].str = kArchQwen35;
-    f.kv["general.architecture"].num = 0;
+    const std::string rewrite = f.str("paw.x3_rewrite");
+    uint16_t codec = 0;
+    if (rewrite == "mul1-v1") codec = X3_CODEC_MUL1;
+    else throw std::runtime_error("paw_adapt: " + f.path + " has unknown paw.x3_rewrite '" + rewrite + "'");
 
     // Build one GGML_X3 virtual tensor per m3 triple, drop the parts, drop the unused rt tlut.
     std::map<std::string, GgufTensor> added;
@@ -89,7 +105,7 @@ void paw_adapt(GgufFile & f) {
         vt.ne = {cols, rows};
         vt.offset = 0;  // virtual: read() walks `parts`
         vt.bytes = sizeof(X3Record) + tr.bytes + suh.bytes + svh.bytes;
-        const X3Record rec = x3_record_make(uint32_t(rows), uint32_t(cols), uint32_t(words));
+        const X3Record rec = x3_record_make(uint32_t(rows), uint32_t(cols), uint32_t(words), codec);
         vt.header.assign(reinterpret_cast<const char *>(&rec),
                          reinterpret_cast<const char *>(&rec) + sizeof(rec));
         vt.parts = {tr, suh, svh};
@@ -101,6 +117,28 @@ void paw_adapt(GgufFile & f) {
     for (const std::string & n : drop) f.tensors.erase(n);
     f.tensors.erase("mach1.ne_tlut");  // legacy rt codec, unused by x3
     for (auto & [n, t] : added) f.tensors.emplace(n, std::move(t));
+}
+
+constexpr KeyAlias kPawDenseAliases[] = {{"paw-dense.", "qwen35."}};
+
+constexpr PawArch kPawArches[] = {
+    {"paw-dense", "qwen35", kPawDenseAliases, map_m3_x3},
+};
+
+} // namespace
+
+void paw_adapt(GgufFile & f) {
+    if (!f.has("general.architecture")) return;
+    const std::string arch = f.str("general.architecture");
+    const PawArch * pa = nullptr;
+    for (const PawArch & p : kPawArches)
+        if (arch == p.paw_arch) { pa = &p; break; }
+    if (!pa) return;
+
+    for (const KeyAlias & al : pa->aliases) prefix_rename(f.kv, al.from, al.to);
+    f.kv["general.architecture"].str = pa->tq_arch;
+    f.kv["general.architecture"].num = 0;
+    pa->map(f);
 }
 
 } // namespace tqllm
