@@ -82,6 +82,17 @@ inline std::string json_error(const std::string & message, const char * type = "
     return out;
 }
 
+// Sampling for requests that set none (--temperature / --top-p / --top-k). Agents such as Codex send no temperature;
+// greedy decoding (the default) can repeat itself on repetitive output, so `tqllm launch` sets the model's recommended values.
+struct SamplingDefaults {
+    float temperature = 0.f, top_p = 1.f;
+    int top_k = 0;
+};
+inline SamplingDefaults & sampling_defaults() {
+    static SamplingDefaults d;
+    return d;
+}
+
 struct ChatRequest {
     std::string prompt_text;
     std::vector<std::string> stop;
@@ -96,8 +107,9 @@ struct ChatRequest {
     bool budget_set = false;
     std::string budget_message;
     bool message_set = false;
-    float temperature = 0.f, top_p = 1.f;  // temperature 0 = greedy (TQLLM samples from the exact top-16 logits)
-    int top_k = 0;
+    float temperature = sampling_defaults().temperature;  // 0 = greedy (TQLLM samples from the exact top-16 logits)
+    float top_p = sampling_defaults().top_p;
+    int top_k = sampling_defaults().top_k;
     uint64_t seed = 0;
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)

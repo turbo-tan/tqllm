@@ -105,7 +105,8 @@ python3 tools/launch/tqllm.py launch claude --model models/Qwen3.8-27B-TQ_S.gguf
 python3 tools/launch/tqllm.py serve --model qwen3.8-27b  # just the server, until Ctrl+C
 ```
 
-- **Agents:** `opencode`, `codex` and `claude` (Claude Code, through a built-in Anthropic Messages to OpenAI bridge).
+- **Agents:** `opencode`, `codex` (through the server's OpenAI Responses API) and `claude` (Claude Code, through the
+  server's Anthropic Messages API).
   Arguments after `--` go to the agent, e.g. `launch opencode -- run "fix the failing test"`.
 - **Models:** `--model` takes a GGUF file, a catalog name from `tools/launch/models.json`, or nothing (the default
   for the GPU's memory). Catalog files are looked up in `./models`, `~/models` and `$TQLLM_MODELS`; missing ones are
@@ -114,8 +115,43 @@ python3 tools/launch/tqllm.py serve --model qwen3.8-27b  # just the server, unti
   prompts are long; `--context`, `--port`, `--reasoning` and `--server-arg` (repeatable) pass through. A server already
   answering on the port is reused and left running; one the command started is stopped when the agent exits or the
   command gets Ctrl+C / SIGTERM.
+- **Sampling and length:** agents get temperature 0.6, top-p 0.95 and top-k 20 for requests that set none (Qwen3.8's
+  thinking-mode settings; Codex sends none, and greedy decoding can repeat itself on repetitive output such as ASCII art)
+  and `--max-tokens 32768`. `--temperature 0` restores greedy decoding; `--top-p`, `--top-k` and `--max-tokens` override.
+  The server takes the same defaults as `tqserve --temperature T --top-p P --top-k K`.
 - The agents' own configuration files are never written; each gets its provider through its environment or command
   line.
+
+### Codex CLI
+
+![tqllm launch codex on one RTX 3090](docs/assets/tqllm-launch-codex.gif)
+
+*`tqllm launch codex` on one RTX 3090 (Qwen3.8-27B TQ3_4S-v2, DFlash2 drafter): the Codex TUI writes and runs
+`fizzbuzz.py`. 47 s of server start are cut from the recording.*
+
+Codex talks to the server's OpenAI Responses API (`/v1/responses`). `launch codex` passes the provider on Codex's
+command line; arguments after `--` go to Codex:
+
+```sh
+python3 tools/launch/tqllm.py launch codex --native build/tqserve            # the Codex TUI in this directory
+python3 tools/launch/tqllm.py launch codex --native build/tqserve -- exec "add a unit test for utils.py"
+```
+
+To point your own Codex at a running server instead, add this to `~/.codex/config.toml` and run `codex`:
+
+```toml
+model = "tqllm"
+model_provider = "tqllm"
+
+[model_providers.tqllm]
+name = "tqLLM"
+base_url = "http://localhost:8086/v1"
+wire_api = "responses"
+```
+
+- Needs a server with `/v1/responses`: a [native build](#native-build) of this repository. The 1.0.0 Docker image
+  predates it; the next image tag includes it.
+- Codex 0.16x no longer accepts `wire_api = "chat"`. Tested with Codex 0.162.1.
 
 ## TQ formats: TQ3_4S, TQ3 and TQ4
 
@@ -376,7 +412,8 @@ cmake --build build --target tqserve -j4
 ./build/tqserve --model models/model.gguf --port 8086
 ```
 
-Use a sufficiently recent CUDA toolkit; CUDA 12.9 was tested on RTX 3090.
+Needs CMake 3.25 or newer (CUDA C++20; `python3 -m pip install cmake` gets one on older distributions) and a recent
+CUDA toolkit; CUDA 12.9 and 13.0 were tested on RTX 3090.
 Model downloads are not included. Model weights and bundled third-party source
 retain their own licenses. tqLLM itself is licensed under Apache-2.0 (see LICENSE and NOTICE).
 

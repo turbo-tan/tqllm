@@ -248,6 +248,18 @@ void test_sampling_numbers() {
 }
 
 int main(int argc, char ** argv) {
+    {  // requests without sampling fields take the server defaults (--temperature / --top-p / --top-k); explicit values win
+        const auto body = std::string(R"({"messages":[{"role":"user","content":"hi"}]})");
+        const auto greedy = tqserve::parse_request(body, 64, "", true);
+        check(greedy.temperature == 0.f && greedy.top_p == 1.f && greedy.top_k == 0, "default sampling is greedy");
+        tqserve::sampling_defaults() = {0.6f, 0.95f, 20};
+        const auto agent = tqserve::parse_request(body, 64, "", true);
+        check(agent.temperature == 0.6f && agent.top_p == 0.95f && agent.top_k == 20, "server sampling defaults apply");
+        const auto own = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}],"temperature":0,"top_k":1})", 64, "", true);
+        check(own.temperature == 0.f && own.top_k == 1 && own.top_p == 0.95f, "request values override the defaults");
+        tqserve::sampling_defaults() = {};
+    }
+
     tqserve::serve_options().repeat_limit = 6;
     test_sampling_numbers();
     test_repeat_guard();

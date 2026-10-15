@@ -30,10 +30,17 @@ def model_dirs():
 
 
 def find_local(rel):
-    """A catalog file (repo path like drafters/x.gguf) in any model folder, by its path or by its file name."""
+    """A catalog file (repo path like drafters/x.gguf) in any model folder: by its path, by its file name, or by its file
+    name one folder down (e.g. ~/models/dflash2/x.gguf)."""
+    name = os.path.basename(rel)
     for d in model_dirs():
-        for cand in (os.path.join(d, rel), os.path.join(d, os.path.basename(rel))):
+        for cand in (os.path.join(d, rel), os.path.join(d, name)):
             if os.path.isfile(cand): return cand
+    for d in model_dirs():
+        try: subs = sorted(e.path for e in os.scandir(d) if e.is_dir())
+        except OSError: continue
+        for sub in subs:
+            if os.path.isfile(os.path.join(sub, name)): return os.path.join(sub, name)
     return None
 
 
@@ -121,8 +128,12 @@ def server_ok(port, name):
 
 def start_server(a):
     """Returns (process, container name or None); waits for /health with a timeout and a liveness check."""
+    sampling = ["--temperature", str(a.temperature), "--top-p", str(a.top_p), "--top-k", str(a.top_k)]
+    if not a.native and a.image.endswith(":1.0.0"):  # 1.0.0 predates the sampling options: it stays greedy
+        print("tqllm: image 1.0.0 has no --temperature / --top-p / --top-k (greedy decoding); --native or a newer image", file=sys.stderr)
+        sampling = []
     args = ["--context", str(a.context), "--np", "1", "--reasoning", a.reasoning, "--max-tokens", str(a.max_tokens),
-            "--name", NAME, "--prompt-cache", "on"] + a.server_arg
+            "--name", NAME, "--prompt-cache", "on"] + sampling + a.server_arg
     if a.native:
         cmd = [a.native, "--model", a.model, "--port", str(a.port), "--host", "127.0.0.1"] + args
         if a.drafter: cmd += ["-md", a.drafter, "--draft-vocab", a.draft_vocab]
@@ -138,7 +149,7 @@ def start_server(a):
             vols += ["-v", f"{ddir}:/drafter:ro", "-v", f"{vdir}:/vocab:ro"]
             env += ["-e", f"DRAFT_MODEL_FILE=/drafter/{dfile}", "-e", f"DRAFT_VOCAB_FILE=/vocab/{vfile}"]
         cmd = ["docker", "run", "--rm", "--name", cname, "--gpus", "all", "-p", f"127.0.0.1:{a.port}:8086"] + vols + env + \
-              [a.image, "--name", NAME, "--prompt-cache", "on"] + a.server_arg
+              [a.image, "--name", NAME, "--prompt-cache", "on"] + sampling + a.server_arg
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(a.log, "w"))
     t0 = time.time()
     while time.time() - t0 < a.start_timeout:
@@ -200,7 +211,7 @@ def run_agent(a, base):
     cmd = agent_command(a, base, env)
     if not shutil.which(cmd[0]): sys.exit(f"tqllm: {cmd[0]} is not installed")
     if tool in ("codex", "claude") and not api_ok(base, "/v1/responses" if tool == "codex" else "/v1/messages"):
-        sys.exit(f"tqllm: the server on {base} has no {'Responses' if tool == 'codex' else 'Messages'} API; use image 1.0.1 or newer")
+        sys.exit(f"tqllm: the server on {base} has no {'Responses' if tool == 'codex' else 'Messages'} API; start it from a native build (--native build/tqserve) or a newer image")
     return subprocess.call(cmd, env=env)
 
 
@@ -215,7 +226,11 @@ def main():
     p.add_argument("--drafter"); p.add_argument("--draft-vocab")
     p.add_argument("--no-drafter", action="store_true", help="run without the catalog model's drafter")
     p.add_argument("--context", type=int, default=65536, help="tokens (default 65536: agent prompts are long)")
-    p.add_argument("--max-tokens", type=int, default=8192); p.add_argument("--reasoning", default="on")
+    p.add_argument("--max-tokens", type=int, default=32768, help="per answer (default 32768: agents write whole files after reasoning)")
+    p.add_argument("--reasoning", default="on")
+    p.add_argument("--temperature", type=float, default=0.6, help="sampling for requests that set none (default 0.6, top-p 0.95, top-k 20: "
+                   "Qwen3.8's thinking-mode settings; agents such as Codex send none, and greedy decoding can loop); 0 = greedy")
+    p.add_argument("--top-p", type=float, default=0.95); p.add_argument("--top-k", type=int, default=20)
     p.add_argument("--port", type=int, default=8086); p.add_argument("--image", default=IMAGE)
     p.add_argument("--native", help="path to a tqserve binary instead of the Docker image")
     p.add_argument("--server-arg", action="append", default=[], help="extra tqserve option (repeatable)")
@@ -246,7 +261,10 @@ def main():
     except KeyboardInterrupt:
         return 130
     finally:
-        if proc: stop_server(proc, cname)
+        if proc:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # a second Ctrl+C must not cut the shutdown short
+                signal.signal(sig, signal.SIG_IGN)
+            stop_server(proc, cname)
 
 
 if __name__ == "__main__":
