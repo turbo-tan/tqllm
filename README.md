@@ -107,6 +107,7 @@ python3 tools/launch/tqllm.py serve --model qwen3.8-27b  # just the server, unti
 
 - **Agents:** `opencode`, `codex` (through the server's OpenAI Responses API) and `claude` (Claude Code, through the
   server's Anthropic Messages API).
+  `pi` (the pi coding agent) and `dsh` (DeepSeek Harness, `web` or `headless` profile) also run against the server.
   Arguments after `--` go to the agent, e.g. `launch opencode -- run "fix the failing test"`.
 - **Models:** `--model` takes a GGUF file, a catalog name from `tools/launch/models.json`, or nothing (the default
   for the GPU's memory). Catalog files are looked up in `./models`, `~/models` and `$TQLLM_MODELS`; missing ones are
