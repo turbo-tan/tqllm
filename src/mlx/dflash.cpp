@@ -287,7 +287,9 @@ void DFlash2::inject(const mx::array& features,int position) {
         }
         live.push_back(*c.k);live.push_back(*c.v);
     }
-    mx::eval(live);i.end+=n;
+    static const bool lazy=std::getenv("TQLLM_MLX_LAZY_INJECT")!=nullptr;  // evaluated with the next draft
+    if(!lazy)mx::eval(live);
+    i.end+=n;
 }
 std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
