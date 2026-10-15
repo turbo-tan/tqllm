@@ -369,12 +369,12 @@ struct Qwen35::Impl {
     }
     mx::array mat(const std::string& name,const mx::array& x,bool input_rotated=false) {
         if(auto found=nax.find(name);found!=nax.end()) {
-            auto y=nax_affine_matmul(found->second,x);
+            auto y=nax_affine_matmul(found->second,x,true);
             if(std::getenv("TQLLM_MLX_NAX_ROW_CHECK") && x.shape(0)>1) {
                 auto full=mx::contiguous(y);mx::eval(full,x);
                 const auto xf=mx::astype(x,mx::float32);mx::eval(xf);
                 for(int r=0;r<x.shape(0);++r) {
-                    auto one=mx::contiguous(nax_affine_matmul(found->second,mx::contiguous(tail_slice(x,0,r,r+1))));mx::eval(one);
+                    auto one=mx::contiguous(nax_affine_matmul(found->second,mx::contiguous(tail_slice(x,0,r,r+1)),true));mx::eval(one);
                     if(std::memcmp(one.data<float>(),full.data<float>()+size_t(r)*one.size(),one.nbytes())) {
                         double peak=0;const float* xp=xf.data<float>();for(size_t j=0;j<xf.size();++j)peak=std::max(peak,double(std::abs(xp[j])));
                         std::fprintf(stderr,"NAX_ROW_MISMATCH %s row=%d m=%d split=%d dtype=%d contiguous=%d max_abs_x=%g\n",name.c_str(),r,x.shape(0),
@@ -383,7 +383,7 @@ struct Qwen35::Impl {
                     }
                 }
             }
-            return bf(y);
+            return y;
         }
         auto rotated=[&]() {
             if(input_rotated)return x;

@@ -19,9 +19,10 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
 // codes [rows, columns] in 0..2^bits-1, scales/biases [rows, columns/group]: the stored payload.
 std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<const uint16_t> scales_bf16,
                                      std::span<const uint16_t> biases_bf16, int rows, int columns, int bits, int group);
-// [m, columns] input (any float dtype, m >= 1) times the stored matrix, FP32 [m, rows]. Every output row depends
-// only on its own input row, so one row and a verify batch give bitwise equal results.
-mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input);
+// [m, columns] input (FP32, BF16 or FP16 read in the kernel and rounded to FP16; m >= 1) times the stored matrix,
+// FP32 [m, rows], optionally rounded to BF16 values in the kernel. Every output row depends only on its own input
+// row, so one row and a verify batch give bitwise equal results.
+mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 int nax_affine_splits(const NaxAffine& weights);
 
 // 8-bit affine, group 64, row-major codes: a token-embedding table read by gather.
