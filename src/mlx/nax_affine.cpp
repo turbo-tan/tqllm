@@ -193,6 +193,23 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
+    if (parts.empty()) throw std::invalid_argument("nax affine concat: no parts");
+    const auto& f = *parts.front();
+    std::vector<mx::array> w, h, sc, b;
+    int rows = 0;
+    for (const auto* p : parts) {
+        if (p->columns != f.columns || p->bits != f.bits || p->group != f.group)
+            throw std::invalid_argument("nax affine concat: parts differ in columns, bits or group");
+        w.push_back(p->words); h.push_back(p->high); sc.push_back(p->scales); b.push_back(p->biases);
+        rows += p->rows;
+    }
+    NaxAffine out{mx::concatenate(w, 0), f.bits == 6 ? mx::concatenate(h, 0) : f.high, mx::concatenate(sc, 0),
+                  mx::concatenate(b, 0), rows, f.columns, f.bits, f.group};
+    mx::eval(out.words, out.high, out.scales, out.biases);
+    return out;
+}
+
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns) {
     if (rows == 0 || columns % 64) throw std::invalid_argument("affine8 embedding needs columns % 64 == 0");
     return rows * columns + rows * (columns / 64) * 4;

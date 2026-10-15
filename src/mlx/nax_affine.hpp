@@ -24,6 +24,9 @@ std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<c
 // row, so one row and a verify batch give bitwise equal results.
 mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 int nax_affine_splits(const NaxAffine& weights);
+// Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that
+// share an input).
+NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts);
 
 // 8-bit affine, group 64, row-major codes: a token-embedding table read by gather.
 struct Affine8Embedding {

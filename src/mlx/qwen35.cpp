@@ -122,6 +122,10 @@ struct Qwen35::Impl {
     std::optional<Q4Embedding> embedding;
     std::optional<Affine8Embedding> embedding8;
     std::map<std::string,NaxAffine> nax;
+    // projections sharing an input run as one NAX launch; members read column views of the shared result
+    struct NaxGroup {NaxAffine weights;std::vector<std::pair<int,int>> parts;std::optional<std::pair<mx::array,mx::array>> last;};
+    std::map<std::string,NaxGroup> nax_groups;
+    std::map<std::string,std::pair<std::string,int>> nax_member;
     std::vector<Cache> caches;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
@@ -341,6 +345,26 @@ struct Qwen35::Impl {
                 for(const auto* name:{"ssm_conv1d.weight","ssm_a","ssm_dt.bias","ssm_norm.weight"}) scalar(p+name);
             }
         }
+        if(!(std::getenv("TQLLM_MLX_NAX_FUSE") && std::string_view(std::getenv("TQLLM_MLX_NAX_FUSE"))=="0"))
+            for(int l=0;l<layers;++l) {
+                const std::string p="blk."+std::to_string(l)+".";
+                for(const auto& members:std::vector<std::vector<std::string>>{{"ffn_gate.weight","ffn_up.weight"},
+                        {"attn_qkv.weight","attn_gate.weight"},{"attn_q.weight","attn_k.weight","attn_v.weight"}}) {
+                    std::vector<const NaxAffine*> parts;
+                    for(const auto& m:members)if(auto f=nax.find(p+m);f!=nax.end())parts.push_back(&f->second);
+                    if(parts.size()!=members.size())continue;
+                    bool same=true;for(const auto* q:parts)same=same&&q->columns==parts[0]->columns&&q->bits==parts[0]->bits&&q->group==parts[0]->group;
+                    if(!same)continue;
+                    NaxGroup g{nax_affine_concat(parts),{},std::nullopt};
+                    int off=0;
+                    for(size_t j=0;j<members.size();++j) {
+                        const int r=nax.at(p+members[j]).rows;g.parts.push_back({off,r});off+=r;
+                        nax_member[p+members[j]]={p+members[0]+"+",int(j)};
+                    }
+                    for(const auto& m:members)nax.erase(p+m);
+                    nax_groups.emplace(p+members[0]+"+",std::move(g));
+                }
+            }
         caches.resize(layers);
         tapes.resize(layers);
         if(mma8) {
@@ -382,6 +406,7 @@ struct Qwen35::Impl {
                 if(name.find(tag)!=std::string::npos) {
                     int rows=0;
                     if(auto f=nax.find(name);f!=nax.end())rows=f->second.rows;
+                    else if(auto f=nax_member.find(name);f!=nax_member.end())rows=nax_groups.at(f->second.first).parts[f->second.second].second;
                     else if(auto it=matrices.find(name);it!=matrices.end())
                         std::visit([&](const auto& w){
                             if constexpr(std::is_same_v<std::decay_t<decltype(w)>,mx::array>)rows=w.shape(0);
@@ -396,6 +421,12 @@ struct Qwen35::Impl {
                     }
                 }
             }
+        if(auto member=nax_member.find(name);member!=nax_member.end()) {
+            auto& g=nax_groups.at(member->second.first);
+            if(!g.last || g.last->first.id()!=x.id())g.last=std::pair{x,nax_affine_matmul(g.weights,x,true)};
+            const auto [off,rows]=g.parts[member->second.second];
+            return mx::slice(g.last->second,{0,off},{x.shape(0),off+rows});
+        }
         if(auto found=nax.find(name);found!=nax.end()) {
             auto y=nax_affine_matmul(found->second,x,true);
             if(std::getenv("TQLLM_MLX_NAX_ROW_CHECK") && x.shape(0)>1) {
