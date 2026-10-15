@@ -110,3 +110,65 @@ class LaunchDrafter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# argv to a file next to the binary; a Ctrl+C takes 3 s to shut down (a real tqserve frees GPU memory first)
+FAKE_SLOW_SERVER = """import json, os, signal, sys, time
+open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "argv.json"), "w").write(json.dumps(sys.argv[1:]))
+signal.signal(signal.SIGINT, lambda *a: (time.sleep(3), os._exit(0)))
+""" + FAKE_SERVER
+
+
+class LaunchFirstRun(unittest.TestCase):
+    """What a first `tqllm launch` on a machine with existing model folders and a native build runs into."""
+    def _load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tqllm_launch_fr", os.path.join(LAUNCH, "tqllm.py"))
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+
+    def _serve(self, d, extra=()):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+        fake = os.path.join(d, "tqserve"); model = os.path.join(d, "m.gguf")
+        with open(fake, "w") as f: f.write("#!" + sys.executable + "\n" + FAKE_SLOW_SERVER)
+        os.chmod(fake, 0o755); open(model, "w").close()
+        p = subprocess.Popen([sys.executable, os.path.join(LAUNCH, "tqllm.py"), "serve", "--native", fake, "--model", model,
+                              "--port", str(port), "--log", os.path.join(d, "log"), "--start-timeout", "30", *extra],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        err = ""
+        for _ in range(100):
+            line = p.stderr.readline(); err += line
+            if "serving" in line or p.poll() is not None: break
+        self.assertIn("serving", err)
+        return p, port
+
+    def test_drafter_found_one_folder_down(self):
+        mod = self._load()
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "dflash2"))
+            want = os.path.join(d, "dflash2", "Qwen3.8-27B-DFlash2-TQ3.gguf"); open(want, "w").close()
+            mod.model_dirs = lambda: [d]
+            self.assertEqual(mod.find_local("drafters/Qwen3.8-27B-DFlash2-TQ3.gguf"), want)
+            self.assertIsNone(mod.find_local("drafters/missing.gguf"))
+
+    def test_agents_get_sampling_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._serve(d)
+            p.send_signal(signal.SIGTERM); p.wait(30)
+            argv = json.load(open(os.path.join(d, "argv.json")))
+            for flag, value in (("--temperature", "0.6"), ("--top-p", "0.95"), ("--top-k", "20"), ("--max-tokens", "32768")):
+                self.assertEqual(argv[argv.index(flag) + 1], value, flag)
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._serve(d, ("--temperature", "0"))
+            p.send_signal(signal.SIGTERM); p.wait(30)
+            argv = json.load(open(os.path.join(d, "argv.json")))
+            self.assertEqual(argv[argv.index("--temperature") + 1], "0.0")
+
+    def test_second_interrupt_during_shutdown_is_quiet(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, port = self._serve(d)
+            p.send_signal(signal.SIGINT); time.sleep(0.5); p.send_signal(signal.SIGINT)
+            _, err = p.communicate(timeout=60)
+            self.assertNotIn("Traceback", err)
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()

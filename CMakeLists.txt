@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)  # before project(), as if given on the command line
+  set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures (default: the GPUs in this machine; e.g. 86;120 to build for others)")
+endif()
 project(TQLLM VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +45,9 @@ add_library(tqjinja STATIC third_party/jinja/jinja/lexer.cpp third_party/jinja/j
 target_include_directories(tqjinja PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
 set_target_properties(tqjinja PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
 if(TQLLM_CUDA)
+  if(CMAKE_VERSION VERSION_LESS 3.25)  # CUDA C++20 dialect
+    message(FATAL_ERROR "CUDA builds need CMake 3.25 or newer (this is ${CMAKE_VERSION}); python3 -m pip install cmake")
+  endif()
   add_compile_definitions(TQLLM_WITH_CUDA=1)  # session.hpp: image input (vision encoder) only in CUDA builds
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
