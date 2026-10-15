@@ -1906,6 +1906,7 @@ private:
     Buf v_xb, v_mixa, v_mixb;  // W4A16: BF16 copy of the activation for BF16 matrices; [qkv|z] and [b|a] partials
     int last_n = 0;
     double last_prefill_ms = 0;
+    std::chrono::steady_clock::time_point dec_log_tp;  // last TQLLM_DEBUG=decode progress print
 
     // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own)
     void mm_h(const Mat & m, bf16 * out, int n) { mm_h(m, out, n, basis_); }
@@ -3747,6 +3748,7 @@ public:
         gen.done = false;
         gen.prefill_ms = last_prefill_ms;
         gen.decode_start = std::chrono::steady_clock::now();
+        dec_log_tp = gen.decode_start;
     }
 
     // Accepted draft count j for the active slot; res[j] becomes the token after them. Column col0 + i of the verify
@@ -4044,6 +4046,18 @@ public:
         return 0;
     }
 
+    // TQLLM_DEBUG=decode: a progress line every ~2.5 s while decoding (tokens / wall time, same basis as reqlog).
+    void dec_progress() {
+        static const bool on = tqllm::debug_on("decode");
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - dec_log_tp).count() < 2.5) return;
+        dec_log_tp = now;
+        const double total = std::chrono::duration<double>(now - gen.decode_start).count();
+        const uint32_t n = uint32_t(gen.out.size());
+        std::fprintf(stderr, "decode progress %u tokens (%.0f tok/s)\n", n, total > 0 ? n / total : 0.0);
+    }
+
     // One draft + verify step on the active slot; false once the generation is complete.
     bool dflash_advance() {
         if (gen.done) return false;
@@ -4229,6 +4243,7 @@ public:
             if (hit_eos) gen.done = true;
         }
         if (out.size() >= count || pending == eos_) gen.done = true;
+        dec_progress();
         return !gen.done;
     }
 
@@ -4427,6 +4442,7 @@ public:
         gen.t_draft += ms(t0, t1);
         gen.t_verify += ms(t1, t2);
         gen.t_tail += ms(t2, t3);
+        dec_progress();
         return !gen.done;
     }
 

@@ -18,7 +18,7 @@ flags:
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"
-    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), reqlog (one line per request: prefill and decode tok/s), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)"
+    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), decode (progress line every ~2.5 s while decoding), draft (first draft / accept decisions), reqlog (one line per request: prefill and decode tok/s), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)"
   - name: TQLLM_MATVEC_RULE
     kind: user
     default: "-"
