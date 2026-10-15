@@ -2,6 +2,7 @@
 #include "dflash.hpp"
 #include "tq3_tiled.hpp"
 #include "mma8.hpp"
+#include "nax_affine.hpp"
 #include "../dequant.hpp"
 #include <algorithm>
 #include <cmath>
@@ -151,6 +152,7 @@ struct DFlash2::Impl {
     float eps,theta;
     std::vector<int> features;
     std::map<std::string,Matrix> matrices;
+    std::map<std::string,NaxAffine> nax;
     std::map<std::string,TqTiledWeights> tiled_ffn;
     std::map<std::string,Mma8Weights> mma8_attn;
     std::optional<std::pair<mx::array,mx::array>> rotation_half;
@@ -180,6 +182,11 @@ struct DFlash2::Impl {
                 dequantize_host(tensor.type,raw.data(),table.data(),table.size());
                 auto values=mx::astype(mx::array(table.data(),{vocab,rank}),mx::bfloat16);
                 mx::eval(values);plain.emplace(name,std::move(values));
+            } else if(tensor.type==GGML_NAX_A4_G64 || tensor.type==GGML_NAX_A4_G128 || tensor.type==GGML_NAX_A6_G64) {
+                auto raw=file.read(tensor);
+                const int bits=tensor.type==GGML_NAX_A6_G64?6:4,group=tensor.type==GGML_NAX_A4_G128?128:64;
+                nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
+                                                 int(tensor.ne[1]),int(tensor.ne[0]),bits,group));
             } else if(tensor.ne.size()==2 && name.find(".weight")!=std::string::npos &&
                       tensor.ne[0]>128 && tensor.ne[1]>128) {
                 auto w=load_matrix(file,name);
@@ -209,6 +216,7 @@ struct DFlash2::Impl {
         caches.resize(layers);target.feature_layers(features);
     }
     mx::array mat(const std::string& name,const mx::array& x) {
+        if(auto found=nax.find(name);found!=nax.end())return nax_affine_matmul(found->second,x,true);
         static const std::string ablate=std::getenv("TQLLM_MLX_DRAFT_ABLATE")?std::getenv("TQLLM_MLX_DRAFT_ABLATE"):"";
         if(!ablate.empty() && x.shape(0)<=8) {
             std::istringstream in(ablate);std::string tag;
