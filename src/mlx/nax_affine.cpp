@@ -18,9 +18,6 @@ inline int lane_fn(int lane) {return ((((lane >> 2) & 2) | (lane & 1)) * 4);}
 const char* kHeader = R"METAL(
 #include <metal_simdgroup>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-template <typename T> inline half4 half4_at(const device T* p) {
-    return half4(half(float(p[0])), half(float(p[1])), half(float(p[2])), half(float(p[3])));
-}
 inline float4 bf16x4(ushort4 v) {return float4(as_type<float>(uint(v.x) << 16), as_type<float>(uint(v.y) << 16),
                                                as_type<float>(uint(v.z) << 16), as_type<float>(uint(v.w) << 16));}
 )METAL";
@@ -53,14 +50,14 @@ const char* kSource = R"METAL(
     const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
     const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
-    const device XT* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
+    const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
     for (int g = 0; g < KS / GS; g++) {
         const float4 s0 = bf16x4(*(const device ushort4*)(sp + g * 32 + fn)), s1 = bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
         const float4 b0 = bf16x4(*(const device ushort4*)(bp + g * 32 + fn)), b1 = bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
         for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
-            half4 a0 = fm < rows ? half4_at(xs + ks * 16) : half4(0.0h);
-            half4 a1 = fm + 8 < rows ? half4_at(xs + 8 * K + ks * 16) : half4(0.0h);
+            half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
+            half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + ks * 16) : half4(0.0h);
             for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
             uint2 w = wp[ks * 32];
             uint h = BITS == 6 ? hp[ks * 32] : 0u;
@@ -78,8 +75,8 @@ const char* kSource = R"METAL(
             }
             op.run(ca, cb, cc);
             if (MR > 16) {
-                half4 a2 = fm + 16 < rows ? half4_at(xs + 16 * K + ks * 16) : half4(0.0h);
-                half4 a3 = fm + 24 < rows ? half4_at(xs + 24 * K + ks * 16) : half4(0.0h);
+                half4 a2 = fm + 16 < rows ? *(const device half4*)(xs + 16 * K + ks * 16) : half4(0.0h);
+                half4 a3 = fm + 24 < rows ? *(const device half4*)(xs + 24 * K + ks * 16) : half4(0.0h);
                 for (short i = 0; i < 4; i++) { ca2[i] = a2[i]; ca2[4 + i] = a3[i]; }
                 op.run(ca2, cb, cc2);
             }
@@ -185,15 +182,14 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
     static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
                                                 kSource, kHeader);
     const int m = input.shape(0), mr = m <= 16 ? 16 : 32, split = nax_affine_splits(w);
-    const auto t = input.dtype();
-    auto x = mx::contiguous(t == mx::float32 || t == mx::bfloat16 || t == mx::float16 ? input : mx::astype(input, mx::float32));
+    auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);
     auto count = mx::array(&m32, {1}, mx::uint32);
     const int bpt = split >= 4 ? 1 : 4 / split, threads = 32 * bpt * split;
     return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
                     {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
-                     {"BF", round_bf16}, {"XT", x.dtype()}},
+                     {"BF", round_bf16}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
