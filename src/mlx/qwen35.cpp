@@ -172,6 +172,14 @@ struct Qwen35::Impl {
     bool native_gdn_prep=env_default_on("TQLLM_MLX_NATIVE_GDN_PREP");
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
+    std::chrono::steady_clock::time_point stage_tick;
+    // with profile_stages: evaluate the arrays and charge the time since the last mark to this stage
+    void stage(const char* name,const std::vector<mx::array>& arrays) {
+        if(!stage_profiling)return;
+        mx::eval(arrays);
+        auto now=std::chrono::steady_clock::now();
+        stages[name]+=std::chrono::duration<double,std::milli>(now-stage_tick).count();stage_tick=now;
+    }
     bool gemm_prefill=false,gemm_verify=false;
     int target_head_shortlist=0;
     bool return_head_ids=false;
@@ -583,6 +591,7 @@ struct Qwen35::Impl {
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
         auto v=mx::transpose(mx::reshape(mat(p+"attn_v.weight",x),{1,m,kvheads,hd}),{0,2,1,3});
         q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
+        stage("attn_proj",{q,k,v,gate});
         if(layer<0) {  // MTP cache: appended by concatenation (its inject path does the same)
             c.keys=c.keys?mx::concatenate({*c.keys,k},2):k;
             c.values=c.values?mx::concatenate({*c.values,v},2):v;
@@ -610,12 +619,14 @@ struct Qwen35::Impl {
         c.kv_len=need;
         auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows,need);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
+        stage("attn_core",{out,*kb,*vb});
         out=gate_mul_bf(out,gate);
         return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
     }
     mx::array gdn(const std::string& p,const mx::array& x,Cache& c,PrefixTape& tape) {
         const int m=x.shape(0),width=2*kh*dk+vh*dv;
         auto qkv=mat(p+"attn_qkv.weight",x);
+        stage("gdn_proj_in",{qkv});
         auto history=c.conv?*c.conv:mx::zeros({conv-1,width});
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
@@ -638,6 +649,7 @@ struct Qwen35::Impl {
         auto gates=native_gdn_prep?gdn_gates_native(a,b,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a")):
             std::pair{gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),mx::sigmoid(b)};
         auto decay=mx::reshape(gates.first,{1,m,vh}),beta=mx::reshape(gates.second,{1,m,vh});
+        stage("gdn_prep",{q,k,v,decay,beta});
         auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
         if(capture_prefix) {
             tape.states=scanned->snapshots;
@@ -646,6 +658,7 @@ struct Qwen35::Impl {
         auto update=scanned?std::vector<mx::array>{scanned->output,scanned->state}:native_head_order?gdn_native(q,k,v,decay,beta,c.state,*native_head_order):
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
+        stage("gdn_scan",{update[0],update[1]});
         auto z=mx::reshape(mat(p+"attn_gate.weight",x),{1,m,vh,dv});
         auto out=gdn_fuse?gdn_post_fused(update[0],z,plain.at(p+"ssm_norm.weight"),eps):
             silu_mul_bf(mx::fast::rms_norm(bf(update[0]),plain.at(p+"ssm_norm.weight"),eps),z);
@@ -696,13 +709,8 @@ struct Qwen35::Impl {
         auto start=std::chrono::steady_clock::now();
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
         stages.clear();rotation.reset();rotation_half.reset();dense_input.reset();
-        auto tick=std::chrono::steady_clock::now();
-        auto record=[&](const char* name,const std::vector<mx::array>& arrays) {
-            if(!stage_profiling)return;
-            mx::eval(arrays);
-            auto now=std::chrono::steady_clock::now();
-            stages[name]+=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;
-        };
+        stage_tick=std::chrono::steady_clock::now();
+        auto record=[&](const char* name,const std::vector<mx::array>& arrays) {stage(name,arrays);};
         const int m=int(tokens.size());auto x=bf(embed(tokens));
         std::vector<mx::array> features;
         if(stage_profiling)record("embedding",{x});

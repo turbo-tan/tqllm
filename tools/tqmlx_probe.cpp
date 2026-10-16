@@ -61,6 +61,7 @@ int main(int argc,char** argv) {
         if(input.empty()||input.size()+size_t(count)>size_t(context))throw std::invalid_argument("prompt or output exceeds context");
         if(cache_limit)mx::set_cache_limit(cache_limit);
         tqllm::mlx_backend::ScopedWiredLimit residency;
+        std::map<std::string,double> prefill_stages;
         auto started=Clock::now();tqllm::mlx_backend::Qwen35 engine(model,context);
         if(verify_prefix_probe)engine.gdn_mode(tqllm::mlx_backend::Qwen35::GdnMode::scan);
         engine.profile(profiling);
@@ -138,6 +139,7 @@ int main(int argc,char** argv) {
             for(size_t p=0;p<input.size();p+=size_t(chunk)) {
                 const size_t n=std::min(size_t(chunk),input.size()-p);
                 auto y=engine.forward({input.data()+p,n},all_logits);
+                if(stage_profiling)for(const auto& [name,ms]:engine.stage_timings())prefill_stages[name]+=ms;
                 if(all_logits && !logits_path.empty()) {
                     std::ofstream out(logits_path,(p?std::ios::app:std::ios::trunc)|std::ios::binary);
                     out.write(reinterpret_cast<const char*>(y.data<float>()),std::streamsize(y.size()*sizeof(float)));
@@ -146,6 +148,11 @@ int main(int argc,char** argv) {
                 logits=mx::reshape(mx::slice(y,{y.shape(0)-1,0},{y.shape(0),y.shape(1)}),{y.shape(1)});
             }
             const double prefill=elapsed(started);
+            if(stage_profiling) {
+                std::cerr<<"MLX_PREFILL_STAGES tokens="<<input.size()<<" sync_per_stage=1";
+                for(const auto& [name,ms]:prefill_stages)std::cerr<<' '<<name<<"_ms="<<ms;
+                std::cerr<<'\n';prefill_stages.clear();
+            }
             memory("prefilled");
             if(clear_prefill_cache) {mx::clear_cache();memory("cache_cleared");}
             uint32_t next=mx::argmax(*logits).item<uint32_t>();
