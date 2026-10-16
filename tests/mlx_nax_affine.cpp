@@ -124,7 +124,7 @@ bool run_tq4(int rows, int k, std::mt19937& rng) {
     for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
     Tq4Weights t{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true};
     auto w = nax_from_tq4(t);
-    const int m = 9;
+    const int m = 40;  // covers the 16-row and the 32-row (prefill) kernels
     std::vector<float> x(size_t(m) * k);
     for (auto& v : x) v = float(mx::float16_t(float(int(rng() % 2001) - 1000) * 1e-3f));
     auto X = mx::array(x.data(), {m, k}, mx::float32);

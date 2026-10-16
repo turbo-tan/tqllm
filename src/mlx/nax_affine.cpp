@@ -77,10 +77,13 @@ const char* kSource = R"METAL(
             uint2 w = wp[ks * 32];
             uint h = BITS == 6 ? hp[ks * 32] : 0u;
             if (TQ4) {
+                // levels 6..127 as bytes of two words: select + shift instead of a divergent constant-memory lookup
                 for (short i = 0; i < 8; i++) {
-                    const float sa = s0[i & 3], sb = s1[i & 3];
-                    cb[i] = half(float(TQ4_LEVEL[(w.x >> (4 * i)) & 15u]) * sa);
-                    cb[8 + i] = half(float(TQ4_LEVEL[(w.y >> (4 * i)) & 15u]) * sb);
+                    const uint ca = (w.x >> (4 * i)) & 15u, cbits = (w.y >> (4 * i)) & 15u;
+                    const float la = float(((ca & 4u ? 0x7F604B3Au : 0x2C1F1206u) >> (8u * (ca & 3u))) & 0xFFu);
+                    const float lb = float(((cbits & 4u ? 0x7F604B3Au : 0x2C1F1206u) >> (8u * (cbits & 3u))) & 0xFFu);
+                    cb[i] = half((ca & 8u ? -la : la) * s0[i & 3]);
+                    cb[8 + i] = half((cbits & 8u ? -lb : lb) * s1[i & 3]);
                 }
             } else
             for (short p = 0; p < 4; p++) {
