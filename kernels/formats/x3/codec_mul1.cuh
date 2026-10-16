@@ -166,6 +166,45 @@ struct Mul1Codec {
         for (int i = 0; i < 8; ++i) w[i] *= 0x83DCD12Du;
     }
 
+    // Register path with the lane-constant window positions computed once per kernel instead of per
+    // tile (TRUSS ~/trellis-kernel src/kernels/trellis/codec_mul1.cuh Mul1Frac). Same windows and
+    // codebook as regs_decode; fractional K only, other K forward to regs_decode.
+    struct Lane {
+        int lane, src_a[2], src_b[2], sh[2];
+        __device__ explicit Lane(int lane_) : lane(lane_) {
+            if constexpr (frac) {
+                constexpr int P = 2 * ka + 1;
+                #pragma unroll
+                for (int g = 0; g < 2; ++g) {
+                    const int e = lane * (4 * P) + (g + 1) * (2 * P);
+                    const int i2 = (e - 1) >> 5;
+                    src_a[g] = i2 == 0 ? u32words - 1 : i2 - 1;
+                    src_b[g] = i2;
+                    sh[g] = ((i2 + 1) << 5) - e;
+                }
+            }
+        }
+        __device__ __forceinline__ void tile(const uint32_t* bw, int t, FragB& f0, FragB& f1) const {
+            if constexpr (frac) {
+                constexpr int P = 2 * ka + 1;
+                uint32_t w[8];
+                #pragma unroll
+                for (int g = 0; g < 2; ++g) {
+                    const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], src_a[g]);
+                    const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], src_b[g]);
+                    const uint32_t v = __funnelshift_r(bwv, awv, sh[g]);
+                    w[4 * g + 3] = v & 0xffff;
+                    w[4 * g + 2] = (v >> (ka + 1)) & 0xffff;
+                    w[4 * g + 1] = (v >> P) & 0xffff;
+                    w[4 * g + 0] = (v >> (P + ka + 1)) & 0xffff;
+                }
+                mul1_decode8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], f0, f1);
+            } else {
+                regs_decode(bw, t, lane, f0, f1);
+            }
+        }
+    };
+
     // 8 weights of tile `t` for `lane`, from the warp's loaded words bw (x3v_dq8_regs_* ported).
     __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
         const uint32_t full = 0xffffffffu;

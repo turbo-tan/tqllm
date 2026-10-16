@@ -7,6 +7,7 @@
 #include "codec_testscalar.cuh"
 #include "gemv_sq.cu"
 #include "gemv_x3v.cu"
+#include "gemv_window.cu"
 #include "reconstruct.cu"
 #include "x3.cuh"
 #include "debug.hpp"
@@ -24,6 +25,11 @@ namespace {
 // Default: every n (1..8) runs the x3v gemv with MMODE 1 so column j is bit-identical across n
 // (the engine's verify uses the batched path; decode must match it token-for-token). TQLLM_DEBUG=x3sq
 // (off by default) forces the faster but int8-activation sq path at n == 1 for A/B measurement.
+bool x3_use_x3v() {
+    static const bool v = tqllm::debug_on("x3v") || tqllm::debug_on("x3sq");
+    return v;
+}
+
 bool x3_use_sq() {
     static const bool v = tqllm::debug_on("x3sq");
     return v;
@@ -95,10 +101,17 @@ size_t codec_ws_bytes(int size_k, int size_n) {
     else { (void) size_k; (void) size_n; return 0; }
 }
 
+template <class Codec>
+constexpr auto codec_window() -> void (*)(const XwList&, const half*, __nv_bfloat16*, int, cudaStream_t) {
+    if constexpr (Codec::supports_gemv_x3v) return &xw_matvec<Codec>;
+    else return nullptr;
+}
+
 template <int KH>
 constexpr X3Codec mul1_row(const char* name) {
     return {X3_CODEC_MUL1, 8 * KH, name, true, Mul1Codec<KH>::supports_gemv_x3v,
-            &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_ws_bytes<Mul1Codec<KH>>};
+            &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_ws_bytes<Mul1Codec<KH>>,
+            codec_window<Mul1Codec<KH>>()};
 }
 
 const X3Codec kTable[] = {
@@ -106,10 +119,12 @@ const X3Codec kTable[] = {
     mul1_row<5>("mul1-K2.5"),  mul1_row<6>("mul1-K3.0"), mul1_row<7>("mul1-K3.5"),
     mul1_row<8>("mul1-K4.0"),
     {2, 128, "testscalar-K8.0", false, true,
-     &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>},
+     &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>, nullptr},
 };
 
 }  // namespace
+
+bool x3_window_enabled() { return !x3_use_x3v(); }
 
 const X3Codec* x3_codec_table(int& count) {
     count = int(sizeof(kTable) / sizeof(kTable[0]));

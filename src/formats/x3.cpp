@@ -9,6 +9,7 @@
 #include "x3_codecs.hpp"
 #include "x3_record.hpp"
 #include "x3.cuh"
+#include "window.hpp"
 
 #include <cuda_runtime.h>
 
@@ -44,6 +45,7 @@ struct Scratch {
     half*  had = nullptr; size_t had_cap = 0;
     half*  dw = nullptr;  size_t dw_cap = 0;
     int*   locks = nullptr; size_t locks_cap = 0;
+    void*  win = nullptr;   size_t win_cap = 0;   // window GEMV scratch (A + partial sums), sized at load
 };
 
 Scratch& scratch() { static Scratch s; return s; }
@@ -60,6 +62,45 @@ void* grow(void** p, size_t& cap, size_t need) {
     }
     *p = np; cap = need;
     return np;
+}
+
+int num_sms() {
+    static const int n = [] { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); return v > 0 ? v : 82; }();
+    return n;
+}
+
+// Runs of consecutive parts with one codec, at most XW_MAX_PARTS each: one window call per run.
+// f(i, j, off): parts [i, j), output row offset of part i.
+template <class F>
+void for_each_window_run(const X3Desc& d, F&& f) {
+    size_t i = 0;
+    int off = 0;
+    while (i < d.parts.size()) {
+        size_t j = i + 1;
+        while (j < d.parts.size() && j - i < size_t(x3::XW_MAX_PARTS) && d.parts[j].codec == d.parts[i].codec) ++j;
+        f(i, j, off);
+        for (size_t k = i; k < j; ++k) off += d.parts[k].rows;
+        i = j;
+    }
+}
+
+size_t window_scratch_bytes(const X3Desc& d) {
+    size_t need = 0;
+    for_each_window_run(d, [&](size_t i, size_t j, int) {
+        int rows[x3::XW_MAX_PARTS];
+        for (size_t k = i; k < j; ++k) rows[k - i] = d.parts[k].rows;
+        need = std::max(need, x3::xw_scratch_bytes(rows, int(j - i), d.cols, num_sms()));
+    });
+    return need;
+}
+
+void* window_scratch(Scratch& sc, const X3Desc& d) { return grow(&sc.win, sc.win_cap, window_scratch_bytes(d)); }
+
+bool window_ok(const X3Desc& d) {
+    if (!x3::x3_window_enabled()) return false;
+    for (const X3Part& p : d.parts)
+        if (!p.codec->window) return false;
+    return true;
 }
 
 struct X3Format final : WeightFormat {
@@ -122,6 +163,7 @@ struct X3Format final : WeightFormat {
             grow(reinterpret_cast<void**>(&sc.c), sc.c_cap, size_t(nb) * rows * sizeof(float));
             grow(reinterpret_cast<void**>(&sc.dw), sc.dw_cap, size_t(cols) * max_part_rows * sizeof(half));
             if (lb) grow(reinterpret_cast<void**>(&sc.locks), sc.locks_cap, lb);
+            window_scratch(sc, *d);
         }
 
         Mat m;
@@ -134,8 +176,40 @@ struct X3Format final : WeightFormat {
         return m;
     }
 
+    // y rows of n columns ldy apart (ldy >= m.rows): lets the engine write fused outputs in place and run
+    // independent small matvecs on its side stream meanwhile (qwen35 mix_mm). Window path only.
+    bool has_matvec_ld() const override { return x3::x3_window_enabled(); }
+    bool matvec_ld(const Mat& m, const __half* x, __nv_bfloat16* y, int n, int ldy, cudaStream_t s) const override {
+        const auto* d = static_cast<const X3Desc*>(m.aux);
+        if (n < 1 || n > max_matvec_cols() || ldy < m.rows || !window_ok(*d)) return false;
+        run_window(*d, x, y, n, ldy, s);
+        return true;
+    }
+
+private:
+    // Every part into y at its own rows, one window call per same-codec run.
+    void run_window(const X3Desc& d, const __half* x, __nv_bfloat16* y, int n, int ldy, cudaStream_t s) const {
+        Scratch& sc = scratch();
+        std::lock_guard<std::mutex> lock(sc.mtx);
+        void* ws = window_scratch(sc, d);
+        for_each_window_run(d, [&](size_t i, size_t j, int off) {
+            x3::XwList L;
+            x3::xw_begin(L, d.cols, n);
+            for (size_t k = i; k < j; ++k) {
+                const X3Part& p = d.parts[k];
+                x3::xw_add(L, p.trellis, p.suh, p.svh, p.rows, off, num_sms());
+                off += p.rows;
+            }
+            x3::xw_bind_scratch(L, ws);
+            d.parts[i].codec->window(L, x, y, ldy, s);
+        });
+    }
+
+public:
+
     void matvec(const Mat& m, const __half* x, __nv_bfloat16* y, int n, cudaStream_t s) const override {
         if (n < 1 || n > max_matvec_cols()) throw std::runtime_error("x3: matvec batch out of range");
+        if (matvec_ld(m, x, y, n, m.rows, s)) return;
         const auto* d = static_cast<const X3Desc*>(m.aux);
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);

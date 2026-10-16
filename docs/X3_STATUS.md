@@ -660,3 +660,30 @@ X3.1 K3.5 trellis (blk.0.ffn_down 5120x17408, 38 MB; blk.0.attn_gate):
 - My simple bench's raw GB/s (476 GB/s reps=1, 298 GB/s reps=8) is a launch/occupancy artifact of the minimal harness, not a kernel rate; the decode-compute and read-bound numbers above bound the real kernel.
 
 **Gate: K3.5 decode >= 1.70 Tw/s -> PASS** (compute 5.4-9.2, read-bound 2.03). Not < 1.70, so proceeding to T1 step 2 (gemv_window.cu n=1..8, half-in/bf16-out ldc, x3_format rows, 7-shape table, per-token sum). The <=600-line kernel itself is the remaining T1 work.
+
+## Phase T1/T2: window GEMV in tqLLM (2026-10-16, lead)
+
+`kernels/formats/x3/gemv_window.cu` (+ `window.hpp` plan, `Mul1Codec::Lane` in codec_mul1.cuh): n = 1..8 in one
+kernel, one mma per tile with the weights as the A operand (TRUSS mma_w), per-lane window positions hoisted,
+activations staged in shared memory, persistent grid; three launches per matvec over all row parts (had_in, gemv,
+out), bf16 output with a row stride (X3 now implements `matvec_ld`, so the GDN [b|a] matvec runs on the side
+stream beside [qkv|z]). Default path; `TQLLM_DEBUG=x3v` selects the old x3v/sq path for A/B.
+
+- Correctness: x3_format OK; vs x3v on real matrices rel err <= 4.4e-3 (bf16 outputs); columns bit-identical
+  n = 1..8; test-dflash-exact PASS tree + linear 256/256.
+- Kernels (`tests/x3_window_bench.cu`, 9 real shapes, n=1 sum): x3v ~585 us, window ~505-520 us (1.12-1.23x).
+- tok/s, same-session A/B (relbench 400 tok x3, df2_stock_q4km drafter), window / x3v / window again:
+  nospec 2k 35.4 / 30.7 / 35.2, 8k 34.7 / 30.2 / 34.5, 32k 32.6 / 28.6 / 32.5;
+  dflash2 2k 116.0 / 99.5 / 115.1, 8k 89.6 / 84.1 / 88.9, 32k 89.4 / 77.1 / 88.6. Acceptance unchanged.
+  Prefill unchanged; the batched-pass crossover rose ~100 -> ~210 columns (21.6 ms per 8-column pass).
+- Correction to T1 step 1 above: decode IS the wall (as TRUSS TRACKER #17 says). In-kernel ablations: weights
+  read alone ~740-800 GB/s; decode + mma without memory ~59 us on 5120x17408 (~1.5 Tw/s); ~45 SASS instr/tile.
+  Repeats of TRUSS results (not re-run again): layout-for-contiguity (#17), 3 blocks/SM and geometry (#28),
+  1 mma/tile alone (#15). Machine drift: same-session A/B only (#27).
+- Token map (nsys, 2k nospec, one token 29.1 ms, 1606 launches): X3 matmul 21.9 ms (75%), launch gaps 2.3,
+  X3 prep/finish kernels 1.2, attention 1.2, output head 1.0 (u4h 0.91), norms/casts 0.9, GDN 0.7.
+- Tried and reverted (both slower): one launch per matvec via a TRUSS v7a-style queue (547 vs ~510 us);
+  GDN [z] on the side stream beside conv + recurrence (29.6 vs 29.3 ms/token: z fills every SM, split costs
+  ~10 us/layer vs ~15 us of hideable work).
+- Next candidates: attention gate beside attention at 32k (untested); drafter acceptance (a verify of 8 columns
+  costs ~the same as 1).
