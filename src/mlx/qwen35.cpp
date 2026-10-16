@@ -582,6 +582,31 @@ struct Qwen35::Impl {
             }
         return {mat(p+"ffn_gate.weight",x),mat(p+"ffn_up.weight",x)};
     }
+    // Prefill FFN on MLX's FP16 GEMM (j601: 31 TFLOPS at 2048 rows vs ~22 for the row kernel): the three matrices are
+    // dequantized to FP16 once per chunk, swiglu runs in one compiled kernel with the BF16 roundings of the row path,
+    // and its FP16 result feeds the down GEMM directly. TQLLM_MLX_FFN_GEMM=<min rows> (prefill chunks only).
+    std::optional<mx::array> ffn_gemm(const std::string& p,const mx::array& n) {
+        static const int min_rows=std::getenv("TQLLM_MLX_FFN_GEMM")?std::atoi(std::getenv("TQLLM_MLX_FFN_GEMM")):0;
+        if(min_rows<=0 || n.shape(0)<min_rows)return std::nullopt;
+        auto find=[&](const std::string& name)->const NaxAffine* {
+            if(auto f=nax_tq4.find(name);f!=nax_tq4.end())return &f->second;
+            if(auto f=nax.find(name);f!=nax.end())return &f->second;
+            return nullptr;
+        };
+        const auto *g=find(p+"ffn_gate.weight"),*u=find(p+"ffn_up.weight"),*d=find(p+"ffn_down.weight");
+        if(!g || !u || !d || g->q6 || u->q6 || d->q6)return std::nullopt;
+        auto x16=g->tq4?tq4_rotate_half(n):mx::astype(n,mx::float16);
+        auto gv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*g)));
+        auto uv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*u)));
+        static auto swiglu16=mx::compile([](const std::vector<mx::array>& a) {
+            auto gate=bf_raw(mx::astype(a[0],mx::float32)),up=bf_raw(mx::astype(a[1],mx::float32));
+            return std::vector<mx::array>{mx::astype(bf_raw(mx::multiply(bf_raw(mx::multiply(gate,mx::sigmoid(gate))),up)),mx::float16)};
+        },true);
+        auto h=swiglu16({gv,uv})[0];
+        if(stage_profiling)stage("ffn_gate_up",{h});
+        auto hin=d->tq4?tq4_rotate_half(h):h;
+        return bf_raw(mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32));
+    }
     mx::array full_attention(const std::string& p,const mx::array& x,Cache& c,int offset,int layer) {
         const int m=x.shape(0);
         auto qg=mx::reshape(mat(p+"attn_q.weight",x),{m,heads,2*hd});
@@ -727,6 +752,12 @@ struct Qwen35::Impl {
                 record((l+1)%interval==0?"attention":"gdn_mixer",values);
             }
             x=add_bf(x,attn);n=norm(x,p+"post_attention_norm.weight");
+            if(ablate_blocks.find("ffn")==std::string::npos)
+                if(auto down=ffn_gemm(p,n)) {
+                    x=add_bf(x,*down);
+                    if(stage_profiling)record("ffn_down",{x});
+                    continue;
+                }
             auto paired=paired_ff(p,n);
             bool ff_rotated=paired && paired_swiglu_rotation;
             auto ff=paired?*paired:[&] {
