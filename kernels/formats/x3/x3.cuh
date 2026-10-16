@@ -34,6 +34,11 @@ const X3Codec* x3_codec_table(int& count);
 // Element-wise casts the format layer uses to present f32 buffers to the codec entry points.
 void x3_cast_h_f32(const half* src, float* dst, int n, cudaStream_t stream);
 void x3_cast_f32_bf16(const float* src, __nv_bfloat16* dst, int n, cudaStream_t stream);
+// dst[t*ld + off + c] = bf16(src[t*part_rows + c]) - a row-part of a row-concatenated matvec output.
+void x3_copy_f32_bf16_strided(const float* src, __nv_bfloat16* dst, int part_rows, int ld, int off, int n,
+                              cudaStream_t stream);
+// dst[r*ld + c] = src[c*rows + r]  (reconstruct's [in][out] -> engine's [rows][cols]).
+void x3_transpose_h(const half* src, half* dst, int rows, int cols, int ld, cudaStream_t stream);
 
 }  // namespace x3
 }  // namespace tqllm

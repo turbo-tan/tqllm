@@ -71,10 +71,11 @@ void codec_gemv(const float* A, const uint16_t* B, float* C, int size_m, int siz
     }
 }
 
+// reconstruct emits W in the fork's [in][out] layout (canonical trellis order: n=in=cols, m=out=rows).
 template <class Codec>
 void codec_dequant(half* W, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
                    cudaStream_t stream) {
-    reconstruct_had<Codec>(W, T, suh, svh, rows, cols, stream);
+    reconstruct_had<Codec>(W, T, suh, svh, cols, rows, stream);
 }
 
 template <class Codec>
@@ -118,6 +119,34 @@ void x3_cast_h_f32(const half* src, float* dst, int n, cudaStream_t stream) {
 }
 void x3_cast_f32_bf16(const float* src, __nv_bfloat16* dst, int n, cudaStream_t stream) {
     if (n > 0) x3_cast_f32_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(src, dst, n);
+}
+
+__global__ void x3_copy_strided_kernel(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+                                       int part_rows, int ld, int off, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // over n * part_rows
+    if (i >= total) return;
+    const int t = i / part_rows, c = i % part_rows;
+    dst[size_t(t) * ld + off + c] = __float2bfloat16(src[i]);
+}
+
+void x3_copy_f32_bf16_strided(const float* src, __nv_bfloat16* dst, int part_rows, int ld, int off, int n,
+                              cudaStream_t stream) {
+    const int total = n * part_rows;
+    if (total > 0) x3_copy_strided_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, dst, part_rows, ld, off, total);
+}
+
+// dst[r*ld + c] = src[c*rows + r]: turn reconstruct's [in][out] into the engine's [rows][cols].
+__global__ void x3_transpose_h_kernel(const half* __restrict__ src, half* __restrict__ dst, int rows, int ld,
+                                      int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // over rows * ld
+    if (i >= total) return;
+    const int r = i / ld, c = i % ld;
+    dst[size_t(r) * ld + c] = src[size_t(c) * rows + r];
+}
+
+void x3_transpose_h(const half* src, half* dst, int rows, int cols, int ld, cudaStream_t stream) {
+    const int total = rows * ld;
+    if (total > 0) x3_transpose_h_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, dst, rows, ld, total);
 }
 
 }  // namespace x3
