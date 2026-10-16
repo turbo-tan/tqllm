@@ -21,10 +21,11 @@ namespace x3 {
 
 namespace {
 
-// TQLLM_DEBUG=x3n1x3v (off by default): force the n == 1 path onto the exact x3v gemv instead of
-// sq, to separate sq int8-activation rounding from real bugs.
-bool x3_n1_x3v() {
-    static const bool v = tqllm::debug_on("x3n1x3v");
+// Default: every n (1..8) runs the x3v gemv with MMODE 1 so column j is bit-identical across n
+// (the engine's verify uses the batched path; decode must match it token-for-token). TQLLM_DEBUG=x3sq
+// (off by default) forces the faster but int8-activation sq path at n == 1 for A/B measurement.
+bool x3_use_sq() {
+    static const bool v = tqllm::debug_on("x3sq");
     return v;
 }
 
@@ -66,19 +67,18 @@ template <class Codec>
 void codec_gemv(const float* A, const uint16_t* B, float* C, int size_m, int size_k, int size_n,
                 const half* suh, half* a_had, const half* svh, int* locks, cudaStream_t stream) {
     if (size_m == 1) {
+        // Codecs with no x3v gemv (K==1) keep sq; others use x3v unless TQLLM_DEBUG=x3sq.
         if constexpr (Codec::supports_sq)
-            if (!x3_n1_x3v()) { launch_sq<Codec, true>(A, B, C, size_k, size_n, suh, svh, locks, stream); return; }
+            if (x3_use_sq() || !Codec::supports_gemv_x3v) { launch_sq<Codec, true>(A, B, C, size_k, size_n, suh, svh, locks, stream); return; }
     }
     if constexpr (!Codec::supports_gemv_x3v) {
         throw std::runtime_error("x3: this codec has no gemv for a batch > 1");
     } else {
         const int cfg = x3v_cfg(size_m, size_k, size_n, Codec::bits);
         if (cfg < 0) throw std::runtime_error("x3: no gemv config for this shape");
-        const bool m1 = size_m == 1;  // MMODE 0 is the m==1 fast path, MMODE 1 covers 2..8
-        if (m1 && cfg == 0)  x3v_launch<Codec, 0, 0>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
-        else if (m1)         x3v_launch<Codec, 0, 1>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
-        else if (cfg == 0)   x3v_launch<Codec, 1, 0>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
-        else                 x3v_launch<Codec, 1, 1>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
+        // MMODE 1 for every n (1 included): column j is then bit-identical across n, matching verify.
+        if (cfg == 0) x3v_launch<Codec, 1, 0>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
+        else          x3v_launch<Codec, 1, 1>(A, B, C, size_m, size_k, size_n, suh, a_had, svh, stream);
     }
 }
 

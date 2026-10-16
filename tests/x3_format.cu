@@ -37,6 +37,39 @@ T* dev_up(const std::vector<T>& h) {
 
 std::string fname(const char* n, int nv) { return std::string(n) + "=" + std::to_string(nv); }
 
+void col_identity(const x3::X3Codec* c, int rows, int cols) {
+    const int tiles = (rows / 16) * (cols / 16);
+    std::vector<uint16_t> trellis(size_t(tiles) * c->words);
+    for (auto& v : trellis) v = uint16_t(lcg() >> 13);
+    std::vector<half> suh(cols, __float2half(1.f)), svh(rows, __float2half(1.f));
+    uint16_t* d_t = dev_up(trellis); half* d_suh = dev_up(suh); half* d_svh = dev_up(svh);
+    const int nmax = 8;
+    std::vector<half> x(size_t(cols) * nmax);
+    for (auto& v : x) v = __float2half(rnd());
+    auto run = [&](int n) {
+        std::vector<float> A(size_t(n) * cols);
+        for (int j = 0; j < n; ++j)
+            for (int i = 0; i < cols; ++i) A[size_t(j) * cols + i] = __half2float(x[size_t(i) * nmax + j]);
+        float* dA = dev_up(A); float* dC = nullptr; cudaMalloc(&dC, size_t(n) * rows * 4);
+        half* dH = nullptr; cudaMalloc(&dH, size_t(n) * cols * 2);
+        std::vector<float> C(size_t(n) * rows);
+        c->gemv(dA, d_t, dC, n, cols, rows, d_suh, dH, d_svh, nullptr, 0);
+        cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost);
+        cudaFree(dA); cudaFree(dC); cudaFree(dH);
+        return C;
+    };
+    const std::vector<float> C8 = run(nmax);
+    bool eq = true;
+    for (int n = 1; n < nmax && eq; ++n) {
+        const std::vector<float> Cn = run(n);
+        for (int j = 0; j < n && eq; ++j)
+            for (int r = 0; r < rows && eq; ++r)
+                if (Cn[size_t(j) * rows + r] != C8[size_t(j) * rows + r]) eq = false;
+    }
+    check(eq, std::string(c->name) + ": column bit-identical n=1..8 (rows=" + std::to_string(rows) + " cols=" + std::to_string(cols) + ")");
+    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh);
+}
+
 void test_row(const x3::X3Codec* c, int rows, int cols) {
     const int tiles = (rows / 16) * (cols / 16);
     const size_t trellis_words = size_t(tiles) * c->words;
@@ -141,6 +174,36 @@ void test_row(const x3::X3Codec* c, int rows, int cols) {
         check(eq, std::string(c->name) + ": width independence n=4 col == n=7 col (maxdiff=" + std::to_string(mx) + ")");
     }
 
+    // Kernel contract: column j of an X3 matvec is bit-identical for every n in 1..8, so decode
+    // (n=1) matches the batched verify token-for-token.
+    if (c->has_x3v) {
+        const int nmax = 8;
+        std::vector<half> x(size_t(cols) * nmax);
+        for (auto& v : x) v = __float2half(rnd());
+        auto run = [&](int n) {
+            std::vector<float> A(size_t(n) * cols);
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < cols; ++i) A[size_t(j) * cols + i] = __half2float(x[size_t(i) * nmax + j]);
+            float* dA = dev_up(A);
+            float* dC = nullptr; cudaMalloc(&dC, size_t(n) * rows * 4);
+            half* dH = nullptr; cudaMalloc(&dH, size_t(n) * cols * 2);
+            std::vector<float> C(size_t(n) * rows);
+            c->gemv(dA, d_t, dC, n, cols, rows, d_suh, dH, d_svh, nullptr, 0);
+            cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost);
+            cudaFree(dA); cudaFree(dC); cudaFree(dH);
+            return C;
+        };
+        const std::vector<float> C8 = run(nmax);
+        bool eq = true;
+        for (int n = 1; n < nmax && eq; ++n) {
+            const std::vector<float> Cn = run(n);
+            for (int j = 0; j < n && eq; ++j)
+                for (int r = 0; r < rows && eq; ++r)
+                    if (Cn[size_t(j) * rows + r] != C8[size_t(j) * rows + r]) eq = false;
+        }
+        check(eq, std::string(c->name) + ": column bit-identical across n=1..8");
+    }
+
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W);
 }
 
@@ -150,8 +213,10 @@ int main() {
     int count = 0;
     const x3::X3Codec* table = x3::x3_codec_table(count);
     check(count >= 8, "codec table has the mul1 K rows + testscalar");
-    for (int i = 0; i < count; ++i)
+    for (int i = 0; i < count; ++i) {
         test_row(&table[i], 256, 256);
+        if (table[i].has_x3v) col_identity(&table[i], 8448, 5120);  // size_n>8192 -> CFG1
+    }
     if (g_ok) std::printf("x3_format: OK\n");
     return g_ok ? 0 : 1;
 }
