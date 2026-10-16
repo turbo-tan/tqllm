@@ -91,6 +91,15 @@ curl http://localhost:8086/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Explain a hash map."}],"temperature":0,"max_tokens":128}'
 ```
 
+## Runtime monitor
+
+A built-in, read-only dashboard for live token flow, request phases, context and
+host/device headroom. It stays responsive while single-slot inference is busy.
+Build from source, add `--monitor-port 8087`, then open `http://localhost:8087/`.
+See [setup, telemetry semantics and limits](docs/MONITOR.md).
+
+![Runtime monitor - illustrative fixture data, not a benchmark](docs/assets/monitor-desktop.png)
+
 ## tqllm launch: a coding agent on your own GPU
 
 `tools/launch/tqllm.py` starts a local server and runs a coding agent against it, like `ollama launch`. It needs

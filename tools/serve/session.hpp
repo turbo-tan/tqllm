@@ -1,4 +1,5 @@
 #pragma once
+#include "monitor.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include <src/json.hpp>
@@ -94,6 +95,7 @@ inline SamplingDefaults & sampling_defaults() {
 }
 
 struct ChatRequest {
+    std::shared_ptr<Monitor::Request> observation;  // server-owned counters; never parsed from client JSON
     std::string prompt_text;
     std::vector<std::string> stop;
     uint32_t max_tokens = 64;
@@ -700,15 +702,20 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     PreparedImages images;
     const auto prompt = prepare(tokenizer, req, context, result, count, incremental ? &images : nullptr);
     if (!result.error.empty()) return result;
+    if (req.observation) req.observation->prefill(result.prompt_tokens);
     // verify path (quantized qwen35 GGUF): chunked prefill, then DFlash2 drafts or one verified token per step.
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+        if (req.observation) req.observation->decoding();
         RepeatGuard guard;
-        while (model.spec_advance())
-            if (guard.check(model.spec_tokens(0))) break;
+        while (model.spec_advance()) {
+            const auto ids = model.spec_tokens(0);
+            if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
+            if (guard.check(ids)) break;
+        }
         uint64_t st[5] = {};
         finish(tokenizer, req, model.spec_finish(st), result);
         set_timings(result, st);
@@ -718,6 +725,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     for (uint32_t i = 0; i + 1 < prompt.size(); ++i) model.forward(prompt[i], i, false);
     uint32_t next = model.forward(prompt.back(), static_cast<uint32_t>(prompt.size() - 1), true);
     const auto t1 = std::chrono::steady_clock::now();
+    if (req.observation) req.observation->decoding();
     result.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     struct DecodeClock {  // decode time ends when the loop exits, whichever way
         DecodeResult & r;
@@ -734,6 +742,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
             break;
         }
         output.push_back(next);
+        if (req.observation) req.observation->tokens(static_cast<uint32_t>(output.size()));
         if (guard.check(output)) break;
         result.text = tokenizer.decode(output);
         bool stopped = false;
@@ -1004,13 +1013,17 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     PreparedImages images;
     const auto prompt = prepare(tokenizer, req, context, result, count, &images);
     if (!result.error.empty()) return result;
+    if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
     model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+    if (req.observation) req.observation->decoding();
     RepeatGuard guard;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);
-        if (guard.check(ids) || !on_tokens(ids)) break;
+        if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
+        if (guard.check(ids)) break;
+        if (!on_tokens(ids)) { if (req.observation) req.observation->finish("cancelled"); break; }
     }
     uint64_t st[5] = {};
     finish(tokenizer, req, model.spec_finish(st), result);
