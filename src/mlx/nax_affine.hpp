@@ -14,8 +14,7 @@ struct NaxAffine {
     mlx::core::array biases;  // [rows/32, columns/group, 32] BF16 bits (uint16)
     int rows, columns, bits, group;
     bool tq4 = false;  // TQLLM TQ4 codebook: value = FP16 scale * signed level (scales hold FP16 bits, no biases)
-    bool q6 = false;
-    bool w16 = false;  // words in the 16-byte-load layout [rows/32, columns/32, 32, 4]   // Q6_K head: 6-bit codes, group 16, FP32 scales (two uint16 words each), value = scale * (code - 32)
+    bool q6 = false;   // Q6_K head: 6-bit codes, group 16, FP32 scales (two uint16 words each), value = scale * (code - 32)
 };
 uint64_t nax_affine_bytes(uint64_t rows, uint64_t columns, int bits, int group);
 NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int columns, int bits, int group);

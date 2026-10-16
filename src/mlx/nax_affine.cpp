@@ -55,9 +55,6 @@ const char* kSource = R"METAL(
     for (short i = 0; i < 16; i++) cc2[i] = 0.0f;
 #endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
-    // W16: words re-laid out as [blocks, steps/2, 32 lanes, 4] so one 16-byte load feeds two 16-column steps
-    const device uint4* wp4 = (const device uint4*)W + ((size_t)blk * (K / 32) + split * (KS / 32)) * 32 + lane;
-    constexpr short STEP = W16 ? 2 : 1;
     const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
     const device ushort* sp = S + (Q6 ? 2 : 1) * (((size_t)blk * (K / GS) + split * (KS / GS)) * 32);
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
@@ -72,16 +69,12 @@ const char* kSource = R"METAL(
                               : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
         const float4 b0 = Q6 ? -32.0f * s0 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
         const float4 b1 = Q6 ? -32.0f * s1 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
-        for (short t0 = 0; t0 < GS / 16; t0 += STEP) {
-          uint4 w4 = uint4(0u);
-          if (W16) w4 = wp4[((g * (GS / 16) + t0) / 2) * 32];
-          for (short u = 0; u < STEP; u++) {
-            const short t = t0 + u;
+        for (short t = 0; t < GS / 16; t++) {
             const int ks = g * (GS / 16) + t;
             half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
             half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + ks * 16) : half4(0.0h);
             for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
-            uint2 w = W16 ? (u ? w4.zw : w4.xy) : wp[ks * 32];
+            uint2 w = wp[ks * 32];
             uint h = BITS == 6 ? hp[ks * 32] : 0u;
             if (TQ4 && !NAX_WIDE) {
                 // 16-row kernel (decode, verify): the constant table is cheaper here (j582: ALU decode 97.9 vs 70.1 ms)
@@ -122,7 +115,6 @@ const char* kSource = R"METAL(
                 op.run(ca2, cb, cc2);
             }
 #endif
-          }
         }
     }
     if (SPLIT > 1) {
@@ -240,18 +232,6 @@ std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<c
     return out;
 }
 
-// 16-byte weight loads (TQLLM_MLX_NAX_W16=1): pairs of 16-column steps interleaved per lane, same codes
-void nax_relayout_w16(NaxAffine& w) {
-    static const bool on = std::getenv("TQLLM_MLX_NAX_W16") != nullptr;
-    const int steps = w.columns / 16;
-    if (!on || w.w16 || w.bits != 4 || steps % 2) return;
-    const int blocks = w.rows / 32;
-    auto x = mx::reshape(w.words, {blocks, steps / 2, 2, 32, 2});
-    w.words = mx::contiguous(mx::reshape(mx::transpose(x, {0, 1, 3, 2, 4}), {blocks, steps / 2, 32, 4}));
-    mx::eval(w.words);
-    w.w16 = true;
-}
-
 NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int columns, int bits, int group) {
     if (payload.size() != nax_affine_bytes(rows, columns, bits, group))
         throw std::invalid_argument("nax affine payload has the wrong size");
@@ -267,9 +247,7 @@ NaxAffine nax_affine_load(std::span<const uint8_t> payload, int rows, int column
     auto scales = mx::array(reinterpret_cast<const uint16_t*>(take(sb)), {blocks, gpr, 32}, mx::uint16);
     auto biases = mx::array(reinterpret_cast<const uint16_t*>(take(sb)), {blocks, gpr, 32}, mx::uint16);
     mx::eval(words, high, scales, biases);
-    NaxAffine out{words, high, scales, biases, rows, columns, bits, group};
-    nax_relayout_w16(out);
-    return out;
+    return {words, high, scales, biases, rows, columns, bits, group};
 }
 
 // K splits for one matrix: enough simdgroups to keep the memory system busy when each matmul waits for the previous
@@ -299,12 +277,12 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
     return kernel({w.words, w.high, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
                     {w.rows / 32 / bpt * threads, (m + mr - 1) / mr, 1}, {threads, 1, 1},
                     {{"K", w.columns}, {"N", w.rows}, {"MR", mr}, {"BITS", w.bits}, {"GS", w.group}, {"SPLIT", split},
-                     {"BF", round_bf16}, {"TQ4", w.tq4}, {"Q6", w.q6}, {"W16", w.w16}},
+                     {"BF", round_bf16}, {"TQ4", w.tq4}, {"Q6", w.q6}},
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
 mx::array nax_affine_dequant(const NaxAffine& w) {
-    if (w.q6 || w.w16) throw std::invalid_argument("nax affine dequant: Q6 / W16 layouts not supported");
+    if (w.q6) throw std::invalid_argument("nax affine dequant: Q6 mode not supported");
     static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_dequant", {"W", "H", "S", "Bz"}, {"Y"}, kDequant, kHeader);
     const int blocks = w.rows / 32, steps = w.columns / 16, gpr = w.columns / w.group;
     return kernel({w.words, w.high, w.scales, w.biases}, {{w.rows, w.columns}}, {mx::float16}, {blocks * steps * 32, 1, 1},
@@ -326,7 +304,7 @@ NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
     std::vector<mx::array> w, h, sc, b;
     int rows = 0;
     for (const auto* p : parts) {
-        if (p->columns != f.columns || p->bits != f.bits || p->group != f.group || p->w16 != f.w16 || p->tq4 != f.tq4)
+        if (p->columns != f.columns || p->bits != f.bits || p->group != f.group)
             throw std::invalid_argument("nax affine concat: parts differ in columns, bits or group");
         w.push_back(p->words); h.push_back(p->high); sc.push_back(p->scales); b.push_back(p->biases);
         rows += p->rows;
@@ -334,7 +312,6 @@ NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
     NaxAffine out{mx::concatenate(w, 0), f.bits == 6 ? mx::concatenate(h, 0) : f.high, mx::concatenate(sc, 0),
                   mx::concatenate(b, 0), rows, f.columns, f.bits, f.group};
     mx::eval(out.words, out.high, out.scales, out.biases);
-    out.w16 = f.w16; out.tq4 = f.tq4;
     return out;
 }
 
@@ -390,7 +367,7 @@ NaxAffine nax_from_tq4(const Tq4Weights& t) {
     out.biases = mx::zeros({64}, mx::uint16);
     mx::eval(out.biases);
     out.tq4 = true;
-    return out;  // nax_affine_load already applied the W16 layout
+    return out;
 }
 
 NaxAffine nax_from_q6(const Q6Weights& q) {
