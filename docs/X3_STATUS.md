@@ -637,3 +637,15 @@ relbench.py, both models, SAME drafter (df2_stock_q4km), same settings, 3 repeat
 - **Acceptance parity: X3 44/36/34% == TQ3_4S 43/41/39%** at identical settings -> the earlier X3 23% vs TQ3 75% gap was a DRAFTER artifact (the results_gpu2 TQ3 rows used the server's default drafter, not df2_stock_q4km), NOT an X3 defect. Draft quality is correct.
 - **Speed: X3 decode ~60% of TQ3_4S** (nospec 30 vs 50; dflash 77-99 vs 117-135), prefill ~75%. Uniform matvec overhead -> Phase 5 tuning (x3.cpp matvec's extra x3_cast_h_f32 + x3_copy_f32_bf16_strided launches + f32 C buffer per matvec, ~640 extra launches/token).
 - G4: acceptance PASS; speed gap is the Phase 5 target.
+
+## X3 port Phase T0 — GT0 PASS (2026-10-16)
+
+TRUSS measurement (~/trellis-kernel, GPU2), no new code:
+- `tk-bench-ceiling` mul1 K3 WNT8 full: **2.15-2.17 Tw/s = 805-813 GB/s at K3 (86-87% of 936 GB/s peak)**; stream flat/cp.async/strided: **887-890 GB/s (95% of 936)**. (No explicit Mul1Frac K3.5 row; K3.5 decode taken as ~2.00 Tw/s proxy from the mul1 K3 family + TRACKER #119.)
+- Survey: `moe_window_test` (v7a persistent dataflow, TRACKER #26) is the T1 model; `gemv_multi_test`/`tk-bench-gemv-pattern` show the split gemv reaches 617-679 GB/s at 16 KB slabs. These can run one dense matrix (E=1, rows 5120..17408).
+
+Projection over the 400 X3.1 matrices (sum max(bytes/stream, weights/decode) / eff), 5 K3.0 + 395 K3.5, 10.64 GB trellis, 24.327 G weights:
+- pure read ceiling 11.96 ms; pure decode ceiling (mixed) 11.31 ms.
+- **eff 0.85 = 14.30 ms** (gate <= 16.8 = 1.15x TQ3_4S's 14.58) -> **PASS**.
+- eff 0.75 = 16.21 ms -> also under the gate.
+- **GT0: PASS** (14.30 ms at eff 0.85). Stops here for lead review before T1.
