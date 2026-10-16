@@ -186,6 +186,8 @@ struct Qwen35::Impl {
     bool return_head_ids=false;
     bool paired_gate_up=std::getenv("TQLLM_MLX_PAIRED_GATE_UP")!=nullptr;
     bool paired_swiglu_rotation=std::getenv("TQLLM_MLX_PAIRED_SWIGLU_ROTATION")!=nullptr;
+    // prefill GEMMs of TQ4 matrices on the int8 matrix-unit path (exact levels, per-row int8 input); opt-in until gated
+    bool prefill_int8=std::getenv("TQLLM_MLX_PREFILL_INT8") && std::string(std::getenv("TQLLM_MLX_PREFILL_INT8"))!="0";
     bool fused_epilogue=std::getenv("TQLLM_MLX_FUSE_EPILOGUE")!=nullptr;
     bool fused_swiglu_rotation=std::getenv("TQLLM_MLX_FUSE_SWIGLU_ROTATION")!=nullptr;
     bool lazy_verify_commit=std::getenv("TQLLM_MLX_LAZY_VERIFY_COMMIT")!=nullptr;
@@ -472,7 +474,8 @@ struct Qwen35::Impl {
                 if(!slot || slot->first.id()!=x.id())slot=std::pair{x,input_rotated && tq4?mx::astype(x,mx::float16):tq4?tq4_rotate_half(x):mx::astype(x,mx::float16)};
                 return slot->second;
             };
-            if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return nax_affine_gemm(found->second,half_input(true),true);
+            if(auto found=nax_tq4.find(name);found!=nax_tq4.end())
+                return prefill_int8?nax_int8_gemm(found->second,half_input(true),true):nax_affine_gemm(found->second,half_input(true),true);
             if(auto member=nax_member.find(name);member!=nax_member.end()) {
                 auto& g=nax_groups.at(member->second.first);
                 if(!g.last || g.last->first.id()!=x.id())g.last=std::pair{x,nax_affine_gemm(g.weights,x,true)};
@@ -620,8 +623,8 @@ struct Qwen35::Impl {
                 }
             }
         }
-        auto gv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*g)));
-        auto uv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*u)));
+        auto gv=prefill_int8 && g->tq4?nax_int8_gemm(*g,x16,false):mx::matmul(x16,mx::transpose(nax_affine_dequant(*g)));
+        auto uv=prefill_int8 && u->tq4?nax_int8_gemm(*u,x16,false):mx::matmul(x16,mx::transpose(nax_affine_dequant(*u)));
         static auto swiglu16=mx::compile([](const std::vector<mx::array>& a) {
             auto gate=bf_raw(mx::astype(a[0],mx::float32)),up=bf_raw(mx::astype(a[1],mx::float32));
             return std::vector<mx::array>{mx::astype(bf_raw(mx::multiply(bf_raw(mx::multiply(gate,mx::sigmoid(gate))),up)),mx::float16)};
@@ -629,7 +632,7 @@ struct Qwen35::Impl {
         auto h=swiglu16({gv,uv})[0];
         if(stage_profiling)stage("ffn_gate_up",{h});
         auto hin=d->tq4?tq4_rotate_half(h):h;
-        auto y=mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32);
+        auto y=prefill_int8 && d->tq4?nax_int8_gemm(*d,hin,false):mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32);
         // TQLLM_MLX_ANE_NOISE=<rel>: add Gaussian noise of norm rel * |y| (Neural Engine slice error budget, debug only)
         static const float ane_noise=std::getenv("TQLLM_MLX_ANE_NOISE")?std::stof(std::getenv("TQLLM_MLX_ANE_NOISE")):0.0f;
         if(ane_noise>0) {
