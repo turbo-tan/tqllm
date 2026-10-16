@@ -463,7 +463,7 @@ struct Qwen35::Impl {
                 }
             }
         // prefill chunks: dequantize once and run one GEMM instead of re-decoding the matrix per 32-row tile
-        static const int gemm_rows=std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")?std::atoi(std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")):0;
+        static const int gemm_rows=std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")?std::atoi(std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")):64;  // default on with the GEMM FFN; =0 off
         if(gemm_rows>0 && x.shape(0)>=gemm_rows) {
             if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return nax_affine_gemm(found->second,rotated(),true);
             if(auto member=nax_member.find(name);member!=nax_member.end()) {
@@ -586,7 +586,7 @@ struct Qwen35::Impl {
     // dequantized to FP16 once per chunk, swiglu runs in one compiled kernel with the BF16 roundings of the row path,
     // and its FP16 result feeds the down GEMM directly. TQLLM_MLX_FFN_GEMM=<min rows> (prefill chunks only).
     std::optional<mx::array> ffn_gemm(const std::string& p,const mx::array& n) {
-        static const int min_rows=std::getenv("TQLLM_MLX_FFN_GEMM")?std::atoi(std::getenv("TQLLM_MLX_FFN_GEMM")):0;
+        static const int min_rows=std::getenv("TQLLM_MLX_FFN_GEMM")?std::atoi(std::getenv("TQLLM_MLX_FFN_GEMM")):64;  // j604: +47-50 % prefill, exact; =0 off
         if(min_rows<=0 || n.shape(0)<min_rows)return std::nullopt;
         auto find=[&](const std::string& name)->const NaxAffine* {
             if(auto f=nax_tq4.find(name);f!=nax_tq4.end())return &f->second;
