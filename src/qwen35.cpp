@@ -2922,7 +2922,11 @@ public:
         return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
     }
 
-    // Drafter K/V of the active slot: the sliding-window ring, else the full context.
+    // Drafter kernel grids independent of the position (sliding-window ring, no retrieval): drafts and commits can be
+    // captured once as CUDA graphs. Retrieval sizes its launches by the position, so it runs eagerly.
+    bool dfl_fixed_grids() const { return dfl.ring > 0 && !dfl.retr; }
+
+    // Drafter K/V of the active slot: the sliding-window (or retrieval) ring, else the full context.
     void alloc_dfl_state() {
         const size_t kd = size_t(dfl.kvheads) * dfl.hd, rows = dfl.ring ? size_t(dfl.ring) : context_;
         for (size_t l = 0; l < dfl.L.size(); ++l) {
@@ -3008,8 +3012,10 @@ public:
         // sliding-window drafter: K/V ring of the window (+ one verify and one draft block, chunk-rounded)
         dfl.ring = dfl.window > 0 ? (dfl.window + NVER + dfl.block + 64 + 63) / 64 * 64 : 0;
         if (dfl.ring >= int(context_)) dfl.ring = 0;
-        if (dfl.retr) {  // retrieval reads far positions: full drafter K/V, scratch for [retrieved | recent | block]
-            dfl.ring = 0;
+        if (dfl.retr) {  // retrieval reads back at most the newest kDflRetrMaxChunks chunks: a ring that holds them, and
+                         // scratch for [retrieved | recent | block]
+            dfl.ring = (tqllm_cuda::kDflRetrMaxChunks * tqllm_cuda::kDflRetrChunk + dfl.recent + NVER + dfl.block + 64 + 63) / 64 * 64;
+            if (dfl.ring >= int(context_)) dfl.ring = 0;
             const size_t kdb = size_t(dfl.kvheads) * dfl.hd;
             dfl_rscore = Buf(size_t(dfl.kvheads) * 4096 * 4);
             dfl_rsel = Buf(size_t(dfl.kvheads) * 128 * 4);
@@ -3225,7 +3231,7 @@ public:
     bool dflash_draft_batch(const std::vector<DraftReq> & rq, std::vector<std::vector<uint32_t>> & out,
                             const std::vector<int> * tree_cols = nullptr, const std::vector<int> * chain_cols = nullptr) {
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        if (rq.size() < 2 || dfl.ring <= 0 || dfl.dspark || subset || !(dsub_rows || head4.p || lm_head.fmt))
+        if (rq.size() < 2 || !dfl_fixed_grids() || dfl.dspark || subset || !(dsub_rows || head4.p || lm_head.fmt))
             return false;
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         const int ns = int(rq.size()), DB = ns * B;
@@ -3428,7 +3434,7 @@ public:
         // Device-resident body (positions in d_pos, tokens / anchor in d_tok): with the K/V ring the kernel grids do not
         // depend on pos, so the whole draft is captured once as a CUDA graph and replayed.
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        const bool graph = dfl.ring > 0 && !subset;
+        const bool graph = dfl_fixed_grids() && !subset;
         auto body = [&] {
         if (dfl.dspark) {
             dspark_forward(pos);
@@ -3461,7 +3467,7 @@ public:
                                ? tqllm_cuda::dflash_retrieve_build(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), kd, dfl.heads,
                                                                    dfl.kvheads, int(pos), B, dfl.recent, dfl.retr, dfl.theta,
                                                                    dfl_rscore.as<float>(), dfl_rsel.as<int>(), dfl_rk.as<bf16>(),
-                                                                   dfl_rv.as<bf16>(), stream)
+                                                                   dfl_rv.as<bf16>(), stream, dfl.ring)
                                : -1;
             if (rr >= 0) {  // scratch [retrieved | recent | block]: the query block sits at scratch row rr + recent
                 if (l == 0) {
@@ -4180,7 +4186,7 @@ public:
                 set_pending(j + 1);
                 last_n = 0;
                 dflash_inject(v_feat.as<bf16>(), j + 1, pos);
-            } else if (dfl.ring > 0) {
+            } else if (dfl_fixed_grids()) {
                 // commit + inject as one graph: ~110 small launches otherwise leave the GPU waiting on the host
                 const int k = j + 1;
                 if (k > last_n) throw std::runtime_error("commit: accepted count out of range");

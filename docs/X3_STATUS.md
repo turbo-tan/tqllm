@@ -701,3 +701,19 @@ stream beside [qkv|z]). Default path; `TQLLM_DEBUG=x3v` selects the old x3v/sq p
   (1.25 GiB at 64K): use it for long prompts when memory allows (not at 262K: X3.1 + drafter is ~20.9 GB there).
 - **`--lookup 3`**: no gain (114.5/88.5/87.5, acceptance 47/35/36%): lookup columns take tree columns out of the
   same 8.
+
+**llama-paw vs tqLLM, same files (2026-10-16).** llama-paw-k25 `873c8b4f5`, X3.1 + df2_stock_q4km (both from `/dev/shm/x3`), xhigh,
+`--spec-draft-n-max 7`, q4_0 KV, c 40960, GPU 2 (bus 48:00.0 checked); `relbench.py --url` with the same prompts and 3 repeats
+(script: job tmp `paw_ab.sh`). Decode tok/s (acceptance) at 2k / 8k / 32k: **llama-paw 93.7 (50%) / 66.8 (32%) / 60.9 (34%)**;
+tqLLM base 116.2 / 89.5 / 89.1 (+24 / +34 / +46%), with `--draft-retrieve 32` 114.4 / 99.8 / 101.2 (+22 / +49 / +66%).
+llama-paw counts the same text as fewer prompt tokens (6747 / 25240 vs 7707 / 31919), so its context is shorter; its prefill
+figure is the cached repeat, so ignore it. The earlier "llama-paw lands 40-50 tok/s" note is superseded by this run.
+
+**`--draft-retrieve` drafter K/V as a ring (2026-10-16).** Retrieval scores at most the newest 4096 chunks of 16
+(`kDflRetrMaxChunks`), yet kept fp16 drafter K/V for the whole context (20 KB/position: 5.4 GB at 262K). Now a ring of
+65536 + recent + NVER + block (~68K positions, ~1.4 GB); the retrieval kernels wrap rows, the graph paths stay off with
+retrieval (`dfl_fixed_grids`). Exact: X3.1 + df2_stock_q4km, context 131072, 89,863-token prompt (past the ring) and 7,730,
+old vs new: same text hash and same drafts (679 / 303 and 679 / 304). VRAM at 131K 21.97 -> 20.73 GB. At 262K X3.1 +
+retrieve now loads with no fit changes (drafter stage 2.89 GB, 2.59 GB free; before it moved the LM head and embeddings
+to host): 109.4 tok/s at the 90K prompt. (Output at 262K differs from 131K because the load-time prefill tuner picks 288
+vs 304 batched columns there, not the ring.) Script: job tmp `ring_test.sh`.
