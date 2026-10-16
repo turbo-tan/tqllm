@@ -587,3 +587,10 @@ Still to do for a full G3: per-token top-2 margins at the first divergence for r
 - **Margin tool not yet built**: `tqllm::Model::capture(prompt, hidden, logits)` gives the final-position logits, so a small `tools/` tool (args: weights gguf + tokenizer + prefix text -> top-5) is the path; it needs the GGUF->tokenizer route tqserve uses.
 - **KLD vs llama-paw (wikitext 32x2048, <1e-3) not yet run** (needs a llama-paw reference logits file).
 - sq verdict: keep sq as the n=1 default (bit-matches llama-paw `GGML_PAW_X3_GEMV=0`).
+
+## X3 port Phase 3 — graph-capture bug fixed; G3 tooling outstanding (2026-10-16)
+
+- **Real bug found + fixed**: a raw `/v1/completions` decode failed with `x3: scratch allocation failed (348160 bytes, free 7099908096)`. Cause: the shared scratch allocated lazily on the first matvec, but the engine captures CUDA graphs around decode and `cudaMalloc` is illegal during capture. `X3Format::load` now warms a/had/c/dw/locks to the sizes the Mat can need, so matvec/dequant_h never allocate. `/v1/completions` returns " Paris."; `x3_format` still OK.
+- `/v1/completions` and `/completion` expose no logprobs either -> the margin readout must come from a new `tools/` tool (`Model::capture` gives the final-position logits), not the server.
+- No pre-existing llama-paw X3.1 kl-divergence-base found under /mnt/hdd/ml/paw27b -> the KLD gate needs one created (`llama-perplexity --kl-divergence-base`, wikitext 32x2048) then `tools/tqkld`.
+- G3 still: 25/40 identity; 10/15 divergences proven by-design (sq vs x3v); 5 (r000,r009,r010,r012,r019) deep divergences await the margin tool; KLD outstanding.
