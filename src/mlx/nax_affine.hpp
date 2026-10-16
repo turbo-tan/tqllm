@@ -34,7 +34,9 @@ mlx::core::array nax_affine_dequant(const NaxAffine& weights);
 mlx::core::array nax_affine_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 // Prefill GEMM on the int8 matrix-unit path: TQ4 levels exact as int8 (group scale applied per 128 columns), input
 // quantized per (row, 128-column block) to int8 (the only approximation). FP32 [m, rows], optionally BF16-rounded.
-mlx::core::array nax_int8_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
+// exact: per-128-group scales applied after each group's run (0.27x, j639); otherwise one run over K with per-row
+// weights (re-quantized) and per-token input (48 TOPS).
+mlx::core::array nax_int8_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false, bool exact = false);
 mlx::core::array nax_tq4_levels_int8(const NaxAffine& weights);  // int8 [columns/128, rows, 128] integer levels (TQ4 only)
 std::pair<mlx::core::array, mlx::core::array> nax_quantize_rows_int8(const mlx::core::array& input, int row_pad = 64);  // int8 [k/128, m padded, 128], FP32 scale [m padded, k/128]
 // Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that

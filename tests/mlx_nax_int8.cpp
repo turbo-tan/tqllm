@@ -79,19 +79,20 @@ int main() {
         for (auto& v : xg) v = float(int(rng() % 255) - 127) / 128.0f;
         for (int r = 0; r < m; ++r) for (int g = 0; g < k / 128; ++g) xg[size_t(r) * k + g * 128] = (g & 1) ? 127.0f / 128.0f : -127.0f / 128.0f;  // block scale exactly 2^-7
         auto Xg = mx::array(xg.data(), {m, k}, mx::float32);
-        auto got = host(nax_int8_gemm(f.w, Xg, false));
+        auto got = host(nax_int8_gemm(f.w, Xg, false, true));
         auto ref = reference(f, xg, m);
         const double e1 = rel_l2(got, ref);
         // 2. realistic inputs: uniform in [-1, 1] (rotated activations are outlier-free)
         std::vector<float> xr(size_t(m) * k);
         for (auto& v : xr) v = float(mx::float16_t(float(int(rng() % 2001) - 1000) * 1e-3f));
         auto Xr = mx::array(xr.data(), {m, k}, mx::float32);
-        auto got2 = host(nax_int8_gemm(f.w, Xr, false));
+        auto got2 = host(nax_int8_gemm(f.w, Xr, false, true));
         auto ref2 = reference(f, xr, m);
         const double e2 = rel_l2(got2, ref2);
+        const double e4 = rel_l2(host(nax_int8_gemm(f.w, Xr, false, false)), ref2);
         auto fp16 = host(nax_affine_gemm(f.w, Xr, false));
         const double e3 = rel_l2(fp16, ref2);
-        std::printf("NAX_INT8 rows=%d m=%d grid_rel_l2=%.2e realistic_rel_l2=%.2e (fp16 path %.2e)\n", rows, m, e1, e2, e3);
+        std::printf("NAX_INT8 rows=%d m=%d exact: grid_rel_l2=%.2e realistic_rel_l2=%.2e; fast (per-row) realistic_rel_l2=%.2e (fp16 path %.2e)\n", rows, m, e1, e2, e4, e3);
         ok = ok && e1 < 1e-5 && e2 < 1e-2;
     }
     // 3. throughput at the FFN shapes (gate/up: 17408 x 5120; down: 5120 x 17408), m = 2048
@@ -101,11 +102,10 @@ int main() {
         mx::eval(X);
         const double flop = 2.0 * 2048 * rows * k;
         const double t16 = best_ms([&] { return nax_affine_gemm(f.w, X, true); });
-        const double t8 = best_ms([&] { return nax_int8_gemm(f.w, X, true); });
-        const double tq = best_ms([&] { return nax_quantize_rows_int8(X).first; });
-        const double tl = best_ms([&] { return nax_tq4_levels_int8(f.w); });
-        std::printf("NAX_INT8_SPEED rows=%d k=%d m=2048 fp16_gemm_path %.2f ms (%.1f TFLOPS) int8_path %.2f ms (%.1f TOPS) -> %.2fx; quantize %.2f ms levels %.2f ms\n",
-                    rows, k, t16, flop / t16 * 1e-9, t8, flop / t8 * 1e-9, t16 / t8, tq, tl);
+        const double t8 = best_ms([&] { return nax_int8_gemm(f.w, X, true, false); });
+        const double t8e = best_ms([&] { return nax_int8_gemm(f.w, X, true, true); });
+        std::printf("NAX_INT8_SPEED rows=%d k=%d m=2048 fp16_gemm_path %.2f ms (%.1f TFLOPS) int8 fast %.2f ms (%.1f TOPS) -> %.2fx; exact %.2f ms (%.1f TOPS)\n",
+                    rows, k, t16, flop / t16 * 1e-9, t8, flop / t8 * 1e-9, t16 / t8, t8e, flop / t8e * 1e-9);
     }
     std::puts(ok ? "NAX_INT8_PASS" : "NAX_INT8_FAIL");
     return ok ? 0 : 1;
