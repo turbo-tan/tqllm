@@ -141,6 +141,23 @@ void test_default_max_tokens() {
     check(big.ok && big.max_tokens == 8192, "max_tokens capped at the server default");
 }
 
+void test_tool_stream_limit() {
+    using tqserve::tool_stream_limit;
+    check(tool_stream_limit("Plain answer.") == 13, "tools: prose without markup streams whole");
+    check(tool_stream_limit("Let me check.\n<function=get_weather>\n<parameter=city>\nParis") == 14, "tools: prose up to the first block");
+    check(tool_stream_limit("Let me check. <func") == 14, "tools: a tail that may grow into <function= is held back");
+    check(tool_stream_limit("Let me check. <tool_") == 14, "tools: a tail that may grow into <tool_call> is held back");
+    check(tool_stream_limit("Hi <tool_call>\n<function=f>") == 3, "tools: a literal <tool_call> cuts like extract_tool_calls");
+    check(tool_stream_limit("<function=f>\n</function>") == 0, "tools: a pure call streams nothing");
+    check(tool_stream_limit("a < b and 3 <= 4") == 16, "tools: a lone '<' that cannot become a marker is not held");
+    // whatever streams is a prefix of the parsed answer (up to the whitespace trim): the streamed text never shows markup
+    for (const std::string raw : {std::string("Checking now.\n<function=ls>\n</function>"), std::string("Sure. <tool_call>\n<function=f>\n</function>")}) {
+        tqserve::DecodeResult r; r.text = raw; tqserve::extract_tool_calls(r);
+        const std::string streamed = raw.substr(0, tool_stream_limit(raw));
+        check(streamed.find('<') == std::string::npos && streamed.compare(0, r.text.size(), r.text) == 0, "tools: streamed prose is the parsed answer's prefix");
+    }
+}
+
 void test_chat_prompt() {
     const auto off = tqserve::parse_request(
         R"({"messages":[{"role":"user","content":"Hello"}]})", 512,
@@ -267,6 +284,7 @@ int main(int argc, char ** argv) {
     test_reader();
     test_chat_prompt();
     test_default_max_tokens();
+    test_tool_stream_limit();
     (void) argc; (void) argv;
     test_jinja_images();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }

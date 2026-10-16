@@ -516,6 +516,19 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// Streaming with tools: how much of the raw answer text can go out now. extract_tool_calls() cuts the answer at the
+// first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
+// tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
+inline size_t tool_stream_limit(const std::string & t) {
+    static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
+    size_t end = t.size();
+    for (const auto & m : markers) { const auto p = t.find(m); if (p != std::string::npos) end = std::min(end, p); }
+    for (const auto & m : markers)
+        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
+    return end;
+}
+
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
 inline void set_timings(DecodeResult & r, const uint64_t * st) {
     r.draft_n = st[1];
@@ -872,7 +885,9 @@ public:
         for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
-            if (!emit(r.reasoning, sr_, true, false) || !(req_.tools || emit(r.text, sc_, false, false))) return false;
+            if (!emit(r.reasoning, sr_, true, false)) return false;
+            if (req_.tools) { if (!emit_tool_text(r.text, sc_)) return false; }
+            else if (!emit(r.text, sc_, false, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
         return true;
@@ -909,7 +924,12 @@ public:
     }
     bool error(const std::string & message) { return send_("data: " + json_error(message) + "\n\n"); }
     // thinking budget: send what is left of a phase's deltas without the final chunk; a phase-2 writer skips the role
-    bool flush(const DecodeResult & r) { return emit(r.reasoning, sr_, true, true) && (req_.tools || emit(r.text, sc_, false, true)); }
+    bool flush(const DecodeResult & r) {
+        if (!emit(r.reasoning, sr_, true, true)) return false;
+        if (!req_.tools) return emit(r.text, sc_, false, true);
+        const size_t end = tool_text_limit(r.text);  // tool markup: nothing past the first block is ours to send
+        return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
+    }
     void mark_role_sent() { role_sent_ = true; }
 
 private:
@@ -932,6 +952,11 @@ private:
             return need > k ? k : 0;
         }
         return 0;
+    }
+    static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
+    bool emit_tool_text(const std::string & raw, std::string & sent) {
+        const size_t end = tool_text_limit(raw);
+        return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
