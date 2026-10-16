@@ -629,7 +629,16 @@ struct Qwen35::Impl {
         auto h=swiglu16({gv,uv})[0];
         if(stage_profiling)stage("ffn_gate_up",{h});
         auto hin=d->tq4?tq4_rotate_half(h):h;
-        return bf_raw(mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32));
+        auto y=mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32);
+        // TQLLM_MLX_ANE_NOISE=<rel>: add Gaussian noise of norm rel * |y| (Neural Engine slice error budget, debug only)
+        static const float ane_noise=std::getenv("TQLLM_MLX_ANE_NOISE")?std::stof(std::getenv("TQLLM_MLX_ANE_NOISE")):0.0f;
+        if(ane_noise>0) {
+            static int calls=0;
+            auto e=mx::random::normal(y.shape(),mx::float32,0.0f,1.0f,mx::random::key(uint64_t(++calls)));
+            auto scale=mx::multiply(mx::array(ane_noise),mx::sqrt(mx::divide(mx::sum(mx::square(y)),mx::sum(mx::square(e)))));
+            y=mx::add(y,mx::multiply(e,scale));
+        }
+        return bf_raw(y);
     }
     mx::array full_attention(const std::string& p,const mx::array& x,Cache& c,int offset,int layer) {
         const int m=x.shape(0);
