@@ -53,6 +53,25 @@ int main() {
         std::printf("GDN_FUSE m=%d pre_max_bf16_ulps=%.3f post_max_bf16_ulps=%.3f\n", m, e1, e2);
         ok = ok && e1 <= 1.01 && e2 <= 1.01;
     }
+    // chunked prefill GDN vs the sequential scan (same inputs, random state), relative error of output and state
+    for (int m : {128, 200, 2048}) {
+        const int kh2 = 16, vh2 = 48;
+        auto nrm = [](const mx::array& x) {return mx::multiply(x, mx::rsqrt(mx::add(mx::sum(mx::square(x), -1, true), mx::array(1e-6f))));};
+        auto q = mx::multiply(nrm(rnd(g, {1, m, kh2, 128}, 1.0f)), mx::array(0.0883883f)), k = nrm(rnd(g, {1, m, kh2, 128}, 1.0f));
+        auto v = rnd(g, {1, m, vh2, 128}, 1.0f);
+        auto decay = mx::exp(mx::multiply(mx::abs(rnd(g, {1, m, vh2}, 1.0f)), mx::array(-0.05f)));
+        auto beta = mx::sigmoid(rnd(g, {1, m, vh2}, 1.0f));
+        auto s0 = rnd(g, {1, vh2, 128, 128}, 0.1f);
+        auto ref = gdn_scan(q, k, v, decay, beta, s0, false, false);
+        auto [o, st] = gdn_chunked(q, k, v, decay, beta, s0, 64);
+        auto rel = [](const mx::array& a, const mx::array& b) {
+            auto d = mx::sqrt(mx::sum(mx::square(mx::subtract(a, b)))), n = mx::sqrt(mx::sum(mx::square(b)));
+            mx::eval(d, n); return double(d.item<float>() / n.item<float>());
+        };
+        const double eo = rel(o, ref.output), es = rel(st, ref.state);
+        std::printf("GDN_CHUNKED m=%d out_rel_err=%.2e state_rel_err=%.2e\n", m, eo, es);
+        ok = ok && eo < 1e-4 && es < 1e-4;
+    }
     std::puts(ok ? "MLX_GDN_FUSE_PASS" : "MLX_GDN_FUSE_FAIL");
     return ok ? 0 : 1;
 }

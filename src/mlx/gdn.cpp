@@ -1,4 +1,6 @@
 #include "gdn.hpp"
+#include <optional>
+#include <vector>
 #include <mlx/compile.h>
 #include <stdexcept>
 #include <cstdlib>
@@ -208,6 +210,57 @@ for(uint t=0;t<M;++t) {
     return {result[0],final,snapshots&&!compact?std::optional<mx::array>(result[1]):std::nullopt,
         compact?std::optional<mx::array>(result[2]):std::nullopt};
 }
+// Chunked gated delta rule for prefill (no per-token snapshots). Same recurrence as gdn_scan
+// (s *= a; d = (v - s k) b; s += d k^T; o = s q), 64 tokens per sub-chunk:
+//   (I + diag(b) A) U = diag(b) (V - diag(g) K S0^T),  A_tj = (g_t / g_j) k_t.k_j (j < t)
+//   O = diag(g) Q S0^T + (Q K^T * G, causal incl. diagonal) U,   S_C = g_C S0 + (U * g_C / g)^T K
+// with g the cumulative decay inside the sub-chunk. The unit-lower-triangular inverse is (I + N)(I + N^2)...(I + N^32),
+// N = -diag(b) A, batched over value heads.
+std::pair<mx::array,mx::array> gdn_chunked(const mx::array& q,const mx::array& k,const mx::array& v,
+    const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,int chunk) {
+    const int m=q.shape(1),kh=q.shape(2),vh=v.shape(2),dk=q.shape(3),dv=v.shape(3);
+    if(q.ndim()!=4 || k.shape()!=q.shape() || v.shape(1)!=m || vh%kh || (chunk!=16 && chunk!=32 && chunk!=64))
+        throw std::invalid_argument("invalid chunked GDN dimensions");
+    const int c=chunk,n=(m+c-1)/c,pad=n*c-m;
+    auto heads=[&](const mx::array& x) {  // [1, m, kh, d] -> value heads [vh, m, d] (value head h reads key head h % kh)
+        auto idx=mx::remainder(mx::arange(vh,mx::int32),mx::array(kh));
+        return mx::transpose(mx::take(mx::squeeze(x,0),idx,1),{1,0,2});
+    };
+    auto padm=[&](const mx::array& x,float value) {return pad?mx::pad(x,std::vector<std::pair<int,int>>{{0,0},{0,pad},{0,0}},mx::array(value)):x;};
+    auto K=padm(heads(k),0.0f),Q=padm(heads(q),0.0f);
+    auto V=padm(mx::transpose(mx::squeeze(v,0),{1,0,2}),0.0f);
+    auto B=mx::transpose(mx::squeeze(beta,0),{1,0}),A=mx::transpose(mx::squeeze(decay,0),{1,0});  // [vh, m]
+    if(pad) {B=mx::pad(B,std::vector<std::pair<int,int>>{{0,0},{0,pad}},mx::array(0.0f));A=mx::pad(A,std::vector<std::pair<int,int>>{{0,0},{0,pad}},mx::array(1.0f));}
+    auto S=state?mx::reshape(*state,{vh,dv,dk}):mx::zeros({vh,dv,dk});
+    auto strict=mx::astype(mx::tril(mx::ones({c,c}),-1),mx::float32),causal=mx::astype(mx::tril(mx::ones({c,c}),0),mx::float32);
+    auto eye=mx::eye(c);
+    std::vector<mx::array> outs;
+    for(int j=0;j<n;++j) {
+        auto sl=[&](const mx::array& x) {return mx::slice(x,{0,j*c,0},{vh,(j+1)*c,x.shape(2)});};
+        auto Kc=sl(K),Qc=sl(Q),Vc=sl(V);
+        auto bc=mx::slice(B,{0,j*c},{vh,(j+1)*c}),gl=mx::cumsum(mx::log(mx::slice(A,{0,j*c},{vh,(j+1)*c})),1);
+        auto ratio=mx::exp(mx::subtract(mx::expand_dims(gl,2),mx::expand_dims(gl,1)));            // g_t / g_j
+        auto KK=mx::matmul(Kc,mx::transpose(Kc,{0,2,1}));
+        auto L=mx::multiply(mx::multiply(KK,mx::multiply(ratio,strict)),mx::expand_dims(bc,2));  // diag(b) A
+        auto N=mx::negative(L),inv=mx::add(eye,N),p=N;
+        for(int s2=2;s2<c;s2*=2) {p=mx::matmul(p,p);inv=mx::matmul(inv,mx::add(eye,p));}
+        auto g=mx::exp(gl);
+        auto KS=mx::matmul(Kc,mx::transpose(S,{0,2,1}));                                        // K S0^T [vh, c, dv]
+        auto rhs=mx::multiply(mx::expand_dims(bc,2),mx::subtract(Vc,mx::multiply(mx::expand_dims(g,2),KS)));
+        auto U=mx::matmul(inv,rhs);
+        auto QK=mx::multiply(mx::matmul(Qc,mx::transpose(Kc,{0,2,1})),mx::multiply(ratio,causal));
+        auto O=mx::add(mx::multiply(mx::expand_dims(g,2),mx::matmul(Qc,mx::transpose(S,{0,2,1}))),mx::matmul(QK,U));
+        outs.push_back(O);
+        auto glast=mx::slice(gl,{0,c-1},{vh,c});                                                 // [vh, 1]
+        auto w=mx::exp(mx::subtract(glast,gl));                                                  // g_C / g_t
+        S=mx::add(mx::multiply(mx::expand_dims(mx::exp(glast),2),S),
+                  mx::matmul(mx::transpose(mx::multiply(U,mx::expand_dims(w,2)),{0,2,1}),Kc));
+    }
+    auto O=mx::concatenate(outs,1);                                                              // [vh, n c, dv]
+    if(pad)O=mx::slice(O,{0,0,0},{vh,m,dv});
+    return {mx::expand_dims(mx::transpose(O,{1,0,2}),0),mx::reshape(S,{1,vh,dv,dk})};
+}
+
 mx::array gdn_replay_prefix(const mx::array& keys,const mx::array& decay,const mx::array& deltas,
     const std::optional<mx::array>& initial,int count) {
     if(keys.ndim()!=4 || keys.shape(0)!=1 || keys.shape(2)<1 || keys.shape(3)!=128 || keys.dtype()!=mx::float32 ||

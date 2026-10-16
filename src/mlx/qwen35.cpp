@@ -703,6 +703,18 @@ struct Qwen35::Impl {
             std::pair{gdn_decay(a,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),compiled_gdn),mx::sigmoid(b)};
         auto decay=mx::reshape(gates.first,{1,m,vh}),beta=mx::reshape(gates.second,{1,m,vh});
         stage("gdn_prep",{q,k,v,decay,beta});
+        // prefill chunks without prefix capture: chunked form (matmuls over 64-token sub-chunks) instead of the
+        // token-by-token scan; TQLLM_MLX_GDN_CHUNKED=0 keeps the scan
+        static const bool chunked_gdn=env_default_on("TQLLM_MLX_GDN_CHUNKED");
+        if(chunked_gdn && !capture_prefix && m>=128 && dk==128 && dv==128) {
+            auto [o,st]=gdn_chunked(q,k,v,decay,beta,c.state,64);
+            c.state=st;
+            stage("gdn_scan",{o,st});
+            auto z=mx::reshape(mat(p+"attn_gate.weight",x),{1,m,vh,dv});
+            auto out=gdn_fuse?gdn_post_fused(o,z,plain.at(p+"ssm_norm.weight"),eps):
+                silu_mul_bf(mx::fast::rms_norm(bf(o),plain.at(p+"ssm_norm.weight"),eps),z);
+            return mat(p+"ssm_out.weight",mx::reshape(out,{m,vh*dv}));
+        }
         auto scanned=scan_gdn?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
         if(capture_prefix) {
             tape.states=scanned->snapshots;

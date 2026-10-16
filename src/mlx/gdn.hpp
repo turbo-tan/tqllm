@@ -1,5 +1,6 @@
 #pragma once
 #include <mlx/mlx.h>
+#include <optional>
 
 namespace tqllm::mlx_backend {
 mlx::core::array gdn_convolve(const mlx::core::array& joined,
@@ -16,6 +17,10 @@ mlx::core::array gdn_decay(const mlx::core::array& alpha,const mlx::core::array&
 mlx::core::array gdn_pre_fused(const mlx::core::array& joined,const mlx::core::array& weights,int key_heads,float query_scale);
 // bf16 -> rms_norm -> * silu(z) -> bf16 in one launch; y, z [1, m, heads, 128]
 mlx::core::array gdn_post_fused(const mlx::core::array& y,const mlx::core::array& z,const mlx::core::array& weight,float eps);
+// prefill-only chunked form of gdn_scan (output [1, m, vh, 128], final state); chunk 16 / 32 / 64
+std::pair<mlx::core::array,mlx::core::array> gdn_chunked(const mlx::core::array& q,const mlx::core::array& k,
+    const mlx::core::array& v,const mlx::core::array& decay,const mlx::core::array& beta,
+    const std::optional<mlx::core::array>& state,int chunk=64);
 struct GdnHeadOrder {
     mlx::core::array to_native,from_native;
     int key_heads,value_heads;
