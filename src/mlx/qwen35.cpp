@@ -874,7 +874,7 @@ void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     }
     std::vector<mx::array> live;
     for(const auto& c:caches)for(const auto* a:{&c.conv,&c.state})if(*a)live.push_back(**a);
-    static const bool lazy=std::getenv("TQLLM_MLX_EAGER_COMMIT")==nullptr;  // replay runs inside the next forward's graph
+    static const bool lazy=!std::getenv("TQLLM_MLX_EAGER_COMMIT") && !std::getenv("TQLLM_MLX_EAGER_ACCEPT");  // replay runs inside the next forward's graph
     if(!lazy)mx::eval(live);
     impl_->caches=std::move(caches);impl_->pos=s->start+int(count);++impl_->revision;
     impl_->last_hidden=count?std::optional<mx::array>(tail_slice(*s->hidden_after,0,int(count)-1,int(count))):s->hidden_before;
