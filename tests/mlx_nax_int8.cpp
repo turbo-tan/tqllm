@@ -70,8 +70,8 @@ int main() {
   try {
     std::mt19937 rng(7);
     bool ok = true;
-    // rows 1056 = 33 x 32: exercises the N bound of the 64-wide tile; m = 200 the M bound
-    for (int rows : {1024, 1056}) {
+    // m = 200 exercises the M bound (row tiles of 64); rows must be a multiple of 128
+    for (int rows : {1024, 1152}) {
         const int k = 5120, m = 200;
         auto f = make(rows, k, rng);
         // 1. grid inputs: every |x| <= 127 * 2^-7, so the row scale is exactly 2^-7 and the int8 codes are exact
@@ -102,7 +102,6 @@ int main() {
         const double flop = 2.0 * 2048 * rows * k;
         const double t16 = best_ms([&] { return nax_affine_gemm(f.w, X, true); });
         const double t8 = best_ms([&] { return nax_int8_gemm(f.w, X, true); });
-        auto [xq, sa] = nax_quantize_rows_int8(X);
         const double tq = best_ms([&] { return nax_quantize_rows_int8(X).first; });
         const double tl = best_ms([&] { return nax_tq4_levels_int8(f.w); });
         std::printf("NAX_INT8_SPEED rows=%d k=%d m=2048 fp16_gemm_path %.2f ms (%.1f TFLOPS) int8_path %.2f ms (%.1f TOPS) -> %.2fx; quantize %.2f ms levels %.2f ms\n",
