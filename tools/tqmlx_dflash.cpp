@@ -7,6 +7,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <stdexcept>
+#include <optional>
 #include <span>
 #include <vector>
 namespace mx=mlx::core;
@@ -41,6 +42,8 @@ int main(int argc,char** argv) {
         // TQLLM_MLX_DFLASH_SPEC_ONLY=1: speculative runs only (ar_equal_prefix then compares with nothing);
         // TQLLM_MLX_DFLASH_WARM_TOKENS=n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
         const bool spec_only=std::getenv("TQLLM_MLX_DFLASH_SPEC_ONLY")!=nullptr;
+        // TQLLM_MLX_DFLASH_PIPELINE=1: draft and verify chained on the GPU (needs TQLLM_MLX_DEVICE_SELECTOR)
+        const bool pipeline=std::getenv("TQLLM_MLX_DFLASH_PIPELINE")!=nullptr && std::getenv("TQLLM_MLX_DEVICE_SELECTOR")!=nullptr;
         const int warm_tokens=std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS")?std::max(2,std::atoi(std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS"))):count;
         for(int mode=spec_only?1:0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             const int limit=run<0?std::min(count,warm_tokens):count;
@@ -62,11 +65,27 @@ int main(int argc,char** argv) {
                 if(!mode) {logits=engine.forward({&pending,1});pending=mx::argmax(logits).item<uint32_t>();output.push_back(pending);continue;}
                 const int pos=engine.position(),want=std::min(width,int(limit-output.size()));
                 const auto step_begin=Clock::now();
-                begin=Clock::now();auto proposed=drafter.draft(pending,pos,want);draft_ms+=seconds(begin)*1000;
-                std::vector<uint32_t> block{pending};block.insert(block.end(),proposed.begin(),proposed.end());
-                Qwen35::Verification ticket;begin=Clock::now();const bool direct_ids=std::getenv("TQLLM_MLX_TARGET_HEAD_IDS")&&std::getenv("TQLLM_MLX_TARGET_HEAD_SHORTLIST");
-                auto choices=direct_ids?engine.verify_choices(block,ticket):mx::argmax(engine.verify(block,ticket),-1);
-                mx::eval(choices);const auto* ids=choices.data<uint32_t>();
+                Qwen35::Verification ticket;const bool direct_ids=std::getenv("TQLLM_MLX_TARGET_HEAD_IDS")&&std::getenv("TQLLM_MLX_TARGET_HEAD_SHORTLIST");
+                std::vector<uint32_t> proposed;std::optional<mx::array> choices;
+                if(pipeline) {
+                    // draft -> verify as one graph: the draft ids never leave the GPU, one host sync per cycle
+                    begin=Clock::now();
+                    auto drafted=drafter.draft_device(pending,pos,want);
+                    const uint32_t anchor[1]={pending};
+                    auto block_ids=mx::concatenate({mx::array(anchor,{1},mx::uint32),drafted},0);
+                    draft_ms+=seconds(begin)*1000;begin=Clock::now();
+                    choices=direct_ids?engine.verify_device(block_ids,ticket,true):mx::argmax(engine.verify_device(block_ids,ticket),-1);
+                    mx::eval(*choices,drafted);
+                    proposed.assign(drafted.data<uint32_t>(),drafted.data<uint32_t>()+want);
+                    for(auto id:proposed)if(id>=uint32_t(engine.vocabulary()))throw std::runtime_error("draft token outside vocabulary");
+                } else {
+                    begin=Clock::now();proposed=drafter.draft(pending,pos,want);draft_ms+=seconds(begin)*1000;
+                    std::vector<uint32_t> block{pending};block.insert(block.end(),proposed.begin(),proposed.end());
+                    begin=Clock::now();
+                    choices=direct_ids?engine.verify_choices(block,ticket):mx::argmax(engine.verify(block,ticket),-1);
+                    mx::eval(*choices);
+                }
+                const auto* ids=choices->data<uint32_t>();
                 auto features=engine.feature_states();verify_ms+=seconds(begin)*1000;build_ms+=engine.timings().first;
                 int accepted=0;while(accepted<want && proposed[accepted]==ids[accepted])++accepted;
                 if(rank_stats && mode && run>=0 && accepted<want) {

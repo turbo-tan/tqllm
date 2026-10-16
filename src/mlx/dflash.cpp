@@ -154,6 +154,8 @@ struct DFlash2::Impl {
     std::map<std::string,Matrix> matrices;
     std::map<std::string,NaxAffine> nax;
     std::vector<std::vector<uint32_t>> candidates;
+    bool device_only=false;                 // draft_device: leave the chosen ids on the GPU
+    std::optional<mx::array> last_chosen;
     std::map<std::string,TqTiledWeights> tiled_ffn;
     std::map<std::string,Mma8Weights> mma8_attn;
     std::optional<std::pair<mx::array,mx::array>> rotation_half;
@@ -294,6 +296,12 @@ void DFlash2::inject(const mx::array& features,int position) {
     if(eager || (trimmed && !lazy_always))mx::eval(live);
     i.end+=n;
 }
+mx::array DFlash2::draft_device(uint32_t anchor,int position,int count) {
+    impl_->device_only=true;
+    try {draft(anchor,position,count);} catch(...) {impl_->device_only=false;throw;}
+    impl_->device_only=false;
+    return *impl_->last_chosen;
+}
 std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
     i.rotation.reset();i.rotation_half.reset();
@@ -343,6 +351,7 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     if(std::getenv("TQLLM_MLX_DEVICE_SELECTOR")) {
         auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
             i.plain.at("selector_predecessor.weight"),anchor,count);
+        if(i.device_only) {i.last_chosen=chosen;return {};}
         mx::eval(chosen);
         std::vector<uint32_t> result(chosen.data<uint32_t>(),chosen.data<uint32_t>()+count);
         if(std::any_of(result.begin(),result.end(),[&](uint32_t id){return id>=uint32_t(i.vocab);}))

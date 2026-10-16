@@ -55,4 +55,5 @@ struct Affine8Embedding {
 uint64_t affine8_embedding_bytes(uint64_t rows, uint64_t columns);
 Affine8Embedding affine8_embedding_load(std::span<const uint8_t> payload, int rows, int columns);
 mlx::core::array affine8_embedding(const Affine8Embedding& table, std::span<const uint32_t> tokens);
+mlx::core::array affine8_embedding(const Affine8Embedding& table, const mlx::core::array& ids);
 }

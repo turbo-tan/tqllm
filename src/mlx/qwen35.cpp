@@ -418,7 +418,9 @@ struct Qwen35::Impl {
             if(tiled_active(name,weights,fp32))matrices.erase(name);
         }
     }
+    std::optional<mx::array> device_ids;  // set by verify_device: the batch's ids stay on the GPU (draft -> verify, no readback)
     mx::array embed(std::span<const uint32_t> tokens) const {
+        if(device_ids)return embedding8?affine8_embedding(*embedding8,*device_ids):q4_embedding(*embedding,*device_ids);
         return embedding8?affine8_embedding(*embedding8,tokens):q4_embedding(*embedding,tokens);
     }
     mx::array mat(const std::string& name,const mx::array& x,bool input_rotated=false) {
@@ -856,6 +858,17 @@ mx::array Qwen35::verify_choices(std::span<const uint32_t> tokens,Verification& 
         restore(before);
         throw;
     }
+}
+mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch,bool choices) {
+    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>8)
+        throw std::invalid_argument("device verification needs uint32 ids [1..8]");
+    const std::vector<uint32_t> placeholder(size_t(ids.shape(0)),0u);
+    impl_->device_ids=ids;
+    try {
+        auto out=choices?verify_choices(placeholder,batch):verify(placeholder,batch);
+        impl_->device_ids.reset();
+        return out;
+    } catch(...) {impl_->device_ids.reset();throw;}
 }
 void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     const auto* s=batch.state_.get();

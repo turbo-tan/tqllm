@@ -18,8 +18,12 @@ mx::array q4_embedding(const Q4Embedding& w, std::span<const uint32_t> ids) {
     if(w.blocks.shape(1)>std::numeric_limits<int>::max()/256 ||
        ids.size()>size_t(std::numeric_limits<int>::max()/(w.blocks.shape(1)*256)))
         throw std::invalid_argument("embedding output exceeds Metal grid range");
-    const int k=w.blocks.shape(1)*256, m=int(ids.size());
-    auto tokens=mx::array(ids.data(),{m},mx::uint32);
+    return q4_embedding(w,mx::array(ids.data(),{int(ids.size())},mx::uint32));
+}
+mx::array q4_embedding(const Q4Embedding& w, const mx::array& ids) {
+    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1)throw std::invalid_argument("device embedding ids must be uint32 [m]");
+    const int k=w.blocks.shape(1)*256, m=ids.shape(0);
+    const auto& tokens=ids;
     static auto kernel=mx::fast::metal_kernel("tqllm_q4_embedding",{"blocks","tokens"},{"y"},R"METAL(
 uint i=thread_position_in_grid.x;
 if(i>=M*K) return;

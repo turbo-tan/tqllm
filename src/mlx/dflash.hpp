@@ -17,6 +17,9 @@ public:
     void reset();
     void inject(const mlx::core::array& features,int position);
     std::vector<uint32_t> draft(uint32_t anchor,int position,int count);
+    // the same draft with the selector's ids left unevaluated on the GPU (uint32 [count]); needs
+    // TQLLM_MLX_DEVICE_SELECTOR. Feed it to Qwen35::verify_device without reading it back.
+    mlx::core::array draft_device(uint32_t anchor,int position,int count);
     // with TQLLM_MLX_DFLASH_RANKSTATS: the last draft's 16 candidates per proposed token, best unary score first
     const std::vector<std::vector<uint32_t>>& candidates() const;
 private:

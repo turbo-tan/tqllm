@@ -427,7 +427,11 @@ Affine8Embedding affine8_embedding_load(std::span<const uint8_t> payload, int ro
 mx::array affine8_embedding(const Affine8Embedding& e, std::span<const uint32_t> tokens) {
     const int m = int(tokens.size());
     for (auto t : tokens) if (t >= uint32_t(e.rows)) throw std::invalid_argument("token id out of range");
-    auto ids = mx::array(tokens.data(), {m}, mx::uint32);
+    return affine8_embedding(e, mx::array(tokens.data(), {m}, mx::uint32));
+}
+
+mx::array affine8_embedding(const Affine8Embedding& e, const mx::array& ids) {
+    const int m = ids.shape(0);
     auto q = mx::reshape(mx::astype(mx::take(e.codes, ids, 0), mx::float32), {m, e.columns / 64, 64});
     auto s = mx::expand_dims(mx::astype(mx::take(e.scales, ids, 0), mx::float32), 2);
     auto b = mx::expand_dims(mx::astype(mx::take(e.biases, ids, 0), mx::float32), 2);

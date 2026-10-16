@@ -23,6 +23,9 @@ public:
     };
     mlx::core::array verify(std::span<const uint32_t> tokens, Verification& batch);
     mlx::core::array verify_choices(std::span<const uint32_t> tokens, Verification& batch);
+    // verify with the batch ids already on the GPU (e.g. the drafter's unevaluated output): no host readback between
+    // draft and verify. choices=true returns verify_choices' ids, otherwise logits.
+    mlx::core::array verify_device(const mlx::core::array& ids, Verification& batch, bool choices = false);
     void accept_prefix(const Verification& batch, size_t count);
     mlx::core::array hidden_states() const;
     void enable_mtp();
