@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 namespace mx=mlx::core;
 using tqllm::mlx_backend::Qwen35;
@@ -42,8 +43,10 @@ int main(int argc,char** argv) {
         // TQLLM_MLX_DFLASH_SPEC_ONLY=1: speculative runs only (ar_equal_prefix then compares with nothing);
         // TQLLM_MLX_DFLASH_WARM_TOKENS=n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
         const bool spec_only=std::getenv("TQLLM_MLX_DFLASH_SPEC_ONLY")!=nullptr;
-        // TQLLM_MLX_DFLASH_PIPELINE=1: draft and verify chained on the GPU (needs TQLLM_MLX_DEVICE_SELECTOR)
-        const bool pipeline=std::getenv("TQLLM_MLX_DFLASH_PIPELINE")!=nullptr && std::getenv("TQLLM_MLX_DEVICE_SELECTOR")!=nullptr;
+        // draft and verify chained on the GPU, draft submitted asynchronously (j598: -3 ms/cycle, exact); needs the
+        // device selector. TQLLM_MLX_DFLASH_PIPELINE=0 restores the synchronous draft readback.
+        const char* pipe_env=std::getenv("TQLLM_MLX_DFLASH_PIPELINE");
+        const bool pipeline=(!pipe_env || std::string(pipe_env)!="0") && std::getenv("TQLLM_MLX_DEVICE_SELECTOR")!=nullptr;
         const int warm_tokens=std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS")?std::max(2,std::atoi(std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS"))):count;
         for(int mode=spec_only?1:0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             const int limit=run<0?std::min(count,warm_tokens):count;
