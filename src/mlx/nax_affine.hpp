@@ -33,10 +33,10 @@ mlx::core::array nax_affine_dequant(const NaxAffine& weights);
 // with nax_affine_matmul (accumulation order), so decode and verify keep the row kernel.
 mlx::core::array nax_affine_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 // Prefill GEMM on the int8 matrix-unit path: TQ4 levels exact as int8 (group scale applied per 128 columns), input
-// quantized per row to int8 (the only approximation). FP32 [m, rows], optionally BF16-rounded.
+// quantized per (row, 128-column block) to int8 (the only approximation). FP32 [m, rows], optionally BF16-rounded.
 mlx::core::array nax_int8_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 mlx::core::array nax_tq4_levels_int8(const NaxAffine& weights);  // int8 [rows, columns] integer levels (TQ4 only)
-std::pair<mlx::core::array, mlx::core::array> nax_quantize_rows_int8(const mlx::core::array& input);  // int8 [m, k], FP32 scale [m]
+std::pair<mlx::core::array, mlx::core::array> nax_quantize_rows_int8(const mlx::core::array& input);  // int8 [m, k], FP32 scale [m, k/128]
 // Matrices with the same columns, bits and group stacked along the output rows (one launch for projections that
 // share an input).
 // TQ4 (GGUF type 300, integer levels, rotated basis) repacked into the matrix-unit lane order; the input must be

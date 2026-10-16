@@ -1,5 +1,5 @@
 // int8 prefill path for TQ4 matrices: exact weights (integer levels, per-128-column FP16 scales), per-row int8 input.
-// 1. inputs on the int8 grid (n * 2^-7): the result equals a float64 host reference (only summation order differs)
+// 1. inputs on the int8 grid (n * 2^-7, every block holding +-127): the result equals a float64 host reference (only summation order differs)
 // 2. realistic inputs: relative error vs the host reference (the activation quantization alone)
 // 3. throughput vs the FP16 GEMM path at prefill shapes
 #include "nax_affine.hpp"
@@ -75,6 +75,7 @@ int main() {
         // 1. grid inputs: every |x| <= 127 * 2^-7, so the row scale is exactly 2^-7 and the int8 codes are exact
         std::vector<float> xg(size_t(m) * k);
         for (auto& v : xg) v = float(int(rng() % 255) - 127) / 128.0f;
+        for (int r = 0; r < m; ++r) for (int g = 0; g < k / 128; ++g) xg[size_t(r) * k + g * 128] = (g & 1) ? 127.0f / 128.0f : -127.0f / 128.0f;  // block scale exactly 2^-7
         auto Xg = mx::array(xg.data(), {m, k}, mx::float32);
         auto got = host(nax_int8_gemm(f.w, Xg, false));
         auto ref = reference(f, xg, m);

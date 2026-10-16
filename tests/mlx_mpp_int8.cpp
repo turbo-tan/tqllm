@@ -187,7 +187,7 @@ for (uint i = 0; i < acc.get_capacity(); ++i) {
 }
 )METAL", header)).first;
     }
-    return it->second({x, w, scales}, {{m, n}}, {mx::float32}, sb ? mx::Shape{(n / nt) * (m / mt) * 32 * simds, 1, 1} : mx::Shape{(n / nt) * 32 * simds, m / mt, 1}, {32 * simds, 1, 1},
+    return it->second({x, w, scales}, {{m, n}}, {mx::float32}, sb ? std::tuple<int, int, int>{(n / nt) * (m / mt) * 32 * simds, 1, 1} : std::tuple<int, int, int>{(n / nt) * 32 * simds, m / mt, 1}, {32 * simds, 1, 1},
                       {{"MT", mt}, {"NT", nt}, {"BK", bk}, {"SIMDS", simds}, {"N", n}, {"K", k}, {"M", m}},
                       std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
