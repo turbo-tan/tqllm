@@ -568,3 +568,13 @@ Next: resolve the canonical trellis layout + orientation against llama-paw (`tes
 - **Prefill OOB fixed** (commit): compute-sanitizer localized it to `reconstruct_had_kernel<Mul1Codec<6>>` reading the trellis OOB from `X3Format::dequant_h` -> `gemm_c_rows`. dequant_h now uses the canonical `(n=in=cols, m=out=rows)` order and transposes into the engine's `[rows][cols]` (cuBLAS OP_T, lda=cols). Smoke 'Paris' and the failing r000 both clean now.
 - **G3 identity (40 prompts, greedy, non-spec vs spec `-md df2_stock_q4km --draft-max 5`)**: **25/40 identical, 15 divergences** (r000,r001,r004,r005,r008,r009,r010,r011,r012,r014,r016,r017,r019,c002,c008). First divergence is deep in long outputs (185-794 chars in; outputs up to 1327 chars).
 - **Margin criterion BLOCKED**: the FAIL criterion is divergence margin > 0.5, which needs token top-2 logprobs; `tqserve`'s `/v1/chat/completions` returns `logprobs: null` (no logprobs support in this build) and no tool exposes per-token top-2. Need a logprobs source (add to tqserve, or a `tqspec` readout) before G3 can be declared PASS/FAIL.
+
+## X3 port Phase 3 — G3 verdict (2026-10-16)
+
+Divergence classification (40 prompts, greedy; spec `-md df2_stock_q4km --draft-max 5`):
+- **25/40 identical.**
+- Of the 15 divergences, re-running non-spec with `TQLLM_X3_N1_X3V=1` (n=1 forced onto the exact x3v gemv instead of sq) makes **10/15 match spec exactly** -> those are **by design**: non-spec decode is sq (int8 activations), spec verify is x3v (exact fp16). Not bugs.
+- Remaining 5: r009/r010/r012/r019 diverge deep (371-868 chars) inside 700-1300-char outputs (near-ties); r000's "spec" text is a **stale pre-fix 500 error** (the spec pass ran before the prefill OOB fix landed).
+- **sq default verdict**: keep sq as the n=1 default (it bit-matches llama-paw's default decode, `GGML_PAW_X3_GEMV=0`). The cost is that non-spec decode diverges from the x3v verify path by ~int8 rounding; if strict spec==non-spec identity is required, run n=1 on x3v (the hook), which is exact.
+
+Still to do for a full G3: per-token top-2 margins at the first divergence for r009/r010/r012/r019 (needs a logits readout - tqserve has no logprobs), regenerate the spec pass post-fix, and G3 KLD vs llama-paw.
