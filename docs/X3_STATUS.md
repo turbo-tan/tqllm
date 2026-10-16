@@ -717,3 +717,23 @@ old vs new: same text hash and same drafts (679 / 303 and 679 / 304). VRAM at 13
 retrieve now loads with no fit changes (drafter stage 2.89 GB, 2.59 GB free; before it moved the LM head and embeddings
 to host): 109.4 tok/s at the 90K prompt. (Output at 262K differs from 131K because the load-time prefill tuner picks 288
 vs 304 batched columns there, not the ring.) Script: job tmp `ring_test.sh`.
+
+## QTIP2 lab "span" decode in tqLLM (2026-10-17) — no gain, reverted
+
+The CPU lab (`~/ML_projects/paw27b/20261016_qtip2_x31b`, X3.1 agent) scored K3.5 decode 60 -> 52 cycles/tile
+(K3 58 -> 50) on its paper model. Most of that came from hoisting lane-constant index math, which
+`Mul1Codec::Lane` (gemv_window) already does; the new part is the K3.5 geometry: a lane's 8 windows are one
+41-bit span of 3 ring words (a, a-1, a-2 mod 28), cut by 2 funnels (+2 selects) instead of 4 words.
+Ported to `Mul1Codec::decode` (reconstruct) and `Lane::tile` (3 shuffles): bit-identical (1M random tiles x
+32 lanes, 0 diffs; x3_format OK). relbench A/B on GPU2, base / span / base again, `--kv tq3 --draft-retrieve 32 -ub 4096`:
+
+| | nospec tg 2k/8k/32k | dflash2 tg 2k/8k/32k | pp 2k/8k/32k (dflash2) |
+|---|---|---|---|
+| base  | 35.7 / 35.1 / 33.0 | 114.2 / 99.5 / 101.1 | 1301 / 1636 / 1496 |
+| span  | 35.0 / 34.4 / 32.4 | 113.1 / 98.6 / 100.2 | 1304 / 1620 / 1474 |
+| base2 | 35.7 / 35.1 / 33.0 | 115.1 / 100.3 / 101.8 | 1301 / 1613 / 1464 |
+
+Span is ~2% slower on tg (selects + an extra dependent shuffle cost more than the saved shuffle), pp unchanged
+(the decode is not the reconstruct bottleneck). Reverted; test kept in job tmp only. Lesson: the lab's
+LDS-based paper score does not model the shuffle-fed register path; its baseline (60) is the per-call
+smem decode, not gemv_window's hoisted Lane.
