@@ -713,8 +713,8 @@ struct Qwen35::Impl {
         auto decay=mx::reshape(gates.first,{1,m,vh}),beta=mx::reshape(gates.second,{1,m,vh});
         stage("gdn_prep",{q,k,v,decay,beta});
         // prefill chunks without prefix capture: chunked form (matmuls over 64-token sub-chunks) instead of the
-        // token-by-token scan; TQLLM_MLX_GDN_CHUNKED=0 keeps the scan
-        static const bool chunked_gdn=env_default_on("TQLLM_MLX_GDN_CHUNKED");
+        // token-by-token scan; opt-in TQLLM_MLX_GDN_CHUNKED=1 (j621: exact ids but 2.27 vs 1.32 s at 8K, slower than the scan)
+        static const bool chunked_gdn=std::getenv("TQLLM_MLX_GDN_CHUNKED") && std::string(std::getenv("TQLLM_MLX_GDN_CHUNKED"))!="0";
         if(chunked_gdn && !capture_prefix && m>=128 && dk==128 && dv==128) {
             auto [o,st]=gdn_chunked(q,k,v,decay,beta,c.state,64);
             c.state=st;
