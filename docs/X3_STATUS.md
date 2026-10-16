@@ -624,3 +624,16 @@ X3.1 on RAM disk, GPU2, greedy, 128 tokens (1 run; TQ3_4S ref used 400 tok x3):
 - decode tok/s: AR 31.3/30.7/28.9; DFlash (df2_stock_q4km --draft-max 7) 63.8/101.9/69.5 (draft acc 79/343, 97/210, 88/287).
 - TQ3_4S reference (results_gpu2.jsonl): pp ~1430-1570; decode AR 46-52, DFlash 107-222.
 - X3 decode is ~40% slower than the TQ3_4S engine baseline (pp comparable); candidate for Phase 5 dispatch.cu tuning (n=1 currently x3v MMODE1; CFG/sq selection). Direct llama-paw-X3 comparison still pending.
+
+## X3 port Phase 4 — G4 A/B verdict (2026-10-16)
+
+relbench.py, both models, SAME drafter (df2_stock_q4km), same settings, 3 repeats, 400 tok:
+| model | mode | ptok 2k/8k/32k | decode t/s | prefill t/s | accept% |
+| x3 | nospec | 1988/7707/31919 | 30.7/30.1/28.6 | 1339/1696/1545 | - |
+| x3 | dflash2 | 1988/7707/31919 | 98.9/83.5/76.6 | 1296/1656/1542 | 44/36/34 |
+| tq3 | nospec | 1988/7707/31919 | 51.5/50.3/46.4 | 1982/2133/1884 | - |
+| tq3 | dflash2 | 1988/7707/31919 | 135.3/127.5/116.7 | 1883/2105/1881 | 43/41/39 |
+
+- **Acceptance parity: X3 44/36/34% == TQ3_4S 43/41/39%** at identical settings -> the earlier X3 23% vs TQ3 75% gap was a DRAFTER artifact (the results_gpu2 TQ3 rows used the server's default drafter, not df2_stock_q4km), NOT an X3 defect. Draft quality is correct.
+- **Speed: X3 decode ~60% of TQ3_4S** (nospec 30 vs 50; dflash 77-99 vs 117-135), prefill ~75%. Uniform matvec overhead -> Phase 5 tuning (x3.cpp matvec's extra x3_cast_h_f32 + x3_copy_f32_bf16_strided launches + f32 C buffer per matvec, ~640 extra launches/token).
+- G4: acceptance PASS; speed gap is the Phase 5 target.
