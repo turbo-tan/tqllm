@@ -1,3 +1,4 @@
+#include <string>
 #include "draft_head.hpp"
 #include "prefill.hpp"
 #include <stdexcept>
@@ -99,7 +100,9 @@ DraftHead4 draft_head4(const Matrix& original) {
     mx::eval(weights);
     DraftHead4 head{weights[0],weights[1],weights[2],std::nullopt,std::nullopt,std::nullopt};
     const int rows=head.codes.shape(0),columns=head.codes.shape(1)*8;
-    if(std::getenv("TQLLM_MLX_HEAD_FRAG") && rows%(16*4)==0 && columns%64==0)frag_pack(head);
+    // default on (TQLLM_MLX_HEAD_FRAG=0 opts out): j578 draft 11.6 vs 16.2 ms/step without it
+    const char* frag=std::getenv("TQLLM_MLX_HEAD_FRAG");
+    if((!frag || std::string(frag)!="0") && rows%(16*4)==0 && columns%64==0)frag_pack(head);
     return head;
 }
 mx::array draft_head4_matmul(const DraftHead4& head,const mx::array& x) {

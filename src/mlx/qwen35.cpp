@@ -336,7 +336,8 @@ struct Qwen35::Impl {
         };
         matrix("output.weight");scalar("output_norm.weight");
         if(file.tensors.contains("output_draft.weight") && std::getenv("TQLLM_MLX_NAX_DRAFT_HEAD4"))matrix("output_draft.weight");
-        const auto* q6_head = std::get_if<Q6Weights>(&matrices.at("output.weight"));
+        const auto head_matrix = matrices.find("output.weight");
+        const auto* q6_head = head_matrix == matrices.end() ? nullptr : std::get_if<Q6Weights>(&head_matrix->second);
         if (q6_head && env_default_on("TQLLM_MLX_NAX_Q6_HEAD") && !target_head_shortlist) {
             nax.emplace("output.weight", nax_from_q6(*q6_head));
         } else if (std::getenv("TQLLM_MLX_Q6_AFFINE")) {
