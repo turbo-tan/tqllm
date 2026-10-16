@@ -76,8 +76,16 @@ const char* kSource = R"METAL(
             for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
             uint2 w = wp[ks * 32];
             uint h = BITS == 6 ? hp[ks * 32] : 0u;
-            if (TQ4) {
-                // levels 6..127 as bytes of two words: select + shift instead of a divergent constant-memory lookup
+            if (TQ4 && !NAX_WIDE) {
+                // 16-row kernel (decode, verify): the constant table is cheaper here (j582: ALU decode 97.9 vs 70.1 ms)
+                for (short i = 0; i < 8; i++) {
+                    const float sa = s0[i & 3], sb = s1[i & 3];
+                    cb[i] = half(float(TQ4_LEVEL[(w.x >> (4 * i)) & 15u]) * sa);
+                    cb[8 + i] = half(float(TQ4_LEVEL[(w.y >> (4 * i)) & 15u]) * sb);
+                }
+            } else if (TQ4) {
+                // 32-row kernel (prefill, compute-bound): levels as bytes of two words, select + shift, same values
+                // (j582: 8K prefill 255 vs 100 tok/s)
                 for (short i = 0; i < 8; i++) {
                     const uint ca = (w.x >> (4 * i)) & 15u, cbits = (w.y >> (4 * i)) & 15u;
                     const float la = float(((ca & 4u ? 0x7F604B3Au : 0x2C1F1206u) >> (8u * (ca & 3u))) & 0xFFu);

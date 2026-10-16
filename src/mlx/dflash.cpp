@@ -287,7 +287,8 @@ void DFlash2::inject(const mx::array& features,int position) {
         }
         live.push_back(*c.k);live.push_back(*c.v);
     }
-    static const bool lazy=!std::getenv("TQLLM_MLX_EAGER_COMMIT") && !std::getenv("TQLLM_MLX_EAGER_INJECT");  // evaluated with the next draft
+    // eager by default: deferred into the draft graph the window copies cost 16 ms/step at 16K (j582); TQLLM_MLX_LAZY_INJECT=1 defers
+    static const bool lazy=std::getenv("TQLLM_MLX_LAZY_INJECT") && !std::getenv("TQLLM_MLX_EAGER_COMMIT");
     if(!lazy)mx::eval(live);
     i.end+=n;
 }
