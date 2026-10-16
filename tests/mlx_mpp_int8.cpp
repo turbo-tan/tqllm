@@ -97,18 +97,23 @@ for (uint i = 0; i < acc.get_capacity(); ++i) {
 
 // staged GEMM with 16-byte loads (no bounds checks: M, N multiples of the tile, K of BK); int8 variants may apply a
 // per-step, per-column float rescale of the int32 tile (exact per-group weight scales, group = BK)
-mx::array staged16(const Variant& v, const mx::array& x, const mx::array& w, const mx::array& scales, int mt, int nt, int bk, int simds, bool rescale, bool dbuf = false) {
+mx::array staged16(const Variant& v, const mx::array& x, const mx::array& w, const mx::array& scales, int mt, int nt, int bk, int simds, bool rescale, bool dbuf = false, int sb = 0) {
     const int m = x.shape(0), k = x.shape(1), n = w.shape(0);
     using Kernel = decltype(mx::fast::metal_kernel(std::string(), std::vector<std::string>(), std::vector<std::string>(), std::string(), std::string()));
     static std::map<std::string, Kernel> kernels;
-    const std::string key = std::string(v.name) + (rescale ? "_rs" : "") + (dbuf ? "_db" : "");
+    const std::string key = std::string(v.name) + (rescale ? "_rs" : "") + (dbuf ? "_db" : "") + (sb ? "_sw" : "");
     auto it = kernels.find(key);
     if (it == kernels.end()) {
         const std::string header = std::string("#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
                                                "typedef ") + v.ta + " TA; typedef " + v.tb + " TB; typedef " + v.tc + " TC;\n#define RESCALE " + (rescale ? "1" : "0") + "\n";
         it = kernels.emplace(key, mx::fast::metal_kernel(std::string("tqllm_mpp_staged16_") + key, {"x", "w", "s"}, {"y"}, R"METAL(
 uint tid = thread_position_in_threadgroup.x;
+#if SB
+const uint tiles_m = uint(M) / uint(MT), l = threadgroup_position_in_grid.x, block = l / (uint(SB) * tiles_m), rem = l - block * uint(SB) * tiles_m;
+const uint n0 = (block * uint(SB) + rem % uint(SB)) * uint(NT), m0 = (rem / uint(SB)) * uint(MT);
+#else
 uint n0 = threadgroup_position_in_grid.x * uint(NT), m0 = threadgroup_position_in_grid.y * uint(MT);
+#endif
 threadgroup TA A[MT * BK];
 threadgroup TB B[NT * BK];
 threadgroup half S[NT];
@@ -182,8 +187,8 @@ for (uint i = 0; i < acc.get_capacity(); ++i) {
 }
 )METAL", header)).first;
     }
-    return it->second({x, w, scales}, {{m, n}}, {mx::float32}, {(n / nt) * 32 * simds, m / mt, 1}, {32 * simds, 1, 1},
-                      {{"MT", mt}, {"NT", nt}, {"BK", bk}, {"SIMDS", simds}, {"N", n}, {"K", k}},
+    return it->second({x, w, scales}, {{m, n}}, {mx::float32}, sb ? mx::Shape{(n / nt) * (m / mt) * 32 * simds, 1, 1} : mx::Shape{(n / nt) * 32 * simds, m / mt, 1}, {32 * simds, 1, 1},
+                      {{"MT", mt}, {"NT", nt}, {"BK", bk}, {"SIMDS", simds}, {"N", n}, {"K", k}, {"M", m}},
                       std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
@@ -258,7 +263,7 @@ int main(int argc, char** argv) {
                                 t.bk, t.simds, ms, flop / ms * 1e-9, err.item<float>());
                 } catch (const std::exception& e) {
                     std::printf("MPP_TYPES N=%d %s mt=%d nt=%d bk=%d simds=%d ERROR %s\n", N, v.name, t.mt, t.nt, t.bk, t.simds,
-                                std::string(e.what()).substr(0, 400).c_str());
+                                std::string(e.what()).substr(0, 1500).c_str());
                 }
             }
         }
@@ -289,11 +294,9 @@ int main(int argc, char** argv) {
     {
         const int Ms = 2048, Ks = 5120, Ns = 17408;
         const double flop = 2.0 * Ms * Ns * Ks;
-        struct R { Variant v; bool rescale; bool dbuf; int bk; };
+        struct R { Variant v; bool rescale; bool dbuf; int bk; int sb; };
         std::vector<R> runs;
-        for (int bk : {32, 64, 128}) {runs.push_back({variants[0], false, false, bk}); runs.push_back({variants[1], false, false, bk});}
-        for (int bk : {32, 64}) {runs.push_back({variants[1], false, true, bk}); runs.push_back({variants[0], false, true, bk});}
-        runs.push_back({variants[1], true, false, 32});
+        for (int sb : {0, 4, 8, 16}) {runs.push_back({variants[1], false, false, 32, sb}); runs.push_back({variants[1], false, false, 64, sb}); runs.push_back({variants[0], false, false, 32, sb});}
         for (const R& r : runs) {
             auto x = operand(r.v.ta, {Ms, Ks}), w = operand(r.v.tb, {Ns, Ks});
             auto sc = mx::astype(mx::add(mx::random::uniform({Ns, Ks / r.bk}), mx::array(0.5f)), mx::float16);
@@ -311,12 +314,12 @@ int main(int argc, char** argv) {
             for (T t : {T{64, 64, 4}, T{128, 64, 4}, T{64, 128, 4}, T{128, 128, 8}}) {
                 if ((t.mt + t.nt) * r.bk * (r.v.ta[0] == 'h' ? 2 : 1) * (r.dbuf ? 2 : 1) > 32768) continue;
                 try {
-                    auto y = staged16(r.v, x, w, sc, t.mt, t.nt, r.bk, t.simds, r.rescale, r.dbuf);
+                    auto y = staged16(r.v, x, w, sc, t.mt, t.nt, r.bk, t.simds, r.rescale, r.dbuf, r.sb);
                     auto err = mx::divide(mx::max(mx::abs(mx::subtract(y, ref))), mx::max(mx::abs(ref)));
                     mx::eval(err);
-                    const double ms = best_ms([&] { return staged16(r.v, x, w, sc, t.mt, t.nt, r.bk, t.simds, r.rescale, r.dbuf); });
-                    std::printf("MPP_STAGED %s%s%s mt=%d nt=%d bk=%d simds=%d %.2f ms %.1f TOPS rel_err %.1e\n", r.v.name, r.rescale ? "_rescale" : "",
-                                r.dbuf ? "_dbuf" : "", t.mt, t.nt, r.bk, t.simds, ms, flop / ms * 1e-9, err.item<float>());
+                    const double ms = best_ms([&] { return staged16(r.v, x, w, sc, t.mt, t.nt, r.bk, t.simds, r.rescale, r.dbuf, r.sb); });
+                    std::printf("MPP_STAGED %s%s%s sb=%d mt=%d nt=%d bk=%d simds=%d %.2f ms %.1f TOPS rel_err %.1e\n", r.v.name, r.rescale ? "_rescale" : "",
+                                r.dbuf ? "_dbuf" : "", r.sb, t.mt, t.nt, r.bk, t.simds, ms, flop / ms * 1e-9, err.item<float>());
                 } catch (const std::exception& e) {
                     std::printf("MPP_STAGED %s%s%s mt=%d nt=%d bk=%d simds=%d ERROR %s\n", r.v.name, r.rescale ? "_rescale" : "", r.dbuf ? "_dbuf" : "",
                                 t.mt, t.nt, r.bk, t.simds, std::string(e.what()).substr(0, 300).c_str());
@@ -336,7 +339,7 @@ int main(int argc, char** argv) {
                     const double ms = best_ms([&] { return device_tensor(v, x, w, t.mt, t.nt, t.simds); });
                     std::printf("MPP_DEVICE %s mt=%d nt=%d simds=%d %.2f ms %.1f TOPS rel_err %.1e\n", v.name, t.mt, t.nt, t.simds, ms, flop / ms * 1e-9, err.item<float>());
                 } catch (const std::exception& e) {
-                    std::printf("MPP_DEVICE %s mt=%d nt=%d simds=%d ERROR %s\n", v.name, t.mt, t.nt, t.simds, std::string(e.what()).substr(0, 400).c_str());
+                    std::printf("MPP_DEVICE %s mt=%d nt=%d simds=%d ERROR %s\n", v.name, t.mt, t.nt, t.simds, std::string(e.what()).substr(0, 1500).c_str());
                 }
             }
         }
