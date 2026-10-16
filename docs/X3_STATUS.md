@@ -616,3 +616,11 @@ Verdict: **G3 PASS for the X3 port.**
 - Kernel contract: column j of an X3 matvec is bit-identical for n=1..8 (verified in tests/x3_format.cu at CFG0 256x256 and CFG1 8448x5120); n=1 now runs x3v MMODE1 (decode tok/s 31.63 vs sq 31.91 = -0.9%).
 - test-dflash-exact PASS (tree + linear, 256/256 identical).
 - 40-prompt identity: 34/40 identical, 6 deep divergences (r009,r010,r012,r014,r017,r019). Ruled out the X3 matvec (column identity) and the head shortlist (TQLLM_DEBUG=full_head unchanged). Pinning KV (-ctk/-ctv q8_0) does not clear them. **The same harness on TQ3_4S diverges too (r009,r010,r014,r019)**, so this is a PRE-EXISTING engine issue (drafter-verify vs plain-greedy) affecting non-X3 formats, not introduced by the X3 port. Recorded for the engine owners; not an X3 blocker.
+
+## X3 port Phase 4 — speed (2026-10-16)
+
+X3.1 on RAM disk, GPU2, greedy, 128 tokens (1 run; TQ3_4S ref used 400 tok x3):
+- pp tok/s: ctx2k 1089/1058 (AR/DFlash), 8k 1443/1425, 32k 1434/1431.
+- decode tok/s: AR 31.3/30.7/28.9; DFlash (df2_stock_q4km --draft-max 7) 63.8/101.9/69.5 (draft acc 79/343, 97/210, 88/287).
+- TQ3_4S reference (results_gpu2.jsonl): pp ~1430-1570; decode AR 46-52, DFlash 107-222.
+- X3 decode is ~40% slower than the TQ3_4S engine baseline (pp comparable); candidate for Phase 5 dispatch.cu tuning (n=1 currently x3v MMODE1; CFG/sq selection). Direct llama-paw-X3 comparison still pending.
