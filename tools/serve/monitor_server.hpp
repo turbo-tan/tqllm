@@ -18,8 +18,8 @@ namespace tqserve {
 class MonitorServer {
 public:
     MonitorServer(Monitor & monitor, const std::string & host, uint16_t port,
-                  std::string key, std::string pci = {})
-        : monitor_(monitor), key_(std::move(key)), pci_(std::move(pci)) {
+                  std::string key, std::string pci = {}, uint16_t inference_port = 0)
+        : monitor_(monitor), key_(std::move(key)), pci_(std::move(pci)), inference_host_(host == "0.0.0.0" ? "127.0.0.1" : host), inference_port_(inference_port) {
         socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (socket_ < 0) throw std::runtime_error("monitor socket failed");
         int one = 1; ::setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -39,6 +39,12 @@ public:
         stop_ = true;
         ::shutdown(socket_, SHUT_RDWR);
         thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            if (chat_client_ >= 0) ::shutdown(chat_client_, SHUT_RDWR);
+            if (chat_upstream_ >= 0) ::shutdown(chat_upstream_, SHUT_RDWR);
+        }
+        if (chat_.joinable()) chat_.join();
         ::close(socket_);
     }
     uint16_t port() const { return port_; }
@@ -58,27 +64,94 @@ private:
             offset += size_t(n);
         }
     }
-    void handle(int fd) {
+    bool handle(int fd) {
         timeval timeout{1, 0};
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        RequestReader reader(0, 8192); uint8_t buffer[2048];
+        RequestReader reader(1024 * 1024, 8192); uint8_t buffer[2048];
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (!reader.complete() && !reader.failed() && !stop_ && std::chrono::steady_clock::now() < deadline) {
             const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
-            if (n <= 0) return;
+            if (n <= 0) return false;
             reader.append(buffer, size_t(n));
         }
         const auto req = reader.request();
-        if (!req.ok()) { send_response(fd, 400, "{\"error\":\"invalid request\"}"); return; }
-        if (req.method != "GET") { send_response(fd, 405, "{\"error\":\"read-only monitor\"}"); return; }
-        if (req.path == "/" || req.path == "/monitor") { send_response(fd, 200, monitor_page, true); return; }
+        if (!req.ok()) { send_response(fd, 400, "{\"error\":\"invalid request\"}"); return false; }
+        if (req.method == "GET" && (req.path == "/" || req.path == "/monitor")) { send_response(fd, 200, monitor_page, true); return false; }
         if (!key_.empty() && req.authorization != "Bearer " + key_) {
-            send_response(fd, 401, "{\"error\":\"API key required\"}"); return;
+            send_response(fd, 401, "{\"error\":\"API key required\"}"); return false;
         }
+        if (req.method == "POST" && req.path == "/api/monitor/v1/chat/completions") {
+            std::string type = req.content_type.substr(0, req.content_type.find(';'));
+            for (auto & c : type) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (type != "application/json" || (!req.origin.empty() && req.origin != "http://" + req.host && req.origin != "https://" + req.host)) {
+                send_response(fd, 403, "{\"error\":\"same-origin JSON required\"}"); return false;
+            }
+            if (!inference_port_) { send_response(fd, 503, "{\"error\":\"chat unavailable\"}"); return false; }
+            if (chat_active_) { send_response(fd, 429, "{\"error\":\"a monitor chat request is already running\"}"); return false; }
+            if (chat_.joinable()) chat_.join();
+            { std::lock_guard<std::mutex> lock(chat_mutex_); chat_client_ = fd; }
+            chat_active_ = true;
+            try { chat_ = std::thread([this, body = std::string(req.body.begin(), req.body.end())] { proxy_chat(body); }); }
+            catch (...) { chat_active_ = false; std::lock_guard<std::mutex> lock(chat_mutex_); chat_client_ = -1; throw; }
+            return true;
+        }
+        if (req.method != "GET") { send_response(fd, 405, "{\"error\":\"method not allowed\"}"); return false; }
         if (req.path == "/api/monitor/v1/snapshot") send_response(fd, 200, monitor_.snapshot());
         else if (req.path == "/health") send_response(fd, 200, "{\"status\":\"ok\",\"service\":\"monitor\"}");
         else send_response(fd, 404, "{\"error\":\"not found\"}");
+        return false;
+    }
+    static bool write_bytes(int fd, const char * bytes, size_t size) {
+        while (size) {
+            const auto n = ::send(fd, bytes, size, MSG_NOSIGNAL);
+            if (n <= 0) return false;
+            bytes += n; size -= size_t(n);
+        }
+        return true;
+    }
+    void proxy_chat(const std::string & body) {
+        int upstream = -1, client;
+        { std::lock_guard<std::mutex> lock(chat_mutex_); client = chat_client_; }
+        bool started = false;
+        try {
+            upstream = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (upstream < 0) throw std::runtime_error("socket");
+            { std::lock_guard<std::mutex> lock(chat_mutex_); chat_upstream_ = upstream; }
+            timeval timeout{1, 0};
+            ::setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            ::setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(inference_port_);
+            ::inet_pton(AF_INET, inference_host_.c_str(), &address.sin_addr);
+            if (::connect(upstream, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) throw std::runtime_error("connect");
+            std::string request = "POST /v1/chat/completions HTTP/1.1\r\nHost: " + inference_host_ + ":" + std::to_string(inference_port_) + "\r\nContent-Type: application/json\r\n";
+            if (!key_.empty()) request += "Authorization: Bearer " + key_ + "\r\n";
+            request += "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+            if (!write_bytes(upstream, request.data(), request.size())) throw std::runtime_error("send");
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+            char buffer[8192];
+            while (!stop_ && std::chrono::steady_clock::now() < deadline) {
+                pollfd downstream{client, POLLIN, 0};
+                if (::poll(&downstream, 1, 0) > 0) {
+                    char probe;
+                    if (downstream.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+                    if ((downstream.revents & POLLIN) && ::recv(client, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
+                }
+                const auto n = ::recv(upstream, buffer, sizeof(buffer), 0);
+                if (n == 0) break;
+                if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; break; }
+                started = true;
+                if (!write_bytes(client, buffer, size_t(n))) break;
+            }
+        } catch (...) {
+            if (!started && !stop_) send_response(client, 502, "{\"error\":\"inference endpoint unavailable\"}");
+        }
+        {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            if (upstream >= 0) ::close(upstream);
+            ::close(client); chat_client_ = chat_upstream_ = -1;
+        }
+        chat_active_ = false;
     }
     void run() {
         MonitorHost collector(pci_);
@@ -89,11 +162,19 @@ private:
             pollfd p{socket_, POLLIN, 0};
             if (::poll(&p, 1, 200) <= 0 || !(p.revents & POLLIN)) continue;
             const int fd = ::accept(socket_, nullptr, nullptr);
-            if (fd >= 0) { handle(fd); ::close(fd); }
+            if (fd >= 0) {
+                try { if (!handle(fd)) ::close(fd); }
+                catch (...) { ::close(fd); }
+            }
         }
     }
     Monitor & monitor_;
-    std::string key_, pci_;
+    std::string key_, pci_, inference_host_;
+    uint16_t inference_port_ = 0;
+    std::mutex chat_mutex_;
+    int chat_client_ = -1, chat_upstream_ = -1;
+    std::atomic<bool> chat_active_{false};
+    std::thread chat_;
     int socket_ = -1;
     uint16_t port_ = 0;
     std::atomic<bool> stop_{false};

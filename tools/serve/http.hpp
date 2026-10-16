@@ -19,6 +19,7 @@ struct Request {
     std::string path;                 // target, no query string
     std::string query;                // empty when absent
     std::string authorization;
+    std::string content_type, origin, host;
     uint64_t content_length = 0;      // as advertised
     std::vector<uint8_t> body;        // exactly content_length bytes, empty when 0
     std::string error;                 // set when the request is unusable
@@ -31,7 +32,7 @@ struct Request {
 //  - the header block is capped at max_header bytes (reject, never loop on a hostile client);
 //  - at most one Content-Length header, value v with 0 <= v <= body_limit; body is the first v
 //    bytes; a Content-Length above body_limit is an error;
-//  - any Transfer-Encoding is refused (no chunked); every other header is ignored.
+//  - any Transfer-Encoding is refused (no chunked); authorization, origin, host and content type are retained; other headers are ignored.
 inline Request split_request(const uint8_t * in, size_t len, uint64_t body_limit,
                              uint64_t max_header = 65536) {
     Request req;
@@ -111,6 +112,12 @@ inline Request split_request(const uint8_t * in, size_t len, uint64_t body_limit
             return fail("transfer-encoding not supported");
         } else if (name == "authorization") {
             req.authorization = val;
+        } else if (name == "content-type") {
+            req.content_type = val;
+        } else if (name == "origin") {
+            req.origin = val;
+        } else if (name == "host") {
+            req.host = val;
         }
     }
 

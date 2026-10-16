@@ -10,6 +10,35 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class InferenceFixture(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.path == '/v1/chat/completions'
+        assert self.headers.get('Authorization') == 'Bearer browser-test-key'
+        assert body['messages'][0]['content'] in ('browser transport gate', 'slow transport gate')
+        answer = b'data: {"choices":[{"delta":{"content":"fixture response"}}]}\n\ndata: [DONE]\n\n'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        if body['messages'][0]['content'] != 'slow transport gate':
+            self.send_header('Content-Length', str(len(answer)))
+        self.end_headers()
+        if body['messages'][0]['content'] == 'slow transport gate':
+            try:
+                for _ in range(20):
+                    self.wfile.write(answer[:10])
+                    self.wfile.flush()
+                    time.sleep(.1)
+            except (BrokenPipeError, ConnectionResetError):
+                self.server.cancelled.set()
+            return
+        self.wfile.write(answer)
+
+    def log_message(self, *args):
+        pass
 
 
 def main():
@@ -24,7 +53,11 @@ def main():
         mode = Path(temporary) / 'mode'
         for browser_name in ('chromium', 'firefox', 'webkit'):
             mode.write_text('queued')
-            server = subprocess.Popen([str(args.binary.resolve()), '--fixture', str(mode), 'browser-test-key'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            upstream = ThreadingHTTPServer(('127.0.0.1', 0), InferenceFixture)
+            upstream.cancelled = threading.Event()
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            server = subprocess.Popen([str(args.binary.resolve()), '--fixture', str(mode), 'browser-test-key', str(upstream.server_port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 port = int(server.stdout.readline().strip())
                 browser = getattr(pw, browser_name).launch()
@@ -41,6 +74,24 @@ def main():
                 expect(page.locator('#queue')).to_have_text('0 / 1')
                 assert page.locator('#apiKey').input_value() == ''
                 assert page.evaluate('localStorage.length + sessionStorage.length') == 0
+                streamed = page.evaluate("""async()=>{
+                    const response=await fetch('/api/monitor/v1/chat/completions',{
+                        method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer browser-test-key'},
+                        body:JSON.stringify({messages:[{role:'user',content:'browser transport gate'}],stream:true})});
+                    return {status:response.status,body:await response.text()};
+                }""")
+                assert streamed['status'] == 200 and 'fixture response' in streamed['body'] and '[DONE]' in streamed['body']
+                cancelled = page.evaluate("""async()=>{
+                    const controller=new AbortController();
+                    const response=await fetch('/api/monitor/v1/chat/completions',{
+                        method:'POST',signal:controller.signal,
+                        headers:{'Content-Type':'application/json',Authorization:'Bearer browser-test-key'},
+                        body:JSON.stringify({messages:[{role:'user',content:'slow transport gate'}],stream:true})});
+                    const reader=response.body.getReader();await reader.read();controller.abort();return true;
+                }""")
+                assert cancelled and upstream.cancelled.wait(3), 'Abort did not close upstream chat'
+
+
                 mode.write_text('prefill')
                 expect(page.locator('#phase')).to_have_text('Prefilling prompt')
                 expect(page.locator('#speed')).to_have_text('--')
@@ -72,6 +123,9 @@ def main():
                 if server.poll() is None:
                     server.terminate()
                     server.wait(timeout=5)
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
     (args.output / 'browser-results.json').write_text(json.dumps(results, indent=2) + '\n')
     print(json.dumps(results))
 

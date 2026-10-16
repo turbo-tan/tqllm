@@ -270,7 +270,7 @@ int main(int argc, char ** argv) {
             int device = 0;
             if (cudaGetDevice(&device) == cudaSuccess) cudaDeviceGetPCIBusId(pci, sizeof(pci), device);
             monitor = std::make_unique<tqserve::Monitor>(tqserve::Monitor::Info{name, TQLLM_COMMIT, hostname, pci, slot_context, np});
-            monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci);
+            monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port));
             std::cerr << "tqserve: monitor http://" << host << ':' << monitor_port << "/ (read-only)\n";
         }
         std::unique_ptr<tqserve::Scheduler> scheduler;

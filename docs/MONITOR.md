@@ -1,6 +1,6 @@
 # Runtime monitor
 
-A read-only dashboard built into `tqserve`. It runs on a separate, optional
+A runtime dashboard built into `tqserve`, with read-only telemetry and a same-origin chat bridge. It runs on a separate, optional
 listener so a long single-slot prefill cannot block monitoring requests. There
 is no JavaScript build step, CDN, database, Python service or extra runtime
 package. The page is embedded in the executable, including installed/container
@@ -29,8 +29,8 @@ rebuilding to include this feature.
 `--api-key` and `--api-key-file` protect monitor data with the same Bearer key.
 The static page can load without a key, then asks for it. The key stays in page
 memory: it is not written to storage or passed in URLs. In authenticated
-setups, use an API client with a Bearer header to inspect JSON. No mutation or
-cancellation endpoint is exposed on this listener. It has no CORS allowlist;
+setups, use an API client with a Bearer header to inspect JSON. No model-management or
+administration endpoint is exposed on this listener. The chat bridge forwards only to this instance's configured inference port; it cannot target an arbitrary URL or execute shell commands. It has no CORS allowlist;
 other applications should proxy the authenticated JSON from their own backend.
 
 ## Contract v1
@@ -38,6 +38,16 @@ other applications should proxy the authenticated JSON from their own backend.
 - `GET /` or `/monitor`: the embedded dashboard.
 - `GET /api/monitor/v1/snapshot`: cached engine/request counters and hardware.
 - `GET /health`: health of the monitor listener, **not** a GPU readiness probe.
+- `POST /api/monitor/v1/chat/completions`: normal OpenAI chat-completions JSON,
+  including `stream: true`, proxied to this instance's inference endpoint. This
+  route requires the same Bearer key, JSON content type and same-origin requests
+  from browsers. There is one concurrent monitor chat, a 1 MiB request limit and
+  a ten-minute connection limit. Telemetry remains responsive during this chat.
+  Closing the stream propagates a disconnect upstream; inference observes that
+  cancellation at its next stream callback, not midway through a blocked prefill.
+
+The terminal-style chat interface and visual redesign are pending integration
+in this draft. It is a chat, not an operating-system shell.
 
 The dashboard polls once per second while visible. Requests have a three-second
 fetch timeout; failures clear live values, mark the connection disconnected and
@@ -52,7 +62,7 @@ error strings. Engine calls never occur in the monitoring thread.
 
 | Field | Meaning |
 | --- | --- |
-| `phase` | queued, prefill, decode, complete, failed or cancelled |
+| `phase` | queued, prefill, decode, complete, failed or cancelled (accepted requests only; not the operating system TCP backlog) |
 | `prompt_tokens` | Tokenizer count for the current generation pass |
 | `output_tokens` | Observed generated token IDs; cumulative across thinking-budget continuations |
 | `context_tokens` | Current pass's prompt + generated IDs; logical sequence length, not resident KV bytes |
