@@ -94,7 +94,7 @@ int main() {
     // 3. throughput at the FFN shapes (gate/up: 17408 x 5120; down: 5120 x 17408), m = 2048
     for (auto [rows, k] : std::vector<std::pair<int, int>>{{17408, 5120}, {5120, 17408}}) {
         auto f = make(rows, k, rng);
-        auto X = mx::astype(mx::random::uniform({2048, k}, mx::float32, -1.0f, 1.0f), mx::float16);
+        auto X = mx::astype(mx::subtract(mx::multiply(mx::random::uniform({2048, k}), mx::array(2.0f)), mx::array(1.0f)), mx::float16);
         mx::eval(X);
         const double flop = 2.0 * 2048 * rows * k;
         const double t16 = best_ms([&] { return nax_affine_gemm(f.w, X, true); });
