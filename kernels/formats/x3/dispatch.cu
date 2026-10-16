@@ -9,6 +9,7 @@
 #include "gemv_x3v.cu"
 #include "reconstruct.cu"
 #include "x3.cuh"
+#include "debug.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -20,10 +21,10 @@ namespace x3 {
 
 namespace {
 
-// Debug-only (off by default): force the n == 1 path onto the exact x3v gemv instead of sq, to
-// separate sq int8-activation rounding from real bugs. Same style as the TQLLM_DEBUG flags.
+// TQLLM_DEBUG=x3n1x3v (off by default): force the n == 1 path onto the exact x3v gemv instead of
+// sq, to separate sq int8-activation rounding from real bugs.
 bool x3_n1_x3v() {
-    static const bool v = std::getenv("TQLLM_X3_N1_X3V") != nullptr;
+    static const bool v = tqllm::debug_on("x3n1x3v");
     return v;
 }
 
