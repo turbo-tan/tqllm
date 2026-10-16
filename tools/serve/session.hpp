@@ -516,6 +516,19 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// Streaming with tools: how much of the raw answer text can go out now. extract_tool_calls() cuts the answer at the
+// first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
+// tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
+inline size_t tool_stream_limit(const std::string & t) {
+    static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
+    size_t end = t.size();
+    for (const auto & m : markers) { const auto p = t.find(m); if (p != std::string::npos) end = std::min(end, p); }
+    for (const auto & m : markers)
+        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
+    return end;
+}
+
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
 inline void set_timings(DecodeResult & r, const uint64_t * st) {
     r.draft_n = st[1];
@@ -940,17 +953,7 @@ private:
         }
         return 0;
     }
-    // Tool calls are in-band markup: extract_tool_calls() cuts the answer at the first block and keeps
-    // trim(text.substr(0, first)), so everything before the marker is final prose and can stream. A tail
-    // that could still grow into the marker is held back, the same way emit() holds back stop sequences.
-    static size_t tool_text_limit(const std::string & t) {
-        static const std::string m = "<" "function=";
-        const auto p = t.find(m);
-        size_t end = (p == std::string::npos) ? t.size() : p;
-        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
-            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
-        return end;
-    }
+    static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
     bool emit_tool_text(const std::string & raw, std::string & sent) {
         const size_t end = tool_text_limit(raw);
         return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);

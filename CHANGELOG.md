@@ -33,6 +33,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   IQ3_S 207.8 -> 220.1 tok/s, Q5_K_M (2000 MiB experts in host memory) 176.5 -> 187.1 tok/s. Output identical.
 
 ### Fixed
+- The answer streams when the request carries tool schemas: `StreamWriter` sent no content deltas until the end whenever
+  `tools` was non-empty, so agent clients saw the thinking live and then the whole answer at once. Prose before the first
+  tool-call marker now streams, and a tail that could still become a marker is held back. Found and fixed by Andrew Zhu
+  (@xhinker) in his fork azllm; test-serve covers the hold-back.
+- `tqserve --max-tokens` defaults to 16384 (was 512): the option caps every request, and thinking counts against it, so
+  turns ended with `finish_reason: length` mid-answer. Reported by Andrew Zhu (@xhinker).
 - `tqllm launch codex` failed with Codex CLI 0.16x, which no longer accepts `wire_api = "chat"`; it now uses the native
   Responses API.
 - A request without `max_tokens` was cut at 64 tokens; it now gets the server's `--max-tokens` (OpenAI clients such as

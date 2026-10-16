@@ -149,7 +149,7 @@ int main(int argc, char ** argv) {
     int32_t thinking_budget = -1;  // default reasoning budget (llama.cpp --reasoning-budget): -1 unlimited, 0 end immediately, N tokens
     std::string budget_message;    // text forced before the end-of-thinking tag when the budget runs out (default none)
     uint32_t answer_reserve = 8192;  // with a thinking budget, max_tokens is raised to at least budget + this, so the answer is not cut off
-    uint32_t port = 8086, context = 2048, max_tokens = 512, np = 1;
+    uint32_t port = 8086, context = 2048, max_tokens = 16384, np = 1;
     std::string mmproj;
     bool use_jinja = true;  // llama.cpp default: render the prompt with the model's Jinja chat template; --no-jinja = native Qwen layout
     std::string template_file, template_kwargs_text;

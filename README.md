@@ -267,7 +267,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--tokenizer FILE` | the GGUF itself | only for safetensors or a deliberate override |
 | `--host IPv4`, `--port N` | 127.0.0.1, 8086 | where the API listens |
 | `--context N` | 2048 | context per server, split evenly across `--np` slots; the memory fit may lower it |
-| `--max-tokens N` | 512 | default output cap per request |
+| `--max-tokens N` | 16384 | default output cap per request (also the cap for requests that ask for more; thinking counts against it) |
 | `--np N` | 1 | requests served at once (batched verify); `GET`/`POST /admin/slots` reads or changes the live limit |
 | `--name NAME`, `--system TEXT` | | model name in the API; a default system prompt |
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
