@@ -111,9 +111,9 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--repeat-limit N (default 256, 0 off)] [--temp T --top-p P --top-k K --presence-penalty X (sampling when a request sets none; default greedy, no penalty)] [--list-kv] [--list-flags]\n"
+                 "[--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
                  "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n";
@@ -149,7 +149,7 @@ int main(int argc, char ** argv) {
     int32_t thinking_budget = -1;  // default reasoning budget (llama.cpp --reasoning-budget): -1 unlimited, 0 end immediately, N tokens
     std::string budget_message;    // text forced before the end-of-thinking tag when the budget runs out (default none)
     uint32_t answer_reserve = 8192;  // with a thinking budget, max_tokens is raised to at least budget + this, so the answer is not cut off
-    uint32_t port = 8086, context = 2048, max_tokens = 512, np = 1;
+    uint32_t port = 8086, context = 2048, max_tokens = 16384, np = 1;
     std::string mmproj;
     bool use_jinja = true;  // llama.cpp default: render the prompt with the model's Jinja chat template; --no-jinja = native Qwen layout
     std::string template_file, template_kwargs_text;
@@ -183,6 +183,9 @@ int main(int argc, char ** argv) {
             else if (arg == "--port") port = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--context") context = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--max-tokens") max_tokens = static_cast<uint32_t>(std::stoul(value()));
+            else if (arg == "--temperature" || arg == "--temp") tqserve::sampling_defaults().temperature = std::stof(value());
+            else if (arg == "--top-p") tqserve::sampling_defaults().top_p = std::stof(value());
+            else if (arg == "--top-k") tqserve::sampling_defaults().top_k = std::stoi(value());
             else if (arg == "--reasoning") {
                 const std::string setting = value();
                 if (setting != "on" && setting != "off") throw std::invalid_argument("--reasoning must be on or off");
@@ -204,10 +207,7 @@ int main(int argc, char ** argv) {
             else if (tqllm::parse_engine_option(argc, argv, i, engine)) continue;
             else if (arg == "--draft-max" || arg == "--draft") tqserve::serve_options().draft_max = std::clamp(std::stoi(value()), 1, 15);
             else if (arg == "--repeat-limit") tqserve::serve_options().repeat_limit = static_cast<uint32_t>(std::stoul(value()));
-            else if (arg == "--temp") tqserve::serve_options().temperature = std::stof(value());
-            else if (arg == "--top-p") tqserve::serve_options().top_p = std::stof(value());
-            else if (arg == "--top-k") tqserve::serve_options().top_k = std::stoi(value());
-            else if (arg == "--presence-penalty") tqserve::serve_options().presence_penalty = std::stof(value());
+            else if (arg == "--presence-penalty") tqserve::sampling_defaults().presence_penalty = std::stof(value());
             else if (arg == "--np") np = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--mmproj") mmproj = value();
             else if (arg == "--image-min-tokens") image_min_tokens = std::stoi(value());

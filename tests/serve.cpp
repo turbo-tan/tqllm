@@ -141,6 +141,23 @@ void test_default_max_tokens() {
     check(big.ok && big.max_tokens == 8192, "max_tokens capped at the server default");
 }
 
+void test_tool_stream_limit() {
+    using tqserve::tool_stream_limit;
+    check(tool_stream_limit("Plain answer.") == 13, "tools: prose without markup streams whole");
+    check(tool_stream_limit("Let me check.\n<function=get_weather>\n<parameter=city>\nParis") == 14, "tools: prose up to the first block");
+    check(tool_stream_limit("Let me check. <func") == 14, "tools: a tail that may grow into <function= is held back");
+    check(tool_stream_limit("Let me check. <tool_") == 14, "tools: a tail that may grow into <tool_call> is held back");
+    check(tool_stream_limit("Hi <tool_call>\n<function=f>") == 3, "tools: a literal <tool_call> cuts like extract_tool_calls");
+    check(tool_stream_limit("<function=f>\n</function>") == 0, "tools: a pure call streams nothing");
+    check(tool_stream_limit("a < b and 3 <= 4") == 16, "tools: a lone '<' that cannot become a marker is not held");
+    // whatever streams is a prefix of the parsed answer (up to the whitespace trim): the streamed text never shows markup
+    for (const std::string raw : {std::string("Checking now.\n<function=ls>\n</function>"), std::string("Sure. <tool_call>\n<function=f>\n</function>")}) {
+        tqserve::DecodeResult r; r.text = raw; tqserve::extract_tool_calls(r);
+        const std::string streamed = raw.substr(0, tool_stream_limit(raw));
+        check(streamed.find('<') == std::string::npos && streamed.compare(0, r.text.size(), r.text) == 0, "tools: streamed prose is the parsed answer's prefix");
+    }
+}
+
 void test_chat_prompt() {
     const auto off = tqserve::parse_request(
         R"({"messages":[{"role":"user","content":"Hello"}]})", 512,
@@ -245,20 +262,25 @@ void test_sampling_numbers() {
     check(b.ok && b.top_k == 0 && b.seed == 0, "zero preserves defaults");
     const auto c = parse("\"top_k\":null,\"seed\":null");
     check(c.ok && c.top_k == 0 && c.seed == 0, "nullable optional sampling fields");
-    // --temp / --top-p / --top-k fill only what the request leaves out
-    tqserve::serve_options().temperature = 0.6f; tqserve::serve_options().top_p = 0.95f; tqserve::serve_options().top_k = 20;
-    const auto d = parse("\"max_tokens\":4");
-    check(d.ok && d.temperature == 0.6f && d.top_p == 0.95f && d.top_k == 20, "server sampling defaults");
-    const auto e = parse("\"temperature\":0,\"top_k\":5");
-    check(e.ok && e.temperature == 0.f && e.top_k == 5 && e.seed == 0, "request sampling overrides server defaults");
-    tqserve::serve_options().presence_penalty = 1.5f;
+    tqserve::sampling_defaults().presence_penalty = 1.5f;
     const auto f = parse("\"max_tokens\":4"), g = parse("\"presence_penalty\":0");
     check(f.ok && f.presence_penalty == 1.5f && g.ok && g.presence_penalty == 0.f, "presence penalty default and override");
-    tqserve::serve_options().presence_penalty = 0.f;
-    tqserve::serve_options().temperature = 0.f; tqserve::serve_options().top_p = 1.f; tqserve::serve_options().top_k = 0;
+    tqserve::sampling_defaults() = {};
 }
 
 int main(int argc, char ** argv) {
+    {  // requests without sampling fields take the server defaults (--temperature / --top-p / --top-k); explicit values win
+        const auto body = std::string(R"({"messages":[{"role":"user","content":"hi"}]})");
+        const auto greedy = tqserve::parse_request(body, 64, "", true);
+        check(greedy.temperature == 0.f && greedy.top_p == 1.f && greedy.top_k == 0, "default sampling is greedy");
+        tqserve::sampling_defaults() = {0.6f, 0.95f, 20};
+        const auto agent = tqserve::parse_request(body, 64, "", true);
+        check(agent.temperature == 0.6f && agent.top_p == 0.95f && agent.top_k == 20, "server sampling defaults apply");
+        const auto own = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}],"temperature":0,"top_k":1})", 64, "", true);
+        check(own.temperature == 0.f && own.top_k == 1 && own.top_p == 0.95f, "request values override the defaults");
+        tqserve::sampling_defaults() = {};
+    }
+
     tqserve::serve_options().repeat_limit = 6;
     test_sampling_numbers();
     test_repeat_guard();
@@ -266,6 +288,7 @@ int main(int argc, char ** argv) {
     test_reader();
     test_chat_prompt();
     test_default_max_tokens();
+    test_tool_stream_limit();
     (void) argc; (void) argv;
     test_jinja_images();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }

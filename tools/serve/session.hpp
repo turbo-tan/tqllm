@@ -2,11 +2,15 @@
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include <src/json.hpp>
+#if TQLLM_WITH_CUDA
 #include <src/vision.hpp>
+#endif
 #include <src/debug.hpp>
 #include "json_out.hpp"
 
+#if TQLLM_WITH_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -28,11 +32,6 @@ namespace tqserve {
 struct ServeOptions {
     int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
-    // --temp / --top-p / --top-k: sampling for requests that do not set their own (llama.cpp's flags). The default
-    // stays greedy; thinking models want sampling (Qwen: 0.6 / 0.95 / 20), since greedy thinking can loop to max_tokens.
-    float temperature = 0.f, top_p = 1.f;
-    int top_k = 0;
-    float presence_penalty = 0.f;  // --presence-penalty: for requests without presence_penalty (Qwen: 1.5 vs loops)
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
@@ -85,6 +84,19 @@ inline std::string json_error(const std::string & message, const char * type = "
     return out;
 }
 
+// Sampling for requests that set none (--temperature (alias --temp) / --top-p / --top-k / --presence-penalty). Agents such
+// as Codex send no temperature; greedy decoding (the default) can repeat itself on repetitive output, so `tqllm launch` sets
+// the model's recommended values.
+struct SamplingDefaults {
+    float temperature = 0.f, top_p = 1.f;
+    int top_k = 0;
+    float presence_penalty = 0.f;  // Qwen: 1.5 against phrase loops in long sampled thinking
+};
+inline SamplingDefaults & sampling_defaults() {
+    static SamplingDefaults d;
+    return d;
+}
+
 struct ChatRequest {
     std::string prompt_text;
     std::vector<std::string> stop;
@@ -99,9 +111,10 @@ struct ChatRequest {
     bool budget_set = false;
     std::string budget_message;
     bool message_set = false;
-    float temperature = 0.f, top_p = 1.f;  // temperature 0 = greedy (TQLLM samples from the exact top-16 logits)
-    float presence_penalty = 0.f;          // sampling only: logit - penalty for tokens in the last 64 output tokens
-    int top_k = 0;
+    float temperature = sampling_defaults().temperature;  // 0 = greedy (TQLLM samples from the exact top-16 logits)
+    float top_p = sampling_defaults().top_p;
+    int top_k = sampling_defaults().top_k;
+    float presence_penalty = sampling_defaults().presence_penalty;  // sampling only: logit - penalty, last 64 output tokens
     uint64_t seed = 0;
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
@@ -181,10 +194,6 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
             return false;
         };
         double tv = 0;
-        req.temperature = serve_options().temperature;
-        req.top_p = serve_options().top_p;
-        req.top_k = serve_options().top_k;
-        req.presence_penalty = serve_options().presence_penalty;
         if (num("temperature", tv)) req.temperature = float(tv);
         if (num("presence_penalty", tv)) req.presence_penalty = float(tv);
         if (num("top_p", tv)) req.top_p = float(tv);
@@ -515,6 +524,19 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// Streaming with tools: how much of the raw answer text can go out now. extract_tool_calls() cuts the answer at the
+// first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
+// tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
+inline size_t tool_stream_limit(const std::string & t) {
+    static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
+    size_t end = t.size();
+    for (const auto & m : markers) { const auto p = t.find(m); if (p != std::string::npos) end = std::min(end, p); }
+    for (const auto & m : markers)
+        for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+            if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
+    return end;
+}
+
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
 inline void set_timings(DecodeResult & r, const uint64_t * st) {
     r.draft_n = st[1];
@@ -525,9 +547,11 @@ inline void set_timings(DecodeResult & r, const uint64_t * st) {
 
 // Server-wide vision encoder (--mmproj); requests encode under the mutex (the encoder reuses its buffers).
 struct Vision {
+#if TQLLM_WITH_CUDA
     std::unique_ptr<tqllm::VisionEncoder> enc;
-    std::mutex mu;
     cudaStream_t stream = nullptr;
+#endif
+    std::mutex mu;
     uint32_t pad_id = 0;  // <|image_pad|>
 };
 inline Vision *& vision() {
@@ -569,6 +593,10 @@ inline bool base64_decode(const std::string & in, size_t from, std::vector<uint8
 
 // Each <|image_pad|> of the prompt becomes the image's nx * ny placeholders; embeddings land in `images`.
 inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> & prompt, PreparedImages & images) {
+#if !TQLLM_WITH_CUDA
+    (void) req; (void) prompt; (void) images;
+    return "image input needs a CUDA build of tqserve";
+#else
     auto * v = vision();
     if (!v) return "this server has no vision encoder (start tqserve with --mmproj)";
     std::vector<size_t> pads;
@@ -615,6 +643,7 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
     }
     prompt = std::move(out);
     return {};
+#endif
 }
 
 // Tokenizes the prompt and sets the generation budget; result.error is set when the request cannot run.
@@ -874,7 +903,9 @@ public:
         for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
-            if (!emit(r.reasoning, sr_, true, false) || !(req_.tools || emit(r.text, sc_, false, false))) return false;
+            if (!emit(r.reasoning, sr_, true, false)) return false;
+            if (req_.tools) { if (!emit_tool_text(r.text, sc_)) return false; }
+            else if (!emit(r.text, sc_, false, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
         return true;
@@ -911,7 +942,12 @@ public:
     }
     bool error(const std::string & message) { return send_("data: " + json_error(message) + "\n\n"); }
     // thinking budget: send what is left of a phase's deltas without the final chunk; a phase-2 writer skips the role
-    bool flush(const DecodeResult & r) { return emit(r.reasoning, sr_, true, true) && (req_.tools || emit(r.text, sc_, false, true)); }
+    bool flush(const DecodeResult & r) {
+        if (!emit(r.reasoning, sr_, true, true)) return false;
+        if (!req_.tools) return emit(r.text, sc_, false, true);
+        const size_t end = tool_text_limit(r.text);  // tool markup: nothing past the first block is ours to send
+        return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
+    }
     void mark_role_sent() { role_sent_ = true; }
 
 private:
@@ -934,6 +970,11 @@ private:
             return need > k ? k : 0;
         }
         return 0;
+    }
+    static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
+    bool emit_tool_text(const std::string & raw, std::string & sent) {
+        const size_t end = tool_text_limit(raw);
+        return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
