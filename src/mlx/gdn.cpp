@@ -1,4 +1,5 @@
 #include "gdn.hpp"
+#include <cmath>
 #include <optional>
 #include <vector>
 #include <mlx/compile.h>
@@ -238,8 +239,12 @@ std::pair<mx::array,mx::array> gdn_chunked(const mx::array& q,const mx::array& k
     for(int j=0;j<n;++j) {
         auto sl=[&](const mx::array& x) {return mx::slice(x,{0,j*c,0},{vh,(j+1)*c,x.shape(2)});};
         auto Kc=sl(K),Qc=sl(Q),Vc=sl(V);
-        auto bc=mx::slice(B,{0,j*c},{vh,(j+1)*c}),gl=mx::cumsum(mx::log(mx::slice(A,{0,j*c},{vh,(j+1)*c})),1);
-        auto ratio=mx::exp(mx::subtract(mx::expand_dims(gl,2),mx::expand_dims(gl,1)));            // g_t / g_j
+        // log decays clamped (decay 0 -> exp(-1e4)); ratios as segment sums over (j, t] so no exp sees a positive
+        // argument and masked pairs give 0, not inf * 0
+        auto lg=mx::maximum(mx::log(mx::slice(A,{0,j*c},{vh,(j+1)*c})),mx::array(-1e4f));
+        auto bc=mx::slice(B,{0,j*c},{vh,(j+1)*c}),gl=mx::cumsum(lg,1);
+        auto seg=mx::cumsum(mx::multiply(mx::broadcast_to(mx::expand_dims(lg,2),{vh,c,c}),strict),1);  // sum_{j<s<=t} lg_s
+        auto ratio=mx::exp(mx::where(mx::astype(causal,mx::bool_),seg,mx::array(-INFINITY)));          // g_t / g_j, 0 above
         auto KK=mx::matmul(Kc,mx::transpose(Kc,{0,2,1}));
         auto L=mx::multiply(mx::multiply(KK,mx::multiply(ratio,strict)),mx::expand_dims(bc,2));  // diag(b) A
         auto N=mx::negative(L),inv=mx::add(eye,N),p=N;
@@ -252,7 +257,7 @@ std::pair<mx::array,mx::array> gdn_chunked(const mx::array& q,const mx::array& k
         auto O=mx::add(mx::multiply(mx::expand_dims(g,2),mx::matmul(Qc,mx::transpose(S,{0,2,1}))),mx::matmul(QK,U));
         outs.push_back(O);
         auto glast=mx::slice(gl,{0,c-1},{vh,c});                                                 // [vh, 1]
-        auto w=mx::exp(mx::subtract(glast,gl));                                                  // g_C / g_t
+        auto w=mx::squeeze(mx::slice(ratio,{0,c-1,0},{vh,c,c}),1);                               // g_C / g_t
         S=mx::add(mx::multiply(mx::expand_dims(mx::exp(glast),2),S),
                   mx::matmul(mx::transpose(mx::multiply(U,mx::expand_dims(w,2)),{0,2,1}),Kc));
     }
