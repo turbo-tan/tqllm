@@ -594,3 +594,10 @@ Still to do for a full G3: per-token top-2 margins at the first divergence for r
 - `/v1/completions` and `/completion` expose no logprobs either -> the margin readout must come from a new `tools/` tool (`Model::capture` gives the final-position logits), not the server.
 - No pre-existing llama-paw X3.1 kl-divergence-base found under /mnt/hdd/ml/paw27b -> the KLD gate needs one created (`llama-perplexity --kl-divergence-base`, wikitext 32x2048) then `tools/tqkld`.
 - G3 still: 25/40 identity; 10/15 divergences proven by-design (sq vs x3v); 5 (r000,r009,r010,r012,r019) deep divergences await the margin tool; KLD outstanding.
+
+## X3 port Phase 3 — G3 margin finding (2026-10-16)
+
+- `tools/tqtop.cpp` built and runs: renders the chat template, appends a prefix, prints top-5 logits at the last position via `verify()`+`verify_logits()` (capture() needs TQ3_4S/BF16).
+- **But the G3 harness is flawed**: it compared only `message.content`, while the model returns reasoning separately. tqtop's raw first token for r000 is "We" (margin 9.6) whereas the run's content starts "To find ..." -> the divergence positions are content-relative, not raw-token positions, so the measured margins are not at the true positions.
+- Margins measured (x3v mode, sq and x3v identical for all 5): r000 9.62, r009 0.54, r010 0.55, r012 0.14, r019 0.94 - but see the caveat above; r000's "spec" text is still a stale 500 (the spec pass with -md errors on r000).
+- To finish G3 the harness must capture reasoning + content (the full raw generation) or the token ids, then re-measure. No clean PASS/FAIL yet.
