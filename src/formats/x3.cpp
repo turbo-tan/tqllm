@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -51,7 +52,12 @@ void* grow(void** p, size_t& cap, size_t need) {
     if (need <= cap) return *p;
     if (*p) { cudaFree(*p); *p = nullptr; cap = 0; }
     void* np = nullptr;
-    if (cudaMalloc(&np, need) != cudaSuccess) throw std::runtime_error("x3: scratch allocation failed");
+    if (cudaMalloc(&np, need) != cudaSuccess) {
+        size_t free_b = 0, tot = 0;
+        cudaMemGetInfo(&free_b, &tot);
+        throw std::runtime_error("x3: scratch allocation failed (" + std::to_string(need) + " bytes, free " +
+                                 std::to_string(free_b) + ")");
+    }
     *p = np; cap = need;
     return np;
 }
@@ -97,6 +103,26 @@ struct X3Format final : WeightFormat {
         }
         if (total != rows) throw std::runtime_error("x3: records total " + std::to_string(total) + " rows, tensor has " +
                                                     std::to_string(rows));
+
+        // Warm the shared scratch at load time (outside any CUDA graph capture). matvec/dequant_h
+        // must never cudaMalloc: the engine captures CUDA graphs around decode, and an allocation
+        // during capture fails (a raw-completions decode hit exactly that).
+        {
+            Scratch& sc = scratch();
+            std::lock_guard<std::mutex> lock(sc.mtx);
+            int max_part_rows = 0;
+            size_t lb = 0;
+            for (const X3Part& p : d->parts) {
+                max_part_rows = std::max(max_part_rows, p.rows);
+                lb = std::max(lb, p.codec->ws_bytes(p.cols, p.rows));
+            }
+            const int nb = max_matvec_cols();
+            grow(reinterpret_cast<void**>(&sc.a), sc.a_cap, size_t(nb) * cols * sizeof(float));
+            grow(reinterpret_cast<void**>(&sc.had), sc.had_cap, size_t(nb) * cols * sizeof(half));
+            grow(reinterpret_cast<void**>(&sc.c), sc.c_cap, size_t(nb) * rows * sizeof(float));
+            grow(reinterpret_cast<void**>(&sc.dw), sc.dw_cap, size_t(cols) * max_part_rows * sizeof(half));
+            if (lb) grow(reinterpret_cast<void**>(&sc.locks), sc.locks_cap, lb);
+        }
 
         Mat m;
         m.p = reinterpret_cast<const char*>(d->parts.front().trellis);  // first part's base (informational)
