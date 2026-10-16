@@ -603,6 +603,23 @@ struct Qwen35::Impl {
         const auto *g=find(p+"ffn_gate.weight"),*u=find(p+"ffn_up.weight"),*d=find(p+"ffn_down.weight");
         if(!g || !u || !d || g->q6 || u->q6 || d->q6)return std::nullopt;
         auto x16=g->tq4?tq4_rotate_half(n):mx::astype(n,mx::float16);
+        // TQLLM_MLX_DUMP_FFN=dir:layer,layer,...: save this layer's FFN input (FP16, rotated for TQ4) per chunk and
+        // its dequantized FP16 weights once, as .npy (Neural Engine split calibration and quality checks)
+        static const std::string dump=std::getenv("TQLLM_MLX_DUMP_FFN")?std::getenv("TQLLM_MLX_DUMP_FFN"):"";
+        if(!dump.empty()) {
+            const auto colon=dump.find(':');const std::string dir=dump.substr(0,colon),layers=","+dump.substr(colon+1)+",";
+            const std::string layer=p.substr(4,p.size()-5);
+            if(layers.find(","+layer+",")!=std::string::npos) {
+                static std::map<std::string,int> chunk;
+                const int c=chunk[layer]++;
+                mx::save(dir+"/x_l"+layer+"_c"+std::to_string(c)+".npy",x16);
+                if(c==0) {
+                    mx::save(dir+"/wg_l"+layer+".npy",nax_affine_dequant(*g));
+                    mx::save(dir+"/wu_l"+layer+".npy",nax_affine_dequant(*u));
+                    mx::save(dir+"/wd_l"+layer+".npy",nax_affine_dequant(*d));
+                }
+            }
+        }
         auto gv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*g)));
         auto uv=mx::matmul(x16,mx::transpose(nax_affine_dequant(*u)));
         static auto swiglu16=mx::compile([](const std::vector<mx::array>& a) {
