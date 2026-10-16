@@ -15,7 +15,8 @@ namespace {
 struct Variant { const char* name; const char* ta; const char* tb; const char* tc; };
 mx::array tiled(const Variant& v, const mx::array& x, const mx::array& w, int mt, int nt, int bk, int simds) {
     const int m = x.shape(0), k = x.shape(1), n = w.shape(0);
-    static std::map<std::string, mx::fast::MetalKernelFunction> kernels;
+    using Kernel = decltype(mx::fast::metal_kernel(std::string(), std::vector<std::string>(), std::vector<std::string>(), std::string(), std::string()));
+    static std::map<std::string, Kernel> kernels;
     auto it = kernels.find(v.name);
     if (it == kernels.end()) {
         const std::string header = std::string("#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
