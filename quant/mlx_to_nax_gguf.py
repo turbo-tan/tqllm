@@ -62,6 +62,25 @@ def v_perm(n, num_k, per_k, head):
     return np.arange(n).reshape(num_k, per_k, head).transpose(1, 0, 2).reshape(-1)
 
 
+def q4_1_pack(codes, s, b, gs):
+    # llama.cpp Q4_1 block (32 values): fp16 d, fp16 m, 16 bytes; byte i = q[i] | q[i + 16] << 4; value = d * q + m
+    N, K = codes.shape
+    sf, bf = bf16_float(s), bf16_float(b)
+    d16, m16 = sf.astype(np.float16), bf.astype(np.float16)
+    if not (np.all(np.isfinite(d16)) and np.all(np.isfinite(m16))): raise SystemExit("Q4_1: scale or bias overflows FP16")
+    inexact = int(np.sum(d16.astype(np.float32) != sf) + np.sum(m16.astype(np.float32) != bf))
+    Q4_1_STATS[0] += inexact; Q4_1_STATS[1] += sf.size * 2
+    rep = gs // 32
+    d = np.repeat(d16, rep, axis=1).reshape(N, K // 32, 1).view(np.uint8).reshape(N, K // 32, 2)
+    m = np.repeat(m16, rep, axis=1).reshape(N, K // 32, 1).view(np.uint8).reshape(N, K // 32, 2)
+    q = codes.reshape(N, K // 32, 32).astype(np.uint8)
+    qs = (q[:, :, :16] | (q[:, :, 16:] << 4)).astype(np.uint8)
+    return np.concatenate([d, m, qs], axis=2).reshape(N, K // 32 * 20)
+
+
+Q4_1_STATS = [0, 0]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mlx", required=True)
@@ -69,6 +88,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--gguf-py", default=os.path.expanduser("~/code/llama.cpp-tq3/gguf-py"))
     ap.add_argument("--draft-head", action="store_true", help="also write output_draft.weight (4-bit g64) for the drafter")
+    ap.add_argument("--q4-1", action="store_true", help="write 4-bit tensors as llama.cpp Q4_1 (same codes; each group-64 scale/bias as FP16 in two 32-blocks) instead of NAX")
     a = ap.parse_args()
     sys.path.insert(0, a.gguf_py)
     import gguf
@@ -106,6 +126,9 @@ def main():
             err = max(err, float(np.max(np.abs(deq - ref) / (mag * 2.0 ** -7 + 1e-9))))
         worst = max(worst, err)
         if err > 1.0: raise SystemExit(f"{name}: converted tensor differs from the BF16 GGUF ({err:.3g} BF16 steps)")
+        if a.q4_1:
+            if bits != 4 or gs % 32: raise SystemExit(f"{name}: Q4_1 output needs 4-bit codes with groups of 32k ({bits}, {gs})")
+            return q4_1_pack(codes, s, b, gs), int(gguf.GGMLQuantizationType.Q4_1)
         if name == "token_embd.weight":
             # lower-bit group-64 embeddings (mlx-community 4-bit) keep their codes, scales and biases: exact in the 8-bit layout
             if gs != 64 or bits not in (4, 6, 8): raise SystemExit("token embedding must be 4/6/8-bit group 64")
@@ -168,7 +191,7 @@ def main():
         vt = field.types[0]
         sub = field.types[-1] if vt == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(field.name, field.contents(), vt, sub_type=sub)
-    writer.add_uint32("tq_mlx.nax_version", 1)
+    if not a.q4_1: writer.add_uint32("tq_mlx.nax_version", 1)
     payloads = []
     for t in reader.tensors:
         if t.name in quant:
@@ -188,6 +211,7 @@ def main():
     writer.write_ti_data_to_file()
     for d in payloads: writer.write_tensor_data(d)
     writer.close()
+    if a.q4_1: print(f"Q4_1 scales/biases not exact in FP16: {Q4_1_STATS[0]} of {Q4_1_STATS[1]}", flush=True)
     print(f"NAX_GGUF_DONE worst gate error {worst:.4f} -> {a.out}", flush=True)
 
 
