@@ -649,3 +649,14 @@ Projection over the 400 X3.1 matrices (sum max(bytes/stream, weights/decode) / e
 - **eff 0.85 = 14.30 ms** (gate <= 16.8 = 1.15x TQ3_4S's 14.58) -> **PASS**.
 - eff 0.75 = 16.21 ms -> also under the gate.
 - **GT0: PASS** (14.30 ms at eff 0.85). Stops here for lead review before T1.
+
+## X3 port Phase T1 step 1 — K3.5 risk gate (2026-10-16)
+
+Measured the K3.5 (Mul1Frac<3>) decode rate directly with a standalone bench on TRUSS's codec
+(`trellis-kernel/src/kernels/trellis/codec_mul1.cuh`, `Mul1Frac<KA>::tile(w,sub,f0,f1)`), on real
+X3.1 K3.5 trellis (blk.0.ffn_down 5120x17408, 38 MB; blk.0.attn_gate):
+- **register decode (compute, tile in registers, no memory) = 5.4-9.2 Tw/s** on K3.5 -> the codec decode is NOT the bottleneck.
+- end-to-end is read-bound: 890 GB/s stream -> **2.03 Tw/s** effective for K3.5 (bytes/weight = 3.5/8). The 1.70 Tw/s GT0 break-even needs only 745 GB/s (84% of peak); TRUSS stream benches reach 887-890 GB/s (95%).
+- My simple bench's raw GB/s (476 GB/s reps=1, 298 GB/s reps=8) is a launch/occupancy artifact of the minimal harness, not a kernel rate; the decode-compute and read-bound numbers above bound the real kernel.
+
+**Gate: K3.5 decode >= 1.70 Tw/s -> PASS** (compute 5.4-9.2, read-bound 2.03). Not < 1.70, so proceeding to T1 step 2 (gemv_window.cu n=1..8, half-in/bf16-out ldc, x3_format rows, 7-shape table, per-token sum). The <=600-line kernel itself is the remaining T1 work.
