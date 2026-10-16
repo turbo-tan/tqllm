@@ -136,6 +136,7 @@ struct Qwen35::Impl {
     struct NaxGroup {NaxAffine weights;std::vector<std::pair<int,int>> parts;std::optional<std::pair<mx::array,mx::array>> last;};
     std::map<std::string,NaxGroup> nax_groups;
     std::optional<std::pair<mx::array,mx::array>> nax_input;  // last matmul input and its FP16 copy (same-input projections)
+    std::optional<std::pair<mx::array,mx::array>> gemm_input,gemm_rotated_input;  // prefill GEMM inputs in FP16
     std::map<std::string,std::pair<std::string,int>> nax_member;
     std::vector<Cache> caches;
     // full-attention KV buffers, written in place; never snapshotted (a snapshot keeps only Cache::kv_len)
@@ -465,14 +466,20 @@ struct Qwen35::Impl {
         // prefill chunks: dequantize once and run one GEMM instead of re-decoding the matrix per 32-row tile
         static const int gemm_rows=std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")?std::atoi(std::getenv("TQLLM_MLX_NAX_PREFILL_GEMM")):64;  // default on with the GEMM FFN; =0 off
         if(gemm_rows>0 && x.shape(0)>=gemm_rows) {
-            if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return nax_affine_gemm(found->second,rotated(),true);
+            // one FP16 copy per distinct input (projections of one input share it); TQ4 inputs rotate in one launch
+            auto half_input=[&](bool tq4) {
+                auto& slot=tq4?gemm_rotated_input:gemm_input;
+                if(!slot || slot->first.id()!=x.id())slot=std::pair{x,input_rotated && tq4?mx::astype(x,mx::float16):tq4?tq4_rotate_half(x):mx::astype(x,mx::float16)};
+                return slot->second;
+            };
+            if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return nax_affine_gemm(found->second,half_input(true),true);
             if(auto member=nax_member.find(name);member!=nax_member.end()) {
                 auto& g=nax_groups.at(member->second.first);
                 if(!g.last || g.last->first.id()!=x.id())g.last=std::pair{x,nax_affine_gemm(g.weights,x,true)};
                 const auto [off,rows]=g.parts[member->second.second];
                 return mx::slice(g.last->second,{0,off},{x.shape(0),off+rows});
             }
-            if(auto found=nax.find(name);found!=nax.end())return nax_affine_gemm(found->second,x,true);
+            if(auto found=nax.find(name);found!=nax.end())return nax_affine_gemm(found->second,half_input(false),true);
         }
         if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
             static const bool fused_rotation=std::getenv("TQLLM_MLX_TQ4_ROTATE_UNFUSED")==nullptr;
@@ -656,7 +663,10 @@ struct Qwen35::Impl {
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
-        static const bool gdn_fuse=std::getenv("TQLLM_MLX_GDN_FUSE")!=nullptr;
+        // fused prep/post kernels: prefill chunks by default (TQLLM_MLX_GDN_FUSE_PREFILL=0 off), every batch with TQLLM_MLX_GDN_FUSE=1
+        static const bool gdn_fuse_all=std::getenv("TQLLM_MLX_GDN_FUSE")!=nullptr;
+        static const bool gdn_fuse_prefill=env_default_on("TQLLM_MLX_GDN_FUSE_PREFILL");
+        const bool gdn_fuse=gdn_fuse_all || (gdn_fuse_prefill && m>8);
         const bool fused_pre=gdn_fuse && ablate_blocks.find("gnorm")==std::string::npos && dk==128 && dv==128;
         auto result=ablate_blocks.find("gconv")!=std::string::npos?tail_slice(joined,0,conv-1,conv-1+m):
             fused_pre?gdn_pre_fused(joined,weights,kh,1.0f/std::sqrt(float(dk))):

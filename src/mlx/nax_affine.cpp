@@ -328,9 +328,13 @@ mx::array nax_affine_dequant(const NaxAffine& w) {
 mx::array nax_affine_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine gemm: input must be [m, columns]");
-    auto x = mx::astype(input, mx::float16);
-    auto y = mx::astype(mx::matmul(x, mx::transpose(nax_affine_dequant(w))), mx::float32);
-    return round_bf16 ? mx::astype(mx::astype(y, mx::bfloat16), mx::float32) : y;
+    auto x = input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16);
+    auto y = mx::matmul(x, mx::transpose(nax_affine_dequant(w)));
+    // FP16 product -> BF16 rounding -> FP32 as one fused elementwise pass
+    static auto to_bf = mx::compile([](const std::vector<mx::array>& a) {
+        return std::vector<mx::array>{mx::astype(mx::astype(mx::astype(a[0], mx::float32), mx::bfloat16), mx::float32)};
+    }, true);
+    return round_bf16 ? to_bf({y})[0] : mx::astype(y, mx::float32);
 }
 
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
