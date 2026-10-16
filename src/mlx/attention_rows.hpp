@@ -84,7 +84,8 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
     // fused SDPA runs on the BF16 cache directly instead of FP32 copies of it. TQLLM_MLX_ATTN_PREFILL_BF16=0 keeps FP32.
     static const bool prefill_bf16 = !std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ||
                                      std::string(std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16")) != "0";
-    if (prefill_bf16 && kv_valid > 0 && n > 8 && !decode_order && k.dtype() == mx::bfloat16 && q.shape(0) == 1) {
+    // only with past keys: a first chunk (no past) is faster on the FP32 path (j605 doc2k 369 vs 345 tok/s)
+    if (prefill_bf16 && kv_valid > n && n > 8 && !decode_order && k.dtype() == mx::bfloat16 && q.shape(0) == 1) {
         auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)});
         auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)});
         auto out = mx::fast::scaled_dot_product_attention(mx::astype(q, mx::bfloat16), keys, values, scale, "causal");
