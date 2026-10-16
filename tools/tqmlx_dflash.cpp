@@ -38,7 +38,12 @@ int main(int argc,char** argv) {
         std::vector<uint32_t> reference,first_spec;
         const bool rank_stats=std::getenv("TQLLM_MLX_DFLASH_RANKSTATS")!=nullptr;
         std::vector<long> rank_hist(17,0),chosen_hist(17,0),rejection_at(8,0);long rejections=0;
-        for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
+        // TQLLM_MLX_DFLASH_SPEC_ONLY=1: speculative runs only (ar_equal_prefix then compares with nothing);
+        // TQLLM_MLX_DFLASH_WARM_TOKENS=n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
+        const bool spec_only=std::getenv("TQLLM_MLX_DFLASH_SPEC_ONLY")!=nullptr;
+        const int warm_tokens=std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS")?std::max(2,std::atoi(std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS"))):count;
+        for(int mode=spec_only?1:0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
+            const int limit=run<0?std::min(count,warm_tokens):count;
             engine.reset();drafter.reset();auto begin=Clock::now();mx::array logits=mx::array(0.0f);
             if(prefill_chunk>0 && int(prompt.size())>prefill_chunk) {
                 for(size_t off=0;off<prompt.size();off+=size_t(prefill_chunk)) {
@@ -53,9 +58,9 @@ int main(int argc,char** argv) {
             const double prefill=seconds(begin);uint32_t pending=mx::argmax(logits).item<uint32_t>();
             std::vector<uint32_t> output{pending};int steps=0,drafted=0,accepted_total=0;
             double draft_ms=0,verify_ms=0,commit_ms=0,build_ms=0,step_ms=0,accept_ms=0;const auto start=Clock::now();
-            while(output.size()<size_t(count) && output.back()!=tokenizer.eos_id()) {
+            while(output.size()<size_t(limit) && output.back()!=tokenizer.eos_id()) {
                 if(!mode) {logits=engine.forward({&pending,1});pending=mx::argmax(logits).item<uint32_t>();output.push_back(pending);continue;}
-                const int pos=engine.position(),want=std::min(width,int(count-output.size()));
+                const int pos=engine.position(),want=std::min(width,int(limit-output.size()));
                 const auto step_begin=Clock::now();
                 begin=Clock::now();auto proposed=drafter.draft(pending,pos,want);draft_ms+=seconds(begin)*1000;
                 std::vector<uint32_t> block{pending};block.insert(block.end(),proposed.begin(),proposed.end());
@@ -71,10 +76,10 @@ int main(int argc,char** argv) {
                     ++rank_hist[rank];++chosen_hist[chosen];++rejections;rejection_at[accepted]++;
                 }
                 ++steps;drafted+=want;accepted_total+=accepted;
-                for(int j=0;j<accepted && output.size()<size_t(count);++j) {
+                for(int j=0;j<accepted && output.size()<size_t(limit);++j) {
                     output.push_back(proposed[j]);if(output.back()==tokenizer.eos_id())break;
                 }
-                if(output.size()<size_t(count) && output.back()!=tokenizer.eos_id())output.push_back(ids[accepted]);
+                if(output.size()<size_t(limit) && output.back()!=tokenizer.eos_id())output.push_back(ids[accepted]);
                 pending=ids[accepted];begin=Clock::now();engine.accept_prefix(ticket,accepted+1);
                 if(std::getenv("TQLLM_MLX_SPLIT_COMMIT_TIMING")){mx::synchronize();}accept_ms+=seconds(begin)*1000;
                 drafter.inject(rows(features,0,accepted+1),pos);commit_ms+=seconds(begin)*1000;step_ms+=seconds(step_begin)*1000;
