@@ -71,6 +71,8 @@ int main(int argc,char** argv) {
                     // draft -> verify as one graph: the draft ids never leave the GPU, one host sync per cycle
                     begin=Clock::now();
                     auto drafted=drafter.draft_device(pending,pos,want);
+                    // submit the draft now; the verify graph is built while the GPU runs it
+                    if(!std::getenv("TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD"))mx::async_eval(drafted);
                     const uint32_t anchor[1]={pending};
                     auto block_ids=mx::concatenate({mx::array(anchor,{1},mx::uint32),drafted},0);
                     draft_ms+=seconds(begin)*1000;begin=Clock::now();
