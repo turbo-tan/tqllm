@@ -101,7 +101,7 @@ mx::array staged16(const Variant& v, const mx::array& x, const mx::array& w, con
     const int m = x.shape(0), k = x.shape(1), n = w.shape(0);
     using Kernel = decltype(mx::fast::metal_kernel(std::string(), std::vector<std::string>(), std::vector<std::string>(), std::string(), std::string()));
     static std::map<std::string, Kernel> kernels;
-    const std::string key = std::string(v.name) + (rescale ? "_rs" : "") + (dbuf ? "_db" : "") + (sb ? "_sw" : "");
+    const std::string key = std::string(v.name) + (rescale ? "_rs" : "") + (dbuf ? "_db" : "") + (sb ? "_sw" + std::to_string(sb) : "");
     auto it = kernels.find(key);
     if (it == kernels.end()) {
         const std::string header = std::string("#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
@@ -203,8 +203,8 @@ mx::array device_tensor(const Variant& v, const mx::array& x, const mx::array& w
                                                "typedef ") + v.ta + " TA; typedef " + v.tb + " TB; typedef " + v.tc + " TC;\n";
         it = kernels.emplace(v.name, mx::fast::metal_kernel(std::string("tqllm_mpp_device_") + v.name, {"x", "w"}, {"y"}, R"METAL(
 uint n0 = threadgroup_position_in_grid.x * uint(NT), m0 = threadgroup_position_in_grid.y * uint(MT);
-auto tx = tensor<const device TA, dextents<int, 2>, tensor_inline>(x + m0 * uint(K), dextents<int, 2>(K, MT));
-auto tw = tensor<const device TB, dextents<int, 2>, tensor_inline>(w + n0 * uint(K), dextents<int, 2>(K, NT));
+auto tx = tensor<device TA, dextents<int, 2>, tensor_inline>((device TA*)(x + m0 * uint(K)), dextents<int, 2>(K, MT));
+auto tw = tensor<device TB, dextents<int, 2>, tensor_inline>((device TB*)(w + n0 * uint(K)), dextents<int, 2>(K, NT));
 constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, metal::dynamic_extent, false, true, false,
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
         const double flop = 2.0 * Ms * Ns * Ks;
         struct R { Variant v; bool rescale; bool dbuf; int bk; int sb; };
         std::vector<R> runs;
-        for (int sb : {0, 4, 8, 16}) {runs.push_back({variants[1], false, false, 32, sb}); runs.push_back({variants[1], false, false, 64, sb}); runs.push_back({variants[0], false, false, 32, sb});}
+        if (all) for (int sb : {0, 4, 8, 16}) {runs.push_back({variants[1], false, false, 32, sb}); runs.push_back({variants[1], false, false, 64, sb}); runs.push_back({variants[0], false, false, 32, sb});}
         for (const R& r : runs) {
             auto x = operand(r.v.ta, {Ms, Ks}), w = operand(r.v.tb, {Ns, Ks});
             auto sc = mx::astype(mx::add(mx::random::uniform({Ns, Ks / r.bk}), mx::array(0.5f)), mx::float16);
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
             mx::eval(x, w);
             auto ref = mx::matmul(mx::astype(x, mx::float32), mx::transpose(mx::astype(w, mx::float32)));
             struct T { int mt, nt, simds; };
-            for (T t : {T{64, 64, 4}, T{32, 32, 1}, T{64, 64, 1}, T{128, 128, 4}}) {
+            for (T t : {T{64, 64, 4}, T{32, 32, 1}, T{64, 64, 1}, T{64, 64, 2}, T{128, 128, 4}, T{128, 128, 8}, T{128, 64, 4}, T{64, 128, 4}, T{32, 64, 1}, T{64, 32, 1}}) {
                 try {
                     auto y = device_tensor(v, x, w, t.mt, t.nt, t.simds);
                     auto err = mx::divide(mx::max(mx::abs(mx::subtract(y, ref))), mx::max(mx::abs(ref)));

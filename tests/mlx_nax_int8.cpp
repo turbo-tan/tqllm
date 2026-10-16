@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace mx = mlx::core;
@@ -66,6 +67,7 @@ template <class F> double best_ms(F f) {
 }  // namespace
 
 int main() {
+  try {
     std::mt19937 rng(7);
     bool ok = true;
     // rows 1056 = 33 x 32: exercises the N bound of the 64-wide tile; m = 200 the M bound
@@ -108,4 +110,8 @@ int main() {
     }
     std::puts(ok ? "NAX_INT8_PASS" : "NAX_INT8_FAIL");
     return ok ? 0 : 1;
+  } catch (const std::exception& e) {
+    std::printf("NAX_INT8_ERROR %s\n", std::string(e.what()).substr(0, 1500).c_str());
+    return 2;
+  }
 }
