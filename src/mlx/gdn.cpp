@@ -84,6 +84,66 @@ gate[i]=1.0f/(1.0f+exp(-beta[i]));
         {{"N",int(alpha.size())},{"HEADS",alpha.shape(1)}},std::nullopt,false,mx::Device(mx::Device::gpu));
     return {result[0],result[1]};
 }
+// conv + silu (as gdn_convolve_native) and the q / k normalization in one launch: one simdgroup per (token, 128-column
+// segment); segments [0, KH) are q (scaled by qscale), [KH, 2KH) are k, the rest v (no normalization).
+mx::array gdn_pre_fused(const mx::array& joined,const mx::array& weights,int kh,float qscale) {
+    if(joined.ndim()!=2 || joined.shape(0)<4 || weights.shape()!=mx::Shape{joined.shape(1),4} || joined.shape(1)%128 ||
+       joined.dtype()!=mx::float32 || weights.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid fused GDN prep dimensions");
+    const int m=joined.shape(0)-3,width=joined.shape(1),segs=width/128;
+    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_pre_fused",{"joined","weights","qscale"},{"out"},R"METAL(
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+uint lane=thread_index_in_simdgroup;
+uint seg=threadgroup_position_in_grid.x*4u+simdgroup_index_in_threadgroup;
+uint token=threadgroup_position_in_grid.y;
+if(seg>=uint(SEGS))return;
+float x[4];
+for(uint e=0;e<4u;++e) {
+    uint col=seg*128u+lane*4u+e;
+    float sum=0.0f;
+    for(uint tap=0;tap<4u;++tap)sum=sum+joined[(token+tap)*WIDTH+col]*weights[col*4u+tap];
+    float rounded=float(bfloat16_t(sum));
+    float gate=1.0f/(1.0f+exp(-rounded));
+    x[e]=float(bfloat16_t(rounded*gate));
+}
+if(seg<2u*uint(KH)) {
+    float ss=0.0f;
+    for(uint e=0;e<4u;++e)ss+=x[e]*x[e];
+    ss=simd_sum(ss);
+    float factor=rsqrt(ss+1e-6f)*(seg<uint(KH)?qscale:1.0f);
+    for(uint e=0;e<4u;++e)x[e]=x[e]*factor;
+}
+for(uint e=0;e<4u;++e)out[token*WIDTH+seg*128u+lane*4u+e]=x[e];
+)METAL");
+    return kernel({mx::contiguous(joined),mx::contiguous(weights),mx::array(qscale)},{{m,width}},{mx::float32},
+        {((segs+3)/4)*128,m,1},{128,1,1},{{"WIDTH",width},{"SEGS",segs},{"KH",kh}},
+        std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+}
+// bf16(y) -> rms_norm(weight, eps) -> * silu(z) -> bf16, one simdgroup per (token, value head)
+mx::array gdn_post_fused(const mx::array& y,const mx::array& z,const mx::array& weight,float eps) {
+    if(y.ndim()!=4 || y.shape(3)!=128 || z.shape()!=y.shape() || weight.shape()!=mx::Shape{128} ||
+       y.dtype()!=mx::float32 || z.dtype()!=mx::float32 || weight.dtype()!=mx::float32)
+        throw std::invalid_argument("invalid fused GDN output dimensions");
+    const int rows=y.shape(1)*y.shape(2);
+    static auto kernel=mx::fast::metal_kernel("tqllm_gdn_post_fused",{"y","z","w","eps"},{"out"},R"METAL(
+uint lane=thread_index_in_simdgroup;
+uint row=threadgroup_position_in_grid.x*4u+simdgroup_index_in_threadgroup;
+if(row>=uint(ROWS))return;
+float a[4];float ss=0.0f;
+for(uint e=0;e<4u;++e) {a[e]=float(bfloat16_t(y[row*128u+lane*4u+e]));ss+=a[e]*a[e];}
+ss=simd_sum(ss);
+float inv=rsqrt(ss/128.0f+eps);
+for(uint e=0;e<4u;++e) {
+    uint i=row*128u+lane*4u+e;
+    float g=z[i];
+    out[i]=float(bfloat16_t((a[e]*inv*w[lane*4u+e])*(g*(1.0f/(1.0f+exp(-g))))));
+}
+)METAL");
+    return kernel({mx::contiguous(y),mx::contiguous(z),mx::contiguous(weight),mx::array(eps)},{y.shape()},{mx::float32},
+        {((rows+3)/4)*128,1,1},{128,1,1},{{"ROWS",rows}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+}
+
 mx::array gdn_normalize(const mx::array& input,float scale,bool compiled) {
     if(input.ndim()!=4 || input.shape(3)<32 || input.shape(3)%32 || input.dtype()!=mx::float32)
         throw std::invalid_argument("invalid GDN normalization dimensions");

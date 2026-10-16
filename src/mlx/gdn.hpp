@@ -12,6 +12,10 @@ std::pair<mlx::core::array,mlx::core::array> gdn_gates_native(
 mlx::core::array gdn_normalize(const mlx::core::array& input,float scale,bool compiled=false);
 mlx::core::array gdn_decay(const mlx::core::array& alpha,const mlx::core::array& bias,
     const mlx::core::array& rate,bool compiled=false);
+// conv + silu + q/k normalization in one launch (output layout of gdn_convolve with q, k normalized in place)
+mlx::core::array gdn_pre_fused(const mlx::core::array& joined,const mlx::core::array& weights,int key_heads,float query_scale);
+// bf16 -> rms_norm -> * silu(z) -> bf16 in one launch; y, z [1, m, heads, 128]
+mlx::core::array gdn_post_fused(const mlx::core::array& y,const mlx::core::array& z,const mlx::core::array& weight,float eps);
 struct GdnHeadOrder {
     mlx::core::array to_native,from_native;
     int key_heads,value_heads;

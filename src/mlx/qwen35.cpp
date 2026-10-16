@@ -620,13 +620,16 @@ struct Qwen35::Impl {
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         auto weights=mx::reshape(plain.at(p+"ssm_conv1d.weight"),{width,conv});
+        static const bool gdn_fuse=std::getenv("TQLLM_MLX_GDN_FUSE")!=nullptr;
+        const bool fused_pre=gdn_fuse && ablate_blocks.find("gnorm")==std::string::npos && dk==128 && dv==128;
         auto result=ablate_blocks.find("gconv")!=std::string::npos?tail_slice(joined,0,conv-1,conv-1+m):
+            fused_pre?gdn_pre_fused(joined,weights,kh,1.0f/std::sqrt(float(dk))):
             native_gdn_prep?gdn_convolve_native(joined,weights):gdn_convolve(joined,weights,compiled_gdn);
         c.conv=mx::contiguous(tail_slice(joined,0,m,m+conv-1));
         auto q=mx::reshape(tail_slice(result,1,0,kh*dk),{1,m,kh,dk});
         auto k=mx::reshape(tail_slice(result,1,kh*dk,2*kh*dk),{1,m,kh,dk});
         auto v=mx::reshape(tail_slice(result,1,2*kh*dk,width),{1,m,vh,dv});
-        if(ablate_blocks.find("gnorm")==std::string::npos) {
+        if(!fused_pre && ablate_blocks.find("gnorm")==std::string::npos) {
             q=gdn_normalize(q,1.0f/std::sqrt(float(dk)),compiled_gdn);
             k=gdn_normalize(k,1,compiled_gdn);
         }
@@ -644,7 +647,8 @@ struct Qwen35::Impl {
             mx::fast::gated_delta_update(q,k,v,decay,beta,c.state);
         c.state=update[1];
         auto z=mx::reshape(mat(p+"attn_gate.weight",x),{1,m,vh,dv});
-        auto out=silu_mul_bf(mx::fast::rms_norm(bf(update[0]),plain.at(p+"ssm_norm.weight"),eps),z);
+        auto out=gdn_fuse?gdn_post_fused(update[0],z,plain.at(p+"ssm_norm.weight"),eps):
+            silu_mul_bf(mx::fast::rms_norm(bf(update[0]),plain.at(p+"ssm_norm.weight"),eps),z);
         return mat(p+"ssm_out.weight",mx::reshape(out,{m,vh*dv}));
     }
     mx::array shortlist_rows(const mx::array& x, int& vocab) const {
