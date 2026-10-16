@@ -94,6 +94,72 @@ for (uint i = 0; i < acc.get_capacity(); ++i) {
                       {{"MT", mt}, {"NT", nt}, {"BK", bk}, {"SIMDS", simds}, {"N", n}, {"REPS", reps}},
                       std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
+
+// staged GEMM with 16-byte loads (no bounds checks: M, N multiples of the tile, K of BK); int8 variants may apply a
+// per-step, per-column float rescale of the int32 tile (exact per-group weight scales, group = BK)
+mx::array staged16(const Variant& v, const mx::array& x, const mx::array& w, const mx::array& scales, int mt, int nt, int bk, int simds, bool rescale) {
+    const int m = x.shape(0), k = x.shape(1), n = w.shape(0);
+    using Kernel = decltype(mx::fast::metal_kernel(std::string(), std::vector<std::string>(), std::vector<std::string>(), std::string(), std::string()));
+    static std::map<std::string, Kernel> kernels;
+    const std::string key = std::string(v.name) + (rescale ? "_rs" : "");
+    auto it = kernels.find(key);
+    if (it == kernels.end()) {
+        const std::string header = std::string("#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+                                               "typedef ") + v.ta + " TA; typedef " + v.tb + " TB; typedef " + v.tc + " TC;\n#define RESCALE " + (rescale ? "1" : "0") + "\n";
+        it = kernels.emplace(key, mx::fast::metal_kernel(std::string("tqllm_mpp_staged16_") + key, {"x", "w", "s"}, {"y"}, R"METAL(
+uint tid = thread_position_in_threadgroup.x;
+uint n0 = threadgroup_position_in_grid.x * uint(NT), m0 = threadgroup_position_in_grid.y * uint(MT);
+threadgroup TA A[MT * BK];
+threadgroup TB B[NT * BK];
+threadgroup half S[NT];
+tensor<threadgroup TA, extents<int, BK, MT>, tensor_inline> ta(A, extents<int, BK, MT>());
+tensor<threadgroup TB, extents<int, BK, NT>, tensor_inline> tb(B, extents<int, BK, NT>());
+constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, BK, false, true, false,
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
+auto acc = op.template get_destination_cooperative_tensor<decltype(ta), decltype(tb), TC>();
+constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
+for (uint i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) acc[i] = TC(0);
+#if RESCALE
+float facc[CAP];
+ushort colidx[CAP];
+for (uint i = 0; i < acc.get_capacity(); ++i) {facc[i] = 0.0f; auto c = acc.get_multidimensional_index(i); colidx[i] = ushort(c[0]);}
+#endif
+constexpr uint ROWB_A = uint(BK) * sizeof(TA) / 16u, ROWB_B = uint(BK) * sizeof(TB) / 16u;  // 16-byte chunks per tile row
+for (uint base = 0; base < uint(K); base += uint(BK)) {
+    for (uint i = tid; i < uint(MT) * ROWB_A; i += 32u * uint(SIMDS)) {
+        uint row = i / ROWB_A, chunk = i % ROWB_A;
+        ((threadgroup uint4*)A)[i] = *(const device uint4*)((const device char*)x + ((m0 + row) * uint(K) + base) * sizeof(TA) + chunk * 16u);
+    }
+    for (uint i = tid; i < uint(NT) * ROWB_B; i += 32u * uint(SIMDS)) {
+        uint row = i / ROWB_B, chunk = i % ROWB_B;
+        ((threadgroup uint4*)B)[i] = *(const device uint4*)((const device char*)w + ((n0 + row) * uint(K) + base) * sizeof(TB) + chunk * 16u);
+    }
+#if RESCALE
+    for (uint i = tid; i < uint(NT); i += 32u * uint(SIMDS)) S[i] = s[(n0 + i) * (uint(K) / uint(BK)) + base / uint(BK)];
+#endif
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    op.run(ta, tb, acc);
+#if RESCALE
+    for (uint i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) {facc[i] += float(acc[i]) * float(S[colidx[i]]); acc[i] = TC(0);}
+#endif
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+for (uint i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    auto c = acc.get_multidimensional_index(i);
+#if RESCALE
+    y[(m0 + uint(c[1])) * uint(N) + n0 + uint(c[0])] = facc[i];
+#else
+    y[(m0 + uint(c[1])) * uint(N) + n0 + uint(c[0])] = float(acc[i]);
+#endif
+}
+)METAL", header)).first;
+    }
+    return it->second({x, w, scales}, {{m, n}}, {mx::float32}, {(n / nt) * 32 * simds, m / mt, 1}, {32 * simds, 1, 1},
+                      {{"MT", mt}, {"NT", nt}, {"BK", bk}, {"SIMDS", simds}, {"N", n}, {"K", k}},
+                      std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
 template <class F>
 double best_ms(F f) {
     mx::eval(f());
@@ -155,6 +221,33 @@ int main() {
                             2.0 * Mc * Nc * bk * reps / ms * 1e-9, err.item<float>());
             } catch (const std::exception& e) {
                 std::printf("MPP_COMPUTE %s mt=%d nt=%d simds=%d ERROR %s\n", v.name, t.mt, t.nt, t.simds, std::string(e.what()).substr(0, 300).c_str());
+            }
+        }
+    }
+    // staged (16-byte loads) GEMMs, the practical rate; int8 with the exact per-group rescale (group = BK) as well
+    {
+        const int Ms = 2048, Ks = 5120, Ns = 17408, bk = 32;
+        const double flop = 2.0 * Ms * Ns * Ks;
+        struct R { Variant v; bool rescale; };
+        for (R r : {R{variants[0], false}, R{variants[1], false}, R{variants[1], true}}) {
+            auto x = operand(r.v.ta, {Ms, Ks}), w = operand(r.v.tb, {Ns, Ks});
+            auto sc = mx::astype(mx::add(mx::random::uniform({Ns, Ks / bk}), mx::array(0.5f)), mx::float16);
+            mx::eval(x, w, sc);
+            auto ref = r.rescale
+                ? mx::sum(mx::multiply(mx::matmul(mx::reshape(mx::astype(x, mx::float32), {Ms, Ks / bk, 1, bk}), mx::transpose(mx::reshape(mx::astype(w, mx::float32), {1, Ns, Ks / bk, bk}), {0, 2, 3, 1})) , mx::astype(mx::transpose(sc), mx::float32)), 1)
+                : mx::matmul(mx::astype(x, mx::float32), mx::transpose(mx::astype(w, mx::float32)));
+            struct T { int mt, nt, simds; };
+            for (T t : {T{64, 64, 4}, T{32, 32, 1}, T{64, 32, 2}, T{128, 64, 4}, T{64, 128, 4}}) {
+                try {
+                    auto y = staged16(r.v, x, w, sc, t.mt, t.nt, bk, t.simds, r.rescale);
+                    auto err = mx::divide(mx::max(mx::abs(mx::subtract(y, ref))), mx::max(mx::abs(ref)));
+                    mx::eval(err);
+                    const double ms = best_ms([&] { return staged16(r.v, x, w, sc, t.mt, t.nt, bk, t.simds, r.rescale); });
+                    std::printf("MPP_STAGED %s%s mt=%d nt=%d bk=%d simds=%d %.2f ms %.1f TOPS rel_err %.1e\n", r.v.name, r.rescale ? "_rescale" : "", t.mt, t.nt, bk,
+                                t.simds, ms, flop / ms * 1e-9, err.item<float>());
+                } catch (const std::exception& e) {
+                    std::printf("MPP_STAGED %s%s mt=%d nt=%d simds=%d ERROR %s\n", r.v.name, r.rescale ? "_rescale" : "", t.mt, t.nt, t.simds, std::string(e.what()).substr(0, 300).c_str());
+                }
             }
         }
     }
