@@ -11,6 +11,7 @@
 #include "x3.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -18,6 +19,14 @@ namespace tqllm {
 namespace x3 {
 
 namespace {
+
+// Debug-only (off by default): force the n == 1 path onto the exact x3v gemv instead of sq, to
+// separate sq int8-activation rounding from real bugs. Same style as the TQLLM_DEBUG flags.
+bool x3_n1_x3v() {
+    static const bool v = std::getenv("TQLLM_X3_N1_X3V") != nullptr;
+    return v;
+}
+
 int dispatch_num_sms() {
     static const int n = [] { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); return v > 0 ? v : 82; }();
     return n;
@@ -56,7 +65,8 @@ template <class Codec>
 void codec_gemv(const float* A, const uint16_t* B, float* C, int size_m, int size_k, int size_n,
                 const half* suh, half* a_had, const half* svh, int* locks, cudaStream_t stream) {
     if (size_m == 1) {
-        if constexpr (Codec::supports_sq) { launch_sq<Codec, true>(A, B, C, size_k, size_n, suh, svh, locks, stream); return; }
+        if constexpr (Codec::supports_sq)
+            if (!x3_n1_x3v()) { launch_sq<Codec, true>(A, B, C, size_k, size_n, suh, svh, locks, stream); return; }
     }
     if constexpr (!Codec::supports_gemv_x3v) {
         throw std::runtime_error("x3: this codec has no gemv for a batch > 1");
