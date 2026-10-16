@@ -107,7 +107,8 @@ def main():
         worst = max(worst, err)
         if err > 1.0: raise SystemExit(f"{name}: converted tensor differs from the BF16 GGUF ({err:.3g} BF16 steps)")
         if name == "token_embd.weight":
-            if (bits, gs) != (8, 64): raise SystemExit("token embedding must be 8-bit group 64")
+            # lower-bit group-64 embeddings (mlx-community 4-bit) keep their codes, scales and biases: exact in the 8-bit layout
+            if gs != 64 or bits not in (4, 6, 8): raise SystemExit("token embedding must be 4/6/8-bit group 64")
             data, ty = np.frombuffer(codes.tobytes() + s.tobytes() + b.tobytes(), np.uint8), EMBED8
         else:
             ty = TYPES[(bits, gs)]
