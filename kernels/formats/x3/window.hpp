@@ -11,8 +11,8 @@ namespace tqllm {
 namespace x3 {
 
 constexpr int XW_MAX_PARTS = 4;
-constexpr int XW_MAX_N = 8;
-constexpr int XW_MAX_ITEM_SLICES = 160;   // k slices per gemv item: the A stage stays <= 41 KB at n = 8
+constexpr int XW_MAX_N = 16;
+constexpr int XW_MAX_ITEM_SLICES = 160;   // k slices per gemv item: the A stage stays <= 41 KB at n = 8 (two blocks per SM)
 
 // gemv block geometry: WK warps split an item's k slices, each warp owns WNT adjacent 16-column tiles,
 // PF k slices of weights in flight per warp, fp16 accumulators folded to fp32 every FOLD slices.
@@ -39,7 +39,7 @@ struct XwList {
     XwPart p[XW_MAX_PARTS];
     int count;
     int cols;            // input size (shared by all parts)
-    int n;               // batch columns 1..8
+    int n;               // batch columns 1..XW_MAX_N
     int items;           // total gemv items
 };
 

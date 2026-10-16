@@ -106,7 +106,8 @@ bool window_ok(const X3Desc& d) {
 struct X3Format final : WeightFormat {
     const char* name() const override { return "x3"; }
     Basis basis() const override { return Basis::Plain; }
-    int max_matvec_cols() const override { return 8; }
+    // the window GEMV takes a whole tree verify (12 columns) in one pass; the x3v fallback stops at 8
+    int max_matvec_cols() const override { return x3::x3_window_enabled() ? x3::XW_MAX_N : 8; }
 
     Mat load(const std::vector<char>& raw, int rows, int cols, const Upload& up, cudaStream_t) const override {
         if (cols % 128 || rows % 128) throw std::runtime_error("x3: dims must be multiples of 128");

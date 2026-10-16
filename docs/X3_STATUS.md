@@ -687,3 +687,17 @@ stream beside [qkv|z]). Default path; `TQLLM_DEBUG=x3v` selects the old x3v/sq p
   ~10 us/layer vs ~15 us of hideable work).
 - Next candidates: attention gate beside attention at 32k (untested); drafter acceptance (a verify of 8 columns
   costs ~the same as 1).
+
+## Drafter levers on the window GEMV (2026-10-16, GPU2, relbench 400 tok x 3, df2_stock_q4km, same session)
+- **16-wide window GEMV** (`gemv_window.cu` NB = 2: a second mma per decoded tile; `XW_MAX_N` 16; X3
+  `max_matvec_cols` 16 on the window path). Bench (9 matrices): n1 unchanged (521-523 vs old 525-538 us,
+  drift), a 12-column call 910 vs 8 + 4 = 1256 us (1.38x); n-identity 1..16 ok; test-dflash-exact PASS
+  tree + linear 256/256. End to end **no change** for one user (new/old/new: 116.1/115.6/115.8, 89.9/89.1/89.4,
+  89.2/88.9/89.2 tok/s): a single-slot verify is capped at 8 columns by `kGdnReplayCols = 8`
+  (`src/tree_columns.hpp`), not by the format. The wider kernel only serves np > 1 batched verify (budget 16)
+  and prefill batches (16 cols / pass).
+- **`--draft-retrieve 32`**: 2k 114.4 (-1.5%), **8k 99.8 (+11.6%), 32k 101.2 (+13.6%)**; acceptance 48/42/46%
+  vs 48/35/37%. Base/base2 116.2/115.7, 89.5/89.3, 89.1/89.1. Costs ~20 KB of drafter K/V per context token
+  (1.25 GiB at 64K): use it for long prompts when memory allows (not at 262K: X3.1 + drafter is ~20.9 GB there).
+- **`--lookup 3`**: no gain (114.5/88.5/87.5, acceptance 47/35/36%): lookup columns take tree columns out of the
+  same 8.

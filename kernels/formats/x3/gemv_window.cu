@@ -1,4 +1,4 @@
-// gemv_window.cu: X3 decode GEMV for n = 1..8 columns, built the TRUSS way (~/trellis-kernel
+// gemv_window.cu: X3 decode GEMV for n = 1..16 columns, built the TRUSS way (~/trellis-kernel
 // src/kernels/moe/moe_window.cu gemv_item: decode in registers, one mma per tile with the weights as the A
 // operand, no grid barrier) instead of the exllamav3 cooperative kernel (gemv_x3v.cu: two grid.sync, one
 // launch per row part, f32 staging around it).
@@ -8,7 +8,8 @@
 //   gemv    P_p[kp][t][cols] = A_p[t][k range kp] . W_p               persistent grid over the items
 //   out     y[t][off_p + c]  = bf16(svh_p * H128(sum_kp P_p[kp][t]))  one warp per (part, t, 128 block)
 // An item is (part, 64-column group, k part). The k split depends on the part's shape only, never on n, so
-// column t is bit-identical for every n (the drafter's verify batch equals decode). Deterministic: fixed
+// column t is bit-identical for every n (the drafter's verify batch equals decode). n > 8 adds a second mma per
+// decoded tile (batch half NB = 2): a 12-column tree verify decodes the weights once instead of twice. Deterministic: fixed
 // reduction orders, no atomics. A single-launch queue version (H items first, epilogue by the last finisher,
 // TRUSS v7a style) was measured slower here: 547 vs ~510 us on the 9 bench matrices (per-item signalling
 // costs more than the two launches it removes).
@@ -90,6 +91,7 @@ static __global__ void xw_out(XwList L, __nv_bfloat16* __restrict__ y, int ldy) 
 
 // ---------------------------------------------------------------------------------------------------------
 // gemv: a persistent grid walks the items (XwGeom: WK k-split warps x WNT tiles, PF slices in flight).
+// NB = batch halves of 8 columns (1: n <= 8, 2: n <= 16); every half gets its own mma on the same decoded tile.
 
 // mma.m16n8k16 with the decoded tile as A (16 output columns x 16 k) and the batch as B (16 k x 8
 // columns t), fp16 accumulate: one mma per tile, every batch slot used (TRUSS mma.cuh mma_w).
@@ -113,7 +115,7 @@ inline size_t xw_gemv_smem(int n, int k_slices) {
 }
 
 // One item (part, column group, k part): P_part[kp][t][group columns].
-template <class Codec>
+template <class Codec, int NB>
 __device__ __forceinline__ void xw_item(const XwList& L, int item) {
     using G = XwGeom;
     constexpr int TWORDS = Codec::u32words;
@@ -165,18 +167,25 @@ __device__ __forceinline__ void xw_item(const XwList& L, int item) {
         __syncthreads();
     }
     const int r0 = lane >> 2;
-    const bool r0_ok = r0 < L.n;
-    const uint32_t* As = xw_smem + r0 * a_stride + warp * chunk * 8 + (lane & 3);
+    bool r_ok[NB];
+    const uint32_t* As[NB];
+    #pragma unroll
+    for (int h = 0; h < NB; ++h) {
+        r_ok[h] = r0 + 8 * h < L.n;
+        As[h] = xw_smem + (r0 + 8 * h) * a_stride + warp * chunk * 8 + (lane & 3);
+    }
 
     const typename Codec::Lane codec(lane);
     const half2 hzero = __half2half2(__ushort_as_half(0));
-    FragCh ch[G::WNT];
-    float2 acc[G::WNT][2];   // [t][f]: column t * 16 + f * 8 + g, batch rows 2q, 2q + 1
+    FragCh ch[G::WNT][NB];
+    float2 acc[G::WNT][NB][2];   // [t][h][f]: column t * 16 + f * 8 + g, batch rows 8h + 2q, 8h + 2q + 1
     #pragma unroll
-    for (int t = 0; t < G::WNT; ++t) {
-        ch[t][0] = ch[t][1] = hzero;
-        acc[t][0] = acc[t][1] = make_float2(0.f, 0.f);
-    }
+    for (int t = 0; t < G::WNT; ++t)
+        #pragma unroll
+        for (int h = 0; h < NB; ++h) {
+            ch[t][h][0] = ch[t][h][1] = hzero;
+            acc[t][h][0] = acc[t][h][1] = make_float2(0.f, 0.f);
+        }
 
     for (int ib = 0; ib < myn; ib += G::PF) {
         #pragma unroll
@@ -186,7 +195,12 @@ __device__ __forceinline__ void xw_item(const XwList& L, int item) {
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l) bw[l] = pf[d][l];
-            const uint32_t alo = r0_ok ? As[i * 8] : 0u, ahi = r0_ok ? As[i * 8 + 4] : 0u;
+            uint32_t alo[NB], ahi[NB];
+            #pragma unroll
+            for (int h = 0; h < NB; ++h) {
+                alo[h] = r_ok[h] ? As[h][i * 8] : 0u;
+                ahi[h] = r_ok[h] ? As[h][i * 8 + 4] : 0u;
+            }
             if (i + G::PF < myn) {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(i + G::PF, l);
@@ -195,17 +209,20 @@ __device__ __forceinline__ void xw_item(const XwList& L, int item) {
             for (int t = 0; t < G::WNT; ++t) {
                 FragB f0, f1;
                 codec.tile(bw, t, f0, f1);
-                xw_mma(f0, f1, alo, ahi, ch[t]);
+                #pragma unroll
+                for (int h = 0; h < NB; ++h) xw_mma(f0, f1, alo[h], ahi[h], ch[t][h]);
             }
             if ((d + 1) % G::FOLD == 0 || i + 1 == myn) {
                 #pragma unroll
                 for (int t = 0; t < G::WNT; ++t)
                     #pragma unroll
-                    for (int f = 0; f < 2; ++f) {
-                        acc[t][f].x += __low2float(ch[t][f]);
-                        acc[t][f].y += __high2float(ch[t][f]);
-                        ch[t][f] = hzero;
-                    }
+                    for (int h = 0; h < NB; ++h)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f) {
+                            acc[t][h][f].x += __low2float(ch[t][h][f]);
+                            acc[t][h][f].y += __high2float(ch[t][h][f]);
+                            ch[t][h][f] = hzero;
+                        }
             }
         }
     }
@@ -218,11 +235,13 @@ __device__ __forceinline__ void xw_item(const XwList& L, int item) {
         #pragma unroll
         for (int t = 0; t < G::WNT; ++t)
             #pragma unroll
-            for (int f = 0; f < 2; ++f) {
-                const int col = t * 16 + f * 8 + g;
-                red[warp][q2 + 0][col] = acc[t][f].x;
-                red[warp][q2 + 1][col] = acc[t][f].y;
-            }
+            for (int h = 0; h < NB; ++h)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    const int col = t * 16 + f * 8 + g;
+                    red[warp][8 * h + q2 + 0][col] = acc[t][h][f].x;
+                    red[warp][8 * h + q2 + 1][col] = acc[t][h][f].y;
+                }
     }
     __syncthreads();
     float* out = P.P + (size_t) kp * L.n * P.rows + group * G::COLS;
@@ -238,9 +257,23 @@ __device__ __forceinline__ void xw_item(const XwList& L, int item) {
 }
 
 // Persistent: a resident grid walks the items, so block start-up and drain are paid once per launch.
-template <class Codec>
+template <class Codec, int NB>
 __global__ __launch_bounds__(XwGeom::THREADS) void xw_gemv(XwList L) {
-    for (int item = blockIdx.x; item < L.items; item += gridDim.x) xw_item<Codec>(L, item);
+    for (int item = blockIdx.x; item < L.items; item += gridDim.x) xw_item<Codec, NB>(L, item);
+}
+
+// One gemv launch with NB batch halves; the resident grid is sized once per instantiation.
+template <class Codec, int NB>
+void xw_gemv_launch(const XwList& L, size_t smem, cudaStream_t s) {
+    static int resident = [] {
+        const size_t most = xw_gemv_smem(8 * NB, XW_MAX_ITEM_SLICES);   // NB = 2: above the 48 KB default
+        cudaFuncSetAttribute(xw_gemv<Codec, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(most));
+        int b = 1, sms = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, xw_gemv<Codec, NB>, XwGeom::THREADS, most);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        return max(1, b) * sms;
+    }();
+    xw_gemv<Codec, NB><<<min(L.items, resident), XwGeom::THREADS, smem, s>>>(L);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -259,13 +292,8 @@ void xw_matvec(const XwList& L, const half* x, __nv_bfloat16* y, int ldy, cudaSt
     int ks_max = 0;
     for (int i = 0; i < L.count; ++i) ks_max = max(ks_max, L.cols / 16 / L.p[i].kparts);
     const size_t smem = xw_gemv_smem(L.n, ks_max);
-    static int resident = [&] {
-        int b = 1, sms = 1;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, xw_gemv<Codec>, XwGeom::THREADS, xw_gemv_smem(XW_MAX_N, XW_MAX_ITEM_SLICES));
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-        return max(1, b) * sms;
-    }();
-    xw_gemv<Codec><<<min(L.items, resident), XwGeom::THREADS, smem, s>>>(L);
+    if (L.n > 8) xw_gemv_launch<Codec, 2>(L, smem, s);
+    else xw_gemv_launch<Codec, 1>(L, smem, s);
     xw_out<<<xw_warp_blocks(L, false), 256, 0, s>>>(L, y, ldy);
 }
 

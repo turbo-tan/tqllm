@@ -1,7 +1,8 @@
 // x3_window_bench: gemv_window.cu vs the serving x3v path on real PAW-27B-X3.1 matrices (diagnostic,
 // not in ctest: needs the GGUF). Per matrix: max error of the window output vs the x3v output (both
-// bf16-rounded, relative to max |y|), column bit-identity across n = 1..8, and graph-timed us / GB/s
-// for both paths at n = 1 and n = 8. A "+" joins tensors into one fused matvec (e.g. gate+up).
+// bf16-rounded, relative to max |y|), column bit-identity across n = 1..16, and graph-timed us / GB/s
+// for both paths at n = 1 and n = 8, plus a 12-column verify: one call vs the old 8 + 4 split. A "+"
+// joins tensors into one fused matvec (e.g. gate+up).
 //
 // build: nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Isrc/formats -Ikernels/formats/x3 tests/x3_window_bench.cu \
 //          build/libtqllm.a -L/usr/local/cuda/lib64 -lcudart -lcublas -lcublasLt -lcusolver -lcuda -ldl
@@ -119,9 +120,9 @@ int main(int argc, char** argv) {
             cudaEventRecord(e1, s); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
         }
     }
-    printf("%-30s %5s %6s %4s | %9s %9s | %8s %8s %7s | %8s %8s %7s\n", "matrix", "rows", "cols", "K",
-           "rel.err", "n-ident", "x3v n1", "win n1", "GB/s", "x3v n8", "win n8", "GB/s");
-    double tot_old = 0, tot_new = 0;
+    printf("%-30s %5s %6s %4s | %9s %9s | %8s %8s %7s | %8s %8s %7s | %8s %8s\n", "matrix", "rows", "cols", "K",
+           "rel.err", "n-ident", "x3v n1", "win n1", "GB/s", "x3v n8", "win n8", "GB/s", "win 8+4", "win n12");
+    double tot_old = 0, tot_new = 0, tot_84 = 0, tot_12 = 0;
     for (const std::string& gname : groups) {
         std::vector<Mtx> ms;
         size_t p = 0;
@@ -156,21 +157,32 @@ int main(int argc, char** argv) {
             const double a = __bfloat162float(yr[i]), b = __bfloat162float(yw[i]);
             mx = std::max(mx, std::fabs(a)); md = std::max(md, std::fabs(a - b));
         }
-        int ident_bad = 0;
-        for (int n = 1; n < 8; ++n) {
-            CK(cudaMemset(dy, 0, (size_t) 8 * rows * 2));
+        // every n = 1..16 against the n = 16 call (columns 0..7 also against n = 8 above)
+        std::vector<__nv_bfloat16> y16((size_t) XW_MAX_N * rows);
+        window(ms, dx, dy, rows, XW_MAX_N, ws, sms, s);
+        CK(cudaMemcpy(y16.data(), dy, y16.size() * 2, cudaMemcpyDeviceToHost));
+        int ident_bad = std::memcmp(y16.data(), yw.data(), (size_t) 8 * rows * 2) != 0;
+        yn.resize(y16.size());
+        for (int n = 1; n < XW_MAX_N; ++n) {
+            CK(cudaMemset(dy, 0, (size_t) XW_MAX_N * rows * 2));
             window(ms, dx, dy, rows, n, ws, sms, s);
             CK(cudaMemcpy(yn.data(), dy, (size_t) n * rows * 2, cudaMemcpyDeviceToHost));
-            ident_bad += std::memcmp(yn.data(), yw.data(), (size_t) n * rows * 2) != 0;
+            ident_bad += std::memcmp(yn.data(), y16.data(), (size_t) n * rows * 2) != 0;
         }
         float t_old1 = graph_us([&] { old_path(1); }, s), t_new1 = graph_us([&] { window(ms, dx, dy, rows, 1, ws, sms, s); }, s);
         float t_old8 = graph_us([&] { old_path(8); }, s), t_new8 = graph_us([&] { window(ms, dx, dy, rows, 8, ws, sms, s); }, s);
-        tot_old += t_old1; tot_new += t_new1;
-        printf("%-30s %5d %6d %4.1f | %9.2e %9s | %8.1f %8.1f %7.0f | %8.1f %8.1f %7.0f\n", gname.c_str(), rows, cols,
-               ms[0].words / 16.0, md / mx, ident_bad ? "FAIL" : "ok", t_old1, t_new1, bytes / t_new1 / 1e3, t_old8,
-               t_new8, bytes / t_new8 / 1e3);
+        float t_84 = graph_us([&] {
+            window(ms, dx, dy, rows, 8, ws, sms, s);
+            window(ms, dx + (size_t) 8 * cols, dy + (size_t) 8 * rows, rows, 4, ws, sms, s);
+        }, s);
+        float t_12 = graph_us([&] { window(ms, dx, dy, rows, 12, ws, sms, s); }, s);
+        tot_old += t_old1; tot_new += t_new1; tot_84 += t_84; tot_12 += t_12;
+        printf("%-30s %5d %6d %4.1f | %9.2e %9s | %8.1f %8.1f %7.0f | %8.1f %8.1f %7.0f | %8.1f %8.1f\n", gname.c_str(), rows,
+               cols, ms[0].words / 16.0, md / mx, ident_bad ? "FAIL" : "ok", t_old1, t_new1, bytes / t_new1 / 1e3, t_old8,
+               t_new8, bytes / t_new8 / 1e3, t_84, t_12);
         for (auto& m : ms) { cudaFree(m.T); cudaFree(m.suh); cudaFree(m.svh); }
     }
     printf("sum n1: x3v %.1f us, window %.1f us (%.2fx)\n", tot_old, tot_new, tot_old / tot_new);
+    printf("sum 12-column verify: 8+4 %.1f us, one call %.1f us (%.2fx)\n", tot_84, tot_12, tot_84 / tot_12);
     return 0;
 }
