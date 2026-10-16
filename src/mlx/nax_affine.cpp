@@ -337,6 +337,136 @@ mx::array nax_affine_gemm(const NaxAffine& w, const mx::array& input, bool round
     return round_bf16 ? to_bf({y})[0] : mx::astype(y, mx::float32);
 }
 
+// Prefill on the matrix unit's int8 path (j630: 54 TOPS int8 vs 32 TFLOPS fp16). TQ4 levels are integers (+-6..127), so
+// the weights are exact as int8 with the FP16 scale of each 128-column group applied to the int32 tile every GROUP/BK
+// K-steps; the input is quantized per row (symmetric int8, scale = max|x| / 127), the only approximation.
+const char* kLevels = R"METAL(
+    const uint t = thread_position_in_grid.x;
+    const uint lane = t % 32u;
+    const uint ks = (t / 32u) % uint(STEPS);
+    const uint blk = t / 32u / uint(STEPS);
+    if (blk >= uint(BLOCKS)) return;
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+    const uint2 w = ((const device uint2*)W)[((size_t)blk * STEPS + ks) * 32 + lane];
+    device char* out = Y + (size_t)(blk * 32 + fn) * K + ks * 16u + fm;
+    for (short p = 0; p < 4; p++) {
+        for (short j = 0; j < 2; j++) {
+            const short i = p + 4 * j;
+            const uint qa = (w.x >> (4 * i)) & 15u, qb = (w.y >> (4 * i)) & 15u;
+            out[(size_t)p * K + 8 * j] = char(TQ4_LEVEL[qa]);
+            out[(size_t)(16 + p) * K + 8 * j] = char(TQ4_LEVEL[qb]);
+        }
+    }
+)METAL";
+mx::array nax_tq4_levels_int8(const NaxAffine& w) {
+    if (!w.tq4) throw std::invalid_argument("nax int8 levels: TQ4 matrices only");
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_tq4_levels", {"W"}, {"Y"}, kLevels, kHeader);
+    const int blocks = w.rows / 32, steps = w.columns / 16;
+    return kernel({w.words}, {{w.rows, w.columns}}, {mx::int8}, {blocks * steps * 32, 1, 1}, {256, 1, 1},
+                  {{"K", w.columns}, {"STEPS", steps}, {"BLOCKS", blocks}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
+std::pair<mx::array, mx::array> nax_quantize_rows_int8(const mx::array& input) {
+    if (input.ndim() != 2) throw std::invalid_argument("nax int8 quantize: input must be [m, k]");
+    auto x = mx::contiguous(input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16));
+    const int m = x.shape(0), k = x.shape(1);
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_quantize_rows_int8", {"x"}, {"q", "s"}, R"METAL(
+    const uint row = threadgroup_position_in_grid.x, tid = thread_position_in_threadgroup.x;
+    const device half* xr = x + size_t(row) * uint(K);
+    float amax = 0.0f;
+    for (uint i = tid; i < uint(K); i += 256u) amax = max(amax, abs(float(xr[i])));
+    amax = simd_max(amax);
+    threadgroup float red[8];
+    if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = red[0];
+    for (uint g = 1; g < 8u; ++g) amax = max(amax, red[g]);
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+    for (uint i = tid; i < uint(K); i += 256u) q[size_t(row) * uint(K) + i] = char(clamp(rint(float(xr[i]) * inv), -127.0f, 127.0f));
+    if (tid == 0) s[row] = scale;
+)METAL");
+    auto out = kernel({x}, {{m, k}, {m}}, {mx::int8, mx::float32}, {m * 256, 1, 1}, {256, 1, 1}, {{"K", k}},
+                      std::nullopt, false, mx::Device(mx::Device::gpu));
+    return {out[0], out[1]};
+}
+
+const char* kInt8Gemm = R"METAL(
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint n0 = threadgroup_position_in_grid.x * uint(NT), m0 = threadgroup_position_in_grid.y * uint(MT);
+    threadgroup int8_t A[MT * BK];
+    threadgroup int8_t B[NT * BK];
+    threadgroup half S[NT];
+    tensor<threadgroup int8_t, extents<int, BK, MT>, tensor_inline> ta(A, extents<int, BK, MT>());
+    tensor<threadgroup int8_t, extents<int, BK, NT>, tensor_inline> tb(B, extents<int, BK, NT>());
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, BK, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ta), decltype(tb), int32_t>();
+    constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
+    float facc[CAP];
+    ushort colidx[CAP];
+    for (uint i = 0; i < CAP; ++i) {
+        facc[i] = 0.0f; colidx[i] = 0;
+        if (acc.is_valid_element(i)) {acc[i] = 0; auto c = acc.get_multidimensional_index(i); colidx[i] = ushort(c[0]);}
+    }
+    constexpr uint CH = uint(BK) / 16u, GSTEPS = uint(GROUP) / uint(BK);
+    for (uint base = 0; base < uint(K); base += uint(BK)) {
+        const uint step = base / uint(BK);
+        for (uint i = tid; i < uint(MT) * CH; i += 32u * uint(SIMDS)) {
+            const uint row = i / CH, chunk = i % CH;
+            ((threadgroup uint4*)A)[i] = m0 + row < uint(M) ? *(const device uint4*)(xq + (m0 + row) * uint(K) + base + chunk * 16u) : uint4(0u);
+        }
+        for (uint i = tid; i < uint(NT) * CH; i += 32u * uint(SIMDS)) {
+            const uint row = i / CH, chunk = i % CH;
+            ((threadgroup uint4*)B)[i] = n0 + row < uint(N) ? *(const device uint4*)(wq + (n0 + row) * uint(K) + base + chunk * 16u) : uint4(0u);
+        }
+        if (step % GSTEPS == 0) {
+            const uint g = base / uint(GROUP);
+            for (uint i = tid; i < uint(NT); i += 32u * uint(SIMDS)) {
+                const uint n = n0 + i;
+                S[i] = n < uint(N) ? as_type<half>(sw[((n >> 5) * uint(GPR) + g) * 32u + (n & 31u)]) : half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(ta, tb, acc);
+        if (step % GSTEPS == GSTEPS - 1) {
+            for (uint i = 0; i < CAP; ++i) if (acc.is_valid_element(i)) {facc[i] += float(acc[i]) * float(S[colidx[i]]); acc[i] = 0;}
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < CAP; ++i) {
+        if (!acc.is_valid_element(i)) continue;
+        auto c = acc.get_multidimensional_index(i);
+        const uint col = n0 + uint(c[0]), row = m0 + uint(c[1]);
+        if (row < uint(M) && col < uint(N)) {
+            const float v = facc[i] * sa[row];
+            y[row * uint(N) + col] = ROUND_BF16 ? float(bfloat16_t(v)) : v;
+        }
+    }
+)METAL";
+mx::array nax_int8_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16) {
+    if (!w.tq4 || w.group != 128 || w.columns % 128) throw std::invalid_argument("nax int8 gemm: TQ4 matrices (group 128) only");
+    if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
+        throw std::invalid_argument("nax int8 gemm: input must be [m, columns]");
+    constexpr int MT = 64, NT = 64, BK = 32, SIMDS = 4;
+    static auto kernels = [] {
+        auto make = [](bool round) {
+            return mx::fast::metal_kernel(std::string("tqllm_nax_int8_gemm") + (round ? "_bf" : ""), {"xq", "sa", "wq", "sw"}, {"y"}, kInt8Gemm,
+                                          std::string("#include <metal_tensor>\n") + kHeader);
+        };
+        return std::pair{make(false), make(true)};
+    }();
+    auto [xq, sa] = nax_quantize_rows_int8(input);
+    auto wq = nax_tq4_levels_int8(w);
+    const int m = input.shape(0), n = w.rows, k = w.columns;
+    return (round_bf16 ? kernels.second : kernels.first)(
+        {xq, sa, wq, w.scales}, {{m, n}}, {mx::float32}, {((n + NT - 1) / NT) * 32 * SIMDS, (m + MT - 1) / MT, 1}, {32 * SIMDS, 1, 1},
+        {{"MT", MT}, {"NT", NT}, {"BK", BK}, {"SIMDS", SIMDS}, {"GROUP", 128}, {"GPR", k / 128}, {"M", m}, {"N", n}, {"K", k}, {"ROUND_BF16", round_bf16}},
+        std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
     if (parts.empty()) throw std::invalid_argument("nax affine concat: no parts");
     const auto& f = *parts.front();
