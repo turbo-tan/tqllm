@@ -167,8 +167,9 @@ struct Qwen35::Impl {
     std::optional<GdnHeadOrder> native_head_order;
     bool scan_gdn=std::getenv("TQLLM_MLX_GDN_SCAN")!=nullptr;
     bool compact_gdn=std::getenv("TQLLM_MLX_COMPACT_GDN_TAPE")!=nullptr;
-    bool compiled_gdn=std::getenv("TQLLM_MLX_COMPILED_GDN")!=nullptr;
-    bool native_gdn_prep=std::getenv("TQLLM_MLX_NATIVE_GDN_PREP")!=nullptr;
+    // default on since j592 (verify -2.6 ms with both, exact); =0 opts out
+    bool compiled_gdn=env_default_on("TQLLM_MLX_COMPILED_GDN");
+    bool native_gdn_prep=env_default_on("TQLLM_MLX_NATIVE_GDN_PREP");
     bool profiling=false,stage_profiling=false;
     std::map<std::string,double> stages;
     bool gemm_prefill=false,gemm_verify=false;
