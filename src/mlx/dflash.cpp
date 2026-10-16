@@ -276,20 +276,22 @@ void DFlash2::inject(const mx::array& features,int position) {
         throw std::invalid_argument("invalid DFlash feature injection");
     auto encoded=i.norm("enc.output_norm.weight",i.mat("fc.weight",features));
     std::vector<mx::array> live;
+    bool trimmed=false;
     for(int l=0;l<int(i.caches.size());++l) {
         const std::string p="blk."+std::to_string(l)+".";auto& c=i.caches[l];
         auto k=i.keys(p,encoded,position),v=i.values(p,encoded);
         c.k=c.k?mx::concatenate({*c.k,k},2):k;c.v=c.v?mx::concatenate({*c.v,v},2):v;
         if(i.window>0 && c.k->shape(2)>i.window) {
-            const int begin=c.k->shape(2)-i.window;
+            const int begin=c.k->shape(2)-i.window;trimmed=true;
             c.k=mx::contiguous(mx::slice(*c.k,{0,0,begin,0},{1,i.kvheads,c.k->shape(2),i.hd}));
             c.v=mx::contiguous(mx::slice(*c.v,{0,0,begin,0},{1,i.kvheads,c.v->shape(2),i.hd}));
         }
         live.push_back(*c.k);live.push_back(*c.v);
     }
-    // eager by default: deferred into the draft graph the window copies cost 16 ms/step at 16K (j582); TQLLM_MLX_LAZY_INJECT=1 defers
-    static const bool lazy=std::getenv("TQLLM_MLX_LAZY_INJECT") && !std::getenv("TQLLM_MLX_EAGER_COMMIT");
-    if(!lazy)mx::eval(live);
+    // deferred into the next draft while the window grows (short prompts +0-3 %, j583); once the window is trimmed
+    // the deferred copies cost 16 ms/step (16K, j582), so evaluate them here
+    static const bool eager=std::getenv("TQLLM_MLX_EAGER_COMMIT")!=nullptr,lazy_always=std::getenv("TQLLM_MLX_LAZY_INJECT")!=nullptr;
+    if(eager || (trimmed && !lazy_always))mx::eval(live);
     i.end+=n;
 }
 std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
