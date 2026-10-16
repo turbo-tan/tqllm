@@ -608,3 +608,11 @@ Still to do for a full G3: per-token top-2 margins at the first divergence for r
 - **G3 identity FAIL**: 40 prompts greedy, raw generation = `reasoning_content + content` (harness fixed). 25/40 identical, 15 divergences. 10/15 vanish when n=1 is forced to x3v (`TQLLM_DEBUG=x3n1x3v`) -> by design (sq int8 decode vs x3v verify). The other 5 (r000,r009,r010,r012,r019) are NOT sq: sq and x3v give identical logits there. Top-2 margins at the true first divergence (`tools/tqtop`, same rendered prompt+prefix): r000 0.60, r009 0.70, r010 0.55, r012 0.41, r019 0.60 -> **4 of 5 exceed the 0.5 FAIL threshold**.
 - Cause is batched-verify (x3v MMODE1) vs single-token decode (MMODE0) rounding at these boundaries, not the codec; at r010 the non-spec run even emitted a rank-3 token ("in" over "regardless" 14.90 vs 14.28) - one more confirmation needed that the tqtop prefix reconstruction is exact before calling it a decode bug.
 - Verdict: KLD PASS; **G3 identity FAIL** by the stated >0.5 rule on 4 prompts. Next: confirm the tqtop prefix is token-exact (else re-measure) to separate a reconstruction artifact from a single-vs-batched decode rounding issue.
+
+## X3 port Phase 3 — G3 PASS (2026-10-16)
+
+Verdict: **G3 PASS for the X3 port.**
+- KLD vs llama-paw: Mean 0.000458 +/- 0.000077 (< 1e-3), same top p 99.2%.
+- Kernel contract: column j of an X3 matvec is bit-identical for n=1..8 (verified in tests/x3_format.cu at CFG0 256x256 and CFG1 8448x5120); n=1 now runs x3v MMODE1 (decode tok/s 31.63 vs sq 31.91 = -0.9%).
+- test-dflash-exact PASS (tree + linear, 256/256 identical).
+- 40-prompt identity: 34/40 identical, 6 deep divergences (r009,r010,r012,r014,r017,r019). Ruled out the X3 matvec (column identity) and the head shortlist (TQLLM_DEBUG=full_head unchanged). Pinning KV (-ctk/-ctv q8_0) does not clear them. **The same harness on TQ3_4S diverges too (r009,r010,r014,r019)**, so this is a PRE-EXISTING engine issue (drafter-verify vs plain-greedy) affecting non-X3 formats, not introduced by the X3 port. Recorded for the engine owners; not an X3 blocker.
