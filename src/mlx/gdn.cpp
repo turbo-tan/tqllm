@@ -212,11 +212,28 @@ for(uint t=0;t<M;++t) {
         compact?std::optional<mx::array>(result[2]):std::nullopt};
 }
 // Chunked gated delta rule for prefill (no per-token snapshots). Same recurrence as gdn_scan
-// (s *= a; d = (v - s k) b; s += d k^T; o = s q), 64 tokens per sub-chunk:
-//   (I + diag(b) A) U = diag(b) (V - diag(g) K S0^T),  A_tj = (g_t / g_j) k_t.k_j (j < t)
-//   O = diag(g) Q S0^T + (Q K^T * G, causal incl. diagonal) U,   S_C = g_C S0 + (U * g_C / g)^T K
-// with g the cumulative decay inside the sub-chunk. The unit-lower-triangular inverse is (I + N)(I + N^2)...(I + N^32),
-// N = -diag(b) A, batched over value heads.
+// (s *= a; d = (v - s k) b; s += d k^T; o = s q) over sub-chunks of c tokens, g the cumulative decay inside a sub-chunk:
+//   T = (I + diag(b) A)^-1,  A_tj = (g_t / g_j) k_t.k_j (j < t);  Uv = T diag(b) V,  W = T diag(b g) K
+//   U_j = Uv_j - W_j S_j^T,  S_{j+1} = g_C S_j + (U_j * g_C / g)^T K_j   (the only sequential part)
+//   O = diag(g) Q S_j^T + (Q K^T * G, causal incl. diagonal) U_j
+// T by forward substitution (a power-series product loses everything to cancellation on near-identical keys).
+static mx::array unit_lower_inverse(const mx::array& l) {  // [batch, c, c] strictly lower L -> (I + L)^-1
+    const int batch=l.shape(0),c=l.shape(1);
+    static auto kernel=mx::fast::metal_kernel("tqllm_unit_lower_inverse",{"l"},{"t"},R"METAL(
+uint x=thread_position_in_grid.x,bt=thread_position_in_grid.y;
+const device float* row=l+size_t(bt)*C*C;
+device float* out=t+size_t(bt)*C*C;
+float col[C];
+for(uint i=0;i<uint(C);++i) {
+    float s=i==x?1.0f:0.0f;
+    for(uint j=x;j<i;++j)s-=row[i*C+j]*col[j];
+    col[i]=s;
+    out[i*C+x]=s;
+}
+)METAL");
+    return kernel({mx::contiguous(l)},{{batch,c,c}},{mx::float32},{c,batch,1},{c,1,1},{{"C",c}},
+        std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+}
 std::pair<mx::array,mx::array> gdn_chunked(const mx::array& q,const mx::array& k,const mx::array& v,
     const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,int chunk) {
     const int m=q.shape(1),kh=q.shape(2),vh=v.shape(2),dk=q.shape(3),dv=v.shape(3);
@@ -227,41 +244,44 @@ std::pair<mx::array,mx::array> gdn_chunked(const mx::array& q,const mx::array& k
         auto idx=mx::remainder(mx::arange(vh,mx::int32),mx::array(kh));
         return mx::transpose(mx::take(mx::squeeze(x,0),idx,1),{1,0,2});
     };
-    auto padm=[&](const mx::array& x,float value) {return pad?mx::pad(x,std::vector<std::pair<int,int>>{{0,0},{0,pad},{0,0}},mx::array(value)):x;};
-    auto K=padm(heads(k),0.0f),Q=padm(heads(q),0.0f);
-    auto V=padm(mx::transpose(mx::squeeze(v,0),{1,0,2}),0.0f);
-    auto B=mx::transpose(mx::squeeze(beta,0),{1,0}),A=mx::transpose(mx::squeeze(decay,0),{1,0});  // [vh, m]
-    if(pad) {B=mx::pad(B,std::vector<std::pair<int,int>>{{0,0},{0,pad}},mx::array(0.0f));A=mx::pad(A,std::vector<std::pair<int,int>>{{0,0},{0,pad}},mx::array(1.0f));}
-    auto S=state?mx::reshape(*state,{vh,dv,dk}):mx::zeros({vh,dv,dk});
+    auto blocks=[&](const mx::array& x,float value) {  // [vh, m, d] -> [vh, n, c, d]
+        auto y=pad?mx::pad(x,std::vector<std::pair<int,int>>{{0,0},{0,pad},{0,0}},mx::array(value)):x;
+        return mx::reshape(y,{vh,n,c,y.shape(2)});
+    };
+    auto rows=[&](const mx::array& x,float value) {  // [1, m, vh] -> [vh, n, c]
+        auto y=mx::transpose(mx::squeeze(x,0),{1,0});
+        if(pad)y=mx::pad(y,std::vector<std::pair<int,int>>{{0,0},{0,pad}},mx::array(value));
+        return mx::reshape(y,{vh,n,c});
+    };
+    auto K=blocks(heads(k),0.0f),Q=blocks(heads(q),0.0f),V=blocks(mx::transpose(mx::squeeze(v,0),{1,0,2}),0.0f);
+    auto B=rows(beta,0.0f),A=rows(decay,1.0f);
     auto strict=mx::astype(mx::tril(mx::ones({c,c}),-1),mx::float32),causal=mx::astype(mx::tril(mx::ones({c,c}),0),mx::float32);
-    auto eye=mx::eye(c);
-    std::vector<mx::array> outs;
+    // log decays clamped (decay 0 -> exp(-1e4)); ratios as segment sums over (j, t] so no exp sees a positive
+    // argument and masked pairs give 0, not inf * 0
+    auto lg=mx::maximum(mx::log(A),mx::array(-1e4f)),gl=mx::cumsum(lg,2);
+    auto seg=mx::cumsum(mx::multiply(mx::expand_dims(lg,3),strict),2);                      // sum_{j<s<=t} lg_s
+    auto ratio=mx::exp(mx::where(mx::astype(causal,mx::bool_),seg,mx::array(-INFINITY)));    // g_t / g_j, 0 above
+    auto Kt=mx::swapaxes(K,2,3);
+    auto L=mx::multiply(mx::multiply(mx::matmul(K,Kt),mx::multiply(ratio,strict)),mx::expand_dims(B,3));  // diag(b) A
+    auto T=mx::reshape(unit_lower_inverse(mx::reshape(L,{vh*n,c,c})),{vh,n,c,c});
+    auto g=mx::exp(gl);
+    auto Uv=mx::matmul(T,mx::multiply(mx::expand_dims(B,3),V));
+    auto W=mx::matmul(T,mx::multiply(mx::expand_dims(mx::multiply(B,g),3),K));
+    auto Aqk=mx::multiply(mx::matmul(Q,Kt),mx::multiply(ratio,causal));
+    auto gC=mx::expand_dims(mx::exp(mx::slice(gl,{0,0,c-1},{vh,n,c})),3);                 // [vh, n, 1, 1]
+    auto w=mx::expand_dims(mx::squeeze(mx::slice(ratio,{0,0,c-1,0},{vh,n,c,c}),2),3);       // g_C / g_t [vh, n, c, 1]
+    auto S=state?mx::reshape(*state,{vh,dv,dk}):mx::zeros({vh,dv,dk});
+    std::vector<mx::array> states,us;
+    auto at=[&](const mx::array& x,int j) {return mx::squeeze(mx::slice(x,{0,j,0,0},{vh,j+1,x.shape(2),x.shape(3)}),1);};
     for(int j=0;j<n;++j) {
-        auto sl=[&](const mx::array& x) {return mx::slice(x,{0,j*c,0},{vh,(j+1)*c,x.shape(2)});};
-        auto Kc=sl(K),Qc=sl(Q),Vc=sl(V);
-        // log decays clamped (decay 0 -> exp(-1e4)); ratios as segment sums over (j, t] so no exp sees a positive
-        // argument and masked pairs give 0, not inf * 0
-        auto lg=mx::maximum(mx::log(mx::slice(A,{0,j*c},{vh,(j+1)*c})),mx::array(-1e4f));
-        auto bc=mx::slice(B,{0,j*c},{vh,(j+1)*c}),gl=mx::cumsum(lg,1);
-        auto seg=mx::cumsum(mx::multiply(mx::broadcast_to(mx::expand_dims(lg,2),{vh,c,c}),strict),1);  // sum_{j<s<=t} lg_s
-        auto ratio=mx::exp(mx::where(mx::astype(causal,mx::bool_),seg,mx::array(-INFINITY)));          // g_t / g_j, 0 above
-        auto KK=mx::matmul(Kc,mx::transpose(Kc,{0,2,1}));
-        auto L=mx::multiply(mx::multiply(KK,mx::multiply(ratio,strict)),mx::expand_dims(bc,2));  // diag(b) A
-        auto N=mx::negative(L),inv=mx::add(eye,N),p=N;
-        for(int s2=2;s2<c;s2*=2) {p=mx::matmul(p,p);inv=mx::matmul(inv,mx::add(eye,p));}
-        auto g=mx::exp(gl);
-        auto KS=mx::matmul(Kc,mx::transpose(S,{0,2,1}));                                        // K S0^T [vh, c, dv]
-        auto rhs=mx::multiply(mx::expand_dims(bc,2),mx::subtract(Vc,mx::multiply(mx::expand_dims(g,2),KS)));
-        auto U=mx::matmul(inv,rhs);
-        auto QK=mx::multiply(mx::matmul(Qc,mx::transpose(Kc,{0,2,1})),mx::multiply(ratio,causal));
-        auto O=mx::add(mx::multiply(mx::expand_dims(g,2),mx::matmul(Qc,mx::transpose(S,{0,2,1}))),mx::matmul(QK,U));
-        outs.push_back(O);
-        auto glast=mx::slice(gl,{0,c-1},{vh,c});                                                 // [vh, 1]
-        auto w=mx::squeeze(mx::slice(ratio,{0,c-1,0},{vh,c,c}),1);                               // g_C / g_t
-        S=mx::add(mx::multiply(mx::expand_dims(mx::exp(glast),2),S),
-                  mx::matmul(mx::transpose(mx::multiply(U,mx::expand_dims(w,2)),{0,2,1}),Kc));
+        states.push_back(S);
+        auto U=mx::subtract(at(Uv,j),mx::matmul(at(W,j),mx::swapaxes(S,1,2)));                // [vh, c, dv]
+        us.push_back(U);
+        S=mx::add(mx::multiply(at(gC,j),S),mx::matmul(mx::swapaxes(mx::multiply(U,at(w,j)),1,2),at(K,j)));
     }
-    auto O=mx::concatenate(outs,1);                                                              // [vh, n c, dv]
+    auto Ss=mx::stack(states,1),Us=mx::stack(us,1);                                              // [vh, n, dv, dk], [vh, n, c, dv]
+    auto O=mx::add(mx::matmul(mx::multiply(mx::expand_dims(g,3),Q),mx::swapaxes(Ss,2,3)),mx::matmul(Aqk,Us));
+    O=mx::reshape(O,{vh,n*c,dv});
     if(pad)O=mx::slice(O,{0,0,0},{vh,m,dv});
     return {mx::expand_dims(mx::transpose(O,{1,0,2}),0),mx::reshape(S,{1,vh,dv,dk})};
 }
