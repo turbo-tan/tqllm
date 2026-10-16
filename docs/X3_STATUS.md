@@ -556,3 +556,9 @@ Next: resolve the canonical trellis layout + orientation against llama-paw (`tes
   - x3v n=4: **0 bit-diffs** (20480 and 24576 entries).
   - (Note: the fork's default `GGML_PAW_X3_GEMV=0` routes n>1 to the reconstructed GEMM; the plan's target is its x3v, hence the flag.)
 - Still open (not blocking G3): multi-part record (row-group-split X3Records) is structurally supported by the record but the adapter emits one record per tensor, so no test exercises it yet.
+
+## X3 port Phase 3 — bring-up OK, G3 BLOCKED (2026-10-16)
+
+- **Bring-up PASS**: PAW-27B-X3.1 loads and serves in tqLLM (`tqserve --model $X3_GGUF`); multi-part records (ffn_gate+ffn_up = two X3Records in one buffer) handled by `X3Format::load`. Greedy "What is the capital of France?" -> **"Paris"** (prompt 24 tok / ~96 ms, ~29 tok/s). Short prompts generate fine at any max_tokens.
+- **G3 BLOCKED**: the 40-prompt greedy run fails with `generation failed: an illegal memory access was encountered` on the first longer prompt (`r000`, 409 chars). Short prompts (35 chars) are clean, so the fault is in the longer-prompt path (prefill). Engine log: `prefill x3: batched pass ... -> batched up to 24 columns` and `prefill GEMMs in int8`. Likely candidates: the engine's x3 batched-prefill path calling matvec with a column count above the format's `max_matvec_cols()` (8) (my x3v supports m<=8), or the fused dequant (`dequant_h`) into the prefill buffer. Needs a focused repro (single matrix, prefill-length input) before Phase 3 can continue.
+- Spec pass could not run: `--spec-type draft-dflash --spec-draft-n-max 5` are not tqserve flags (usage lists `-md DRAFTER.gguf --draft-max N`); rerun the spec pass with `-md $DRAFTER --draft-max 5`.
