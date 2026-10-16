@@ -578,3 +578,12 @@ Divergence classification (40 prompts, greedy; spec `-md df2_stock_q4km --draft-
 - **sq default verdict**: keep sq as the n=1 default (it bit-matches llama-paw's default decode, `GGML_PAW_X3_GEMV=0`). The cost is that non-spec decode diverges from the x3v verify path by ~int8 rounding; if strict spec==non-spec identity is required, run n=1 on x3v (the hook), which is exact.
 
 Still to do for a full G3: per-token top-2 margins at the first divergence for r009/r010/r012/r019 (needs a logits readout - tqserve has no logprobs), regenerate the spec pass post-fix, and G3 KLD vs llama-paw.
+
+## X3 port Phase 3 — G3 state after the sq hook fold (2026-10-16)
+
+- Hook is now `TQLLM_DEBUG=x3n1x3v` (no new env var); flags regenerated, `gen_flags.py --check` ok.
+- Post-fix G3 (both passes regenerated): **25/40 identical, 15 divergences** (same set). With `TQLLM_DEBUG=x3n1x3v` (n=1 -> exact x3v), **10/15 match spec exactly** -> by design (non-spec decode sq vs verify x3v).
+- Remaining 5 (r000 now valid post-fix, plus r009/r010/r012/r019) diverge deep (371-868 chars) in long outputs; these are x3v MMODE0 (n=1) vs MMODE1 (batched verify) accumulation-tie candidates, but the >0.5 margin rule needs a measured top-2.
+- **Margin tool not yet built**: `tqllm::Model::capture(prompt, hidden, logits)` gives the final-position logits, so a small `tools/` tool (args: weights gguf + tokenizer + prefix text -> top-5) is the path; it needs the GGUF->tokenizer route tqserve uses.
+- **KLD vs llama-paw (wikitext 32x2048, <1e-3) not yet run** (needs a llama-paw reference logits file).
+- sq verdict: keep sq as the n=1 default (bit-matches llama-paw `GGML_PAW_X3_GEMV=0`).
