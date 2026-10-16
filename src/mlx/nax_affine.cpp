@@ -35,7 +35,7 @@ const char* kSource = R"METAL(
     const uint local = sg / SPLIT;
     const int split = int(sg % SPLIT);
     const uint blk = threadgroup_position_in_grid.x * BPT + local;
-    constexpr int E = MR > 16 ? 32 : 16;
+    constexpr int E = MR > 32 ? 64 : (MR > 16 ? 32 : 16);
     threadgroup float part[SPLIT > 1 ? BPT * SPLIT * 32 * E : 1];
     const int row0 = int(threadgroup_position_in_grid.y) * MR;
     const int rows = min(int(R[0]) - row0, MR);
@@ -53,6 +53,14 @@ const char* kSource = R"METAL(
     auto ca2 = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
     for (short i = 0; i < 16; i++) cc2[i] = 0.0f;
+#endif
+#if NAX_WIDE > 1
+    // 64-row prefill tile: four row tiles share every decoded weight fragment
+    auto ca3 = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto cc3 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto ca4 = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto cc4 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    for (short i = 0; i < 16; i++) {cc3[i] = 0.0f; cc4[i] = 0.0f;}
 #endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
     const device uint* hp = H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
@@ -115,6 +123,18 @@ const char* kSource = R"METAL(
                 op.run(ca2, cb, cc2);
             }
 #endif
+#if NAX_WIDE > 1
+            {
+                half4 a4 = fm + 32 < rows ? *(const device half4*)(xs + 32 * K + ks * 16) : half4(0.0h);
+                half4 a5 = fm + 40 < rows ? *(const device half4*)(xs + 40 * K + ks * 16) : half4(0.0h);
+                for (short i = 0; i < 4; i++) { ca3[i] = a4[i]; ca3[4 + i] = a5[i]; }
+                op.run(ca3, cb, cc3);
+                half4 a6 = fm + 48 < rows ? *(const device half4*)(xs + 48 * K + ks * 16) : half4(0.0h);
+                half4 a7 = fm + 56 < rows ? *(const device half4*)(xs + 56 * K + ks * 16) : half4(0.0h);
+                for (short i = 0; i < 4; i++) { ca4[i] = a6[i]; ca4[4 + i] = a7[i]; }
+                op.run(ca4, cb, cc4);
+            }
+#endif
         }
     }
     if (SPLIT > 1) {
@@ -124,6 +144,9 @@ const char* kSource = R"METAL(
 #if NAX_WIDE
         for (short i = 0; i < 16; i++) mine[16 + i] = cc2[i];
 #endif
+#if NAX_WIDE > 1
+        for (short i = 0; i < 16; i++) {mine[32 + i] = cc3[i]; mine[48 + i] = cc4[i];}
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (split != 0) return;
         for (int p = 1; p < SPLIT; p++) {
@@ -131,6 +154,9 @@ const char* kSource = R"METAL(
             for (short i = 0; i < 16; i++) cc[i] = cc[i] + other[i];
 #if NAX_WIDE
             for (short i = 0; i < 16; i++) cc2[i] = cc2[i] + other[16 + i];
+#endif
+#if NAX_WIDE > 1
+            for (short i = 0; i < 16; i++) {cc3[i] = cc3[i] + other[32 + i]; cc4[i] = cc4[i] + other[48 + i];}
 #endif
         }
     }
@@ -142,6 +168,10 @@ const char* kSource = R"METAL(
         if (r < rows) Y[(size_t)(row0 + r) * N + c] = v;
 #if NAX_WIDE
         if (r + 16 < rows) Y[(size_t)(row0 + r + 16) * N + c] = BF ? float(bfloat16_t(float(cc2[i]))) : float(cc2[i]);
+#endif
+#if NAX_WIDE > 1
+        if (r + 32 < rows) Y[(size_t)(row0 + r + 32) * N + c] = BF ? float(bfloat16_t(float(cc3[i]))) : float(cc3[i]);
+        if (r + 48 < rows) Y[(size_t)(row0 + r + 48) * N + c] = BF ? float(bfloat16_t(float(cc4[i]))) : float(cc4[i]);
 #endif
     }
 )METAL";
@@ -268,8 +298,13 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
                                                   std::string("#define NAX_WIDE 0\n") + kSource, kHeader);
     static auto kernel32 = mx::fast::metal_kernel("tqllm_nax_affine32", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
                                                   std::string("#define NAX_WIDE 1\n") + kSource, kHeader);
-    const int m = input.shape(0), mr = m <= 16 ? 16 : 32, split = nax_affine_splits(w);
-    auto& kernel = mr == 16 ? kernel16 : kernel32;
+    // TQLLM_MLX_NAX_MR64=1: chunks over 32 rows use the 64-row tile without split-K (row tiles give the parallelism)
+    static auto kernel64 = mx::fast::metal_kernel("tqllm_nax_affine64", {"W", "H", "S", "Bz", "X", "R"}, {"Y"},
+                                                  std::string("#define NAX_WIDE 2\n") + kSource, kHeader);
+    static const bool mr64 = std::getenv("TQLLM_MLX_NAX_MR64") != nullptr;
+    const int m = input.shape(0), mr = m <= 16 ? 16 : (m <= 32 || !mr64 ? 32 : 64);
+    const int split = mr == 64 ? 1 : nax_affine_splits(w);
+    auto& kernel = mr == 16 ? kernel16 : mr == 32 ? kernel32 : kernel64;
     auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);
     auto count = mx::array(&m32, {1}, mx::uint32);
