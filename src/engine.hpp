@@ -27,9 +27,11 @@ struct Engine {
         throw std::runtime_error("speculative decoding not supported for this model");
     }
     // Sampling for generate_spec (temperature 0 = greedy): top-k <= 16 of the exact head logits, top-p, seed.
-    virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) {
+    // presence: subtracted from the logit of every candidate seen in the last kPresenceLastN output tokens
+    // (OpenAI presence_penalty; breaks the phrase-level loops of long sampled thinking)
+    virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) {
         if (temperature > 0.f) throw std::runtime_error("sampling not supported for this model");
-        (void) top_p, (void) top_k, (void) seed;
+        (void) top_p, (void) top_k, (void) seed, (void) presence;
     }
     // Multi-slot serving: each slot holds one sequence (KV, recurrent state, drafter K/V, sampling). select_slot makes
     // a slot active for the calls that follow; spec_begin prefills it, spec_advance runs one draft + verify step

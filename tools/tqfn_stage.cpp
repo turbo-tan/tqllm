@@ -3201,7 +3201,8 @@ public:
     }
     bool incremental() const override { return true; }
     bool has_drafter() const override { return true; }
-    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) override {
+    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) override {
+        (void) presence;
         S().temp_ = temperature; S().top_p_ = top_p > 0.f && top_p <= 1.f ? top_p : 1.f; S().top_k_ = top_k; S().rng_.seed(seed ? seed : 0x9e3779b97f4a7c15ull);
     }
     uint32_t step(uint32_t, uint32_t, bool, float *) override { throw std::runtime_error("Flash-Next serves through spec_begin / spec_advance"); }

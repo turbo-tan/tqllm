@@ -36,7 +36,7 @@ public:
     std::vector<uint32_t> generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int draft,
                                         uint64_t * stats = nullptr);
     // Sampling for generate_spec: temperature 0 = greedy; top_k <= 16, top_p, seed.
-    void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0);
+    void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0, float presence = 0.f);
     // Multi-slot: select_slot makes a slot active for the calls that follow (set_sampling included).
     int slots() const;
     uint32_t context() const;  // positions per slot (the memory fit may have halved the requested context)

@@ -245,6 +245,17 @@ void test_sampling_numbers() {
     check(b.ok && b.top_k == 0 && b.seed == 0, "zero preserves defaults");
     const auto c = parse("\"top_k\":null,\"seed\":null");
     check(c.ok && c.top_k == 0 && c.seed == 0, "nullable optional sampling fields");
+    // --temp / --top-p / --top-k fill only what the request leaves out
+    tqserve::serve_options().temperature = 0.6f; tqserve::serve_options().top_p = 0.95f; tqserve::serve_options().top_k = 20;
+    const auto d = parse("\"max_tokens\":4");
+    check(d.ok && d.temperature == 0.6f && d.top_p == 0.95f && d.top_k == 20, "server sampling defaults");
+    const auto e = parse("\"temperature\":0,\"top_k\":5");
+    check(e.ok && e.temperature == 0.f && e.top_k == 5 && e.seed == 0, "request sampling overrides server defaults");
+    tqserve::serve_options().presence_penalty = 1.5f;
+    const auto f = parse("\"max_tokens\":4"), g = parse("\"presence_penalty\":0");
+    check(f.ok && f.presence_penalty == 1.5f && g.ok && g.presence_penalty == 0.f, "presence penalty default and override");
+    tqserve::serve_options().presence_penalty = 0.f;
+    tqserve::serve_options().temperature = 0.f; tqserve::serve_options().top_p = 1.f; tqserve::serve_options().top_k = 0;
 }
 
 int main(int argc, char ** argv) {

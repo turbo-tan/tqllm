@@ -1772,7 +1772,8 @@ private:
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
     // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; the host runs
     // speculative sampling (accept draft d with p(d), else resample from p without d; bonus token from p).
-    struct Sampling { float temperature = 0.f, top_p = 1.f; int top_k = 0; } samp;
+    struct Sampling { float temperature = 0.f, top_p = 1.f, presence = 0.f; int top_k = 0; } samp;
+    static constexpr int kPresenceLastN = 64;  // llama.cpp's default penalty window (repeat_last_n)
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
@@ -2203,8 +2204,9 @@ public:
     bool full_logits = tqllm::debug_value("full_head") != nullptr;  // TQLLM_DEBUG=full_head: full-vocabulary int8 head, the reference for the shortlist
     void set_full_logits(bool on) override { full_logits = on; }
     const float * verify_logits() const override { return v_logits.as<float>(); }
-    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) override {
+    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) override {
         samp.temperature = temperature;
+        samp.presence = presence > 0.f ? presence : 0.f;
         samp.top_p = top_p > 0.f && top_p <= 1.f ? top_p : 1.f;
         samp.top_k = top_k;
         rng.seed(seed);
@@ -2613,14 +2615,21 @@ public:
             tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, lg_out, id_out, s_scr.p, stream);
     }
 
-    // Column i's sampling distribution: top-16 by exact logit, temperature, top-k (<= 16), top-p.
+    // Column i's sampling distribution: top-16 by exact logit, presence penalty against `recent` (the last output
+    // tokens before this column), temperature, top-k (<= 16), top-p.
     struct Dist { uint32_t id[16]; double p[16]; int n = 0; };
-    Dist dist(int col) const {
+    Dist dist(int col, const std::vector<uint32_t> & recent = {}) const {
         Dist d;
         int ord[16];
         for (int i = 0; i < 16; ++i) ord[i] = i;
-        const float * lg = h_slg.data() + size_t(col) * 16;
+        float lg[16];
         const uint32_t * id = h_sid.data() + size_t(col) * 16;
+        std::copy_n(h_slg.data() + size_t(col) * 16, 16, lg);
+        if (samp.presence > 0.f) {
+            const size_t r0 = recent.size() > size_t(kPresenceLastN) ? recent.size() - kPresenceLastN : 0;
+            for (int i = 0; i < 16; ++i)
+                if (std::find(recent.begin() + long(r0), recent.end(), id[i]) != recent.end()) lg[i] -= samp.presence;
+        }
         std::sort(ord, ord + 16, [&](int a, int b) { return lg[a] > lg[b]; });
         const int k = samp.top_k > 0 ? std::min(samp.top_k, 16) : 16;
         double sum = 0;
@@ -3707,8 +3716,9 @@ public:
                     if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
                     if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-                        std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f tok/s)\n", t + uint32_t(m), P,
-                                     (t + uint32_t(m)) / elapsed);
+                        const uint32_t done = t + uint32_t(m);  // rate counts this request's new tokens (not reused ones)
+                        std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f%%, %.0f tok/s)\n", done, P,
+                                     100.0 * done / P, (done - P0) / elapsed);
                     }
                 }
                 sync_ck();
@@ -3763,16 +3773,22 @@ public:
         int j = 0;
         if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
             std::uniform_real_distribution<double> uni(0.0, 1.0);
+            std::vector<uint32_t> recent;  // presence window: the output so far, then each draft token as it is accepted
+            if (samp.presence > 0.f) {
+                const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
+                recent.assign(gen.out.begin() + long(r0), gen.out.end());
+            }
             for (; j < int(draft.size()); ++j) {
-                const Dist d = dist(col0 + j);
+                const Dist d = dist(col0 + j, recent);
                 double q = 0;
                 for (int i = 0; i < d.n; ++i) if (d.id[i] == draft[j]) q = d.p[i];
                 if (uni(rng) >= q) {
                     res[j] = draw(d, draft[j]);
                     break;
                 }
+                if (samp.presence > 0.f) recent.push_back(draft[j]);
             }
-            if (j == int(draft.size())) res[j] = draw(dist(col0 + j));
+            if (j == int(draft.size())) res[j] = draw(dist(col0 + j, recent));
         } else {
             while (j < int(draft.size()) && draft[j] == res[j]) ++j;
         }
@@ -4061,7 +4077,9 @@ public:
         dec_log_tp = now;
         const double total = std::chrono::duration<double>(now - gen.decode_start).count();
         const uint32_t n = uint32_t(gen.out.size());
-        std::fprintf(stderr, "decode progress %u tokens (%.0f tok/s)\n", n, total > 0 ? n / total : 0.0);
+        std::fprintf(stderr, "decode progress %u tokens (%.0f tok/s), drafts accepted %llu of %llu (%.0f%%)\n", n,
+                     total > 0 ? n / total : 0.0, (unsigned long long) gen.accepted, (unsigned long long) gen.drafted,
+                     gen.drafted ? 100.0 * gen.accepted / gen.drafted : 0.0);
     }
 
     // One draft + verify step on the active slot; false once the generation is complete.

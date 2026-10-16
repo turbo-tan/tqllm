@@ -702,8 +702,8 @@ void Model::verify(const std::vector<uint32_t> & tokens, uint32_t pos, std::vect
 void Model::commit(int accepted) { impl_->e->commit(accepted); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
-void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed) {
-    impl_->e->set_sampling(temperature, top_p, top_k, seed);
+void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
+    impl_->e->set_sampling(temperature, top_p, top_k, seed, presence);
 }
 
 std::vector<uint32_t> Model::generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int draft,
