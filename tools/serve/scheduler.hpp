@@ -190,7 +190,7 @@ private:
                 if (!job || std::find(admitted.begin(), admitted.end(), job) == admitted.end()) continue;
                 try {
                     model_.select_slot(int(s));
-                    model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
+                    model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed, job->req.presence_penalty);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     model_.spec_begin(job->prompt, job->count, draft_length());
                 } catch (const std::exception & e) {

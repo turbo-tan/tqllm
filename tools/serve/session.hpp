@@ -5,6 +5,7 @@
 #if TQLLM_WITH_CUDA
 #include <src/vision.hpp>
 #endif
+#include <src/debug.hpp>
 #include "json_out.hpp"
 
 #if TQLLM_WITH_CUDA
@@ -22,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -82,11 +84,13 @@ inline std::string json_error(const std::string & message, const char * type = "
     return out;
 }
 
-// Sampling for requests that set none (--temperature / --top-p / --top-k). Agents such as Codex send no temperature;
-// greedy decoding (the default) can repeat itself on repetitive output, so `tqllm launch` sets the model's recommended values.
+// Sampling for requests that set none (--temperature (alias --temp) / --top-p / --top-k / --presence-penalty). Agents such
+// as Codex send no temperature; greedy decoding (the default) can repeat itself on repetitive output, so `tqllm launch` sets
+// the model's recommended values.
 struct SamplingDefaults {
     float temperature = 0.f, top_p = 1.f;
     int top_k = 0;
+    float presence_penalty = 0.f;  // Qwen: 1.5 against phrase loops in long sampled thinking
 };
 inline SamplingDefaults & sampling_defaults() {
     static SamplingDefaults d;
@@ -110,6 +114,7 @@ struct ChatRequest {
     float temperature = sampling_defaults().temperature;  // 0 = greedy (TQLLM samples from the exact top-16 logits)
     float top_p = sampling_defaults().top_p;
     int top_k = sampling_defaults().top_k;
+    float presence_penalty = sampling_defaults().presence_penalty;  // sampling only: logit - penalty, last 64 output tokens
     uint64_t seed = 0;
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
@@ -190,6 +195,7 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         };
         double tv = 0;
         if (num("temperature", tv)) req.temperature = float(tv);
+        if (num("presence_penalty", tv)) req.presence_penalty = float(tv);
         if (num("top_p", tv)) req.top_p = float(tv);
         if (const auto * x = root.get("top_k"); x && x->kind != tqllm::Json::Null) {
             if (x->kind != tqllm::Json::Number || !std::isfinite(x->num) || x->num < 0 ||
@@ -208,6 +214,8 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 return req;
             }
             req.seed = uint64_t(x->num);
+        } else if (req.temperature > 0.f) {
+            req.seed = std::random_device{}();  // sampling without a seed: a fresh one per request (llama.cpp), so a retry is not a replay
         }
         const auto * max_tokens = root.get("max_tokens");
         if (!max_tokens) max_tokens = root.get("max_completion_tokens");
@@ -703,7 +711,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // verify path (quantized qwen35 GGUF): chunked prefill, then DFlash2 drafts or one verified token per step.
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
-        model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
+        model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         model.spec_begin(prompt, count, draft_length(model.native_mtp()));
         RepeatGuard guard;
@@ -867,6 +875,16 @@ inline void usage_timings(std::string & out, const DecodeResult & result) {
     out += ",\"predicted_n\":" + std::to_string(n) + ",\"predicted_ms\":" + num(result.decode_ms);
     out += ",\"predicted_per_second\":" + num(result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0);
     out += ",\"draft_n\":" + std::to_string(result.draft_n) + ",\"draft_n_accepted\":" + std::to_string(result.draft_accepted) + "}";
+    // TQLLM_DEBUG=reqlog: one line per finished request with the same tok/s the client gets (llama.cpp-style:
+    // decode rate excludes the first token, which the prefill produced).
+    if (tqllm::debug_on("reqlog")) {
+        const double pre_tps = result.prefill_ms > 0 ? result.prompt_tokens * 1000.0 / result.prefill_ms : 0;
+        const double dec_tps = result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0;
+        std::fprintf(stderr, "reqlog: prompt %u tokens %.1f ms (%.1f tok/s) | decode %u tokens %.1f ms (%.1f tok/s) | draft %llu/%llu (%.0f%%)\n",
+                     result.prompt_tokens, result.prefill_ms, pre_tps, n, result.decode_ms, dec_tps,
+                     (unsigned long long) result.draft_accepted, (unsigned long long) result.draft_n,
+                     result.draft_n ? 100.0 * result.draft_accepted / result.draft_n : 0.0);
+    }
 }
 
 // SSE output of one request. update() sends what the ids generated so far add to the reasoning / content texts that
@@ -1004,7 +1022,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     PreparedImages images;
     const auto prompt = prepare(tokenizer, req, context, result, count, &images);
     if (!result.error.empty()) return result;
-    model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
+    model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
     model.spec_begin(prompt, count, draft_length(model.native_mtp()));
     RepeatGuard guard;

@@ -63,6 +63,10 @@ struct WeightFormat {
                         int topk, cudaStream_t) const;
     // FP16 [rows][cols] in basis(), for the cuBLAS prefill GEMM.
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
+    // int8 prefill without an FP16 round trip: weights quantised straight to int8 [rows][cols] (row-major) plus the
+    // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
+    // dequant_h + per-chunk quantise path (the default for every format).
+    virtual bool dequant_i8(const Mat &, int8_t * w8, float * row_scale, cudaStream_t) const { return false; }
     // Device bytes per row of the data / aux arrays when rows are stored contiguously (a row range is then a Mat of its
     // own: p + r0 * row_bytes, aux + r0 * aux_row_bytes); 0 = not row-sliceable.
     virtual size_t row_bytes(int /*cols*/) const { return 0; }

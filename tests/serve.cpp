@@ -262,6 +262,10 @@ void test_sampling_numbers() {
     check(b.ok && b.top_k == 0 && b.seed == 0, "zero preserves defaults");
     const auto c = parse("\"top_k\":null,\"seed\":null");
     check(c.ok && c.top_k == 0 && c.seed == 0, "nullable optional sampling fields");
+    tqserve::sampling_defaults().presence_penalty = 1.5f;
+    const auto f = parse("\"max_tokens\":4"), g = parse("\"presence_penalty\":0");
+    check(f.ok && f.presence_penalty == 1.5f && g.ok && g.presence_penalty == 0.f, "presence penalty default and override");
+    tqserve::sampling_defaults() = {};
 }
 
 int main(int argc, char ** argv) {

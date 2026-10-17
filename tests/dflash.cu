@@ -243,7 +243,7 @@ int main() {
     { // multi-query verify attention (head_dim 256) vs CPU, causal, several depths
         const int heads = 24, kvh = 4, D = 256;
         struct Case { int seq0, nq; bool q8; };
-        for (auto [seq0, nq, q8] : {Case{5, 8, false}, {100, 8, false}, {3000, 8, false}, {3000, 3, false}, {37, 1, false},
+        for (auto [seq0, nq, q8] : std::initializer_list<Case>{{5, 8, false}, {100, 8, false}, {3000, 8, false}, {3000, 3, false}, {37, 1, false},
                                     {3000, 8, true}, {77, 5, true}}) {
             const int ctx = seq0 + nq + 64;
             std::vector<bf16> q(size_t(nq) * heads * D), kc(size_t(ctx) * kvh * D), vc(kc.size());

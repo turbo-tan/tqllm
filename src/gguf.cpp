@@ -1,4 +1,5 @@
 #include "gguf.hpp"
+#include "paw_gguf.hpp"
 
 #include <fstream>
 #include <limits>
@@ -85,7 +86,8 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
     switch (type) {
         case GGML_F32:    elems = 1;   bytes = 4;   return true;
         case GGML_F16:
-        case GGML_BF16:   elems = 1;   bytes = 2;   return true;
+        case GGML_BF16:
+        case GGML_I16:    elems = 1;   bytes = 2;   return true;
         case GGML_Q4_0:   elems = 32;  bytes = 18;  return true;
         case GGML_Q8_0:   elems = 32;  bytes = 34;  return true;
         case GGML_GSQ_Q2_0: elems = 64; bytes = 18; return true;
@@ -190,6 +192,21 @@ bool GgufFile::has(const std::string & key) const { return kv.count(key) != 0; }
 
 std::vector<char> GgufFile::read(const GgufTensor & t) const {
     std::ifstream in(path, std::ios::binary);
+    if (!t.parts.empty()) {
+        // Virtual tensor: header, then each part's bytes read from wherever it lives.
+        std::vector<char> buf;
+        buf.reserve(size_t(t.bytes));
+        buf.insert(buf.end(), t.header.begin(), t.header.end());
+        for (const GgufTensor & p : t.parts) {
+            std::vector<char> pb(p.bytes);
+            in.seekg(std::streamoff(p.offset));
+            in.read(pb.data(), std::streamsize(p.bytes));
+            if (!in) throw std::runtime_error("failed reading GGUF tensor part");
+            buf.insert(buf.end(), pb.begin(), pb.end());
+        }
+        if (buf.size() != t.bytes) throw std::runtime_error("virtual GGUF tensor byte-count mismatch");
+        return buf;
+    }
     std::vector<char> buf(t.bytes);
     in.seekg(std::streamoff(t.offset));
     in.read(buf.data(), std::streamsize(t.bytes));
@@ -249,6 +266,7 @@ GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
         if (t.bytes > size - t.offset) throw std::runtime_error("GGUF tensor out of bounds: " + name);
         f.tensors.emplace(name, std::move(t));
     }
+    paw_adapt(f);  // paw-dense -> qwen35 view (no-op for every other arch)
     return f;
 }
 

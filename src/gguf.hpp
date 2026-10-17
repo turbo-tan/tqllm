@@ -24,11 +24,13 @@ enum GgmlType : uint32_t {
     GGML_IQ3_S = 21,
     GGML_IQ2_S = 22,     // MoE expert tensors (GLM-5.3-Flash ffn_gate_exps / ffn_up_exps)
     GGML_IQ4_XS = 23,
+    GGML_I16 = 25,       // PAW X3 trellis words (m3_trellis parts), 1 elem / 2 B
     GGML_IQ1_M = 29,
     GGML_BF16 = 30,
     GGML_TQ3_4S = 46,
     GGML_TQ4 = 300, GGML_TQ3 = 301,  // TQLLM-only ids
     GGML_GSQ_Q2_0 = 302,  // explicit GSQ-RCO dialect: external id42, not fork Q1_0
+    GGML_X3 = 303,        // PAW X3 (EXL3 trellis) virtual matmul: header + trellis/suh/svh parts
 };
 
 
@@ -38,6 +40,12 @@ struct GgufTensor {
     uint64_t offset = 0;       // absolute file offset
     uint64_t bytes = 0;
     uint64_t type_header_offset = 0; // original type field, for explicit dialect reader adapters
+
+    // Virtual tensors (type GGML_X3): the byte payload is `header` followed by every part's bytes,
+    // which may live at unrelated file offsets. read() concatenates exactly that. Empty for an
+    // ordinary single-range tensor, where offset/bytes describe the file range directly.
+    std::vector<char> header;
+    std::vector<GgufTensor> parts;
 };
 
 // Block layout of a quantised GGUF type: `elems` weights per block, `bytes` per block.
