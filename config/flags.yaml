@@ -3,6 +3,302 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_MLX_ABLATE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ABLATE_BLOCKS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ABLATE_SMALL
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_CHECK
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_FFN
+    kind: user
+    default: "-"
+    doc: "DIR: Neural Engine share of the prefill FFN from per-layer Core ML models (opt-in fast prefill; quality changes, see docs/MLX_BACKEND.md)"
+  - name: TQLLM_MLX_ANE_FULL_DEQUANT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_NOISE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_SERIAL
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_SKIP_PREDICT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_TIMING
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ANE_WAVE
+    kind: user
+    default: "-"
+    doc: "1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN)"
+  - name: TQLLM_MLX_ATTN_DECODE_ROWS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ATTN_DECODE_V2
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ATTN_DECODE_V3
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ATTN_PREFILL_BF16
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ATTN_Q_CHUNK
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_ATTN_V3_PB
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_CACHE_LIMIT_MIB
+    kind: user
+    default: "-"
+    doc: "MiB: MLX buffer-cache limit for the Mac tools (default 512)"
+  - name: TQLLM_MLX_COUNT_NODES
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_BLOCK
+    kind: user
+    default: "-"
+    doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
+  - name: TQLLM_MLX_DFLASH_CHAIN
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_PIPELINE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_RANKSTATS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_SHARDED_TOP16
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_SPEC_ONLY
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_WARM_TOKENS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DRAFT_ABLATE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DRAFT_BUILD_PROFILE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DROP_TILED_ORIGINALS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DUMP_FFN
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DUMP_FFN_SLICE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_EAGER_ACCEPT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_EAGER_COMMIT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_FFN_GEMM
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_FUSE_EW
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_FUSE_SWIGLU_ROTATION
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_GDN_CHUNKED
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_GDN_FUSE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_GDN_FUSE_PREFILL
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_GDN_STEP
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_HEAD_FRAG
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_KV_F32
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_LAZY_INJECT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_LAZY_VERIFY_COMMIT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_MMA8
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_MMA8_DRAFT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_MMA8_UNTILED_ONLY
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_DRAFT_HEAD4
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_DRAFT_SHORTLIST
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_FUSE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_MAX_SPLIT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_MR64
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_NO_INPUT_CACHE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_PREFILL_GEMM
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_Q6_HEAD
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_ROW_CHECK
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_SPLIT_TARGET
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_NAX_TQ4
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_PAIRED_SWIGLU_ROTATION
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_PREFILL_CHUNK
+    kind: user
+    default: "-"
+    doc: "N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best)"
+  - name: TQLLM_MLX_PREFILL_GEMM
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_PREFILL_INT8
+    kind: user
+    default: "-"
+    doc: "1: int8 matrix-unit prefill for FFN gate/up (opt-in, quality changes; 2 = exact slow mode)"
+  - name: TQLLM_MLX_PREFILL_INT8_MASK
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_SPLIT_COMMIT_TIMING
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_STAGED_BKM
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_STAGED_KS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_STAGED_MT
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_STAGED_PERSG
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_STAGED_SIMDS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_TARGET_HEAD_HOST
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_TARGET_HEAD_IDS
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_TARGET_HEAD_SHORTLIST
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_TQ4_ROTATE_UNFUSED
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MOE_FUSE_SHARED
     kind: debug
     default: "on"
