@@ -126,7 +126,9 @@ def main():
         if f == "CMakeLists.txt":
             n = n.replace("file(GLOB TQLLM_FORMAT_SOURCES CONFIGURE_DEPENDS src/formats/*.cpp kernels/formats/*.cu)",
                           "file(GLOB_RECURSE TQLLM_FORMAT_SOURCES CONFIGURE_DEPENDS src/formats/*.cpp src/formats/*.cu)")
-            n = n.replace("${CMAKE_CURRENT_SOURCE_DIR}/kernels", "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            n = n.replace("${CMAKE_CURRENT_SOURCE_DIR}/kernels/third_party/", "${CMAKE_CURRENT_SOURCE_DIR}/third_party/")
+            n = n.replace("(MIT, kernels/third_party/", "(MIT, third_party/")
+            n = re.sub(r"\$\{CMAKE_CURRENT_SOURCE_DIR\}/kernels(?![\w/])", "${CMAKE_CURRENT_SOURCE_DIR}/src", n)
             if "include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core" not in n:
                 dirs = [d for d in INCLUDE_DIRS if os.path.isdir(os.path.join(ROOT, d))]
                 block = ("# Source layout (AGENTS.md): one folder per component and per model architecture, host and device code together.\n"
