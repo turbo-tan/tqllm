@@ -52,7 +52,7 @@ int main(int argc,char** argv) {
             else throw std::invalid_argument("unknown argument: "+arg);
         }
         if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1||verify_repeats<1||
-           (verify_width!=0 && verify_width!=1 && verify_width!=2 && verify_width!=4 && verify_width!=8 && !(verify_width==16 && !verify_prefix_probe)))
+           (verify_width!=0 && verify_width!=1 && verify_width!=2 && verify_width!=4 && verify_width!=8 && verify_width!=16))
             throw std::invalid_argument("usage: tqmlx-probe --model file.gguf --prompt text [--generate N --repeat N --warmup N]");
         tqllm::Tokenizer tokenizer;tokenizer.load(model);
         std::vector<uint32_t> input;
