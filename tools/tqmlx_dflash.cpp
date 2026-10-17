@@ -29,7 +29,7 @@ int main(int argc,char** argv) {
         // exact 8-row blocks, the next block only while every drafted token so far is accepted: tok/step of a wider draft
         // with today's 8-row verify paths (speed not representative)
         const bool chain=std::getenv("TQLLM_MLX_DFLASH_CHAIN")!=nullptr;
-        if(width<1 || width>(chain?15:7) || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
+        if(width<1 || width>15 || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
         int prefill_chunk=0;
         if(const char* mode=std::getenv("TQLLM_MLX_PREFILL_CHUNK")) {
             prefill_chunk=std::stoi(mode);

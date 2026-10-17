@@ -23,15 +23,15 @@ int main(int argc, char** argv) {
         if (layers <= 0 || hidden <= 0) throw std::invalid_argument("invalid layer audit dimensions");
         tqllm::Tokenizer tokenizer; tokenizer.load(argv[1]);
         auto prompt = tokenizer.encode("Write a Python function that merges two sorted lists, then explain its time complexity.");
-        auto tokens = tokenizer.encode("The function compares the first elements of each list before appending the remaining elements.");
-        if (tokens.size() < 8) throw std::runtime_error("layer audit fixture needs eight tokens");
+        auto tokens = tokenizer.encode("The function compares the first elements of each list before appending the remaining elements, and returns the merged list.");
+        if (tokens.size() < 16) throw std::runtime_error("layer audit fixture needs sixteen tokens");
         mx::set_cache_limit(512*1024*1024);
         Qwen35 model(argv[1],256);
         model.gdn_mode(Qwen35::GdnMode::scan); model.verify_tiles(true);
         std::vector<int> selected(layers); std::iota(selected.begin(),selected.end(),0);
         model.feature_layers(selected); model.forward(prompt);
         auto start = model.checkpoint();
-        for (int width : {1,2,4,8}) {
+        for (int width : {1,2,4,8,16}) {
             model.restore(start);
             std::vector<std::vector<float>> reference(width);
             for (int t = 0; t < width; ++t) {

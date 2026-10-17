@@ -76,7 +76,7 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
     if (past < 0 || v.shape(2) != k.shape(2) || length > k.shape(2))
         throw std::invalid_argument("attention cache shorter than query block");
     const bool decode_rows = std::getenv("TQLLM_MLX_ATTN_DECODE_ROWS") != nullptr;
-    if (decode_rows && n <= 8 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
+    if (decode_rows && n <= 16 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
         (k.dtype() == mx::float32 || k.dtype() == mx::bfloat16) && v.dtype() == k.dtype() &&
         (q.shape(3) == 128 || q.shape(3) == 256) && q.shape(1) % k.shape(1) == 0)
         return decode_rows_attention(q, k, v, scale, length);

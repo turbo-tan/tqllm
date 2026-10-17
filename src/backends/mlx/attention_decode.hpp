@@ -8,12 +8,12 @@
 #include <mlx/transforms.h>
 
 namespace tqllm::mlx_backend {
-// Decode attention for 1-8 query rows. Keys are split into fixed partitions and merged in partition order, so a
+// Decode attention for 1-16 query rows (one simdgroup per row; 16-row verify runs 512-thread groups). Keys are split into fixed partitions and merged in partition order, so a
 // row's result does not depend on how many rows share the call (AR and the 8-row verify agree bit for bit).
 inline void check_decode_rows_shape(const mlx::core::array& q, const mlx::core::array& k, const mlx::core::array& v,
                                     int valid) {
     namespace mx = mlx::core;
-    if (q.ndim() != 4 || k.ndim() != 4 || q.shape(0) != 1 || k.shape(0) != 1 || q.shape(2) < 1 || q.shape(2) > 8 ||
+    if (q.ndim() != 4 || k.ndim() != 4 || q.shape(0) != 1 || k.shape(0) != 1 || q.shape(2) < 1 || q.shape(2) > 16 ||
         (valid > 0 ? valid : k.shape(2)) < q.shape(2) || valid > k.shape(2) || v.shape() != k.shape() || q.shape(1) % k.shape(1) ||
         (q.shape(3) != 128 && q.shape(3) != 256) || k.shape(3) != q.shape(3) || q.dtype() != mx::float32 ||
         (k.dtype() != mx::float32 && k.dtype() != mx::bfloat16) || v.dtype() != k.dtype())
@@ -97,7 +97,7 @@ out[(hg * rows + t) * uint(DIM) + d] = numerator / total;
     const auto stream = mx::Device(mx::Device::gpu);
     auto scratch = partial({mx::contiguous(q), mx::contiguous(k), mx::contiguous(v), layout_array, mx::array(scale)},
                            {{kvheads, parts, n, group}, {kvheads, parts, n, group}, {kvheads, parts, n, group, dim}},
-                           {mx::float32, mx::float32, mx::float32}, {parts * 256, kvheads, 1}, {256, 1, 1},
+                           {mx::float32, mx::float32, mx::float32}, {parts * (n > 8 ? 512 : 256), kvheads, 1}, {n > 8 ? 512 : 256, 1, 1},
                            {{"DIM", dim}, {"GROUP", group}, {"PB", PB}, {"KT", k.dtype()}}, std::nullopt, false, stream);
     return merge({scratch[0], scratch[1], scratch[2], layout_array}, {q.shape()}, {mx::float32}, {dim, heads, n},
                  {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
@@ -440,6 +440,7 @@ inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const m
                                               const mlx::core::array& v, float scale, int valid = -1) {
     // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
     static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr, v3 = std::getenv("TQLLM_MLX_ATTN_DECODE_V3") != nullptr;
+    if (q.shape(2) > 8) return decode_rows_attention_v1(q, k, v, scale, valid);  // v2 / v3 tile 8 rows
     return v3 ? decode_rows_attention_v3(q, k, v, scale, valid)
          : v2 ? decode_rows_attention_v2(q, k, v, scale, valid) : decode_rows_attention_v1(q, k, v, scale, valid);
 }

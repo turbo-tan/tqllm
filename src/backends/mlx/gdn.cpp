@@ -170,7 +170,7 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
        decay.dtype()!=mx::float32 || beta.dtype()!=mx::float32)
         throw std::invalid_argument("unsupported GDN scan dimensions");
     const int m=q.shape(1),kh=q.shape(2),vh=v.shape(2);
-    if(compact && (!snapshots || m>8))
+    if(compact && (!snapshots || m>16))
         throw std::invalid_argument("compact GDN tape requires prefix snapshots and 1-8 tokens");
     auto initial=state?*state:mx::zeros({1,vh,128,128});
     if(initial.shape()!=mx::Shape{1,vh,128,128} || initial.dtype()!=mx::float32)
@@ -415,7 +415,7 @@ mx::array gdn_replay_prefix(const mx::array& keys,const mx::array& decay,const m
        deltas.ndim()!=3 || deltas.shape(0)!=keys.shape(1) || deltas.shape(1)<1 || deltas.shape(2)!=128 ||
        deltas.dtype()!=mx::float32 || deltas.shape(1)%keys.shape(2) ||
        decay.shape()!=mx::Shape{1,keys.shape(1),deltas.shape(1)} || decay.dtype()!=mx::float32 ||
-       count<1 || count>keys.shape(1) || keys.shape(1)>8)
+       count<1 || count>keys.shape(1) || keys.shape(1)>16)
         throw std::invalid_argument("invalid compact GDN prefix tape");
     const int kh=keys.shape(2),vh=deltas.shape(1);
     auto state=initial?*initial:mx::zeros({1,vh,128,128});

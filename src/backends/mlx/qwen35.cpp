@@ -1160,8 +1160,8 @@ struct Qwen35::Verification::State {
     std::optional<mx::array> features_before,features_after;
 };
 mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
-    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
-        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-8 tokens");
+    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>16)
+        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-16 tokens");
     batch.state_.reset();
     const auto before=checkpoint();
     impl_->capture_prefix=true;
@@ -1183,8 +1183,8 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
     }
 }
 mx::array Qwen35::verify_choices(std::span<const uint32_t> tokens,Verification& batch) {
-    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>8)
-        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-8 tokens");
+    if(!impl_->scan_gdn || impl_->native_head_order || tokens.empty() || tokens.size()>16)
+        throw std::invalid_argument("MLX prefix verification requires scan GDN and 1-16 tokens");
     batch.state_.reset();
     const auto before=checkpoint();
     impl_->capture_prefix=true;
@@ -1209,8 +1209,8 @@ mx::array Qwen35::verify_choices(std::span<const uint32_t> tokens,Verification& 
     }
 }
 mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch,bool choices) {
-    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>8)
-        throw std::invalid_argument("device verification needs uint32 ids [1..8]");
+    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>16)
+        throw std::invalid_argument("device verification needs uint32 ids [1..16]");
     const std::vector<uint32_t> placeholder(size_t(ids.shape(0)),0u);
     impl_->device_ids=ids;
     try {
