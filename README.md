@@ -95,7 +95,7 @@ curl http://localhost:8086/v1/chat/completions \
 
 Follow an individual request from waiting to first output and completion, pin a
 finished request to compare latency and throughput, and chat with this instance.
-Hardware counters stay in a collapsible section. Read-only telemetry stays
+RAM, GPU memory, utilisation, temperature and power stay visible, with hardware sampling every three seconds. Read-only telemetry stays
 responsive while single-slot inference is busy; chat supports Stop and Escape.
 Build from source, add `--monitor-port 8087`, then open `http://localhost:8087/`.
 See [setup, telemetry semantics and limits](docs/MONITOR.md).

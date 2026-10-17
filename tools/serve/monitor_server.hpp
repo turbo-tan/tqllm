@@ -160,10 +160,11 @@ private:
     }
     void run() {
         MonitorHost collector(pci_);
-        auto sampled = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+        const auto hardware_interval = std::chrono::seconds(3);
+        auto sampled = std::chrono::steady_clock::now() - hardware_interval;
         while (!stop_) {
             const auto now = std::chrono::steady_clock::now();
-            if (now - sampled >= std::chrono::seconds(1)) { monitor_.hardware(collector.sample()); sampled = now; }
+            if (now - sampled >= hardware_interval) { monitor_.hardware(collector.sample()); sampled = now; }
             pollfd p{socket_, POLLIN, 0};
             if (::poll(&p, 1, 200) <= 0 || !(p.revents & POLLIN)) continue;
             const int fd = ::accept(socket_, nullptr, nullptr);

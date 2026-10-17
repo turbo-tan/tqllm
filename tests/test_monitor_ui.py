@@ -99,6 +99,12 @@ def main():
                 expect(page.locator('#connection')).to_have_text('Connected')
                 expect(page.locator('#auth')).not_to_be_visible()
                 expect(page.locator('#queue')).to_have_text('0 / 1')
+                expect(page.locator('#ramMemory')).to_be_visible()
+                expect(page.locator('#gpuMemory')).to_be_visible()
+                expect(page.locator('#cpu')).to_be_visible()
+                expect(page.locator('#temperature')).to_be_visible()
+                assert page.locator('#themeButton').inner_text() == ''
+                expect(page.locator('#themeButton')).to_have_accessible_name('Switch to light theme')
                 assert page.locator('#apiKey').input_value() == ''
                 assert page.evaluate('localStorage.length + sessionStorage.length') == 0
 
@@ -141,6 +147,7 @@ def main():
                 expect(page.locator('#chatStats')).to_contain_text('123.4 tok/s (server)')
                 page.locator('#themeButton').click()
                 assert page.evaluate('document.documentElement.dataset.theme') == 'light'
+                expect(page.locator('#themeButton')).to_have_accessible_name('Switch to dark theme')
                 page.locator('#themeButton').click()
                 page.locator('#chatClear').click()
                 page.locator('#chatInput').fill('slow terminal')

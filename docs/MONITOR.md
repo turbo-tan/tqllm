@@ -23,7 +23,7 @@ Pin a finished request as a reference to compare first-output latency and output
 rate with another request. The reference is an in-memory copy, cleared on an engine
 restart or page reload. Different token counts trigger a comparison warning; even
 equal counts do not establish equal prompts or benchmark conditions. Hardware
-readings live under **Engine and hardware details**. The compact chat dock remains
+readings stay visible under **Engine and hardware**. The compact chat dock remains
 available beside the workbench, or below it on small screens.
 
 ## Start
@@ -64,7 +64,10 @@ other applications should proxy the authenticated JSON from their own backend.
 The right-hand terminal-style chat uses this bridge. It is a chat, not an
 operating-system shell.
 
-The dashboard polls once per second while visible. Requests have a three-second
+The dashboard polls request telemetry once per second while visible. Host/device
+measurements are collected independently every three seconds and cached between
+samples. Hardware sample age is shown; readings older than ten seconds are
+unavailable. Theme switching uses an accessible sun/moon icon. Requests have a three-second
 fetch timeout; failures clear live values, mark the connection disconnected and
 retry. A five-second freshness guard clears live values after a stalled fetch.
 Engine identity and dimmed request history remain visible as last-known data.

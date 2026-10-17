@@ -112,7 +112,11 @@ h1{font-size:32px;letter-spacing:-.05em;margin:4px 0;font-weight:550}
 .lens-note{font-size:12px;color:var(--muted);margin:0;line-height:1.6}
 .compare{margin-top:16px;border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--decode)}.compare[hidden]{display:none}
 .consoles{display:none}.stats{border-radius:10px}.stat{padding:12px}
-.hardware summary{cursor:pointer;color:var(--muted);font-size:12px;padding:4px 0 12px}
+.hardware-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;margin-bottom:10px;flex-wrap:wrap}
+#device{white-space:normal;font-size:11px}
+#themeButton{display:inline-flex;align-items:center;justify-content:center;width:34px;height:32px;padding:6px}
+#themeButton svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+#themeButton .moon{display:none}:root[data-theme="light"] #themeButton .sun{display:none}:root[data-theme="light"] #themeButton .moon{display:block}
 .chart{border-radius:12px;padding:14px 18px}.chart svg{height:54px}
 .log{border:0;background:transparent}.log .head{padding:0 0 12px;border:0}
 th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transparent}tbody tr{border-top:1px solid var(--line)}
@@ -129,7 +133,7 @@ th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transp
   <div class="brand">tq<b>LLM</b> monitor</div>
   <div class="id"><strong id="model">engine</strong> on <span id="host">--</span>, build <span id="build">--</span>, <span id="slots">-- slots</span></div>
   <span class="pill"><i></i><span id="connection">Connecting</span></span>
-  <button type="button" id="themeButton" title="light / dark">theme</button>
+  <button type="button" id="themeButton" title="Switch to light theme" aria-label="Switch to light theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A8.5 8.5 0 0 1 9 4a8.5 8.5 0 1 0 11 11Z"/></svg></button>
   <button type="button" id="keyButton">key</button>
 </header>
 <main>
@@ -150,7 +154,7 @@ th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transp
     <div class="console prefill"><h2>PREFILL</h2><div class="big" id="first">--</div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="prefillLine" d=""/></svg><div class="sub" id="firstNote">time to first output, latest request</div></div>
     <div class="console decode"><h2>DECODE</h2><div class="big"><span id="speed">--</span><small>tok/s</small></div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="decodeLine" d=""/></svg><div class="sub" id="speedNote">sum over decoding requests</div></div>
   </div>
-  <details class="hardware"><summary>Engine and hardware details</summary><div class="stats">
+  <section class="hardware" aria-label="Engine and hardware"><div class="hardware-head"><span>Engine and hardware</span><span>Hardware every 3 s / requests every 1 s</span></div><div class="stats">
     <div class="stat"><div class="label">active / queued</div><strong id="queue">--</strong></div>
     <div class="stat"><div class="label">output tokens</div><strong id="tokens">--</strong></div>
     <div class="stat"><div class="label">draft acceptance</div><strong id="acceptance">--</strong></div>
@@ -164,7 +168,7 @@ th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transp
     <div class="stat"><div class="label">device</div><strong id="device">--</strong></div>
     <div class="stat"><div class="label">hardware sample</div><strong id="hardwareAge">--</strong></div>
   </div>
-  </details>
+  </section>
   <div class="chart"><div class="head"><span>output tokens / s, last 60 s</span><span id="chartStart">--</span></div>
     <svg viewBox="0 0 600 78" preserveAspectRatio="none" aria-label="Throughput, last 60 seconds"><line class="grid" x1="0" y1="39" x2="600" y2="39"/><line class="grid" x1="0" y1="77" x2="600" y2="77"/><path id="chartFill" d=""/><path id="chartLine" d=""/></svg></div>
   <div class="log"><div class="head"><span>Request history / select to inspect</span><span id="requestCount">none yet</span></div>
@@ -315,7 +319,7 @@ function render(data) {
     return tr;
   }));
   budget('context', 'contextBar', active.length ? Math.max(...active.map(r => r.context_tokens || 0)) : 0, data.engine.context_per_slot, false);
-  const h = data.hardware || {}, fresh = typeof h.sample_age_ms === 'number' && h.sample_age_ms < 5000;
+  const h = data.hardware || {}, fresh = typeof h.sample_age_ms === 'number' && h.sample_age_ms < 10000;
   budget('gpuMemory', 'gpuMemoryBar', fresh ? h.gpu_used_bytes : null, h.gpu_total_bytes, true);
   budget('ramMemory', 'ramMemoryBar', fresh ? h.ram_used_bytes : null, h.ram_total_bytes, true);
   text('cpu', fresh && h.cpu_percent != null ? number(h.cpu_percent) + '%' : '--');
@@ -347,7 +351,12 @@ async function poll(token = generation) {
   }
 }
 $('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; $('auth').hidden = true; generation++; clearTimeout(timer); poll(generation); });
-$('themeButton').addEventListener('click', () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'; });
+$('themeButton').addEventListener('click', () => {
+  const light = document.documentElement.dataset.theme !== 'light';
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  const label = 'Switch to ' + (light ? 'dark' : 'light') + ' theme';
+  $('themeButton').setAttribute('aria-label', label); $('themeButton').title = label;
+});
 $('keyButton').addEventListener('click', () => { $('auth').hidden = !$('auth').hidden; if (!$('auth').hidden) $('apiKey').focus(); });
 $('snapshotLink').addEventListener('click', event => { if (key) { event.preventDefault(); notice('The JSON endpoint uses Bearer authentication; the key is never placed in a URL. Query /api/monitor/v1/snapshot from your API client.'); } });
 document.addEventListener('visibilitychange', () => { generation++; clearTimeout(timer); previous = null; if (!document.hidden) poll(generation); });
