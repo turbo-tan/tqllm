@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -71,21 +72,47 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
     return ok && exact;
 }
 
-// microseconds per call of the v1 and v2 kernels on a BF16 KV buffer of `length` keys
+// microseconds per call on a BF16 KV buffer (cap > length, as the in-place cache), 16 calls per eval like 16 attention
+// layers: v1 / v3, MLX's fused SDPA over all rows (causal), and MLX's SDPA one row at a time (batch-invariant by construction)
 void bench(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) {
-    auto q = random_array(rng, {1, heads, n, dim}, 1.0f);
-    auto k = mx::astype(random_array(rng, {1, kvheads, length, dim}, 1.0f), mx::bfloat16);
-    auto v = mx::astype(random_array(rng, {1, kvheads, length, dim}, 1.0f), mx::bfloat16);
-    mx::eval(q, k, v);
+    const int cap = length + 512, calls = 16;
+    std::vector<mx::array> qs, ks, vs;
+    for (int c = 0; c < calls; ++c) {
+        qs.push_back(random_array(rng, {1, heads, n, dim}, 1.0f));
+        ks.push_back(mx::astype(random_array(rng, {1, kvheads, cap, dim}, 1.0f), mx::bfloat16));
+        vs.push_back(mx::astype(random_array(rng, {1, kvheads, cap, dim}, 1.0f), mx::bfloat16));
+    }
+    mx::eval(qs); mx::eval(ks); mx::eval(vs);
     const float scale = 1.0f / std::sqrt(float(dim));
-    for (int ver : {1, 3}) {
-        auto call = [&] { return ver == 1 ? decode_rows_attention_v1(q, k, v, scale) : decode_rows_attention_v3(q, k, v, scale); };
-        mx::eval(call());
-        const int reps = 20;
+    auto view = [&](const mx::array& x, int len) { return mx::slice(x, {0, 0, 0, 0}, {1, kvheads, len, dim}); };
+    auto sdpa_all = [&](int c) {
+        auto q = mx::astype(qs[c], mx::bfloat16);
+        return mx::astype(mx::fast::scaled_dot_product_attention(q, view(ks[c], length), view(vs[c], length), scale, n > 1 ? "causal" : ""), mx::float32);
+    };
+    auto sdpa_rows = [&](int c) {
+        std::vector<mx::array> out;
+        for (int t = 0; t < n; ++t) {
+            auto q = mx::astype(mx::slice(qs[c], {0, 0, t, 0}, {1, heads, t + 1, dim}), mx::bfloat16);
+            const int vis = length - n + t + 1;
+            out.push_back(mx::fast::scaled_dot_product_attention(q, view(ks[c], vis), view(vs[c], vis), scale, ""));
+        }
+        return mx::astype(mx::concatenate(out, 2), mx::float32);
+    };
+    const char* names[] = {"v1", "v3", "sdpa_all", "sdpa_rows"};
+    for (int ver = 0; ver < 4; ++ver) {
+        auto call = [&](int c) {
+            return ver == 0 ? decode_rows_attention_v1(qs[c], ks[c], vs[c], scale, length)
+                 : ver == 1 ? decode_rows_attention_v3(qs[c], ks[c], vs[c], scale, length)
+                 : ver == 2 ? sdpa_all(c) : sdpa_rows(c);
+        };
+        if (ver == 1 && n > 8) continue;
+        auto round = [&] { std::vector<mx::array> o; for (int c = 0; c < calls; ++c) o.push_back(call(c)); mx::eval(o); };
+        round();
+        const int reps = 10;
         auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < reps; ++i) mx::eval(call());
-        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / reps;
-        std::printf("DECODE_ROWS_BENCH v%d length=%d n=%d %.1f us\n", ver, length, n, us);
+        for (int i = 0; i < reps; ++i) round();
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / reps / calls;
+        std::printf("DECODE_ROWS_BENCH %-9s length=%d n=%d %.1f us per call (16 per eval)\n", names[ver], length, n, us);
     }
 }
 }  // namespace
@@ -102,8 +129,8 @@ int main() {
         ok &= run(8, 2, 128, 3000, 1, rng);
         ok &= run(24, 4, 256, 16384, 8, rng);
     }
-    for (int length : {300, 2048, 16384})
-        for (int n : {1, 8}) bench(24, 4, 256, length, n, rng);
+    for (int length : {64, 2048, 8192, 16384})
+        for (int n : {1, 8, 16}) bench(24, 4, 256, length, n, rng);
     std::printf(ok ? "DECODE_ROWS_PASS\n" : "DECODE_ROWS_FAIL\n");
     return ok ? 0 : 1;
 }
