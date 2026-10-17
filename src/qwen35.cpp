@@ -232,6 +232,7 @@ struct DFlash {
     int retr = 0, recent = 0;  // retrieval window: retr chunks of 16 far positions + `recent` latest positions
     uint32_t mask_id = 0;
     std::vector<int> target_ids;  // target layers whose *input* hidden states feed the drafter
+    static constexpr int injBatch = 32;  // tokens per inject matvec batch (the u4h NCOL cap); the inject scratch is sized to it
     Mat fc, sel_hidden, w_kv_all;  // w_kv_all: [layer][k | v] rows of every layer, one matvec for injection
     const float *enc_norm = nullptr, *out_norm = nullptr;
     const __nv_bfloat16 *sel_prev = nullptr, *sel_next = nullptr;  // [vocab][rank]
@@ -1854,7 +1855,8 @@ private:
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
     Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > NVER): run the LM head only on the final chunk
-    Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_topk;
+    Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_inj_g, d_inj_kv,
+        d_topk;
     Buf dfl_part, ds_t, ds_act, ds_q, ds_o;  // DSpark drafter attention partials and block scratch
     uint32_t * h_tok = nullptr;  // pinned staging for the graph inputs
     int * h_pos = nullptr;
@@ -3062,6 +3064,10 @@ public:
         d_pos = Buf(2 * size_t(nslots) * sizeof(int));
         d_tok = Buf(B * 4);
         d_kv = Buf(size_t(NVER) * nl * 2 * kd * 2);
+        // inject scratch for batches wider than the draft buffers (d_x / d_kv hold a draft block and NVER rows): prefill
+        // injects in batches of DFlash::injBatch tokens, so the projections read each weight once per batch
+        d_inj_g = Buf(size_t(DFlash::injBatch) * H * 2);
+        d_inj_kv = Buf(size_t(DFlash::injBatch) * nl * 2 * kd * 2);
         d_topk = Buf(B * 64 * 16 * 8);
         if (const char * dv = opt.draft_vocab.c_str(); *dv && has_head8()) {
             // draft vocabulary (llama.cpp map format): those head8 rows in 4 bits; ids mapped on the device
@@ -3213,6 +3219,18 @@ public:
         ck(cudaMemcpyAsync(d_pos.p, v, sizeof(v), cudaMemcpyHostToDevice, stream));
     }
 
+    // The inject projections as matvec batches of the format's max_batch_cols(): per-column results are identical to
+    // narrower calls (the batched-matvec contract), while each weight is read once per batch of tokens instead of once
+    // per 8-token group - the whole cost of the old prefill injection.
+    void inj_mm(const Mat & m, const bf16 * in, bf16 * out, int n) {
+        if (n > DFlash::injBatch) throw std::runtime_error("dflash inject: batch wider than the scratch");
+        const int mc = m.fmt->max_batch_cols();
+        for (int c0 = 0; c0 < n; c0 += mc) {
+            const int nc = std::min(mc, n - c0);
+            prep_input(m.fmt->basis(), in + size_t(c0) * m.cols, v_xh.as<__half>(), m.cols, nc);
+            m.fmt->matvec(m, v_xh.as<__half>(), out + size_t(c0) * m.rows, nc, stream);
+        }
+    }
     // Encodes n rows of target features (device [n][nf*H]) for positions pos.. and writes every drafter layer's K/V.
     void dflash_inject(const bf16 * feats, int n, uint32_t pos) {
         set_dpos(pos);
@@ -3220,10 +3238,10 @@ public:
     }
     void dflash_inject_body(const bf16 * feats, int n) {  // positions from d_pos
         const int H = int(cfg.hidden), kd = dfl.kvheads * dfl.hd, nl = int(dfl.L.size());
-        auto *G = d_x.as<bf16>(), *KV = d_kv.as<bf16>();
-        mmx(dfl.fc, feats, G, n);
+        auto *G = d_inj_g.as<bf16>(), *KV = d_inj_kv.as<bf16>();
+        inj_mm(dfl.fc, feats, G, n);
         tqllm_cuda::rms_f_multi(G, H, 0, dfl.enc_norm, G, H, 0, H, 1, n, cfg.eps, stream);
-        mmx(dfl.w_kv_all, G, KV, n);
+        inj_mm(dfl.w_kv_all, G, KV, n);
         const int ts = dfl.w_kv_all.rows;
         for (int l = 0; l < nl; ++l) {
             bf16 * K = KV + size_t(l) * 2 * kd;
@@ -3713,8 +3731,8 @@ public:
                         if (final && count > 1 && next != eos_)
                             first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
                     }
-                    for (int off = 0; off < m && dfl_on; off += 8) {
-                        const int count = std::min(8, m - off);
+                    for (int off = 0; off < m && dfl_on; off += DFlash::injBatch) {
+                        const int count = std::min(DFlash::injBatch, m - off);
                         if (t + uint32_t(off + count) <= inj0) continue;
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                     }
