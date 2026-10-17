@@ -422,7 +422,22 @@ struct IQ4_NL final : WeightFormat {
     const char * name() const override { return "IQ4_NL"; }
     Basis basis() const override { return Basis::Plain; }
     Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
-        if (cols % 128) throw std::runtime_error("IQ4_NL needs a multiple of 128 columns");
+        if (cols % 128) {  // the IQ4L kernels need 128-column rows: the same values as Q8_0 (block scale x int8 table value)
+            if (cols % 32) throw std::runtime_error("IQ4_NL needs a multiple of 32 columns");
+            static const int8_t kv[16] = {
+#include "kvalues_iq4nl.inc"
+            };
+            const int64_t nb = int64_t(rows) * cols / 32;
+            std::vector<char> q8(size_t(nb) * 34);
+            for (int64_t b = 0; b < nb; ++b) {
+                const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 18;
+                char * o = q8.data() + b * 34; std::memcpy(o, blk, 2);
+                for (int j = 0; j < 16; ++j) { o[2 + j] = char(kv[blk[2 + j] & 0xF]); o[2 + 16 + j] = char(kv[blk[2 + j] >> 4]); }
+            }
+            const WeightFormat * q80 = weight_format(8);
+            if (!q80) throw std::runtime_error("IQ4_NL: Q8_0 format not registered");
+            return q80->load(q8, rows, cols, up, s);
+        }
         const int64_t nb = int64_t(rows) * cols / 32;
         std::vector<uint8_t> w(size_t(nb) * 16);
         std::vector<uint16_t> d(static_cast<size_t>(nb));

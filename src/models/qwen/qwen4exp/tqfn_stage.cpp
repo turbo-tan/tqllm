@@ -2451,7 +2451,10 @@ struct DecodeModel {
     // start the copies of `layer` (plan + first two groups) unless they are already queued
     static void stage_begin(PrefillStage & st, const MixedExpertCache & cache, int layer) {
         if (st.layer == layer && st.cache == &cache) return;
-        st.cache = &cache; st.layer = layer; st.plan = stage_plan(cache, layer); st.issued = 0;
+        st.cache = &cache; st.layer = layer; st.issued = 0;
+        // no prepacked file (a GB10 keeps every expert in its bank): nothing to stage, prefill_layer fills the bank instead
+        if (!cache.bank_layout(layer).src0) { st.plan.clear(); return; }
+        st.plan = stage_plan(cache, layer);
         const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
         for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
     }
@@ -2546,7 +2549,6 @@ struct DecodeModel {
             stage_begin(st, cache, layer);
         }
         const auto lay = cache.bank_layout(layer);
-        require(lay.src0 != nullptr, "layer-major prefill needs the prepacked expert file (--experts)");
         size_t need = 0; { size_t off[6]; stage_offsets(lay, st.K, off); need = off[5] + align256(size_t(st.K) * lay.piece[5]); }
         require(need <= st.half_bytes, "layer-major prefill: staging bank too small for this layer");
         // the groups already queued stay (copied before the routing was known); the rest of the plan is the routed experts
@@ -2554,7 +2556,9 @@ struct DecodeModel {
         st.plan.resize(std::min(st.plan.size(), size_t(st.issued) * size_t(st.K)));
         std::vector<char> planned(size_t(E), 0); for (int e : st.plan) planned[size_t(e)] = 1;
         std::vector<int> hot;
-        for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) ? hot : st.plan).push_back(e);
+        // without a prepacked file every routed expert goes through the bank (prepare loads the missing ones)
+        for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) || !lay.src0 ? hot : st.plan).push_back(e);
+        require(st.plan.empty() || lay.src0, "layer-major prefill: experts to stream but no prepacked expert file (--experts)");
         const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
         for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
         // per-slot assignment lists of every pass, uploaded once: [counts W][groups W x cap]
@@ -2975,8 +2979,10 @@ struct DecodeModel {
         // its summation order flips near-tie top-k choices: 64K text changed on 10-17)
         static const bool router_gemv = !(std::getenv("TQFN_ROUTER_GEMM") && std::atoi(std::getenv("TQFN_ROUTER_GEMM")) != 0);
         if (bf16 && router_gemv && n > 64) {
-            tqllm_cuda::fn_gemv_bf16_chunk(cp.bf16_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);
-            tqllm_cuda::fn_gemv_bf16_chunk(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), x, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
+            Device<__nv_bfloat16> xb(size_t(n) * h);  // x rounded once for both GEMVs (they round it per product anyway)
+            tqllm_cuda::fn_round_bf16(x, xb.p, int64_t(n) * h, nullptr);
+            tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp.weight"), xb.p, logits, c.experts, h, n, c.experts + 1, nullptr);
+            tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), xb.p, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
         } else if (bf16 && n > 64) {
             // prefill chunks: fp32 GEMM on an exact f32 copy of the bf16 weights (4 MB per layer, resident), products exact,
             // sums in cuBLAS order; TF32 off for these calls so the logits stay within f32 rounding of the per-token GEMV
@@ -3674,7 +3680,7 @@ struct FnServe {
     std::vector<std::string> arg_store; std::vector<char *> argv;
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
     std::unique_ptr<MixedExpertCache> cache, mtp_cache; PackedExperts packed; char * mtp_packed = nullptr; size_t mtp_block = 0;
-    ScratchArena arena; size_t arena_prefill = 0, arena_decode = 0;
+    ScratchArena arena; size_t arena_prefill = 0, arena_decode = 0; int kv_capacity_full = 0;
     float * res_host = nullptr; size_t res_host_cap = 0;  // pinned prompt residuals of a multi-chunk prefill (one prefill at a time)
 };
 class FlashNextEngine final : public tqllm::Engine {
@@ -3837,7 +3843,9 @@ public:
           auto rows = warm.step(ids); ck(cudaDeviceSynchronize());
           // then one 512-token layer-major chunk: the prefill kernels' modules load and the pinned buffers and resident
           // router copies are created now (nsys: 0.3 s of module loads and pinned allocations inside the first prompt)
-          { std::vector<int> lm(512); for (int i = 0; i < 512; ++i) lm[size_t(i)] = 2000 + (i * 53) % 50000;
+          // (needs the prepacked expert file: a GB10 build keeps every expert resident and has none)
+          if (f.cache->has_layout(0) && f.cache->bank_layout(0).src0) {
+            std::vector<int> lm(512); for (int i = 0; i < 512; ++i) lm[size_t(i)] = 2000 + (i * 53) % 50000;
             (void) warm.step(lm); ck(cudaDeviceSynchronize()); warm.release_prefill(); }
           (void) checkpoint.head_argmax_rows(rows->p, 1); rows.reset();  // the full LM head loads here, not at the first prompt's first token (1.9 s)
           warm.mtp_experts = f.mtp_cache.get();  // the MTP layer too: its bank and weights, so the first request does not build them
@@ -3853,7 +3861,7 @@ public:
           size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
           std::fprintf(stderr, "tqllm: Flash-Next warm-up %.1f s: expert banks %.0f MB, %.0f MB free\n",
                        std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), f.cache->stats().device_bytes / 1048576.0, fr / 1048576.0); }
-        g_kv_capacity = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+        g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
         {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
             // cannot hold it (it would prefill for minutes and then fail in decode)
             int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
@@ -3911,6 +3919,10 @@ public:
         auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
         require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
         S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
+        if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
+            const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
+            if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }
+        }
         if (g_arena) g_arena->used = 0;
         // the pool keeps what the last request freed (release threshold max); hand it back so plain cudaMalloc users (expert
         // banks, staging, attention workspaces) can have it
@@ -3979,7 +3991,7 @@ public:
                     // a smaller selection block first (~0.5 s at 32K); halving the chunk doubles the expert bytes streamed per prompt
                     if (block > 512) { block = block > 1024 ? 1024 : 512; continue; }
                     if (chunk <= 2048) throw;
-                    chunk = std::max(2048, chunk * 3 / 4 / 1024 * 1024); block = block0;  // 16K -> 12K -> 9K -> 6K: each step costs expert streaming, so take the smallest that fits
+                    chunk = std::max(2048, chunk * 7 / 8 / 1024 * 1024); block = block0;  // 16K -> 14K -> 12K -> 10.5K ...: every chunk streams all experts, so take the largest that fits
                 }
             }
             g_qsa_block = block; g_sub_req = block;

@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <vector>
 #include "qwen4exp_kernels.cuh"
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <algorithm>
@@ -352,6 +353,129 @@ __global__ void __launch_bounds__(1024) topk_sorted_k(const uint64_t * keys, uin
     if (tid < need) out[tid] = buf[tid];
 }
 
+// score_pack_fixed_k with the score bits only: the key's low word is ~block, i.e. the index
+template<int RB, int QT, int W>
+__global__ void __launch_bounds__(32 * W) score_bits_k(const float * pooled_keys, const float * query, uint32_t * scores,
+                                                     int blocks, int tokens, int first_position, int ratio) {
+    constexpr int H = 4, DIM = 128, J = DIM / 32;
+    __shared__ float4 qs[QT][H][32];
+    const int lane = threadIdx.x, t0 = blockIdx.y * QT, block0 = (blockIdx.x * W + threadIdx.y) * RB;
+    const int nq = min(QT, tokens - t0);
+    for (int i = threadIdx.y * 32 + lane; i < nq * H * 32; i += 32 * W) {
+        const int qi = i / (H * 32), h = (i / 32) % H, m = i % 32;
+        const float4 v = reinterpret_cast<const float4 *>(query + int64_t(t0 + qi) * H * DIM + h * DIM)[m];
+        float * dst = reinterpret_cast<float *>(&qs[qi][h][0]);
+        dst[((4 * m) % 32) * 4 + (4 * m) / 32] = v.x; dst[((4 * m + 1) % 32) * 4 + (4 * m + 1) / 32] = v.y;
+        dst[((4 * m + 2) % 32) * 4 + (4 * m + 2) / 32] = v.z; dst[((4 * m + 3) % 32) * 4 + (4 * m + 3) / 32] = v.w;
+    }
+    __syncthreads();
+    if (block0 >= blocks) return;
+    float kv[RB][J];
+    #pragma unroll
+    for (int b = 0; b < RB; ++b) {
+        const float * k = pooled_keys + int64_t(min(block0 + b, blocks - 1)) * DIM;
+        #pragma unroll
+        for (int j = 0; j < J; ++j) kv[b][j] = k[lane + 32 * j];
+    }
+    const int ob = block0 + (((lane >> 4) << 1) | ((lane >> 3) & 1));
+    int complete = (first_position + t0 + 1) / ratio, rem = (first_position + t0 + 1) % ratio;
+    #pragma unroll 1
+    for (int qi = 0; qi < QT; ++qi, complete += ++rem == ratio ? (rem = 0, 1) : 0) {
+        const int t = t0 + qi;
+        if (t >= tokens) return;
+        uint32_t * out = scores + int64_t(t) * blocks;
+        if (block0 >= complete) continue;  // the top-k reads only complete blocks
+        float a[RB * H];
+        #pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const float4 q4 = qs[qi][h][lane];
+            const float qr[J] = {q4.x, q4.y, q4.z, q4.w};
+            #pragma unroll
+            for (int b = 0; b < RB; ++b) {
+                float dot = 0.f;
+                #pragma unroll
+                for (int j = 0; j < J; ++j) dot = fmaf(kv[b][j], qr[j], dot);
+                a[b * H + h] = dot;
+            }
+        }
+        butterfly_fold<16, RB * H>(a, lane);
+        const float dot = a[0] + __shfl_xor_sync(0xffffffffu, a[0], 1);
+        const float d1 = __shfl_down_sync(0xffffffffu, dot, 2), d2 = __shfl_down_sync(0xffffffffu, dot, 4), d3 = __shfl_down_sync(0xffffffffu, dot, 6);
+        if ((lane & 7) == 0 && ob < blocks && ob < complete) {
+            float total = 0.f;
+            total += fmaxf(dot, 0.f); total += fmaxf(d1, 0.f); total += fmaxf(d2, 0.f); total += fmaxf(d3, 0.f);
+            out[ob] = __float_as_uint(total == 0.f ? 0.f : total);
+        }
+    }
+}
+// topk_sorted_k on score bits: the need-th largest key is (T << 32 | ~i) for the threshold score T; three radix passes
+// (11, 11, 10 bits) find T and how many keys equal to T it takes (r); ties go by index, smallest first, as the key order does.
+__global__ void __launch_bounds__(1024) topk_bits_k(const uint32_t * scores, uint64_t * out, int blocks, int first_position,
+                                                    int ratio, int need_cap) {
+    using Scan = cub::BlockScan<int, 1024>;
+    __shared__ typename Scan::TempStorage scan;
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const int complete = (first_position + t + 1) / ratio, need = min(complete, need_cap);
+    if (need <= 0) return;
+    scores += int64_t(t) * blocks; out += int64_t(t) * kTopkCap;
+    __shared__ unsigned hist[2048];
+    __shared__ uint32_t prefix_s; __shared__ int remain_s, count_s;
+    __shared__ uint64_t buf[kTopkCap];
+    uint32_t prefix = 0, mask = 0; int remain = need;
+    const int shifts[3] = {21, 10, 0}, bits[3] = {11, 11, 10};
+    #pragma unroll 1
+    for (int p = 0; p < 3; ++p) {
+        const int shift = shifts[p]; const uint32_t bm = (1u << bits[p]) - 1u; const int nb = int(bm) + 1;
+        for (int i = tid; i < 2048; i += 1024) hist[i] = 0;
+        __syncthreads();
+        for (int i = tid; i < complete; i += 1024) {
+            const uint32_t k = scores[i];
+            if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & bm], 1u);
+        }
+        __syncthreads();
+        // bins from the top: thread j holds bins hi = nb-1-2j and lo = hi-1; S(d) = keys in bins >= d
+        const int hi = nb - 1 - 2 * tid, lo = hi - 1;
+        const int ch = hi >= 0 ? int(hist[hi]) : 0, cl = lo >= 0 ? int(hist[lo]) : 0;
+        int before;  // keys in the bins above hi
+        Scan(scan).ExclusiveSum(ch + cl, before);
+        const int s_hi = before + ch, s_lo = s_hi + cl;
+        // chosen bin d: S(d) >= remain and S(d + 1) < remain (bin 0 if no higher one), as the serial walk from the top picks
+        if (hi >= 0 && s_hi >= remain && before < remain) { prefix_s = prefix | (uint32_t(hi) << shift); remain_s = remain - before; }
+        else if (lo >= 0 && s_lo >= remain && s_hi < remain) { prefix_s = prefix | (uint32_t(lo) << shift); remain_s = remain - s_hi; }
+        __syncthreads();
+        prefix = prefix_s; remain = remain_s; mask |= bm << shift;
+        __syncthreads();
+    }
+    // prefix = T; keys above T all go, the first `remain` keys equal to T (by index) go
+    if (tid == 0) count_s = 0;
+    for (int i = tid; i < kTopkCap; i += 1024) buf[i] = 0;
+    __syncthreads();
+    int ties = 0;
+    #pragma unroll 1
+    for (int base = 0; base < complete; base += 1024) {
+        const int i = base + tid;
+        const uint32_t k = i < complete ? scores[i] : 0u;
+        const bool gt = i < complete && k > prefix, eq = i < complete && k == prefix;
+        int rank, total;
+        Scan(scan).ExclusiveSum(int(eq), rank, total);
+        if (gt || (eq && ties + rank < remain)) buf[atomicAdd(&count_s, 1)] = (uint64_t(k) << 32) | uint32_t(~uint32_t(i));
+        ties += total;
+        __syncthreads();
+    }
+    __syncthreads();
+    for (int size = 2; size <= kTopkCap; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const int j = tid ^ stride;
+            if (j > tid) {
+                const bool desc = (tid & size) == 0;
+                const uint64_t a = buf[tid], b = buf[j];
+                if (desc ? a < b : a > b) { buf[tid] = b; buf[j] = a; }
+            }
+            __syncthreads();
+        }
+    if (tid < need) out[tid] = buf[tid];
+}
+
 } // namespace
 
 QsaBatchScratch::QsaBatchScratch(int max_queries_, int max_cells, int ratio, int top_k)
@@ -600,13 +724,21 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
     const bool topk = topk_on && need_cap <= kTopkCap && int64_t(tokens) * kTopkCap <= int64_t(scratch.max_queries) * scratch.max_blocks;
     int stride = blocks;
     if (blocks > 0 && topk) {
-        qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);
-        topk_sorted_k<<<tokens, 1024, 0, stream>>>(scratch.keys, scratch.sorted, blocks, first_position, ratio_, need_cap);
+        if (heads_ == 4 && dim_ == 128) {  // score bits (4 B) and a 3-pass top-k: the same keys, 2.5x faster top-k at 122K positions
+            uint32_t * bits = reinterpret_cast<uint32_t *>(scratch.keys);
+            score_bits_k<4, 16, 8><<<dim3(unsigned((blocks + 31) / 32), unsigned((tokens + 15) / 16)), dim3(32, 8), 0, stream>>>(
+                keys_.normalized(), scratch.query, bits, blocks, tokens, first_position, ratio_);
+            topk_bits_k<<<tokens, 1024, 0, stream>>>(bits, scratch.sorted, blocks, first_position, ratio_, need_cap);
+        } else {
+            qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);
+            topk_sorted_k<<<tokens, 1024, 0, stream>>>(scratch.keys, scratch.sorted, blocks, first_position, ratio_, need_cap);
+        }
         ck(cudaPeekAtLastError());
         stride = kTopkCap;
         if (check) {  // full sort into temp positions, compare the reachable prefix of every query
             std::vector<uint64_t> fast(size_t(tokens) * kTopkCap);
             ck(cudaMemcpyAsync(fast.data(), scratch.sorted, fast.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+            qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);  // full keys for the reference sort
             segment_offsets<<<(tokens + 256) / 256, 256, 0, stream>>>(scratch.offsets, tokens, blocks);
             size_t available = scratch.temp_bytes;
             ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(scratch.temp, available, scratch.keys, scratch.sorted, tokens * blocks,

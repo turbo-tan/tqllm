@@ -912,6 +912,60 @@ template<int R, int T> __global__ void fn_gemv_bf16_tiles_k(const __nv_bfloat16 
         y[int64_t(t0 + t) * ldy + row0 + r] = s;
     }
 }
+// fn_gemv_bf16_tiles_k on an input already rounded to bf16 (fn_round_bf16): the kernel rounds x to bf16 before every
+// product anyway, so the sums are the same bits and each 8-column load is 16 bytes instead of 32.
+template<int R, int T> __global__ void fn_gemv_bf16x_tiles_k(const __nv_bfloat16 * w, const __nv_bfloat16 * x, float * y, int rows,
+                                                             int cols, int tokens, int64_t ldy) {
+    const int row0 = blockIdx.x * R, t0 = blockIdx.y * T, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    float sum[R][T];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) sum[r][t] = 0.f;
+    for (int v = threadIdx.x; v < cols / 8; v += blockDim.x) {
+        float xs[T][8];
+        #pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const uint4 p = reinterpret_cast<const uint4 *>(x + int64_t(min(t0 + t, tokens - 1)) * cols)[v];
+            const __nv_bfloat16 * xv = reinterpret_cast<const __nv_bfloat16 *>(&p);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) xs[t][k] = __bfloat162float(xv[k]);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint4 packed = reinterpret_cast<const uint4 *>(w + int64_t(min(row0 + r, rows - 1)) * cols)[v];
+            const __nv_bfloat16 * wv = reinterpret_cast<const __nv_bfloat16 *>(&packed);
+            #pragma unroll
+            for (int t = 0; t < T; ++t)
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) sum[r][t] += __bfloat162float(wv[k]) * xs[t][k];
+        }
+    }
+    __shared__ float part[R * T][8];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float s = sum[r][t];
+            for (int d = 16; d; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+            if (!lane) part[r * T + t][warp] = s;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < R * T; i += blockDim.x) {
+        const int r = i / T, t = i % T;
+        if (row0 + r >= rows || t0 + t >= tokens) continue;
+        float s = 0.f;
+        for (int k = 0; k < int(blockDim.x / 32); ++k) s += part[i][k];
+        y[int64_t(t0 + t) * ldy + row0 + r] = s;
+    }
+}
+__global__ void fn_round_bf16_k(const float * x, __nv_bfloat16 * xb, int64_t n) {
+    const int64_t i = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        const float4 v = *reinterpret_cast<const float4 *>(x + i);
+        xb[i] = __float2bfloat16_rn(v.x); xb[i + 1] = __float2bfloat16_rn(v.y); xb[i + 2] = __float2bfloat16_rn(v.z); xb[i + 3] = __float2bfloat16_rn(v.w);
+    } else for (int64_t j = i; j < n; ++j) xb[j] = __float2bfloat16_rn(x[j]);
+}
 // Short rows (<= 512 columns): 8 lanes per row, 4 rows per warp, so each lane keeps several loads in flight.
 template<int T> __global__ void fn_gemv_bf16_short_k(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols) {
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 8, sub = threadIdx.x & 7;
@@ -1287,6 +1341,21 @@ void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int
     const unsigned tiles = unsigned((tokens + T - 1) / T);
     if (rows >= 8) fn_gemv_bf16_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
     else fn_gemv_bf16_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
+}
+void fn_round_bf16(const float * x, __nv_bfloat16 * xb, int64_t n, cudaStream_t s) {
+    if (n <= 0) return;
+    fn_round_bf16_k<<<unsigned((n / 4 + 255) / 256 + 1), 256, 0, s>>>(x, xb, n);
+}
+// fn_gemv_bf16_chunk with x from fn_round_bf16: same bits; 8 x 8 tiles (0.66 vs 0.79 ms for the 16 x 8 fp32-input kernel
+// on the router's 512 x 2560 x 2048 tokens, RTX 3090)
+void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
+    if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 chunk gemv: invalid shape or pointer");
+    if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 chunk gemv: rows take the warp-per-row path");
+    const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
+    constexpr int T = 8;
+    const unsigned tiles = unsigned((tokens + T - 1) / T);
+    if (rows >= 8) fn_gemv_bf16x_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
+    else fn_gemv_bf16x_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
 }
 void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 gemv: invalid shape or pointer");

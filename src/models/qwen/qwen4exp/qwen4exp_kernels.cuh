@@ -69,6 +69,8 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
 // Prefill chunks on the block-per-row layout (rows <= 16, or rows <= 1024 with cols >= 1024): sums bit-identical to
 // fn_gemv_bf16_tokens, x read once per 8 rows; output row t at y + t * ldy.
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
+void fn_round_bf16(const float * x, __nv_bfloat16 * xb, int64_t n, cudaStream_t);
+void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 // fn_gemv_bf16_tokens on its block-per-row path with output row t at y + t * ldy (same sums, bit-identical).
 void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 constexpr int kGemvSegs = 4;
