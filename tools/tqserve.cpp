@@ -1,5 +1,6 @@
 #include "../src/tokenizer_path.hpp"
 #include "serve/http.hpp"
+#include "serve/monitor_server.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
@@ -113,7 +114,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature T --top-p P --top-k K (defaults for requests that set none; default greedy)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
+                 "[--monitor-port N (optional read-only dashboard)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
                  "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n";
@@ -134,6 +135,13 @@ template <class F> tqserve::DecodeResult guarded(F && f) {
 
 } // namespace
 
+void observe_result(const std::shared_ptr<tqserve::Monitor::Request> & observation, const tqserve::DecodeResult & result) {
+    if (!observation) return;
+    if (!result.error.empty()) { observation->finish("failed"); return; }
+    observation->timings(result.prompt_tokens, result.completion_tokens, result.prefill_ms, result.decode_ms,
+                         result.draft_n, result.draft_accepted);
+}
+
 int main(int argc, char ** argv) {
     tqllm::check_env_flags("tqserve");
     tqserve::free_mb_probe() = [] {
@@ -144,6 +152,7 @@ int main(int argc, char ** argv) {
     std::string model_dir, model_path, tokenizer_path, host = "127.0.0.1", name = "tqllm";
     std::string system;  // none by default, like the Qwen3.5/3.8 chat template (--system sets one)
     std::string api_key;
+    uint32_t monitor_port = 0;
     bool reasoning = false;
     std::string effort = "xhigh";  // default reasoning_effort when a request does not set one
     int32_t thinking_budget = -1;  // default reasoning budget (llama.cpp --reasoning-budget): -1 unlimited, 0 end immediately, N tokens
@@ -211,6 +220,12 @@ int main(int argc, char ** argv) {
             else if (arg == "--mmproj") mmproj = value();
             else if (arg == "--image-min-tokens") image_min_tokens = std::stoi(value());
             else if (arg == "--image-max-tokens") image_max_tokens = std::stoi(value());
+            else if (arg == "--monitor-port") {
+                const auto input = value(); size_t consumed = 0;
+                const auto v = std::stoul(input, &consumed);
+                if (!v || v > 65535 || consumed != input.size()) throw std::invalid_argument("monitor port must be 1..65535");
+                monitor_port = static_cast<uint32_t>(v);
+            }
             else if (arg == "--api-key") api_key = value();
             else if (arg == "--api-key-file") {
                 std::ifstream key_file(value());
@@ -224,7 +239,7 @@ int main(int argc, char ** argv) {
             if (tokenizer_path.empty()) tokenizer_path = model_dir + "/tokenizer.tqtok";
         }
         tokenizer_path = tqllm::tokenizer_for(model_path, tokenizer_path);
-        if (model_path.empty() || tokenizer_path.empty() || port == 0 || port > 65535 || context == 0 || max_tokens == 0 || name.empty() || np == 0 || np > 64) {
+        if (model_path.empty() || tokenizer_path.empty() || port == 0 || port > 65535 || monitor_port == port || context == 0 || max_tokens == 0 || name.empty() || np == 0 || np > 64) {
             usage();
             return 2;
         }
@@ -248,6 +263,16 @@ int main(int argc, char ** argv) {
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
+        std::unique_ptr<tqserve::Monitor> monitor;
+        std::unique_ptr<tqserve::MonitorServer> monitor_server;
+        if (monitor_port) {
+            char hostname[256]{}, pci[32]{}; ::gethostname(hostname, sizeof(hostname) - 1);
+            int device = 0;
+            if (cudaGetDevice(&device) == cudaSuccess) cudaDeviceGetPCIBusId(pci, sizeof(pci), device);
+            monitor = std::make_unique<tqserve::Monitor>(tqserve::Monitor::Info{name, TQLLM_COMMIT, hostname, pci, slot_context, np});
+            monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port));
+            std::cerr << "tqserve: monitor http://" << host << ':' << monitor_port << "/ (read-only)\n";
+        }
         std::unique_ptr<tqserve::Scheduler> scheduler;
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
         std::atomic<int> inflight{0};
@@ -365,6 +390,7 @@ int main(int argc, char ** argv) {
                 auto parsed = adapt_error.empty()
                     ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
                     : tqserve::ChatRequest{};
+                if (monitor && parsed.ok) parsed.observation = monitor->begin();
                 if (!adapt_error.empty()) { parsed.ok = false; parsed.error = adapt_error; }
                 if (parsed.ok && parsed.thinking) {
                     if (!parsed.budget_set) parsed.thinking_budget = thinking_budget;
@@ -392,10 +418,12 @@ int main(int argc, char ** argv) {
                     auto send = [&](const std::string & d) { return rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d); };
                     auto run_stream = [&](const tqserve::ChatRequest & r, tqserve::StreamWriter & w) {
                         auto on_tokens = [&](const std::vector<uint32_t> & ids) { return w.update(ids); };
-                        return guarded([&] {
+                        auto result = guarded([&] {
                             return scheduler ? scheduler->submit_stream(r, on_tokens)
                                              : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
                         });
+                        observe_result(r.observation, result);
+                        return result;
                     };
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {
                         auto phase1 = parsed;  // thinking budget, streamed: phase 1 deltas, then phase 2 continues the answer
@@ -433,11 +461,14 @@ int main(int argc, char ** argv) {
                         if (!generated.error.empty()) out.error(generated.error);
                         else out.close(generated);
                     }
+                    if (parsed.observation) parsed.observation->finish();
                     ::close(client);
                     return;
                 } else {
                     auto run = [&](const tqserve::ChatRequest & r) {
-                        return guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        auto result = guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        observe_result(r.observation, result);
+                        return result;
                     };
                     tqserve::DecodeResult generated;
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {
@@ -479,6 +510,7 @@ int main(int argc, char ** argv) {
                         else if (api == tqserve::Api::Messages) body = tqserve::chat_to_messages(body, name);
                     }
                 }
+                if (parsed.observation) parsed.observation->finish(status == 200 ? "complete" : "failed");
                 if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
                 const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" ||

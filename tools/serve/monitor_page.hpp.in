@@ -1,0 +1,4 @@
+#pragma once
+namespace tqserve {
+inline constexpr char monitor_page[] = R"TQMONITOR(@TQLLM_MONITOR_HTML@)TQMONITOR";
+}

@@ -107,6 +107,13 @@ they are out of date. A/B switches used while developing are removed before merg
 shared library. ABI 1 is a proof of the loading path only; it is not yet a format or quantisation ABI. If you want to
 build on it, open an issue describing what your plugin needs to reach.
 
+### Monitor UI and telemetry panels
+
+The monitor has a source-level registry for trusted panels, with isolated snapshot
+copies and per-panel error handling. It is separate from the kernel-plugin ABI.
+See [the monitor contributor guide](docs/MONITOR_CONTRIBUTING.md) for the source map,
+panel example, hardware collector contract, UI checklist and three-browser tests.
+
 ## Performance claims
 
 Use the shipped benchmark so others can reproduce your number:

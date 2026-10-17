@@ -4,3 +4,4 @@ models/
 *.safetensors
 *.log
 __pycache__/
+.venv-monitor/

@@ -6,6 +6,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased (next: 1.0.1)
 
 ### Added
+- Optional `tqserve --monitor-port` instrument panel with request telemetry, host/device readings and a right-hand
+  terminal chat. Includes in-memory theme/key controls, thinking toggle, Stop/Escape and explicit unknown counters.
+  The request workbench adds selectable request journeys, pinned-reference latency/rate comparisons and visible hardware details sampled every three seconds. Theme switching uses a sun/moon icon.
 - `tqllm launch pi` (the pi coding agent) and `tqllm launch dsh` (DeepSeek Harness, `web` or `headless` profile): each
   gets the server as a provider through a temporary config the launcher deletes afterwards (`PI_CODING_AGENT_DIR` /
   `dsh --patch`). Both wrote and ran a file against Qwen3.8-27B on an RTX 3090. Implemented by `tqllm launch codex exec`
@@ -22,6 +25,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   to the server (`ANTHROPIC_BASE_URL`). `tqllm launch codex` / `claude` now point the agent at the server directly.
 
 ### Changed
+- Monitor: aligned accessible icon controls, keyboard/IME handling, stable request focus, non-disruptive streaming scroll and retryable errors. Trusted panel extensions have isolated snapshots, a contributor guide and Chromium/Firefox/WebKit CI coverage.
 - `tqllm launch`: `--max-tokens` default 8192 -> 32768 (an agent's reasoning used up 8192 before it wrote the file); the
   drafter and vocabulary are also found one folder down in a model folder (e.g. `~/models/dflash2/`); a second Ctrl+C
   while the server shuts down no longer prints a traceback. A CUDA build without `-DCMAKE_CUDA_ARCHITECTURES` targets the

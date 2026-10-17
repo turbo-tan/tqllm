@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tqLLM monitor</title>
+<style>
+:root,:root[data-theme="dark"]{color-scheme:dark;--bg:#0a0c10;--panel:#10131a;--panel2:#141821;--line:#1f2430;--text:#d7dce6;--muted:#7d8799;--dim:#4d5566;
+  --live:#7ee787;--prefill:#e3b341;--decode:#79c0ff;--bad:#ff7b72;--mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+:root[data-theme="light"]{color-scheme:light;--bg:#f4f5f8;--panel:#ffffff;--panel2:#f0f2f6;--line:#d9dde6;--text:#1c2230;--muted:#5c6577;--dim:#8a93a6;--live:#1a7f37;--prefill:#9a6700;--decode:#0550ae;--bad:#cf222e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--mono);display:flex;flex-direction:column;min-height:100vh}
+button,input,textarea{font:inherit;color:inherit}
+button{background:var(--panel2);border:1px solid var(--line);border-radius:3px;padding:3px 10px;cursor:pointer}
+button:hover{border-color:var(--muted)}button:disabled{opacity:.45;cursor:default}
+a{color:var(--decode);text-decoration:none}a:hover{text-decoration:underline}
+/* top bar */
+.bar{display:flex;align-items:center;gap:14px;padding:7px 14px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+.bar .brand{font-weight:700;letter-spacing:.04em}.bar .brand b{color:var(--live)}
+.bar .id{color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.bar .id strong{color:var(--text);font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+body[data-connection="live"] .pill i{background:var(--live);box-shadow:0 0 6px var(--live)}
+body[data-connection="stale"] .pill i,body[data-connection="auth"] .pill i{background:var(--prefill)}
+body[data-connection="offline"] .pill i{background:var(--bad)}
+/* layout */
+main{display:grid;grid-template-columns:minmax(0,58fr) minmax(0,42fr);flex:1;min-height:0}
+.left{border-right:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.right{display:flex;flex-direction:column;min-width:0;min-height:420px}
+.notice{border:1px solid var(--bad);color:var(--bad);background:rgba(255,123,114,.06);padding:6px 10px;border-radius:3px}
+.notice[hidden]{display:none}
+form#auth{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--prefill);padding:8px 10px;border-radius:3px}
+form#auth[hidden]{display:none}
+form#auth input{flex:1;min-width:160px;background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:4px 8px}
+form#auth small{color:var(--muted);width:100%}
+/* request status */
+.status{display:flex;gap:10px;align-items:center;flex-wrap:wrap;color:var(--muted)}
+.status .prompt{color:var(--live)}.status #phase{color:var(--text)}
+.status-rate{margin-left:auto;font:12px var(--mono)}
+/* stats */
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+.stat{background:var(--panel);padding:7px 10px;min-width:0}
+.stat .label{color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.stat strong{display:block;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .track{height:3px;background:var(--line);margin-top:5px;border-radius:2px;overflow:hidden}
+.stat .track b{display:block;height:100%;width:0;background:var(--live);transition:width .4s}
+.stat .track b.warn{background:var(--prefill)}.stat .track b.hot{background:var(--bad)}
+/* chart */
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:8px 11px}
+.chart .head{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.chart svg{width:100%;height:78px;display:block;margin-top:4px}
+.chart svg .grid{stroke:var(--line);stroke-width:1}
+.chart svg #chartLine{fill:none;stroke:var(--decode);stroke-width:1.5;stroke-linejoin:round}
+.chart svg #chartFill{fill:var(--decode);opacity:.08}
+/* request log */
+.log{background:var(--panel);border:1px solid var(--line);border-radius:4px;display:flex;flex-direction:column;min-height:0;flex:1}
+.log .head{display:flex;justify-content:space-between;padding:7px 11px;color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid var(--line)}
+.table-wrap{overflow:auto;min-height:120px;max-height:520px;flex:1}
+table{border-collapse:collapse;width:100%;min-width:420px}
+th,td{text-align:left;padding:4px 11px;white-space:nowrap;font-variant-numeric:tabular-nums}
+th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--panel)}
+td.phase-prefill{color:var(--prefill)}td .progress{display:block;height:3px;background:var(--line);margin-top:3px;border-radius:2px;overflow:hidden}td .progress b{display:block;height:100%;background:var(--prefill)}td.phase-decode{color:var(--decode)}td.phase-complete{color:var(--live)}td.phase-failed,td.phase-cancelled{color:var(--bad)}
+tbody tr:nth-child(odd){background:var(--panel2)}
+/* chat */
+.chat-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.chat-head span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-head .toggle{display:inline-flex;align-items:center;gap:5px;cursor:pointer;text-transform:none;letter-spacing:0}
+.msg pre.thought{color:var(--dim);border-left:2px solid var(--line);padding-left:8px;margin-bottom:6px}.msg pre.thought:empty{display:none}
+#transcript{flex:1;overflow:auto;padding:12px;min-height:200px;display:flex;flex-direction:column;gap:10px}
+.msg{display:grid;grid-template-columns:62px minmax(0,1fr);gap:8px}
+.msg .who{color:var(--dim);text-align:right}
+.msg.you .who{color:var(--live)}.msg.model .who{color:var(--decode)}.msg.sys .who{color:var(--prefill)}
+.msg pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
+.msg.model.streaming pre:not(.thought)::after{content:"\2588";color:var(--decode);animation:blink 1s steps(2) infinite}
+@keyframes blink{to{opacity:0}}
+.hint{color:var(--dim);text-align:center;margin:auto 0;padding:20px}
+.compose{border-top:1px solid var(--line);padding:9px 12px;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:end;background:var(--panel)}
+.compose .caret{color:var(--live);padding-bottom:5px}
+.compose textarea{background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:5px 8px;resize:vertical;min-height:32px;max-height:160px;width:100%}
+.compose .buttons{display:flex;gap:6px}
+.chat-foot{display:flex;gap:14px;padding:5px 12px;color:var(--muted);font-size:11px;border-top:1px solid var(--line);flex-wrap:wrap}
+footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;border-top:1px solid var(--line);color:var(--dim);font-size:11px;flex-wrap:wrap}
+@media(min-width:1101px){.stats{grid-template-columns:repeat(6,minmax(0,1fr))}}
+@media(max-width:1100px){main{grid-template-columns:1fr}.left{border-right:0;border-bottom:1px solid var(--line)}.right{min-height:460px}}
+@media(max-width:520px){.bar .id{display:none}.msg{grid-template-columns:48px minmax(0,1fr)}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+/* Request workbench: follow measured work, rather than a wall of gauges. */
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.bar{padding:14px 24px}.bar .brand{font-size:20px;letter-spacing:-.04em}
+main{grid-template-columns:minmax(0,1fr) minmax(300px,360px)}
+.left{padding:28px;gap:20px}.right{background:var(--panel)}
+.eyebrow{font:11px var(--mono);letter-spacing:.13em;color:var(--muted);text-transform:uppercase}
+h1{font-size:32px;letter-spacing:-.05em;margin:4px 0;font-weight:550}
+.intro p{margin:0;color:var(--muted)}
+.lens{border:1px solid var(--line);border-radius:16px;padding:24px;background:var(--panel)}
+.lens-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.lens-top h2{margin:4px 0 0;font-size:19px;font-weight:550}.lens button{border-radius:20px;padding:7px 12px}
+.journey{display:flex;gap:4px;height:28px;margin:24px 0 10px;border-radius:8px;overflow:hidden;background:var(--line)}
+.journey span{min-width:3px;background:var(--prefill)}.journey span:last-child{background:var(--decode)}
+.journey-caption{display:flex;justify-content:space-between;gap:14px;color:var(--muted);font-size:12px}.journey-caption b{color:var(--text);font-weight:500}
+.lens-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:24px 0 16px}
+.lens-metrics small{display:block;color:var(--muted);font-size:11px}.lens-metrics strong{display:block;font:24px var(--mono);letter-spacing:-.05em;margin:4px 0}
+.lens-note{font-size:12px;color:var(--muted);margin:0;line-height:1.6}
+.compare{margin-top:16px;border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--decode)}.compare[hidden]{display:none}
+.stats{border-radius:10px}.stat{padding:12px}
+.hardware-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;margin-bottom:10px;flex-wrap:wrap}
+#device{white-space:normal;font-size:11px}
+#themeButton{display:inline-flex;align-items:center;justify-content:center;width:34px;height:32px;padding:6px}
+#themeButton svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+#themeButton .moon{display:none}:root[data-theme="light"] #themeButton .sun{display:none}:root[data-theme="light"] #themeButton .moon{display:block}
+.chart{border-radius:12px;padding:14px 18px}.chart svg{height:54px}
+.log{border:0;background:transparent}.log .head{padding:0 0 12px;border:0}
+th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transparent}tbody tr{border-top:1px solid var(--line)}
+.request-select{background:transparent;border:1px solid transparent;border-radius:6px;padding:4px 8px}.request-select[aria-pressed="true"]{border-color:var(--decode);color:var(--decode)}
+.chat-head{padding:18px 16px;font-size:10px}.msg{grid-template-columns:1fr;gap:5px}.msg .who{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.1em}
+.msg pre{font:12px/1.7 var(--mono)}#transcript{padding:20px;gap:24px}.compose{padding:14px;grid-template-columns:minmax(0,1fr) auto}.compose .caret{display:none}
+.compose textarea{border-radius:8px;min-height:64px;padding:10px}.compose .buttons{flex-direction:column}button{border-radius:6px}.chat-foot{padding:10px 14px}
+@media(max-width:1100px){main{grid-template-columns:1fr}.right{min-height:420px}}
+@media(max-width:520px){.left{padding:18px 14px;gap:16px}.bar{padding:12px 14px;gap:8px}h1{font-size:27px}.lens{padding:18px}.lens-metrics{gap:8px}.lens-metrics strong{font-size:18px}.journey-caption{font-size:11px}.table-wrap{max-height:240px}.chart .head{font-size:10px;gap:12px}}
+
+/* Shared control geometry and accessible keyboard states. */
+button,.icon-button,#themeButton{min-width:44px;min-height:44px}
+.icon-button,#themeButton{width:44px;height:44px;display:inline-flex;align-items:center;justify-content:center;padding:10px;flex-shrink:0}
+.icon-button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+button.primary{background:var(--decode);color:var(--bg);border-color:var(--decode)}
+:focus-visible{outline:2px solid var(--decode);outline-offset:3px}
+[hidden]{display:none!important}
+.bar .brand{white-space:nowrap}.bar .pill{margin-left:auto}.bar .id{flex-basis:200px}
+.lens-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.compare{display:flex;align-items:center;gap:12px}.compare span{flex:1}
+#requestLens[data-stale="true"] .journey,#requestLens[data-stale="true"] .lens-metrics{opacity:.45}
+.chat-head{padding:10px 14px;gap:8px}.chat-head .toggle{min-height:44px;white-space:nowrap}
+.chat-head input{width:16px;height:16px;accent-color:var(--decode)}
+.compose{align-items:end;grid-template-columns:minmax(0,1fr) auto}.compose .buttons{flex-direction:row;align-items:center}
+.compose textarea{font-size:16px;line-height:1.5;min-height:72px}.chat-help{font-size:11px;color:var(--muted);padding:0 14px 10px}
+#transcript{height:420px;min-height:200px;max-height:70vh;overflow-y:auto;overflow-anchor:none}
+.msg pre.thought{color:var(--muted)}.hint,.msg .who,th{color:var(--muted)}
+#monitorPanels:empty{display:none}.extension-panel{padding:18px;border:1px solid var(--line);border-radius:12px;margin-top:12px;overflow-wrap:anywhere}
+.extension-panel h2{font-size:14px;margin:0 0 12px}.extension-panel[data-state="unavailable"]{color:var(--muted)}
+@media(min-width:1101px){.right{position:sticky;top:0;max-height:100vh;min-height:min(100vh,800px)}#transcript{height:0;max-height:none}}
+@media(max-width:520px){.bar{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:6px}.bar .brand{font-size:18px;grid-column:1;grid-row:1}.bar .id{display:block;grid-column:1/-1;grid-row:3;font-size:11px}.bar .pill{grid-column:1;grid-row:2;justify-self:start;margin:0;font-size:11px;padding:2px 6px}#themeButton{grid-column:2;grid-row:1/3}#keyButton{grid-column:3;grid-row:1/3}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.compose{grid-template-columns:1fr}.compose .buttons{justify-content:flex-end}.lens-actions{width:100%}.lens-actions button{flex:1}}
+@media(max-width:360px){.lens-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.lens-metrics>div:last-child{grid-column:1/-1}}
+</style>
+</head>
+<body data-connection="connecting">
+<header class="bar">
+  <div class="brand">tq<b>LLM</b> monitor</div>
+  <div class="id"><strong id="model">engine</strong> on <span id="host">--</span>, build <span id="build">--</span>, <span id="slots">-- slots</span></div>
+  <span class="pill" role="status"><i></i><span id="connection">Connecting</span></span>
+  <button type="button" id="themeButton" title="Switch to light theme" aria-label="Switch to light theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A8.5 8.5 0 0 1 9 4a8.5 8.5 0 1 0 11 11Z"/></svg></button>
+  <button type="button" id="keyButton" class="icon-button" title="Server API key" aria-label="Server API key" aria-expanded="false" aria-controls="auth"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="4"/><path d="m11 12 8 8m-4-4 3-3m-6 0 3-3"/></svg></button>
+</header>
+<main>
+<section class="left" aria-label="Telemetry">
+  <div id="notice" class="notice" hidden role="alert"></div>
+  <form id="auth" hidden><label for="apiKey">api key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="the key configured on tqserve"><button type="submit">connect</button><small>Kept in memory for this tab only; never written to storage or a URL.</small></form>
+  <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
+  <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
+  <section class="lens" id="requestLens" aria-label="Selected request">
+    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><div class="lens-actions"><button type="button" id="followLatest" hidden title="Follow the latest request">Follow latest</button><button type="button" id="pinRequest" disabled>Pin as reference</button></div></div>
+    <div class="journey" aria-label="Time before and after first output"><span id="journeyWait" style="flex-grow:1"></span><span id="journeyOutput" style="flex-grow:0"></span></div>
+    <div class="journey-caption"><span>Before first output <b id="journeyBefore">--</b></span><span>After first output <b id="journeyAfter">--</b></span></div>
+    <div class="lens-metrics"><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small>OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
+    <p class="lens-note" id="lensNote">Engine measurements, without guessing why a request is waiting.</p>
+    <div class="compare" id="comparison" hidden><span id="comparisonText"></span><button type="button" id="clearReference" class="icon-button" title="Clear reference" aria-label="Clear reference"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
+  </section>
+  <section class="hardware" aria-label="Engine and hardware"><div class="hardware-head"><span>Engine and hardware</span><span>Hardware every 3 s / requests every 1 s</span></div><div class="stats">
+    <div class="stat"><div class="label">active / queued</div><strong id="queue">--</strong></div>
+    <div class="stat"><div class="label">output tokens</div><strong id="tokens">--</strong></div>
+    <div class="stat"><div class="label">draft acceptance</div><strong id="acceptance">--</strong></div>
+    <div class="stat"><div class="label">context, tokens</div><strong id="context">--</strong><div class="track"><b id="contextBar"></b></div></div>
+    <div class="stat" title="Whole-device memory, including other applications"><div class="label">gpu memory, GiB</div><strong id="gpuMemory">--</strong><div class="track"><b id="gpuMemoryBar"></b></div></div>
+    <div class="stat"><div class="label">host memory, GiB</div><strong id="ramMemory">--</strong><div class="track"><b id="ramMemoryBar"></b></div></div>
+    <div class="stat" title="Whole-device GPU utilisation"><div class="label">gpu load</div><strong id="gpu">--</strong></div>
+    <div class="stat"><div class="label">gpu temp</div><strong id="temperature">--</strong></div>
+    <div class="stat"><div class="label">power</div><strong id="power">--</strong></div>
+    <div class="stat" title="System CPU utilisation, not just this server"><div class="label">host cpu</div><strong id="cpu">--</strong></div>
+    <div class="stat"><div class="label">device</div><strong id="device">--</strong></div>
+    <div class="stat"><div class="label">hardware sample</div><strong id="hardwareAge">--</strong></div>
+  </div>
+  </section>
+  <div class="chart"><div class="head"><span>output tokens / s, last 60 s</span><span id="chartStart">--</span></div>
+    <svg viewBox="0 0 600 78" preserveAspectRatio="none" aria-label="Throughput, last 60 seconds"><line class="grid" x1="0" y1="39" x2="600" y2="39"/><line class="grid" x1="0" y1="77" x2="600" y2="77"/><path id="chartFill" d=""/><path id="chartLine" d=""/></svg></div>
+  <div class="log"><div class="head"><span>Request history / select to inspect</span><span id="requestCount">none yet</span></div>
+    <div class="table-wrap" id="requestHistory" tabindex="0" role="region" aria-label="Scrollable request history"><table aria-label="Recent requests"><thead><tr><th scope="col">id</th><th scope="col">phase</th><th scope="col">prompt / output</th><th scope="col">first out</th><th scope="col">tok/s</th><th scope="col">elapsed</th></tr></thead><tbody id="requests"></tbody></table></div></div>
+  <div id="monitorPanels"></div>
+</section>
+<section class="right" aria-label="Chat">
+  <div class="chat-head"><span>chat / this instance</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear" class="icon-button" title="Clear conversation" aria-label="Clear conversation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg></button></div>
+  <div id="transcript" tabindex="0" role="region" aria-label="Conversation"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
+  <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" aria-label="Message to this model" aria-describedby="composeHelp" rows="2" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend" class="icon-button primary" title="Send message (Enter)" aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V4m-6 6 6-6 6 6"/></svg></button><button type="button" id="chatStop" class="icon-button" title="Stop response (Escape)" aria-label="Stop response" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button></div></form>
+  <div class="chat-help" id="composeHelp">Enter to send / Shift+Enter for a new line / Esc to stop</div><div class="chat-foot"><span id="chatStatus" role="status">idle</span><span id="chatStats"></span></div>
+</section>
+</main>
+<footer><span>Telemetry is read-only and local; the chat is sent only to this tqserve instance. <a href="/api/monitor/v1/snapshot" id="snapshotLink">snapshot json</a></span><span>schema v1</span></footer>
+<script>
+@TQLLM_MONITOR_PANELS@
+</script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const number = (v, d = 0) => typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}) : '--';
+const terminal = p => ['complete', 'failed', 'cancelled'].includes(p);
+const text = (id, value) => { if ($(id).textContent !== String(value)) $(id).textContent = value; };
+let focusedId = null, pinnedRequest = null, currentRows = [];
+let key = '', timer = null, instance = null, samples = [], previous = null, lastSuccess = null, generation = 0;
+
+function connection(state, message) { document.body.dataset.connection = state; text('connection', message); }
+function notice(message) { $('notice').hidden = !message; text('notice', message); }
+function clearLive() {
+  text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true; $('followLatest').disabled = true;
+  for (const id of ['speed', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
+  for (const id of ['contextBar', 'gpuMemoryBar', 'ramMemoryBar']) $(id).style.width = '0';
+  $('requestLens').setAttribute('data-stale', 'true'); monitorPanels.invalidate();
+}
+function chart() {
+  const now = performance.now(), start = Math.max(now - 60000, samples[0]?.at || now), span = Math.max(1000, now - start);
+  const max = Math.max(1, ...samples.map(p => p.rate || 0));
+  text('chartStart', number(span / 1000, 0) + ' s window, peak ' + number(max, 0) + ' tok/s');
+  const pts = samples.map(p => [((p.at - start) / span * 600), p.rate === null ? null : 77 - (p.rate / max) * 74]);
+  let d = '', pen = false;
+  for (const [x, y] of pts) { if (y === null) { pen = false; continue; } d += (pen ? ' L' : ' M') + x.toFixed(1) + ' ' + y.toFixed(1); pen = true; }
+  $('chartLine').setAttribute('d', d.trim());
+  let fill = '', segment = [];
+  const close = () => {
+    if (segment.length > 1) fill += 'M' + segment[0][0].toFixed(1) + ' 77 ' + segment.map(p => 'L' + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ') + ' L' + segment.at(-1)[0].toFixed(1) + ' 77 Z ';
+    segment = [];
+  };
+  for (const point of pts) { if (point[1] === null) close(); else segment.push(point); }
+  close(); $('chartFill').setAttribute('d', fill.trim());
+}
+function budget(label, bar, used, total, bytes) {
+  const ok = typeof used === 'number' && typeof total === 'number' && total > 0;
+  text(label, ok ? number(bytes ? used / 2 ** 30 : used, bytes ? 1 : 0) + ' / ' + number(bytes ? total / 2 ** 30 : total, bytes ? 1 : 0) : 'unavailable');
+  const share = ok ? Math.min(1, used / total) : 0, b = $(bar);
+  b.style.width = (share * 100).toFixed(1) + '%'; b.className = share > .92 ? 'hot' : share > .75 ? 'warn' : '';
+}
+const seconds = value => Number.isFinite(value) ? number(value / 1000, 2) + ' s' : '--';
+function requestLens() {
+  if (focusedId !== null && !currentRows.some(row => row.id === focusedId)) focusedId = null;
+  const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
+  document.querySelector('.journey').hidden = !r;
+  $('followLatest').hidden = focusedId === null;
+  if (!r) {
+    text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
+    for (const id of ['lensFirst','lensRate','lensElapsed','journeyBefore','journeyAfter']) text(id, '--');
+    $('comparison').hidden = true; $('pinRequest').disabled = true;
+    $('journeyWait').style.flexGrow = 1; $('journeyOutput').style.flexGrow = 0;
+    text('lensNote', 'Engine measurements, without guessing why a request is waiting.');
+    return;
+  }
+  text('lensPhase', r.phase + (focusedId === null ? ' / following latest' : ' / selected request'));
+  text('lensTitle', 'Request ' + r.id + ' / ' + number(r.prompt_tokens) + ' in, ' + number(r.output_tokens) + ' out');
+  const hasFirst = Number.isFinite(r.first_output_ms), elapsed = Math.max(0, r.elapsed_ms || 0);
+  const before = hasFirst ? Math.max(0, r.first_output_ms) : elapsed;
+  const after = hasFirst ? Math.max(0, elapsed - before) : 0;
+  $('journeyWait').style.flexGrow = Math.max(.001, before); $('journeyOutput').style.flexGrow = after;
+  $('journeyWait').hidden = before === 0; $('journeyOutput').hidden = after === 0;
+  text('journeyBefore', hasFirst ? seconds(before) : 'not observed yet'); text('journeyAfter', hasFirst ? seconds(after) : '--');
+  text('lensFirst', seconds(r.first_output_ms)); text('lensElapsed', seconds(r.elapsed_ms));
+  text('lensRate', Number.isFinite(r.decode_tokens_per_second) ? number(r.decode_tokens_per_second, 1) + ' tok/s' : '--');
+  text('lensNote', 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
+    (terminal(r.phase) ? 'Finished request; measurements are retained.' : 'Live snapshot; the journey grows as the request runs.'));
+  $('pinRequest').disabled = !terminal(r.phase); $('followLatest').disabled = false;
+  $('pinRequest').textContent = pinnedRequest && pinnedRequest.id === r.id ? 'Clear reference' : 'Pin as reference';
+  $('comparison').hidden = !pinnedRequest;
+  if (pinnedRequest) {
+    const delta = (a,b,unit) => Number.isFinite(a) && Number.isFinite(b) ? (a-b > 0 ? '+' : '') + number(a-b, 1) + unit : 'unavailable';
+    text('comparisonText', 'Reference #' + pinnedRequest.id + ': first output ' + delta(r.first_output_ms, pinnedRequest.first_output_ms, ' ms') +
+      ' / rate ' + delta(r.decode_tokens_per_second, pinnedRequest.decode_tokens_per_second, ' tok/s') + '. ' +
+      (r.prompt_tokens === pinnedRequest.prompt_tokens && r.output_tokens === pinnedRequest.output_tokens ?
+        'Token counts match; prompt content and other conditions may differ.' : 'Different token counts; this is not a matched benchmark.'));
+  }
+}
+$('clearReference').addEventListener('click', () => { pinnedRequest = null; requestLens(); $('requestHistory').focus({preventScroll:true}); });
+$('followLatest').addEventListener('click', () => { focusedId = null; requestLens();
+  for (const b of $('requests').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.textContent === String(currentRows.at(-1)?.id)));
+  $('requestHistory').focus({preventScroll:true});
+});
+$('pinRequest').addEventListener('click', () => {
+  if (document.body.dataset.connection !== 'live') return;
+  const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
+  if (!r || !terminal(r.phase)) return;
+  pinnedRequest = pinnedRequest && pinnedRequest.id === r.id ? null : {...r}; requestLens();
+});
+function render(data) {
+  if (data.schema_version !== 1 || !data.engine || !Array.isArray(data.requests)) throw new Error('Unsupported telemetry schema');
+  if (instance !== data.instance_id) { samples = []; previous = null; focusedId = null; pinnedRequest = null; instance = data.instance_id; }
+  const now = performance.now(), rows = data.requests, active = rows.filter(r => !terminal(r.phase)), latest = rows.at(-1);
+  currentRows = rows; requestLens(); $('requestLens').removeAttribute('data-stale');
+  const decoders = active.filter(r => r.phase === 'decode'), total = rows.reduce((n, r) => n + (r.output_tokens || 0), 0);
+  // history eviction can lower the retained sum: mark a gap instead of inventing throughput
+  let rate = null; if (previous && total >= previous.total) rate = (total - previous.total) * 1000 / (now - previous.at);
+  samples.push({at: now, rate}); samples = samples.filter(p => now - p.at <= 60000); previous = {total, at: now}; chart();
+  text('model', data.engine.model || 'tqLLM'); text('host', data.engine.host || 'local'); text('build', data.engine.build || 'unknown');
+  text('slots', number(data.engine.slots) + (data.engine.slots === 1 ? ' slot' : ' slots'));
+  text('phase', active.length ? active.some(r => r.phase === 'prefill') ? 'Prefilling prompt' : decoders.length ? 'Generating output' : 'Requests queued' : 'Ready for your next request');
+  const measured = decoders.filter(r => typeof r.decode_tokens_per_second === 'number');
+  text('speed', measured.length ? number(measured.reduce((n, r) => n + r.decode_tokens_per_second, 0), 1) : '--');
+  text('queue', active.filter(r => r.phase !== 'queued').length + ' / ' + active.filter(r => r.phase === 'queued').length);
+  text('tokens', number(total));
+  const drafted = rows.reduce((n, r) => n + (r.drafted || 0), 0), accepted = rows.reduce((n, r) => n + (r.accepted || 0), 0);
+  text('acceptance', drafted ? number(accepted / drafted * 100, 1) + '% of ' + number(drafted) : '--');
+  text('requestCount', rows.length ? rows.length + ' retained' : 'none yet');
+  const requestFocus = $('requests').contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') : null;
+  $('requests').replaceChildren(...rows.slice(-14).reverse().map(r => {
+    const tr = document.createElement('tr');
+    const cells = [r.id, r.phase, number(r.prompt_tokens) + ' / ' + number(r.output_tokens), typeof r.first_output_ms === 'number' ? number(r.first_output_ms) + ' ms' : '--',
+      typeof r.decode_tokens_per_second === 'number' ? number(r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
+    cells.forEach((value, i) => {
+      const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
+      if (i === 0) {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'request-select';
+        button.textContent = String(r.id); button.setAttribute('aria-label', 'Inspect request ' + r.id);
+        button.setAttribute('aria-pressed', String(r.id === (focusedId ?? latest?.id)));
+        button.addEventListener('click', () => {
+          if (document.body.dataset.connection !== 'live') return;
+          focusedId = focusedId === r.id ? null : r.id; requestLens();
+          for (const b of $('requests').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.textContent === String(focusedId ?? currentRows.at(-1)?.id)));
+        });
+        td.replaceChildren(button);
+      }
+      if (i === 2 && r.phase === 'prefill' && data.capabilities?.prefill_progress === true && r.prompt_tokens > 0 && typeof r.prefill_processed_tokens === 'number') {
+        const bar = document.createElement('span'); bar.className = 'progress'; const fill = document.createElement('b'); fill.style.width = (Math.min(1, r.prefill_processed_tokens / r.prompt_tokens) * 100).toFixed(1) + '%'; bar.append(fill); td.append(bar);
+      }
+      tr.append(td);
+    });
+    return tr;
+  }));
+  if (requestFocus) {
+    const target = [...$('requests').querySelectorAll('button')].find(b => b.getAttribute('aria-label') === requestFocus);
+    (target || $('requestHistory')).focus({preventScroll:true});
+  }
+  budget('context', 'contextBar', active.length ? Math.max(...active.map(r => r.context_tokens || 0)) : 0, data.engine.context_per_slot, false);
+  const h = data.hardware || {}, fresh = typeof h.sample_age_ms === 'number' && h.sample_age_ms < 10000;
+  budget('gpuMemory', 'gpuMemoryBar', fresh ? h.gpu_used_bytes : null, h.gpu_total_bytes, true);
+  budget('ramMemory', 'ramMemoryBar', fresh ? h.ram_used_bytes : null, h.ram_total_bytes, true);
+  text('cpu', fresh && h.cpu_percent != null ? number(h.cpu_percent) + '%' : '--');
+  text('gpu', fresh && h.gpu_percent != null ? number(h.gpu_percent) + '%' : '--');
+  text('temperature', fresh && h.gpu_celsius != null ? number(h.gpu_celsius) + ' C' : '--');
+  text('power', fresh && h.gpu_watts != null ? number(h.gpu_watts) + ' W' : '--');
+  text('device', h.device_name || data.engine.device_id || 'unknown');
+  text('hardwareAge', typeof h.sample_age_ms === 'number' ? (fresh ? number(h.sample_age_ms / 1000, 1) + ' s old' : 'stale, ' + number(h.sample_age_ms / 1000, 0) + ' s old') : 'no sample');
+  text('sample', 'snapshot ' + new Date().toLocaleTimeString());
+  connection('live', 'Connected'); notice(''); lastSuccess = now; monitorPanels.update(data);
+}
+async function poll(token = generation) {
+  if (token !== generation) return;
+  try {
+    const response = await fetch('/api/monitor/v1/snapshot', {headers: key ? {Authorization: 'Bearer ' + key} : {}, cache: 'no-store', signal: AbortSignal.timeout(3000)});
+    if (token !== generation) return;
+    if (response.status === 401 || response.status === 403) {
+      key = ''; if ($('auth').hidden) showAuth(true); connection('auth', 'Access required'); text('phase', 'Telemetry needs the server key'); clearLive();
+      timer = setTimeout(() => poll(token), 4000); return;
+    }
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    render(await response.json());
+    timer = setTimeout(() => poll(token), 1000);
+  } catch (error) {
+    if (token !== generation) return;
+    connection('offline', 'Disconnected'); clearLive(); text('phase', 'Telemetry unavailable'); text('sample', 'last snapshot ' + (lastSuccess === null ? 'never' : number((performance.now() - lastSuccess) / 1000, 0) + ' s ago'));
+    notice('Cannot reach /api/monitor/v1/snapshot on this server (' + (error && error.message ? error.message : 'request failed') + '). Retrying.');
+    timer = setTimeout(() => poll(token), 2000);
+  }
+}
+$('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; showAuth(false); generation++; clearTimeout(timer); poll(generation); });
+$('themeButton').addEventListener('click', () => {
+  const light = document.documentElement.dataset.theme !== 'light';
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  const label = 'Switch to ' + (light ? 'dark' : 'light') + ' theme';
+  $('themeButton').setAttribute('aria-label', label); $('themeButton').title = label;
+});
+function showAuth(show) { $('auth').hidden = !show; $('keyButton').setAttribute('aria-expanded', String(show)); if (show) $('apiKey').focus(); }
+$('keyButton').addEventListener('click', () => showAuth($('auth').hidden));
+$('snapshotLink').addEventListener('click', event => { if (key) { event.preventDefault(); notice('The JSON endpoint uses Bearer authentication; the key is never placed in a URL. Query /api/monitor/v1/snapshot from your API client.'); } });
+document.addEventListener('visibilitychange', () => { generation++; clearTimeout(timer); previous = null; if (!document.hidden) poll(generation); });
+setInterval(() => { if (lastSuccess !== null && performance.now() - lastSuccess > 5000 && document.body.dataset.connection === 'live') { connection('stale', 'Stale snapshot'); clearLive(); notice('No fresh snapshot in five seconds; live values are cleared until the next one.'); } }, 1000);
+
+// chat: one streaming completion at a time against this instance's bridge, same key, text rendered as text only
+const history = [];
+let controller = null, chatGeneration = 0;
+function line(role, who) {
+  const msg = document.createElement('div'); msg.className = 'msg ' + role;
+  const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
+  const pre = document.createElement('pre');
+  if (role === 'model') { const body = document.createElement('div'); const thought = document.createElement('pre'); thought.className = 'thought'; body.append(thought, pre); msg.append(w, body); }
+  else msg.append(w, pre);
+  $('chatHint')?.remove(); $('transcript').append(msg); return pre;
+}
+function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatInput').disabled = on; }
+let followOutput = true;
+$('transcript').addEventListener('scroll', () => { const t = $('transcript'); followOutput = t.scrollHeight - t.clientHeight - t.scrollTop < 48; });
+function chatScroll() { const t = $('transcript'); if (followOutput) t.scrollTop = t.scrollHeight; }
+async function send(prompt) {
+  if (!key && document.body.dataset.connection === 'auth') { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); showAuth(true); return; }
+  followOutput = true;
+  const revision = chatGeneration, checkpoint = history.length;
+  history.push({role: 'user', content: prompt}); line('you', 'you').textContent = prompt;
+  const pre = line('model', 'model'), msg = pre.closest('.msg'), thought = msg.querySelector('.thought'); msg.classList.add('streaming'); chatScroll();
+  controller = new AbortController(); chatBusy(true); text('chatStatus', 'waiting for the first token'); text('chatStats', '');
+  const started = performance.now(); let first = null, pieces = 0, reply = '', thinking = '', usage = null, timings = null, done = false, failed = false;
+  const live = setInterval(() => { if (first !== null) text('chatStats', number((performance.now() - started) / 1000, 1) + ' s / ' + number(pieces / ((performance.now() - first) / 1000), 1) + ' chunks/s'); }, 500);
+  try {
+    const response = await fetch('/api/monitor/v1/chat/completions', {method: 'POST', signal: controller.signal, cache: 'no-store',
+      headers: {...(key ? {Authorization: 'Bearer ' + key} : {}), 'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.assign({messages: history, stream: true}, $('chatThink').checked ? {} : {chat_template_kwargs: {enable_thinking: false}}))});
+    if (response.status === 401 || response.status === 403) { showAuth(true); throw new Error('the server rejected the key'); }
+    if (response.status === 409 || response.status === 429) throw new Error('another chat is already running on this monitor');
+    if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
+    const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '';
+    for (;;) {
+      const {value, done: eof} = await reader.read(); if (eof) break;
+      buffer += decoder.decode(value, {stream: true});
+      let cut; while ((cut = buffer.indexOf('\n')) >= 0) {
+        const raw = buffer.slice(0, cut).trim(); buffer = buffer.slice(cut + 1);
+        if (!raw.startsWith('data:')) continue;
+        const payload = raw.slice(5).trim(); if (payload === '[DONE]') { done = true; continue; }
+        let chunk; try { chunk = JSON.parse(payload); } catch (e) { continue; }
+        if (chunk.error) throw new Error(typeof chunk.error === 'string' ? chunk.error : chunk.error.message || 'inference failed');
+        if (chunk.usage) usage = chunk.usage; if (chunk.timings) timings = chunk.timings;
+        const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
+        if (reasoning) { if (first === null) { first = performance.now(); text('chatStatus', 'thinking'); } thinking += reasoning; thought.textContent = thinking; chatScroll(); }
+        const delta = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.text ?? '';
+        if (reasoning || delta) pieces++;
+        if (delta) { if (first === null) { first = performance.now(); text('chatStatus', 'streaming'); } reply += delta; pre.textContent = reply; chatScroll(); }
+        if (chunk.choices?.[0]?.finish_reason) done = true;
+      }
+    }
+    if (revision === chatGeneration) text('chatStatus', done ? 'done' : 'stream ended without a finish marker');
+  } catch (error) {
+    failed = true;
+    if (revision === chatGeneration) text('chatStatus', controller.signal.aborted ? 'stopped' : 'failed: ' + (error && error.message ? error.message : 'request failed'));
+    if (!controller.signal.aborted) {
+      msg.classList.replace('model', 'sys');
+      if (revision === chatGeneration && !$('chatInput').value) $('chatInput').value = prompt;
+    }
+  } finally {
+    const elapsed = (performance.now() - started) / 1000, gen = first === null ? 0 : (performance.now() - first) / 1000;
+    const parts = [number(elapsed, 1) + ' s'];
+    if (first !== null) parts.push('first output ' + number((first - started) / 1000, 2) + ' s');
+    if (timings && Number.isFinite(timings.predicted_per_second)) parts.push(number(timings.predicted_per_second, 1) + ' tok/s (server)');
+    if (usage && Number.isFinite(usage.completion_tokens)) parts.push(number(usage.completion_tokens) + ' tokens');
+    else if (pieces) parts.push(pieces + ' chunks' + (gen > 0 ? ', ' + number(pieces / gen, 1) + ' chunks/s' : '') + ' (no token count from the server)');
+    clearInterval(live); if (revision === chatGeneration) text('chatStats', parts.join(' / ')); msg.classList.remove('streaming');
+    if (revision === chatGeneration) {
+      if (done && reply && !failed && !controller.signal.aborted) history.push({role: 'assistant', content: reply});
+      else history.splice(checkpoint);
+    }
+    controller = null; chatBusy(false); $('chatInput').focus();
+  }
+}
+$('compose').addEventListener('submit', event => { event.preventDefault(); const value = $('chatInput').value.trim(); if (!value || controller) return; $('chatInput').value = ''; send(value); });
+$('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  if (controller) controller.abort();
+  else if (!$('auth').hidden) { showAuth(false); $('keyButton').focus(); }
+});
+$('chatStop').addEventListener('click', () => { if (controller) controller.abort(); });
+$('chatClear').addEventListener('click', () => { chatGeneration++; if (controller) controller.abort(); history.length = 0; $('transcript').replaceChildren(Object.assign(document.createElement('div'), {className: 'hint', id: 'chatHint', textContent: 'Transcript cleared.'})); text('chatStatus', 'idle'); text('chatStats', ''); });
+poll();
+</script>
+</body></html>
