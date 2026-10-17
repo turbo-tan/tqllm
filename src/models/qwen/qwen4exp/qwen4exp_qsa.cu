@@ -484,14 +484,20 @@ QsaBatchScratch::QsaBatchScratch(int max_queries_, int max_cells, int ratio, int
     if (max_queries <= 0 || max_cells <= 0 || ratio <= 0 || top_k <= 0)
         throw std::invalid_argument("QSA batch scratch: invalid dimensions");
     const size_t items = size_t(max_queries) * max_blocks;
+    lean = (width_cap - 1) / ratio + 1 <= kTopkCap && max_blocks >= kTopkCap;
     try {
         ck(cudaMalloc(&query, size_t(max_queries) * 4 * 128 * sizeof(float)));
-        ck(cudaMalloc(&keys, items * sizeof(uint64_t)));
-        ck(cudaMalloc(&sorted, items * sizeof(uint64_t)));
-        ck(cudaMalloc(&offsets, size_t(max_queries + 1) * sizeof(int)));
-        ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries,
-                                                             offsets, offsets + 1));
-        ck(cudaMalloc(&temp, temp_bytes));
+        if (lean) {
+            ck(cudaMalloc(&keys, items * sizeof(uint32_t)));
+            ck(cudaMalloc(&sorted, size_t(max_queries) * kTopkCap * sizeof(uint64_t)));
+        } else {
+            ck(cudaMalloc(&keys, items * sizeof(uint64_t)));
+            ck(cudaMalloc(&sorted, items * sizeof(uint64_t)));
+            ck(cudaMalloc(&offsets, size_t(max_queries + 1) * sizeof(int)));
+            ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries,
+                                                                 offsets, offsets + 1));
+            ck(cudaMalloc(&temp, temp_bytes));
+        }
         ck(cudaMalloc(&positions, size_t(max_queries) * width_cap * sizeof(int32_t)));
         ck(cudaMalloc(&valid, size_t(max_queries) * width_cap));
     } catch (...) {
@@ -500,6 +506,17 @@ QsaBatchScratch::QsaBatchScratch(int max_queries_, int max_cells, int ratio, int
     }
 }
 
+void QsaBatchScratch::full() {
+    if (!lean) return;
+    const size_t items = size_t(max_queries) * max_blocks;
+    ck(cudaDeviceSynchronize()); cudaFree(keys); cudaFree(sorted); keys = sorted = nullptr;
+    ck(cudaMalloc(&keys, items * sizeof(uint64_t)));
+    ck(cudaMalloc(&sorted, items * sizeof(uint64_t)));
+    ck(cudaMalloc(&offsets, size_t(max_queries + 1) * sizeof(int)));
+    ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries, offsets, offsets + 1));
+    ck(cudaMalloc(&temp, temp_bytes));
+    lean = false;
+}
 QsaBatchScratch::~QsaBatchScratch() {
     cudaFree(valid); cudaFree(positions); cudaFree(temp); cudaFree(offsets); cudaFree(sorted); cudaFree(keys); cudaFree(query);
 }
@@ -730,6 +747,7 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
                 keys_.normalized(), scratch.query, bits, blocks, tokens, first_position, ratio_);
             topk_bits_k<<<tokens, 1024, 0, stream>>>(bits, scratch.sorted, blocks, first_position, ratio_, need_cap);
         } else {
+            scratch.full();  // 64-bit keys
             qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);
             topk_sorted_k<<<tokens, 1024, 0, stream>>>(scratch.keys, scratch.sorted, blocks, first_position, ratio_, need_cap);
         }
@@ -738,6 +756,7 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
         if (check) {  // full sort into temp positions, compare the reachable prefix of every query
             std::vector<uint64_t> fast(size_t(tokens) * kTopkCap);
             ck(cudaMemcpyAsync(fast.data(), scratch.sorted, fast.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+            ck(cudaStreamSynchronize(stream)); scratch.full();  // the reference sort needs the full key buffers
             qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);  // full keys for the reference sort
             segment_offsets<<<(tokens + 256) / 256, 256, 0, stream>>>(scratch.offsets, tokens, blocks);
             size_t available = scratch.temp_bytes;
@@ -756,6 +775,7 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
             ck(cudaStreamSynchronize(stream));
         }
     } else if (blocks > 0) {
+        scratch.full();
         qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);
         segment_offsets<<<(tokens + 256) / 256, 256, 0, stream>>>(scratch.offsets, tokens, blocks);
         ck(cudaPeekAtLastError());

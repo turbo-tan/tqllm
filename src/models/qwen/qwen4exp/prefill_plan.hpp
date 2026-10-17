@@ -48,7 +48,11 @@ inline size_t prefill_context_bytes(int context, int sub, int attention_layers, 
     const size_t ctx = size_t(std::max(0, context)), blocks = ctx / size_t(std::max(1, ratio));
     const size_t per_layer = 2 * ctx * size_t(kv_heads) * size_t(head_dim) * 2 + ctx * size_t(index_dim) * 4 + blocks * 4;
     const size_t items = size_t(std::max(16, sub)) * blocks, width = size_t(std::min<int64_t>(int64_t(ctx), int64_t(top_k) + ratio - 1));
-    const size_t scratch = items * 8 * 2 + items * 16 + size_t(std::max(16, sub)) * (width * 5 + 4 * 128 * 4);
+    // lean scratch (QsaBatchScratch::lean: top-k only): 32-bit score bits + 1024 sorted keys per query; else sort keys,
+    // sorted keys and CUB temp of the same order
+    const bool lean = (width - 1) / size_t(std::max(1, ratio)) + 1 <= 1024 && blocks >= 1024;
+    const size_t sel = lean ? items * 4 + size_t(std::max(16, sub)) * 1024 * 8 : items * 8 * 2 + items * 16;
+    const size_t scratch = sel + size_t(std::max(16, sub)) * (width * 5 + 4 * 128 * 4);
     return size_t(std::max(0, attention_layers)) * per_layer + scratch;
 }
 

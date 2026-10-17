@@ -89,7 +89,8 @@ struct MixedExpertCache::State {
             banks.erase(victim);
         }
         void * p = nullptr;
-        if (const cudaError_t e = cudaMalloc(&p, bytes); e != cudaSuccess) {
+        // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so)
+        if (const cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10)); e != cudaSuccess) {
             cudaGetLastError(); size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
             throw std::runtime_error(std::string(cudaGetErrorString(e)) + ": expert bank upload of " + std::to_string(bytes >> 20) +
                                      " MiB for layer " + std::to_string(protect) + " (cache " + std::to_string(live >> 20) + " of " +

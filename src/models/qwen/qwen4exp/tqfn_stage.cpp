@@ -2422,7 +2422,8 @@ struct DecodeModel {
         if (st.half_bytes >= need && st.K == K) return;
         ck(cudaDeviceSynchronize());
         for (auto & hp : st.half) if (hp) { ck(cudaFree(hp)); hp = nullptr; }
-        for (auto & hp : st.half) ck(cudaMalloc(reinterpret_cast<void **>(&hp), need));
+        // + a tail: MMQ reads the last row up to a multiple of 512 columns (a 640-column IQ4_NL down row ran off the end)
+        for (auto & hp : st.half) ck(cudaMalloc(reinterpret_cast<void **>(&hp), need + (size_t(64) << 10)));
         st.half_bytes = need; st.K = K; st.layer = -1;
         if (!st.copy) {
             ck(cudaStreamCreateWithFlags(&st.copy, cudaStreamNonBlocking));

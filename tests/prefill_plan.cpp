@@ -61,7 +61,7 @@ int main() {
     // Flash-Next attention state: 12 attention layers, 2 kv heads x 256, indexer dim 128, sub-chunk 2048
     const size_t ctx32 = prefill_context_bytes(33024, 2048, 12, 2, 256, 128), ctx128 = prefill_context_bytes(126976, 2048, 12, 2, 256, 128);
     expect(ctx32 > 1000 * MB && ctx32 < 2500 * MB, "context state at 32K between 1 and 2.5 GB");
-    expect(ctx128 > 4500 * MB && ctx128 < 8000 * MB && ctx128 > 3 * ctx32, "context state at 128K between 4.5 and 8 GB, more than 3x the 32K one (the scratch scales with sub x context)");
+    expect(ctx128 > 3800 * MB && ctx128 < 8000 * MB && ctx128 > 3 * ctx32, "context state at 128K between 3.8 and 8 GB (lean top-k scratch: 4 bytes per query x block), more than 3x the 32K one");
     { auto t = tuning(16384); t.context_bytes = ctx128; expect(prefill_plan(s, t, 122555, free0).need == prefill_plan(s, tuning(16384), 122555, free0).need + ctx128, "the context state adds to the need"); }
     expect(prefill_plan(s, tuning(8192), 30892, 64 * size_t(1024) * MB).release == 0, "nothing released on a 64 GB device");
 
