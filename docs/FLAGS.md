@@ -13,7 +13,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_CACHE_LIMIT_MIB` | - | MiB: MLX buffer-cache limit for the Mac tools (default 512) |  |
 | `TQLLM_MLX_DFLASH_BLOCK` | - | N: drafter block rows (8, or 16 for block-16 drafts and verify) |  |
 | `TQLLM_MLX_ATTN_DECODE_V5` | - | =1: own decode / verify attention v5 (matrix-unit S and P.V, queries staged once per 32, in-register softmax); takes precedence over SDPA / v1 |  |
-| `TQLLM_MLX_ATTN_DECODE_SDPA` | - | =1: decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4) |  |
+| `TQLLM_MLX_ATTN_DECODE_SDPA` | 1 | default on; =0 returns to v1. Decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4) |  |
 | `TQLLM_MLX_VERIFY_NARROW_AT` | 0 | position from which spec verify narrows to TQLLM_MLX_VERIFY_NARROW_WIDTH rows (0 = always full width) |  |
 | `TQLLM_MLX_VERIFY_NARROW_WIDTH` | 7 | drafted tokens verified per step past TQLLM_MLX_VERIFY_NARROW_AT |  |
 | `TQLLM_MLX_PREFILL_CHUNK` | - | N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best) |  |

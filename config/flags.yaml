@@ -93,8 +93,8 @@ flags:
     doc: "v5 key partition length (multiple of 8)"
   - name: TQLLM_MLX_ATTN_DECODE_SDPA
     kind: user
-    default: "-"
-    doc: "=1: decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4)"
+    default: "1"
+    doc: "default on; =0 returns to v1. Decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4)"
   - name: TQLLM_MLX_VERIFY_NARROW_AT
     kind: user
     default: "0"

@@ -593,7 +593,8 @@ inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const m
                                               const mlx::core::array& v, float scale, int valid = -1) {
     // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
     static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr, v3 = std::getenv("TQLLM_MLX_ATTN_DECODE_V3") != nullptr;
-    static const bool v4 = std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA") && std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA")) != "0";
+    // v4 is the default (j703: exact on 8 prompts x 2 files, 8K verify 125 -> 92 ms); =0 returns to v1
+    static const bool v4 = !std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA") || std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA")) != "0";
     static const bool v5 = std::getenv("TQLLM_MLX_ATTN_DECODE_V5") && std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_V5")) != "0";
     if (v5) return decode_rows_attention_v5(q, k, v, scale, valid);
     if (v4 && k.dtype() == mlx::core::bfloat16) return decode_rows_attention_v4(q, k, v, scale, valid);
