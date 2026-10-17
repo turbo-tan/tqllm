@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
+#include <atomic>
 
 namespace mx = mlx::core;
 using Clock = std::chrono::steady_clock;
@@ -70,14 +72,20 @@ int main(int argc, char** argv) {
             ane();               // ANE share runs meanwhile on this thread
             mx::eval(mx::add(g, y_ane));
         });
-        // compute-bound GPU work on cache-resident operands (no DRAM traffic): does the running ANE slow the GPU's clock?
+        // GPU work timed on this thread while a background thread keeps the ANE busy: compute-bound work on cache-resident
+        // operands (no DRAM traffic: a slowdown means clock / power) and the FFN GPU share (DRAM-heavy: bandwidth)
         auto ca = mx::astype(mx::random::normal({1024, 1024}), mx::float16), cb = mx::astype(mx::random::normal({1024, 1024}), mx::float16);
         mx::eval(ca, cb);
         auto compute = [&] {auto c = ca; for (int i = 0; i < 24; ++i) c = mx::matmul(c, cb); return c;};
         const double t_comp = best([&] {mx::eval(compute());});
-        const double t_comp_ane = best([&] {auto c = compute(); mx::async_eval(c); ane(); mx::eval(c);});
-        std::printf("ANE_CONTENTION compute-only GPU %.2f ms alone, %.2f ms with the ANE running (ANE alone %.2f ms); GPU share %.2f ms alone\n",
-                    t_comp, t_comp_ane, t_ane, t_gpu);
+        std::atomic<bool> stop{false}; std::atomic<int> calls{0};
+        std::thread busy([&] {while (!stop) {ane(); ++calls;}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const double t_comp_ane = best([&] {mx::eval(compute());});
+        const double t_gpu_ane = best([&] {mx::eval(gpu_ffn(wg, wu, wd));});
+        stop = true; busy.join();
+        std::printf("ANE_CONTENTION compute-only GPU %.2f -> %.2f ms with the ANE busy (%+.0f %%); FFN GPU share %.2f -> %.2f ms (%+.0f %%); ANE calls %d\n",
+                    t_comp, t_comp_ane, 100 * (t_comp_ane / t_comp - 1), t_gpu, t_gpu_ane, 100 * (t_gpu_ane / t_gpu - 1), calls.load());
         const double flop = 2.0 * M * 3.0 * H * F;
         std::printf("ANE_SPLIT M=%d C=%d gpu_full %.2f ms (%.1f TFLOPS) gpu_share %.2f ms ane_share %.2f ms (%.1f TFLOPS) concurrent %.2f ms -> %.2fx\n",
                     M, C, t_full, flop / t_full * 1e-9, t_gpu, t_ane, 2.0 * M * 3.0 * H * C / t_ane * 1e-9, t_both, t_full / t_both);
