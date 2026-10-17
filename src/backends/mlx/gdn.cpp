@@ -178,37 +178,20 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     static const bool skip_scan=std::getenv("TQLLM_MLX_ABLATE_BLOCKS") && std::string_view(std::getenv("TQLLM_MLX_ABLATE_BLOCKS")).find("gscan")!=std::string_view::npos;
     if(skip_scan && compact)
         return {mx::zeros({1,m,vh,128}),initial,std::nullopt,std::optional<mx::array>(mx::zeros({m,vh,128}))};
-    const char* pf_env=std::getenv("TQLLM_MLX_GDN_SCAN_PREFETCH");
-    const bool prefetch=!pf_env || std::string_view(pf_env)!="0";
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states","deltas"},R"METAL(
 uint lane=thread_position_in_threadgroup.x;
 uint row=thread_position_in_grid.y,head=thread_position_in_grid.z;
 uint base=(head*128u+row)*128u+lane*4u;
 float4 s=*((const device float4*)(initial+base));
-// PF: the next token's inputs are loaded one step ahead (same arithmetic, so the same bits); the token chain then
-// waits on the two simd_sums only, not on memory
-uint at0=(head%KH)*128u+lane*4u;
-float4 nkey=*((const device float4*)(k+at0)),nquery=*((const device float4*)(q+at0));
-float ndecay=decay[head],nbeta=beta[head],nv=v[head*128u+row];
 for(uint t=0;t<M;++t) {
- float4 key,query;float dk,bt,vv;
- if(PF) {
-  key=nkey;query=nquery;dk=ndecay;bt=nbeta;vv=nv;
-  if(t+1<M) {
-   uint an=((t+1)*KH+head%KH)*128u+lane*4u;
-   nkey=*((const device float4*)(k+an));nquery=*((const device float4*)(q+an));
-   ndecay=decay[(t+1)*VH+head];nbeta=beta[(t+1)*VH+head];nv=v[((t+1)*VH+head)*128u+row];
-  }
- } else {
-  uint at=(t*KH+head%KH)*128u+lane*4u;
-  key=*((const device float4*)(k+at));query=*((const device float4*)(q+at));
-  dk=decay[t*VH+head];bt=beta[t*VH+head];vv=v[(t*VH+head)*128u+row];
- }
- s*=dk;
+ uint at=(t*KH+head%KH)*128u+lane*4u;
+ float4 key=*((const device float4*)(k+at));
+ float4 query=*((const device float4*)(q+at));
+ s*=decay[t*VH+head];
  float memory=0.0f;
  for(uint j=0;j<4;++j)memory+=s[j]*key[j];
  memory=simd_sum(memory);
- float delta=(vv-memory)*bt;
+ float delta=(v[(t*VH+head)*128u+row]-memory)*beta[t*VH+head];
  if(COMPACT && lane==0)deltas[(t*VH+head)*128u+row]=delta;
  float value=0.0f;
  for(uint j=0;j<4;++j) {s[j]=s[j]+key[j]*delta;value+=s[j]*query[j];}
@@ -222,7 +205,7 @@ for(uint t=0;t<M;++t) {
 )METAL");
     auto result=kernel({mx::contiguous(q),mx::contiguous(k),mx::contiguous(v),mx::contiguous(decay),
         mx::contiguous(beta),mx::contiguous(initial)},{{1,m,vh,128},{snapshots&&!compact?m:1,vh,128,128},compact?mx::Shape{m,vh,128}:mx::Shape{1}},
-        {mx::float32,mx::float32,mx::float32},{32,128,vh},{32,4,1},{{"M",m},{"KH",kh},{"VH",vh},{"SNAPSHOTS",snapshots},{"COMPACT",compact},{"PF",prefetch}},
+        {mx::float32,mx::float32,mx::float32},{32,128,vh},{32,4,1},{{"M",m},{"KH",kh},{"VH",vh},{"SNAPSHOTS",snapshots},{"COMPACT",compact}},
         std::nullopt,false,mx::Device(mx::Device::gpu));
     auto final=snapshots&&!compact?mx::slice(result[1],{m-1,0,0,0},{m,vh,128,128}):result[1];
     return {result[0],final,snapshots&&!compact?std::optional<mx::array>(result[1]):std::nullopt,

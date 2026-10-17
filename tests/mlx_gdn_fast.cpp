@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <random>
@@ -95,29 +94,15 @@ int main() {
         bool chain = same_bits(mx::concatenate(ys, 1), y) && same_bits(st, s);
         std::printf("GDN_FAST sequential invariance: 15 vs 8+7 %d, 15 vs 15x1 %d\n", int(split), int(chain));
     }
-    for (int t : {1, 7, 16, 300, 2048}) {  // prefetching scan == plain scan, bit for bit (outputs, final state)
-        auto in = make(rng, t);
-        setenv("TQLLM_MLX_GDN_SCAN_PREFETCH", "0", 1);
-        auto plain = gdn_scan(in.q, in.k, in.v, in.decay, in.beta, in.state, t <= 16, t <= 16);
-        setenv("TQLLM_MLX_GDN_SCAN_PREFETCH", "1", 1);
-        auto pf = gdn_scan(in.q, in.k, in.v, in.decay, in.beta, in.state, t <= 16, t <= 16);
-        bool same = same_bits(pf.output, plain.output) && same_bits(pf.state, plain.state);
-        if (pf.deltas && plain.deltas) same = same && same_bits(*pf.deltas, *plain.deltas);
-        ok &= same;
-        std::printf("GDN_FAST prefetch scan T=%d bitwise %s\n", t, same ? "PASS" : "FAIL");
-    }
     for (int t : {1, 8, 15, 16, 2048}) {
         std::vector<Inputs> layers;
         for (int l = 0; l < 48; ++l) layers.push_back(make(rng, t));
         for (auto& in : layers) mx::eval(in.q, in.k, in.v, in.decay, in.beta, in.state);
         const int reps = t >= 2048 ? 3 : 20;
-        setenv("TQLLM_MLX_GDN_SCAN_PREFETCH", "0", 1);
-        double a0 = time_us([&] { std::vector<mx::array> o; for (auto& in : layers) { auto r = gdn_scan(in.q, in.k, in.v, in.decay, in.beta, in.state); o.push_back(r.output); o.push_back(r.state); } return o; }, reps);
-        setenv("TQLLM_MLX_GDN_SCAN_PREFETCH", "1", 1);
         double a = time_us([&] { std::vector<mx::array> o; for (auto& in : layers) { auto r = gdn_scan(in.q, in.k, in.v, in.decay, in.beta, in.state); o.push_back(r.output); o.push_back(r.state); } return o; }, reps);
         double b = time_us([&] { std::vector<mx::array> o; for (auto& in : layers) { auto r = mlx_scan(in); o.push_back(r.first); o.push_back(r.second); } return o; }, reps);
         double c = time_us([&] { std::vector<mx::array> o; for (auto& in : layers) { auto r = mx::fast::gated_delta_update(in.q, in.k, in.v, in.decay, in.beta, in.state); o.push_back(r[0]); o.push_back(r[1]); } return o; }, reps);
-        std::printf("GDN_FAST_BENCH T=%d 48 layers: ours plain %.0f us, ours prefetch %.0f us, mlx %.0f us (with head permutes), mlx bare %.0f us\n", t, a0, a, b, c);
+        std::printf("GDN_FAST_BENCH T=%d 48 layers: ours %.0f us, mlx %.0f us (with head permutes), mlx bare %.0f us\n", t, a, b, c);
     }
     std::printf(ok ? "GDN_FAST_PASS\n" : "GDN_FAST_FAIL\n");
     return ok ? 0 : 1;

@@ -833,10 +833,6 @@ flags:
     kind: debug
     default: "unset (backend default)"
     doc: "Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_GDN_SCAN_PREFETCH
-    kind: debug
-    default: "1"
-    doc: "0 turns off the GDN scan's one-token-ahead input prefetch (same arithmetic, bit-identical)"
   - name: TQLLM_MLX_GDN_SCAN
     kind: debug
     default: "unset (backend default)"
