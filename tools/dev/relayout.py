@@ -109,6 +109,15 @@ def main():
             edited += 1
     print("include edits in %d files" % edited)
     pats = sorted(full.items(), key=lambda r: -len(r[0]))
+    # whole folders that move (wildcard rows `dir/*`): bare directory strings too (include dirs in CMakeLists.txt / cmake/*.cmake)
+    dir_rows = []
+    for line in open(MAP):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        old, new = (line[len("branch:"):] if line.startswith("branch:") else line).split("\t")
+        if old.endswith("/*") and new.endswith("/*") and any(f.startswith(old[:-1]) for f in present):
+            dir_rows.append((old[:-2], new[:-2]))
     texted = 0
     for f in tracked:
         if f.endswith(("layout-map-20261017.tsv", "relayout.py")) or not (f.endswith(TEXT_EXT) or f in ("NOTICE", "Dockerfile", "CMakeLists.txt", ".gitignore")):
@@ -121,6 +130,8 @@ def main():
         n = s
         for o, nn in pats:
             n = re.sub(r'(?<![\w/])' + re.escape(o) + r'(?![\w.])', nn, n)
+        for od, nd in dir_rows:
+            n = re.sub(r'(?<![\w/])' + re.escape(od) + r'(?=[\s)"/;]|$)', nd, n, flags=re.M)
         for a, b in LITERAL.get(f, []):
             n = n.replace(a, b)
         if f == "CMakeLists.txt":
