@@ -1,5 +1,5 @@
 // Drafts + prompt-lookup columns must fit the GDN replay limit for every option combination.
-#include "../src/tree_columns.hpp"
+#include "tree_columns.hpp"
 
 #include <cstdio>
 

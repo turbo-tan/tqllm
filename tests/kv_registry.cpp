@@ -1,6 +1,6 @@
 // Host-only contract test for the KV-cache format registry: every format is registered, reports sane sizes and
 // provenance, and declares its verify-scratch need. No GPU needed.
-#include "src/formats/kv_format.hpp"
+#include "kv_format.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -34,7 +34,7 @@ int main() {
         CHECK(k2 >= k1 * 1024 && k2 <= k1 * 1024 + 4096, "%s: key bytes not linear in context (%zu vs %zu)", n.c_str(), k1, k2);
         CHECK(v2 >= v1 * 1024 && v2 <= v1 * 1024 + 4096, "%s: value bytes not linear in context (%zu vs %zu)", n.c_str(), v1, v2);
         CHECK(f->split_factor() >= 1, "%s: split_factor < 1", n.c_str());
-        // KV storage (src/kv_store.hpp) places position p at p * row inside a page: sizes must be exactly linear
+        // KV storage (src/kv/kv_store.hpp) places position p at p * row inside a page: sizes must be exactly linear
         for (int64_t c : {int64_t(255), int64_t(256), int64_t(4096), int64_t(204800)}) {
             CHECK(f->key_bytes(c, 4, 256) == size_t(c) * k1, "%s: key bytes at %lld not c * row", n.c_str(), (long long)c);
             CHECK(f->value_bytes(c, 4, 256) == size_t(c) * v1, "%s: value bytes at %lld not c * row", n.c_str(), (long long)c);

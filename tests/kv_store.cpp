@@ -1,6 +1,6 @@
-// Host-only tests for KV storage (src/kv_store.hpp): pool accounting, flat layout, paging, rollback, tiered offload and
+// Host-only tests for KV storage (src/kv/kv_store.hpp): pool accounting, flat layout, paging, rollback, tiered offload and
 // restore. A fake memory with byte budgets stands in for the GPU and pinned host memory.
-#include "src/kv_store.hpp"
+#include "kv_store.hpp"
 
 #include <cstdio>
 #include <cstdlib>

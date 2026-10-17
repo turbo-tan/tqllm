@@ -1,8 +1,8 @@
 // GPU test: KV rows split between device memory and a host-memory tail (KvPool with device_rows) give byte-identical
 // cache contents and attention outputs to an all-device cache, through the real KV-format kernels (prefill chunks and
 // verify blocks that cross the device/host boundary).
-#include "src/formats/kv_format.hpp"
-#include "src/kv_store.hpp"
+#include "kv_format.hpp"
+#include "kv_store.hpp"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
 

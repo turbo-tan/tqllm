@@ -1,7 +1,7 @@
 // Bench only (no tests): n-column matvec of TQ3_4S (GGUF 46), TQ4 (300), TQ3 (301), IQ4_XS (23), IQ3_S (21), IQ3_XXS (18) and
 // Q4_K (12) at the two FFN shapes, for timing and ncu.
 // usage: matvec-bench [iters=50] [ncols=8] [tq4_variant=0] [rowscale=1] [type=0 (all)]
-#include "formats/weight_format.hpp"
+#include "weight_format.hpp"
 #include "quant_kernels.cuh"
 #include <cuda_fp16.h>
 #include <cmath>

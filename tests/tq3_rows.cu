@@ -1,6 +1,6 @@
 // TQ3_4S row slices: the capped prefill GEMM dequantises row blocks (p + r0 * row_bytes); each block must equal the
 // same rows of a whole-matrix dequant. Without a row stride the 16 GB fit could not shrink the FP16 weight buffer.
-#include "../src/formats/weight_format.hpp"
+#include "weight_format.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

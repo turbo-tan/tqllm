@@ -1,5 +1,5 @@
 // fn_gemv_bf16_segments must equal fn_gemv_bf16_tokens bit for bit on the router shapes (512 x 2560 and 1 x 2560).
-#include "../kernels/qwen4exp_kernels.cuh"
+#include "qwen4exp_kernels.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdio>

@@ -1,6 +1,6 @@
 // Chunked gated-delta prefill vs the per-token kernel at the Flash-Next shape: max relative error of the outputs and the
 // final state, and the time per call of both. Exit 1 when the error exceeds 1e-3.
-#include "../kernels/qwen4exp_kernels.cuh"
+#include "qwen4exp_kernels.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>

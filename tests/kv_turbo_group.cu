@@ -1,6 +1,6 @@
 // Turbo KV formats with a wide GQA group (MiniCPM-V-4.7 / Qwen3.5-35B-A3B: 16 query heads per 2 KV heads, group 8):
 // an n-token step (verify or prefill chunk) must work and match n 1-token steps (the CTV kernel takes at most 48 query rows per launch).
-#include "src/formats/kv_format.hpp"
+#include "kv_format.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

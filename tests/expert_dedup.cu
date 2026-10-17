@@ -1,6 +1,6 @@
 // Dedup grouped expert matvec (one block per unique expert) must equal the per-assignment grouped matvec bit for bit.
-#include "../src/formats/weight_format.hpp"
-#include "../src/gguf.hpp"
+#include "weight_format.hpp"
+#include "gguf.hpp"
 #include "quant_kernels.cuh"
 #include <cstdio>
 #include <cstring>

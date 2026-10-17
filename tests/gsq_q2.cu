@@ -1,6 +1,6 @@
-#include "../src/formats/weight_format.hpp"
-#include "../src/gguf.hpp"
-#include "formats/gsq_q2.cuh"
+#include "weight_format.hpp"
+#include "gguf.hpp"
+#include "gsq_q2.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstring>

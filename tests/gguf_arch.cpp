@@ -1,4 +1,4 @@
-// Host-only gate for the C1 arch-detection plumbing added to src/gguf.cpp:
+// Host-only gate for the C1 arch-detection plumbing added to src/core/gguf.cpp:
 //   GgufFile::str(), GgufFile::has(), gguf_shape_string()
 //
 // Why this is a separate test from gguf_layout.cpp: that one checks byte sizing. This one checks

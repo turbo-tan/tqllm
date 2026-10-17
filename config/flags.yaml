@@ -1,4 +1,4 @@
-# TQLLM environment variables: the single registry (docs/FLAGS.md and src/flags_gen.hpp are generated from it by
+# TQLLM environment variables: the single registry (docs/FLAGS.md and src/core/flags_gen.hpp are generated from it by
 # tools/gen_flags.py; ctest flags_registry checks both). Settings are command-line options (docs/CONFIG.md);
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
@@ -22,7 +22,7 @@ flags:
   - name: TQLLM_MATVEC_RULE
     kind: user
     default: "-"
-    doc: "override the matvec kernel rule table (kernels/formats/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)"
+    doc: "override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)"
   - name: TQLLM_ATTN_NBUF
     kind: retired
     default: "-"

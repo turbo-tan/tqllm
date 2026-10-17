@@ -6,13 +6,13 @@ A map of the source tree for contributors. See [CONTRIBUTING.md](../CONTRIBUTING
 
 ```
 HTTP request (tools/tqserve.cpp, tools/serve/)
-  -> chat template (tools/serve/jinja_template.cpp, third_party/jinja) and tokenizer (src/tokenizer.cpp)
+  -> chat template (tools/serve/jinja_template.cpp, third_party/jinja) and tokenizer (src/core/tokenizer.cpp)
   -> scheduler and sessions (tools/serve/scheduler.hpp, session.hpp): one slot per concurrent request
-  -> tqllm::Model (include/tqllm/model.hpp, src/model.cpp): memory fit, engine choice
-  -> Engine (src/engine.hpp), e.g. src/qwen35.cpp: prefill, decode step, speculative verify / commit
-       weights  -> WeightFormat registry (src/formats/weight_format.hpp, registry.cpp) -> kernels/formats/, kernels/quant.cu
-       KV cache -> KvFormat registry (src/formats/kv_format.hpp, kv_registry.cpp) -> kernels/attention.cu, kernels/formats/kv_*.cu
-       drafter  -> DFlash2 (kernels/dflash.cu) or the model's MTP head; token tree / chain verify
+  -> tqllm::Model (include/tqllm/model.hpp, src/engine/model.cpp): memory fit, engine choice
+  -> Engine (src/engine/engine.hpp), e.g. src/models/qwen/qwen35/qwen35.cpp: prefill, decode step, speculative verify / commit
+       weights  -> WeightFormat registry (src/formats/weight/weight_format.hpp, registry.cpp) -> src/formats/weight/ (host + kernels, quant.cu)
+       KV cache -> KvFormat registry (src/formats/kv/kv_format.hpp, kv_registry.cpp) -> src/models/qwen/qwen35/attention.cu, src/formats/kv/kv_*.cu
+       drafter  -> DFlash2 (src/spec/dflash.cu) or the model's MTP head; token tree / chain verify
   -> streamed tokens and per-request timings back to the client
 ```
 
@@ -21,14 +21,14 @@ HTTP request (tools/tqserve.cpp, tools/serve/)
 | Path | What lives there |
 |---|---|
 | `include/tqllm/` | public C++ API: `Model`, `EngineOptions`, tokenizer, runtime, the experimental plugin ABI (`plugin.h`) |
-| `src/model.cpp` | `tqllm::Model`: opens GGUF or safetensors, runs the memory fit (`fit_context.hpp`), creates the engine |
-| `src/engine.hpp` | the per-architecture engine interface |
-| `src/qwen35.cpp` | Qwen3.5 / Qwen3.8 engine: hybrid attention + Gated DeltaNet, prefill, decode, DFlash2 and MTP verify, multi-slot |
+| `src/engine/model.cpp` | `tqllm::Model`: opens GGUF or safetensors, runs the memory fit (`fit_context.hpp`), creates the engine |
+| `src/engine/engine.hpp` | the per-architecture engine interface |
+| `src/models/qwen/qwen35/qwen35.cpp` | Qwen3.5 / Qwen3.8 engine: hybrid attention + Gated DeltaNet, prefill, decode, DFlash2 and MTP verify, multi-slot |
 | `src/formats/` | weight formats (`tq3.cpp`, `tq4.cpp`, `tq3_4s.cpp`, `q4.cpp`, `i8h.cpp`, `composite.cpp`) and KV formats (`kv_*.cpp`), each registered by id or name |
 | `src/kv_store*.cpp` | TqCache: KV positions in system RAM, staged back while decoding |
-| `src/gguf.cpp`, `src/safetensors.cpp` | model file readers |
-| `src/options.cpp` | command-line options shared by the tools |
-| `src/vision.cpp` | image encoder for `--mmproj` |
+| `src/core/gguf.cpp`, `src/core/safetensors.cpp` | model file readers |
+| `src/core/options.cpp` | command-line options shared by the tools |
+| `src/vision/vision.cpp` | image encoder for `--mmproj` |
 | `kernels/` | CUDA kernels: attention, quantised matvec / GEMM (`quant.cu`, `int8_gemm.cu`, `fp8_gemm.cu`), DFlash2, KV compaction, vision |
 | `kernels/formats/` | per-format kernels and the decode kernel rule table (`matvec_rules.hpp`) |
 | `tools/` | `tqserve` (the server) and developer tools: `tqrun`, `tqbench`, `tqkld`, `tqverify`, `tqspec`, `tqgolden`, `tqkbench`, `tqvision`, `tqtokenize`, `tqconvert.py` |

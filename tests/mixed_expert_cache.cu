@@ -1,4 +1,4 @@
-#include "../src/tq3_expert_cache.hpp"
+#include "tq3_expert_cache.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>

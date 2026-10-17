@@ -2,9 +2,9 @@
 #include "monitor.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
-#include <src/json.hpp>
+#include <third_party/nlohmann/json.hpp>
 #if TQLLM_WITH_CUDA
-#include <src/vision.hpp>
+#include <src/vision/vision.hpp>
 #endif
 #include "json_out.hpp"
 

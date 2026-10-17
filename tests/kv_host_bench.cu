@@ -2,8 +2,8 @@
 // host tail in place, tq3 KV, decode (1 query), verify (12) and a 512-token prefill chunk. Decides whether staging the host
 // tail into device memory before each attention layer can pay.
 // usage: test-kv-host-bench [context 131072] [host positions 65536] [iters 10]
-#include "src/formats/kv_format.hpp"
-#include "src/kv_store.hpp"
+#include "kv_format.hpp"
+#include "kv_store.hpp"
 #include "qwen2_kernels.cuh"
 
 #include <cuda_bf16.h>

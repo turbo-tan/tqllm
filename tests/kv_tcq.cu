@@ -2,7 +2,7 @@
 // row (rotation undone). Compares tq3 / scalar 2-bit / trellis 2-bit V error on Gaussian rows with outliers, and checks
 // the TCQ GPU decode against a host decode of the same record.
 #include "qwen35_kernels.cuh"
-#include "../kernels/formats/tcq2_tables.inc"
+#include "tcq2_tables.inc"
 
 #include <cmath>
 #include <cstdio>

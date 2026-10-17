@@ -1,7 +1,7 @@
 // Image embeddings from an mmproj GGUF: [int32 nx, ny, n_tok, n_embd] + float[n_tok][n_embd] (the layout of
 // llama.cpp mtmd_get_output_embd, for parity checks).
 // usage: tqvision MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N]
-#include "../src/vision.hpp"
+#include "vision.hpp"
 
 #include <cuda_runtime.h>
 

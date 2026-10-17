@@ -1,7 +1,7 @@
 // TQFN_PF_EVENTS: a demand miss and the compute stream must not wait for a prefetch of an expert the call does not read,
 // and every slot must hold its expert's exact packed bytes once the copies land. The prefetch copy stream is held by a
 // host function; with --legacy (the bank-wide wait) the demand call cannot finish while it is held, so that run fails.
-#include "../src/tq3_expert_cache.hpp"
+#include "tq3_expert_cache.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>

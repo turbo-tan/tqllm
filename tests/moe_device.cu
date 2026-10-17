@@ -3,8 +3,8 @@
 // Declares tqllm_cuda::iq3_matvec_bf16, used below as the decode reference for GGUF 21.
 // The target's include dir is ${CMAKE_CURRENT_SOURCE_DIR}/kernels, so a bare name resolves.
 #include "quant_kernels.cuh"
-#include "../src/formats/weight_format.hpp"
-#include "../src/moe.hpp"
+#include "weight_format.hpp"
+#include "moe.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -75,7 +75,7 @@ static void route_test() {
 
 // Every GGUF type whose runtime format now has grouped-expert support, so the identity suite
 // covers the whole u4h family instead of only the three formats that were wired first.
-//   bytes        = encoded size of one block (src/gguf.cpp gguf_block_layout)
+//   bytes        = encoded size of one block (src/core/gguf.cpp gguf_block_layout)
 //   scale_off    = half-scale offset(s) inside the block that the loader memcpys; the generator
 //                  writes a varying non-zero scale there (never 0 -> no inf/nan reciprocals)
 //   clamp        = byte range the loader uses as a divisor/table index, forced to 1..32

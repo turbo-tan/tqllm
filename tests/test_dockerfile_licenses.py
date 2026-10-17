@@ -19,7 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO / "Dockerfile"
 
 # Files that exist in the repo and MUST end up inside the runtime image.
-# src/stb_image.h is public-domain and already ships inside src/ (copied by the build stage),
+# third_party/stb/stb_image.h is public-domain and already ships inside src/ (copied by the build stage),
 # so it needs no extra COPY; the rest are top-level or third_party notices that the runtime
 # stage never received.
 REQUIRED = [

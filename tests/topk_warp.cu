@@ -1,5 +1,5 @@
 // topk_warp_k must give the same ids, weights and shared weights, bit for bit, as topk_k.
-#include "../kernels/moe_kernels.cuh"
+#include "moe_kernels.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>

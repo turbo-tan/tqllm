@@ -1,14 +1,14 @@
-#include "../src/tokenizer_path.hpp"
+#include "tokenizer_path.hpp"
 #include "serve/http.hpp"
 #include "serve/monitor_server.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
-#include "src/gguf.hpp"
-#include "src/flags_gen.hpp"
-#include "src/formats/kv_format.hpp"
-#include "src/kv_store.hpp"
+#include "gguf.hpp"
+#include "flags_gen.hpp"
+#include "kv_format.hpp"
+#include "kv_store.hpp"
 
 #include <cuda_runtime.h>
 

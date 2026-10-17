@@ -10,7 +10,7 @@
 //   gate/up  640 x 2560  -> 640 * 80 * 18 = 921,600 B
 //   down    2560 x 640   -> 2560 * 20 * 18 = 921,600 B
 // so a gate+up+down triple is 3 x 0.92 MB = 2.76 MB of weight bytes per miss expert.
-#include "../src/cpu_expert_matvec.hpp"
+#include "cpu_expert_matvec.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

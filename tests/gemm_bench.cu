@@ -1,8 +1,8 @@
 // Prefill GEMM bench: fused u4h-family GEMM (WeightFormat::gemm) vs dequant_h + cuBLAS (the prefill path), per GGUF type.
 // Random blocks with sane FP16 scales; error of both vs an FP32-accumulate cuBLAS reference on the dequantised weights.
 // usage: gemm-bench [rows 17408] [cols 5120] [iters 10] [type 0 = all]
-#include "../src/formats/weight_format.hpp"
-#include "../src/gguf.hpp"
+#include "weight_format.hpp"
+#include "gguf.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>

@@ -1,7 +1,7 @@
 // Bench only: grouped dedup expert matvec at the Flash-Next decode shape (G distinct experts from a 64-slot bank,
 // 1-2 token columns each), isolated from copies; prints us and effective GB/s per format.
 // usage: expert-dedup-bench [groups=16] [cols_per_group=2] [iters=200]
-#include "formats/weight_format.hpp"
+#include "weight_format.hpp"
 #include "quant_kernels.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
