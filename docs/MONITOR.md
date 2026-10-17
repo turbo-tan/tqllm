@@ -9,9 +9,13 @@ builds.
 ![Runtime monitor desktop preview](assets/monitor-desktop.png)
 
 The preview uses explicitly labelled fixture request counters, not a model
-benchmark. [Mobile preview](assets/monitor-mobile.png).
+benchmark. Host/device values are live read-only samples from the preview machine.
+[Light theme](assets/monitor-light.png) / [Mobile preview](assets/monitor-mobile.png).
 
 ## Request workbench
+
+For panel extensions, hardware adapters and browser tests, see the
+[monitor contributor guide](MONITOR_CONTRIBUTING.md).
 
 The page follows the latest request by default. Select a request ID in the history
 to inspect it; selecting it again resumes following the latest request. Its journey

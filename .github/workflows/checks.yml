@@ -37,3 +37,28 @@ jobs:
 
       - name: ctest
         run: ctest --test-dir build --output-on-failure -j 4
+
+  monitor-browser:
+    name: monitor / Chromium, Firefox, WebKit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build the monitor fixture (CPU only)
+        run: |
+          cmake -S . -B build-monitor -DTQLLM_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-monitor --target test-monitor -j 2
+      - name: Install contributor browser tooling
+        run: |
+          python3 -m venv .venv-monitor
+          .venv-monitor/bin/pip install playwright==1.64.0
+          .venv-monitor/bin/python -m playwright install --with-deps chromium firefox webkit
+      - name: Browser regression gate (no model or GPU)
+        run: .venv-monitor/bin/python tests/test_monitor_ui.py --binary build-monitor/test-monitor --output build-monitor/monitor-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monitor-browser-artifacts
+          path: build-monitor/monitor-artifacts
+          if-no-files-found: ignore
+          retention-days: 7

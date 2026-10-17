@@ -33,19 +33,10 @@ form#auth{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px soli
 form#auth[hidden]{display:none}
 form#auth input{flex:1;min-width:160px;background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:4px 8px}
 form#auth small{color:var(--muted);width:100%}
-/* status line + consoles */
-.status{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;color:var(--muted)}
+/* request status */
+.status{display:flex;gap:10px;align-items:center;flex-wrap:wrap;color:var(--muted)}
 .status .prompt{color:var(--live)}.status #phase{color:var(--text)}
-.consoles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-.console{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:9px 11px;display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:4px 10px;align-items:end}
-.console h2{margin:0;font-size:11px;font-weight:600;letter-spacing:.12em;color:var(--muted);grid-column:1/-1}
-.console .big{font-size:26px;line-height:1.1;font-weight:600;font-variant-numeric:tabular-nums}
-.console .big small{font-size:12px;color:var(--muted);font-weight:400;margin-left:4px}
-.console.prefill .big{color:var(--prefill)}.console.decode .big{color:var(--decode)}
-.console .sub{grid-column:1/-1;color:var(--muted);font-size:12px}
-.console svg{width:92px;height:30px;display:block}
-.console svg path{fill:none;stroke-width:1.5;stroke-linejoin:round}
-.console.prefill svg path{stroke:var(--prefill)}.console.decode svg path{stroke:var(--decode)}
+.status-rate{margin-left:auto;font:12px var(--mono)}
 /* stats */
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden}
 .stat{background:var(--panel);padding:7px 10px;min-width:0}
@@ -91,7 +82,7 @@ tbody tr:nth-child(odd){background:var(--panel2)}
 footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;border-top:1px solid var(--line);color:var(--dim);font-size:11px;flex-wrap:wrap}
 @media(min-width:1101px){.stats{grid-template-columns:repeat(6,minmax(0,1fr))}}
 @media(max-width:1100px){main{grid-template-columns:1fr}.left{border-right:0;border-bottom:1px solid var(--line)}.right{min-height:460px}}
-@media(max-width:520px){.consoles{grid-template-columns:1fr}.console .big{font-size:22px}.bar .id{display:none}.msg{grid-template-columns:48px minmax(0,1fr)}}
+@media(max-width:520px){.bar .id{display:none}.msg{grid-template-columns:48px minmax(0,1fr)}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 /* Request workbench: follow measured work, rather than a wall of gauges. */
 body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -111,7 +102,7 @@ h1{font-size:32px;letter-spacing:-.05em;margin:4px 0;font-weight:550}
 .lens-metrics small{display:block;color:var(--muted);font-size:11px}.lens-metrics strong{display:block;font:24px var(--mono);letter-spacing:-.05em;margin:4px 0}
 .lens-note{font-size:12px;color:var(--muted);margin:0;line-height:1.6}
 .compare{margin-top:16px;border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--decode)}.compare[hidden]{display:none}
-.consoles{display:none}.stats{border-radius:10px}.stat{padding:12px}
+.stats{border-radius:10px}.stat{padding:12px}
 .hardware-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;margin-bottom:10px;flex-wrap:wrap}
 #device{white-space:normal;font-size:11px}
 #themeButton{display:inline-flex;align-items:center;justify-content:center;width:34px;height:32px;padding:6px}
@@ -126,45 +117,63 @@ th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transp
 .compose textarea{border-radius:8px;min-height:64px;padding:10px}.compose .buttons{flex-direction:column}button{border-radius:6px}.chat-foot{padding:10px 14px}
 @media(max-width:1100px){main{grid-template-columns:1fr}.right{min-height:420px}}
 @media(max-width:520px){.left{padding:18px 14px;gap:16px}.bar{padding:12px 14px;gap:8px}h1{font-size:27px}.lens{padding:18px}.lens-metrics{gap:8px}.lens-metrics strong{font-size:18px}.journey-caption{font-size:11px}.table-wrap{max-height:240px}.chart .head{font-size:10px;gap:12px}}
+
+/* Shared control geometry and accessible keyboard states. */
+button,.icon-button,#themeButton{min-width:44px;min-height:44px}
+.icon-button,#themeButton{width:44px;height:44px;display:inline-flex;align-items:center;justify-content:center;padding:10px;flex-shrink:0}
+.icon-button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+button.primary{background:var(--decode);color:var(--bg);border-color:var(--decode)}
+:focus-visible{outline:2px solid var(--decode);outline-offset:3px}
+[hidden]{display:none!important}
+.bar .brand{white-space:nowrap}.bar .pill{margin-left:auto}.bar .id{flex-basis:200px}
+.lens-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.compare{display:flex;align-items:center;gap:12px}.compare span{flex:1}
+#requestLens[data-stale="true"] .journey,#requestLens[data-stale="true"] .lens-metrics{opacity:.45}
+.chat-head{padding:10px 14px;gap:8px}.chat-head .toggle{min-height:44px;white-space:nowrap}
+.chat-head input{width:16px;height:16px;accent-color:var(--decode)}
+.compose{align-items:end;grid-template-columns:minmax(0,1fr) auto}.compose .buttons{flex-direction:row;align-items:center}
+.compose textarea{font-size:16px;line-height:1.5;min-height:72px}.chat-help{font-size:11px;color:var(--muted);padding:0 14px 10px}
+#transcript{height:420px;min-height:200px;max-height:70vh;overflow-y:auto;overflow-anchor:none}
+.msg pre.thought{color:var(--muted)}.hint,.msg .who,th{color:var(--muted)}
+#monitorPanels:empty{display:none}.extension-panel{padding:18px;border:1px solid var(--line);border-radius:12px;margin-top:12px;overflow-wrap:anywhere}
+.extension-panel h2{font-size:14px;margin:0 0 12px}.extension-panel[data-state="unavailable"]{color:var(--muted)}
+@media(min-width:1101px){.right{position:sticky;top:0;max-height:100vh;min-height:min(100vh,800px)}#transcript{height:0;max-height:none}}
+@media(max-width:520px){.bar{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:6px}.bar .brand{font-size:18px;grid-column:1;grid-row:1}.bar .id{display:block;grid-column:1/-1;grid-row:3;font-size:11px}.bar .pill{grid-column:1;grid-row:2;justify-self:start;margin:0;font-size:11px;padding:2px 6px}#themeButton{grid-column:2;grid-row:1/3}#keyButton{grid-column:3;grid-row:1/3}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.compose{grid-template-columns:1fr}.compose .buttons{justify-content:flex-end}.lens-actions{width:100%}.lens-actions button{flex:1}}
+@media(max-width:360px){.lens-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.lens-metrics>div:last-child{grid-column:1/-1}}
 </style>
 </head>
 <body data-connection="connecting">
 <header class="bar">
   <div class="brand">tq<b>LLM</b> monitor</div>
   <div class="id"><strong id="model">engine</strong> on <span id="host">--</span>, build <span id="build">--</span>, <span id="slots">-- slots</span></div>
-  <span class="pill"><i></i><span id="connection">Connecting</span></span>
+  <span class="pill" role="status"><i></i><span id="connection">Connecting</span></span>
   <button type="button" id="themeButton" title="Switch to light theme" aria-label="Switch to light theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A8.5 8.5 0 0 1 9 4a8.5 8.5 0 1 0 11 11Z"/></svg></button>
-  <button type="button" id="keyButton">key</button>
+  <button type="button" id="keyButton" class="icon-button" title="Server API key" aria-label="Server API key" aria-expanded="false" aria-controls="auth"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="4"/><path d="m11 12 8 8m-4-4 3-3m-6 0 3-3"/></svg></button>
 </header>
 <main>
 <section class="left" aria-label="Telemetry">
   <div id="notice" class="notice" hidden role="alert"></div>
   <form id="auth" hidden><label for="apiKey">api key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="the key configured on tqserve"><button type="submit">connect</button><small>Kept in memory for this tab only; never written to storage or a URL.</small></form>
-  <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span></div>
+  <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
   <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
-  <section class="lens" aria-label="Selected request">
-    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><button type="button" id="pinRequest" disabled>Pin as reference</button></div>
+  <section class="lens" id="requestLens" aria-label="Selected request">
+    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><div class="lens-actions"><button type="button" id="followLatest" hidden title="Follow the latest request">Follow latest</button><button type="button" id="pinRequest" disabled>Pin as reference</button></div></div>
     <div class="journey" aria-label="Time before and after first output"><span id="journeyWait" style="flex-grow:1"></span><span id="journeyOutput" style="flex-grow:0"></span></div>
     <div class="journey-caption"><span>Before first output <b id="journeyBefore">--</b></span><span>After first output <b id="journeyAfter">--</b></span></div>
     <div class="lens-metrics"><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small>OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
     <p class="lens-note" id="lensNote">Engine measurements, without guessing why a request is waiting.</p>
-    <div class="compare" id="comparison" hidden></div>
+    <div class="compare" id="comparison" hidden><span id="comparisonText"></span><button type="button" id="clearReference" class="icon-button" title="Clear reference" aria-label="Clear reference"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
   </section>
-  <div class="consoles" aria-hidden="true">
-    <div class="console prefill"><h2>PREFILL</h2><div class="big" id="first">--</div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="prefillLine" d=""/></svg><div class="sub" id="firstNote">time to first output, latest request</div></div>
-    <div class="console decode"><h2>DECODE</h2><div class="big"><span id="speed">--</span><small>tok/s</small></div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="decodeLine" d=""/></svg><div class="sub" id="speedNote">sum over decoding requests</div></div>
-  </div>
   <section class="hardware" aria-label="Engine and hardware"><div class="hardware-head"><span>Engine and hardware</span><span>Hardware every 3 s / requests every 1 s</span></div><div class="stats">
     <div class="stat"><div class="label">active / queued</div><strong id="queue">--</strong></div>
     <div class="stat"><div class="label">output tokens</div><strong id="tokens">--</strong></div>
     <div class="stat"><div class="label">draft acceptance</div><strong id="acceptance">--</strong></div>
     <div class="stat"><div class="label">context, tokens</div><strong id="context">--</strong><div class="track"><b id="contextBar"></b></div></div>
-    <div class="stat"><div class="label">gpu memory, GiB</div><strong id="gpuMemory">--</strong><div class="track"><b id="gpuMemoryBar"></b></div></div>
+    <div class="stat" title="Whole-device memory, including other applications"><div class="label">gpu memory, GiB</div><strong id="gpuMemory">--</strong><div class="track"><b id="gpuMemoryBar"></b></div></div>
     <div class="stat"><div class="label">host memory, GiB</div><strong id="ramMemory">--</strong><div class="track"><b id="ramMemoryBar"></b></div></div>
-    <div class="stat"><div class="label">gpu</div><strong id="gpu">--</strong></div>
+    <div class="stat" title="Whole-device GPU utilisation"><div class="label">gpu load</div><strong id="gpu">--</strong></div>
     <div class="stat"><div class="label">gpu temp</div><strong id="temperature">--</strong></div>
     <div class="stat"><div class="label">power</div><strong id="power">--</strong></div>
-    <div class="stat"><div class="label">cpu</div><strong id="cpu">--</strong></div>
+    <div class="stat" title="System CPU utilisation, not just this server"><div class="label">host cpu</div><strong id="cpu">--</strong></div>
     <div class="stat"><div class="label">device</div><strong id="device">--</strong></div>
     <div class="stat"><div class="label">hardware sample</div><strong id="hardwareAge">--</strong></div>
   </div>
@@ -172,40 +181,36 @@ th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transp
   <div class="chart"><div class="head"><span>output tokens / s, last 60 s</span><span id="chartStart">--</span></div>
     <svg viewBox="0 0 600 78" preserveAspectRatio="none" aria-label="Throughput, last 60 seconds"><line class="grid" x1="0" y1="39" x2="600" y2="39"/><line class="grid" x1="0" y1="77" x2="600" y2="77"/><path id="chartFill" d=""/><path id="chartLine" d=""/></svg></div>
   <div class="log"><div class="head"><span>Request history / select to inspect</span><span id="requestCount">none yet</span></div>
-    <div class="table-wrap"><table aria-label="Recent requests"><thead><tr><th scope="col">id</th><th scope="col">phase</th><th scope="col">prompt / output</th><th scope="col">first out</th><th scope="col">tok/s</th><th scope="col">elapsed</th></tr></thead><tbody id="requests"></tbody></table></div></div>
+    <div class="table-wrap" id="requestHistory" tabindex="0" role="region" aria-label="Scrollable request history"><table aria-label="Recent requests"><thead><tr><th scope="col">id</th><th scope="col">phase</th><th scope="col">prompt / output</th><th scope="col">first out</th><th scope="col">tok/s</th><th scope="col">elapsed</th></tr></thead><tbody id="requests"></tbody></table></div></div>
+  <div id="monitorPanels"></div>
 </section>
 <section class="right" aria-label="Chat">
-  <div class="chat-head"><span>chat / this instance</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear">clear</button></div>
-  <div id="transcript"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
-  <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" rows="1" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend">send</button><button type="button" id="chatStop" disabled>stop</button></div></form>
-  <div class="chat-foot"><span id="chatStatus">idle</span><span id="chatStats"></span></div>
+  <div class="chat-head"><span>chat / this instance</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear" class="icon-button" title="Clear conversation" aria-label="Clear conversation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg></button></div>
+  <div id="transcript" tabindex="0" role="region" aria-label="Conversation"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
+  <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" aria-label="Message to this model" aria-describedby="composeHelp" rows="2" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend" class="icon-button primary" title="Send message (Enter)" aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V4m-6 6 6-6 6 6"/></svg></button><button type="button" id="chatStop" class="icon-button" title="Stop response (Escape)" aria-label="Stop response" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button></div></form>
+  <div class="chat-help" id="composeHelp">Enter to send / Shift+Enter for a new line / Esc to stop</div><div class="chat-foot"><span id="chatStatus" role="status">idle</span><span id="chatStats"></span></div>
 </section>
 </main>
 <footer><span>Telemetry is read-only and local; the chat is sent only to this tqserve instance. <a href="/api/monitor/v1/snapshot" id="snapshotLink">snapshot json</a></span><span>schema v1</span></footer>
+<script>
+@TQLLM_MONITOR_PANELS@
+</script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
 const number = (v, d = 0) => typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}) : '--';
 const terminal = p => ['complete', 'failed', 'cancelled'].includes(p);
-const text = (id, value) => { $(id).textContent = value; };
+const text = (id, value) => { if ($(id).textContent !== String(value)) $(id).textContent = value; };
 let focusedId = null, pinnedRequest = null, currentRows = [];
 let key = '', timer = null, instance = null, samples = [], previous = null, lastSuccess = null, generation = 0;
-const firstHistory = [];  // first_output_ms of the last requests, for the prefill sparkline
 
 function connection(state, message) { document.body.dataset.connection = state; text('connection', message); }
 function notice(message) { $('notice').hidden = !message; text('notice', message); }
 function clearLive() {
-  text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true;
-  for (const id of ['speed', 'first', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
+  text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true; $('followLatest').disabled = true;
+  for (const id of ['speed', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
   for (const id of ['contextBar', 'gpuMemoryBar', 'ramMemoryBar']) $(id).style.width = '0';
-  for (const id of ['prefillLine', 'decodeLine']) $(id).setAttribute('d', '');
-}
-// sparkline path over the last values, scaled to the box; a single value draws a flat line
-function spark(id, values, w, h) {
-  const v = values.filter(x => typeof x === 'number' && Number.isFinite(x));
-  if (!v.length) { $(id).setAttribute('d', ''); return; }
-  const max = Math.max(1e-9, ...v), step = v.length > 1 ? w / (v.length - 1) : w;
-  $(id).setAttribute('d', v.map((x, i) => (i ? 'L' : 'M') + (v.length > 1 ? i * step : 0).toFixed(1) + ' ' + (h - 2 - (x / max) * (h - 4)).toFixed(1)).join(' ') + (v.length > 1 ? '' : ' H' + w));
+  $('requestLens').setAttribute('data-stale', 'true'); monitorPanels.invalidate();
 }
 function chart() {
   const now = performance.now(), start = Math.max(now - 60000, samples[0]?.at || now), span = Math.max(1000, now - start);
@@ -215,8 +220,13 @@ function chart() {
   let d = '', pen = false;
   for (const [x, y] of pts) { if (y === null) { pen = false; continue; } d += (pen ? ' L' : ' M') + x.toFixed(1) + ' ' + y.toFixed(1); pen = true; }
   $('chartLine').setAttribute('d', d.trim());
-  const solid = pts.filter(p => p[1] !== null);
-  $('chartFill').setAttribute('d', solid.length > 1 ? 'M' + solid[0][0].toFixed(1) + ' 77 ' + solid.map(p => 'L' + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ') + ' L' + solid.at(-1)[0].toFixed(1) + ' 77 Z' : '');
+  let fill = '', segment = [];
+  const close = () => {
+    if (segment.length > 1) fill += 'M' + segment[0][0].toFixed(1) + ' 77 ' + segment.map(p => 'L' + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ') + ' L' + segment.at(-1)[0].toFixed(1) + ' 77 Z ';
+    segment = [];
+  };
+  for (const point of pts) { if (point[1] === null) close(); else segment.push(point); }
+  close(); $('chartFill').setAttribute('d', fill.trim());
 }
 function budget(label, bar, used, total, bytes) {
   const ok = typeof used === 'number' && typeof total === 'number' && total > 0;
@@ -226,7 +236,10 @@ function budget(label, bar, used, total, bytes) {
 }
 const seconds = value => Number.isFinite(value) ? number(value / 1000, 2) + ' s' : '--';
 function requestLens() {
+  if (focusedId !== null && !currentRows.some(row => row.id === focusedId)) focusedId = null;
   const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
+  document.querySelector('.journey').hidden = !r;
+  $('followLatest').hidden = focusedId === null;
   if (!r) {
     text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
     for (const id of ['lensFirst','lensRate','lensElapsed','journeyBefore','journeyAfter']) text(id, '--');
@@ -235,7 +248,6 @@ function requestLens() {
     text('lensNote', 'Engine measurements, without guessing why a request is waiting.');
     return;
   }
-  if (focusedId !== null && !currentRows.some(row => row.id === focusedId)) focusedId = null;
   text('lensPhase', r.phase + (focusedId === null ? ' / following latest' : ' / selected request'));
   text('lensTitle', 'Request ' + r.id + ' / ' + number(r.prompt_tokens) + ' in, ' + number(r.output_tokens) + ' out');
   const hasFirst = Number.isFinite(r.first_output_ms), elapsed = Math.max(0, r.elapsed_ms || 0);
@@ -248,17 +260,22 @@ function requestLens() {
   text('lensRate', Number.isFinite(r.decode_tokens_per_second) ? number(r.decode_tokens_per_second, 1) + ' tok/s' : '--');
   text('lensNote', 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
     (terminal(r.phase) ? 'Finished request; measurements are retained.' : 'Live snapshot; the journey grows as the request runs.'));
-  $('pinRequest').disabled = !terminal(r.phase);
+  $('pinRequest').disabled = !terminal(r.phase); $('followLatest').disabled = false;
   $('pinRequest').textContent = pinnedRequest && pinnedRequest.id === r.id ? 'Clear reference' : 'Pin as reference';
   $('comparison').hidden = !pinnedRequest;
   if (pinnedRequest) {
     const delta = (a,b,unit) => Number.isFinite(a) && Number.isFinite(b) ? (a-b > 0 ? '+' : '') + number(a-b, 1) + unit : 'unavailable';
-    text('comparison', 'Reference #' + pinnedRequest.id + ': first output ' + delta(r.first_output_ms, pinnedRequest.first_output_ms, ' ms') +
+    text('comparisonText', 'Reference #' + pinnedRequest.id + ': first output ' + delta(r.first_output_ms, pinnedRequest.first_output_ms, ' ms') +
       ' / rate ' + delta(r.decode_tokens_per_second, pinnedRequest.decode_tokens_per_second, ' tok/s') + '. ' +
       (r.prompt_tokens === pinnedRequest.prompt_tokens && r.output_tokens === pinnedRequest.output_tokens ?
         'Token counts match; prompt content and other conditions may differ.' : 'Different token counts; this is not a matched benchmark.'));
   }
 }
+$('clearReference').addEventListener('click', () => { pinnedRequest = null; requestLens(); $('requestHistory').focus({preventScroll:true}); });
+$('followLatest').addEventListener('click', () => { focusedId = null; requestLens();
+  for (const b of $('requests').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.textContent === String(currentRows.at(-1)?.id)));
+  $('requestHistory').focus({preventScroll:true});
+});
 $('pinRequest').addEventListener('click', () => {
   if (document.body.dataset.connection !== 'live') return;
   const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
@@ -267,33 +284,24 @@ $('pinRequest').addEventListener('click', () => {
 });
 function render(data) {
   if (data.schema_version !== 1 || !data.engine || !Array.isArray(data.requests)) throw new Error('Unsupported telemetry schema');
-  if (instance !== data.instance_id) { samples = []; previous = null; firstHistory.length = 0; focusedId = null; pinnedRequest = null; instance = data.instance_id; }
+  if (instance !== data.instance_id) { samples = []; previous = null; focusedId = null; pinnedRequest = null; instance = data.instance_id; }
   const now = performance.now(), rows = data.requests, active = rows.filter(r => !terminal(r.phase)), latest = rows.at(-1);
-  currentRows = rows; requestLens();
+  currentRows = rows; requestLens(); $('requestLens').removeAttribute('data-stale');
   const decoders = active.filter(r => r.phase === 'decode'), total = rows.reduce((n, r) => n + (r.output_tokens || 0), 0);
   // history eviction can lower the retained sum: mark a gap instead of inventing throughput
   let rate = null; if (previous && total >= previous.total) rate = (total - previous.total) * 1000 / (now - previous.at);
   samples.push({at: now, rate}); samples = samples.filter(p => now - p.at <= 60000); previous = {total, at: now}; chart();
-  spark('decodeLine', samples.slice(-40).map(p => p.rate), 92, 30);
   text('model', data.engine.model || 'tqLLM'); text('host', data.engine.host || 'local'); text('build', data.engine.build || 'unknown');
   text('slots', number(data.engine.slots) + (data.engine.slots === 1 ? ' slot' : ' slots'));
   text('phase', active.length ? active.some(r => r.phase === 'prefill') ? 'Prefilling prompt' : decoders.length ? 'Generating output' : 'Requests queued' : 'Ready for your next request');
   const measured = decoders.filter(r => typeof r.decode_tokens_per_second === 'number');
   text('speed', measured.length ? number(measured.reduce((n, r) => n + r.decode_tokens_per_second, 0), 1) : '--');
-  text('speedNote', decoders.length ? 'sum over ' + decoders.length + ' decoding request' + (decoders.length === 1 ? '' : 's') : 'no request decoding');
-  if (latest && typeof latest.first_output_ms === 'number' && (!firstHistory.length || firstHistory.at(-1).id !== latest.id || firstHistory.at(-1).ms !== latest.first_output_ms)) {
-    if (firstHistory.length && firstHistory.at(-1).id === latest.id) firstHistory.pop();
-    firstHistory.push({id: latest.id, ms: latest.first_output_ms}); if (firstHistory.length > 24) firstHistory.shift();
-  }
-  spark('prefillLine', firstHistory.map(h => h.ms), 92, 30);
-  if (latest && typeof latest.first_output_ms === 'number') { $('first').textContent = ''; $('first').append(number(latest.first_output_ms >= 10000 ? latest.first_output_ms / 1000 : latest.first_output_ms, latest.first_output_ms >= 10000 ? 1 : 0), Object.assign(document.createElement('small'), {textContent: latest.first_output_ms >= 10000 ? 's' : 'ms'})); }
-  else text('first', '--');
-  text('firstNote', latest ? 'request ' + latest.id + ', ' + number(latest.prompt_tokens) + ' prompt tokens; first output includes queue time' : 'time to first output, latest request');
   text('queue', active.filter(r => r.phase !== 'queued').length + ' / ' + active.filter(r => r.phase === 'queued').length);
   text('tokens', number(total));
   const drafted = rows.reduce((n, r) => n + (r.drafted || 0), 0), accepted = rows.reduce((n, r) => n + (r.accepted || 0), 0);
   text('acceptance', drafted ? number(accepted / drafted * 100, 1) + '% of ' + number(drafted) : '--');
   text('requestCount', rows.length ? rows.length + ' retained' : 'none yet');
+  const requestFocus = $('requests').contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') : null;
   $('requests').replaceChildren(...rows.slice(-14).reverse().map(r => {
     const tr = document.createElement('tr');
     const cells = [r.id, r.phase, number(r.prompt_tokens) + ' / ' + number(r.output_tokens), typeof r.first_output_ms === 'number' ? number(r.first_output_ms) + ' ms' : '--',
@@ -318,6 +326,10 @@ function render(data) {
     });
     return tr;
   }));
+  if (requestFocus) {
+    const target = [...$('requests').querySelectorAll('button')].find(b => b.getAttribute('aria-label') === requestFocus);
+    (target || $('requestHistory')).focus({preventScroll:true});
+  }
   budget('context', 'contextBar', active.length ? Math.max(...active.map(r => r.context_tokens || 0)) : 0, data.engine.context_per_slot, false);
   const h = data.hardware || {}, fresh = typeof h.sample_age_ms === 'number' && h.sample_age_ms < 10000;
   budget('gpuMemory', 'gpuMemoryBar', fresh ? h.gpu_used_bytes : null, h.gpu_total_bytes, true);
@@ -329,7 +341,7 @@ function render(data) {
   text('device', h.device_name || data.engine.device_id || 'unknown');
   text('hardwareAge', typeof h.sample_age_ms === 'number' ? (fresh ? number(h.sample_age_ms / 1000, 1) + ' s old' : 'stale, ' + number(h.sample_age_ms / 1000, 0) + ' s old') : 'no sample');
   text('sample', 'snapshot ' + new Date().toLocaleTimeString());
-  connection('live', 'Connected'); notice(''); lastSuccess = now;
+  connection('live', 'Connected'); notice(''); lastSuccess = now; monitorPanels.update(data);
 }
 async function poll(token = generation) {
   if (token !== generation) return;
@@ -337,7 +349,7 @@ async function poll(token = generation) {
     const response = await fetch('/api/monitor/v1/snapshot', {headers: key ? {Authorization: 'Bearer ' + key} : {}, cache: 'no-store', signal: AbortSignal.timeout(3000)});
     if (token !== generation) return;
     if (response.status === 401 || response.status === 403) {
-      key = ''; $('auth').hidden = false; connection('auth', 'Access required'); text('phase', 'Telemetry needs the server key'); clearLive();
+      key = ''; if ($('auth').hidden) showAuth(true); connection('auth', 'Access required'); text('phase', 'Telemetry needs the server key'); clearLive();
       timer = setTimeout(() => poll(token), 4000); return;
     }
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -350,14 +362,15 @@ async function poll(token = generation) {
     timer = setTimeout(() => poll(token), 2000);
   }
 }
-$('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; $('auth').hidden = true; generation++; clearTimeout(timer); poll(generation); });
+$('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; showAuth(false); generation++; clearTimeout(timer); poll(generation); });
 $('themeButton').addEventListener('click', () => {
   const light = document.documentElement.dataset.theme !== 'light';
   document.documentElement.dataset.theme = light ? 'light' : 'dark';
   const label = 'Switch to ' + (light ? 'dark' : 'light') + ' theme';
   $('themeButton').setAttribute('aria-label', label); $('themeButton').title = label;
 });
-$('keyButton').addEventListener('click', () => { $('auth').hidden = !$('auth').hidden; if (!$('auth').hidden) $('apiKey').focus(); });
+function showAuth(show) { $('auth').hidden = !show; $('keyButton').setAttribute('aria-expanded', String(show)); if (show) $('apiKey').focus(); }
+$('keyButton').addEventListener('click', () => showAuth($('auth').hidden));
 $('snapshotLink').addEventListener('click', event => { if (key) { event.preventDefault(); notice('The JSON endpoint uses Bearer authentication; the key is never placed in a URL. Query /api/monitor/v1/snapshot from your API client.'); } });
 document.addEventListener('visibilitychange', () => { generation++; clearTimeout(timer); previous = null; if (!document.hidden) poll(generation); });
 setInterval(() => { if (lastSuccess !== null && performance.now() - lastSuccess > 5000 && document.body.dataset.connection === 'live') { connection('stale', 'Stale snapshot'); clearLive(); notice('No fresh snapshot in five seconds; live values are cleared until the next one.'); } }, 1000);
@@ -374,9 +387,12 @@ function line(role, who) {
   $('chatHint')?.remove(); $('transcript').append(msg); return pre;
 }
 function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatInput').disabled = on; }
-function chatScroll() { const t = $('transcript'); t.scrollTop = t.scrollHeight; }
+let followOutput = true;
+$('transcript').addEventListener('scroll', () => { const t = $('transcript'); followOutput = t.scrollHeight - t.clientHeight - t.scrollTop < 48; });
+function chatScroll() { const t = $('transcript'); if (followOutput) t.scrollTop = t.scrollHeight; }
 async function send(prompt) {
-  if (!key && document.body.dataset.connection === 'auth') { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); $('auth').hidden = false; $('apiKey').focus(); return; }
+  if (!key && document.body.dataset.connection === 'auth') { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); showAuth(true); return; }
+  followOutput = true;
   const revision = chatGeneration, checkpoint = history.length;
   history.push({role: 'user', content: prompt}); line('you', 'you').textContent = prompt;
   const pre = line('model', 'model'), msg = pre.closest('.msg'), thought = msg.querySelector('.thought'); msg.classList.add('streaming'); chatScroll();
@@ -387,7 +403,7 @@ async function send(prompt) {
     const response = await fetch('/api/monitor/v1/chat/completions', {method: 'POST', signal: controller.signal, cache: 'no-store',
       headers: {...(key ? {Authorization: 'Bearer ' + key} : {}), 'Content-Type': 'application/json'},
       body: JSON.stringify(Object.assign({messages: history, stream: true}, $('chatThink').checked ? {} : {chat_template_kwargs: {enable_thinking: false}}))});
-    if (response.status === 401 || response.status === 403) throw new Error('the server rejected the key');
+    if (response.status === 401 || response.status === 403) { showAuth(true); throw new Error('the server rejected the key'); }
     if (response.status === 409 || response.status === 429) throw new Error('another chat is already running on this monitor');
     if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
     const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '';
@@ -413,7 +429,10 @@ async function send(prompt) {
   } catch (error) {
     failed = true;
     if (revision === chatGeneration) text('chatStatus', controller.signal.aborted ? 'stopped' : 'failed: ' + (error && error.message ? error.message : 'request failed'));
-    if (!controller.signal.aborted) msg.classList.replace('model', 'sys');
+    if (!controller.signal.aborted) {
+      msg.classList.replace('model', 'sys');
+      if (revision === chatGeneration && !$('chatInput').value) $('chatInput').value = prompt;
+    }
   } finally {
     const elapsed = (performance.now() - started) / 1000, gen = first === null ? 0 : (performance.now() - first) / 1000;
     const parts = [number(elapsed, 1) + ' s'];
@@ -430,8 +449,12 @@ async function send(prompt) {
   }
 }
 $('compose').addEventListener('submit', event => { event.preventDefault(); const value = $('chatInput').value.trim(); if (!value || controller) return; $('chatInput').value = ''; send(value); });
-$('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
-document.addEventListener('keydown', event => { if (event.key === 'Escape' && controller) controller.abort(); });
+$('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  if (controller) controller.abort();
+  else if (!$('auth').hidden) { showAuth(false); $('keyButton').focus(); }
+});
 $('chatStop').addEventListener('click', () => { if (controller) controller.abort(); });
 $('chatClear').addEventListener('click', () => { chatGeneration++; if (controller) controller.abort(); history.length = 0; $('transcript').replaceChildren(Object.assign(document.createElement('div'), {className: 'hint', id: 'chatHint', textContent: 'Transcript cleared.'})); text('chatStatus', 'idle'); text('chatStats', ''); });
 poll();

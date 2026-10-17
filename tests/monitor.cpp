@@ -75,7 +75,8 @@ int main(int argc, char ** argv) {
         if (argc >= 3 && argc <= 5 && std::string(argv[1]) == "--fixture") {
             tqserve::MonitorServer server(m, "127.0.0.1", 0, argc >= 4 ? argv[3] : "", "", argc == 5 ? uint16_t(std::stoul(argv[4])) : 0);
             std::cout << server.port() << std::endl;
-            for (int i = 0; i < 6; ++i) {
+            std::ifstream initial_file(argv[2]); std::string initial_mode; initial_file >> initial_mode;
+            for (int i = 0; i < (initial_mode == "empty" ? 0 : 6); ++i) {
                 auto history = m.begin(); history->prefill(1024 * uint32_t(i + 1)); history->decoding();
                 history->tokens(128); history->timings(1024 * uint32_t(i + 1), 128, 500 + i * 100, 1500, 140, 110);
                 history->finish(i == 2 ? "cancelled" : "complete");
@@ -86,7 +87,7 @@ int main(int argc, char ** argv) {
                 std::ifstream file(argv[2]); std::string mode; file >> mode;
                 if (mode != last_mode) {
                     if (job) job->finish();
-                    if (mode != "idle") job = m.begin();
+                    if (mode != "idle" && mode != "empty") job = m.begin();
                     if (mode == "prefill" || mode == "decode") job->prefill(8192);
                     if (mode == "decode") job->decoding();
                     if (mode == "failed") job->finish("failed");
