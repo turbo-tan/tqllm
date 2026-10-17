@@ -212,29 +212,6 @@ void reconstruct_had_rows_i8(int8_t* W, int ld, const uint16_t* T, const half* s
                                                                                   svh, m / 16, 0, ld, sc);
 }
 
-// Per-row int8 scales of a reconstructed FP16 matrix: sc[r] = max_c |w[r][c]| / 127 (1 for an all-zero row).
-// The same rule and warp reduction as quant_rows_k, so the load-time scales are bit-identical to per-chunk
-// quantisation of the same values.
-__global__ void __launch_bounds__(256) x3_row_scales_kernel(const half* __restrict__ w, int cols, float* __restrict__ sc) {
-    const int r = blockIdx.x;
-    const half* row = w + size_t(r) * cols;
-    float m = 0.f;
-    for (int c = threadIdx.x; c < cols; c += 256) m = fmaxf(m, fabsf(__half2float(row[c])));
-    __shared__ float red[8];
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
-    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = m;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        m = threadIdx.x < 8 ? red[threadIdx.x] : 0.f;
-        for (int o = 4; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
-        if (threadIdx.x == 0) sc[r] = m > 0.f ? m / 127.f : 1.f;
-    }
-}
-
-void x3_row_scales(const half* w, int rows, int cols, float* sc, cudaStream_t s) {
-    if (rows > 0) x3_row_scales_kernel<<<rows, 256, 0, s>>>(w, cols, sc);
-}
-
 // W is (n, m) row-major fp16 in the TRANSFORMED basis; T is (n/16, m/16, words); m multiple of 128.
 template <class Codec>
 __global__ __launch_bounds__(X3_RP_THREADS)

@@ -53,9 +53,6 @@ void x3_cast_f32_bf16(const float* src, __nv_bfloat16* dst, int n, cudaStream_t 
 // dst[t*ld + off + c] = bf16(src[t*part_rows + c]) - a row-part of a row-concatenated matvec output.
 void x3_copy_f32_bf16_strided(const float* src, __nv_bfloat16* dst, int part_rows, int ld, int off, int n,
                               cudaStream_t stream);
-// Per-row int8 scales of a reconstructed FP16 matrix [rows][cols]: sc[r] = max_c |w[r][c]| / 127 (1 for an all-zero
-// row) - the same rule as the engine's per-chunk weight quantisation, computed once at load.
-void x3_row_scales(const half* w, int rows, int cols, float* sc, cudaStream_t stream);
 
 }  // namespace x3
 }  // namespace tqllm

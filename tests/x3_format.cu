@@ -114,16 +114,17 @@ void i8_identity(const x3::X3Codec* c, int rows, int cols) {
     half* d_suh = dev_up(suh);
     half* d_svh = dev_up(svh);
     half* d_W = nullptr;
-    int8_t *d_q = nullptr, *d_qref = nullptr;
+    int8_t *d_q = nullptr, *d_qref = nullptr, *d_tmp = nullptr;
     float *d_sc = nullptr, *d_sc_ref = nullptr;
     cudaMalloc(&d_W, size_t(rows) * cols * sizeof(half));
     cudaMalloc(&d_q, size_t(rows) * cols);
     cudaMalloc(&d_qref, size_t(rows) * cols);
+    cudaMalloc(&d_tmp, size_t(rows) * cols);
     cudaMalloc(&d_sc, size_t(rows) * 4);
     cudaMalloc(&d_sc_ref, size_t(rows) * 4);
     c->dequant_rows(d_W, cols, d_t, d_suh, d_svh, rows, cols, 0);
-    // load-time path: scales from the reconstructed FP16, then straight-to-int8 reconstruct
-    x3::x3_row_scales(d_W, rows, cols, d_sc, 0);
+    // load-time path (X3Format::load): the engine's quantise kernel into a throwaway int8 buffer, keep the scales
+    tqllm_cuda::int8_quant_rows(d_W, rows, cols, cols, d_tmp, d_sc, 0);
     c->dequant_rows_i8(d_q, cols, d_t, d_suh, d_svh, rows, cols, d_sc, 0);
     // reference path: the engine's per-chunk quantise kernel on the same FP16 values
     tqllm_cuda::int8_quant_rows(d_W, rows, cols, cols, d_qref, d_sc_ref, 0);
@@ -138,8 +139,8 @@ void i8_identity(const x3::X3Codec* c, int rows, int cols) {
     bool eq = std::memcmp(q.data(), qref.data(), q.size()) == 0 && std::memcmp(&sc[0], &sc_ref[0], sc.size() * 4) == 0;
     check(eq, std::string(c->name) + ": dequant_rows_i8 == int8_quant_rows(dequant_rows) (rows=" + std::to_string(rows) +
               " cols=" + std::to_string(cols) + ")");
-    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_q); cudaFree(d_qref); cudaFree(d_sc);
-    cudaFree(d_sc_ref);
+    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_q); cudaFree(d_qref); cudaFree(d_tmp);
+    cudaFree(d_sc); cudaFree(d_sc_ref);
 }
 
 void test_row(const x3::X3Codec* c, int rows, int cols) {

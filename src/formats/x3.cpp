@@ -8,6 +8,7 @@
 #include "gguf.hpp"
 #include "x3_codecs.hpp"
 #include "x3_record.hpp"
+#include "int8_gemm.cuh"
 #include "x3.cuh"
 #include "window.hpp"
 
@@ -164,26 +165,27 @@ struct X3Format final : WeightFormat {
             window_scratch(sc, *d);
         }
 
-        // Row scales for the int8 prefill GEMM, once at load (the weights never change): reconstruct each part to a
-        // temporary FP16 buffer and apply the same amax/127 rule as the per-chunk quantise pass (x3_row_scales), so
-        // dequant_i8 can skip both the FP16 round trip and the quantise kernel.
+        // Row scales for the int8 prefill GEMM, once at load (the weights never change): run the engine's own
+        // quantise kernel (int8_quant_rows) on each reconstructed part into a temporary int8 buffer and keep only
+        // the scales - one source of the amax/127 rule. dequant_i8 then skips both the FP16 round trip and the
+        // per-chunk quantise pass.
         {
             if (cudaMalloc(&d->sc, size_t(rows) * 4) != cudaSuccess) throw std::runtime_error("x3: row scale allocation failed");
-            half* tmp = nullptr;
-            size_t tmp_cap = 0;
+            void* tmp_h = nullptr;
+            size_t tmp_h_cap = 0;
+            void* tmp_q = nullptr;
+            size_t tmp_q_cap = 0;
             int off = 0;
             for (const X3Part& p : d->parts) {
-                const size_t need = size_t(p.rows) * cols * sizeof(half);
-                if (need > tmp_cap) {
-                    if (tmp) cudaFree(tmp);
-                    if (cudaMalloc(&tmp, need) != cudaSuccess) throw std::runtime_error("x3: scale scratch allocation failed");
-                    tmp_cap = need;
-                }
-                p.codec->dequant_rows(tmp, cols, p.trellis, p.suh, p.svh, p.rows, p.cols, stream);
-                x3::x3_row_scales(tmp, p.rows, cols, d->sc + off, stream);
+                grow(&tmp_h, tmp_h_cap, size_t(p.rows) * cols * sizeof(half));
+                grow(&tmp_q, tmp_q_cap, size_t(p.rows) * cols);
+                p.codec->dequant_rows(static_cast<half*>(tmp_h), cols, p.trellis, p.suh, p.svh, p.rows, p.cols, stream);
+                tqllm_cuda::int8_quant_rows(static_cast<const __half*>(tmp_h), p.rows, cols, cols,
+                                            static_cast<int8_t*>(tmp_q), d->sc + off, stream);
                 off += p.rows;
             }
-            if (tmp) cudaFree(tmp);
+            if (tmp_h) cudaFree(tmp_h);
+            if (tmp_q) cudaFree(tmp_q);
         }
         Mat m;
         m.p = reinterpret_cast<const char*>(d->parts.front().trellis);  // first part's base (informational)
