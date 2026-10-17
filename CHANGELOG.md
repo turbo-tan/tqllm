@@ -6,6 +6,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased (next: 1.0.1)
 
 ### Added
+- Native MTP drafting on mixture-of-experts (qwen35moe) files that carry an MTP block (`--mtp`): the block's experts
+  load like the trunk's and stay in VRAM. Qwen3.6-35B-A3B UD-Q4_K_XL on an RTX 3090: 188.8 tok/s mean over five
+  chats (164.9 without MTP), 186.1 after a 4K prompt (163.1); output identical with and without MTP.
+- `--moe-host-mb auto` (default for files larger than the free GPU memory): the experts beyond it go to system RAM,
+  spread over the layers when there is no routing profile; `--moe-cache-mb auto` sizes the VRAM cache of host experts.
 - Optional `tqserve --monitor-port` instrument panel with request telemetry, host/device readings and a right-hand
   terminal chat. Includes in-memory theme/key controls, thinking toggle, Stop/Escape and explicit unknown counters.
   The request workbench adds selectable request journeys, pinned-reference latency/rate comparisons and visible hardware details sampled every three seconds. Theme switching uses a sun/moon icon.
