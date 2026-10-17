@@ -278,7 +278,7 @@ DFlash2::DFlash2(const std::string& path,Qwen35& target):impl_(std::make_unique<
 DFlash2::~DFlash2()=default;
 const std::vector<std::vector<uint32_t>>& DFlash2::candidates() const {return impl_->candidates;}
 int verify_width(int width,int position) {
-    static const int at=std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")?std::atoi(std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")):2048;
+    static const int at=std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")?std::atoi(std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")):0;
     static const int narrow=std::getenv("TQLLM_MLX_VERIFY_NARROW_WIDTH")?std::atoi(std::getenv("TQLLM_MLX_VERIFY_NARROW_WIDTH")):7;
     return at>0 && position>=at ? std::min(width,std::max(1,narrow)) : width;
 }
