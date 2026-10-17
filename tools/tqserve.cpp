@@ -10,7 +10,9 @@
 #include "kv_format.hpp"
 #include "kv_store.hpp"
 
+#if TQLLM_WITH_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -27,7 +29,7 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -146,7 +148,9 @@ int main(int argc, char ** argv) {
     tqllm::check_env_flags("tqserve");
     tqserve::free_mb_probe() = [] {
         size_t free = 0, total = 0;
+#if TQLLM_WITH_CUDA
         cudaMemGetInfo(&free, &total);
+#endif
         return free >> 20;
     };
     std::string model_dir, model_path, tokenizer_path, host = "127.0.0.1", name = "tqllm";
@@ -248,6 +252,9 @@ int main(int argc, char ** argv) {
         tqllm::Tokenizer tokenizer;
         tokenizer.load(tokenizer_path);
         tqserve::Vision vis;
+#if !TQLLM_WITH_CUDA
+        if (!mmproj.empty()) throw std::runtime_error("--mmproj (image input) needs a CUDA build");
+#else
         if (!mmproj.empty()) {  // before the model, so the context fit sees the encoder's memory
             const auto pad = tokenizer.encode("<|image_pad|>");
             if (pad.size() != 1) throw std::runtime_error("tokenizer has no <|image_pad|> token");
@@ -260,6 +267,7 @@ int main(int argc, char ** argv) {
             std::cerr << "tqserve: vision encoder " << mmproj << " (" << image_min_tokens << ".." << image_max_tokens
                       << " tokens per image)\n";
         }
+#endif
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
@@ -268,7 +276,11 @@ int main(int argc, char ** argv) {
         if (monitor_port) {
             char hostname[256]{}, pci[32]{}; ::gethostname(hostname, sizeof(hostname) - 1);
             int device = 0;
+#if TQLLM_WITH_CUDA
             if (cudaGetDevice(&device) == cudaSuccess) cudaDeviceGetPCIBusId(pci, sizeof(pci), device);
+#else
+            (void)device;
+#endif
             monitor = std::make_unique<tqserve::Monitor>(tqserve::Monitor::Info{name, TQLLM_COMMIT, hostname, pci, slot_context, np});
             monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port));
             std::cerr << "tqserve: monitor http://" << host << ':' << monitor_port << "/ (read-only)\n";
@@ -544,7 +556,7 @@ int main(int argc, char ** argv) {
 }
 #else
 int main() {
-    std::cerr << "tqserve requires Linux/POSIX sockets and a CUDA-enabled build\n";
+    std::cerr << "tqserve requires Linux or macOS (POSIX sockets)\n";
     return 1;
 }
 #endif
