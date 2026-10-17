@@ -577,13 +577,15 @@ const char* kStagedGemm = R"METAL(
     using TA = tensor<device half, dextents<int, 2>, tensor_inline>;
     using TB = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
     auto ta = TA((device half*)(x + size_t(m0) * uint(K)), dextents<int, 2>(K, MT));
-    TB tb0(stage, dextents<int, 2>(KS, NT));
-    TB tb1(stage + NT * KS, dextents<int, 2>(KS, NT));
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, KS, false, true, false,
+    // BKM = 1: K-major stage (stage[k * NT + n]); each lane's 4 consecutive rows of one input are one half4 store
+    TB tb0(stage, BKM ? dextents<int, 2>(NT, KS) : dextents<int, 2>(KS, NT));
+    TB tb1(stage + NT * KS, BKM ? dextents<int, 2>(NT, KS) : dextents<int, 2>(KS, NT));
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, KS, false, BKM ? false : true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
     auto a_first = ta.template slice<KS, MT>(0, 0);
-    auto bs0 = tb0.template slice<KS, NT>(0, 0), bs1 = tb1.template slice<KS, NT>(0, 0);
+    auto bs0 = tb0.template slice<(BKM ? NT : KS), (BKM ? KS : NT)>(0, 0);
+    auto bs1 = tb1.template slice<(BKM ? NT : KS), (BKM ? KS : NT)>(0, 0);
     auto acc = op.template get_destination_cooperative_tensor<decltype(a_first), decltype(bs0), float>();
     constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
 #pragma unroll
@@ -620,17 +622,24 @@ const char* kStagedGemm = R"METAL(
             const uint ksl = rest % KSTEPS, bl = rest / KSTEPS;
             const short qid = ln >> 2, fm = (qid & 4) | ((ln >> 1) & 3), fn = ((qid & 2) | (ln & 1)) * 4;
 #pragma unroll
-            for (short p = 0; p < 4; ++p)
+            for (short j = 0; j < 2; ++j) {
+                half4 va4, vb4;
 #pragma unroll
-                for (short j = 0; j < 2; ++j) {
+                for (short p = 0; p < 4; ++p) {
                     const short e = p + 4 * j;
                     const uint qa = (wr[i].x >> (4 * e)) & 15u, qb = (wr[i].y >> (4 * e)) & 15u;
-                    const half va = TQ4 ? half(float(TQ4_LEVEL[qa]) * sca[i][p]) : half(fma(float(qa), sca[i][p], bia[i][p]));
-                    const half vb = TQ4 ? half(float(TQ4_LEVEL[qb]) * scb[i][p]) : half(fma(float(qb), scb[i][p], bib[i][p]));
-                    const uint k = ksl * 16u + uint(fm) + 8u * uint(j);
-                    buf[(bl * 32u + uint(fn) + uint(p)) * uint(KS) + k] = va;
-                    buf[(bl * 32u + 16u + uint(fn) + uint(p)) * uint(KS) + k] = vb;
+                    va4[p] = TQ4 ? half(float(TQ4_LEVEL[qa]) * sca[i][p]) : half(fma(float(qa), sca[i][p], bia[i][p]));
+                    vb4[p] = TQ4 ? half(float(TQ4_LEVEL[qb]) * scb[i][p]) : half(fma(float(qb), scb[i][p], bib[i][p]));
                 }
+                const uint k = ksl * 16u + uint(fm) + 8u * uint(j), na = bl * 32u + uint(fn), nb = na + 16u;
+                if (BKM) {
+                    *((threadgroup half4*)(buf + k * uint(NT) + na)) = va4;
+                    *((threadgroup half4*)(buf + k * uint(NT) + nb)) = vb4;
+                } else {
+#pragma unroll
+                    for (short p = 0; p < 4; ++p) {buf[(na + uint(p)) * uint(KS) + k] = va4[p]; buf[(nb + uint(p)) * uint(KS) + k] = vb4[p];}
+                }
+            }
         }
     };
     const uint steps = uint(K) / uint(KS);
@@ -657,8 +666,12 @@ mx::array nax_affine_gemm_staged(const NaxAffine& w, const mx::array& input, boo
         throw std::invalid_argument("nax staged gemm: 4-bit matrices with rows and columns a multiple of 64");
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax staged gemm: input must be [m, columns]");
-    static const int MT = std::getenv("TQLLM_MLX_STAGED_MT") ? std::atoi(std::getenv("TQLLM_MLX_STAGED_MT")) : 128;
-    constexpr int NT = 64, KS = 64, SIMDS = 4;
+    auto knob = [](const char* name, int fallback) {return std::getenv(name) ? std::atoi(std::getenv(name)) : fallback;};
+    static const int MT = knob("TQLLM_MLX_STAGED_MT", 64), KS = knob("TQLLM_MLX_STAGED_KS", 64),
+                     SIMDS = knob("TQLLM_MLX_STAGED_SIMDS", 4), BKM = knob("TQLLM_MLX_STAGED_BKM", 1);
+    constexpr int NT = 64;
+    if ((NT / 32) * (KS / 16) * 32 % (32 * SIMDS) || MT % (8 * SIMDS) || w.columns % KS)
+        throw std::invalid_argument("nax staged gemm: tile parameters do not divide");
     static auto kernels = [] {
         auto make = [](bool round) {
             return mx::fast::metal_kernel(std::string("tqllm_nax_staged_gemm") + (round ? "_bf" : ""), {"x", "W", "S", "Bz"}, {"y"}, kStagedGemm,
@@ -672,8 +685,8 @@ mx::array nax_affine_gemm_staged(const NaxAffine& w, const mx::array& input, boo
     x = mx::contiguous(x);
     return (round_bf16 ? kernels.second : kernels.first)(
         {x, w.words, w.scales, w.biases}, {{m, n}}, {mx::float32}, {(n / NT) * (mp / MT) * 32 * SIMDS, 1, 1}, {32 * SIMDS, 1, 1},
-        {{"MT", MT}, {"NT", NT}, {"KS", KS}, {"SIMDS", SIMDS}, {"K", k}, {"N", n}, {"M", m}, {"MP", mp}, {"GPR", k / w.group},
-         {"GS", w.group}, {"TQ4", w.tq4}, {"ROUND_BF16", round_bf16}},
+        {{"MT", MT}, {"NT", NT}, {"KS", KS}, {"SIMDS", SIMDS}, {"BKM", BKM}, {"K", k}, {"N", n}, {"M", m}, {"MP", mp},
+         {"GPR", k / w.group}, {"GS", w.group}, {"TQ4", w.tq4}, {"ROUND_BF16", round_bf16}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
