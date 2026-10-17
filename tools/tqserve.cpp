@@ -7,7 +7,9 @@
 #include "serve/jinja_template.hpp"
 #include "gguf.hpp"
 #include "flags_gen.hpp"
+#if TQLLM_WITH_CUDA
 #include "kv_format.hpp"
+#endif
 #include "kv_store.hpp"
 
 #if TQLLM_WITH_CUDA
@@ -183,7 +185,9 @@ int main(int argc, char ** argv) {
                 return 0;
             }
             if (arg == "--list-kv") {  // registered KV-cache formats with size, scratch need and provenance (Qwen3.8 27B: 16 attention layers, 4 kv heads, head_dim 256)
+#if TQLLM_WITH_CUDA
                 std::fputs(tqllm::kv_format_listing(16, 4, 256).c_str(), stdout);
+#endif
                 std::printf("\nKV stores (--kv-store):\n");
                 for (const auto & n : tqllm::kv_store_names())
                     std::printf("  %-8s %s\n", n.c_str(), tqllm::kv_store_policy(n)->summary());
