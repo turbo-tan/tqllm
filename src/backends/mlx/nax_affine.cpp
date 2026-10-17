@@ -576,18 +576,21 @@ const char* kStagedGemm = R"METAL(
     threadgroup half stage[2 * NT * KS];
     using TA = tensor<device half, dextents<int, 2>, tensor_inline>;
     using TB = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
-    auto ta = TA((device half*)(x + size_t(m0) * uint(K)), dextents<int, 2>(K, MT));
+    // PERSG = 1: each simdgroup runs its own matmul2d on its 32 rows over the shared stage (MT = 32 x SIMDS)
+    const uint sgi = simdgroup_index_in_threadgroup;
+    constexpr uint OPROWS = PERSG ? 32u : uint(MT);
+    auto ta = TA((device half*)(x + (size_t(m0) + (PERSG ? sgi * 32u : 0u)) * uint(K)), dextents<int, 2>(K, OPROWS));
     // BKM = 1: K-major stage (stage[k * NT + n]); each lane's 4 consecutive rows of one input are one half4 store
     TB tb0(stage, BKM ? dextents<int, 2>(NT, KS) : dextents<int, 2>(KS, NT));
     TB tb1(stage + NT * KS, BKM ? dextents<int, 2>(NT, KS) : dextents<int, 2>(KS, NT));
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, KS, false, BKM ? false : true, false,
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(OPROWS, NT, KS, false, BKM ? false : true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
-    auto a_first = ta.template slice<KS, MT>(0, 0);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<(PERSG ? 1 : SIMDS)>> op;
+    auto a_first = ta.template slice<KS, OPROWS>(0, 0);
     auto bs0 = tb0.template slice<(BKM ? NT : KS), (BKM ? KS : NT)>(0, 0);
     auto bs1 = tb1.template slice<(BKM ? NT : KS), (BKM ? KS : NT)>(0, 0);
     auto acc = op.template get_destination_cooperative_tensor<decltype(a_first), decltype(bs0), float>();
-    constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
+    constexpr uint CAP = OPROWS * uint(NT) / (32u * (PERSG ? 1u : uint(SIMDS)));
 #pragma unroll
     for (uint i = 0; i < CAP; ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f;
     // staging: per step NT/32 blocks x KS/16 16-column words x 32 lanes, WPT words per thread
@@ -649,7 +652,7 @@ const char* kStagedGemm = R"METAL(
         store(buf);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t + 1 < steps) load(t + 1);   // the next step's words and scales arrive while this step's matmul runs
-        auto a = ta.template slice<KS, MT>(int(t * uint(KS)), 0);
+        auto a = ta.template slice<KS, OPROWS>(int(t * uint(KS)), 0);
         if (t & 1u) op.run(a, bs1, acc);
         else op.run(a, bs0, acc);
     }
@@ -657,7 +660,7 @@ const char* kStagedGemm = R"METAL(
     for (uint i = 0; i < CAP; ++i) {
         if (!acc.is_valid_element(i)) continue;
         auto c = acc.get_multidimensional_index(i);
-        const uint col = n0 + uint(c[0]), row = m0 + uint(c[1]);
+        const uint col = n0 + uint(c[0]), row = m0 + (PERSG ? sgi * 32u : 0u) + uint(c[1]);
         if (row < uint(M)) y[size_t(row) * uint(N) + col] = ROUND_BF16 ? float(bfloat16_t(acc[i])) : acc[i];
     }
 )METAL";
@@ -667,10 +670,11 @@ mx::array nax_affine_gemm_staged(const NaxAffine& w, const mx::array& input, boo
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax staged gemm: input must be [m, columns]");
     auto knob = [](const char* name, int fallback) {return std::getenv(name) ? std::atoi(std::getenv(name)) : fallback;};
-    static const int MT = knob("TQLLM_MLX_STAGED_MT", 64), KS = knob("TQLLM_MLX_STAGED_KS", 64),
-                     SIMDS = knob("TQLLM_MLX_STAGED_SIMDS", 4), BKM = knob("TQLLM_MLX_STAGED_BKM", 1);
+    static const int MT = knob("TQLLM_MLX_STAGED_MT", 128), KS = knob("TQLLM_MLX_STAGED_KS", 64),
+                     SIMDS = knob("TQLLM_MLX_STAGED_SIMDS", 8), BKM = knob("TQLLM_MLX_STAGED_BKM", 1),
+                     PERSG = knob("TQLLM_MLX_STAGED_PERSG", 0);
     constexpr int NT = 64;
-    if ((NT / 32) * (KS / 16) * 32 % (32 * SIMDS) || MT % (8 * SIMDS) || w.columns % KS)
+    if ((NT / 32) * (KS / 16) * 32 % (32 * SIMDS) || MT % (8 * SIMDS) || w.columns % KS || (PERSG && MT != 32 * SIMDS))
         throw std::invalid_argument("nax staged gemm: tile parameters do not divide");
     static auto kernels = [] {
         auto make = [](bool round) {
@@ -685,7 +689,7 @@ mx::array nax_affine_gemm_staged(const NaxAffine& w, const mx::array& input, boo
     x = mx::contiguous(x);
     return (round_bf16 ? kernels.second : kernels.first)(
         {x, w.words, w.scales, w.biases}, {{m, n}}, {mx::float32}, {(n / NT) * (mp / MT) * 32 * SIMDS, 1, 1}, {32 * SIMDS, 1, 1},
-        {{"MT", MT}, {"NT", NT}, {"KS", KS}, {"SIMDS", SIMDS}, {"BKM", BKM}, {"K", k}, {"N", n}, {"M", m}, {"MP", mp},
+        {{"MT", MT}, {"NT", NT}, {"KS", KS}, {"SIMDS", SIMDS}, {"BKM", BKM}, {"PERSG", PERSG}, {"K", k}, {"N", n}, {"M", m}, {"MP", mp},
          {"GPR", k / w.group}, {"GS", w.group}, {"TQ4", w.tq4}, {"ROUND_BF16", round_bf16}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
