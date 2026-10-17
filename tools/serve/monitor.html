@@ -253,7 +253,7 @@ async function poll(token = generation) {
   }
 }
 $('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; $('auth').hidden = true; generation++; clearTimeout(timer); poll(generation); });
-$('themeButton').addEventListener('click', () => { const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; document.documentElement.dataset.theme = dark ? 'light' : 'dark'; });
+$('themeButton').addEventListener('click', () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'; });
 $('keyButton').addEventListener('click', () => { $('auth').hidden = !$('auth').hidden; if (!$('auth').hidden) $('apiKey').focus(); });
 $('snapshotLink').addEventListener('click', event => { if (key) { event.preventDefault(); notice('The JSON endpoint uses Bearer authentication; the key is never placed in a URL. Query /api/monitor/v1/snapshot from your API client.'); } });
 document.addEventListener('visibilitychange', () => { generation++; clearTimeout(timer); previous = null; if (!document.hidden) poll(generation); });
