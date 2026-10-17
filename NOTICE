@@ -12,6 +12,12 @@ This product includes third-party code under its own licence:
   IQ4_NL codebook from ggml (llama.cpp), used only to read GGUF files stored in those formats.
   MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
 
+* kernels/formats/x3/{gemv_sq.cu, gemv_x3v.cu, reconstruct.cu, had128.cuh, ptx.cuh, dispatch.cu, codec_mul1.cuh} - the
+  X3 (EXL3 mul1 trellis) decode, GEMV and dequant kernels, ported from llama-paw-k25
+  ggml/src/ggml-cuda/paw-x3.cu, itself a port of exllamav3 (exllamav3_ext/quant, commit 63b32f0).
+  MIT License, Copyright (c) 2023-2026 The ggml authors (licenses/ggml-MIT.txt) and Copyright (c) 2025 Turboderp
+  (licenses/exllamav3-MIT.txt).
+
 * src/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
@@ -24,6 +30,9 @@ Credits - work this project builds on or learned from (ideas and formats, no cod
 * Google Research: TurboQuant (ICLR 2026), the rotation-plus-codebook lineage the TQ3 / TQ4 formats follow.
 * TheTom (turboquant_plus): TurboQuant KV-cache ideas and the REFRACT distance-from-reference quality metric.
 * Avarok (TorQuant): learned rotations for quantisation.
+* turboderp (ExLlamaV3) and Tseng et al. (QTIP): the trellis / mul1 codebook weight format behind X3 / X3.1.
+* PAW / llama-paw: the X3 / X3.1 GGUF layout (m3_trellis / m3_suh / m3_svh) and the PAW-27B-X3.1 weights.
+* TRUSS (trellis-kernel): the window GEMV design (one decode per tile feeding the mma A operand, no grid barrier).
 * Unsloth: the UD GGUF quantisations, which TQLLM runs natively and benchmarks against.
 
 The full credits table, including methods and comparison baselines, is in README.md (Credits).

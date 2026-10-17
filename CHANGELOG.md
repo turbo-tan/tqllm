@@ -6,6 +6,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased (next: 1.0.1)
 
 ### Added
+- X3 / X3.1 weights (EXL3 mul1 trellis, K 1 to 4 bits in half steps): PAW GGUF files such as PAW-27B-X3.1 load natively,
+  weights bit-exact to the file (KLD 0.000458 vs llama-paw on the same file). Decode with the DFlash2 drafter on an
+  RTX 3090: 116 / 90 / 89 tok/s at 2k / 8k / 32k context (llama-paw on the same files: 94 / 67 / 61).
+- `--draft-retrieve C`: C x 16 positions of the DFlash2 drafter's window are far 16-token chunks it retrieves from the
+  context (one slot); its K/V is kept as a ~68K-position ring (1.4 GB at 262K instead of 5.4 GB). `--draft-retrieve 32`: +12-14% decode at 8k / 32k.
+- `--presence-penalty P` (OpenAI presence_penalty default for requests that set none); `--temp` is an alias of
+  `--temperature`.
+- `tools/tqtop`: top-k next-token logits at a chat-templated prompt and prefix.
 - `tqllm launch pi` (the pi coding agent) and `tqllm launch dsh` (DeepSeek Harness, `web` or `headless` profile): each
   gets the server as a provider through a temporary config the launcher deletes afterwards (`PI_CODING_AGENT_DIR` /
   `dsh --patch`). Both wrote and ran a file against Qwen3.8-27B on an RTX 3090. Implemented by `tqllm launch codex exec`
