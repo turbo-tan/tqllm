@@ -30,6 +30,10 @@ struct X3Codec {
     // The same matrix in the engine's GEMM layout: W[r * ld + c], r < rows (out), c < cols (in); ld % 4 == 0.
     void (*dequant_rows)(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
                          cudaStream_t stream);
+    // The same matrix quantised straight to int8 (no FP16 round trip): W[r * ld + c] = round(clamp(half2float(v) / sc[r])),
+    // sc the load-time row scales (amax/127, 1 for a zero row); ld % 4 == 0.
+    void (*dequant_rows_i8)(int8_t* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
+                            const float* sc, cudaStream_t stream);
     // Caller workspace bytes for the n == 1 sq path (counters + qsums + partials).
     size_t (*ws_bytes)(int size_k, int size_n);
     // Window GEMV (gemv_window.cu) over a list of this codec's parts: y[t][out_off + r] = bf16(W x[t]),
@@ -49,6 +53,9 @@ void x3_cast_f32_bf16(const float* src, __nv_bfloat16* dst, int n, cudaStream_t 
 // dst[t*ld + off + c] = bf16(src[t*part_rows + c]) - a row-part of a row-concatenated matvec output.
 void x3_copy_f32_bf16_strided(const float* src, __nv_bfloat16* dst, int part_rows, int ld, int off, int n,
                               cudaStream_t stream);
+// Per-row int8 scales of a reconstructed FP16 matrix [rows][cols]: sc[r] = max_c |w[r][c]| / 127 (1 for an all-zero
+// row) - the same rule as the engine's per-chunk weight quantisation, computed once at load.
+void x3_row_scales(const half* w, int rows, int cols, float* sc, cudaStream_t stream);
 
 }  // namespace x3
 }  // namespace tqllm

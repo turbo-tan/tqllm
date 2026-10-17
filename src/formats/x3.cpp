@@ -36,6 +36,7 @@ struct X3Part {
 struct X3Desc {
     std::vector<X3Part> parts;
     int rows, cols;
+    float* sc = nullptr;  // load-time int8 row scales [rows], amax/127 (1 for a zero row); lives with the descriptor
 };
 
 struct Scratch {
@@ -108,7 +109,7 @@ struct X3Format final : WeightFormat {
     // the window GEMV takes a whole tree verify (12 columns) in one pass; the x3v fallback stops at 8
     int max_matvec_cols() const override { return x3::x3_window_enabled() ? x3::XW_MAX_N : 8; }
 
-    Mat load(const std::vector<char>& raw, int rows, int cols, const Upload& up, cudaStream_t) const override {
+    Mat load(const std::vector<char>& raw, int rows, int cols, const Upload& up, cudaStream_t stream) const override {
         if (cols % 128 || rows % 128) throw std::runtime_error("x3: dims must be multiples of 128");
         auto d = std::make_unique<X3Desc>();
         d->rows = rows; d->cols = cols;
@@ -163,6 +164,27 @@ struct X3Format final : WeightFormat {
             window_scratch(sc, *d);
         }
 
+        // Row scales for the int8 prefill GEMM, once at load (the weights never change): reconstruct each part to a
+        // temporary FP16 buffer and apply the same amax/127 rule as the per-chunk quantise pass (x3_row_scales), so
+        // dequant_i8 can skip both the FP16 round trip and the quantise kernel.
+        {
+            if (cudaMalloc(&d->sc, size_t(rows) * 4) != cudaSuccess) throw std::runtime_error("x3: row scale allocation failed");
+            half* tmp = nullptr;
+            size_t tmp_cap = 0;
+            int off = 0;
+            for (const X3Part& p : d->parts) {
+                const size_t need = size_t(p.rows) * cols * sizeof(half);
+                if (need > tmp_cap) {
+                    if (tmp) cudaFree(tmp);
+                    if (cudaMalloc(&tmp, need) != cudaSuccess) throw std::runtime_error("x3: scale scratch allocation failed");
+                    tmp_cap = need;
+                }
+                p.codec->dequant_rows(tmp, cols, p.trellis, p.suh, p.svh, p.rows, p.cols, stream);
+                x3::x3_row_scales(tmp, p.rows, cols, d->sc + off, stream);
+                off += p.rows;
+            }
+            if (tmp) cudaFree(tmp);
+        }
         Mat m;
         m.p = reinterpret_cast<const char*>(d->parts.front().trellis);  // first part's base (informational)
         m.type = GGML_X3;
@@ -237,6 +259,21 @@ public:
             p.codec->dequant_rows(out + size_t(off) * m.cols, m.cols, p.trellis, p.suh, p.svh, p.rows, p.cols, s);
             off += p.rows;
         }
+    }
+
+    // int8 prefill: each part reconstructed straight to int8 with the load-time row scales (no FP16 round trip, no
+    // per-chunk quantise pass); row_scale copied from the descriptor's load-time array.
+    bool dequant_i8(const Mat& m, int8_t* w8, float* row_scale, cudaStream_t s) const override {
+        const auto* d = static_cast<const X3Desc*>(m.aux);
+        int off = 0;
+        for (const X3Part& p : d->parts) {
+            p.codec->dequant_rows_i8(w8 + size_t(off) * m.cols, m.cols, p.trellis, p.suh, p.svh, p.rows, p.cols,
+                                     d->sc + off, s);
+            off += p.rows;
+        }
+        if (cudaMemcpyAsync(row_scale, d->sc, size_t(m.rows) * 4, cudaMemcpyDeviceToDevice, s) != cudaSuccess)
+            throw std::runtime_error("x3: row scale copy failed");
+        return true;
     }
 };
 

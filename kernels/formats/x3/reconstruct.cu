@@ -20,11 +20,12 @@ namespace x3 {
 // OutMajor (tqLLM addition, epilogue only): write the tile as [out][in] with row stride ld_out, the engine's
 // [rows][cols] GEMM layout, instead of the fork's [in][out]. Same values, so bit-identical to reconstruct +
 // transpose, without the scratch matrix and the transpose pass.
-template <class Codec, bool OutMajor = false>
+template <class Codec, bool OutMajor = false, bool Int8 = false>
 __global__ __launch_bounds__(X3_RH_THREADS)
 void reconstruct_had_kernel(half* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
                             const half* __restrict__ suh, const half* __restrict__ svh,
-                            int packed_blocks_n, int packed_n_offset, int ld_out = 0) {
+                            int packed_blocks_n, int packed_n_offset, int ld_out = 0,
+                            const float* __restrict__ row_scale = nullptr) {
     constexpr int packed_size = Codec::words;
     constexpr float r_scale = kRScale;
 
@@ -162,10 +163,24 @@ void reconstruct_had_kernel(half* __restrict__ g_unpacked, const uint16_t* __res
         for (int oo = 0; oo < 128 / (X3_RH_THREADS / 32); ++oo) {
             const int o = warp_id * (128 / (X3_RH_THREADS / 32)) + oo;
             const int col = (((o >> 2) ^ lane_id) * 2 + ((o & 3) >> 1)) * 2 + (o & 1);   // half index in a row
-            half4 v;
-            v.x = __halves2half2(sh[(lane_id * 4 + 0) * 128 + col], sh[(lane_id * 4 + 1) * 128 + col]);
-            v.y = __halves2half2(sh[(lane_id * 4 + 2) * 128 + col], sh[(lane_id * 4 + 3) * 128 + col]);
-            *((half4*) (g_unpacked + (size_t) (nb * 128 + o) * ld_out + kb * 128 + lane_id * 4)) = v;
+            if constexpr (Int8) {
+                // All four gathered values are out row nb*128+o, so one scale per iteration: quantise exactly as
+                // quant_rows_k (inv = 1 / sc[row], clamp to [-127, 127], round-to-nearest), packed into one int32.
+                const float inv = 1.f / row_scale[nb * 128 + o];
+                int32_t q = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float v = __half2float(sh[(lane_id * 4 + i) * 128 + col]) * inv;
+                    q |= int32_t(uint32_t(int(__float2int_rn(fminf(fmaxf(v, -127.f), 127.f)))) & 0xffu) << (8 * i);
+                }
+                *reinterpret_cast<int32_t*>(reinterpret_cast<int8_t*>(g_unpacked) +
+                                             (size_t)(nb * 128 + o) * ld_out + kb * 128 + lane_id * 4) = q;
+            } else {
+                half4 v;
+                v.x = __halves2half2(sh[(lane_id * 4 + 0) * 128 + col], sh[(lane_id * 4 + 1) * 128 + col]);
+                v.y = __halves2half2(sh[(lane_id * 4 + 2) * 128 + col], sh[(lane_id * 4 + 3) * 128 + col]);
+                *((half4*) (g_unpacked + (size_t) (nb * 128 + o) * ld_out + kb * 128 + lane_id * 4)) = v;
+            }
         }
     }
 }
@@ -184,6 +199,40 @@ void reconstruct_had_rows(half* W, int ld, const uint16_t* T, const half* suh, c
                           cudaStream_t stream) {
     dim3 grid((m + 127) / 128, (n + 127) / 128);
     reconstruct_had_kernel<Codec, true><<<grid, X3_RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0, ld);
+}
+
+// Same matrix straight to int8 [rows][cols]: q[r][c] = round(clamp(half2float(W[r][c]) * inv_r, -127, 127)) with
+// inv_r = 1 / sc[r], sc the load-time row scales (amax/127, 1 for a zero row) - quant_rows_k's formula, so the
+// bytes are identical to dequantising to FP16 and quantising. ld is the int8 row stride (a multiple of 4).
+template <class Codec>
+void reconstruct_had_rows_i8(int8_t* W, int ld, const uint16_t* T, const half* suh, const half* svh, int n, int m,
+                             const float* sc, cudaStream_t stream) {
+    dim3 grid((m + 127) / 128, (n + 127) / 128);
+    reconstruct_had_kernel<Codec, true, true><<<grid, X3_RH_THREADS, 0, stream>>>(reinterpret_cast<half*>(W), T, suh,
+                                                                                  svh, m / 16, 0, ld, sc);
+}
+
+// Per-row int8 scales of a reconstructed FP16 matrix: sc[r] = max_c |w[r][c]| / 127 (1 for an all-zero row).
+// The same rule and warp reduction as quant_rows_k, so the load-time scales are bit-identical to per-chunk
+// quantisation of the same values.
+__global__ void __launch_bounds__(256) x3_row_scales_kernel(const half* __restrict__ w, int cols, float* __restrict__ sc) {
+    const int r = blockIdx.x;
+    const half* row = w + size_t(r) * cols;
+    float m = 0.f;
+    for (int c = threadIdx.x; c < cols; c += 256) m = fmaxf(m, fabsf(__half2float(row[c])));
+    __shared__ float red[8];
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        m = threadIdx.x < 8 ? red[threadIdx.x] : 0.f;
+        for (int o = 4; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        if (threadIdx.x == 0) sc[r] = m > 0.f ? m / 127.f : 1.f;
+    }
+}
+
+void x3_row_scales(const half* w, int rows, int cols, float* sc, cudaStream_t s) {
+    if (rows > 0) x3_row_scales_kernel<<<rows, 256, 0, s>>>(w, cols, sc);
 }
 
 // W is (n, m) row-major fp16 in the TRANSFORMED basis; T is (n/16, m/16, words); m multiple of 128.

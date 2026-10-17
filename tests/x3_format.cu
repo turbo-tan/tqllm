@@ -1,7 +1,10 @@
 // G2: X3 weight format. For each codec table row: dequant() then a host GEMV of the dequantised
 // matrix must match gemv() (dequant + host GEMV < 2e-3 RMS); the codec seam is proven by running
 // the test-only scalar codec through the same reconstruct/gemv skeletons. sq (n=1) and x3v (n=2..8)
-// are both exercised. No llama-paw needed here (that bit-match lives in the porting notes).
+// are both exercised. The straight-to-int8 reconstruct must equal the engine's own quantise kernel
+// (int8_quant_rows on dequant_rows' output) bit for bit. No llama-paw needed here (that bit-match
+// lives in the porting notes).
+#include "int8_gemm.cuh"
 #include "x3.cuh"
 
 #include <cuda_fp16.h>
@@ -97,6 +100,46 @@ void rows_identity(const x3::X3Codec* c, int rows, int cols, int ld) {
     check(eq, std::string(c->name) + ": dequant_rows == dequant transposed (rows=" + std::to_string(rows) +
               " cols=" + std::to_string(cols) + " ld=" + std::to_string(ld) + ")");
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_R);
+}
+
+// Straight-to-int8 reconstruct must equal the engine's own quantise (int8_quant_rows) applied to
+// dequant_rows' output, bit for bit: every code byte and every scale bit.
+void i8_identity(const x3::X3Codec* c, int rows, int cols) {
+    std::vector<uint16_t> trellis(size_t(rows / 16) * (cols / 16) * c->words);
+    for (auto& v : trellis) v = uint16_t(lcg() >> 13);
+    std::vector<half> suh(cols), svh(rows);
+    for (auto& v : suh) v = __float2half(0.5f + rnd());
+    for (auto& v : svh) v = __float2half(0.5f + rnd());
+    uint16_t* d_t = dev_up(trellis);
+    half* d_suh = dev_up(suh);
+    half* d_svh = dev_up(svh);
+    half* d_W = nullptr;
+    int8_t *d_q = nullptr, *d_qref = nullptr;
+    float *d_sc = nullptr, *d_sc_ref = nullptr;
+    cudaMalloc(&d_W, size_t(rows) * cols * sizeof(half));
+    cudaMalloc(&d_q, size_t(rows) * cols);
+    cudaMalloc(&d_qref, size_t(rows) * cols);
+    cudaMalloc(&d_sc, size_t(rows) * 4);
+    cudaMalloc(&d_sc_ref, size_t(rows) * 4);
+    c->dequant_rows(d_W, cols, d_t, d_suh, d_svh, rows, cols, 0);
+    // load-time path: scales from the reconstructed FP16, then straight-to-int8 reconstruct
+    x3::x3_row_scales(d_W, rows, cols, d_sc, 0);
+    c->dequant_rows_i8(d_q, cols, d_t, d_suh, d_svh, rows, cols, d_sc, 0);
+    // reference path: the engine's per-chunk quantise kernel on the same FP16 values
+    tqllm_cuda::int8_quant_rows(d_W, rows, cols, cols, d_qref, d_sc_ref, 0);
+    cudaError_t err = cudaDeviceSynchronize();
+    check(err == cudaSuccess, std::string(c->name) + ": i8 launch (" + cudaGetErrorString(err) + ")");
+    std::vector<int8_t> q(size_t(rows) * cols), qref(size_t(rows) * cols);
+    std::vector<float> sc(rows), sc_ref(rows);
+    cudaMemcpy(q.data(), d_q, q.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(qref.data(), d_qref, qref.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(sc.data(), d_sc, sc.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(sc_ref.data(), d_sc_ref, sc_ref.size() * 4, cudaMemcpyDeviceToHost);
+    bool eq = std::memcmp(q.data(), qref.data(), q.size()) == 0 && std::memcmp(&sc[0], &sc_ref[0], sc.size() * 4) == 0;
+    check(eq, std::string(c->name) + ": dequant_rows_i8 == int8_quant_rows(dequant_rows) (rows=" + std::to_string(rows) +
+              " cols=" + std::to_string(cols) + ")");
+    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_q); cudaFree(d_qref); cudaFree(d_sc);
+    cudaFree(d_sc_ref);
 }
 
 void test_row(const x3::X3Codec* c, int rows, int cols) {
@@ -246,6 +289,9 @@ int main() {
         test_row(&table[i], 256, 256);
         rows_identity(&table[i], 256, 384, 392);
         rows_identity(&table[i], 384, 256, 256);
+        i8_identity(&table[i], 256, 256);
+        i8_identity(&table[i], 256, 384);
+        i8_identity(&table[i], 384, 256);
         if (table[i].has_x3v) col_identity(&table[i], 8448, 5120);  // size_n>8192 -> CFG1
     }
     if (g_ok) std::printf("x3_format: OK\n");

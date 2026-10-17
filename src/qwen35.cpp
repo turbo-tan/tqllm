@@ -2059,12 +2059,17 @@ private:
         // int8 only on chunks of >= 1024 tokens: per-chunk weight quantisation does not pay off on the 512-token chunks of
         // 24 GB cards at 256K (3090 192K prompt: int8 641 vs FP16 668 tok/s; 54K: 1760 vs 1445)
         if (i8 && np >= 1024 && m.cols % 4 == 0 && ldo % 4 == 0 && r_off % 4 == 0) {
-            m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
+            // Formats that can quantise their weights to int8 themselves (X3's straight-to-int8 reconstruct with
+            // load-time scales) skip the FP16 round trip and the per-chunk weight quantise pass entirely.
+            float* sw = fp8_sw.as<float>() + r_off;
+            const bool preq = m.fmt->dequant_i8(m, i8->w8(), sw, stream);
+            if (!preq) m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
             if (!fp8_x_ready) {
                 i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream);
                 fp8_x_ready = true;
             }
-            i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, fp8_sw.as<float>() + r_off, stream);
+            if (preq) i8->gemm_prequant(m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, stream);
+            else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream);
             i8_used = true;
             return;
         }

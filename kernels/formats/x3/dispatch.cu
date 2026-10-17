@@ -102,6 +102,12 @@ void codec_dequant_rows(half* W, int ld, const uint16_t* T, const half* suh, con
 }
 
 template <class Codec>
+void codec_dequant_rows_i8(int8_t* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
+                           const float* sc, cudaStream_t stream) {
+    reconstruct_had_rows_i8<Codec>(W, ld, T, suh, svh, cols, rows, sc, stream);
+}
+
+template <class Codec>
 size_t codec_ws_bytes(int size_k, int size_n) {
     if constexpr (Codec::supports_sq) return sq_workspace_bytes(size_k, size_n);
     else { (void) size_k; (void) size_n; return 0; }
@@ -117,6 +123,7 @@ template <int KH>
 constexpr X3Codec mul1_row(const char* name) {
     return {X3_CODEC_MUL1, 8 * KH, name, true, Mul1Codec<KH>::supports_gemv_x3v,
             &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_dequant_rows<Mul1Codec<KH>>,
+            &codec_dequant_rows_i8<Mul1Codec<KH>>,
             &codec_ws_bytes<Mul1Codec<KH>>,
             codec_window<Mul1Codec<KH>>()};
 }
@@ -127,7 +134,7 @@ const X3Codec kTable[] = {
     mul1_row<8>("mul1-K4.0"),
     {2, 128, "testscalar-K8.0", false, true,
      &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_dequant_rows<TestScalarCodec>,
-     &codec_ws_bytes<TestScalarCodec>, nullptr},
+     &codec_dequant_rows_i8<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>, nullptr},
 };
 
 }  // namespace
