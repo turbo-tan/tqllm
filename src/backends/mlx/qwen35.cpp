@@ -23,6 +23,7 @@
 #include <limits>
 #include <iostream>
 #include <atomic>
+#include <ctime>
 #include <future>
 #include <map>
 #include <set>
@@ -662,7 +663,7 @@ struct Qwen35::Impl {
         std::future<void> job;int job_half=-1;
         static const bool timing=std::getenv("TQLLM_MLX_ANE_TIMING")!=nullptr;
         // direct evidence: ANE calls made, time inside the predict call (worker thread), layers that fell back to the GPU
-        std::atomic<double> ane_ms{0};int ane_calls=0,gpu_layers=0;long gpu_share_cols=0;
+        std::atomic<double> ane_ms{0},ane_cpu_ms{0};int ane_calls=0,gpu_layers=0;long gpu_share_cols=0;
         double t_eval=0,t_join=0,t_build=0;auto tick=std::chrono::steady_clock::now();
         auto lap=[&]() {auto now=std::chrono::steady_clock::now();double d=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;return d;};
         auto join=[&]() {
@@ -711,16 +712,19 @@ struct Qwen35::Impl {
                 static const bool skip_predict=std::getenv("TQLLM_MLX_ANE_SKIP_PREDICT")!=nullptr;  // debug: GPU work alone
                 ++ane_calls;gpu_share_cols+=share->wg.shape(0);
                 std::atomic<double>* acc=&ane_ms;
-                job=skip_predict?std::async(std::launch::deferred,[]{}):std::async(std::launch::async,[a,l,xp,yp,hidden,acc]{
-                    const auto t0=std::chrono::steady_clock::now();a->predict(l,xp,yp,hidden);
-                    const double d=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+                std::atomic<double>* cpu_acc=&ane_cpu_ms;
+                job=skip_predict?std::async(std::launch::deferred,[]{}):std::async(std::launch::async,[a,l,xp,yp,hidden,acc,cpu_acc]{
+                    auto thread_ms=[]{timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec*1e3+t.tv_nsec*1e-6;};
+                    const auto t0=std::chrono::steady_clock::now();const double c0=thread_ms();a->predict(l,xp,yp,hidden);
+                    const double d=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),c=thread_ms()-c0;
                     double cur=acc->load();while(!acc->compare_exchange_weak(cur,cur+d)) {}
+                    cur=cpu_acc->load();while(!cpu_acc->compare_exchange_weak(cur,cur+c)) {}
                 });job_half=k;
             }
         }
         join();
-        if(timing)std::fprintf(stderr,"ANE_WAVE chunk %d rows: host graph build %.0f ms, GPU sync waits %.0f ms, ANE join waits %.0f ms | ANE calls %d (inside predict %.0f ms), GPU-only FFN layers %d, GPU share rows per call %ld of %d\n",
-            2*R,t_build,t_eval,t_join,ane_calls,ane_ms.load(),gpu_layers,ane_calls?gpu_share_cols/ane_calls:0L,layers?int(nax_tq4.count("blk.0.ffn_gate.weight")?nax_tq4.at("blk.0.ffn_gate.weight").rows:nax.count("blk.0.ffn_gate.weight")?nax.at("blk.0.ffn_gate.weight").rows:0):0);
+        if(timing)std::fprintf(stderr,"ANE_WAVE chunk %d rows: host graph build %.0f ms, GPU sync waits %.0f ms, ANE join waits %.0f ms | ANE calls %d (inside predict %.0f ms wall, %.0f ms CPU), GPU-only FFN layers %d, GPU share rows per call %ld of %d\n",
+            2*R,t_build,t_eval,t_join,ane_calls,ane_ms.load(),ane_cpu_ms.load(),gpu_layers,ane_calls?gpu_share_cols/ane_calls:0L,layers?int(nax_tq4.count("blk.0.ffn_gate.weight")?nax_tq4.at("blk.0.ffn_gate.weight").rows:nax.count("blk.0.ffn_gate.weight")?nax.at("blk.0.ffn_gate.weight").rows:0):0);
         for(int k=0;k<2;++k)if(!h[k].feats.empty())features.push_back(mx::concatenate(h[k].feats,1));
         if(features.size()==2) {auto both=mx::concatenate({features[0],features[1]},0);features={both};}
         return mx::concatenate({h[0].x,h[1].x},0);

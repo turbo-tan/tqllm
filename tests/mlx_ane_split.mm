@@ -70,6 +70,14 @@ int main(int argc, char** argv) {
             ane();               // ANE share runs meanwhile on this thread
             mx::eval(mx::add(g, y_ane));
         });
+        // compute-bound GPU work on cache-resident operands (no DRAM traffic): does the running ANE slow the GPU's clock?
+        auto ca = mx::astype(mx::random::normal({1024, 1024}), mx::float16), cb = mx::astype(mx::random::normal({1024, 1024}), mx::float16);
+        mx::eval(ca, cb);
+        auto compute = [&] {auto c = ca; for (int i = 0; i < 24; ++i) c = mx::matmul(c, cb); return c;};
+        const double t_comp = best([&] {mx::eval(compute());});
+        const double t_comp_ane = best([&] {auto c = compute(); mx::async_eval(c); ane(); mx::eval(c);});
+        std::printf("ANE_CONTENTION compute-only GPU %.2f ms alone, %.2f ms with the ANE running (ANE alone %.2f ms); GPU share %.2f ms alone\n",
+                    t_comp, t_comp_ane, t_ane, t_gpu);
         const double flop = 2.0 * M * 3.0 * H * F;
         std::printf("ANE_SPLIT M=%d C=%d gpu_full %.2f ms (%.1f TFLOPS) gpu_share %.2f ms ane_share %.2f ms (%.1f TFLOPS) concurrent %.2f ms -> %.2fx\n",
                     M, C, t_full, flop / t_full * 1e-9, t_gpu, t_ane, 2.0 * M * 3.0 * H * C / t_ane * 1e-9, t_both, t_full / t_both);
