@@ -33,6 +33,10 @@ void builtins() {
 }
 }  // namespace
 
+void KvFormat::attend_selected(const KvSelected &) const {
+    throw std::runtime_error(std::string("KV format ") + name() + " has no selected-position attention");
+}
+
 void register_kv_format(const std::string & name, std::unique_ptr<KvFormat> f) {
     if (!table().emplace(name, std::move(f)).second) throw std::runtime_error("KV format " + name + " registered twice");
 }

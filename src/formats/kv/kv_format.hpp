@@ -30,6 +30,20 @@ struct KvStep {  // one attention layer, n new tokens (verify: n <= nver; prefil
     const void * compact = nullptr;  // TqCache stand-in segment (tqllm_cuda::KvCompactSeg); only formats with compact_ok()
 };
 
+// One layer of sparse attention: each query attends to its `width` selected positions (valid[i] == 0: padding).
+struct KvSelected {
+    const void * keys;            // the format's K rows of the layer
+    const void * values;          // and its V rows
+    const float * query;          // [tokens][heads][head_dim]
+    float * output;               // [tokens][heads][head_dim]
+    const int32_t * positions;    // [tokens][width]
+    const uint8_t * valid;        // [tokens][width]
+    int width = 0, tokens = 0, first_cells = 0, heads = 0, kvheads = 0, head_dim = 0;  // query t sees cells below first_cells + t
+    float * scores = nullptr;     // prefill blocks (tokens >= 32): [tokens][heads][width] scratch; null: the per-query path
+    float * inv = nullptr;        // [tokens][heads]
+    cudaStream_t stream = nullptr;
+};
+
 // Who made the format and what was borrowed; printed by `tqserve --list-kv` and logged when a format loads (TQLLM_DEBUG=memlog).
 // borrowed: "own", "idea" (follows published work), "code" (adapted, licence checked) or "see NOTICE".
 struct KvProvenance {
@@ -59,6 +73,11 @@ struct KvFormat {
     // (one position, all KV heads: key_bytes(1, ...) / value_bytes(1, ...)) is self-contained, so a commit may move rows
     virtual bool tree_ok() const { return false; }
     virtual void write_and_attend(const KvStep &) const = 0;
+    // Sparse attention over selected positions (Flash-Next's QSA): one layer's K and V rows in this format's layout
+    // (bf16: [position][kvheads][head_dim], K and V in separate buffers). Formats without it are refused by engines
+    // that attend sparsely.
+    virtual bool selected_ok() const { return false; }
+    virtual void attend_selected(const KvSelected &) const;
 };
 
 const KvFormat * kv_format(const std::string & name);  // throws on unknown names

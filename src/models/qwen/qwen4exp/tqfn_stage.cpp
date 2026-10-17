@@ -6,6 +6,7 @@
 #include "tq3_expert_cache.hpp"
 #include "prefill_plan.hpp"
 #include "kv_store.hpp"
+#include "kv_format.hpp"
 #include "qwen4exp.hpp"
 #include "dequant.hpp"
 #include "moe_kernels.cuh"
@@ -1199,6 +1200,17 @@ struct KvBuf {
     }
     size_t page_rows(size_t row) const { return page / row; }
 };
+// The K/V format of the attention layers (src/formats/kv): TQFN_KV=<name>, default bf16. Flash-Next attends sparsely, so
+// the format must implement attend_selected().
+static const tqllm::KvFormat & kv_fmt() {
+    static const tqllm::KvFormat * f = [] {
+        const char * n = std::getenv("TQFN_KV");
+        const tqllm::KvFormat * x = tqllm::kv_format(n && *n ? n : "bf16");
+        if (!x->selected_ok()) throw std::runtime_error(std::string("Flash-Next: KV format ") + x->name() + " has no selected-position attention");
+        return x;
+    }();
+    return *f;
+}
 struct AttentionState { std::unique_ptr<KvBuf> k, v; int len = 0;
                         std::unique_ptr<tqllm_cuda::QsaIndexer> qsa; };  // QSA indexer keys (beyond the indexer budget)
 // pre: the row-wise projections of this sequence's rows were done for a whole batch (qkv, z, alpha, beta slices);
@@ -1407,11 +1419,14 @@ static void attention_core(const Checkpoint & checkpoint, const float * input_p,
                 const int nb = std::min(qb, n - q0);
                 const auto sel = carry->qsa->select_batch(iq.p + size_t(q0) * iheads * idim, qnorm, pos + q0, nb, *batch, nullptr);
                 const float * qp = q.p + size_t(q0) * heads * dim; float * op = out.p + size_t(q0) * heads * dim;
-                if (nb >= 32) {  // grouped kernel, K/V read once per kv head; few tokens (verify blocks): the per-head kernel has more blocks
-                    ArenaMark block_scratch;
-                    Device<float> sc(size_t(nb) * heads * sel.width), inv(size_t(nb) * heads);
-                    tqllm_cuda::qsa_attention_grouped(qp, carry->k->p, carry->v->p, sel, sc.p, inv.p, op, nb, pos + q0 + 1, heads, kvheads, dim, nullptr);
-                } else tqllm_cuda::qsa_attention_direct(qp, carry->k->p, carry->v->p, sel, op, nb, pos + q0 + 1, heads, kvheads, dim, nullptr);
+                tqllm::KvSelected att{carry->k->p, carry->v->p, qp, op, sel.positions, sel.valid, sel.width, nb, pos + q0 + 1, heads, kvheads, dim};
+                ArenaMark block_scratch;
+                std::unique_ptr<Device<float>> sc, inv;
+                if (nb >= 32) {  // grouped kernel, K/V read once per kv head; few tokens (verify blocks): the per-query path has more blocks
+                    sc = std::make_unique<Device<float>>(size_t(nb) * heads * sel.width); inv = std::make_unique<Device<float>>(size_t(nb) * heads);
+                    att.scores = sc->p; att.inv = inv->p;
+                }
+                kv_fmt().attend_selected(att);
             }
         } else tqllm_cuda::fn_dense_attention(q.p, carry->k->p, carry->v->p, out.p, heads, kvheads, dim, n, pos, nullptr);
         carry->len += n;

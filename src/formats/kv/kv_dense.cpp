@@ -1,4 +1,5 @@
 #include "kv_format.hpp"
+#include "kv_qsa.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
 
@@ -10,6 +11,16 @@ namespace {
 // BF16 K/V (default; also readable by the single-token step path).
 struct KvBf16 final : KvFormat {
     const char * name() const override { return "bf16"; }
+    bool selected_ok() const override { return true; }
+    void attend_selected(const KvSelected & a) const override {
+        const auto * k = static_cast<const __nv_bfloat16 *>(a.keys);
+        const auto * v = static_cast<const __nv_bfloat16 *>(a.values);
+        const tqllm_cuda::QsaDeviceSelection sel{a.positions, a.valid, a.width};
+        if (a.scores && a.inv)  // grouped: K/V read once per kv head
+            tqllm_cuda::qsa_attention_grouped(a.query, k, v, sel, a.scores, a.inv, a.output, a.tokens, a.first_cells, a.heads, a.kvheads, a.head_dim, a.stream);
+        else
+            tqllm_cuda::qsa_attention_direct(a.query, k, v, sel, a.output, a.tokens, a.first_cells, a.heads, a.kvheads, a.head_dim, a.stream);
+    }
     KvProvenance provenance() const override { return {"BF16 K and V (reference format, also read by the single-token path)"}; }
     bool compressed() const override { return false; }
     bool tree_ok() const override { return true; }
