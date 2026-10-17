@@ -737,3 +737,26 @@ Span is ~2% slower on tg (selects + an extra dependent shuffle cost more than th
 (the decode is not the reconstruct bottleneck). Reverted; test kept in job tmp only. Lesson: the lab's
 LDS-based paper score does not model the shuffle-fed register path; its baseline (60) is the per-call
 smem decode, not gemv_window's hoisted Lane.
+
+## Prefill: X3 weight preparation (2026-10-17, GPU2)
+
+First nsys split of an X3.1 prefill in tqLLM (served config: `--kv tq3 -ub 4096`, drafter + `--draft-retrieve 32`,
+second of two ~8K-token wiki prompts, 8,117 tokens = 2 chunks, 5.10 s, GPU busy 99.4%; job tmp `pp/x31.nsys-rep`):
+int8 GEMM (cuBLASLt `Kernel2` + igemm) 2.02 s (~215 TOPS, near the 3090's IMMA rate), **`x3_transpose_h` 0.93 s**,
+GDN 0.48, int8 weight quantise (`quant_rows_k`) 0.30, `reconstruct_had` 0.28, int32 -> bf16 scale 0.24, attention
+0.21, other < 0.15 each. Weight preparation (reconstruct + transpose + quantise) was 1.5 s of 5.1: every chunk
+rebuilds all FP16 weights.
+
+- **Step 1, tiled transpose** (32x32 smem tiles; the old kernel read with a stride of `rows`): bit-identical on 6
+  shapes incl. 33x47 (job tmp `pp/tr_check.cu`), 2.3-3.8x faster per call (17408x5120: 1.31 -> 0.58 ms).
+- **Step 2, no transpose at all:** `reconstruct_had_kernel<Codec, OutMajor>` (epilogue only: the finished tile goes
+  back to its own smem slot, then each warp stores 16 out rows of half4) behind a new codec entry `dequant_rows`;
+  `X3Format::dequant_h` writes each part straight into its row block. The transpose kernel and the FP16 scratch
+  matrix (`Scratch::dw`, largest matrix, ~0.18 GB) are gone. `x3_format`: `dequant_rows` == `dequant` transposed,
+  bit for bit, every codec, non-square, padded ld. Load-time tuner: dequant fixed cost per chunk **505 -> 154 ms**
+  (so the batched-GEMV/GEMM crossover moves 288 -> 80 columns: chunks of 81-288 tokens now take dequant + GEMM).
+- End to end (served flags, 3 prompts of ~8K tokens, greedy 32 tokens, warm repeat; text hashes identical in
+  every run), time to first token: original 5.01 / 5.98 / 4.99 s, step 1 4.38 / 5.07 / 4.36, **step 2 4.13 / 4.69 /
+  4.11 (-17.5 / -21.7 / -17.5%)**. Scripts: job tmp `pp/ab.sh`, `pp/req2.py`.
+- Left (not done): int8 weight quantise 0.30 s and int32 -> bf16 0.24 s per 8K prompt (engine-side, every
+  format), GDN 0.48 s; the GEMM itself is at the int8 tensor rate.

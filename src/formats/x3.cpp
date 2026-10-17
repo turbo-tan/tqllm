@@ -43,7 +43,6 @@ struct Scratch {
     float* a = nullptr;   size_t a_cap = 0;
     float* c = nullptr;   size_t c_cap = 0;
     half*  had = nullptr; size_t had_cap = 0;
-    half*  dw = nullptr;  size_t dw_cap = 0;
     int*   locks = nullptr; size_t locks_cap = 0;
     void*  win = nullptr;   size_t win_cap = 0;   // window GEMV scratch (A + partial sums), sized at load
 };
@@ -152,17 +151,14 @@ struct X3Format final : WeightFormat {
         {
             Scratch& sc = scratch();
             std::lock_guard<std::mutex> lock(sc.mtx);
-            int max_part_rows = 0;
             size_t lb = 0;
             for (const X3Part& p : d->parts) {
-                max_part_rows = std::max(max_part_rows, p.rows);
                 lb = std::max(lb, p.codec->ws_bytes(p.cols, p.rows));
             }
             const int nb = max_matvec_cols();
             grow(reinterpret_cast<void**>(&sc.a), sc.a_cap, size_t(nb) * cols * sizeof(float));
             grow(reinterpret_cast<void**>(&sc.had), sc.had_cap, size_t(nb) * cols * sizeof(half));
             grow(reinterpret_cast<void**>(&sc.c), sc.c_cap, size_t(nb) * rows * sizeof(float));
-            grow(reinterpret_cast<void**>(&sc.dw), sc.dw_cap, size_t(cols) * max_part_rows * sizeof(half));
             if (lb) grow(reinterpret_cast<void**>(&sc.locks), sc.locks_cap, lb);
             window_scratch(sc, *d);
         }
@@ -232,19 +228,13 @@ public:
         }
     }
 
-    // The engine wants [rows][cols] (cuBLAS OP_T, lda = cols). reconstruct emits [in][out] (the fork's
-    // canonical order, n=in=cols, m=out=rows), so each part is reconstructed into a scratch then
-    // transposed into place.
+    // The engine wants [rows][cols] (cuBLAS OP_T, lda = cols): each part is reconstructed straight into its
+    // row block (dequant_rows, the out-major form of reconstruct; no scratch, no transpose pass).
     void dequant_h(const Mat& m, __half* out, cudaStream_t s) const override {
         const auto* d = static_cast<const X3Desc*>(m.aux);
-        Scratch& sc = scratch();
-        std::lock_guard<std::mutex> lock(sc.mtx);
         int off = 0;
         for (const X3Part& p : d->parts) {
-            half* tmp = static_cast<half*>(grow(reinterpret_cast<void**>(&sc.dw), sc.dw_cap,
-                                                size_t(p.cols) * p.rows * sizeof(half)));
-            p.codec->dequant(tmp, p.trellis, p.suh, p.svh, p.rows, p.cols, s);
-            x3::x3_transpose_h(tmp, out + size_t(off) * m.cols, p.rows, p.cols, m.cols, s);
+            p.codec->dequant_rows(out + size_t(off) * m.cols, m.cols, p.trellis, p.suh, p.svh, p.rows, p.cols, s);
             off += p.rows;
         }
     }

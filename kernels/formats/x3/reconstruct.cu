@@ -17,11 +17,14 @@ namespace x3 {
 #define X3_RP_THREADS 256
 
 // T is the (rows/16, cols/16, Codec::words) trellis; suh[cols], svh[rows]; rows/cols multiples of 128.
-template <class Codec>
+// OutMajor (tqLLM addition, epilogue only): write the tile as [out][in] with row stride ld_out, the engine's
+// [rows][cols] GEMM layout, instead of the fork's [in][out]. Same values, so bit-identical to reconstruct +
+// transpose, without the scratch matrix and the transpose pass.
+template <class Codec, bool OutMajor = false>
 __global__ __launch_bounds__(X3_RH_THREADS)
 void reconstruct_had_kernel(half* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
                             const half* __restrict__ suh, const half* __restrict__ svh,
-                            int packed_blocks_n, int packed_n_offset) {
+                            int packed_blocks_n, int packed_n_offset, int ld_out = 0) {
     constexpr int packed_size = Codec::words;
     constexpr float r_scale = kRScale;
 
@@ -142,7 +145,28 @@ void reconstruct_had_kernel(half* __restrict__ g_unpacked, const uint16_t* __res
         half4 v;
         v.x = __hmul2(__hmul2(h01, su2), sv4.x);
         v.y = __hmul2(__hmul2(h23, su2), sv4.y);
-        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+        if constexpr (OutMajor) {   // back into this lane's own slot of row R (only this warp touches row R)
+            stile[base] = v.x;
+            stile[base + 1] = v.y;
+        } else {
+            *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+        }
+    }
+    if constexpr (OutMajor) {
+        // stile row R (in index) holds out columns o at half2 R*64 + ((o>>2) ^ ((R>>2)&31))*2 + ((o&3)>>1).
+        // Each warp writes 16 out rows; a lane gathers in indices R = lane*4 .. +3 (so (R>>2)&31 == lane) and
+        // stores them as one half4: 256 contiguous bytes per warp.
+        __syncthreads();
+        const half* sh = reinterpret_cast<const half*>(stile);
+        #pragma unroll 4
+        for (int oo = 0; oo < 128 / (X3_RH_THREADS / 32); ++oo) {
+            const int o = warp_id * (128 / (X3_RH_THREADS / 32)) + oo;
+            const int col = (((o >> 2) ^ lane_id) * 2 + ((o & 3) >> 1)) * 2 + (o & 1);   // half index in a row
+            half4 v;
+            v.x = __halves2half2(sh[(lane_id * 4 + 0) * 128 + col], sh[(lane_id * 4 + 1) * 128 + col]);
+            v.y = __halves2half2(sh[(lane_id * 4 + 2) * 128 + col], sh[(lane_id * 4 + 3) * 128 + col]);
+            *((half4*) (g_unpacked + (size_t) (nb * 128 + o) * ld_out + kb * 128 + lane_id * 4)) = v;
+        }
     }
 }
 
@@ -151,6 +175,15 @@ template <class Codec>
 void reconstruct_had(half* W, const uint16_t* T, const half* suh, const half* svh, int n, int m, cudaStream_t stream) {
     dim3 grid((m + 127) / 128, (n + 127) / 128);
     reconstruct_had_kernel<Codec><<<grid, X3_RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0);
+}
+
+// Same matrix written out-major: W[o * ld + i] for out o < m, in i < n (the engine's [rows][cols]); ld >= n,
+// ld a multiple of 4.
+template <class Codec>
+void reconstruct_had_rows(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int n, int m,
+                          cudaStream_t stream) {
+    dim3 grid((m + 127) / 128, (n + 127) / 128);
+    reconstruct_had_kernel<Codec, true><<<grid, X3_RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0, ld);
 }
 
 // W is (n, m) row-major fp16 in the TRANSFORMED basis; T is (n/16, m/16, words); m multiple of 128.

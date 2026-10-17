@@ -96,6 +96,12 @@ void codec_dequant(half* W, const uint16_t* T, const half* suh, const half* svh,
 }
 
 template <class Codec>
+void codec_dequant_rows(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
+                        cudaStream_t stream) {
+    reconstruct_had_rows<Codec>(W, ld, T, suh, svh, cols, rows, stream);
+}
+
+template <class Codec>
 size_t codec_ws_bytes(int size_k, int size_n) {
     if constexpr (Codec::supports_sq) return sq_workspace_bytes(size_k, size_n);
     else { (void) size_k; (void) size_n; return 0; }
@@ -110,7 +116,8 @@ constexpr auto codec_window() -> void (*)(const XwList&, const half*, __nv_bfloa
 template <int KH>
 constexpr X3Codec mul1_row(const char* name) {
     return {X3_CODEC_MUL1, 8 * KH, name, true, Mul1Codec<KH>::supports_gemv_x3v,
-            &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_ws_bytes<Mul1Codec<KH>>,
+            &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_dequant_rows<Mul1Codec<KH>>,
+            &codec_ws_bytes<Mul1Codec<KH>>,
             codec_window<Mul1Codec<KH>>()};
 }
 
@@ -119,7 +126,8 @@ const X3Codec kTable[] = {
     mul1_row<5>("mul1-K2.5"),  mul1_row<6>("mul1-K3.0"), mul1_row<7>("mul1-K3.5"),
     mul1_row<8>("mul1-K4.0"),
     {2, 128, "testscalar-K8.0", false, true,
-     &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>, nullptr},
+     &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_dequant_rows<TestScalarCodec>,
+     &codec_ws_bytes<TestScalarCodec>, nullptr},
 };
 
 }  // namespace
@@ -159,20 +167,6 @@ void x3_copy_f32_bf16_strided(const float* src, __nv_bfloat16* dst, int part_row
                               cudaStream_t stream) {
     const int total = n * part_rows;
     if (total > 0) x3_copy_strided_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, dst, part_rows, ld, off, total);
-}
-
-// dst[r*ld + c] = src[c*rows + r]: turn reconstruct's [in][out] into the engine's [rows][cols].
-__global__ void x3_transpose_h_kernel(const half* __restrict__ src, half* __restrict__ dst, int rows, int ld,
-                                      int total) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // over rows * ld
-    if (i >= total) return;
-    const int r = i / ld, c = i % ld;
-    dst[size_t(r) * ld + c] = src[size_t(c) * rows + r];
-}
-
-void x3_transpose_h(const half* src, half* dst, int rows, int cols, int ld, cudaStream_t stream) {
-    const int total = rows * ld;
-    if (total > 0) x3_transpose_h_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, dst, rows, ld, total);
 }
 
 }  // namespace x3

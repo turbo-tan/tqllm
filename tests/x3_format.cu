@@ -70,6 +70,35 @@ void col_identity(const x3::X3Codec* c, int rows, int cols) {
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh);
 }
 
+// dequant_rows (out-major, row stride ld) must hold exactly dequant's values transposed: W_rows[r*ld + c] ==
+// W[c*rows + r], bit for bit, and must not touch the ld padding.
+void rows_identity(const x3::X3Codec* c, int rows, int cols, int ld) {
+    std::vector<uint16_t> trellis(size_t(rows / 16) * (cols / 16) * c->words);
+    for (auto& v : trellis) v = uint16_t(lcg() >> 13);
+    std::vector<half> suh(cols), svh(rows);
+    for (auto& v : suh) v = __float2half(0.5f + rnd());
+    for (auto& v : svh) v = __float2half(0.5f + rnd());
+    uint16_t* d_t = dev_up(trellis);
+    half* d_suh = dev_up(suh);
+    half* d_svh = dev_up(svh);
+    half *d_W = nullptr, *d_R = nullptr;
+    cudaMalloc(&d_W, size_t(rows) * cols * sizeof(half));
+    cudaMalloc(&d_R, size_t(rows) * ld * sizeof(half));
+    cudaMemset(d_R, 0x7b, size_t(rows) * ld * sizeof(half));   // padding sentinel
+    c->dequant(d_W, d_t, d_suh, d_svh, rows, cols, 0);
+    c->dequant_rows(d_R, ld, d_t, d_suh, d_svh, rows, cols, 0);
+    std::vector<uint16_t> W(size_t(rows) * cols), R(size_t(rows) * ld);
+    cudaMemcpy(W.data(), d_W, W.size() * 2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(R.data(), d_R, R.size() * 2, cudaMemcpyDeviceToHost);
+    bool eq = true;
+    for (int r = 0; r < rows; ++r)
+        for (int k = 0; k < ld; ++k)
+            eq &= R[size_t(r) * ld + k] == (k < cols ? W[size_t(k) * rows + r] : uint16_t(0x7b7b));
+    check(eq, std::string(c->name) + ": dequant_rows == dequant transposed (rows=" + std::to_string(rows) +
+              " cols=" + std::to_string(cols) + " ld=" + std::to_string(ld) + ")");
+    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_R);
+}
+
 void test_row(const x3::X3Codec* c, int rows, int cols) {
     const int tiles = (rows / 16) * (cols / 16);
     const size_t trellis_words = size_t(tiles) * c->words;
@@ -215,6 +244,8 @@ int main() {
     check(count >= 8, "codec table has the mul1 K rows + testscalar");
     for (int i = 0; i < count; ++i) {
         test_row(&table[i], 256, 256);
+        rows_identity(&table[i], 256, 384, 392);
+        rows_identity(&table[i], 384, 256, 256);
         if (table[i].has_x3v) col_identity(&table[i], 8448, 5120);  // size_n>8192 -> CFG1
     }
     if (g_ok) std::printf("x3_format: OK\n");

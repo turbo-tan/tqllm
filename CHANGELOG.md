@@ -9,6 +9,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - X3 / X3.1 weights (EXL3 mul1 trellis, K 1 to 4 bits in half steps): PAW GGUF files such as PAW-27B-X3.1 load natively,
   weights bit-exact to the file (KLD 0.000458 vs llama-paw on the same file). Decode with the DFlash2 drafter on an
   RTX 3090: 116 / 90 / 89 tok/s at 2k / 8k / 32k context (llama-paw on the same files: 94 / 67 / 61).
+  X3 prefill rebuilds each chunk's FP16 weights straight into the GEMM layout (no transpose pass): ~8K-token
+  prompts 1,440-1,570 -> 1,830-1,910 tok/s on an RTX 3090, output identical.
 - `--draft-retrieve C`: C x 16 positions of the DFlash2 drafter's window are far 16-token chunks it retrieves from the
   context (one slot); its K/V is kept as a ~68K-position ring (1.4 GB at 262K instead of 5.4 GB). `--draft-retrieve 32`: +12-14% decode at 8k / 32k.
 - `--presence-penalty P` (OpenAI presence_penalty default for requests that set none); `--temp` is an alias of
