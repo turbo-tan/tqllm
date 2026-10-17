@@ -93,8 +93,9 @@ curl http://localhost:8086/v1/chat/completions \
 
 ## Runtime monitor
 
-A built-in, read-only dashboard for live token flow, request phases, context and
-host/device headroom. It stays responsive while single-slot inference is busy.
+Live token flow, request phases, context and host/device headroom beside a
+terminal-style chat with the model on this instance. Read-only telemetry stays
+responsive while single-slot inference is busy; chat supports Stop and Escape.
 Build from source, add `--monitor-port 8087`, then open `http://localhost:8087/`.
 See [setup, telemetry semantics and limits](docs/MONITOR.md).
 

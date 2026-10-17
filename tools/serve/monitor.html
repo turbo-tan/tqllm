@@ -201,7 +201,7 @@ function render(data) {
   spark('prefillLine', firstHistory.map(h => h.ms), 92, 30);
   if (latest && typeof latest.first_output_ms === 'number') { $('first').textContent = ''; $('first').append(number(latest.first_output_ms >= 10000 ? latest.first_output_ms / 1000 : latest.first_output_ms, latest.first_output_ms >= 10000 ? 1 : 0), Object.assign(document.createElement('small'), {textContent: latest.first_output_ms >= 10000 ? 's' : 'ms'})); }
   else text('first', '--');
-  text('firstNote', latest ? 'request ' + latest.id + ', ' + number(latest.prompt_tokens) + ' prompt tokens' + (typeof latest.first_output_ms === 'number' && latest.first_output_ms >= 1 && latest.prompt_tokens ? ', ' + number(latest.prompt_tokens / (latest.first_output_ms / 1000), 0) + ' prompt tok/s' : '') : 'time to first output, latest request');
+  text('firstNote', latest ? 'request ' + latest.id + ', ' + number(latest.prompt_tokens) + ' prompt tokens; first output includes queue time' : 'time to first output, latest request');
   text('queue', active.filter(r => r.phase !== 'queued').length + ' / ' + active.filter(r => r.phase === 'queued').length);
   text('tokens', number(total));
   const drafted = rows.reduce((n, r) => n + (r.drafted || 0), 0), accepted = rows.reduce((n, r) => n + (r.accepted || 0), 0);
@@ -213,8 +213,8 @@ function render(data) {
       typeof r.decode_tokens_per_second === 'number' ? number(r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
     cells.forEach((value, i) => {
       const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
-      if (i === 2 && r.phase === 'prefill' && r.prompt_tokens > 0 && typeof r.context_tokens === 'number') {  // prompt tokens already processed
-        const bar = document.createElement('span'); bar.className = 'progress'; const fill = document.createElement('b'); fill.style.width = (Math.min(1, r.context_tokens / r.prompt_tokens) * 100).toFixed(1) + '%'; bar.append(fill); td.append(bar);
+      if (i === 2 && r.phase === 'prefill' && data.capabilities?.prefill_progress === true && r.prompt_tokens > 0 && typeof r.prefill_processed_tokens === 'number') {
+        const bar = document.createElement('span'); bar.className = 'progress'; const fill = document.createElement('b'); fill.style.width = (Math.min(1, r.prefill_processed_tokens / r.prompt_tokens) * 100).toFixed(1) + '%'; bar.append(fill); td.append(bar);
       }
       tr.append(td);
     });
@@ -261,7 +261,7 @@ setInterval(() => { if (lastSuccess !== null && performance.now() - lastSuccess 
 
 // chat: one streaming completion at a time against this instance's bridge, same key, text rendered as text only
 const history = [];
-let controller = null;
+let controller = null, chatGeneration = 0;
 function line(role, who) {
   const msg = document.createElement('div'); msg.className = 'msg ' + role;
   const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
@@ -273,15 +273,16 @@ function line(role, who) {
 function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatInput').disabled = on; }
 function chatScroll() { const t = $('transcript'); t.scrollTop = t.scrollHeight; }
 async function send(prompt) {
-  if (!key) { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); $('auth').hidden = false; $('apiKey').focus(); return; }
+  if (!key && document.body.dataset.connection === 'auth') { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); $('auth').hidden = false; $('apiKey').focus(); return; }
+  const revision = chatGeneration, checkpoint = history.length;
   history.push({role: 'user', content: prompt}); line('you', 'you').textContent = prompt;
   const pre = line('model', 'model'), msg = pre.closest('.msg'), thought = msg.querySelector('.thought'); msg.classList.add('streaming'); chatScroll();
   controller = new AbortController(); chatBusy(true); text('chatStatus', 'waiting for the first token'); text('chatStats', '');
-  const started = performance.now(); let first = null, pieces = 0, reply = '', thinking = '', usage = null, timings = null, done = false;
+  const started = performance.now(); let first = null, pieces = 0, reply = '', thinking = '', usage = null, timings = null, done = false, failed = false;
   const live = setInterval(() => { if (first !== null) text('chatStats', number((performance.now() - started) / 1000, 1) + ' s / ' + number(pieces / ((performance.now() - first) / 1000), 1) + ' chunks/s'); }, 500);
   try {
     const response = await fetch('/api/monitor/v1/chat/completions', {method: 'POST', signal: controller.signal, cache: 'no-store',
-      headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'},
+      headers: {...(key ? {Authorization: 'Bearer ' + key} : {}), 'Content-Type': 'application/json'},
       body: JSON.stringify(Object.assign({messages: history, stream: true}, $('chatThink').checked ? {} : {chat_template_kwargs: {enable_thinking: false}}))});
     if (response.status === 401 || response.status === 403) throw new Error('the server rejected the key');
     if (response.status === 409 || response.status === 429) throw new Error('another chat is already running on this monitor');
@@ -295,34 +296,41 @@ async function send(prompt) {
         if (!raw.startsWith('data:')) continue;
         const payload = raw.slice(5).trim(); if (payload === '[DONE]') { done = true; continue; }
         let chunk; try { chunk = JSON.parse(payload); } catch (e) { continue; }
+        if (chunk.error) throw new Error(typeof chunk.error === 'string' ? chunk.error : chunk.error.message || 'inference failed');
         if (chunk.usage) usage = chunk.usage; if (chunk.timings) timings = chunk.timings;
         const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
-        if (reasoning) { if (first === null) { first = performance.now(); text('chatStatus', 'thinking'); } pieces++; thinking += reasoning; thought.textContent = thinking; chatScroll(); }
+        if (reasoning) { if (first === null) { first = performance.now(); text('chatStatus', 'thinking'); } thinking += reasoning; thought.textContent = thinking; chatScroll(); }
         const delta = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.text ?? '';
-        if (delta) { if (first === null) { first = performance.now(); text('chatStatus', 'streaming'); } pieces++; reply += delta; pre.textContent = reply; chatScroll(); }
+        if (reasoning || delta) pieces++;
+        if (delta) { if (first === null) { first = performance.now(); text('chatStatus', 'streaming'); } reply += delta; pre.textContent = reply; chatScroll(); }
         if (chunk.choices?.[0]?.finish_reason) done = true;
       }
     }
-    text('chatStatus', done ? 'done' : 'stream ended without a finish marker');
+    if (revision === chatGeneration) text('chatStatus', done ? 'done' : 'stream ended without a finish marker');
   } catch (error) {
-    text('chatStatus', controller.signal.aborted ? 'stopped' : 'failed: ' + (error && error.message ? error.message : 'request failed'));
+    failed = true;
+    if (revision === chatGeneration) text('chatStatus', controller.signal.aborted ? 'stopped' : 'failed: ' + (error && error.message ? error.message : 'request failed'));
     if (!controller.signal.aborted) msg.classList.replace('model', 'sys');
   } finally {
     const elapsed = (performance.now() - started) / 1000, gen = first === null ? 0 : (performance.now() - first) / 1000;
     const parts = [number(elapsed, 1) + ' s'];
-    if (first !== null) parts.push('first token ' + number((first - started) / 1000, 2) + ' s');
-    if (usage && typeof usage.completion_tokens === 'number') parts.push(number(usage.completion_tokens) + ' tokens' + (gen > 0 ? ', ' + number(usage.completion_tokens / gen, 1) + ' tok/s' : ''));
-    else if (timings && typeof timings.predicted_per_second === 'number') parts.push(number(timings.predicted_per_second, 1) + ' tok/s (server)');
+    if (first !== null) parts.push('first output ' + number((first - started) / 1000, 2) + ' s');
+    if (timings && Number.isFinite(timings.predicted_per_second)) parts.push(number(timings.predicted_per_second, 1) + ' tok/s (server)');
+    if (usage && Number.isFinite(usage.completion_tokens)) parts.push(number(usage.completion_tokens) + ' tokens');
     else if (pieces) parts.push(pieces + ' chunks' + (gen > 0 ? ', ' + number(pieces / gen, 1) + ' chunks/s' : '') + ' (no token count from the server)');
-    clearInterval(live); text('chatStats', parts.join(' / ')); msg.classList.remove('streaming');
-    if (reply) history.push({role: 'assistant', content: reply}); else history.pop();
+    clearInterval(live); if (revision === chatGeneration) text('chatStats', parts.join(' / ')); msg.classList.remove('streaming');
+    if (revision === chatGeneration) {
+      if (done && reply && !failed && !controller.signal.aborted) history.push({role: 'assistant', content: reply});
+      else history.splice(checkpoint);
+    }
     controller = null; chatBusy(false); $('chatInput').focus();
   }
 }
 $('compose').addEventListener('submit', event => { event.preventDefault(); const value = $('chatInput').value.trim(); if (!value || controller) return; $('chatInput').value = ''; send(value); });
 $('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && controller) controller.abort(); });
 $('chatStop').addEventListener('click', () => { if (controller) controller.abort(); });
-$('chatClear').addEventListener('click', () => { if (controller) controller.abort(); history.length = 0; $('transcript').replaceChildren(Object.assign(document.createElement('div'), {className: 'hint', id: 'chatHint', textContent: 'Transcript cleared.'})); text('chatStatus', 'idle'); text('chatStats', ''); });
+$('chatClear').addEventListener('click', () => { chatGeneration++; if (controller) controller.abort(); history.length = 0; $('transcript').replaceChildren(Object.assign(document.createElement('div'), {className: 'hint', id: 'chatHint', textContent: 'Transcript cleared.'})); text('chatStatus', 'idle'); text('chatStats', ''); });
 poll();
 </script>
 </body></html>

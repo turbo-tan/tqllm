@@ -145,7 +145,7 @@ int main(int argc, char ** argv) {
         chat_proxy_gate();
         tqserve::MonitorServer server(m, "127.0.0.1", 0, "test-key");
         const auto html = get(server.port(), "/");
-        check(html.find("200 OK") != std::string::npos && html.find("Engine observatory") != std::string::npos, "embedded page");
+        check(html.find("200 OK") != std::string::npos && html.find("id=\"chatInput\"") != std::string::npos && html.find("id=\"chartLine\"") != std::string::npos, "embedded page");
         check(get(server.port(), "/api/monitor/v1/snapshot").find("401 Unauthorized") != std::string::npos, "auth enforced");
         const auto before = std::chrono::steady_clock::now();
         auto long_prefill = m.begin(); long_prefill->prefill(32768);

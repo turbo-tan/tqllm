@@ -18,8 +18,33 @@ class InferenceFixture(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         assert self.path == '/v1/chat/completions'
-        assert self.headers.get('Authorization') == 'Bearer browser-test-key'
-        assert body['messages'][0]['content'] in ('browser transport gate', 'slow transport gate')
+        assert self.headers.get('Authorization') == ('Bearer ' + self.server.key if self.server.key else None)
+        self.server.requests.append(body)
+        prompt = body['messages'][-1]['content']
+        if prompt in ('hello monitor', 'after clear', 'slow terminal', 'usage-less'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            def emit(value):
+                data=('data: '+json.dumps(value,ensure_ascii=False)+'\n\n').encode()
+                # Deliberately split SSE lines and UTF-8 across network writes.
+                split = data.find(b'\xc3') + 1 if b'\xc3' in data else 9
+                for part in [data[:split],data[split:-1],data[-1:]]:
+                    self.wfile.write(part);self.wfile.flush()
+            try:
+                emit({'choices':[{'delta':{'reasoning_content':'fixture thought'}}]})
+                emit({'choices':[{'delta':{'content':'<b>safe text</b> cafe\u00e9' if prompt=='hello monitor' else 'partial' if prompt=='slow terminal' else 'clean followup'}}]})
+                if prompt=='slow terminal':
+                    for _ in range(50):
+                        time.sleep(.1);emit({'choices':[{'delta':{'content':' more'}}]})
+                final={'choices':[{'delta':{},'finish_reason':'stop'}]}
+                if prompt!='usage-less':
+                    final.update(usage={'prompt_tokens':20,'completion_tokens':8},timings={'predicted_per_second':123.4})
+                emit(final);self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
+            except (BrokenPipeError,ConnectionResetError):
+                self.server.cancelled.set()
+            self.close_connection=True
+            return
         answer = b'data: {"choices":[{"delta":{"content":"fixture response"}}]}\n\ndata: [DONE]\n\n'
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -55,6 +80,8 @@ def main():
             mode.write_text('queued')
             upstream = ThreadingHTTPServer(('127.0.0.1', 0), InferenceFixture)
             upstream.cancelled = threading.Event()
+            upstream.requests = []
+            upstream.key = 'browser-test-key'
             upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
             upstream_thread.start()
             server = subprocess.Popen([str(args.binary.resolve()), '--fixture', str(mode), 'browser-test-key', str(upstream.server_port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -92,8 +119,45 @@ def main():
                 assert cancelled and upstream.cancelled.wait(3), 'Abort did not close upstream chat'
 
 
+                page.locator('#chatInput').fill('hello monitor')
+                page.locator('#chatSend').click()
+                expect(page.locator('#chatStatus')).to_have_text('done')
+                expect(page.locator('.msg.model pre:not(.thought)')).to_have_text('<b>safe text</b> cafe\u00e9')
+                assert page.locator('.msg.model b').count() == 0, 'chat rendered model HTML'
+                assert upstream.requests[-1]['chat_template_kwargs']['enable_thinking'] is False
+                expect(page.locator('#chatStats')).to_contain_text('123.4 tok/s (server)')
+                page.locator('#themeButton').click()
+                assert page.evaluate('document.documentElement.dataset.theme') == 'light'
+                page.locator('#themeButton').click()
+                page.locator('#chatClear').click()
+                page.locator('#chatInput').fill('slow terminal')
+                page.locator('#chatSend').click()
+                expect(page.locator('.msg.model pre:not(.thought)')).to_contain_text('partial')
+                page.locator('#chatClear').click()
+                expect(page.locator('#chatSend')).to_be_enabled()
+                page.locator('#chatInput').fill('after clear')
+                page.locator('#chatSend').click()
+                expect(page.locator('#chatStatus')).to_have_text('done')
+                assert upstream.requests[-1]['messages'] == [{'role':'user','content':'after clear'}], 'cleared reply leaked into next conversation'
+                page.locator('#chatClear').click()
+                page.locator('#chatInput').fill('slow terminal')
+                page.locator('#chatSend').click()
+                expect(page.locator('.msg.model pre:not(.thought)')).to_contain_text('partial')
+                page.keyboard.press('Escape')
+                expect(page.locator('#chatStatus')).to_have_text('stopped')
+                expect(page.locator('#chatSend')).to_be_enabled()
+                page.locator('#chatClear').click()
+                page.locator('#chatInput').fill('usage-less')
+                page.locator('#chatSend').click()
+                expect(page.locator('#chatStatus')).to_have_text('done')
+                expect(page.locator('#chatStats')).to_contain_text('chunks')
+                expect(page.locator('#chatStats')).to_contain_text('no token count')
+                assert page.evaluate('localStorage.length + sessionStorage.length') == 0
+
                 mode.write_text('prefill')
                 expect(page.locator('#phase')).to_have_text('Prefilling prompt')
+                assert page.locator('#requests .progress').count() == 0, 'context allocation is not measured prefill progress'
+                assert 'prompt tok/s' not in page.locator('#firstNote').inner_text()
                 expect(page.locator('#speed')).to_have_text('--')
                 expect(page.locator('#context')).to_contain_text('8,192')
                 mode.write_text('decode')
@@ -118,6 +182,20 @@ def main():
                 expect(page.locator('#notice')).to_be_visible()
                 assert not errors, errors
                 results.append({'browser': browser_name, 'passed': True, 'api_mocked': False, 'fixture': True, 'page_errors': errors})
+                # A server without --api-key must not demand a made-up key in chat.
+                upstream.key = ''
+                no_key = subprocess.Popen([str(args.binary.resolve()), '--fixture', str(mode), '', str(upstream.server_port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    free_port = int(no_key.stdout.readline().strip())
+                    open_page = browser.new_page()
+                    open_page.goto(f'http://127.0.0.1:{free_port}/')
+                    expect(open_page.locator('#connection')).to_have_text('Connected')
+                    open_page.locator('#chatInput').fill('usage-less')
+                    open_page.locator('#chatSend').click()
+                    expect(open_page.locator('#chatStatus')).to_have_text('done')
+                    open_page.close()
+                finally:
+                    no_key.terminate(); no_key.wait(timeout=5)
                 browser.close()
             finally:
                 if server.poll() is None:

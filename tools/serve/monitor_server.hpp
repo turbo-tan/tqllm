@@ -14,7 +14,7 @@
 
 namespace tqserve {
 #if defined(__linux__)
-// An independent, bounded read-only listener; no inference calls or engine locks.
+// Independent telemetry listener and bounded same-instance chat bridge; no engine locks.
 class MonitorServer {
 public:
     MonitorServer(Monitor & monitor, const std::string & host, uint16_t port,
@@ -131,12 +131,17 @@ private:
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
             char buffer[8192];
             while (!stop_ && std::chrono::steady_clock::now() < deadline) {
-                pollfd downstream{client, POLLIN, 0};
-                if (::poll(&downstream, 1, 0) > 0) {
+                pollfd ready[2]{{client, POLLIN, 0}, {upstream, POLLIN, 0}};
+                const auto available = ::poll(ready, 2, 200);
+                if (available < 0) { if (errno == EINTR) continue; break; }
+                if (!available) continue;
+                if (ready[0].revents) {
                     char probe;
-                    if (downstream.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
-                    if ((downstream.revents & POLLIN) && ::recv(client, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
+                    if (ready[0].revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+                    if ((ready[0].revents & POLLIN) && ::recv(client, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
                 }
+                if (ready[1].revents & (POLLERR | POLLNVAL)) break;
+                if (!(ready[1].revents & (POLLIN | POLLHUP))) continue;
                 const auto n = ::recv(upstream, buffer, sizeof(buffer), 0);
                 if (n == 0) break;
                 if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; break; }

@@ -77,7 +77,7 @@ The chart uses deltas of observed IDs between snapshots, not SSE chunk counts.
 Its history is local to this browser page, up to 60 seconds. Engine restarts and
 completed-history eviction produce a gap rather than a throughput spike.
 Snapshots retain at most 32 completed requests and all currently active ones;
-the dashboard shows the newest 12. Output/draft totals describe this retained
+the dashboard shows the newest 14. Output/draft totals describe this retained
 window, not all-time totals.
 
 Linux CPU activity and host memory come from `/proc`. Device utilization,
@@ -122,3 +122,26 @@ API mocks: authentication, live/idle/prefill/error states, storage hygiene,
 mobile overflow and disconnect clearing on Chromium, Firefox and WebKit.
 Real-model sampling, scheduling and output-parity checks remain part of the
 engine release gate; a fixture screenshot is not such a gate.
+
+## Terminal chat
+
+The right-hand pane streams from this instance through the existing same-origin
+bridge. Thinking is off by default; its toggle changes the chat template option.
+Enter sends, Shift+Enter inserts a line, and Stop/Escape cancel. Clear discards
+transcript and context, including any response still in flight. Interrupted or
+failed responses are not silently reused as completed conversation history.
+
+Text and reasoning are rendered as text, without executing model HTML. The
+server key remains in tab memory and is omitted when the server requires no key.
+Theme changes also remain in memory. No terminal commands are executed.
+
+Chat token counts and throughput are shown only when reported by the server;
+otherwise the footer labels events as chunks. Time to first output includes
+queue time, so it is not used to invent prefill throughput. Allocated context is
+not prefill progress; the progress bar requires an explicit processed-token
+counter and capability from the backend.
+
+The browser gate submits through the actual chat UI and C++ listener, including
+fragmented SSE/UTF-8, reported timings, unknown token counts, abort/Escape,
+Clear-follow-up isolation, authentication and keyless servers. No model or GPU
+job is needed for this transport gate.
