@@ -110,6 +110,11 @@ mx::array draft_head4_matmul(const DraftHead4& head,const mx::array& x) {
         throw std::invalid_argument("invalid proposal head input");
     const int m=x.shape(0);auto input=x;
     if(head.frag_codes && m<=8)return frag_matmul(head,x);
+    // block-16 drafts: the 8-row fragment kernel twice (rows are independent) instead of the generic quantized matmul,
+    // which doubled the draft (j692: 11.1 -> 21.8 ms)
+    if(head.frag_codes && m<=16)
+        return mx::concatenate({frag_matmul(head,mx::slice(x,{0,0},{8,x.shape(1)})),
+                                frag_matmul(head,mx::slice(x,{8,0},{m,x.shape(1)}))},0);
     if(m>1 && m<32 && !std::getenv("TQLLM_MLX_DRAFT_HEAD_UNPAD"))
         input=mx::concatenate({input,mx::zeros({32-m,x.shape(1)},mx::float32)},0);
     auto result=mx::quantized_matmul(input,head.codes,head.scales,head.biases,true,64,4,"affine");
