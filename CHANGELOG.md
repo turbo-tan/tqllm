@@ -11,6 +11,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   RTX 3090: 116 / 90 / 89 tok/s at 2k / 8k / 32k context (llama-paw on the same files: 94 / 67 / 61).
   X3 prefill rebuilds each chunk's FP16 weights straight into the GEMM layout (no transpose pass): ~8K-token
   prompts 1,440-1,570 -> 1,830-1,910 tok/s on an RTX 3090, output identical.
+  X3 prefill weights are rebuilt straight to int8 (row scales computed once at load) and the DFlash2 drafter reads
+  the prompt in 32-token batches: ~8K prompts 1,992 -> 2,132 tok/s, 32K 1,778 -> 1,883; output and drafts identical.
 - `--draft-retrieve C`: C x 16 positions of the DFlash2 drafter's window are far 16-token chunks it retrieves from the
   context (one slot); its K/V is kept as a ~68K-position ring (1.4 GB at 262K instead of 5.4 GB). `--draft-retrieve 32`: +12-14% decode at 8k / 32k.
 - `--presence-penalty P` (OpenAI presence_penalty default for requests that set none); `--temp` is an alias of

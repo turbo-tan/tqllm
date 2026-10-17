@@ -760,3 +760,23 @@ rebuilds all FP16 weights.
   4.11 (-17.5 / -21.7 / -17.5%)**. Scripts: job tmp `pp/ab.sh`, `pp/req2.py`.
 - Left (not done): int8 weight quantise 0.30 s and int32 -> bf16 0.24 s per 8K prompt (engine-side, every
   format), GDN 0.48 s; the GEMM itself is at the int8 tensor rate.
+
+## Prefill: int8 weights and drafter injection (2026-10-17, GPU2, omp lab)
+
+Lab: `~/ML_projects/paw27b/20261017_pp_x3` (omp on PAW-27B-X3.1 as executor, `ppbench` = served flags, greedy
+128 tokens on prompts of 2K / 3 x ~8K (warm repeat) / 32K; hashes vs baseline; ledger `data/ledger.tsv`).
+
+| step | commit | output | pp8k | pp32k | tg 2k / 8k / 32k |
+|---|---|---|---|---|---|
+| baseline | 367611d | - | 1,992 | 1,778 | 122.9 / 102.5 / 93.3 |
+| X3 reconstructs straight to int8, row scales once at load | 30c8d50 | EXACT | 2,098 | 1,863 | 122.5 / 101.9 / 92.9 |
+| load scales via `int8_quant_rows` (one amax/127 rule) | cdc33ec | EXACT | 2,093 | 1,859 | 121.9 / 101.1 / 92.3 |
+| DFlash2 prefill injection in 32-token batches (was 8) | 61a875f | EXACT | **2,132** | **1,883** | 121.8 / 102.0 / 92.7 |
+
+- Int8: the per-chunk weight `quant_rows_k` is gone for X3 (`WeightFormat::dequant_i8`, default off for every
+  other format; `Int8Gemm::gemm_prequant`). `x3_format`: int8 bytes and scales == `quant_rows_k(dequant_rows)`.
+- Injection: each drafter weight was read once per 8 prompt tokens (`u4h_matvec`, 0.15 s per 8K prompt). Drafts
+  accepted on every bench request are identical to the baseline (the greedy text cannot show drafter changes).
+- Note: a build configured without `-DCUDAToolkit_ROOT=/usr/local/cuda-12.6` links the system CUDA 11 cuBLAS and
+  prefills ~15% slower.
+- Left: next-matrix reconstruct overlapped with the GEMM, int32 -> bf16 conversion, GDN (not exact).
