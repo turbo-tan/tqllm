@@ -89,8 +89,8 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "-ub" || a == "--ubatch-size") o.ubatch = count(1);
     else if (a == "--gemm-rows") o.gemm_rows = count(0);
     else if (a == "-ncmoe" || a == "--n-cpu-moe") o.n_cpu_moe = count(0);
-    else if (a == "--moe-host-mb") o.moe_host_mb = count(0);
-    else if (a == "--moe-cache-mb") o.moe_cache_mb = count(0);
+    else if (a == "--moe-host-mb") { const std::string v = value(); o.moe_host_mb = v == "auto" ? -1 : std::stol(v); if (o.moe_host_mb < -1) throw std::invalid_argument("--moe-host-mb must be auto or >= 0"); }
+    else if (a == "--moe-cache-mb") { const std::string v = value(); o.moe_cache_mb = v == "auto" ? -1 : std::stol(v); if (o.moe_cache_mb < -1) throw std::invalid_argument("--moe-cache-mb must be auto or >= 0"); }
     else if (a == "--moe-profile") o.moe_profile = value();
     else if (a == "-fit" || a == "--fit") {
         const std::string v = value();
@@ -112,7 +112,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 const char * engine_options_usage() {
     return "  engine: [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
-           "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C (VRAM cache of recently used host experts)]]\n"
+           "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)] [--mtp (draft with the model's own MTP head; text-only, greedy, --np 1) [--mtp-from N --mtp-depth D with -md: MTP for prompts of N+ tokens]] [-fitl on|off (on: pick KV / context / prefill buffers to fit and announce them; off: refuse instead)] [--gemm-rows N (prefill FP16 weight blocks of N rows; 0 whole matrices)]\n"
            "          [--slot-reserve MiB free per parallel slot (128)] [--graph-cache captured CUDA graphs kept (256)]\n";
 }

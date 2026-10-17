@@ -97,4 +97,22 @@ inline std::string fit_result_changes(const FitSetting & asked, const FitSetting
 inline bool fit_try_return(size_t free_b, size_t margin, size_t min_spare = size_t(512) << 20) {
     return margin && free_b > margin && free_b - margin >= min_spare;
 }
+// MoE experts in host memory. --moe-host-mb auto (host < 0): what the file needs beyond the free device memory, leaving
+// `headroom` for KV, buffers and the runtime (the fit steps settle the rest). --moe-cache-mb auto (cache < 0): a VRAM cache
+// of recently used host experts of 12 % of the host share (256..1536 MiB), the host share raised by the same MiB so the
+// device holds what it would without the cache (3090 at a 16 GB cap, MiniCPM-V-4.7 Q5_K_M: 10000 MiB host -> 11200 + 1200
+// cache, P3 54.9 -> 83.5 tok/s). No experts in host memory: no cache.
+struct MoePlace { long host_mb = 0, cache_mb = 0; };
+inline MoePlace moe_auto_place(uint64_t file_b, size_t free_b, long host, long cache, size_t headroom = size_t(2) << 30) {
+    MoePlace r;
+    if (host < 0) {
+        const double need = double(file_b) + double(headroom) - double(free_b);
+        r.host_mb = need > 0 ? long(need / 1048576.0) : 0;
+    } else r.host_mb = host;
+    if (cache < 0) {
+        r.cache_mb = r.host_mb > 0 ? std::clamp(r.host_mb * 12 / 100, 256L, 1536L) : 0;
+        r.host_mb += r.cache_mb;
+    } else r.cache_mb = r.host_mb > 0 ? cache : 0;
+    return r;
+}
 }  // namespace tqllm

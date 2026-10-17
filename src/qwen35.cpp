@@ -987,14 +987,17 @@ private:
         const std::string path = opt.moe_profile.empty() ? f.path + ".experts" : opt.moe_profile;
         std::ifstream in(path);
         int pl = 0, pe = 0;
-        if (!(in >> pl >> pe) || pl != L || pe != E)
-            throw std::runtime_error("--moe-host-mb needs a routing profile for this model (" + path + "; write one with TQLLM_MOE_PROFILE=FILE)");
+        const bool have = bool(in >> pl >> pe);
+        if (have && (pl != L || pe != E)) throw std::runtime_error("routing profile " + path + " is for another model");
         std::vector<std::tuple<unsigned long long, int, int>> order;
         unsigned long long total = 0, placed = 0;
+        if (!have)  // no profile: the same share of every layer (rank e of each layer before rank e + 1 of any)
+            std::fprintf(stderr, "tqllm: no MoE routing profile (%s): host experts spread evenly over the layers (TQLLM_MOE_PROFILE=FILE "
+                         "writes one, then --moe-profile FILE)\n", path.c_str());
         for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
             unsigned long long c = 0;
-            if (!(in >> c)) throw std::runtime_error("truncated routing profile " + path);
-            order.emplace_back(c, l, e); total += c;
+            if (have && !(in >> c)) throw std::runtime_error("truncated routing profile " + path);
+            order.emplace_back(have ? c : (unsigned long long)(E - 1 - e), l, e); total += c;
         }
         std::stable_sort(order.begin(), order.end());
         const double want = double(opt.moe_host_mb) * 1048576.0;
@@ -1066,6 +1069,13 @@ private:
 
     const float * g_f32(const GgufFile & f, const std::string & name, uint64_t n) {
         const auto & t = gt(f, name);
+        if (t.type == GGML_BF16 && t.bytes == n * 2) {  // BF16 vectors (e.g. the MTP block's router in Unsloth MTP files): exact widening
+            const auto raw = f.read(t);
+            std::vector<float> w(n);
+            const auto * h = reinterpret_cast<const uint16_t *>(raw.data());
+            for (uint64_t i = 0; i < n; ++i) { const uint32_t u = uint32_t(h[i]) << 16; std::memcpy(&w[i], &u, 4); }
+            return static_cast<const float *>(put(w.data(), w.size() * 4));
+        }
         if (t.type != GGML_F32 || t.bytes != n * 4) throw std::runtime_error("expected F32[" + std::to_string(n) + "] " + name);
         const auto host = f.read(t);
         return static_cast<const float *>(put(host.data(), host.size()));
@@ -1080,9 +1090,55 @@ private:
         const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
         lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
         if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
+        // routed + shared experts of one MoE block (the trunk's layers and the MTP block): router, VRAM / host / split
+        // expert matrices, the shared expert fused into the routed launches where its type and shape allow
+        auto load_moe = [&](Layer & L, const std::string & p, const std::vector<char> & cold, bool force_host) {
+            const int E = int(cfg.expert_count), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
+            L.router = g_f32(f, p + "ffn_gate_inp.weight", uint64_t(E) * H);
+            const int nc = int(std::count(cold.begin(), cold.end(), char(1)));
+            const bool host = nc == E || force_host;
+            // the shared expert joins the VRAM experts for decode when its matrices have the experts' type and shape
+            // (TQLLM_MOE_FUSE_SHARED=0: off); prefill keeps its dense path
+            auto same = [&](const char * sh, const char * ex, int rows, int cols) {
+                if (!f.tensors.count(p + sh)) return false;
+                const auto & a = gt(f, p + sh);
+                const auto & b = gt(f, p + ex);
+                return a.type == b.type && a.ne.size() == 2 && a.ne[0] == uint64_t(cols) && a.ne[1] == uint64_t(rows) && FS == FE;
+            };
+            const char * fz = std::getenv("TQLLM_MOE_FUSE_SHARED");
+            const bool fuse = !host && !(fz && fz[0] == '0') && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
+                              same("ffn_up_shexp.weight", "ffn_up_exps.weight", FE, H) &&
+                              same("ffn_down_shexp.weight", "ffn_down_exps.weight", H, FE);
+            auto x = [&](const char * sh) { return fuse ? p + sh : std::string(); };
+            if (nc == 0 || host) {
+                L.ex_gate = g_exps(f, p + "ffn_gate_exps.weight", E, FE, H, host, x("ffn_gate_shexp.weight"));
+                L.ex_up = g_exps(f, p + "ffn_up_exps.weight", E, FE, H, host, x("ffn_up_shexp.weight"));
+                L.ex_down = g_exps(f, p + "ffn_down_exps.weight", E, H, FE, host, x("ffn_down_shexp.weight"));
+                if (fuse) L.sh_slot = E;
+            } else {
+                std::tie(L.ex_gate, L.cx_gate) = g_exps_split(f, p + "ffn_gate_exps.weight", E, FE, H, cold, x("ffn_gate_shexp.weight"));
+                std::tie(L.ex_up, L.cx_up) = g_exps_split(f, p + "ffn_up_exps.weight", E, FE, H, cold, x("ffn_up_shexp.weight"));
+                std::tie(L.ex_down, L.cx_down) = g_exps_split(f, p + "ffn_down_exps.weight", E, H, FE, cold, x("ffn_down_shexp.weight"));
+                std::vector<int> hs(size_t(E), -1), cs(size_t(E), -1);
+                for (int e = 0; e < E; ++e) {
+                    if (cold[size_t(e)]) cs[size_t(e)] = L.n_cold++;
+                    else hs[size_t(e)] = L.n_hot++;
+                }
+                if (fuse) L.sh_slot = L.n_hot;  // after the hot routed experts
+                L.hot_slot = static_cast<const int *>(put(hs.data(), hs.size() * sizeof(int)));
+                L.cold_slot = static_cast<const int *>(put(cs.data(), cs.size() * sizeof(int)));
+            }
+            L.sh_gu = g_cat(f, {{p + "ffn_gate_shexp.weight", FS}, {p + "ffn_up_shexp.weight", FS}}, H);
+            if (!L.sh_gu.p) throw std::runtime_error(p + "ffn_{gate,up}_shexp: types cannot be fused");
+            L.sh_down = g_mat(f, p + "ffn_down_shexp.weight", H, FS);
+            L.sh_gate = g_f32(f, p + "ffn_gate_inp_shexp.weight", H);
+            for (const Mat * m : {&L.ex_gate, &L.ex_up, &L.ex_down, &L.cx_gate, &L.cx_up, &L.cx_down})
+                if (m->p && (!m->fmt->has_expert_matvec() || m->fmt->basis() != Basis::Plain))
+                    throw std::runtime_error(p + "unsupported grouped expert format: " + m->fmt->name());
+        };
         const auto mp = "blk." + std::to_string(cfg.layers) + ".";
         // the MTP head drafts without -md, or beside DFlash2 with --mtp (--mtp-from N: prompts of N+ tokens use MTP)
-        if (f.tensors.count(mp + "nextn.eh_proj.weight") && (opt.draft_model.empty() || opt.native_mtp) && !cfg.moe) {  // MoE MTP is not wired yet
+        if (f.tensors.count(mp + "nextn.eh_proj.weight") && (opt.draft_model.empty() || opt.native_mtp)) {
             mtp.present = true;
             mtp.eh_proj = g_mat(f, mp + "nextn.eh_proj.weight", H, 2 * H);
             mtp.enorm = g_f32(f, mp + "nextn.enorm.weight", H);
@@ -1096,8 +1152,11 @@ private:
             L.wo = g_mat(f, mp + "attn_output.weight", H, int(cfg.heads) * hd);
             L.q_norm = g_f32(f, mp + "attn_q_norm.weight", hd);
             L.k_norm = g_f32(f, mp + "attn_k_norm.weight", hd);
-            L.w_gu = g_cat(f, {{mp + "ffn_gate.weight", F}, {mp + "ffn_up.weight", F}}, H);
-            L.w_down = g_mat(f, mp + "ffn_down.weight", H, F);
+            if (cfg.moe) load_moe(L, mp, std::vector<char>(size_t(cfg.expert_count), 0), false);  // the MTP block's experts stay in VRAM
+            else {
+                L.w_gu = g_cat(f, {{mp + "ffn_gate.weight", F}, {mp + "ffn_up.weight", F}}, H);
+                L.w_down = g_mat(f, mp + "ffn_down.weight", H, F);
+            }
             // Draft vocabulary (llama.cpp map format: header "llama-mtp-vocab-v1 <vocab> <n>", then one id per line).
             if (const char * dv = opt.draft_vocab.c_str(); *dv && opt.draft_model.empty()) {  // DFlash builds its own subset
                 std::ifstream in(dv);
@@ -1129,49 +1188,7 @@ private:
             L.in_norm = g_f32(f, p + "attn_norm.weight", H);
             L.post_norm = g_f32(f, p + "post_attention_norm.weight", H);
             if (cfg.moe) {
-                const int E = int(cfg.expert_count), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
-                L.router = g_f32(f, p + "ffn_gate_inp.weight", uint64_t(E) * H);
-                const auto & cold = cold_of[l];
-                const int nc = int(std::count(cold.begin(), cold.end(), char(1)));
-                const bool host = nc == E || int(l) < opt.n_cpu_moe;
-                // the shared expert joins the VRAM experts for decode when its matrices have the experts' type and shape
-                // (TQLLM_MOE_FUSE_SHARED=0: off); prefill keeps its dense path
-                auto same = [&](const char * sh, const char * ex, int rows, int cols) {
-                    if (!f.tensors.count(p + sh)) return false;
-                    const auto & a = gt(f, p + sh);
-                    const auto & b = gt(f, p + ex);
-                    return a.type == b.type && a.ne.size() == 2 && a.ne[0] == uint64_t(cols) && a.ne[1] == uint64_t(rows) && FS == FE;
-                };
-                const char * fz = std::getenv("TQLLM_MOE_FUSE_SHARED");
-                const bool fuse = !host && !(fz && fz[0] == '0') && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
-                                  same("ffn_up_shexp.weight", "ffn_up_exps.weight", FE, H) &&
-                                  same("ffn_down_shexp.weight", "ffn_down_exps.weight", H, FE);
-                auto x = [&](const char * sh) { return fuse ? p + sh : std::string(); };
-                if (nc == 0 || host) {
-                    L.ex_gate = g_exps(f, p + "ffn_gate_exps.weight", E, FE, H, host, x("ffn_gate_shexp.weight"));
-                    L.ex_up = g_exps(f, p + "ffn_up_exps.weight", E, FE, H, host, x("ffn_up_shexp.weight"));
-                    L.ex_down = g_exps(f, p + "ffn_down_exps.weight", E, H, FE, host, x("ffn_down_shexp.weight"));
-                    if (fuse) L.sh_slot = E;
-                } else {
-                    std::tie(L.ex_gate, L.cx_gate) = g_exps_split(f, p + "ffn_gate_exps.weight", E, FE, H, cold, x("ffn_gate_shexp.weight"));
-                    std::tie(L.ex_up, L.cx_up) = g_exps_split(f, p + "ffn_up_exps.weight", E, FE, H, cold, x("ffn_up_shexp.weight"));
-                    std::tie(L.ex_down, L.cx_down) = g_exps_split(f, p + "ffn_down_exps.weight", E, H, FE, cold, x("ffn_down_shexp.weight"));
-                    std::vector<int> hs(size_t(E), -1), cs(size_t(E), -1);
-                    for (int e = 0; e < E; ++e) {
-                        if (cold[size_t(e)]) cs[size_t(e)] = L.n_cold++;
-                        else hs[size_t(e)] = L.n_hot++;
-                    }
-                    if (fuse) L.sh_slot = L.n_hot;  // after the hot routed experts
-                    L.hot_slot = static_cast<const int *>(put(hs.data(), hs.size() * sizeof(int)));
-                    L.cold_slot = static_cast<const int *>(put(cs.data(), cs.size() * sizeof(int)));
-                }
-                L.sh_gu = g_cat(f, {{p + "ffn_gate_shexp.weight", FS}, {p + "ffn_up_shexp.weight", FS}}, H);
-                if (!L.sh_gu.p) throw std::runtime_error(p + "ffn_{gate,up}_shexp: types cannot be fused");
-                L.sh_down = g_mat(f, p + "ffn_down_shexp.weight", H, FS);
-                L.sh_gate = g_f32(f, p + "ffn_gate_inp_shexp.weight", H);
-                for (const Mat * m : {&L.ex_gate, &L.ex_up, &L.ex_down, &L.cx_gate, &L.cx_up, &L.cx_down})
-                    if (m->p && (!m->fmt->has_expert_matvec() || m->fmt->basis() != Basis::Plain))
-                        throw std::runtime_error(p + "unsupported grouped expert format: " + m->fmt->name());
+                load_moe(L, p, cold_of[l], int(l) < opt.n_cpu_moe);
             } else {
                 L.w_gu = g_cat(f, {{p + "ffn_gate.weight", F}, {p + "ffn_up.weight", F}}, H);
                 if (!L.w_gu.p) {

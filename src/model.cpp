@@ -6,6 +6,7 @@
 #include "qwen2_kernels.cuh"
 #include "engine.hpp"
 #include "json.hpp"
+#include "gguf.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -434,6 +435,27 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                          double(fr) / 1e9);
         return true;
     };
+    // MoE experts in host memory: --moe-host-mb auto takes what the file needs beyond the free device memory (2 GiB left for
+    // KV, buffers and the runtime; the steps below settle the rest); a VRAM cache of recently used host experts (--moe-cache-mb
+    // auto) moves the same MiB of experts to host, so the device holds what it would without it
+    if (opt.moe_host_mb != 0 || opt.moe_cache_mb > 0) {
+        bool moe = false;
+        try {
+            const auto g = gguf_open(path);
+            const std::string arch = g.has("general.architecture") ? g.str("general.architecture") : std::string();
+            moe = g.num(arch + ".expert_count", 0) > 0;
+        } catch (const std::exception &) {}
+        if (!moe) opt.moe_host_mb = 0, opt.moe_cache_mb = 0;
+        std::error_code ec;
+        const uint64_t file_b = std::filesystem::file_size(path, ec);
+        const bool host_auto_mb = opt.moe_host_mb < 0, cache_auto = opt.moe_cache_mb < 0;
+        const MoePlace mp = moe_auto_place(ec ? 0 : file_b, free0, opt.moe_host_mb, opt.moe_cache_mb);
+        opt.moe_host_mb = mp.host_mb, opt.moe_cache_mb = mp.cache_mb;
+        if (moe && (host_auto_mb || (cache_auto && mp.cache_mb)))
+            std::fprintf(stderr, "tqllm: fit: MoE experts in host memory %ld MiB%s, host-expert cache %ld MiB%s (%.2f GB free on the device)\n",
+                         mp.host_mb, host_auto_mb ? " (--moe-host-mb auto)" : "", mp.cache_mb, cache_auto ? " (--moe-cache-mb auto)" : "",
+                         double(free0) / 1e9);
+    }
     const FitSetting asked{opt.kv_format(), ctx, long(opt.ubatch), long(opt.gemm_rows)};
     auto finish = [&](std::unique_ptr<Engine> en) {
         if (!en) return en;
