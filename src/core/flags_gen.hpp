@@ -32,6 +32,8 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_CACHE_LIMIT_MIB", Kind::User, "-", "MiB: MLX buffer-cache limit for the Mac tools (default 512)", ""},
     {"TQLLM_MLX_COUNT_NODES", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DFLASH_BLOCK", Kind::User, "-", "N: drafter block rows (8, or 16 for block-16 drafts and verify)", ""},
+    {"TQLLM_MLX_VERIFY_NARROW_AT", Kind::User, "2048", "position from which spec verify narrows to TQLLM_MLX_VERIFY_NARROW_WIDTH rows (0 = always full width)", ""},
+    {"TQLLM_MLX_VERIFY_NARROW_WIDTH", Kind::User, "7", "drafted tokens verified per step past TQLLM_MLX_VERIFY_NARROW_AT", ""},
     {"TQLLM_MLX_DFLASH_CHAIN", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DFLASH_PIPELINE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},

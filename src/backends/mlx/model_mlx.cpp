@@ -19,6 +19,7 @@
 
 namespace mx = mlx::core;
 using tqllm::mlx_backend::DFlash2;
+using tqllm::mlx_backend::verify_width;
 using tqllm::mlx_backend::Qwen35;
 
 namespace tqllm {
@@ -174,7 +175,7 @@ bool Model::spec_advance() {
         i.done = i.output.size() >= limit || i.pending == i.eos;
         return !i.done;
     }
-    const int pos = i.engine->position(), want = std::min(i.width, int(limit - i.output.size()));
+    const int pos = i.engine->position(), want = std::min(verify_width(i.width, pos), int(limit - i.output.size()));
     if (want < 1) {i.done = true; return false;}
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
     auto drafted = i.drafter->draft_device(i.pending, pos, want);

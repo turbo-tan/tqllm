@@ -83,6 +83,14 @@ flags:
     kind: user
     default: "-"
     doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
+  - name: TQLLM_MLX_VERIFY_NARROW_AT
+    kind: user
+    default: "2048"
+    doc: "position from which spec verify narrows to TQLLM_MLX_VERIFY_NARROW_WIDTH rows (0 = always full width)"
+  - name: TQLLM_MLX_VERIFY_NARROW_WIDTH
+    kind: user
+    default: "7"
+    doc: "drafted tokens verified per step past TQLLM_MLX_VERIFY_NARROW_AT"
   - name: TQLLM_MLX_DFLASH_CHAIN
     kind: debug
     default: "-"

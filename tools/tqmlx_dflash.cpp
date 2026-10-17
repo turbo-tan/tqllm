@@ -15,6 +15,7 @@
 namespace mx=mlx::core;
 using tqllm::mlx_backend::Qwen35;
 using tqllm::mlx_backend::DFlash2;
+using tqllm::mlx_backend::verify_width;
 using Clock=std::chrono::steady_clock;
 double seconds(Clock::time_point t) {return std::chrono::duration<double>(Clock::now()-t).count();}
 // host CPU time of this thread (MLX encodes command buffers on the calling thread), ms
@@ -73,7 +74,7 @@ int main(int argc,char** argv) {
             double draft_ms=0,verify_ms=0,commit_ms=0,build_ms=0,step_ms=0,accept_ms=0,submit_ms=0,wait_ms=0,draft_cpu=0,verify_cpu=0;const auto start=Clock::now();
             while(output.size()<size_t(limit) && output.back()!=tokenizer.eos_id()) {
                 if(!mode) {logits=engine.forward({&pending,1});pending=mx::argmax(logits).item<uint32_t>();output.push_back(pending);continue;}
-                const int pos=engine.position(),want=std::min(width,int(limit-output.size()));
+                const int pos=engine.position(),want=std::min(verify_width(width,pos),int(limit-output.size()));
                 const auto step_begin=Clock::now();
                 if(chain) {
                     const auto proposed=drafter.draft(pending,pos,want);
