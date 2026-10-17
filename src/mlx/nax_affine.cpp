@@ -6,7 +6,6 @@
 #include <cstring>
 #include <string>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mx = mlx::core;
 namespace tqllm::mlx_backend {
@@ -507,18 +506,18 @@ std::pair<mx::array, mx::array> nax_quantize_tokens_int8(const mx::array& input,
 }
 // SmoothQuant-style fold for the fast path: x' = x / s, w' = w * s per input column with s = xmax^a / wmax^(1-a),
 // xmax from the chunk itself (no calibration files), wmax cached per matrix. Outlier channels leave the per-token
-// input quantization for the per-row weight requant. a <= 0 means off (s = 1).
+// input quantization for the per-row weight requant. a <= 0 means off (s = 1). The column max lives in the matrix
+// (a cache keyed by array id broke when a freed matrix's id was reused, j641).
 static mx::array nax_int8_smooth(const NaxAffine& w, const mx::array& x, float alpha) {
-    static std::unordered_map<std::uintptr_t, mx::array> wmax_cache;
-    auto it = wmax_cache.find(w.words.id());
-    if (it == wmax_cache.end()) {
+    if (!w.colmax) {
         auto wm = mx::max(mx::abs(mx::astype(nax_affine_dequant(w), mx::float32)), 0);
         mx::eval(wm);
-        it = wmax_cache.emplace(w.words.id(), wm).first;
+        w.colmax = wm;
     }
+    const auto& wmax = *w.colmax;
     auto xm = mx::max(mx::abs(mx::astype(x, mx::float32)), 0);
-    auto s = mx::divide(mx::power(xm, mx::array(alpha)), mx::power(it->second, mx::array(1.0f - alpha)));
-    auto ok = mx::logical_and(mx::greater(xm, mx::array(0.0f)), mx::greater(it->second, mx::array(0.0f)));
+    auto s = mx::divide(mx::power(xm, mx::array(alpha)), mx::power(wmax, mx::array(1.0f - alpha)));
+    auto ok = mx::logical_and(mx::greater(xm, mx::array(0.0f)), mx::greater(wmax, mx::array(0.0f)));
     return mx::where(ok, mx::maximum(s, mx::array(1e-5f)), mx::array(1.0f));
 }
 const char* kInt8GemmRows = R"METAL(
