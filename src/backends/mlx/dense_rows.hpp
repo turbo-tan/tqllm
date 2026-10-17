@@ -7,7 +7,7 @@
 namespace tqllm::mlx_backend {
 inline mlx::core::array dense_row_views(const mlx::core::array& input) {
     namespace mx=mlx::core;
-    if(input.ndim()!=2 || input.dtype()!=mx::float32 || input.shape(0)<1 || input.shape(0)>8 ||
+    if(input.ndim()!=2 || input.dtype()!=mx::float32 || input.shape(0)<1 || input.shape(0)>16 ||
        input.shape(1)<1 || input.shape(1)>std::numeric_limits<int>::max()-32)
         throw std::invalid_argument("invalid singleton dense batch input");
     const int m=input.shape(0),k=input.shape(1);
