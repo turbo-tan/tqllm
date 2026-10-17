@@ -171,7 +171,9 @@ struct DFlash2::Impl {
         if(file.kv.at("general.architecture").str!="dflash")throw std::invalid_argument("DFlash GGUF required");
         hidden=int(file.num("dflash.embedding_length"));heads=int(file.num("dflash.attention.head_count"));
         kvheads=int(file.num("dflash.attention.head_count_kv"));hd=int(file.num("dflash.attention.key_length"));
-        block=int(file.num("dflash.block_size"));group=int(file.num("dflash.conv_group_size"));
+        block=int(file.num("dflash.block_size"));
+        // TQLLM_MLX_DFLASH_BLOCK=n: draft blocks of n rows (block-16 pricing with a block-8 drafter, own block-16 drafters)
+        if(const char* b=std::getenv("TQLLM_MLX_DFLASH_BLOCK"))block=std::atoi(b);group=int(file.num("dflash.conv_group_size"));
         window=int(file.num("dflash.attention.sliding_window"));rank=int(file.num("dflash.selector_rank"));
         mask=uint32_t(file.num("tokenizer.ggml.mask_token_id"));
         eps=float(file.num("dflash.attention.layer_norm_rms_epsilon"));theta=float(file.num("dflash.rope.freq_base"));

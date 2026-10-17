@@ -25,7 +25,11 @@ int main(int argc,char** argv) {
         if(argc<4 || argc>9)throw std::invalid_argument("usage: tqmlx-dflash model.gguf draft.gguf prompt [width=7] [count=128] [reps=5] [shortlist=32768] [warmup=1]");
         const int width=argc>4?std::stoi(argv[4]):7,count=argc>5?std::stoi(argv[5]):128,reps=argc>6?std::stoi(argv[6]):5;
         const int shortlist=argc>7?std::stoi(argv[7]):32768,warmup=argc>8?std::stoi(argv[8]):1;
-        if(width<1 || width>7 || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
+        // TQLLM_MLX_DFLASH_CHAIN=1: draft up to 15 tokens (needs TQLLM_MLX_DFLASH_BLOCK=16) and verify them as consecutive
+        // exact 8-row blocks, the next block only while every drafted token so far is accepted: tok/step of a wider draft
+        // with today's 8-row verify paths (speed not representative)
+        const bool chain=std::getenv("TQLLM_MLX_DFLASH_CHAIN")!=nullptr;
+        if(width<1 || width>(chain?15:7) || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
         int prefill_chunk=0;
         if(const char* mode=std::getenv("TQLLM_MLX_PREFILL_CHUNK")) {
             prefill_chunk=std::stoi(mode);
@@ -71,6 +75,29 @@ int main(int argc,char** argv) {
                 if(!mode) {logits=engine.forward({&pending,1});pending=mx::argmax(logits).item<uint32_t>();output.push_back(pending);continue;}
                 const int pos=engine.position(),want=std::min(width,int(limit-output.size()));
                 const auto step_begin=Clock::now();
+                if(chain) {
+                    const auto proposed=drafter.draft(pending,pos,want);
+                    uint32_t anchor=pending;int at=pos,used=0;bool done=false;
+                    while(!done) {
+                        const int n=std::min(7,want-used);
+                        std::vector<uint32_t> block{anchor};block.insert(block.end(),proposed.begin()+used,proposed.begin()+used+n);
+                        Qwen35::Verification t;auto ch=mx::argmax(engine.verify(block,t),-1);mx::eval(ch);
+                        const auto* ids=ch.data<uint32_t>();auto f=engine.feature_states();
+                        int acc=0;while(acc<n && proposed[used+acc]==ids[acc])++acc;
+                        for(int j=0;j<acc && output.size()<size_t(limit);++j)output.push_back(proposed[used+j]);
+                        engine.accept_prefix(t,acc+1);drafter.inject(rows(f,0,acc+1),at);at+=acc+1;accepted_total+=acc;
+                        const uint32_t next=ids[acc];
+                        if(acc==n && used+n<want && proposed[used+n]==next && output.size()<size_t(limit)) {
+                            output.push_back(next);++accepted_total;anchor=next;used+=n+1;   // the next block starts on it
+                        } else {
+                            if(output.size()<size_t(limit))output.push_back(next);
+                            pending=next;done=true;
+                        }
+                        if(output.back()==tokenizer.eos_id())done=true;
+                    }
+                    ++steps;drafted+=want;step_ms+=seconds(step_begin)*1000;
+                    continue;
+                }
                 Qwen35::Verification ticket;const bool direct_ids=std::getenv("TQLLM_MLX_TARGET_HEAD_IDS")&&std::getenv("TQLLM_MLX_TARGET_HEAD_SHORTLIST");
                 std::vector<uint32_t> proposed;std::optional<mx::array> choices;
                 if(pipeline) {

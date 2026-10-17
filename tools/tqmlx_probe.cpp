@@ -52,7 +52,7 @@ int main(int argc,char** argv) {
             else throw std::invalid_argument("unknown argument: "+arg);
         }
         if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1||verify_repeats<1||
-           (verify_width!=0 && verify_width!=1 && verify_width!=2 && verify_width!=4 && verify_width!=8))
+           (verify_width!=0 && verify_width!=1 && verify_width!=2 && verify_width!=4 && verify_width!=8 && !(verify_width==16 && !verify_prefix_probe)))
             throw std::invalid_argument("usage: tqmlx-probe --model file.gguf --prompt text [--generate N --repeat N --warmup N]");
         tqllm::Tokenizer tokenizer;tokenizer.load(model);
         std::vector<uint32_t> input;
@@ -81,14 +81,15 @@ int main(int argc,char** argv) {
             uint32_t token=mx::argmax(*last).item<uint32_t>();
             std::vector<uint32_t> chain;
             std::vector<std::vector<float>> reference;
-            for(int i=0;i<8;++i) {
+            const int chain_len=verify_width==16?16:8;
+            for(int i=0;i<chain_len;++i) {
                 chain.push_back(token);
                 auto y=engine.forward({&token,1});
                 const float* p=y.data<float>();reference.emplace_back(p,p+y.size());
                 token=mx::argmax(y).item<uint32_t>();
             }
-            for(int width:{1,2,4,8}) {
-                if(verify_width && width!=verify_width)continue;
+            for(int width:{1,2,4,8,16}) {
+                if((verify_width && width!=verify_width) || (width==16 && verify_width!=16))continue;
                 std::vector<double> milliseconds,bodies,heads;
                 double max_diff=0,mean_kld=0;
                 int same=0;
