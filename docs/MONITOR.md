@@ -46,8 +46,8 @@ other applications should proxy the authenticated JSON from their own backend.
   Closing the stream propagates a disconnect upstream; inference observes that
   cancellation at its next stream callback, not midway through a blocked prefill.
 
-The terminal-style chat interface and visual redesign are pending integration
-in this draft. It is a chat, not an operating-system shell.
+The right-hand terminal-style chat uses this bridge. It is a chat, not an
+operating-system shell.
 
 The dashboard polls once per second while visible. Requests have a three-second
 fetch timeout; failures clear live values, mark the connection disconnected and
@@ -145,3 +145,18 @@ The browser gate submits through the actual chat UI and C++ listener, including
 fragmented SSE/UTF-8, reported timings, unknown token counts, abort/Escape,
 Clear-follow-up isolation, authentication and keyless servers. No model or GPU
 job is needed for this transport gate.
+
+## Real-model regression gate
+
+Commit `3095140` passed a monitor-off/on check on an RTX 5060 Ti 16 GB,
+CUDA 12.9, with `Qwen3.5-9B-UD-Q4_K_XL.gguf`. The same binary, model, ordered
+prompts, greedy settings and seed produced identical token IDs, text and finish
+reasons on all five prompts (311 generated IDs per arm). Cases include arithmetic,
+code, explanation, multi-turn recall and a longer repeated-text prompt.
+
+There were 32 real snapshots during generation, with a maximum observed response
+time of 20.5 ms. The actual chat bridge and browser UI returned output, usage and
+engine timings; the mobile page had no horizontal overflow or JavaScript errors.
+These are scoped runtime/parity checks, not a throughput benchmark, a general
+quality evaluation, or proof across all models/platforms/speculative modes.
+[Inputs, model/binary hashes and per-case output evidence](validation/monitor-3095140.json).
