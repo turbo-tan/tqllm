@@ -83,6 +83,10 @@ flags:
     kind: user
     default: "-"
     doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
+  - name: TQLLM_MLX_ATTN_DECODE_SDPA
+    kind: user
+    default: "-"
+    doc: "=1: decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4)"
   - name: TQLLM_MLX_VERIFY_NARROW_AT
     kind: user
     default: "2048"

@@ -12,6 +12,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_ANE_WAVE` | - | 1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN) |  |
 | `TQLLM_MLX_CACHE_LIMIT_MIB` | - | MiB: MLX buffer-cache limit for the Mac tools (default 512) |  |
 | `TQLLM_MLX_DFLASH_BLOCK` | - | N: drafter block rows (8, or 16 for block-16 drafts and verify) |  |
+| `TQLLM_MLX_ATTN_DECODE_SDPA` | - | =1: decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4) |  |
 | `TQLLM_MLX_VERIFY_NARROW_AT` | 2048 | position from which spec verify narrows to TQLLM_MLX_VERIFY_NARROW_WIDTH rows (0 = always full width) |  |
 | `TQLLM_MLX_VERIFY_NARROW_WIDTH` | 7 | drafted tokens verified per step past TQLLM_MLX_VERIFY_NARROW_AT |  |
 | `TQLLM_MLX_PREFILL_CHUNK` | - | N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best) |  |
