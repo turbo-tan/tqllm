@@ -19,6 +19,8 @@ component live in the same folder. Dependencies point down only, and `tests/test
         qwen/qwen4exp        Flash-Next
         qwen/qwen2           the draft-model forward
         deepseek/ nemotron/ glm/ ...   next architectures, same shape
+  src/backends/<name>/       another runtime for the same models (e.g. mlx/: Apple MLX / Metal); model level,
+                             may use components and core, never a model folder or another backend
         |   a model may use any component below; it never includes another model
         v
   src/formats/weight/        weight formats: host codec + kernels + registry (WeightFormat)

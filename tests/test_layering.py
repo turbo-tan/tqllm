@@ -27,6 +27,8 @@ def layer(path):
     if path.startswith("src/models/"):
         parts = path.split("/")
         return 3, "/".join(parts[2:4]) if len(parts) > 4 else parts[2]
+    if path.startswith("src/backends/"):  # an alternative implementation (e.g. Apple MLX / Metal): model level, its own group
+        return 3, "backends/" + path.split("/")[2]
     if path.startswith("src/engine/"):
         return 4, None
     if path.startswith("tools/"):
