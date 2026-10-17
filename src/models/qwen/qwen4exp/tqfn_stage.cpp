@@ -153,11 +153,13 @@ template<class T> struct Device {
     explicit Device(size_t n) : count(n) {
         const size_t bytes = (std::max<size_t>(n, 1) * sizeof(T) + 255) / 256 * 256;
         if (g_arena && !g_persistent) {
-            if (g_arena->used + bytes > g_arena->size)
-                throw std::runtime_error("decode scratch arena exhausted: " + std::to_string(bytes) + " bytes requested, " +
-                                         std::to_string(g_arena->used) + " of " + std::to_string(g_arena->size) + " used");
-            p = reinterpret_cast<T *>(g_arena->base + g_arena->used); g_arena->used += bytes; owned = false;
-            g_arena->high = std::max(g_arena->high, g_arena->used); return;
+            if (g_arena->used + bytes <= g_arena->size) {
+                p = reinterpret_cast<T *>(g_arena->base + g_arena->used); g_arena->used += bytes; owned = false;
+                g_arena->high = std::max(g_arena->high, g_arena->used); return;
+            }
+            // the arena is sized by a measured rule; past it the pool serves the request (same values, another address)
+            static bool warned = false;
+            if (!warned) { warned = true; std::fprintf(stderr, "tqllm: scratch arena full (%zu of %zu MB): allocating from the pool\n", g_arena->used >> 20, g_arena->size >> 20); }
         }
         if (const cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&p), bytes, nullptr); e != cudaSuccess) {
             cudaGetLastError(); size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
@@ -3980,7 +3982,7 @@ public:
             tqllm::PrefillPlan plan;
             for (;;) {
                 tu.chunk = chunk; tu.sub = std::min(g_tune.sub, block); tu.context_bytes = context_term(block);
-                arena_req = chunk < f_.chunk ? std::min<size_t>(f_.arena_prefill, tqllm::prefill_arena_bytes(chunk)) : f_.arena_prefill;
+                arena_req = std::min<size_t>(f_.arena_prefill, tqllm::prefill_arena_bytes(chunk));  // the measured rule at every chunk size
                 arena_req += size_t(block) * size_t(checkpoint.attention_heads) * 2052 * 8 + (size_t(64) << 20);  // one block's QSA score scratch + headroom
                 tu.arena_bytes = arena_req;
                 plan = tqllm::prefill_plan(sh, tu, P, free_now() + mtp_room);

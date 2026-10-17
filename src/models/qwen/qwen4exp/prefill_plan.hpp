@@ -38,9 +38,10 @@ struct PrefillChunkBytes {
 };
 
 inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
-// the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention; measured 1375 MB at
-// 8192 tokens, 3519+ MB short at 32768 with 3800)
-inline size_t prefill_arena_bytes(int chunk) { return size_t(chunk / 5 + 64) << 20; }
+// the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
+// block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB
+// without their scores; 3519+ MB short at 32768 with 3800). 0.15 MB per token + 128 MB; an overflow falls back to the pool.
+inline size_t prefill_arena_bytes(int chunk) { return (size_t(std::max(0, chunk)) * 154 / 1024 + 128) << 20; }
 // The attention state a request allocates lazily during its first chunk, all sized by the context: per attention layer
 // the bf16 K and V rows, the indexer's raw keys (fp32) and pooled scores; plus one QSA batch scratch shared by the layers
 // (sort keys and sorted keys for sub-chunk queries x context/ratio blocks, CUB temp of the same order, selected positions).
