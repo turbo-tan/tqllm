@@ -1,7 +1,7 @@
 // tqllm::Model on the MLX backend (Apple Silicon): the server's single-slot speculative path (spec_begin / spec_advance /
 // spec_tokens / spec_finish) over Qwen35 + the DFlash2 drafter, with the settings of the measured exact configuration as
 // defaults (an environment variable that is already set wins). Greedy is exact (output == the target's own greedy
-// decode); a request with temperature > 0 decodes token by token from the target's distribution without the drafter.
+// decode); a request with temperature > 0 uses speculative sampling with the same drafter (exact distribution).
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "dflash.hpp"
@@ -113,16 +113,15 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
     if (prompt.size() + count + 16 > i.context_) throw std::invalid_argument("prompt and answer exceed the context");
     i.output.clear(); i.count = count; i.steps = i.drafted = i.accepted = 0; i.decode_us = 0;
     i.sampling = i.temperature > 0.f;
-    if (i.sampling) std::fprintf(stderr, "tqserve: temperature %.2f: sampled token by token (no drafter)\n", i.temperature);
     const auto t0 = Clock::now();
     i.engine->reset(); i.drafter->reset();
     mx::array logits = mx::array(0.0f);
     for (size_t off = 0; off < prompt.size(); off += size_t(i.chunk)) {
         const int n = std::min(i.chunk, int(prompt.size() - off));
         logits = i.engine->forward(std::span<const uint32_t>(prompt.data() + off, size_t(n)));
-        if (!i.sampling) i.drafter->inject(i.engine->feature_states(), int(off));
+        i.drafter->inject(i.engine->feature_states(), int(off));
     }
-    if (!i.sampling && !i.head4) i.engine->draft_shortlist(logits, i.shortlist);
+    if (!i.head4) i.engine->draft_shortlist(logits, i.shortlist);
     i.pending = mx::argmax(logits).item<uint32_t>();
     if (i.sampling) {
         // sample the first token from the last prompt position's distribution
@@ -153,28 +152,6 @@ bool Model::spec_advance() {
     auto& i = *impl_;
     if (!i.active || i.done) return false;
     const uint32_t limit = i.count;
-    if (i.sampling) {
-        auto logits = i.engine->forward({&i.pending, 1});
-        auto scaled = mx::multiply(mx::astype(mx::reshape(logits, {-1}), mx::float32), mx::array(1.0f / i.temperature));
-        mx::eval(scaled);
-        const float* p = scaled.data<float>(); const size_t v = scaled.size();
-        std::vector<std::pair<float, uint32_t>> top;
-        const int k = i.top_k > 0 ? i.top_k : 64;
-        for (size_t t = 0; t < v; ++t) {
-            if (int(top.size()) < k) {top.push_back({p[t], uint32_t(t)}); std::push_heap(top.begin(), top.end(), std::greater<>());}
-            else if (p[t] > top.front().first) {std::pop_heap(top.begin(), top.end(), std::greater<>()); top.back() = {p[t], uint32_t(t)}; std::push_heap(top.begin(), top.end(), std::greater<>());}
-        }
-        std::sort(top.rbegin(), top.rend());
-        double z = 0; std::vector<double> w(top.size());
-        for (size_t t = 0; t < top.size(); ++t) {w[t] = std::exp(double(top[t].first - top[0].first)); z += w[t];}
-        double mass = 0; size_t keep = top.size();
-        for (size_t t = 0; t < top.size(); ++t) {mass += w[t] / z; if (mass >= i.top_p) {keep = t + 1; break;}}
-        std::discrete_distribution<size_t> pick(w.begin(), w.begin() + long(keep));
-        i.pending = top[pick(i.rng)].second;
-        i.output.push_back(i.pending); ++i.steps;
-        i.done = i.output.size() >= limit || i.pending == i.eos;
-        return !i.done;
-    }
     const int pos = i.engine->position(), want = std::min(verify_width(i.width, pos), int(limit - i.output.size()));
     if (want < 1) {i.done = true; return false;}
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
@@ -183,13 +160,59 @@ bool Model::spec_advance() {
     const uint32_t anchor[1] = {i.pending};
     auto block = mx::concatenate({mx::array(anchor, {1}, mx::uint32), drafted}, 0);
     Qwen35::Verification ticket;
-    auto choices = mx::argmax(i.engine->verify_device(block, ticket), -1);
-    mx::eval(choices, drafted);
-    const auto* ids = choices.data<uint32_t>();
-    const auto* proposed = drafted.data<uint32_t>();
-    auto features = i.engine->feature_states();
+    auto verified = i.engine->verify_device(block, ticket);
+    std::vector<uint32_t> sampled_ids;
+    const uint32_t* ids = nullptr;
+    mx::array choices = mx::array(0u);
     int acc = 0;
-    while (acc < want && proposed[acc] == ids[acc]) ++acc;
+    const uint32_t* proposed = nullptr;
+    if (!i.sampling) {
+        choices = mx::argmax(verified, -1);
+        mx::eval(choices, drafted);
+        ids = choices.data<uint32_t>();
+        proposed = drafted.data<uint32_t>();
+        while (acc < want && proposed[acc] == ids[acc]) ++acc;
+    } else {
+        // speculative sampling with a point-mass draft: accept proposed[j] with probability p_j(x); on rejection sample
+        // from p_j without x (renormalized) and stop; after a full accept sample the bonus token from the last row.
+        // The output distribution equals token-by-token sampling from the same filtered p (top-k, then top-p).
+        const int rows = want + 1, k = i.top_k > 0 ? i.top_k : 64;
+        auto scaled = mx::multiply(mx::astype(mx::reshape(verified, {rows, -1}), mx::float32), mx::array(1.0f / i.temperature));
+        auto idx = mx::slice(mx::argpartition(mx::negative(scaled), k - 1, -1), {0, 0}, {rows, k});
+        auto val = mx::take_along_axis(scaled, idx, -1);
+        idx = mx::astype(idx, mx::uint32);
+        mx::eval(idx, val, drafted);
+        proposed = drafted.data<uint32_t>();
+        const auto* pi = idx.data<uint32_t>(); const auto* pv = val.data<float>();
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        sampled_ids.assign(size_t(rows), 0u);
+        auto row_dist = [&](int r, std::vector<std::pair<double, uint32_t>>& d) {
+            d.clear();
+            for (int t = 0; t < k; ++t) d.push_back({double(pv[r * k + t]), pi[r * k + t]});
+            std::sort(d.begin(), d.end(), [](auto& x, auto& y) {return x.first > y.first;});
+            double z = 0; for (auto& e : d) {e.first = std::exp(e.first - d[0].first); z += e.first;}
+            double mass = 0; size_t keep = d.size();
+            for (size_t t = 0; t < d.size(); ++t) {mass += d[t].first / z; if (mass >= i.top_p) {keep = t + 1; break;}}
+            d.resize(keep); z = 0; for (auto& e : d) z += e.first; for (auto& e : d) e.first /= z;
+        };
+        auto draw = [&](const std::vector<std::pair<double, uint32_t>>& d, uint32_t skip) {
+            double z = 0; for (auto& e : d) if (e.second != skip) z += e.first;
+            double u = unit(i.rng) * z, c = 0; uint32_t last = d[0].second;
+            for (auto& e : d) {if (e.second == skip) continue; last = e.second; c += e.first; if (u < c) return e.second;}
+            return last;
+        };
+        std::vector<std::pair<double, uint32_t>> d;
+        for (; acc < want; ++acc) {
+            row_dist(acc, d);
+            double px = 0; for (auto& e : d) if (e.second == proposed[acc]) px = e.first;
+            if (unit(i.rng) < px) {sampled_ids[size_t(acc)] = proposed[acc]; continue;}
+            sampled_ids[size_t(acc)] = d.size() == 1 && d[0].second == proposed[acc] ? proposed[acc] : draw(d, proposed[acc]);
+            break;
+        }
+        if (acc == want) {row_dist(want, d); sampled_ids[size_t(want)] = draw(d, UINT32_MAX);}
+        ids = sampled_ids.data();
+    }
+    auto features = i.engine->feature_states();
     ++i.steps; i.drafted += uint64_t(want); i.accepted += uint64_t(acc);
     for (int j = 0; j < acc && i.output.size() < limit; ++j) {
         i.output.push_back(proposed[j]);
