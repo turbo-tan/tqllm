@@ -29,6 +29,11 @@ mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::ar
 int nax_affine_splits(const NaxAffine& weights);
 // The stored matrix as FP16 [rows, columns], the values the matmul kernel multiplies.
 mlx::core::array nax_affine_dequant(const NaxAffine& weights);
+// Prefill GEMM without the FP16 weight copy: each threadgroup decodes its 64 output columns of the packed weights into a
+// double-buffered threadgroup stage, 64 inputs per step, and matmul2d reads the [m, columns] FP16 input from device memory
+// (4-bit affine and TQ4; FP32 [m, rows] out, optionally BF16-rounded). Accumulates in FP32, so it differs from
+// nax_affine_gemm (FP16 product) in the last bits.
+mlx::core::array nax_affine_gemm_staged(const NaxAffine& w, const mlx::core::array& input, bool round_bf16);
 // Prefill: dequantize once, then one FP16 GEMM (FP32 accumulate, FP16 output) for many input rows. Not row-invariant
 // with nax_affine_matmul (accumulation order), so decode and verify keep the row kernel.
 mlx::core::array nax_affine_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);

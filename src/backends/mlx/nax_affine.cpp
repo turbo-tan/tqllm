@@ -568,6 +568,115 @@ mx::array nax_int8_gemm(const NaxAffine& w, const mx::array& input, bool round_b
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+const char* kStagedGemm = R"METAL(
+    const uint tid = thread_position_in_threadgroup.x;
+    // grid: the row tiles of one column block run back to back, so the block's packed weights are reused from cache
+    const uint tiles_m = uint(MP) / uint(MT), l = threadgroup_position_in_grid.x;
+    const uint n0 = (l / tiles_m) * uint(NT), m0 = (l % tiles_m) * uint(MT);
+    threadgroup half stage[2 * NT * KS];
+    using TA = tensor<device half, dextents<int, 2>, tensor_inline>;
+    using TB = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
+    auto ta = TA((device half*)(x + size_t(m0) * uint(K)), dextents<int, 2>(K, MT));
+    TB tb0(stage, dextents<int, 2>(KS, NT));
+    TB tb1(stage + NT * KS, dextents<int, 2>(KS, NT));
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(MT, NT, KS, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
+    auto a_first = ta.template slice<KS, MT>(0, 0);
+    auto b_first = tb0.template slice<KS, NT>(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(a_first), decltype(b_first), float>();
+    constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
+#pragma unroll
+    for (uint i = 0; i < CAP; ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    // staging: per step NT/32 blocks x KS/16 16-column words x 32 lanes, WPT words per thread
+    constexpr uint KSTEPS = uint(KS) / 16u, WPS = uint(NT) / 32u * KSTEPS * 32u, WPT = WPS / (32u * uint(SIMDS));
+    constexpr uint STEPS = uint(K) / 16u;
+    uint2 wr[WPT]; float sca[WPT][4], scb[WPT][4], bia[WPT][4], bib[WPT][4];
+    auto load = [&](uint step) {
+#pragma unroll
+        for (uint i = 0; i < WPT; ++i) {
+            const uint item = tid + i * 32u * uint(SIMDS), ln = item % 32u, rest = item / 32u;
+            const uint ksl = rest % KSTEPS, bl = rest / KSTEPS, blk = n0 / 32u + bl, ks = step * KSTEPS + ksl;
+            wr[i] = ((const device uint2*)W)[(size_t(blk) * STEPS + ks) * 32u + ln];
+            const short qid = ln >> 2, fn = ((qid & 2) | (ln & 1)) * 4;
+            const uint g = ks * 16u / uint(GS);
+            const device ushort* sp = S + (size_t(blk) * uint(GPR) + g) * 32u;
+            const device ushort* bp = Bz + (size_t(blk) * uint(GPR) + g) * 32u;
+#pragma unroll
+            for (short p = 0; p < 4; ++p) {
+                if (TQ4) {sca[i][p] = float(as_type<half>(sp[fn + p])); scb[i][p] = float(as_type<half>(sp[16 + fn + p])); bia[i][p] = bib[i][p] = 0.0f;}
+                else {
+                    sca[i][p] = as_type<float>(uint(sp[fn + p]) << 16); scb[i][p] = as_type<float>(uint(sp[16 + fn + p]) << 16);
+                    bia[i][p] = as_type<float>(uint(bp[fn + p]) << 16); bib[i][p] = as_type<float>(uint(bp[16 + fn + p]) << 16);
+                }
+            }
+        }
+    };
+    // the same values nax_affine_dequant writes (FP16 rounding of one fma per element)
+    auto store = [&](threadgroup half* buf) {
+#pragma unroll
+        for (uint i = 0; i < WPT; ++i) {
+            const uint item = tid + i * 32u * uint(SIMDS), ln = item % 32u, rest = item / 32u;
+            const uint ksl = rest % KSTEPS, bl = rest / KSTEPS;
+            const short qid = ln >> 2, fm = (qid & 4) | ((ln >> 1) & 3), fn = ((qid & 2) | (ln & 1)) * 4;
+#pragma unroll
+            for (short p = 0; p < 4; ++p)
+#pragma unroll
+                for (short j = 0; j < 2; ++j) {
+                    const short e = p + 4 * j;
+                    const uint qa = (wr[i].x >> (4 * e)) & 15u, qb = (wr[i].y >> (4 * e)) & 15u;
+                    const half va = TQ4 ? half(float(TQ4_LEVEL[qa]) * sca[i][p]) : half(fma(float(qa), sca[i][p], bia[i][p]));
+                    const half vb = TQ4 ? half(float(TQ4_LEVEL[qb]) * scb[i][p]) : half(fma(float(qb), scb[i][p], bib[i][p]));
+                    const uint k = ksl * 16u + uint(fm) + 8u * uint(j);
+                    buf[(bl * 32u + uint(fn) + uint(p)) * uint(KS) + k] = va;
+                    buf[(bl * 32u + 16u + uint(fn) + uint(p)) * uint(KS) + k] = vb;
+                }
+        }
+    };
+    const uint steps = uint(K) / uint(KS);
+    load(0u);
+    for (uint t = 0; t < steps; ++t) {
+        threadgroup half* buf = stage + (t & 1u) * uint(NT) * uint(KS);
+        store(buf);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t + 1 < steps) load(t + 1);   // the next step's words and scales arrive while this step's matmul runs
+        auto a = ta.template slice<KS, MT>(int(t * uint(KS)), 0);
+        if (t & 1u) op.run(a, tb1.template slice<KS, NT>(0, 0), acc);
+        else op.run(a, tb0.template slice<KS, NT>(0, 0), acc);
+    }
+#pragma unroll
+    for (uint i = 0; i < CAP; ++i) {
+        if (!acc.is_valid_element(i)) continue;
+        auto c = acc.get_multidimensional_index(i);
+        const uint col = n0 + uint(c[0]), row = m0 + uint(c[1]);
+        if (row < uint(M)) y[size_t(row) * uint(N) + col] = ROUND_BF16 ? float(bfloat16_t(acc[i])) : acc[i];
+    }
+)METAL";
+mx::array nax_affine_gemm_staged(const NaxAffine& w, const mx::array& input, bool round_bf16) {
+    if (w.q6 || w.bits != 4 || w.columns % 64 || w.rows % 64 || w.group % 16)
+        throw std::invalid_argument("nax staged gemm: 4-bit matrices with rows and columns a multiple of 64");
+    if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
+        throw std::invalid_argument("nax staged gemm: input must be [m, columns]");
+    static const int MT = std::getenv("TQLLM_MLX_STAGED_MT") ? std::atoi(std::getenv("TQLLM_MLX_STAGED_MT")) : 128;
+    constexpr int NT = 64, KS = 64, SIMDS = 4;
+    static auto kernels = [] {
+        auto make = [](bool round) {
+            return mx::fast::metal_kernel(std::string("tqllm_nax_staged_gemm") + (round ? "_bf" : ""), {"x", "W", "S", "Bz"}, {"y"}, kStagedGemm,
+                                          std::string("#include <metal_tensor>\n") + kHeader);
+        };
+        return std::pair{make(false), make(true)};
+    }();
+    const int m = input.shape(0), mp = (m + MT - 1) / MT * MT, n = w.rows, k = w.columns;
+    auto x = input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16);
+    if (mp != m) x = mx::pad(x, {{0, mp - m}, {0, 0}});
+    x = mx::contiguous(x);
+    return (round_bf16 ? kernels.second : kernels.first)(
+        {x, w.words, w.scales, w.biases}, {{m, n}}, {mx::float32}, {(n / NT) * (mp / MT) * 32 * SIMDS, 1, 1}, {32 * SIMDS, 1, 1},
+        {{"MT", MT}, {"NT", NT}, {"KS", KS}, {"SIMDS", SIMDS}, {"K", k}, {"N", n}, {"M", m}, {"MP", mp}, {"GPR", k / w.group},
+         {"GS", w.group}, {"TQ4", w.tq4}, {"ROUND_BF16", round_bf16}},
+        std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 NaxAffine nax_affine_concat(const std::vector<const NaxAffine*>& parts) {
     if (parts.empty()) throw std::invalid_argument("nax affine concat: no parts");
     const auto& f = *parts.front();
