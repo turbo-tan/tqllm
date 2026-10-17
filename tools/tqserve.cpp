@@ -22,6 +22,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <stdexcept>
 #include <string>
@@ -350,6 +353,12 @@ int main(int argc, char ** argv) {
                 return;
             }
 
+            // --np 1 (no scheduler): one generation at a time, but /health and /v1/models answer while it runs; every
+            // connection has its own thread, so a long generation no longer blocks the accept loop
+            static std::mutex single_slot;
+            const bool status_path = request.method == "GET" && (request.path == "/health" || request.path == "/v1/models" || request.path == "/v1/models/" + name);
+            std::unique_lock<std::mutex> hold(single_slot, std::defer_lock);
+            if (!scheduler && !status_path) hold.lock();
             std::string body;
             status = 200;
             if (request.method == "GET" && request.path == "/health") {
@@ -410,14 +419,24 @@ int main(int argc, char ** argv) {
                 } else if (parsed.stream) {
                     send_all(client, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                                      "Connection: close\r\n\r\n");
-                    auto raw = [&](const std::string & d) { return send_all(client, d); };
+                    // SSE comments every 10 s until the first token: a long prefill otherwise looks like a dead connection to
+                    // clients with a read timeout (agents on 200K contexts)
+                    std::mutex ka_mx; std::condition_variable ka_cv; bool ka_stop = false;
+                    auto raw = [&](const std::string & d) { std::lock_guard<std::mutex> lk(ka_mx); return send_all(client, d); };
+                    std::thread keepalive([&] {
+                        std::unique_lock<std::mutex> lk(ka_mx);
+                        while (!ka_cv.wait_for(lk, std::chrono::seconds(10), [&] { return ka_stop; }))
+                            if (!send_all(client, ": keepalive\n\n")) break;
+                    });
+                    auto stop_keepalive = [&] { { std::lock_guard<std::mutex> lk(ka_mx); ka_stop = true; } ka_cv.notify_all(); };
+                    struct KeepaliveJoin { std::function<void()> stop; std::thread & t; ~KeepaliveJoin() { stop(); if (t.joinable()) t.join(); } } ka_join{stop_keepalive, keepalive};
                     std::unique_ptr<tqserve::ResponsesSse> rsse;
                     std::unique_ptr<tqserve::MessagesSse> msse;
                     if (api == tqserve::Api::Responses) { rsse = std::make_unique<tqserve::ResponsesSse>(name, raw); rsse->begin(); }
                     if (api == tqserve::Api::Messages) { msse = std::make_unique<tqserve::MessagesSse>(name, raw); msse->begin(); }
                     auto send = [&](const std::string & d) { return rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d); };
                     auto run_stream = [&](const tqserve::ChatRequest & r, tqserve::StreamWriter & w) {
-                        auto on_tokens = [&](const std::vector<uint32_t> & ids) { return w.update(ids); };
+                        auto on_tokens = [&](const std::vector<uint32_t> & ids) { stop_keepalive(); return w.update(ids); };
                         auto result = guarded([&] {
                             return scheduler ? scheduler->submit_stream(r, on_tokens)
                                              : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
@@ -521,15 +540,11 @@ int main(int argc, char ** argv) {
             send_all(client, response(status, body));
             ::close(client);
             };
-            if (scheduler) {
-                ++inflight;
-                std::thread([handle, &inflight] {
-                    handle();
-                    --inflight;
-                }).detach();
-            } else {
+            ++inflight;
+            std::thread([handle, &inflight] {
                 handle();
-            }
+                --inflight;
+            }).detach();
         }
         scheduler.reset();  // fails queued and running requests so their connection threads can answer
         for (int i = 0; i < 500 && inflight > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));

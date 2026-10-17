@@ -8,11 +8,26 @@
 namespace tqllm_cuda {
 // F32 residual and norm tensors use [tokens][streams][hidden], matching reference HC math.
 void hc_init(const float * embedding, float * residual, int hidden, int streams, int tokens, cudaStream_t);
+void hc_combine_norm(const float * residual, const float * block, const float * inject, const float * gamma, float * combined, float * normed,
+                     int h, int c, int n, float eps, cudaStream_t s);
 void hc_norm(const float * residual, const float * gamma, float * normalized,
               int hidden, int streams, int tokens, float epsilon, cudaStream_t);
 void hc_low_silu(float * low_rank, int count, int streams, cudaStream_t);
+// _bf16 variants: the same results plus their BF16 images (bit-identical to f32_to_bf16 of the f32 outputs)
+void hc_norm_bf16(const float * residual, const float * gamma, float * normalized, __nv_bfloat16 * normalized_bf16,
+                  int hidden, int streams, int tokens, float eps, cudaStream_t);
+void hc_low_silu_bf16(float * low_rank, __nv_bfloat16 * low_rank_bf16, int count, int streams, cudaStream_t);
+// _rs variants: the norm keeps only its row scale (rs [tokens * streams]) and BF16 image; the mix recomputes the normalized
+// value from (residual, rs, gamma) exactly as hc_norm does, so hc_mix_rs == hc_mix(hc_norm(...)) bit for bit
+void hc_norm_rs_bf16(const float * residual, const float * gamma, float * rs, __nv_bfloat16 * normalized_bf16,
+                     int hidden, int streams, int tokens, float eps, cudaStream_t);
+void hc_mix_rs(const float * residual, const float * rs, const float * gamma, const float * gate_logits, float * mixed,
+               int hidden, int streams, int tokens, cudaStream_t);
 void hc_mix(const float * normalized, const float * gate_logits, float * mixed,
              int hidden, int streams, int tokens, cudaStream_t);
+// hc_combine followed by hc_norm_rs_bf16 in one kernel (out may alias residual): bit-identical to the pair
+void hc_combine_norm_rs_bf16(const float * residual, const float * block_out, const float * inject_logits, float * out, const float * gamma,
+                             float * rs, __nv_bfloat16 * normalized_bf16, int h, int c, int tokens, float epsilon, cudaStream_t);
 void hc_combine(const float * residual, const float * block_out, const float * inject_logits, float * out,
                  int hidden, int streams, int tokens, cudaStream_t);
 void ple_gate(const float * key_norm, const float * query_norm, float * gates,
@@ -25,12 +40,16 @@ void ple_conv(const float * normalized, const float * history, const float * ker
 void ple_apply(const float * hidden, const float * gated, const float * conv, float * out, int count, cudaStream_t);
 // Packed Q/K/V [tokens][2*kheads*dim + vheads*dim]; state [vheads][value][key].
 // Inputs and recurrent state stay F32. Key heads use GGUF's tiled order (h % kheads).
+size_t fn_gdn_workspace_bytes();
+void fn_gdn_release_workspaces();
 void fn_gdn(const float * qkv, const float * alpha, const float * beta, const float * neg_a,
             const float * dt_bias, const float * state, float * next_state, float * out,
             int kheads, int vheads, int dim, int tokens, float epsilon, cudaStream_t);
 // Same as fn_gdn, also writing the state after every token to states[t][vheads][value][key] (speculative rollback).
 // Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default TQFN_GDN_CHUNK_MIN or 64). Tests.
 void fn_gdn_set_chunk_min(int n);
+void fn_gdn_set_kh(int on);
+void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
                   int heads, int dim, int tokens, float epsilon, cudaStream_t);
 // Text-only positions. An interleaved query input stores [q|gate] per head.
@@ -49,11 +68,16 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
 // Prefill chunks on the block-per-row layout (rows <= 16, or rows <= 1024 with cols >= 1024): sums bit-identical to
 // fn_gemv_bf16_tokens, x read once per 8 rows; output row t at y + t * ldy.
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
+// fn_gemv_bf16_tokens on its block-per-row path with output row t at y + t * ldy (same sums, bit-identical).
+void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 constexpr int kGemvSegs = 4;
 struct GemvSegs { int n = 0; int start[kGemvSegs + 1] = {}; const __nv_bfloat16 * w[kGemvSegs] = {}; float * y[kGemvSegs] = {}; int64_t ld[kGemvSegs] = {}; };
 // Only for row-blocks that fn_gemv_bf16_tokens runs on its block-per-row path (rows <= 16, or rows <= 1024 with cols >= 1024).
 void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t);
 void fn_swiglu_bf16_h(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, int64_t count, cudaStream_t);
+// fn_swiglu_bf16_h on the assignments listed per slot (counts[slots], groups[slots][capacity] of assignment indices, rows of ff)
+void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, const int * counts, const int * groups,
+                             int slots, int capacity, int ff, cudaStream_t);
 void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t);
 void fn_moe_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
                     float * out, int hidden, int topk, int tokens, cudaStream_t);
@@ -149,6 +173,9 @@ public:
 // 4-head x 128 kernel, 0 the generic one (bit-identical keys), -1 by TQFN_QSA_FIXED.
 void qsa_score_pack(const float * pooled_keys, const float * query, uint64_t * keys, int blocks, int first_position, int ratio,
                     int heads, int dim, int tokens, cudaStream_t stream, int fixed = -1);
+void qsa_set_split(int splits);  // TQFN_QSA_SPLIT override: S > 1 splits decode attention over the selected positions (numeric)
+void qsa_set_tc(int on);  // 0: scalar instead of tensor-core prefill selected attention (12 heads per kv head, dim 256)
+void qsa_reserve_split_scratch();  // allocate the split-attention scratch now (start-up)
 void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                           const QsaDeviceSelection & selected, float * output, int tokens, int first_cells,
                           int heads, int kv_heads, int dim, cudaStream_t);

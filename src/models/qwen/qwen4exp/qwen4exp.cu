@@ -1,10 +1,12 @@
 #include <algorithm>
 #include "qwen4exp_kernels.cuh"
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include "gdn_seq_fast.cuh"
 // TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
 static inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); return !v || (v[0] && v[0] != '0'); }
 
@@ -35,6 +37,61 @@ __global__ void norm_k(const float * x, const float * gamma, float * out, int h,
     for (int j = tid; j < h; j += blockDim.x)
         out[int64_t(row) * h + j] = __fmul_rn(__fmul_rn(src[j], inv), gamma[(row % c) * h + j]);
 }
+// norm_k with the BF16 image of its output (what f32_to_bf16 of `out` gives) for the BF16 projections that read it
+__global__ void norm_bf16_k(const float * x, const float * gamma, float * out, __nv_bfloat16 * outb, int h, int c, float eps) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const float * src = x + int64_t(row) * h;
+    float sum = 0.f;
+    for (int j = tid; j < h; j += blockDim.x) sum += src[j] * src[j];
+    __shared__ float partial[256];
+    partial[tid] = sum;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / h + eps);
+    for (int j = tid; j < h; j += blockDim.x) {
+        const float v = __fmul_rn(__fmul_rn(src[j], inv), gamma[(row % c) * h + j]);
+        out[int64_t(row) * h + j] = v; outb[int64_t(row) * h + j] = __float2bfloat16_rn(v);
+    }
+}
+// norm_bf16_k without the fp32 output (row scale + BF16 image only); mix_rs_k recomputes the normalized value
+// from the residual, the row scale and gamma with norm_k's two roundings, so its result equals mix_k on norm_k's output
+__global__ void norm_rs_bf16_k(const float * x, const float * gamma, float * rs, __nv_bfloat16 * outb, int h, int c, float eps) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const float * src = x + int64_t(row) * h;
+    float sum = 0.f;
+    for (int j = tid; j < h; j += blockDim.x) sum += src[j] * src[j];
+    __shared__ float partial[256];
+    partial[tid] = sum;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / h + eps);
+    if (tid == 0) rs[row] = inv;
+    for (int j = tid; j < h; j += blockDim.x)
+        outb[int64_t(row) * h + j] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(src[j], inv), gamma[(row % c) * h + j]));
+}
+__global__ void mix_rs_k(const float * x, const float * rs, const float * gamma, const float * logits, float * out, int h, int c, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int token = i / h, j = i % h;
+    float sum = 0.f;
+    for (int stream = 0; stream < c; ++stream) {
+        const int64_t at = (int64_t(token) * c + stream) * h + j;
+        const float normed = __fmul_rn(__fmul_rn(x[at], rs[token * c + stream]), gamma[stream * h + j]);
+        const float gate = 1.f / (1.f + expf(-logits[at]));
+        sum = __fadd_rn(sum, __fmul_rn(normed, gate));
+    }
+    out[i] = sum / c;
+}
+__global__ void low_bf16_k(float * x, __nv_bfloat16 * xb, int count, int c) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) { const float v = x[i] / c; const float y = v / (1.f + expf(-v)); x[i] = y; xb[i] = __float2bfloat16_rn(y); }
+}
 __global__ void low_k(float * x, int count, int c) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) { const float v = x[i] / c; x[i] = v / (1.f + expf(-v)); }
@@ -58,6 +115,30 @@ __global__ void combine_k(const float * residual, const float * block, const flo
     const int token = i / (h * c), stream = (i / h) % c, j = i % h;
     const float scatter = 2.f / (1.f + expf(-inject[token * c + stream] / c));
     out[i] = __fadd_rn(residual[i], __fmul_rn(block[token * h + j], scatter));
+}
+// combine_k followed by norm_k in one launch (same arithmetic, same order): row = token * c + stream
+__global__ void combine_norm_k(const float * residual, const float * block, const float * inject, const float * gamma,
+                               float * combined, float * normed, int h, int c, float eps) {
+    const int row = blockIdx.x, token = row / c, stream = row % c, tid = threadIdx.x;
+    const float scatter = 2.f / (1.f + expf(-inject[token * c + stream] / c));
+    float sum = 0.f;
+    for (int j = tid; j < h; j += blockDim.x) {
+        const int64_t i = int64_t(row) * h + j;
+        const float v = __fadd_rn(residual[i], __fmul_rn(block[int64_t(token) * h + j], scatter));
+        combined[i] = v; sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[tid] = sum;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / h + eps);
+    for (int j = tid; j < h; j += blockDim.x) {
+        const int64_t i = int64_t(row) * h + j;
+        normed[i] = __fmul_rn(__fmul_rn(combined[i], inv), gamma[stream * h + j]);
+    }
 }
 __global__ void ple_gate_k(const float * key, const float * query, float * gates, int h) {
     const int row = blockIdx.x, tid = threadIdx.x;
@@ -211,6 +292,121 @@ __global__ void fn_gdn_main_k(const float * qkv, const float * qk, const float *
         for (int r = 0; r < pieces; ++r) next[base + r * 32 + lane] = column[v][r];
     }
 }
+// Key-head GDN prefill: the gated delta rule token by token over the whole sub-chunk, one block per (key head, 32 value columns) and
+// its VPK value heads (they share q and k); the state slice in registers (thread (c, rg): rows rg*32..+31 of column c),
+// q / k / v / gates staged 8 tokens at a time with cp.async, double-buffered. Design after Strata's gdn_rec_kh_kernel
+// (MIT, Copyright (c) 2026 Niko1221 and the Strata contributors); own code on our layouts: state [head][value][key],
+// q and k from fn_gdn_prep_k (q carries 1 / sqrt(dim)), gates [t][head][decay, beta] from fn_gdn_gates_k.
+namespace gdnkh {
+constexpr int S = 128, CB = 32, RG = 4, RPG = S / RG, TB = 8;
+__device__ __forceinline__ void cp16(void * d, const void * g) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"((unsigned) __cvta_generic_to_shared(d)), "l"(g));
+#else
+    *reinterpret_cast<float4 *>(d) = *reinterpret_cast<const float4 *>(g);
+#endif
+}
+__device__ __forceinline__ void cp4(void * d, const void * g) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"((unsigned) __cvta_generic_to_shared(d)), "l"(g));
+#else
+    *reinterpret_cast<float *>(d) = *reinterpret_cast<const float *>(g);
+#endif
+}
+__device__ __forceinline__ void commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void wait_prev() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
+}
+}  // namespace gdnkh
+template <int VPK>
+__global__ void __launch_bounds__(gdnkh::CB * gdnkh::RG) fn_gdn_kh_k(const float * __restrict__ qkv, const float * __restrict__ qk,
+                                                                   const float * __restrict__ gates, const float * __restrict__ state,
+                                                                   float * __restrict__ next, float * __restrict__ out, int kh, int vh, int n) {
+    using namespace gdnkh;
+    constexpr int NT = CB * RG, QP = S / 4, VP = CB / 4;
+    __shared__ __align__(16) float sq[2][TB][S];
+    __shared__ __align__(16) float sk[2][TB][S];
+    __shared__ __align__(16) float sv[2][TB][VPK][CB];
+    __shared__ float sg[2][TB][VPK], sb[2][TB][VPK], rkv[VPK][RG][CB], ro[VPK][RG][CB];
+    const int ncb = S / CB, qh = blockIdx.x / ncb, cb = blockIdx.x % ncb;
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int64_t channels = int64_t(2 * kh + vh) * S;
+    float st[VPK][RPG];
+#pragma unroll
+    for (int j = 0; j < VPK; ++j) {
+        const float4 * src = reinterpret_cast<const float4 *>(state + (int64_t(qh + j * kh) * S + col) * S + rg * RPG);
+#pragma unroll
+        for (int r = 0; r < RPG / 4; ++r) { const float4 v = src[r]; st[j][4 * r] = v.x; st[j][4 * r + 1] = v.y; st[j][4 * r + 2] = v.z; st[j][4 * r + 3] = v.w; }
+    }
+    const int nblk = (n + TB - 1) / TB;
+    auto stage = [&](int k) {
+        const int bb = k & 1, t0 = k * TB;
+        for (int p = tid; p < TB * 2 * QP; p += NT) {
+            const int i = p / (2 * QP), w = p % (2 * QP), isk = w / QP, jj = (w % QP) * 4;
+            if (t0 + i < n) cp16(isk ? &sk[bb][i][jj] : &sq[bb][i][jj], qk + (int64_t(t0 + i) * 2 * kh + (isk ? kh : 0) + qh) * S + jj);
+        }
+        for (int p = tid; p < TB * VPK * VP; p += NT) {
+            const int i = p / (VPK * VP), w = p % (VPK * VP), j = w / VP, jj = (w % VP) * 4;
+            if (t0 + i < n) cp16(&sv[bb][i][j][jj], qkv + int64_t(t0 + i) * channels + int64_t(2 * kh) * S + int64_t(qh + j * kh) * S + cb * CB + jj);
+        }
+        for (int p = tid; p < 2 * TB * VPK; p += NT) {
+            const int isb = p / (TB * VPK), w = p % (TB * VPK), i = w / VPK, j = w % VPK;
+            if (t0 + i < n) cp4(isb ? &sb[bb][i][j] : &sg[bb][i][j], gates + 2 * (int64_t(t0 + i) * vh + qh + j * kh) + isb);
+        }
+    };
+    if (nblk > 0) stage(0);
+    commit();
+    for (int k = 0; k < nblk; ++k) {
+        if (k + 1 < nblk) stage(k + 1);  // buffer (k + 1) & 1 was last read in block k - 1, before its last __syncthreads
+        commit();
+        wait_prev();
+        __syncthreads();
+        const int bb = k & 1, cnt = min(TB, n - k * TB);
+        for (int i = 0; i < cnt; ++i) {
+            const int64_t t = int64_t(k) * TB + i;
+            float kc[RPG];
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kc[r] = sk[bb][i][rg * RPG + r];
+            float kv[VPK], o[VPK], delta[VPK];
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) { kv[j] = 0.f; o[j] = 0.f; }
+#pragma unroll
+            for (int r = 0; r < RPG; ++r)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) kv[j] = fmaf(st[j][r], kc[r], kv[j]);
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) rkv[j][rg][c] = kv[j];
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) {
+                const float mem = rkv[j][0][c] + rkv[j][1][c] + rkv[j][2][c] + rkv[j][3][c];
+                delta[j] = (sv[bb][i][j][c] - sg[bb][i][j] * mem) * sb[bb][i][j];
+            }
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                const float qr = sq[bb][i][rg * RPG + r];
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) { st[j][r] = fmaf(sg[bb][i][j], st[j][r], kc[r] * delta[j]); o[j] = fmaf(st[j][r], qr, o[j]); }
+            }
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) ro[j][rg][c] = o[j];
+            __syncthreads();
+            if (rg < VPK) out[(t * vh + qh + rg * kh) * S + col] = ro[rg][0][c] + ro[rg][1][c] + ro[rg][2][c] + ro[rg][3][c];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < VPK; ++j) {
+        float4 * dst = reinterpret_cast<float4 *>(next + (int64_t(qh + j * kh) * S + col) * S + rg * RPG);
+#pragma unroll
+        for (int r = 0; r < RPG / 4; ++r) dst[r] = make_float4(st[j][4 * r], st[j][4 * r + 1], st[j][4 * r + 2], st[j][4 * r + 3]);
+    }
+}
 // Chunked gated delta rule for long prefills (the chunkwise / WY form of flash-linear-attention, MIT; own code).
 // S_t = a_t S_{t-1} + e_t k_t^T, e_t = b_t (v_t - a_t S_{t-1} k_t). With g_t = prod a within a chunk, (I + A) E = R where
 // A_tj = b_t (g_t / g_j) k_t.k_j (j < t) and R = b V - b g (K S0^T); then O = g (Q S0^T) + M E with M_tj = (g_t / g_j) q_t.k_j
@@ -323,6 +519,121 @@ __global__ void __launch_bounds__(256) fn_gdn_chunk_k(const float * qkv, const f
     __syncthreads();
     for (int i = tid; i < VS * dim; i += blockDim.x) next[(int64_t(head) * dim + v0 + i / dim) * dim + i % dim] = S[(i / dim) * P + i % dim];
 }
+// WY form of the same chunked rule, split so that only state-dependent work stays sequential. Every chunk, in parallel:
+// T = (I + A)^-1 (unit lower triangular), U = T (b V), W = T (b g K), M as above; then E = U - W S0^T. Layouts per
+// value head and chunk: U, W [C][dim], M [C][C], lg [C] (running log decay inside the chunk).
+template <int C>
+__global__ void __launch_bounds__(256) fn_gdn_wy_k(const float * qkv, const float * qk, const float * gates, float * U, float * W,
+                                                   float * Mg, float * lgo, int kh, int vh, int dim, int n) {
+    extern __shared__ float sm[];
+    const int P = dim + 1, head = blockIdx.x, chunk = blockIdx.y, t0 = chunk * C, cn = min(C, n - t0), tid = threadIdx.x;
+    const int key_head = head % kh, channels = (2 * kh + vh) * dim;
+    float * K = sm; float * Q = K + C * P; float * V = Q + C * P;
+    float * A = V + C * P; float * T = A + C * (C + 1);
+    float * lg = T + C * (C + 1); float * bt = lg + C; float * eg = bt + C;
+    for (int i = tid; i < C * dim; i += blockDim.x) {
+        const int t = i / dim, d = i % dim; const bool in = t < cn; const int64_t tt = int64_t(t0 + t);
+        K[t * P + d] = in ? qk[(tt * 2 * kh + kh + key_head) * dim + d] : 0.f;
+        Q[t * P + d] = in ? qk[(tt * 2 * kh + key_head) * dim + d] : 0.f;
+        V[t * P + d] = in ? qkv[tt * channels + 2 * kh * dim + head * dim + d] : 0.f;
+    }
+    if (tid < 32) {  // C == 32: one lane per token, inclusive scan of the log decay
+        const bool in = tid < cn;
+        float x = in ? logf(fmaxf(gates[2 * ((int64_t(t0) + tid) * vh + head)], 1e-30f)) : 0.f;
+        for (int o = 1; o < 32; o <<= 1) { const float y = __shfl_up_sync(0xffffffffu, x, o); if (tid >= o) x += y; }
+        lg[tid] = x; eg[tid] = expf(x); bt[tid] = in ? gates[2 * ((int64_t(t0) + tid) * vh + head) + 1] : 0.f;
+    }
+    __syncthreads();
+    float * Mo = Mg + (int64_t(head) * gridDim.y + chunk) * C * C;
+    for (int i = tid; i < C * C; i += blockDim.x) {
+        const int t = i / C, j = i % C;
+        float a = 0.f, m = 0.f;
+        if (j <= t && t < cn) {
+            float kk = 0.f, qq = 0.f;
+            for (int d = 0; d < dim; ++d) { const float kj = K[j * P + d]; kk += K[t * P + d] * kj; qq += Q[t * P + d] * kj; }
+            const float ratio = expf(lg[t] - lg[j]);
+            if (j < t) a = bt[t] * ratio * kk;
+            m = ratio * qq;
+        }
+        A[t * (C + 1) + j] = a; Mo[i] = m;
+    }
+    __syncthreads();
+    if (tid < C) {  // column tid of (I + A)^-1 by forward substitution; columns are independent
+        const int c = tid;
+        for (int t = 0; t < C; ++t) T[t * (C + 1) + c] = t == c ? 1.f : 0.f;
+        for (int t = c + 1; t < C; ++t) {
+            float acc = 0.f;
+            for (int j = c; j < t; ++j) acc += A[t * (C + 1) + j] * T[j * (C + 1) + c];
+            T[t * (C + 1) + c] = -acc;
+        }
+    }
+    __syncthreads();
+    float * Uo = U + (int64_t(head) * gridDim.y + chunk) * C * dim, * Wo = W + (int64_t(head) * gridDim.y + chunk) * C * dim;
+    for (int i = tid; i < C * dim; i += blockDim.x) {
+        const int t = i / dim, d = i % dim;
+        float u = 0.f, w = 0.f;
+        for (int j = 0; j <= t; ++j) { const float tb = T[t * (C + 1) + j] * bt[j]; u += tb * V[j * P + d]; w += tb * eg[j] * K[j * P + d]; }
+        Uo[i] = u; Wo[i] = w;
+    }
+    if (tid < C) lgo[(int64_t(head) * gridDim.y + chunk) * C + tid] = lg[tid];
+}
+// The sequential part: per C-token chunk E = U - W S^T, O = g (Q S^T) + M E, S = g_C S + sum_j (g_C / g_j) e_j k_j^T.
+// Block = one value head x VS value columns; a thread owns output rows t = tid / 8 and columns v = tid % 8 + 8 k.
+template <int C, int VS>
+__global__ void __launch_bounds__(256) fn_gdn_seq_k(const float * qk, const float * U, const float * W, const float * Mg,
+                                                    const float * lgi, const float * state, float * next, float * out,
+                                                    int kh, int vh, int dim, int n, int chunks) {
+    extern __shared__ float sm[];
+    const int P = dim + 1, head = blockIdx.x, v0 = blockIdx.y * VS, tid = threadIdx.x, key_head = head % kh;
+    float * S = sm; float * Wc = S + VS * P; float * Qc = Wc + C * P; float * Kc = Qc + C * P;
+    float * E = Kc + C * P; float * M = E + C * (VS + 1); float * eg = M + C * C; float * rg = eg + C;
+    for (int i = tid; i < VS * dim; i += blockDim.x) S[(i / dim) * P + i % dim] = state[(int64_t(head) * dim + v0 + i / dim) * dim + i % dim];
+    constexpr int CPT = VS / 8;  // value columns per thread in the E / O phase
+    const int et = tid / 8, ev = tid % 8;
+    for (int c = 0; c < chunks; ++c) {
+        const int t0 = c * C, cn = min(C, n - t0);
+        __syncthreads();
+        const float * Ug = U + (int64_t(head) * chunks + c) * C * dim, * Wg = W + (int64_t(head) * chunks + c) * C * dim;
+        for (int i = tid; i < C * dim; i += blockDim.x) {
+            const int t = i / dim, d = i % dim; const bool in = t < cn; const int64_t tt = int64_t(t0 + t);
+            Wc[t * P + d] = Wg[i];
+            Qc[t * P + d] = in ? qk[(tt * 2 * kh + key_head) * dim + d] : 0.f;
+            Kc[t * P + d] = in ? qk[(tt * 2 * kh + kh + key_head) * dim + d] : 0.f;
+        }
+        for (int i = tid; i < C * VS; i += blockDim.x) E[(i / VS) * (VS + 1) + i % VS] = Ug[(i / VS) * dim + v0 + i % VS];
+        for (int i = tid; i < C * C; i += blockDim.x) M[i] = Mg[(int64_t(head) * chunks + c) * C * C + i];
+        if (tid < C) {
+            const float * l = lgi + (int64_t(head) * chunks + c) * C;
+            eg[tid] = expf(l[tid]); rg[tid] = tid < cn ? expf(l[cn - 1] - l[tid]) : 0.f;
+        }
+        __syncthreads();
+        float ws[CPT], qs[CPT];
+        for (int k = 0; k < CPT; ++k) { ws[k] = 0.f; qs[k] = 0.f; }
+        for (int d = 0; d < dim; ++d) {
+            const float w = Wc[et * P + d], q = Qc[et * P + d];
+            for (int k = 0; k < CPT; ++k) { const float sv = S[(ev + 8 * k) * P + d]; ws[k] += w * sv; qs[k] += q * sv; }
+        }
+        for (int k = 0; k < CPT; ++k) E[et * (VS + 1) + ev + 8 * k] -= ws[k];
+        __syncthreads();
+        if (et < cn)
+            for (int k = 0; k < CPT; ++k) {
+                const int v = ev + 8 * k;
+                float o = eg[et] * qs[k];
+                for (int j = 0; j <= et; ++j) o += M[et * C + j] * E[j * (VS + 1) + v];
+                out[(int64_t(t0 + et) * vh + head) * dim + v0 + v] = o;
+            }
+        __syncthreads();
+        const float gc = expf(lgi[(int64_t(head) * chunks + c) * C + cn - 1]);
+        const int sv_ = tid / 8, sd0 = tid % 8;  // S update: thread owns value row sv_ (VS == 32) and key columns sd0 + 8 k
+        for (int k = sd0; k < dim; k += 8) {
+            float acc = gc * S[sv_ * P + k];
+            for (int j = 0; j < cn; ++j) acc += rg[j] * E[j * (VS + 1) + sv_] * Kc[j * P + k];
+            S[sv_ * P + k] = acc;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < VS * dim; i += blockDim.x) next[(int64_t(head) * dim + v0 + i / dim) * dim + i % dim] = S[(i / dim) * P + i % dim];
+}
 __global__ void fn_gated_rms_k(const float * x, const float * gate, const float * weight, float * out,
                                int dim, float eps) {
     const int row = blockIdx.x, lane = threadIdx.x;
@@ -397,6 +708,19 @@ __global__ void fn_attention_gate_k(float * out, const float * qg, int dim, int 
 __global__ void fn_swiglu_bf16_h_k(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * o, int64_t n) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= n) return;
     const float a = __bfloat162float(g[i]); o[i] = __float2half_rn(a / (1.f + expf(-a)) * __bfloat162float(u[i]));
+}
+// same element arithmetic as fn_swiglu_bf16_h_k, only on the assignments of a grouped-expert pass (slot lists); blockIdx.x
+// strides over the slot's rows (a cap x slots grid would launch mostly empty blocks)
+__global__ void fn_swiglu_bf16_h_groups_k(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * o, const int * counts,
+                                               const int * groups, int capacity, int ff) {
+    const int slot = blockIdx.y, n = counts[slot];
+    for (int col = blockIdx.x; col < n; col += gridDim.x) {
+        const int64_t base = int64_t(groups[int64_t(slot) * capacity + col]) * ff;
+        for (int j = threadIdx.x; j < ff; j += blockDim.x) {
+            const int64_t i = base + j;
+            const float a = __bfloat162float(g[i]); o[i] = __float2half_rn(__fmul_rn(__fdiv_rn(a, __fadd_rn(1.f, expf(-a))), __bfloat162float(u[i])));
+        }
+    }
 }
 __global__ void fn_swiglu_f32_k(const float * g, const float * u, float * o, int64_t n) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= n) return;
@@ -512,7 +836,7 @@ template<int T> __global__ void fn_gemv_bf16_multi_k(const __nv_bfloat16 * w, co
     }
 }
 // One block per row (<= 256 threads): the columns spread over several warps instead of one.
-template<int T> __global__ void fn_gemv_bf16_few_k(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols) {
+template<int T> __global__ void fn_gemv_bf16_few_k(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t ldy) {
     const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const uint4 * wr = reinterpret_cast<const uint4 *>(w + int64_t(row) * cols);
     float sum[T];
@@ -539,7 +863,7 @@ template<int T> __global__ void fn_gemv_bf16_few_k(const __nv_bfloat16 * w, cons
     if (threadIdx.x < T) {
         float r = 0.f;
         for (int k = 0; k < int(blockDim.x / 32); ++k) r += part[threadIdx.x][k];
-        y[int64_t(threadIdx.x) * rows + row] = r;
+        y[int64_t(threadIdx.x) * ldy + row] = r;
     }
 }
 // fn_gemv_bf16_few_k for a prefill chunk: R rows x T tokens per block, so x is read once per R rows instead of once
@@ -619,10 +943,65 @@ void hc_init(const float * embedding, float * residual, int h, int c, int n, cud
     const int count = h * c * n;
     init_k<<<(int64_t(count) + 255) / 256, 256, 0, s>>>(embedding, residual, h, c, count);
 }
+void hc_combine_norm(const float * residual, const float * block, const float * inject, const float * gamma, float * combined, float * normed,
+                     int h, int c, int n, float eps, cudaStream_t s) {
+    shape(h, c, n);
+    if (!residual || !block || !inject || !gamma || !combined || !normed || !std::isfinite(eps) || eps <= 0.f) throw std::invalid_argument("HC combine+norm: invalid pointer or epsilon");
+    combine_norm_k<<<c * n, 256, 0, s>>>(residual, block, inject, gamma, combined, normed, h, c, eps);
+}
 void hc_norm(const float * x, const float * gamma, float * out, int h, int c, int n, float eps, cudaStream_t s) {
     shape(h, c, n);
     if (!x || !gamma || !out || !std::isfinite(eps) || eps <= 0.f) throw std::invalid_argument("HC norm: invalid pointer or epsilon");
     norm_k<<<c * n, 256, 0, s>>>(x, gamma, out, h, c, eps);
+}
+void hc_norm_bf16(const float * x, const float * gamma, float * out, __nv_bfloat16 * outb, int h, int c, int n, float eps, cudaStream_t s) {
+    shape(h, c, n);
+    if (!x || !gamma || !out || !outb || !std::isfinite(eps) || eps <= 0.f) throw std::invalid_argument("HC norm: invalid pointer or epsilon");
+    norm_bf16_k<<<c * n, 256, 0, s>>>(x, gamma, out, outb, h, c, eps);
+}
+// combine_k and norm_rs_bf16_k in one pass over the row (token, stream): out = residual + block * scatter is written
+// once and its sum of squares taken in the same loop (the same per-thread strides and reduction as norm_rs_bf16_k, so rs
+// and the bf16 image are bit-identical to the two kernels); the second pass reads the fresh row back from L2
+__global__ void combine_norm_rs_bf16_k(const float * residual, const float * block, const float * inject, float * out,
+                                       const float * gamma, float * rs, __nv_bfloat16 * outb, int h, int c, float eps) {
+    const int row = blockIdx.x, tid = threadIdx.x, token = row / c, stream = row % c;
+    const float scatter = 2.f / (1.f + expf(-inject[token * c + stream] / c));
+    const float * res = residual + int64_t(row) * h, * blk = block + int64_t(token) * h; float * dst = out + int64_t(row) * h;
+    float sum = 0.f;
+    for (int j = tid; j < h; j += blockDim.x) { const float v = __fadd_rn(res[j], __fmul_rn(blk[j], scatter)); dst[j] = v; sum += v * v; }
+    __shared__ float partial[256];
+    partial[tid] = sum;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(partial[0] / h + eps);
+    if (tid == 0) rs[row] = inv;
+    for (int j = tid; j < h; j += blockDim.x)
+        outb[int64_t(row) * h + j] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(dst[j], inv), gamma[stream * h + j]));
+}
+void hc_combine_norm_rs_bf16(const float * residual, const float * block, const float * inject, float * out, const float * gamma,
+                             float * rs, __nv_bfloat16 * outb, int h, int c, int n, float eps, cudaStream_t s) {
+    shape(h, c, n);
+    if (!residual || !block || !inject || !out || !gamma || !rs || !outb || !std::isfinite(eps) || eps <= 0.f)
+        throw std::invalid_argument("HC combine + norm (rs): invalid pointer or epsilon");
+    combine_norm_rs_bf16_k<<<c * n, 256, 0, s>>>(residual, block, inject, out, gamma, rs, outb, h, c, eps);
+}
+void hc_norm_rs_bf16(const float * x, const float * gamma, float * rs, __nv_bfloat16 * outb, int h, int c, int n, float eps, cudaStream_t s) {
+    shape(h, c, n);
+    if (!x || !gamma || !rs || !outb || !std::isfinite(eps) || eps <= 0.f) throw std::invalid_argument("HC norm (rs): invalid pointer or epsilon");
+    norm_rs_bf16_k<<<c * n, 256, 0, s>>>(x, gamma, rs, outb, h, c, eps);
+}
+void hc_mix_rs(const float * x, const float * rs, const float * gamma, const float * logits, float * out, int h, int c, int n, cudaStream_t s) {
+    shape(h, c, n);
+    if (!x || !rs || !gamma || !logits || !out) throw std::invalid_argument("HC mix (rs): null pointer");
+    const int count = h * n;
+    mix_rs_k<<<(int64_t(count) + 255) / 256, 256, 0, s>>>(x, rs, gamma, logits, out, h, c, count);
+}
+void hc_low_silu_bf16(float * x, __nv_bfloat16 * xb, int count, int c, cudaStream_t s) {
+    if (!x || !xb || count <= 0 || c <= 0) throw std::invalid_argument("HC low-rank: invalid shape or pointer");
+    low_bf16_k<<<(int64_t(count) + 255) / 256, 256, 0, s>>>(x, xb, count, c);
 }
 void hc_low_silu(float * x, int count, int c, cudaStream_t s) {
     if (!x || count <= 0 || c <= 0) throw std::invalid_argument("HC low-rank: invalid shape or pointer");
@@ -670,7 +1049,17 @@ void ple_apply(const float * hidden, const float * gated, const float * conv, fl
     ple_apply_k<<<(int64_t(count) + 255) / 256, 256, 0, s>>>(hidden, gated, conv, out, count);
 }
 static int g_gdn_chunk_min = -1;
+static int g_gdn_kh = 1;  // key-head prefill kernel (fn_gdn_set_kh(0): the per-token kernel, tests)
 void fn_gdn_set_chunk_min(int n) { g_gdn_chunk_min = n; }
+// grow-only GDN prefill workspaces (sized by the largest chunk), visible to the server's memory ledger and released after
+// a prompt (decode steps are small)
+static struct { float * work = nullptr; size_t cap = 0; float * gram = nullptr; size_t gcap = 0; float * wbuf = nullptr; size_t wcap = 0; } g_gdn_ws;
+size_t fn_gdn_workspace_bytes() { return (g_gdn_ws.cap + g_gdn_ws.gcap + g_gdn_ws.wcap) * sizeof(float); }
+void fn_gdn_release_workspaces() {
+    cudaDeviceSynchronize();
+    cudaFree(g_gdn_ws.work); cudaFree(g_gdn_ws.gram); cudaFree(g_gdn_ws.wbuf);
+    g_gdn_ws.work = g_gdn_ws.gram = g_gdn_ws.wbuf = nullptr; g_gdn_ws.cap = g_gdn_ws.gcap = g_gdn_ws.wcap = 0;
+}
 void fn_gdn(const float * qkv, const float * alpha, const float * beta, const float * neg_a,
             const float * bias, const float * state, float * next, float * out,
             int kh, int vh, int dim, int n, float eps, cudaStream_t s) {
@@ -682,7 +1071,7 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
         out == qkv || out == alpha || out == beta || out == neg_a || out == bias || out == state)
         throw std::invalid_argument("Flash-Next GDN: invalid shape, pointer, epsilon or buffer alias");
     {
-        static float * work = nullptr; static size_t cap = 0;
+        float *& work = g_gdn_ws.work; size_t & cap = g_gdn_ws.cap;
         const size_t need = size_t(n) * 2 * kh * dim + size_t(n) * vh * 2;
         if (need > cap) {
             cudaStreamCaptureStatus cs; cudaStreamIsCapturing(s, &cs);
@@ -694,8 +1083,14 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
         float * qk = work, * gates = work + size_t(n) * 2 * kh * dim;
         fn_gdn_prep_k<<<dim3(n, kh), 32, 0, s>>>(qkv, qk, kh, vh, dim, eps);
         fn_gdn_gates_k<<<(n * vh + 127) / 128, 128, 0, s>>>(alpha, beta, neg_a, bias, gates, vh, n);
+        // the key-head kernel (fn_gdn_kh_k) for prefills of 64+ tokens at the Flash-Next shape (dim 128,
+        // 3 value heads per key head): one launch walks the sub-chunk with the state in registers
+        if (g_gdn_kh > 0 && n >= 64 && dim == 128 && vh == 3 * kh) {
+            fn_gdn_kh_k<3><<<unsigned(kh * (128 / gdnkh::CB)), dim3(gdnkh::CB, gdnkh::RG), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, n);
+            return;
+        }
         // TQFN_GDN_CHUNK_MIN (default 64; 0 = off): prefills of that many tokens use the chunked kernel (C 32, 32 value columns)
-        if (g_gdn_chunk_min < 0) g_gdn_chunk_min = std::getenv("TQFN_GDN_CHUNK_MIN") ? std::atoi(std::getenv("TQFN_GDN_CHUNK_MIN")) : 0;  // off until it beats the per-token kernel
+        if (g_gdn_chunk_min < 0) g_gdn_chunk_min = std::getenv("TQFN_GDN_CHUNK_MIN") ? std::atoi(std::getenv("TQFN_GDN_CHUNK_MIN")) : 64;  // WY chunked path beats the per-token kernel from 64 tokens
         const int chunk_min = g_gdn_chunk_min;
         if (chunk_min > 0 && n >= chunk_min && dim <= 128 && dim % 32 == 0) {
             constexpr int C = 32, VS = 32;
@@ -703,17 +1098,56 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             static bool attr = false;
             if (!attr) { cudaFuncSetAttribute(fn_gdn_chunk_k<C, VS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr = true; }
             const int chunks = (n + C - 1) / C;
-            static float * gram = nullptr; static size_t gcap = 0;
+            float *& gram = g_gdn_ws.gram; size_t & gcap = g_gdn_ws.gcap;
             const size_t gneed = size_t(kh) * chunks * 2 * C * C;
             if (gneed > gcap) { if (gram) cudaFree(gram); if (cudaMalloc(&gram, gneed * sizeof(float)) != cudaSuccess) throw std::runtime_error("GDN chunk: gram allocation failed"); gcap = gneed; }
+            static const bool wy = !std::getenv("TQFN_GDN_WY") || std::atoi(std::getenv("TQFN_GDN_WY")) != 0;
+            if (wy) {  // parallel per-chunk WY terms, then the sequential state pass
+                float *& wbuf = g_gdn_ws.wbuf; size_t & wcap = g_gdn_ws.wcap;
+                const size_t per = size_t(vh) * chunks;
+                const size_t wneed = per * C * dim * 2 + per * C * C + per * C;
+                if (wneed > wcap) {
+                    cudaStreamCaptureStatus cs; cudaStreamIsCapturing(s, &cs);
+                    if (cs != cudaStreamCaptureStatusNone) throw std::runtime_error("GDN WY: workspace must grow outside capture");
+                    if (wbuf) cudaFree(wbuf);
+                    if (cudaMalloc(&wbuf, wneed * sizeof(float)) != cudaSuccess) throw std::runtime_error("GDN WY: allocation failed");
+                    wcap = wneed;
+                }
+                float * U = wbuf, * W = U + per * C * dim, * Mg = W + per * C * dim, * lg = Mg + per * C * C;
+                const size_t wsm = (3 * size_t(C) * (dim + 1) + 2 * size_t(C) * (C + 1) + 3 * C) * sizeof(float);
+                const size_t ssm = (size_t(VS) * (dim + 1) + 3 * size_t(C) * (dim + 1) + size_t(C) * (VS + 1) + size_t(C) * C + 2 * C) * sizeof(float);
+                static bool wattr = false;
+                if (!wattr) {
+                    cudaFuncSetAttribute(fn_gdn_wy_k<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(wsm));
+                    cudaFuncSetAttribute(fn_gdn_seq_k<C, VS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(ssm));
+                    wattr = true;
+                }
+                fn_gdn_wy_k<C><<<dim3(vh, chunks), 256, wsm, s>>>(qkv, qk, gates, U, W, Mg, lg, kh, vh, dim, n);
+                // TQFN_GDN_SEQ_FAST (default on): Omega's sequential pass (gdn_seq_fast.cuh) at dim 128; 0 = fn_gdn_seq_k
+                static const bool seq_fast = !(std::getenv("TQFN_GDN_SEQ_FAST") && std::atoi(std::getenv("TQFN_GDN_SEQ_FAST")) == 0);
+                if (seq_fast && dim == 128) fn_gdn_seq_fast(qk, U, W, Mg, lg, state, next, out, kh, vh, dim, n, chunks, s);
+                else fn_gdn_seq_k<C, VS><<<dim3(vh, dim / VS), 256, ssm, s>>>(qk, U, W, Mg, lg, state, next, out, kh, vh, dim, n, chunks);
+                return;
+            }
             const size_t gsmem = 2 * size_t(C) * (dim + 1) * sizeof(float);
             fn_gdn_chunk_gram_k<C><<<dim3(kh, chunks), 256, gsmem, s>>>(qk, gram, kh, dim, n);
             fn_gdn_chunk_k<C, VS><<<dim3(vh, dim / VS), 256, smem, s>>>(qkv, qk, gates, gram, state, next, out, kh, vh, dim, n);
             return;
         }
-        if (dim % 32 == 0) fn_gdn_main_k<8><<<dim3(vh, dim / 32), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);  // 8 value columns per warp
+        // TQFN_GDN_VPW (default 8): value columns per warp (each column's arithmetic is the same for any value)
+        static const int vpw = std::getenv("TQFN_GDN_VPW") ? std::atoi(std::getenv("TQFN_GDN_VPW")) : 8;
+        if (dim % 32 == 0 && vpw == 4) fn_gdn_main_k<4><<<dim3(vh, dim / 16), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
+        else if (dim % 32 == 0 && vpw == 2) fn_gdn_main_k<2><<<dim3(vh, dim / 8), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
+        else if (dim % 32 == 0) fn_gdn_main_k<8><<<dim3(vh, dim / 32), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);  // 8 value columns per warp
         else fn_gdn_main_k<1><<<dim3(vh, dim / 4), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
     }
+}
+void fn_gdn_set_kh(int on) { g_gdn_kh = on; }
+__global__ void h_to_f32_k(const __half * x, float * y, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) y[i] = __half2float(x[i]);
+}
+void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t s) {
+    if (n > 0) h_to_f32_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(x, y, n);
 }
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
                   int heads, int dim, int n, float eps, cudaStream_t s) {
@@ -763,6 +1197,12 @@ void fn_attention_gate(float * out, const float * qg, int heads, int dim, int n,
 void fn_swiglu_bf16_h(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * o, int64_t n, cudaStream_t s) {
     if (n <= 0 || !g || !u || !o) throw std::invalid_argument("Flash-Next swiglu: invalid shape or pointer");
     fn_swiglu_bf16_h_k<<<(n + 255) / 256, 256, 0, s>>>(g, u, o, n);
+}
+void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * o, const int * counts, const int * groups,
+                             int slots, int capacity, int ff, cudaStream_t s) {
+    if (slots <= 0 || slots > 65535 || capacity <= 0 || ff <= 0 || !g || !u || !o || !counts || !groups)
+        throw std::invalid_argument("Flash-Next grouped swiglu: invalid shape or pointer");
+    fn_swiglu_bf16_h_groups_k<<<dim3(unsigned(std::min(capacity, 64)), unsigned(slots)), 256, 0, s>>>(g, u, o, counts, groups, capacity, ff);
 }
 void fn_swiglu_f32(const float * g, const float * u, float * o, int64_t n, cudaStream_t s) {
     if (n <= 0 || !g || !u || !o) throw std::invalid_argument("Flash-Next swiglu: invalid shape or pointer");
@@ -839,10 +1279,10 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
     for (int t0 = 0; t0 < tokens; t0 += 4) {
         const int k = std::min(4, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * rows;
         if (few) {
-            if (k == 1) fn_gemv_bf16_few_k<1><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols);
-            else if (k == 2) fn_gemv_bf16_few_k<2><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols);
-            else if (k == 3) fn_gemv_bf16_few_k<3><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols);
-            else fn_gemv_bf16_few_k<4><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols);
+            if (k == 1) fn_gemv_bf16_few_k<1><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
+            else if (k == 2) fn_gemv_bf16_few_k<2><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
+            else if (k == 3) fn_gemv_bf16_few_k<3><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
+            else fn_gemv_bf16_few_k<4><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
         } else if (shrt) {
             const int sb = (rows * 8 + 255) / 256;
             if (k == 1) fn_gemv_bf16_short_k<1><<<sb, 256, 0, s>>>(w, xt, yt, rows, cols);
@@ -853,6 +1293,18 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
         else if (k == 2) fn_gemv_bf16_multi_k<2><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
         else if (k == 3) fn_gemv_bf16_multi_k<3><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
         else fn_gemv_bf16_multi_k<4><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
+    }
+}
+void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
+    if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 strided gemv: invalid shape or pointer");
+    if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 strided gemv: rows take the warp-per-row path");
+    const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
+    for (int t0 = 0; t0 < tokens; t0 += 4) {
+        const int k = std::min(4, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * ldy;
+        if (k == 1) fn_gemv_bf16_few_k<1><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
+        else if (k == 2) fn_gemv_bf16_few_k<2><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
+        else if (k == 3) fn_gemv_bf16_few_k<3><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
+        else fn_gemv_bf16_few_k<4><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
     }
 }
 } // namespace tqllm_cuda

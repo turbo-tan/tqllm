@@ -96,7 +96,7 @@ __global__ void topk_k(const float * logits, int * ids, float * weights, float *
 // same per-thread sums (j = t, t + 256, ...), the same 128/64/32 tree and the same final warp reduction; the argmax rule
 // (larger value, ties -> lower index) has one answer whatever the order. No block barriers.
 template <int R>
-__global__ void topk_warp_k(const float * logits, int * ids, float * weights, float * shared_weights, int e, int k, float scale) {
+__device__ __forceinline__ void topk_warp_body(const float * logits, int * ids, float * weights, float * shared_weights, int e, int k, float scale) {
     const int token = blockIdx.x, lane = threadIdx.x;
     const float * x = logits + int64_t(token) * (e + 1);
     float p[8][R];
@@ -151,6 +151,17 @@ __global__ void topk_warp_k(const float * logits, int * ids, float * weights, fl
         for (int i = 0; i < k; ++i) weights[int64_t(token) * k + i] *= factor;
         shared_weights[token] = 1.f / (1.f + expf(-x[e]));
     }
+}
+template <int R>
+__global__ void topk_warp_k(const float * logits, int * ids, float * weights, float * shared_weights, int e, int k, float scale) {
+    topk_warp_body<R>(logits, ids, weights, shared_weights, e, k, scale);
+}
+// Two routings in one launch (blockIdx.y picks the set): each token's selection is topk_warp_k's.
+struct TopkSet { const float * logits; int * ids; float * weights; float * shared_weights; };
+template <int R>
+__global__ void topk_warp2_k(TopkSet a, TopkSet b, int e, int k, float scale) {
+    const TopkSet & t = blockIdx.y ? b : a;
+    topk_warp_body<R>(t.logits, t.ids, t.weights, t.shared_weights, e, k, scale);
 }
 
 __global__ void group_k(const int * ids, int * counts, int * groups, int n, int k) {
@@ -245,6 +256,13 @@ void moe_topk_variant(const float * logits, int * ids, float * weights, float * 
     if (warp && e <= 512) topk_warp_k<2><<<n, 32, 0, stream>>>(logits, ids, weights, shared_weights, e, k, scale);
     else if (warp && e <= 1024) topk_warp_k<4><<<n, 32, 0, stream>>>(logits, ids, weights, shared_weights, e, k, scale);
     else topk_k<<<n, 256, size_t(e) * sizeof(float), stream>>>(logits, ids, weights, shared_weights, e, k, scale);
+}
+void moe_topk2(const float * logits, int * ids, float * weights, float * shared_weights,
+               const float * logits2, int * ids2, float * weights2, float * shared_weights2, int e, int k, int n, float scale, cudaStream_t stream) {
+    if (e <= 0 || e > 1024 || k <= 0 || k > e || n <= 0) throw std::invalid_argument("moe_topk2: invalid shape");
+    const TopkSet a{logits, ids, weights, shared_weights}, b{logits2, ids2, weights2, shared_weights2};
+    if (e <= 512) topk_warp2_k<2><<<dim3(unsigned(n), 2u), 32, 0, stream>>>(a, b, e, k, scale);
+    else topk_warp2_k<4><<<dim3(unsigned(n), 2u), 32, 0, stream>>>(a, b, e, k, scale);
 }
 void moe_group(const int * ids, int * counts, int * groups, int e, int n, int k, cudaStream_t stream) {
     if (e <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("moe_group: invalid shape");  // k > e is fine: ids outside the set are -1

@@ -18,6 +18,9 @@ constexpr int kParamCopyMax = 8192;  // bytes per launch (kernel parameters, CUD
 void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream);
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,
               int experts, int topk, int n, float scale, cudaStream_t);
+// moe_topk on two routings in one launch (this layer's and the next layer's prediction); e <= 1024, warp path.
+void moe_topk2(const float * logits, int * ids, float * weights, float * shared_weights,
+               const float * logits2, int * ids2, float * weights2, float * shared_weights2, int e, int k, int n, float scale, cudaStream_t);
 void moe_topk_variant(const float * logits, int * ids, float * weights, float * shared_weights,
                       int e, int k, int n, float scale, bool warp, cudaStream_t stream);
 // One assignment per expert per token; groups [experts][n], counts [experts]. Negative ids are skipped.

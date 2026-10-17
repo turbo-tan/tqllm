@@ -89,6 +89,15 @@ public:
     void set_layer_slots(const std::vector<int> & per_layer);  // before the first prepare; same total bytes is the caller's choice
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;
+    bool has_layout(int layer) const;  // a bank existed once: bank_layout / bank_mat answer without one (no device pointers)
+    // Frees least-recently-used banks (never `protect`) until `want` bytes of device memory are free, after all queued work.
+    // Returns the evicted layers; prepare() recreates a bank on its next use.
+    std::vector<int> evict_until_free(size_t want, int protect = -1);
+    std::vector<int> banks_lru() const;  // layers with a bank, least recently used first
+    size_t bank_bytes(int layer) const;  // device bytes of that layer's bank (0: none)
+    void release_bank(int layer);        // frees the bank now (after all queued work); prepare() recreates it on use
+    void reset_usage();                  // forgets the expert frequencies (victim policy), keeps the banks
+    void reserve_staging(int min_cap = 0);  // staging for a whole bank (at least min_cap experts), so no prepare grows it mid-request
     bool resident(int layer, int expert) const;  // in the layer's bank now (no side effects)
     BankLayout bank_layout(int layer) const;                // piece sizes; src0 set when a prepacked source exists
     BankState bank_state(int layer) const;                  // waits for pending host-side copies first

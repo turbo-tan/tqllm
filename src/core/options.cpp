@@ -54,6 +54,18 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "idle" && v != "turn") throw std::invalid_argument("--kv-compact-at must be idle or turn");
         o.kv_compact_turn = v == "turn";
     }
+    else if (a == "--prefill-chunk") o.prefill_chunk = count(256);
+    else if (a == "--prefill-sub") o.prefill_sub = count(16);
+    else if (a == "--prefill-stage") o.prefill_stage = count(1);
+    else if (a == "--prefill-reserve-mb") o.prefill_reserve_mb = count(0);
+    else if (a == "--prefill-arena-mb") o.prefill_arena_mb = count(0);
+    else if (a == "--dense-cache-mb") o.dense_cache_mb = count(0);
+    else if (a == "--prefill-borrow") {
+        const std::string v = value();
+        if (v != "all" && v != "auto" && (v.empty() || v.find_first_not_of("0123456789") != std::string::npos))
+            throw std::invalid_argument("--prefill-borrow must be all, auto or a bank count");
+        o.prefill_borrow = v;
+    }
     else if (a == "--prefill-int8") {
         const std::string v = value();
         if (v != "on" && v != "off") throw std::invalid_argument("--prefill-int8 must be on or off");
@@ -113,6 +125,8 @@ const char * engine_options_usage() {
     return "  engine: [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
+           "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"
+           "          [--prefill-arena-mb N (3800)] [--dense-cache-mb N (600)] [--prefill-borrow auto|all|N (auto)]\n"
            "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)] [--mtp (draft with the model's own MTP head; text-only, greedy, --np 1) [--mtp-from N --mtp-depth D with -md: MTP for prompts of N+ tokens]] [-fitl on|off (on: pick KV / context / prefill buffers to fit and announce them; off: refuse instead)] [--gemm-rows N (prefill FP16 weight blocks of N rows; 0 whole matrices)]\n"
            "          [--slot-reserve MiB free per parallel slot (128)] [--graph-cache captured CUDA graphs kept (256)]\n";
 }

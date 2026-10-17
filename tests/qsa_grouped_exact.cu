@@ -55,6 +55,7 @@ static bool run(int tokens, int width, int first_cells, int heads, int kv_heads,
     return diff == 0;
 }
 int main() {
+    tqllm_cuda::qsa_set_tc(0); tqllm_cuda::qsa_set_split(0);  // the scalar kernels; the tensor-core and split paths have their own tolerance tests
     if (std::getenv("QSA_BENCH")) return run(1024, 2051, 14000, 24, 2, 256) ? 0 : 1;
     bool ok = run(64, 2051, 4096, 24, 2, 256);
     ok = run(33, 2051, 2100, 24, 2, 256) && ok;

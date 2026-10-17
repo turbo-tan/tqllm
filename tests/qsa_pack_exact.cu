@@ -1,5 +1,6 @@
 // QSA indexer block scores (qsa_score_pack): the fixed 4-head x 128 kernel vs the generic one, sort keys bitwise equal,
-// including blocks not yet complete for a query (key 0), a last group of fewer than 16 blocks and negative dots.
+// including blocks not yet complete for a query (key 0), a last group of fewer than 16 blocks, a partial group of
+// queries and negative dots.
 #include "qwen4exp_kernels.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -43,6 +44,8 @@ int main() {
     if (std::getenv("QSA_BENCH")) return run(23413, 1024, 92631, 4) ? 0 : 1;
     bool ok = run(23413, 64, 93590, 4);   // 93.7K prompt, last chunk
     ok = run(1000, 64, 3970, 4) && ok;    // early blocks incomplete for the first queries
+    ok = run(23413, 37, 93590, 4) && ok;  // a partial group of 16 queries
+    ok = run(5000, 100, 1000, 4) && ok;   // a query group that crosses the completion boundary of many block groups
     ok = run(37, 16, 120, 4) && ok;       // last group of 5 blocks
     ok = run(1, 4, 3, 4) && ok;
     std::puts(ok ? "qsa_pack_exact PASS" : "qsa_pack_exact FAIL");

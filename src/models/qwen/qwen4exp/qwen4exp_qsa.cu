@@ -190,59 +190,84 @@ __global__ void score_pack_batch(const float * pooled_keys, const float * query,
     }
 }
 
-// score_pack_batch for 4 indexer heads of 128: a warp scores RB blocks at once with q in registers, and the RB * 4 dots
-// reduce in a transposing butterfly (the pairs of the shfl_down tree; a + b == b + a) instead of 5 shuffles each.
-// Same keys bit for bit.
-template<int RB>
-__global__ void score_pack_fixed_k(const float * pooled_keys, const float * query, uint64_t * keys, int blocks, int first_position, int ratio) {
+// score_pack_batch for 4 indexer heads of 128: a CTA of W warps scores W * RB blocks for QT consecutive queries, the
+// blocks' keys in registers and the queries staged once in shared memory (one key read per QT queries and one query read
+// per W * RB blocks instead of one each per (query, block): at 128K the re-reads made this kernel 13 s of a 74 s prefill);
+// the RB * 4 dots of a query reduce in a transposing butterfly (the pairs of the shfl_down tree; a + b == b + a) instead
+// of 5 shuffles each. Same keys bit for bit.
+// One level of the transposing butterfly over a lane's N values: lanes with bit OFF set keep their upper half and add
+// the partner's lower half, the others the reverse; N / 2 values remain. Compile-time OFF and N keep the array in
+// registers (a runtime loop turned the 15 shuffles into ~500 instructions of register-array emulation).
+template<int OFF, int N>
+__device__ __forceinline__ void butterfly_fold(float (&a)[16], int lane) {
+    const bool upper = lane & OFF;
+    #pragma unroll
+    for (int j = 0; j < N / 2; ++j) {
+        const float mine = upper ? a[j + N / 2] : a[j], send = upper ? a[j] : a[j + N / 2];
+        a[j] = mine + __shfl_xor_sync(0xffffffffu, send, OFF);
+    }
+    if constexpr (OFF > 2) butterfly_fold<OFF / 2, N / 2>(a, lane);
+}
+template<int RB, int QT, int W>
+__global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * pooled_keys, const float * query, uint64_t * keys,
+                                                            int blocks, int tokens, int first_position, int ratio) {
     constexpr int H = 4, DIM = 128, J = DIM / 32;
     static_assert(RB == 4, "lane mapping below assumes 16 values per lane");
-    const int lane = threadIdx.x, t = blockIdx.y, block0 = (blockIdx.x * blockDim.y + threadIdx.y) * RB;
+    __shared__ float4 qs[QT][H][32];  // [query][head][lane] = the lane's 4 dims (lane + 32 j), one 16-byte read per head
+    const int lane = threadIdx.x, t0 = blockIdx.y * QT, block0 = (blockIdx.x * W + threadIdx.y) * RB;
+    const int nq = min(QT, tokens - t0);
+    for (int i = threadIdx.y * 32 + lane; i < nq * H * 32; i += 32 * W) {  // float4 i of the group's queries, transposed
+        const int qi = i / (H * 32), h = (i / 32) % H, m = i % 32;
+        const float4 v = reinterpret_cast<const float4 *>(query + int64_t(t0 + qi) * H * DIM + h * DIM)[m];
+        float * dst = reinterpret_cast<float *>(&qs[qi][h][0]);
+        dst[((4 * m) % 32) * 4 + (4 * m) / 32] = v.x; dst[((4 * m + 1) % 32) * 4 + (4 * m + 1) / 32] = v.y;
+        dst[((4 * m + 2) % 32) * 4 + (4 * m + 2) / 32] = v.z; dst[((4 * m + 3) % 32) * 4 + (4 * m + 3) / 32] = v.w;
+    }
+    __syncthreads();
     if (block0 >= blocks) return;
-    uint64_t * out = keys + int64_t(t) * blocks;
-    const int complete = (first_position + t + 1) / ratio;
-    const float * q = query + int64_t(t) * H * DIM;
-    float qr[H][J];
-    #pragma unroll
-    for (int h = 0; h < H; ++h)
-        #pragma unroll
-        for (int j = 0; j < J; ++j) qr[h][j] = q[h * DIM + lane + 32 * j];
-    float a[RB * H];
+    float kv[RB][J];
     #pragma unroll
     for (int b = 0; b < RB; ++b) {
         const float * k = pooled_keys + int64_t(min(block0 + b, blocks - 1)) * DIM;
-        float kv[J];
         #pragma unroll
-        for (int j = 0; j < J; ++j) kv[j] = k[lane + 32 * j];
+        for (int j = 0; j < J; ++j) kv[b][j] = k[lane + 32 * j];
+    }
+    const int ob = block0 + (((lane >> 4) << 1) | ((lane >> 3) & 1));  // the block whose total lands on this lane
+    int complete = (first_position + t0 + 1) / ratio, rem = (first_position + t0 + 1) % ratio;  // complete blocks of query t
+    #pragma unroll 1
+    for (int qi = 0; qi < QT; ++qi, complete += ++rem == ratio ? (rem = 0, 1) : 0) {
+        const int t = t0 + qi;
+        if (t >= tokens) return;
+        uint64_t * out = keys + int64_t(t) * blocks;
+        if (block0 >= complete) {  // no block of the group complete for this query: every key 0
+            if ((lane & 7) == 0 && ob < blocks) out[ob] = 0;
+            continue;
+        }
+        float a[RB * H];
         #pragma unroll
         for (int h = 0; h < H; ++h) {
-            float dot = 0.f;
+            const float4 q4 = qs[qi][h][lane];
+            const float qr[J] = {q4.x, q4.y, q4.z, q4.w};
             #pragma unroll
-            for (int j = 0; j < J; ++j) dot = fmaf(kv[j], qr[h][j], dot);
-            a[b * H + h] = dot;
+            for (int b = 0; b < RB; ++b) {
+                float dot = 0.f;
+                #pragma unroll
+                for (int j = 0; j < J; ++j) dot = fmaf(kv[b][j], qr[j], dot);
+                a[b * H + h] = dot;
+            }
         }
-    }
-    // 16 values: halve at offsets 16, 8, 4, 2; lane bits 4..1 then name (block, head) = (bit4 bit3, bit2 bit1)
-    #pragma unroll
-    for (int off = 16, n = RB * H; off >= 2; off >>= 1, n >>= 1) {
-        const bool upper = lane & off; const int half = n / 2;
-        #pragma unroll
-        for (int j = 0; j < half; ++j) {
-            const float mine = upper ? a[j + half] : a[j], send = upper ? a[j] : a[j + half];
-            a[j] = mine + __shfl_xor_sync(0xffffffffu, send, off);
+        // 16 values: halve at offsets 16, 8, 4, 2; lane bits 4..1 then name (block, head) = (bit4 bit3, bit2 bit1)
+        butterfly_fold<16, RB * H>(a, lane);
+        const float dot = a[0] + __shfl_xor_sync(0xffffffffu, a[0], 1);
+        // heads 1..3 of this lane's block sit 2, 4, 6 lanes up; the total adds them in head order as score_pack_batch does
+        const float d1 = __shfl_down_sync(0xffffffffu, dot, 2), d2 = __shfl_down_sync(0xffffffffu, dot, 4), d3 = __shfl_down_sync(0xffffffffu, dot, 6);
+        if ((lane & 7) == 0 && ob < blocks) {
+            if (ob >= complete) { out[ob] = 0; continue; }
+            float total = 0.f;
+            total += fmaxf(dot, 0.f); total += fmaxf(d1, 0.f); total += fmaxf(d2, 0.f); total += fmaxf(d3, 0.f);
+            const float score = total == 0.f ? 0.f : total;
+            out[ob] = (uint64_t(__float_as_uint(score)) << 32) | uint32_t(~uint32_t(ob));
         }
-    }
-    const float dot = a[0] + __shfl_xor_sync(0xffffffffu, a[0], 1);
-    // heads 1..3 of this lane's block sit 2, 4, 6 lanes up; the total adds them in head order as score_pack_batch does
-    const float d1 = __shfl_down_sync(0xffffffffu, dot, 2), d2 = __shfl_down_sync(0xffffffffu, dot, 4), d3 = __shfl_down_sync(0xffffffffu, dot, 6);
-    if ((lane & 7) == 0) {
-        const int b = ((lane >> 4) << 1) | ((lane >> 3) & 1), block = block0 + b;
-        if (block >= blocks) return;
-        if (block >= complete) { out[block] = 0; return; }
-        float total = 0.f;
-        total += fmaxf(dot, 0.f); total += fmaxf(d1, 0.f); total += fmaxf(d2, 0.f); total += fmaxf(d3, 0.f);
-        const float score = total == 0.f ? 0.f : total;
-        out[block] = (uint64_t(__float_as_uint(score)) << 32) | uint32_t(~uint32_t(block));
     }
 }
 
@@ -332,6 +357,96 @@ __global__ void attention_direct(const float * query, const __nv_bfloat16 * keys
             if (cell[row] >= 0)  // skipped rows add fmaf(w, 0, value) == value in the gathered layout
                 value = fmaf(scores[row], __bfloat162float(values[(int64_t(cell[row]) * kv_heads + kv_head) * dim + d]), value);
         output[d] = value * inv;
+    }
+}
+// TQFN_QSA_SPLIT=S: decode attention split over the selected positions (flash-decoding): block (head, row, slice) scores its
+// width / S positions and writes its max, its exp-sum and its weighted value sum; attention_merge combines the S slices.
+// heads * rows blocks (72 at verify) leave most SMs idle; S = 8 gives 576. Not bit-identical to attention_direct (the
+// softmax and value sums are split), a numeric flag.
+__global__ void attention_split(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
+                                const int32_t * positions, const uint8_t * valid, float * part, int width, int first_cells,
+                                int heads, int kv_heads, int dim, int splits) {
+    const int head = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int kv_head = head / (heads / kv_heads), cells = first_cells + t;
+    const int per = (width + splits - 1) / splits, r0 = sp * per, r1 = min(width, r0 + per), nr = max(0, r1 - r0);
+    const float * q = query + (int64_t(t) * heads + head) * dim;
+    positions += int64_t(t) * width; valid += int64_t(t) * width;
+    float * out = part + ((int64_t(t) * heads + head) * splits + sp) * (dim + 2);
+    extern __shared__ float scores[];
+    int * cell = reinterpret_cast<int *>(scores + per);
+    __shared__ float reduction[128];
+    for (int i = tid; i < nr; i += 128) {
+        const int row = r0 + i, pos = positions[row];
+        cell[i] = valid[row] && pos >= 0 && pos < cells ? pos : -1;
+    }
+    __syncthreads();
+    float qreg[8];
+    const int nd = (dim + 31) / 32;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) qreg[i] = i < nd && lane + 32 * i < dim ? q[lane + 32 * i] : 0.f;
+    constexpr int R = 4;
+    for (int i0 = warp * R; i0 < nr; i0 += 4 * R) {
+        float dot[R];
+#pragma unroll
+        for (int j = 0; j < R; ++j) {
+            dot[j] = 0.f; const int i = i0 + j;
+            if (i < nr && cell[i] >= 0) {
+                const __nv_bfloat16 * kr = keys + (int64_t(cell[i]) * kv_heads + kv_head) * dim;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) if (k < nd && lane + 32 * k < dim) dot[j] = fmaf(qreg[k], __bfloat162float(kr[lane + 32 * k]), dot[j]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < R; ++j) for (int delta = 16; delta; delta >>= 1) dot[j] += __shfl_down_sync(0xffffffffu, dot[j], delta);
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < R; ++j) { const int i = i0 + j; if (i < nr) scores[i] = valid[r0 + i] ? dot[j] * rsqrtf(float(dim)) : -INFINITY; }
+    }
+    __syncthreads();
+    float maximum = -INFINITY;
+    for (int i = tid; i < nr; i += 128) maximum = fmaxf(maximum, scores[i]);
+    reduction[tid] = maximum;
+    __syncthreads();
+    for (int delta = 64; delta; delta >>= 1) { if (tid < delta) reduction[tid] = fmaxf(reduction[tid], reduction[tid + delta]); __syncthreads(); }
+    maximum = reduction[0];
+    __syncthreads();
+    float sum = 0.f;
+    if (isfinite(maximum))
+        for (int i = tid; i < nr; i += 128) { const float w = valid[r0 + i] ? expf(scores[i] - maximum) : 0.f; scores[i] = w; sum += w; }
+    reduction[tid] = sum;
+    __syncthreads();
+    for (int delta = 64; delta; delta >>= 1) { if (tid < delta) reduction[tid] += reduction[tid + delta]; __syncthreads(); }
+    if (tid == 0) { out[dim] = maximum; out[dim + 1] = reduction[0]; }
+    for (int d = tid; d < dim; d += 128) {
+        float value = 0.f;
+        if (isfinite(maximum)) {
+            constexpr int U = 8; int i = 0;
+            for (; i + U <= nr; i += U) {
+                float v[U];
+#pragma unroll
+                for (int j = 0; j < U; ++j) { const int cr = cell[i + j]; v[j] = cr >= 0 ? __bfloat162float(values[(int64_t(cr) * kv_heads + kv_head) * dim + d]) : 0.f; }
+#pragma unroll
+                for (int j = 0; j < U; ++j) value = fmaf(scores[i + j], v[j], value);
+            }
+            for (; i < nr; ++i) if (cell[i] >= 0) value = fmaf(scores[i], __bfloat162float(values[(int64_t(cell[i]) * kv_heads + kv_head) * dim + d]), value);
+        }
+        out[d] = value;
+    }
+}
+__global__ void attention_merge(const float * part, float * output, int heads, int dim, int splits) {
+    const int head = blockIdx.x, t = blockIdx.y;
+    const float * p = part + (int64_t(t) * heads + head) * splits * (dim + 2);
+    float m = -INFINITY;
+    for (int s = 0; s < splits; ++s) m = fmaxf(m, p[s * (dim + 2) + dim]);
+    float * o = output + (int64_t(t) * heads + head) * dim;
+    if (!isfinite(m)) { for (int d = threadIdx.x; d < dim; d += blockDim.x) o[d] = 0.f; return; }
+    float l = 0.f;
+    for (int s = 0; s < splits; ++s) { const float ms = p[s * (dim + 2) + dim]; if (isfinite(ms)) l += p[s * (dim + 2) + dim + 1] * expf(ms - m); }
+    const float inv = 1.f / l;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = 0.f;
+        for (int s = 0; s < splits; ++s) { const float ms = p[s * (dim + 2) + dim]; if (isfinite(ms)) v = fmaf(p[s * (dim + 2) + d], expf(ms - m), v); }
+        o[d] = v * inv;
     }
 }
 // Grouped selected attention, three passes with the arithmetic of attention_direct (same dot order, same reductions):
@@ -647,23 +762,182 @@ void qsa_score_pack(const float * pooled_keys, const float * query, uint64_t * k
                     int heads, int dim, int tokens, cudaStream_t stream, int fixed) {
     if (fixed < 0) fixed = 1;  // fixed-shape kernels (bitwise equal to the generic ones, test-qsa-pack-exact)
     if (fixed && heads == 4 && dim == 128)
-        score_pack_fixed_k<4><<<dim3(unsigned((blocks + 15) / 16), unsigned(tokens)), dim3(32, 4), 0, stream>>>(pooled_keys, query, keys, blocks, first_position, ratio);
+        score_pack_fixed_k<4, 16, 8><<<dim3(unsigned((blocks + 31) / 32), unsigned((tokens + 15) / 16)), dim3(32, 8), 0, stream>>>(pooled_keys, query, keys, blocks, tokens, first_position, ratio);
     else
         score_pack_batch<<<dim3((blocks + 3) / 4, tokens), dim3(32, 4), 0, stream>>>(pooled_keys, query, keys, blocks, first_position, ratio, heads, dim);
     ck(cudaPeekAtLastError());
 }
 
+static int g_qsa_split = -1;  // -1: TQFN_QSA_SPLIT, else qsa_set_split()
+constexpr int64_t kQsaSplitPart = int64_t(16) * 32 * 16 * (256 + 2);  // rows x heads x splits x (dim + 2)
+void qsa_set_split(int splits) { g_qsa_split = splits; }
+// TQFN_QSA_SPLIT (default 16; 0 or 1 = attention_direct): slices per decode attention row
+static int qsa_split_count() {
+    static const int env = std::getenv("TQFN_QSA_SPLIT") ? std::atoi(std::getenv("TQFN_QSA_SPLIT")) : 16;
+    return g_qsa_split >= 0 ? g_qsa_split : env;
+}
+static float * g_qsa_split_part = nullptr;
+static float * qsa_split_scratch(cudaStream_t stream) {
+    if (!g_qsa_split_part) {
+        cudaStreamCaptureStatus cs; cudaStreamIsCapturing(stream, &cs);
+        if (cs != cudaStreamCaptureStatusNone) throw std::runtime_error("QSA split: scratch must be allocated outside capture");
+        ck(cudaMalloc(&g_qsa_split_part, size_t(kQsaSplitPart) * sizeof(float)));
+    }
+    return g_qsa_split_part;
+}
+// at start-up, before the expert banks take the free memory (allocated mid-request it can fail on a full device)
+void qsa_reserve_split_scratch() { if (qsa_split_count() > 1) qsa_split_scratch(nullptr); }
 void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                           const QsaDeviceSelection & selected, float * output, int tokens, int first_cells,
                           int heads, int kv_heads, int dim, cudaStream_t stream) {
     if (!query || !keys || !values || !selected.positions || !selected.valid || !output || tokens <= 0 || tokens > 65535 ||
         selected.width <= 0 || selected.width > 8192 || heads <= 0 || kv_heads <= 0 || heads % kv_heads || dim <= 0 || dim > 256)
         throw std::invalid_argument("QSA direct attention: invalid dimensions or pointer");
+    const int splits = qsa_split_count();
+    if (splits > 1 && dim <= 256 && int64_t(tokens) * heads * splits * (dim + 2) <= kQsaSplitPart) {
+        float * part = qsa_split_scratch(stream);
+        const int per = (selected.width + splits - 1) / splits;
+        attention_split<<<dim3(heads, tokens, splits), 128, size_t(per) * (sizeof(float) + sizeof(int)), stream>>>(
+            query, keys, values, selected.positions, selected.valid, part, selected.width, first_cells, heads, kv_heads, dim, splits);
+        attention_merge<<<dim3(heads, tokens), 128, 0, stream>>>(part, output, heads, dim, splits);
+        ck(cudaPeekAtLastError());
+        return;
+    }
     attention_direct<<<dim3(heads, tokens), 128, size_t(selected.width) * (sizeof(float) + sizeof(int)), stream>>>(
         query, keys, values, selected.positions, selected.valid, output, selected.width, first_cells, heads, kv_heads, dim);
     ck(cudaPeekAtLastError());
 }
 
+// Tensor-core prefill selected attention at the Flash-Next shape (12 query heads per kv head, dim 256) on the tensor cores.
+// Block = (kv head, query token): the 12 heads' queries as one 16 x 256 bf16 tile; the token's selected keys / values are
+// gathered 32 rows at a time into shared memory; S = Q K^T and O += P V are mma.m16n8k16 (bf16 in, fp32 out) with an
+// online softmax between them (scores never leave the block). Numeric (bf16 Q and P), not bit-identical to the grouped path.
+namespace qsatc {
+constexpr int G = 12, D = 256, TK = 32, QP = D + 8, KP = D + 8, PP = TK + 8, NT = 128;
+__device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return uint32_t(__bfloat16_as_ushort(lo)) | (uint32_t(__bfloat16_as_ushort(hi)) << 16);
+}
+constexpr size_t smem_bytes() { return size_t(16 * QP + 2 * TK * KP + 16 * PP) * 2 + size_t(16 * TK + 3 * 16) * 4 + 2 * TK * 4; }
+}  // namespace qsatc
+__global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __restrict__ query, const __nv_bfloat16 * __restrict__ keys,
+                                                           const __nv_bfloat16 * __restrict__ values, const int32_t * __restrict__ positions,
+                                                           const uint8_t * __restrict__ valid, float * __restrict__ output,
+                                                           int width, int first_cells, int kv_heads) {
+    using namespace qsatc;
+    extern __shared__ __align__(16) unsigned char sm_raw[];
+    __nv_bfloat16 * Qs = reinterpret_cast<__nv_bfloat16 *>(sm_raw);
+    __nv_bfloat16 * Ks = Qs + 16 * QP, * Vs = Ks + TK * KP, * Ps = Vs + TK * KP;
+    float * Ss = reinterpret_cast<float *>(Ps + 16 * PP), * mrow = Ss + 16 * TK, * lrow = mrow + 16, * arow = lrow + 16;
+    int * cell = reinterpret_cast<int *>(arow + 16), * vflag = cell + TK;  // vflag: the row is valid (a score, 0 when not read)
+    const int kv_head = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const int heads = G * kv_heads, cells = first_cells + t;
+    positions += int64_t(t) * width; valid += int64_t(t) * width;
+    const float scale = rsqrtf(float(D));
+    for (int i = tid; i < 16 * D; i += NT) {  // rows 12..15 zero
+        const int r = i / D, d = i % D;
+        Qs[r * QP + d] = __float2bfloat16(r < G ? query[(int64_t(t) * heads + kv_head * G + r) * D + d] * scale : 0.f);
+    }
+    if (tid < 16) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    float acc[8][4];  // warp: output dims warp * 64 .. + 63 (8 n8 tiles), rows g / g + 8
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    for (int base = 0; base < width; base += TK) {
+        __syncthreads();  // previous tile's K / V / P reads are done
+        if (tid < TK) {
+            const int row = base + tid, pos = row < width ? positions[row] : -1;
+            vflag[tid] = row < width && valid[row];
+            cell[tid] = vflag[tid] && pos >= 0 && pos < cells ? pos : -1;
+        }
+        __syncthreads();
+        for (int i = tid; i < TK * (D / 8); i += NT) {  // 16-byte pieces of the gathered rows (zero for unread rows)
+            const int r = i / (D / 8), c8 = (i % (D / 8)) * 8, pos = cell[r];
+            uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
+            if (pos >= 0) {
+                kk = __ldg(reinterpret_cast<const uint4 *>(keys + (int64_t(pos) * kv_heads + kv_head) * D + c8));
+                vv = __ldg(reinterpret_cast<const uint4 *>(values + (int64_t(pos) * kv_heads + kv_head) * D + c8));
+            }
+            *reinterpret_cast<uint4 *>(Ks + r * KP + c8) = kk; *reinterpret_cast<uint4 *>(Vs + r * KP + c8) = vv;
+        }
+        __syncthreads();
+        {   // S = Q K^T: warp w -> keys w * 8 .. + 7 (one n8 tile), k over D
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            const int n0 = warp * 8;
+#pragma unroll 4
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t *>(Qs + g * QP + k0 + tq * 2);
+                a[1] = *reinterpret_cast<const uint32_t *>(Qs + (g + 8) * QP + k0 + tq * 2);
+                a[2] = *reinterpret_cast<const uint32_t *>(Qs + g * QP + k0 + tq * 2 + 8);
+                a[3] = *reinterpret_cast<const uint32_t *>(Qs + (g + 8) * QP + k0 + tq * 2 + 8);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t *>(Ks + (n0 + g) * KP + k0 + tq * 2);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t *>(Ks + (n0 + g) * KP + k0 + tq * 2 + 8);
+                mma16816(c, a, b0, b1);
+            }
+            Ss[g * TK + n0 + tq * 2] = c[0]; Ss[g * TK + n0 + tq * 2 + 1] = c[1];
+            Ss[(g + 8) * TK + n0 + tq * 2] = c[2]; Ss[(g + 8) * TK + n0 + tq * 2 + 1] = c[3];
+        }
+        __syncthreads();
+        // online softmax: warp w -> rows 4w .. 4w + 3, lane = key
+#pragma unroll
+        for (int rr = 0; rr < 4; ++rr) {
+            const int r = warp * 4 + rr;
+            const float sv = !vflag[lane] ? -INFINITY : cell[lane] >= 0 ? Ss[r * TK + lane] : 0.f;  // as grouped_scores: valid, unread = 0
+            float mx = sv;
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = mrow[r], m_new = fmaxf(m_old, mx);
+            const float p = m_new == -INFINITY ? 0.f : __expf(sv - m_new);
+            float sum = p;
+            for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            Ps[r * PP + lane] = __float2bfloat16(p);
+            __syncwarp();
+            if (lane == 0) {
+                const float alpha = m_old == -INFINITY ? 0.f : __expf(m_old - m_new);
+                arow[r] = alpha; lrow[r] = lrow[r] * alpha + sum; mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        {   // O = alpha O + P V: warp w -> output dims w * 64 .. + 63, k over the tile's keys
+            const float al0 = arow[g], al1 = arow[g + 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { acc[j][0] *= al0; acc[j][1] *= al0; acc[j][2] *= al1; acc[j][3] *= al1; }
+#pragma unroll
+            for (int k0 = 0; k0 < TK; k0 += 16) {
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t *>(Ps + g * PP + k0 + tq * 2);
+                a[1] = *reinterpret_cast<const uint32_t *>(Ps + (g + 8) * PP + k0 + tq * 2);
+                a[2] = *reinterpret_cast<const uint32_t *>(Ps + g * PP + k0 + tq * 2 + 8);
+                a[3] = *reinterpret_cast<const uint32_t *>(Ps + (g + 8) * PP + k0 + tq * 2 + 8);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int n = warp * 64 + j * 8 + g;  // B[k][n] = V[key k][dim n]
+                    const uint32_t b0 = pack2(Vs[(k0 + tq * 2) * KP + n], Vs[(k0 + tq * 2 + 1) * KP + n]);
+                    const uint32_t b1 = pack2(Vs[(k0 + tq * 2 + 8) * KP + n], Vs[(k0 + tq * 2 + 9) * KP + n]);
+                    mma16816(acc[j], a, b0, b1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const float il0 = lrow[g] > 0.f ? 1.f / lrow[g] : 0.f, il1 = lrow[g + 8] > 0.f ? 1.f / lrow[g + 8] : 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = warp * 64 + j * 8 + tq * 2;
+        if (g < G) {
+            float * o = output + (int64_t(t) * heads + kv_head * G + g) * D + d;
+            o[0] = acc[j][0] * il0; o[1] = acc[j][1] * il0;
+        }
+        if (g + 8 < G) {
+            float * o = output + (int64_t(t) * heads + kv_head * G + g + 8) * D + d;
+            o[0] = acc[j][2] * il1; o[1] = acc[j][3] * il1;
+        }
+    }
+}
+static int g_qsa_tc = 1;  // tensor-core prefill attention (qsa_set_tc(0): the scalar kernel, tests)
+void qsa_set_tc(int on) { g_qsa_tc = on; }
 void qsa_attention_grouped(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                            const QsaDeviceSelection & selected, float * scores, float * inv, float * output, int tokens,
                            int first_cells, int heads, int kv_heads, int dim, cudaStream_t stream) {
@@ -671,6 +945,14 @@ void qsa_attention_grouped(const float * query, const __nv_bfloat16 * keys, cons
         tokens > 65535 || selected.width <= 0 || heads <= 0 || kv_heads <= 0 || heads % kv_heads ||
         heads / kv_heads > kQsaMaxGroup || dim <= 0 || dim > 256)
         throw std::invalid_argument("QSA grouped attention: invalid dimensions or pointer");
+    if (g_qsa_tc != 0 && heads / kv_heads == 12 && dim == 256) {
+        static bool attr = false;
+        if (!attr) { cudaFuncSetAttribute(qsa_prefill_tc_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes())); attr = true; }
+        qsa_prefill_tc_k<<<dim3(kv_heads, tokens), qsatc::NT, qsatc::smem_bytes(), stream>>>(query, keys, values, selected.positions, selected.valid,
+                                                                                          output, selected.width, first_cells, kv_heads);
+        ck(cudaPeekAtLastError());
+        return;
+    }
     if (heads / kv_heads == 12 && dim == 256) {  // fixed-shape kernel (bitwise equal to the generic one)
         constexpr int rw_env = 1;  // rows per warp (2 and 4 measured 2-4x slower on the 3090)
         const int RW = rw_env == 4 ? 4 : rw_env == 1 ? 1 : 2;

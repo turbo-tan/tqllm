@@ -82,4 +82,18 @@ bool WeightFormat::gemm_f32(const Mat & m, const __half * x, float * y, int n, c
     if (id < 0 || m.cols % 64) return false;
     return tqllm_cuda::u4h_family_gemm_f32(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, m.rows);
 }
+bool WeightFormat::expert_gemm_gateup(const Mat & g, const Mat & u, const __half * x, __half * y, int rows,
+                                      const int * counts, const int * groups, int capacity, int experts, int topk, cudaStream_t s) const {
+    const int id = u4h_id();
+    if (id != 1 && id != 4 && id != 5 && id != 6 && id != 7 && id != 10 && id != 13 && id != 14) return false;
+    if (g.fmt != u.fmt || g.cols != u.cols || g.rows != u.rows) return false;
+    tqllm_cuda::k_expert_gemm_gateup(id, static_cast<const uint8_t *>(g.p), g.aux, static_cast<const uint8_t *>(u.p), u.aux, x, y, rows, g.cols,
+                                     counts, groups, capacity, experts, topk, s);
+    return true;
+}
+bool WeightFormat::gemm_i8_f32(const Mat & m, const int8_t * xq, const float * xs, const int16_t * xsum, float * y, int n, cudaStream_t s, int mode) const {
+    const int id = u4h_id();
+    if (id < 0 || m.cols % 64) return false;
+    return tqllm_cuda::u4h_family_gemm_i8_f32(id, static_cast<const uint8_t *>(m.p), m.aux, xq, xs, xsum, y, m.rows, m.cols, n, s, m.rows, mode);
+}
 }  // namespace tqllm

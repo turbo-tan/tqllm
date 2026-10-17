@@ -36,6 +36,14 @@ struct EngineOptions {
     int lookup = 0;            // --lookup L: prompt-lookup chain of up to L tokens beside the draft tree (copy tasks)
     int lookup_first = 0;      // --lookup-first K: a lookup match of >= K tokens takes the whole verify block
     int ubatch = 0;            // -ub / --ubatch-size: prefill buffer columns (0: engine default)
+    // Flash-Next layer-major prefill (.tqfn); -1 = the engine default
+    int prefill_chunk = -1;       // --prefill-chunk N: prompt tokens per prefill chunk (default: the manifest's chunk=)
+    int prefill_sub = -1;         // --prefill-sub N: tokens per dense sub-chunk inside a chunk (2048)
+    int prefill_stage = -1;       // --prefill-stage N: experts per staging bank half for streamed experts (192)
+    long prefill_reserve_mb = -1; // --prefill-reserve-mb N: extra memory freed (expert banks borrowed) per long prompt (3400)
+    long prefill_arena_mb = -1;   // --prefill-arena-mb N: prefill scratch arena (3800)
+    long dense_cache_mb = -1;     // --dense-cache-mb N: FP16 dense weight images reused by a chunk's sub-chunks (600; 0 off)
+    std::string prefill_borrow;   // --prefill-borrow auto|all|N: expert banks released for a long prompt (auto: the fewest the plan needs)
     // memory placement; the fit (Model) sets them when the device is short
     bool embed_host = false;   // token embeddings in host memory
     bool head_host = false;    // int8 LM head in host memory

@@ -626,7 +626,11 @@ void tq4_matvec_i8_bf16(const uint8_t * w4, const __half * sc, const __half * xh
     const size_t need = size_t(8) * k;
     if (need > cap) {  // prototype scratch (grown, never freed)
         if (xq) cudaFree(xq), cudaFree(sx);
-        cudaMalloc(&xq, need), cudaMalloc(&sx, need / 128 * 4);
+        xq = nullptr, sx = nullptr, cap = 0;
+        if (cudaMalloc(&xq, need) != cudaSuccess || cudaMalloc(&sx, need / 128 * 4) != cudaSuccess) {
+            cudaGetLastError();
+            throw std::runtime_error("tq4_matvec_i8: scratch allocation failed");
+        }
         cap = need;
     }
     tq4_xquant_k<<<ncols * (k / 128), 32, 0, s>>>(xh, xq, sx, k, ncols);

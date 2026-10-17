@@ -48,6 +48,12 @@ struct WeightFormat {
     virtual bool expert_gemm(const Mat &, const __half *, __nv_bfloat16 *, int,
                               const int *, const int *, int, int,
                               int, bool, cudaStream_t) const { return false; }
+    // Same as expert_gemm with int8 activations (per-32-block scales + per-16 sums); false: no int8 kernel for this format.
+    virtual bool expert_gemm_i8(const Mat &, const int8_t *, const float *, const int16_t *, __nv_bfloat16 *, int,
+                                 const int *, const int *, int, int, int, bool, cudaStream_t, int mode) const;
+    // gate and up (same format) in one launch with the swiglu epilogue; y [assignments][rows] half
+    virtual bool expert_gemm_gateup(const Mat & g, const Mat & u, const __half * x, __half * y, int rows,
+                                    const int * counts, const int * groups, int capacity, int experts, int topk, cudaStream_t) const;
     virtual bool has_expert_matvec() const { return false; }
     // Stacked weights [experts * rows][cols], device IDs [n][topk], output [n * topk][rows].
     virtual void expert_matvec(const Mat &, const __half *, __nv_bfloat16 *, int rows,
@@ -72,6 +78,7 @@ struct WeightFormat {
     virtual bool has_gemm() const { return fused_gemm_cols() > 0; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
     // y [n][rows] F32 through the u4h-family GEMM (weights read once per 64 columns); false: no GEMM for this format
     bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;
+    bool gemm_i8_f32(const Mat & m, const int8_t * xq, const float * xs, const int16_t * xsum, float * y, int n, cudaStream_t s, int mode) const;
     // gemm() also replaces the dequant + cuBLAS prefill up to this many columns (0: only below the cuBLAS threshold).
     virtual int fused_gemm_cols() const { return 0; }
     // gemm() with output rows ldy apart (y [n][ldy]); false: not supported.

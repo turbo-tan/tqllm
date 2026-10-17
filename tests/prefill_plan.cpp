@@ -1,0 +1,124 @@
+// Flash-Next prefill memory plan and bank ledger (src/models/qwen/qwen4exp/prefill_plan.hpp), on a mock device: the plan's sizes at the
+// Flash-Next shape, the borrow policies, and the request order (the 2026-10-16 refill-while-buffers-held OOM and the
+// start-up arena sized by a 32K chunk reproduce here).
+#include "prefill_plan.hpp"
+#include <cstdio>
+#include <map>
+#include <set>
+#include <stdexcept>
+#include <vector>
+using namespace tqllm;
+
+namespace {
+int fails = 0;
+void expect(bool ok, const char * what) { if (!ok) { std::printf("FAIL %s\n", what); ++fails; } }
+constexpr size_t MB = size_t(1) << 20;
+
+// Flash-Next GSQ-RCO IQ3_S on the 3090 (140 slots): 48 layers x 512 experts, ~1.95 MB per staged expert
+PrefillShape shape() { PrefillShape s; s.hidden = 2560; s.hc = 4; s.expert_ff = 640; s.topk = 10; s.experts = 512; s.layers = 48; s.expert_block_bytes = 1950 * 1024; return s; }
+PrefillTuning tuning(int chunk) { PrefillTuning t; t.chunk = chunk; t.arena_bytes = 3800 * MB; t.dense_cache_bytes = 600 * MB; t.mtp_bank_bytes = 650 * MB; return t; }
+
+// A device of `total` bytes holding `layers` banks of `bank` bytes each plus `other` fixed bytes; prefill buffers are
+// "held" by the test to model the request's life.
+struct MockDevice {
+    size_t total, bank, other, held = 0; std::set<int> banks; std::vector<int> lru; int refills = 0;
+    MockDevice(size_t total_, size_t bank_, size_t other_, int layers) : total(total_), bank(bank_), other(other_) {
+        for (int l = 0; l < layers; ++l) { banks.insert(l); lru.push_back(l); }
+    }
+    size_t free() const { return total - other - banks.size() * bank - held; }
+    BankLedger::Ops ops() {
+        BankLedger::Ops o;
+        o.lru_layers = [this] { std::vector<int> v; for (int l : lru) if (banks.count(l)) v.push_back(l); return v; };
+        o.bank_bytes = [this](int) { return bank; };
+        o.release = [this](int l) { banks.erase(l); };
+        o.refill = [this](int l) { if (free() < bank) throw std::runtime_error("out of memory"); banks.insert(l); ++refills; };
+        o.free_bytes = [this] { return free(); };
+        return o;
+    }
+};
+}  // namespace
+
+int main() {
+    const auto s = shape();
+    // 1. sizes: an 8K chunk is ~6-7 GB, a 32K chunk ~9-11 GB, monotonic in tokens and capped by the chunk
+    const auto c8 = prefill_chunk_bytes(s, tuning(8192), 30892), c32 = prefill_chunk_bytes(s, tuning(32768), 30892);
+    expect(c8.total() > 6000 * MB && c8.total() < 7500 * MB, "8K chunk between 6 and 7.5 GB");
+    expect(c32.total() > 11000 * MB && c32.total() < 15000 * MB, "32K chunk between 11 and 15 GB (its arena alone is 6.6 GB)");
+    expect(c32.arena == prefill_arena_bytes(32768) && c8.arena == 3800 * MB, "the arena follows the chunk once the parameter is too small (the 10-16 one-chunk OOM)");
+    expect(c32.total() > c8.total(), "bigger chunk, bigger peak");
+    expect(prefill_chunk_bytes(s, tuning(8192), 4095).total() < c8.total(), "a 4K prompt needs less than a full 8K chunk");
+    expect(prefill_chunk_bytes(s, tuning(8192), 100000).tokens == 8192, "the chunk caps the token count");
+    bool threw = false; try { prefill_chunk_bytes(s, tuning(100), 1000); } catch (const std::invalid_argument &) { threw = true; }
+    expect(threw, "chunk below 256 rejected");
+
+    // 2. the plan: copies fall 4x with one 32K chunk; release = need - free
+    const size_t free0 = 2400 * MB;
+    const auto p8 = prefill_plan(s, tuning(8192), 30892, free0), p32 = prefill_plan(s, tuning(32768), 30892, free0);
+    expect(p8.chunks == 4 && p32.chunks == 1, "4 chunks at 8K, 1 at 32K");
+    expect(p32.host_copies * 4 == p8.host_copies, "one chunk streams a quarter of the expert bytes");
+    expect(p8.host_copies > 170 * 1000 * MB && p8.host_copies < 200 * 1000 * MB, "8K chunks: ~174-192 GB streamed at 32K");
+    expect(p8.release == p8.need - free0 && p32.release > p8.release, "release covers the shortfall, more for 32K");
+    // Flash-Next attention state: 12 attention layers, 2 kv heads x 256, indexer dim 128, sub-chunk 2048
+    const size_t ctx32 = prefill_context_bytes(33024, 2048, 12, 2, 256, 128), ctx128 = prefill_context_bytes(126976, 2048, 12, 2, 256, 128);
+    expect(ctx32 > 1000 * MB && ctx32 < 2500 * MB, "context state at 32K between 1 and 2.5 GB");
+    expect(ctx128 > 4500 * MB && ctx128 < 8000 * MB && ctx128 > 3 * ctx32, "context state at 128K between 4.5 and 8 GB, more than 3x the 32K one (the scratch scales with sub x context)");
+    { auto t = tuning(16384); t.context_bytes = ctx128; expect(prefill_plan(s, t, 122555, free0).need == prefill_plan(s, tuning(16384), 122555, free0).need + ctx128, "the context state adds to the need"); }
+    expect(prefill_plan(s, tuning(8192), 30892, 64 * size_t(1024) * MB).release == 0, "nothing released on a 64 GB device");
+
+    // 3. borrow policies over 48 LRU banks of 274 MB (13.1 GB)
+    const std::vector<size_t> banks(48, 274 * MB);
+    const int k_auto = banks_to_borrow(p8, banks, BorrowMode::Auto);
+    expect(k_auto > 0 && k_auto < 48 && size_t(k_auto) * 274 * MB >= p8.release && size_t(k_auto - 1) * 274 * MB < p8.release, "auto: the fewest banks that cover the shortfall");
+    expect(banks_to_borrow(p8, banks, BorrowMode::All) == 48, "all: every bank");
+    expect(banks_to_borrow(p8, banks, BorrowMode::Count, 10) == 10 && banks_to_borrow(p8, banks, BorrowMode::Count, 99) == 48, "count: clamped");
+    threw = false; try { banks_to_borrow(prefill_plan(s, tuning(32768), 30892, 0), std::vector<size_t>(2, 274 * MB), BorrowMode::Auto); } catch (const std::runtime_error &) { threw = true; }
+    expect(threw, "auto with too few banks reports the shortfall instead of starting");
+
+    // 4. the request order on a 24 GB mock: borrow, hold the buffers, release them, refill
+    {
+        MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);  // 13.1 GB banks + 8.5 GB fixed -> 2.3 GB free
+        BankLedger ledger(dev.ops());
+        const auto plan = prefill_plan(s, tuning(32768), 30892, dev.free());
+        const auto got = ledger.borrow(plan, BorrowMode::All);
+        expect(got.size() == 48 && dev.banks.empty() && dev.free() >= plan.need, "borrow all: 48 banks released, the 32K plan fits");
+        dev.held = plan.trunk_peak;  // the trunk runs
+        bool logic = false; try { ledger.refill(); } catch (const std::logic_error &) { logic = true; }
+        expect(logic, "refill while the prefill buffers are held is refused (the 10-16 OOM)");
+        dev.held = 0; ledger.buffers_released();
+        expect(ledger.refill() == 48 && dev.banks.size() == 48 && ledger.state() == BankLedger::State::Refilled, "after the release every bank refills");
+    }
+    // 5. a refill that runs out of memory stops and reports how many came back; auto borrows the LRU banks first
+    {
+        MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
+        dev.lru = {7, 3, 11, 0};  for (int l = 0; l < 48; ++l) if (l != 7 && l != 3 && l != 11 && l != 0) dev.lru.push_back(l);
+        BankLedger ledger(dev.ops());
+        const auto plan = prefill_plan(s, tuning(8192), 30892, dev.free());
+        const auto got = ledger.borrow(plan, BorrowMode::Auto);
+        expect(got.size() >= 4 && got[0] == 7 && got[1] == 3 && got[2] == 11 && got[3] == 0, "auto releases least recently used banks first");
+        expect(ledger.borrowed(7) && !ledger.borrowed(47), "borrowed() answers per layer");
+        ledger.buffers_released();
+        dev.other += (dev.free() - got.size() * dev.bank) + 5 * dev.bank;  // room for all but 5 banks: the refill cannot complete
+        const int back = ledger.refill();
+        expect(back == int(got.size()) - 5 && ledger.state() == BankLedger::State::Refilled, "a short refill stops at the first failure and reports the count");
+    }
+    // 5b. an overlapped refill keeps the catch-up's room and the second call finishes the rest
+    {
+        MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
+        BankLedger ledger(dev.ops());
+        const auto plan = prefill_plan(s, tuning(16384), 30892, dev.free());
+        const auto got = ledger.borrow(plan, BorrowMode::All);
+        ledger.buffers_released();
+        const size_t keep = 9000 * MB;
+        const int first = ledger.refill(keep);
+        expect(first > 0 && first < int(got.size()) && dev.free() >= keep && dev.free() < keep + 274 * MB, "partial refill stops at the kept room");
+        expect(ledger.state() == BankLedger::State::BuffersReleased && ledger.borrowed_total() == got.size(), "the rest stays borrowed, total unchanged");
+        const int second = ledger.refill();
+        expect(first + second == int(got.size()) && dev.banks.size() == 48 && ledger.state() == BankLedger::State::Refilled, "the second call completes the refill");
+    }
+    // 6. start-up: the arena is sized by the 8K chunk even when the manifest chunk is 32K (the second 10-16 OOM)
+    auto startup_arena_mb = [](int chunk) { return std::min(chunk, 8192) / 5 + 64; };
+    expect(startup_arena_mb(32768) == startup_arena_mb(8192) && startup_arena_mb(8192) == 1702, "start-up arena capped at the 8K-chunk size");
+
+    std::printf(fails ? "PREFILL_PLAN FAIL\n" : "PREFILL_PLAN PASS\n");
+    return fails ? 1 : 0;
+}

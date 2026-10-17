@@ -10,11 +10,37 @@ namespace tqllm_cuda {
 void k_expert_gemm(int fmt, const uint8_t *, const void *, const __half *, __nv_bfloat16 *,
                    int rows, int cols, const int * counts, const int * groups,
                    int capacity, int experts, int topk, bool per_expert_input, cudaStream_t);
+// INT8-activation grouped GEMM (prefill): xq int8 [rows][cols], xs float [rows][cols/32], xsum int16 [rows][cols/32][2]
+void k_expert_gemm_i8(int fmt, const uint8_t *, const void *, const int8_t * xq, const float * xs, const int16_t * xsum,
+                      __nv_bfloat16 *, int rows, int cols, const int * counts, const int * groups,
+                      int capacity, int experts, int topk, bool per_expert_input, cudaStream_t, int mode = 1);  // mode 1: per-32 scales, 2: per token
+// Activation quantiser (mode 1: per-32-block scales, 2: per-token); rows_of null: rows 0..nrows-1; else the grouped lists [slots][cap] with counts
+void k_quant_act_rows(const __half * x, const int * rows_of, const int * counts, int cap, int slots, int nrows, int k,
+                      int8_t * q, float * s, int16_t * qsum, cudaStream_t, int mode = 1);
+bool u4h_family_gemm_i8_f32(int fmt, const uint8_t *, const void *, const int8_t * xq, const float * xs, const int16_t * xsum,
+                            float * y, int rows, int k, int ncols, cudaStream_t, int ldy, int mode);
+void k_expert_gemm_gateup(int fmt, const uint8_t * wg, const void * auxg, const uint8_t * wu, const void * auxu, const __half * x,
+                          __half * yh, int rows, int cols, const int * counts, const int * groups,
+                          int capacity, int experts, int topk, cudaStream_t);
 // Stacked K4/K5/K6 experts selected entirely on device; output [n * topk][rows].
 // Dedup grouped matvec: per unique expert kDedupStride ints = slot, columns (<= kDedupCols), input rows, output rows.
 constexpr int kDedupCols = 4, kDedupStride = 2 + 2 * kDedupCols;
 void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
                            int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
+// Layer-major prefill experts (src/experts/mmq_experts.cu): llama.cpp's MMQ on our expert banks. gate / act on the up
+// projection fuse the SwiGLU into its epilogue (act = half silu(gate) * up, nothing stored in y). Activations quantised to q8_1 tiles once per
+// input row (mmq_quantize_act: rows 0..rows-1; _rows: a pass's groups only); the GEMM reads slot z's columns
+// groups[z cap + j] (j < counts[z]), input row groups[] / div, writes y[groups[] * rows + r] (bf16).
+size_t mmq_act_bytes(int rows, int k);
+void mmq_quantize_act(const __half * x, int rows, int k, void * yq, cudaStream_t);
+void mmq_quantize_act_rows(const __half * x, int rows, int k, const int * rows_of, const int * counts, int cap, int slots, void * yq, cudaStream_t);
+int mmq_max_tiles(int cap, int slots);
+size_t mmq_warm();  // load the MMQ kernels now; returns the device bytes it cost
+bool mmq_supports(int fmt, int k);
+bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tiled, int rows, int k, const int * counts,
+                     const int * counts_host, const int * groups, int cap, int slots, int div, const void * yq, int ny,
+                     __nv_bfloat16 * y, int2 * tiles, int tiles_cap, cudaStream_t,
+                     const __nv_bfloat16 * gate = nullptr, __half * act = nullptr);
 // TQFN_TILED: grouped expert kernels read lane-contiguous tiles (16 rows x 4 blocks); tile_expert_rows writes them.
 void set_tiled_experts(bool on);
 int tiled_block_bytes(int fmt);  // code bytes per 32 weights of a tileable u4h format, else 0

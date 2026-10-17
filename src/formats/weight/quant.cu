@@ -1457,6 +1457,19 @@ struct U4hTile {
             }
         }
     }
+    // One code word (k 4u..4u+3 of 16-group h) of rows a and b: the int8 kernel's lane t needs only u = t, so the grid
+    // formats do one lookup instead of four. Formats without a specialisation take the full decode.
+    __device__ __forceinline__ void codes1(int h, int u, int s, bool ok, const uint32_t * grid, uint32_t & ca, uint32_t & cb) {
+        if constexpr (FMT == 13 || FMT == 14) {
+            const uint32_t a2 = h ? (u < 2 ? wa.z : wa.w) : (u < 2 ? wa.x : wa.y), b2 = h ? (u < 2 ? wb.z : wb.w) : (u < 2 ? wb.x : wb.y);
+            ca = iq4nl_codes((a2 >> (16 * (u & 1))) & 0xFFFFu); cb = iq4nl_codes((b2 >> (16 * (u & 1))) & 0xFFFFu);
+        } else if constexpr (FMT == 5) {
+            const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x; const int w = 4 * h + u;
+            ca = iq3x_code(grid[(qa >> (8 * u)) & 0xFF], iq3x_signs(wa.z, w)); cb = iq3x_code(grid[(qb >> (8 * u)) & 0xFF], iq3x_signs(wb.z, w));
+        } else {
+            uint32_t wa4[4], wb4[4]; codes(h, s, ok, grid, wa4, wb4); ca = wa4[u]; cb = wb4[u];
+        }
+    }
     __device__ __forceinline__ void codes(int h, int s, bool ok, const uint32_t * grid, uint32_t wa4[4], uint32_t wb4[4]) {
         if constexpr (FMT == 13 || FMT == 14) {  // weights 16h + 4u .. + 3: nibbles of 16-bit half (u & 1) of word 2h + u / 2
             const uint32_t a2[2] = {h ? wa.z : wa.x, h ? wa.w : wa.y}, b2[2] = {h ? wb.z : wb.x, h ? wb.w : wb.y};
@@ -1696,10 +1709,13 @@ __global__ void __launch_bounds__(256, GROUPED ? 4 : U4H_DENSE_MINB) u4h_matvec_
 // Prefill GEMM on the u4h-family formats without a dequantised copy: 64 rows x 64 columns per CTA, warp w takes row tile
 // w & 3 and k half w >> 2. Each lane decodes its 32-weight block once (U4hTile, the matvec decode) and reuses the
 // fragments across 8 n-tiles, so the weights are read once per 64 columns. FP32 accumulate.
-template <int FMT, bool GROUPED = false, typename OUT = __nv_bfloat16>
+template <int FMT, bool GROUPED = false, typename OUT = __nv_bfloat16, bool GATEUP = false>
 __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                   OUT * y, int rows, int k, int ncols, int ldy, const int * counts = nullptr, const int * groups = nullptr,
-                                                  int capacity = 0, int topk = 1, bool per_expert_input = false) {
+                                                  int capacity = 0, int topk = 1, bool per_expert_input = false,
+                                                  const uint8_t * w4b = nullptr, const __half2 * smb = nullptr, __half * yh = nullptr) {
+    // GATEUP (unused by the engines since the MMQ prefill path; library only): w4/sm = gate, w4b/smb = up (same format and shape); the epilogue writes silu(g) * u as
+    // half to yh (the down projection's input), so the gate and up outputs and the separate swiglu pass never exist.
     int source_row = 0;
     if constexpr (GROUPED) {
         const int expert = blockIdx.z;
@@ -1734,6 +1750,7 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
         return hfma2u(hadd2u(__byte_perm(w, 0x64646464u, sel), NEG1024), su, mu);
     };
     float c[NT][4] = {};
+    [[maybe_unused]] float c2[GATEUP ? NT : 1][4] = {};
     for (int base = 0; base < nb; base += 8) {  // 8 blocks (256 k) per step: warps ks = 0 / 1 take blocks base + 4 ks + t
         __syncthreads();  // previous step's tile reads are done
         for (int i = threadIdx.x; i < 64 * 32; i += 256) {
@@ -1777,6 +1794,32 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
 #pragma unroll
             for (int u = 0; u < 8; ++u) mma_f16(c[nt], af[u][0], af[u][1], af[u][2], af[u][3], xw[2 * u], xw[2 * u + 1]);
         }
+        if constexpr (GATEUP) {  // the up tile of the same block, same x fragments
+            U4hTile<FMT, GROUPED> qu;
+            qu.load(w4b, smb, k, ra, rb, s, nb, ok);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                uint32_t wa4[4], wb4[4];
+                qu.codes(h, s, ok, grid, wa4, wb4);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    af[4 * h + u][0] = deq(wa4[u], 0x5140, qu.sa[h], qu.ma[h]);
+                    af[4 * h + u][1] = deq(wb4[u], 0x5140, qu.sb[h], qu.mb[h]);
+                    af[4 * h + u][2] = deq(wa4[u], 0x5342, qu.sa[h], qu.ma[h]);
+                    af[4 * h + u][3] = deq(wb4[u], 0x5342, qu.sb[h], qu.mb[h]);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const uint4 * xp = xt + (nt * 8 + g) * XS + (ks * 4 + t) * 4;
+                uint4 x4[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) x4[i] = xp[i];
+                const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) mma_f16(c2[nt], af[u][0], af[u][1], af[u][2], af[u][3], xw[2 * u], xw[2 * u + 1]);
+            }
+        }
     }
     __syncthreads();
     float (*red)[32][NT * 4] = reinterpret_cast<float (*)[32][NT * 4]>(xt);  // 16 KB of the 33.8 KB tile
@@ -1786,27 +1829,48 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
 #pragma unroll
             for (int i = 0; i < 4; ++i) red[rt][lane][nt * 4 + i] = c[nt][i];
     __syncthreads();
+    if (ks == 0)
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) c[nt][i] += red[rt][lane][nt * 4 + i];
+    if constexpr (GATEUP) {  // second round for the up accumulators
+        __syncthreads();
+        if (ks == 1)
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) red[rt][lane][nt * 4 + i] = c2[nt][i];
+        __syncthreads();
+        if (ks == 0)
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) c2[nt][i] += red[rt][lane][nt * 4 + i];
+    }
     if (ks == 0) {
         const int r = row0 + g;
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int n0 = col0 + nt * 8 + 2 * t, n1 = n0 + 1;
-            const float v0 = c[nt][0] + red[rt][lane][nt * 4 + 0], v1 = c[nt][1] + red[rt][lane][nt * 4 + 1];
-            const float v2 = c[nt][2] + red[rt][lane][nt * 4 + 2], v3 = c[nt][3] + red[rt][lane][nt * 4 + 3];
-            const auto put = [&](int col, int row, float value) {
+            const auto put = [&](int col, int row, float value, [[maybe_unused]] float up) {
                 if (col < ncols) {
                     if constexpr (GROUPED) col = groups[col];
-                    if constexpr (std::is_same_v<OUT, float>) y[int64_t(col) * ldy + row] = value;
+                    if constexpr (GATEUP) {
+                        // the same arithmetic as fn_swiglu_bf16_h_groups_k on bf16-rounded gate / up values
+                        const float a = __bfloat162float(__float2bfloat16_rn(value)), b = __bfloat162float(__float2bfloat16_rn(up));
+                        yh[int64_t(col) * ldy + row] = __float2half_rn(a / (1.f + expf(-a)) * b);
+                    } else if constexpr (std::is_same_v<OUT, float>) y[int64_t(col) * ldy + row] = value;
                     else y[int64_t(col) * ldy + row] = __float2bfloat16_rn(value);
                 }
             };
             if (r < rows) {
-                put(n0, r, v0);
-                put(n1, r, v1);
+                put(n0, r, c[nt][0], GATEUP ? c2[nt][0] : 0.f);
+                put(n1, r, c[nt][1], GATEUP ? c2[nt][1] : 0.f);
             }
             if (r + 8 < rows) {
-                put(n0, r + 8, v2);
-                put(n1, r + 8, v3);
+                put(n0, r + 8, c[nt][2], GATEUP ? c2[nt][2] : 0.f);
+                put(n1, r + 8, c[nt][3], GATEUP ? c2[nt][3] : 0.f);
             }
         }
     }
@@ -1817,6 +1881,399 @@ static void u4h_gemm_launch(const uint8_t * w4, const void * sm, const __half * 
     if (k % 64) throw std::invalid_argument("u4h_gemm: k must be a multiple of 64");
     const dim3 grid((rows + 63) / 64, (ncols + 63) / 64);
     u4h_gemm_k<FMT, false, OUT><<<grid, 256, 0, s>>>(w4, reinterpret_cast<const __half2 *>(sm), xh, y, rows, k, ncols, ldy ? ldy : rows);
+}
+
+// ---- INT8-activation prefill GEMM (TQFN_PREFILL_INT8) ----
+// Activations quantised per 32-value block (Strata's scheme): x = xs[row][blk] * q (int8), plus the sum of q per 16-group
+// (int16) for the weight "min" term. Weights stay in their bank format: value = scale_h * code + min_h per 16-group h
+// (U4hTile), with code - 128 as the int8 operand, so dot(value, x) = xs * (scale_h * D + (128 scale_h + min_h) * Q) with
+// D = dot(code - 128, q) and Q = sum(q): both exact int32 (|D| <= 127 * 128 * 16), rescaled into fp32 per 16-group, so no
+// int32 sum ever crosses a scale boundary. The int32 accumulator starts at the float bits of 12582912 so D's bits are the
+// exact float of 12582912 + D (|D| < 2^22). Zero blocks: codes 0, scale 0, output 0.
+template <bool TOKEN>
+__global__ void quant_act_rows_k(const __half * x, const int * rows_of, const int * counts, int cap, int k,
+                                 int8_t * q, float * s, int16_t * qsum) {
+    int row;  // rows_of null: row blockIdx.x; else grouped: row rows_of[slot * cap + i] for i < counts[slot]
+    if (!rows_of) row = int(blockIdx.x);
+    else { const int slot = int(blockIdx.y), i = int(blockIdx.x); if (i >= counts[slot]) return; row = rows_of[slot * cap + i]; }
+    const __half * xr = x + int64_t(row) * k; const int nb = k / 32, lane = threadIdx.x % 32;
+    __shared__ float tok_m;
+    if constexpr (TOKEN) {  // one scale per token: absmax over the row
+        float m = 0.f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) m = fmaxf(m, fabsf(__half2float(xr[i])));
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+        __shared__ float red[32];
+        if (lane == 0) red[threadIdx.x / 32] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) { float mm = 0.f; for (unsigned i = 0; i < blockDim.x / 32; ++i) mm = fmaxf(mm, red[i]); tok_m = mm; }
+        __syncthreads();
+    }
+    for (int blk = threadIdx.x / 32; blk < nb; blk += blockDim.x / 32) {
+        const float v = __half2float(xr[blk * 32 + lane]);
+        float m = fabsf(v);
+        if constexpr (TOKEN) m = tok_m;
+        else for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+        const float inv = m > 0.f ? 127.f / m : 0.f;
+        const int qi = __float2int_rn(v * inv);
+        q[int64_t(row) * k + blk * 32 + lane] = int8_t(qi);
+        int sum = qi;
+        for (int o = 8; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);  // within each 16-lane half
+        if (lane == 0) { s[int64_t(row) * nb + blk] = m / 127.f; qsum[(int64_t(row) * nb + blk) * 2] = int16_t(sum); }
+        if (lane == 16) qsum[(int64_t(row) * nb + blk) * 2 + 1] = int16_t(sum);
+    }
+}
+__device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+    constexpr int M = 0x4B400000;
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(M), "r"(M), "r"(M), "r"(M));
+}
+__device__ __forceinline__ float h2lo(uint32_t v) { return __half2float(__ushort_as_half(uint16_t(v & 0xFFFFu))); }
+// 64 rows x 64 columns per CTA, 8 warps: warp w takes row tile w & 3 and k half w >> 2 (blocks 4 (w >> 2) .. + 3 of each
+// 256-k step). Unlike u4h_gemm_k, the 4 lanes of a row group work on the same block (one scale per MMA): lane t holds
+// k 4t..4t+3 of each 16-group (wa4[t] of U4hTile::codes). Formats with one scale per 32 use one k32 MMA per block; formats
+// with a scale per 16 use two k16 MMAs. Where min = -OFF * scale exactly (power-of-two OFF, exact in half) the int8
+// operand is code - OFF and no min term is needed; the other formats use code - 128 and add (128 scale + min) * sum(q).
+__device__ __forceinline__ void mma_s8_k32(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    constexpr int M = 0x4B400000;
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(M), "r"(M), "r"(M), "r"(M));
+}
+template <int FMT> __host__ __device__ constexpr int i8_offset() {  // min == -offset * scale: 0 = generic (min term)
+    // IQ4_NL / IQ4_XS: code - 128 is exact (verified against the fp16 kernel and an fp64 oracle). Every other format takes the
+    // generic path: operand code - 128 plus (128 scale + min) * sum(q) from the kernel's own (scale, min), exact by construction
+    // whatever the format's code offset is (the per-format offset table was wrong for IQ2_S and unverified for IQ3_S).
+    return (FMT == 13 || FMT == 14) ? 128 : 0;
+}
+template <int FMT> __host__ __device__ constexpr bool i8_one_scale() { return FMT == 1 || FMT == 5 || FMT == 6 || FMT == 13 || FMT == 14; }
+// TOKEN: one activation scale per token (xs[row][0]), applied once at the store; the per-block epilogue is then weight
+// scale only (8 scalar instructions per k32 MMA instead of 14). Per-32 scales (TOKEN = false) isolate outliers per block.
+template <int FMT, bool GROUPED, bool TOKEN = false, typename OUT = __nv_bfloat16>
+__global__ void __launch_bounds__(256) u4h_i8_gemm_k(const uint8_t * w4, const __half2 * sm, const int8_t * xq, const float * xs,
+                                                     const int16_t * xsum, OUT * y, int rows, int k, int ncols, int ldy,
+                                                     const int * counts, const int * groups, int capacity, int topk, bool per_expert_input) {
+    int source_row = 0;
+    if constexpr (GROUPED) {
+        const int expert = blockIdx.z;
+        ncols = counts[expert];
+        if (int(blockIdx.y) * 64 >= ncols) return;
+        groups += int64_t(expert) * capacity;
+        source_row = expert * rows;
+    }
+    constexpr int KS = 256, XS = KS + 16, NT = 8, NB = KS / 32;
+    constexpr int OFF = i8_offset<FMT>();
+    constexpr bool ONE = i8_one_scale<FMT>(), MINTERM = OFF == 0;
+    constexpr uint32_t SUB = MINTERM ? 0x80808080u : uint32_t(OFF) * 0x01010101u;
+    constexpr bool GRID_SMEM = ud_grid_words(FMT) > 1 && ud_grid_words(FMT) <= 2048;
+    __shared__ __align__(16) int8_t xt[64 * XS];
+    __shared__ float st[64][NB];
+    __shared__ int16_t sq[64][NB * 2];
+    __shared__ uint32_t gsm[GRID_SMEM ? ud_grid_words(FMT) : 1];
+    __shared__ int cols_in[64];
+    const uint32_t * grid = gsm;
+    if constexpr (FMT == 4) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) gsm[i] = iq3s_grid_d[i];
+    } else if constexpr (FMT == 5) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) gsm[i] = iq3xxs_grid_d[i];
+    } else if constexpr (FMT >= 8 && FMT <= 11) {
+        if constexpr (GRID_SMEM) {
+            const uint32_t * src = ud_grid_src<FMT>();
+            for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) gsm[i] = src[i];
+        } else {
+            grid = ud_grid_src<FMT>();
+        }
+    }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+    const int rt = warp & 3, ks = warp >> 2;
+    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * 64, nb = k / 32;
+    const int ra = source_row + min(row0 + g, rows - 1), rb = source_row + min(row0 + g + 8, rows - 1);
+    if (threadIdx.x < 64) {
+        int col = col0 + int(threadIdx.x), in = -1;
+        if (col < ncols) { in = col; if constexpr (GROUPED) { in = groups[col]; if (!per_expert_input) in /= topk; } }
+        cols_in[threadIdx.x] = in;
+    }
+    auto sub = [](uint32_t code) { return MINTERM || OFF == 128 ? code ^ 0x80808080u : __vsub4(code, SUB); };
+    float acc[NT][4] = {};
+    for (int base = 0; base < k; base += KS) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 64 * (KS / 16); i += 256) {
+            const int col = i / (KS / 16), qd16 = i % (KS / 16), in = cols_in[col];
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (in >= 0 && base + qd16 * 16 < k) v = __ldg(reinterpret_cast<const uint4 *>(xq + int64_t(in) * k + base) + qd16);
+            *reinterpret_cast<uint4 *>(xt + col * XS + qd16 * 16) = v;
+        }
+        for (int i = threadIdx.x; i < 64 * NB; i += 256) {
+            const int col = i / NB, b = i % NB, in = cols_in[col];
+            const bool ok = in >= 0 && base + b * 32 < k;
+            st[col][b] = ok ? xs[int64_t(in) * nb + base / 32 + b] : 0.f;
+            if constexpr (MINTERM) {
+                sq[col][2 * b] = ok ? xsum[(int64_t(in) * nb + base / 32 + b) * 2] : int16_t(0);
+                sq[col][2 * b + 1] = ok ? xsum[(int64_t(in) * nb + base / 32 + b) * 2 + 1] : int16_t(0);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int bb = 0; bb < 4; ++bb) {
+            const int b = ks * 4 + bb, s = base / 32 + b;
+            if (s >= nb) break;
+            U4hTile<FMT, GROUPED> qd;
+            qd.load(w4, sm, k, ra, rb, s, nb, true);
+            uint32_t wa0[4], wb0[4], wa1[4], wb1[4];  // only element t is used: the lane's own 4 codes per 16-group
+            qd.codes1(0, t, s, true, grid, wa0[t], wb0[t]);
+            qd.codes1(1, t, s, true, grid, wa1[t], wb1[t]);
+            if constexpr (ONE) {  // one k32 MMA per block
+                const uint32_t a0 = sub(wa0[t]), a1 = sub(wb0[t]), a2 = sub(wa1[t]), a3 = sub(wb1[t]);
+                const float sa = h2lo(qd.sa[0]), sb = h2lo(qd.sb[0]);
+                [[maybe_unused]] float ca = 0.f, cb = 0.f;
+                if constexpr (MINTERM) { ca = fmaf(128.f, sa, h2lo(qd.ma[0])); cb = fmaf(128.f, sb, h2lo(qd.mb[0])); }
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const int8_t * xp = xt + (nt * 8 + g) * XS + b * 32 + 4 * t;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t *>(xp), b1 = *reinterpret_cast<const uint32_t *>(xp + 16);
+                    int d[4];
+                    mma_s8_k32(d, a0, a1, a2, a3, b0, b1);
+                    const int c0 = nt * 8 + 2 * t, c1 = c0 + 1;
+                    if constexpr (TOKEN) {
+                        acc[nt][0] = fmaf(sa, __int_as_float(d[0]) - 12582912.f, acc[nt][0]); acc[nt][1] = fmaf(sa, __int_as_float(d[1]) - 12582912.f, acc[nt][1]);
+                        acc[nt][2] = fmaf(sb, __int_as_float(d[2]) - 12582912.f, acc[nt][2]); acc[nt][3] = fmaf(sb, __int_as_float(d[3]) - 12582912.f, acc[nt][3]);
+                        if constexpr (MINTERM) {
+                            const float q0 = float(sq[c0][2 * b]) + float(sq[c0][2 * b + 1]), q1 = float(sq[c1][2 * b]) + float(sq[c1][2 * b + 1]);
+                            acc[nt][0] = fmaf(ca, q0, acc[nt][0]); acc[nt][1] = fmaf(ca, q1, acc[nt][1]); acc[nt][2] = fmaf(cb, q0, acc[nt][2]); acc[nt][3] = fmaf(cb, q1, acc[nt][3]);
+                        }
+                        continue;
+                    }
+                    const float x0 = st[c0][b], x1 = st[c1][b];
+                    float d0 = sa * (__int_as_float(d[0]) - 12582912.f), d1 = sa * (__int_as_float(d[1]) - 12582912.f);
+                    float d2 = sb * (__int_as_float(d[2]) - 12582912.f), d3 = sb * (__int_as_float(d[3]) - 12582912.f);
+                    if constexpr (MINTERM) {
+                        const float q0 = float(sq[c0][2 * b]) + float(sq[c0][2 * b + 1]), q1 = float(sq[c1][2 * b]) + float(sq[c1][2 * b + 1]);
+                        d0 = fmaf(ca, q0, d0); d1 = fmaf(ca, q1, d1); d2 = fmaf(cb, q0, d2); d3 = fmaf(cb, q1, d3);
+                    }
+                    acc[nt][0] = fmaf(x0, d0, acc[nt][0]); acc[nt][1] = fmaf(x1, d1, acc[nt][1]);
+                    acc[nt][2] = fmaf(x0, d2, acc[nt][2]); acc[nt][3] = fmaf(x1, d3, acc[nt][3]);
+                }
+            } else {  // a scale per 16: two k16 MMAs per block
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    const uint32_t a0 = sub(hh ? wa1[t] : wa0[t]), a1 = sub(hh ? wb1[t] : wb0[t]);
+                    const float sa = h2lo(qd.sa[hh]), sb = h2lo(qd.sb[hh]);
+                    [[maybe_unused]] float ca = 0.f, cb = 0.f;
+                    if constexpr (MINTERM) { ca = fmaf(128.f, sa, h2lo(qd.ma[hh])); cb = fmaf(128.f, sb, h2lo(qd.mb[hh])); }
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        const uint32_t b0 = *reinterpret_cast<const uint32_t *>(xt + (nt * 8 + g) * XS + b * 32 + hh * 16 + 4 * t);
+                        int d[4];
+                        mma_s8_k16(d, a0, a1, b0);
+                        const int c0 = nt * 8 + 2 * t, c1 = c0 + 1;
+                        if constexpr (TOKEN) {
+                            acc[nt][0] = fmaf(sa, __int_as_float(d[0]) - 12582912.f, acc[nt][0]); acc[nt][1] = fmaf(sa, __int_as_float(d[1]) - 12582912.f, acc[nt][1]);
+                            acc[nt][2] = fmaf(sb, __int_as_float(d[2]) - 12582912.f, acc[nt][2]); acc[nt][3] = fmaf(sb, __int_as_float(d[3]) - 12582912.f, acc[nt][3]);
+                            if constexpr (MINTERM) {
+                                const float q0 = float(sq[c0][2 * b + hh]), q1 = float(sq[c1][2 * b + hh]);
+                                acc[nt][0] = fmaf(ca, q0, acc[nt][0]); acc[nt][1] = fmaf(ca, q1, acc[nt][1]); acc[nt][2] = fmaf(cb, q0, acc[nt][2]); acc[nt][3] = fmaf(cb, q1, acc[nt][3]);
+                            }
+                            continue;
+                        }
+                        const float x0 = st[c0][b], x1 = st[c1][b];
+                        float d0 = sa * (__int_as_float(d[0]) - 12582912.f), d1 = sa * (__int_as_float(d[1]) - 12582912.f);
+                        float d2 = sb * (__int_as_float(d[2]) - 12582912.f), d3 = sb * (__int_as_float(d[3]) - 12582912.f);
+                        if constexpr (MINTERM) {
+                            const float q0 = float(sq[c0][2 * b + hh]), q1 = float(sq[c1][2 * b + hh]);
+                            d0 = fmaf(ca, q0, d0); d1 = fmaf(ca, q1, d1); d2 = fmaf(cb, q0, d2); d3 = fmaf(cb, q1, d3);
+                        }
+                        acc[nt][0] = fmaf(x0, d0, acc[nt][0]); acc[nt][1] = fmaf(x1, d1, acc[nt][1]);
+                        acc[nt][2] = fmaf(x0, d2, acc[nt][2]); acc[nt][3] = fmaf(x1, d3, acc[nt][3]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    float (*red)[32][NT * 4] = reinterpret_cast<float (*)[32][NT * 4]>(xt);  // 16 KB of the 17 KB tile
+    if (ks == 1)
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) red[rt][lane][nt * 4 + i] = acc[nt][i];
+    __syncthreads();
+    if (ks == 0) {
+        const int r = row0 + g;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int n0 = col0 + nt * 8 + 2 * t, n1 = n0 + 1;
+            const float v0 = acc[nt][0] + red[rt][lane][nt * 4 + 0], v1 = acc[nt][1] + red[rt][lane][nt * 4 + 1];
+            const float v2 = acc[nt][2] + red[rt][lane][nt * 4 + 2], v3 = acc[nt][3] + red[rt][lane][nt * 4 + 3];
+            const auto put = [&](int col, int row, float value) {
+                if (col < ncols) {
+                    if constexpr (TOKEN) { const int in = cols_in[col - col0]; value *= in >= 0 ? xs[int64_t(in) * nb] : 0.f; }
+                    if constexpr (GROUPED) col = groups[col];
+                    if constexpr (std::is_same_v<OUT, float>) y[int64_t(col) * ldy + row] = value;
+                    else y[int64_t(col) * ldy + row] = __float2bfloat16_rn(value);
+                }
+            };
+            if (r < rows) { put(n0, r, v0); put(n1, r, v1); }
+            if (r + 8 < rows) { put(n0, r + 8, v2); put(n1, r + 8, v3); }
+        }
+    }
+}
+
+// ---- INT8 expert GEMM v3 (TQFN_PREFILL_INT8=3 per-32 activation scales, 4 per-token) ----
+// Structure after Strata's fused IQ kernel (moe_fused_iq.cu, credited; own implementation): the weights of a 128-row x 64-k
+// stage are decoded ONCE per CTA into shared memory as int8 (one thread per (row, 32-block)), with their per-16 scale and
+// min term, double-buffered; the activations of the 128-token tile arrive by cp.async one stage ahead. 8 warps = 4 row
+// groups (32 rows = 2 m16) x 2 token groups (64 tokens = 8 n8): 16 tensor-core ops per warp per 32 k. Per-32-scale formats
+// use one m16n8k32 per block, per-16 formats two m16n8k16. Same exact int -> float trick as u4h_i8_gemm_k.
+__device__ __forceinline__ void cp_async16(void * smem, const void * gmem, bool pred) {
+    const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    const int n = pred ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(gmem), "r"(n));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
+template <int FMT, bool TOKEN>
+__global__ void __launch_bounds__(256) u4h_i8v3_gemm_k(const uint8_t * w4, const __half2 * sm, const int8_t * xq, const float * xs,
+                                                       const int16_t * xsum, __nv_bfloat16 * y, int rows, int k,
+                                                       const int * counts, const int * groups, int capacity, int topk, bool per_expert_input) {
+    // tokens per CTA: 128 (two warp columns of 64); the generic formats carry min-term tables, so 64 keeps static smem < 48 KB
+    constexpr int BM = 128, BN = i8_offset<FMT>() == 0 ? 64 : 128, KS = 64, NBS = KS / 32, WN = BN / 2, NI = WN / 8;
+    constexpr int WLD = KS + 16, XLD = KS + 16;                 // padded row strides (bytes)
+    constexpr int OFF = i8_offset<FMT>();
+    constexpr bool ONE = i8_one_scale<FMT>(), MINTERM = OFF == 0;
+    constexpr bool GRID_SMEM = ud_grid_words(FMT) > 1 && ud_grid_words(FMT) <= 1024;  // IQ2_S's 8 KB grid stays in L1 here
+    const int expert = blockIdx.z, ncols = counts[expert];
+    if (int(blockIdx.y) * BN >= ncols) return;
+    groups += int64_t(expert) * capacity;
+    const int source_row = expert * rows, row_tile = blockIdx.x * BM, col0 = blockIdx.y * BN, nb = k / 32;
+    __shared__ __align__(16) int8_t wsm[2][BM * WLD];
+    __shared__ float wsc[2][BM][NBS * 2];                       // weight scale per 16-group
+    __shared__ float wmc[2][MINTERM ? BM : 1][NBS * 2];         // (128 scale + min) per 16-group (generic formats)
+    __shared__ __align__(16) int8_t xsmem[2][BN * XLD];
+    __shared__ float xsc[2][BN][NBS];                           // activation scale per 32 (TOKEN: unused)
+    __shared__ float xqs[2][MINTERM ? BN : 1][NBS * 2];         // sum of codes per 16 (generic formats)
+    __shared__ int cols_in[BN];
+    __shared__ uint32_t gsm[GRID_SMEM ? ud_grid_words(FMT) : 1];
+    const uint32_t * grid = gsm;
+    if constexpr (FMT == 4) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) gsm[i] = iq3s_grid_d[i];
+    } else if constexpr (FMT == 5) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) gsm[i] = iq3xxs_grid_d[i];
+    } else if constexpr (FMT >= 8 && FMT <= 11) {
+        if constexpr (GRID_SMEM) {
+            const uint32_t * src = ud_grid_src<FMT>();
+            for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) gsm[i] = src[i];
+        } else {
+            grid = ud_grid_src<FMT>();
+        }
+    }
+    for (int i = threadIdx.x; i < BN; i += blockDim.x) {
+        const int col = col0 + i; int in = -1;
+        if (col < ncols) { in = groups[col]; if (!per_expert_input) in /= topk; }
+        cols_in[i] = in;
+    }
+    __syncthreads();
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int wr = warp & 3, wc = warp >> 2;                    // row group (32 rows), token group (64 tokens)
+    // stage loader: weights decoded by thread (row = tid >> 1, block = tid & 1); activations by cp.async
+    auto load_stage = [&](int stage, int buf) {
+        const int kb = stage * KS;
+        {
+            const int r = tid >> 1, j = tid & 1, s = kb / 32 + j, row = row_tile + r;
+            const bool ok = row < rows && s < nb;
+            const int ra = source_row + min(row, rows - 1);
+            U4hTile<FMT, true> qd;
+            qd.load(w4, sm, k, ra, ra, ok ? s : 0, nb, ok);
+            uint32_t w0[4], w1[4], d0[4], d1[4];
+            qd.codes(0, ok ? s : 0, ok, grid, w0, d0);
+            qd.codes(1, ok ? s : 0, ok, grid, w1, d1);
+            uint32_t * dst = reinterpret_cast<uint32_t *>(&wsm[buf][r * WLD + j * 32]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) { dst[u] = ok ? (w0[u] ^ 0x80808080u) : 0u; dst[4 + u] = ok ? (w1[u] ^ 0x80808080u) : 0u; }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const float sc = ok ? h2lo(qd.sa[h]) : 0.f;
+                wsc[buf][r][2 * j + h] = sc;
+                if constexpr (MINTERM) wmc[buf][r][2 * j + h] = ok ? fmaf(128.f, sc, h2lo(qd.ma[h])) : 0.f;
+            }
+        }
+        for (int i = tid; i < BN * (KS / 16); i += 256) {        // 128 tokens x 4 x 16 bytes
+            const int c = i / (KS / 16), q = i % (KS / 16), in = cols_in[c];
+            const bool ok = in >= 0 && kb + q * 16 < k;
+            cp_async16(&xsmem[buf][c * XLD + q * 16], ok ? static_cast<const void *>(xq + int64_t(in) * k + kb + q * 16) : static_cast<const void *>(xq), ok);
+        }
+        for (int i = tid; i < BN * NBS; i += 256) {
+            const int c = i / NBS, j = i % NBS, in = cols_in[c], s = kb / 32 + j;
+            const bool ok = in >= 0 && s < nb;
+            if constexpr (!TOKEN) xsc[buf][c][j] = ok ? xs[int64_t(in) * nb + s] : 0.f;
+            if constexpr (MINTERM) {
+                xqs[buf][c][2 * j] = ok ? float(xsum[(int64_t(in) * nb + s) * 2]) : 0.f;
+                xqs[buf][c][2 * j + 1] = ok ? float(xsum[(int64_t(in) * nb + s) * 2 + 1]) : 0.f;
+            }
+        }
+        cp_async_commit();
+    };
+    float acc[2][NI][4] = {};
+    const int nstages = (k + KS - 1) / KS;
+    load_stage(0, 0);
+    for (int st = 0; st < nstages; ++st) {
+        const int buf = st & 1;
+        cp_async_wait0();
+        __syncthreads();
+        if (st + 1 < nstages) load_stage(st + 1, buf ^ 1);       // overlaps with the MMAs below
+#pragma unroll
+        for (int j = 0; j < NBS; ++j) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const int r0 = wr * 32 + mi * 16 + g, r1 = r0 + 8;
+                const int8_t * wa = &wsm[buf][r0 * WLD + j * 32], * wb = &wsm[buf][r1 * WLD + j * 32];
+                const uint32_t a0 = *reinterpret_cast<const uint32_t *>(wa + 4 * t), a1 = *reinterpret_cast<const uint32_t *>(wb + 4 * t);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t *>(wa + 16 + 4 * t), a3 = *reinterpret_cast<const uint32_t *>(wb + 16 + 4 * t);
+                const float s0a = wsc[buf][r0][2 * j], s1a = wsc[buf][r0][2 * j + 1], s0b = wsc[buf][r1][2 * j], s1b = wsc[buf][r1][2 * j + 1];
+                [[maybe_unused]] float m0a = 0.f, m1a = 0.f, m0b = 0.f, m1b = 0.f;
+                if constexpr (MINTERM) { m0a = wmc[buf][r0][2 * j]; m1a = wmc[buf][r0][2 * j + 1]; m0b = wmc[buf][r1][2 * j]; m1b = wmc[buf][r1][2 * j + 1]; }
+#pragma unroll
+                for (int ni = 0; ni < NI; ++ni) {
+                    const int c0 = wc * WN + ni * 8 + g;                     // token row of the B fragment
+                    const int8_t * xp = &xsmem[buf][c0 * XLD + j * 32];
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t *>(xp + 4 * t), b1 = *reinterpret_cast<const uint32_t *>(xp + 16 + 4 * t);
+                    const int oc0 = wc * WN + ni * 8 + 2 * t, oc1 = oc0 + 1;  // output columns of this lane
+                    float x0 = 1.f, x1 = 1.f;
+                    if constexpr (!TOKEN) { x0 = xsc[buf][oc0][j]; x1 = xsc[buf][oc1][j]; }
+                    float v[4];
+                    if constexpr (ONE && !MINTERM) {
+                        int d[4]; mma_s8_k32(d, a0, a1, a2, a3, b0, b1);
+                        v[0] = s0a * (__int_as_float(d[0]) - 12582912.f); v[1] = s0a * (__int_as_float(d[1]) - 12582912.f);
+                        v[2] = s0b * (__int_as_float(d[2]) - 12582912.f); v[3] = s0b * (__int_as_float(d[3]) - 12582912.f);
+                    } else {
+                        int d[4], e[4]; mma_s8_k16(d, a0, a1, b0); mma_s8_k16(e, a2, a3, b1);
+                        v[0] = fmaf(s0a, __int_as_float(d[0]) - 12582912.f, s1a * (__int_as_float(e[0]) - 12582912.f));
+                        v[1] = fmaf(s0a, __int_as_float(d[1]) - 12582912.f, s1a * (__int_as_float(e[1]) - 12582912.f));
+                        v[2] = fmaf(s0b, __int_as_float(d[2]) - 12582912.f, s1b * (__int_as_float(e[2]) - 12582912.f));
+                        v[3] = fmaf(s0b, __int_as_float(d[3]) - 12582912.f, s1b * (__int_as_float(e[3]) - 12582912.f));
+                        if constexpr (MINTERM) {
+                            const float q00 = xqs[buf][oc0][2 * j], q01 = xqs[buf][oc0][2 * j + 1], q10 = xqs[buf][oc1][2 * j], q11 = xqs[buf][oc1][2 * j + 1];
+                            v[0] = fmaf(m0a, q00, fmaf(m1a, q01, v[0])); v[1] = fmaf(m0a, q10, fmaf(m1a, q11, v[1]));
+                            v[2] = fmaf(m0b, q00, fmaf(m1b, q01, v[2])); v[3] = fmaf(m0b, q10, fmaf(m1b, q11, v[3]));
+                        }
+                    }
+                    acc[mi][ni][0] = fmaf(x0, v[0], acc[mi][ni][0]); acc[mi][ni][1] = fmaf(x1, v[1], acc[mi][ni][1]);
+                    acc[mi][ni][2] = fmaf(x0, v[2], acc[mi][ni][2]); acc[mi][ni][3] = fmaf(x1, v[3], acc[mi][ni][3]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NI; ++ni)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int r = row_tile + wr * 32 + mi * 16 + g + (q >= 2 ? 8 : 0);
+                const int cl = wc * WN + ni * 8 + 2 * t + (q & 1), col = col0 + cl;
+                if (r >= rows || col >= ncols) continue;
+                float value = acc[mi][ni][q];
+                if constexpr (TOKEN) { const int in = cols_in[cl]; value *= in >= 0 ? xs[int64_t(in) * nb] : 0.f; }
+                y[int64_t(groups[col]) * rows + r] = __float2bfloat16_rn(value);
+            }
 }
 
 // i8h -> u4h (draft-only copies): per 32 weights, asymmetric min / max 4-bit, codes in the u4h nibble order.
@@ -2286,6 +2743,93 @@ void k_expert_gemm(int fmt, const uint8_t * w, const void * aux, const __half * 
 }
 
 // fmt: 0 u4h, 1 k4, 2 k3, 4 iq3, 5 iq3x, 6 k5, 7 k6, 8-12 UD types (u4h_matvec_k's FMT); gemm only: 13 iq4n, 14 iq4l, 15 i8h
+void k_expert_gemm_i8(int fmt, const uint8_t * w, const void * aux, const int8_t * xq, const float * xs, const int16_t * xsum,
+                      __nv_bfloat16 * y, int rows, int cols, const int * counts, const int * groups,
+                      int capacity, int experts, int topk, bool per_expert_input, cudaStream_t stream, int mode) {
+    if (!w || !aux || !xq || !xs || !xsum || !y || !counts || !groups || rows <= 0 || cols <= 0 ||
+        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
+        experts <= 0 || experts > 65535 || topk <= 0)
+        throw std::invalid_argument("k_expert_gemm_i8: invalid shape");
+    const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
+    const auto * scales = static_cast<const __half2 *>(aux);
+#define TQ_I8G(F) do { if (mode >= 3) { const int bn3 = i8_offset<F>() == 0 ? 64 : 128; const dim3 g3(unsigned((rows + 127) / 128), unsigned((capacity + bn3 - 1) / bn3), unsigned(experts)); \
+                         if (mode == 4) u4h_i8v3_gemm_k<F, true><<<g3, 256, 0, stream>>>(w, scales, xq, xs, xsum, y, rows, cols, counts, groups, capacity, topk, per_expert_input); \
+                         else u4h_i8v3_gemm_k<F, false><<<g3, 256, 0, stream>>>(w, scales, xq, xs, xsum, y, rows, cols, counts, groups, capacity, topk, per_expert_input); } \
+                       else if (mode == 2) u4h_i8_gemm_k<F, true, true><<<grid, 256, 0, stream>>>(w, scales, xq, xs, xsum, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); \
+                       else u4h_i8_gemm_k<F, true, false><<<grid, 256, 0, stream>>>(w, scales, xq, xs, xsum, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); } while (0)
+    switch (fmt) {
+        case 1: TQ_I8G(1); break;
+        case 4: TQ_I8G(4); break;
+        case 5: TQ_I8G(5); break;
+        case 6: TQ_I8G(6); break;
+        case 7: TQ_I8G(7); break;
+        case 10: TQ_I8G(10); break;
+        case 13: TQ_I8G(13); break;
+        case 14: TQ_I8G(14); break;
+        default: throw std::invalid_argument("k_expert_gemm_i8: unsupported format");
+    }
+#undef TQ_I8G
+}
+void k_quant_act_rows(const __half * x, const int * rows_of, const int * counts, int cap, int slots, int nrows, int k,
+                      int8_t * q, float * s, int16_t * qsum, cudaStream_t stream, int mode) {
+    if (k % 32 || !x || !q || !s || !qsum) throw std::invalid_argument("k_quant_act_rows: invalid shape");
+    if (!rows_of) {
+        if (nrows <= 0) return;
+        if (mode == 2 || mode == 4) quant_act_rows_k<true><<<unsigned(nrows), 256, 0, stream>>>(x, nullptr, nullptr, 0, k, q, s, qsum);
+        else quant_act_rows_k<false><<<unsigned(nrows), 256, 0, stream>>>(x, nullptr, nullptr, 0, k, q, s, qsum);
+    } else if (cap > 0 && slots > 0) {
+        if (mode == 2 || mode == 4) quant_act_rows_k<true><<<dim3(unsigned(cap), unsigned(slots)), 256, 0, stream>>>(x, rows_of, counts, cap, k, q, s, qsum);
+        else quant_act_rows_k<false><<<dim3(unsigned(cap), unsigned(slots)), 256, 0, stream>>>(x, rows_of, counts, cap, k, q, s, qsum);
+    }
+}
+
+// dense (non-grouped) int8-activation GEMM, f32 output: the layer-major dense projections (TQFN_DENSE_INT8)
+bool u4h_family_gemm_i8_f32(int fmt, const uint8_t * w, const void * aux, const int8_t * xq, const float * xs, const int16_t * xsum,
+                            float * y, int rows, int k, int ncols, cudaStream_t s, int ldy, int mode) {
+    if (k % 64 || rows <= 0 || ncols <= 0) return false;
+    const dim3 grid(unsigned((rows + 63) / 64), unsigned((ncols + 63) / 64));
+    const auto * scales = static_cast<const __half2 *>(aux);
+#define TQ_I8D(F) do { if (mode == 2) u4h_i8_gemm_k<F, false, true, float><<<grid, 256, 0, s>>>(w, scales, xq, xs, xsum, y, rows, k, ncols, ldy ? ldy : rows, nullptr, nullptr, 0, 1, false); \
+                       else u4h_i8_gemm_k<F, false, false, float><<<grid, 256, 0, s>>>(w, scales, xq, xs, xsum, y, rows, k, ncols, ldy ? ldy : rows, nullptr, nullptr, 0, 1, false); } while (0)
+    switch (fmt) {
+        case 1: TQ_I8D(1); break;
+        case 4: TQ_I8D(4); break;
+        case 5: TQ_I8D(5); break;
+        case 6: TQ_I8D(6); break;
+        case 7: TQ_I8D(7); break;
+        case 10: TQ_I8D(10); break;
+        case 13: TQ_I8D(13); break;
+        case 14: TQ_I8D(14); break;
+        default: return false;
+    }
+#undef TQ_I8D
+    return true;
+}
+
+// gate + up in one grouped launch with the swiglu epilogue (library only): yh [assignment][rows] half
+void k_expert_gemm_gateup(int fmt, const uint8_t * wg, const void * auxg, const uint8_t * wu, const void * auxu, const __half * x,
+                          __half * yh, int rows, int cols, const int * counts, const int * groups,
+                          int capacity, int experts, int topk, cudaStream_t stream) {
+    if (!wg || !auxg || !wu || !auxu || !x || !yh || !counts || !groups || rows <= 0 || cols <= 0 ||
+        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 || experts <= 0 || experts > 65535 || topk <= 0)
+        throw std::invalid_argument("k_expert_gemm_gateup: invalid shape");
+    const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
+    const auto * sg = static_cast<const __half2 *>(auxg); const auto * su = static_cast<const __half2 *>(auxu);
+#define TQ_GU(F) u4h_gemm_k<F, true, __nv_bfloat16, true><<<grid, 256, 0, stream>>>(wg, sg, x, nullptr, rows, cols, capacity, rows, counts, groups, capacity, topk, false, wu, su, yh)
+    switch (fmt) {
+        case 1: TQ_GU(1); break;
+        case 4: TQ_GU(4); break;
+        case 5: TQ_GU(5); break;
+        case 6: TQ_GU(6); break;
+        case 7: TQ_GU(7); break;
+        case 10: TQ_GU(10); break;
+        case 13: TQ_GU(13); break;
+        case 14: TQ_GU(14); break;
+        default: throw std::invalid_argument("k_expert_gemm_gateup: unsupported format");
+    }
+#undef TQ_GU
+}
+
 void u4h_family_gemm(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                      int ncols, cudaStream_t s, int ldy) {
     switch (fmt) {
@@ -2843,6 +3387,22 @@ void tq3_matvec_h_variant(const void * w, const __half * xh, __nv_bfloat16 * y, 
 }
 
 // Per-shape kernel variant for <= 8 columns, picked by tq3_tune at load (all variants are bit-identical per column):
+// Tuning scratch: a full device must fail closed here, not time launches that never ran (or ran on null buffers).
+static void tune_scratch(__half ** x, size_t xbytes, __nv_bfloat16 ** y, size_t ybytes, const char * who) {
+    if (cudaMalloc(x, xbytes) != cudaSuccess || cudaMalloc(y, ybytes) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFree(*x);
+        *x = nullptr;
+        throw std::runtime_error(std::string(who) + ": tuning scratch allocation failed");
+    }
+}
+static void tune_done(__half * x, __nv_bfloat16 * y, const char * who) {
+    const cudaError_t e = cudaGetLastError();
+    cudaFree(x);
+    cudaFree(y);
+    if (e != cudaSuccess) throw std::runtime_error(std::string(who) + ": " + cudaGetErrorString(e));
+}
+
 // 0 narrow, 1 / 2 prefetching with 1 / 2 row tiles, 3 / 4 row-tiled x2 / x4.
 static std::map<std::pair<int, int>, int> & tq3_tuned() {
     static std::map<std::pair<int, int>, int> m;
@@ -2853,8 +3413,7 @@ void tq3_tune(const void * w, int rows, int k, cudaStream_t s) {
     if (tq3_tuned().count({rows, k})) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
-    cudaMalloc(&x, size_t(8) * k * 2);
-    cudaMalloc(&y, size_t(8) * rows * 2);
+    tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "tq3_tune");
     cudaMemsetAsync(x, 0, size_t(8) * k * 2, s);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -2873,8 +3432,7 @@ void tq3_tune(const void * w, int rows, int k, cudaStream_t s) {
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
-    cudaFree(x);
-    cudaFree(y);
+    tune_done(x, y, "tq3_tune");
     tq3_tuned()[{rows, k}] = best;
     if (tqllm::debug_on("tune")) std::fprintf(stderr, "tq3_tune %d x %d -> variant %d (%.1f us)\n", rows, k, best, best_ms * 1000.f / 30.f);
 }
@@ -3265,8 +3823,7 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
     if (tuned<FMT>().count({rows, k})) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
-    cudaMalloc(&x, size_t(8) * k * 2);
-    cudaMalloc(&y, size_t(8) * rows * 2);
+    tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "u4h_tune");
     cudaMemsetAsync(x, 0, size_t(8) * k * 2, s);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -3285,8 +3842,7 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
-    cudaFree(x);
-    cudaFree(y);
+    tune_done(x, y, "u4h_tune");
     tuned<FMT>()[{rows, k}] = best;
     if (tqllm::debug_on("tune")) std::fprintf(stderr, "u4h_tune fmt %d %d x %d -> MT %d (%.1f us)\n", FMT, rows, k, best, best_ms * 1000.f / 30.f);
 }

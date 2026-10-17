@@ -4,6 +4,8 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -64,8 +66,17 @@ std::vector<float> MappedGguf::gather_rows(const std::string & name, const std::
     const auto data = checked(t);
     const size_t stride = size_t(t.ne[0] / block * bytes);
     std::vector<float> result(rows.size() * size_t(t.ne[0]));
-    for (size_t i = 0; i < rows.size(); ++i)
-        dequantize_host(t.type, data.data + rows[i] * stride, result.data() + i * t.ne[0], int64_t(t.ne[0]));
+    const auto part = [&](size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1; ++i)
+            dequantize_host(t.type, data.data + rows[i] * stride, result.data() + i * t.ne[0], int64_t(t.ne[0]));
+    };
+    // prefill chunks gather many scattered rows (per-layer embeddings: 16 per token) from the mapped file: split them
+    const size_t threads = rows.size() >= 4096 ? std::min<size_t>(16, std::max(1u, std::thread::hardware_concurrency())) : 1;
+    if (threads <= 1) { part(0, rows.size()); return result; }
+    std::vector<std::thread> pool;
+    const size_t step = (rows.size() + threads - 1) / threads;
+    for (size_t i0 = 0; i0 < rows.size(); i0 += step) pool.emplace_back(part, i0, std::min(rows.size(), i0 + step));
+    for (auto & th : pool) th.join();
     return result;
 }
 } // namespace tqllm
