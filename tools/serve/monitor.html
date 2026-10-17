@@ -4,8 +4,9 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>tqLLM monitor</title>
 <style>
-:root{color-scheme:dark;--bg:#0a0c10;--panel:#10131a;--panel2:#141821;--line:#1f2430;--text:#d7dce6;--muted:#7d8799;--dim:#4d5566;
+:root,:root[data-theme="dark"]{color-scheme:dark;--bg:#0a0c10;--panel:#10131a;--panel2:#141821;--line:#1f2430;--text:#d7dce6;--muted:#7d8799;--dim:#4d5566;
   --live:#7ee787;--prefill:#e3b341;--decode:#79c0ff;--bad:#ff7b72;--mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+:root[data-theme="light"]{color-scheme:light;--bg:#f4f5f8;--panel:#ffffff;--panel2:#f0f2f6;--line:#d9dde6;--text:#1c2230;--muted:#5c6577;--dim:#8a93a6;--live:#1a7f37;--prefill:#9a6700;--decode:#0550ae;--bad:#cf222e}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--mono);display:flex;flex-direction:column;min-height:100vh}
 button,input,textarea{font:inherit;color:inherit}
@@ -67,17 +68,19 @@ form#auth small{color:var(--muted);width:100%}
 table{border-collapse:collapse;width:100%;min-width:420px}
 th,td{text-align:left;padding:4px 11px;white-space:nowrap;font-variant-numeric:tabular-nums}
 th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--panel)}
-td.phase-prefill{color:var(--prefill)}td.phase-decode{color:var(--decode)}td.phase-complete{color:var(--live)}td.phase-failed,td.phase-cancelled{color:var(--bad)}
+td.phase-prefill{color:var(--prefill)}td .progress{display:block;height:3px;background:var(--line);margin-top:3px;border-radius:2px;overflow:hidden}td .progress b{display:block;height:100%;background:var(--prefill)}td.phase-decode{color:var(--decode)}td.phase-complete{color:var(--live)}td.phase-failed,td.phase-cancelled{color:var(--bad)}
 tbody tr:nth-child(odd){background:var(--panel2)}
 /* chat */
 .chat-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
 .chat-head span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-head .toggle{display:inline-flex;align-items:center;gap:5px;cursor:pointer;text-transform:none;letter-spacing:0}
+.msg pre.thought{color:var(--dim);border-left:2px solid var(--line);padding-left:8px;margin-bottom:6px}.msg pre.thought:empty{display:none}
 #transcript{flex:1;overflow:auto;padding:12px;min-height:200px;display:flex;flex-direction:column;gap:10px}
 .msg{display:grid;grid-template-columns:62px minmax(0,1fr);gap:8px}
 .msg .who{color:var(--dim);text-align:right}
 .msg.you .who{color:var(--live)}.msg.model .who{color:var(--decode)}.msg.sys .who{color:var(--prefill)}
 .msg pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
-.msg.model.streaming pre::after{content:"\2588";color:var(--decode);animation:blink 1s steps(2) infinite}
+.msg.model.streaming pre:not(.thought)::after{content:"\2588";color:var(--decode);animation:blink 1s steps(2) infinite}
 @keyframes blink{to{opacity:0}}
 .hint{color:var(--dim);text-align:center;margin:auto 0;padding:20px}
 .compose{border-top:1px solid var(--line);padding:9px 12px;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:end;background:var(--panel)}
@@ -97,6 +100,7 @@ footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;bord
   <div class="brand">tq<b>LLM</b> monitor</div>
   <div class="id"><strong id="model">engine</strong> on <span id="host">--</span>, build <span id="build">--</span>, <span id="slots">-- slots</span></div>
   <span class="pill"><i></i><span id="connection">Connecting</span></span>
+  <button type="button" id="themeButton" title="light / dark">theme</button>
   <button type="button" id="keyButton">key</button>
 </header>
 <main>
@@ -128,7 +132,7 @@ footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;bord
     <div class="table-wrap"><table aria-label="Recent requests"><thead><tr><th scope="col">id</th><th scope="col">phase</th><th scope="col">prompt / output</th><th scope="col">first out</th><th scope="col">tok/s</th><th scope="col">elapsed</th></tr></thead><tbody id="requests"></tbody></table></div></div>
 </section>
 <section class="right" aria-label="Chat">
-  <div class="chat-head"><span>chat / this instance only / one at a time</span><button type="button" id="chatClear">clear</button></div>
+  <div class="chat-head"><span>chat / this instance only / one at a time</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear">clear</button></div>
   <div id="transcript"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
   <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" rows="1" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend">send</button><button type="button" id="chatStop" disabled>stop</button></div></form>
   <div class="chat-foot"><span id="chatStatus">idle</span><span id="chatStats"></span></div>
@@ -207,7 +211,13 @@ function render(data) {
     const tr = document.createElement('tr');
     const cells = [r.id, r.phase, number(r.prompt_tokens) + ' / ' + number(r.output_tokens), typeof r.first_output_ms === 'number' ? number(r.first_output_ms) + ' ms' : '--',
       typeof r.decode_tokens_per_second === 'number' ? number(r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
-    cells.forEach((value, i) => { const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase; tr.append(td); });
+    cells.forEach((value, i) => {
+      const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
+      if (i === 2 && r.phase === 'prefill' && r.prompt_tokens > 0 && typeof r.context_tokens === 'number') {  // prompt tokens already processed
+        const bar = document.createElement('span'); bar.className = 'progress'; const fill = document.createElement('b'); fill.style.width = (Math.min(1, r.context_tokens / r.prompt_tokens) * 100).toFixed(1) + '%'; bar.append(fill); td.append(bar);
+      }
+      tr.append(td);
+    });
     return tr;
   }));
   budget('context', 'contextBar', active.length ? Math.max(...active.map(r => r.context_tokens || 0)) : 0, data.engine.context_per_slot, false);
@@ -243,6 +253,7 @@ async function poll(token = generation) {
   }
 }
 $('auth').addEventListener('submit', event => { event.preventDefault(); key = $('apiKey').value; $('apiKey').value = ''; $('auth').hidden = true; generation++; clearTimeout(timer); poll(generation); });
+$('themeButton').addEventListener('click', () => { const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; document.documentElement.dataset.theme = dark ? 'light' : 'dark'; });
 $('keyButton').addEventListener('click', () => { $('auth').hidden = !$('auth').hidden; if (!$('auth').hidden) $('apiKey').focus(); });
 $('snapshotLink').addEventListener('click', event => { if (key) { event.preventDefault(); notice('The JSON endpoint uses Bearer authentication; the key is never placed in a URL. Query /api/monitor/v1/snapshot from your API client.'); } });
 document.addEventListener('visibilitychange', () => { generation++; clearTimeout(timer); previous = null; if (!document.hidden) poll(generation); });
@@ -254,19 +265,24 @@ let controller = null;
 function line(role, who) {
   const msg = document.createElement('div'); msg.className = 'msg ' + role;
   const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
-  const pre = document.createElement('pre'); msg.append(w, pre); $('chatHint')?.remove(); $('transcript').append(msg); return pre;
+  const pre = document.createElement('pre');
+  if (role === 'model') { const body = document.createElement('div'); const thought = document.createElement('pre'); thought.className = 'thought'; body.append(thought, pre); msg.append(w, body); }
+  else msg.append(w, pre);
+  $('chatHint')?.remove(); $('transcript').append(msg); return pre;
 }
 function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatInput').disabled = on; }
 function chatScroll() { const t = $('transcript'); t.scrollTop = t.scrollHeight; }
 async function send(prompt) {
   if (!key) { notice('Enter the server key first (key button, top right); the chat uses the same Bearer key as the telemetry.'); $('auth').hidden = false; $('apiKey').focus(); return; }
   history.push({role: 'user', content: prompt}); line('you', 'you').textContent = prompt;
-  const pre = line('model', 'model'); pre.parentElement.classList.add('streaming'); chatScroll();
+  const pre = line('model', 'model'), msg = pre.closest('.msg'), thought = msg.querySelector('.thought'); msg.classList.add('streaming'); chatScroll();
   controller = new AbortController(); chatBusy(true); text('chatStatus', 'waiting for the first token'); text('chatStats', '');
-  const started = performance.now(); let first = null, pieces = 0, reply = '', usage = null, timings = null, done = false;
+  const started = performance.now(); let first = null, pieces = 0, reply = '', thinking = '', usage = null, timings = null, done = false;
+  const live = setInterval(() => { if (first !== null) text('chatStats', number((performance.now() - started) / 1000, 1) + ' s / ' + number(pieces / ((performance.now() - first) / 1000), 1) + ' chunks/s'); }, 500);
   try {
     const response = await fetch('/api/monitor/v1/chat/completions', {method: 'POST', signal: controller.signal, cache: 'no-store',
-      headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'}, body: JSON.stringify({messages: history, stream: true})});
+      headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.assign({messages: history, stream: true}, $('chatThink').checked ? {} : {chat_template_kwargs: {enable_thinking: false}}))});
     if (response.status === 401 || response.status === 403) throw new Error('the server rejected the key');
     if (response.status === 409 || response.status === 429) throw new Error('another chat is already running on this monitor');
     if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
@@ -280,6 +296,8 @@ async function send(prompt) {
         const payload = raw.slice(5).trim(); if (payload === '[DONE]') { done = true; continue; }
         let chunk; try { chunk = JSON.parse(payload); } catch (e) { continue; }
         if (chunk.usage) usage = chunk.usage; if (chunk.timings) timings = chunk.timings;
+        const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
+        if (reasoning) { if (first === null) { first = performance.now(); text('chatStatus', 'thinking'); } pieces++; thinking += reasoning; thought.textContent = thinking; chatScroll(); }
         const delta = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.text ?? '';
         if (delta) { if (first === null) { first = performance.now(); text('chatStatus', 'streaming'); } pieces++; reply += delta; pre.textContent = reply; chatScroll(); }
         if (chunk.choices?.[0]?.finish_reason) done = true;
@@ -288,7 +306,7 @@ async function send(prompt) {
     text('chatStatus', done ? 'done' : 'stream ended without a finish marker');
   } catch (error) {
     text('chatStatus', controller.signal.aborted ? 'stopped' : 'failed: ' + (error && error.message ? error.message : 'request failed'));
-    if (!controller.signal.aborted) pre.parentElement.classList.replace('model', 'sys');
+    if (!controller.signal.aborted) msg.classList.replace('model', 'sys');
   } finally {
     const elapsed = (performance.now() - started) / 1000, gen = first === null ? 0 : (performance.now() - first) / 1000;
     const parts = [number(elapsed, 1) + ' s'];
@@ -296,7 +314,7 @@ async function send(prompt) {
     if (usage && typeof usage.completion_tokens === 'number') parts.push(number(usage.completion_tokens) + ' tokens' + (gen > 0 ? ', ' + number(usage.completion_tokens / gen, 1) + ' tok/s' : ''));
     else if (timings && typeof timings.predicted_per_second === 'number') parts.push(number(timings.predicted_per_second, 1) + ' tok/s (server)');
     else if (pieces) parts.push(pieces + ' chunks' + (gen > 0 ? ', ' + number(pieces / gen, 1) + ' chunks/s' : '') + ' (no token count from the server)');
-    text('chatStats', parts.join(' / ')); pre.parentElement.classList.remove('streaming');
+    clearInterval(live); text('chatStats', parts.join(' / ')); msg.classList.remove('streaming');
     if (reply) history.push({role: 'assistant', content: reply}); else history.pop();
     controller = null; chatBusy(false); $('chatInput').focus();
   }
