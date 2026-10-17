@@ -583,8 +583,8 @@ const char* kStagedGemm = R"METAL(
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SIMDS>> op;
     auto a_first = ta.template slice<KS, MT>(0, 0);
-    auto b_first = tb0.template slice<KS, NT>(0, 0);
-    auto acc = op.template get_destination_cooperative_tensor<decltype(a_first), decltype(b_first), float>();
+    auto bs0 = tb0.template slice<KS, NT>(0, 0), bs1 = tb1.template slice<KS, NT>(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(a_first), decltype(bs0), float>();
     constexpr uint CAP = uint(MT) * uint(NT) / (32u * uint(SIMDS));
 #pragma unroll
     for (uint i = 0; i < CAP; ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f;
@@ -641,8 +641,8 @@ const char* kStagedGemm = R"METAL(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t + 1 < steps) load(t + 1);   // the next step's words and scales arrive while this step's matmul runs
         auto a = ta.template slice<KS, MT>(int(t * uint(KS)), 0);
-        if (t & 1u) op.run(a, tb1.template slice<KS, NT>(0, 0), acc);
-        else op.run(a, tb0.template slice<KS, NT>(0, 0), acc);
+        if (t & 1u) op.run(a, bs1, acc);
+        else op.run(a, bs0, acc);
     }
 #pragma unroll
     for (uint i = 0; i < CAP; ++i) {
