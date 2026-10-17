@@ -2957,9 +2957,10 @@ struct DecodeModel {
     // Router logits [n][experts + 1] (last = shared-expert gate). BF16 router weights: per-token GEMVs on the raw weights.
     void router(const std::string & prefix, const float * x, float * logits, int n) {
         const bool bf16 = cp.file(prefix + "ffn_gate_inp.weight").file().tensors.at(prefix + "ffn_gate_inp.weight").type == GGML_BF16;
-        static const bool router_gemv = std::getenv("TQFN_ROUTER_GEMV") && std::atoi(std::getenv("TQFN_ROUTER_GEMV")) != 0;
+        // default: the tiled GEMV (exact, the per-token kernel's sums); TQFN_ROUTER_GEMM=1: fp32 cuBLAS GEMM (faster, but
+        // its summation order flips near-tie top-k choices: 64K text changed on 10-17)
+        static const bool router_gemv = !(std::getenv("TQFN_ROUTER_GEMM") && std::atoi(std::getenv("TQFN_ROUTER_GEMM")) != 0);
         if (bf16 && router_gemv && n > 64) {
-            // TQFN_ROUTER_GEMV=1: the tiled GEMV on the raw bf16 weights (0.92 ms per 2K-token sub-chunk; 0.7 s per 32K prompt)
             tqllm_cuda::fn_gemv_bf16_chunk(cp.bf16_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);
             tqllm_cuda::fn_gemv_bf16_chunk(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), x, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
         } else if (bf16 && n > 64) {

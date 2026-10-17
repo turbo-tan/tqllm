@@ -1264,6 +1264,15 @@ void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 chunk gemv: invalid shape or pointer");
     if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 chunk gemv: rows take the warp-per-row path");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
+    // Each (row, token) sum depends only on the thread count and the columns per thread, not on the R x T tile, so the
+    // tile is free to choose: 32 rows x 2 tokens reads the [tokens][cols] input 4x less often than 8 x 8 (the router of
+    // a 2K sub-chunk re-read 16 MB of input per 8 rows), same bits. TQFN_GEMV_TILE=8 keeps the 8 x 8 tile.
+    static const int tile = std::getenv("TQFN_GEMV_TILE") ? std::atoi(std::getenv("TQFN_GEMV_TILE")) : 32;
+    if (rows >= 32 && tile == 32) {
+        constexpr int R = 32, T = 2;
+        fn_gemv_bf16_tiles_k<R, T><<<dim3(unsigned((rows + R - 1) / R), unsigned((tokens + T - 1) / T)), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
+        return;
+    }
     constexpr int T = 8;
     const unsigned tiles = unsigned((tokens + T - 1) / T);
     if (rows >= 8) fn_gemv_bf16_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
