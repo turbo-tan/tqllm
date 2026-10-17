@@ -18,25 +18,28 @@ HTTP request (tools/tqserve.cpp, tools/serve/)
 
 ## Directories
 
+The layering rules and the diagram are in [AGENTS.md](../AGENTS.md); `tests/test_layering.py` enforces them.
+
 | Path | What lives there |
 |---|---|
 | `include/tqllm/` | public C++ API: `Model`, `EngineOptions`, tokenizer, runtime, the experimental plugin ABI (`plugin.h`) |
-| `src/engine/model.cpp` | `tqllm::Model`: opens GGUF or safetensors, runs the memory fit (`fit_context.hpp`), creates the engine |
-| `src/engine/engine.hpp` | the per-architecture engine interface |
-| `src/models/qwen/qwen35/qwen35.cpp` | Qwen3.5 / Qwen3.8 engine: hybrid attention + Gated DeltaNet, prefill, decode, DFlash2 and MTP verify, multi-slot |
-| `src/formats/` | weight formats (`tq3.cpp`, `tq4.cpp`, `tq3_4s.cpp`, `q4.cpp`, `i8h.cpp`, `composite.cpp`) and KV formats (`kv_*.cpp`), each registered by id or name |
-| `src/kv_store*.cpp` | TqCache: KV positions in system RAM, staged back while decoding |
-| `src/core/gguf.cpp`, `src/core/safetensors.cpp` | model file readers |
-| `src/core/options.cpp` | command-line options shared by the tools |
-| `src/vision/vision.cpp` | image encoder for `--mmproj` |
-| `kernels/` | CUDA kernels: attention, quantised matvec / GEMM (`quant.cu`, `int8_gemm.cu`, `fp8_gemm.cu`), DFlash2, KV compaction, vision |
-| `kernels/formats/` | per-format kernels and the decode kernel rule table (`matvec_rules.hpp`) |
-| `tools/` | `tqserve` (the server) and developer tools: `tqrun`, `tqbench`, `tqkld`, `tqverify`, `tqspec`, `tqgolden`, `tqkbench`, `tqvision`, `tqtokenize`, `tqconvert.py` |
-| `tests/` | CTest suite (C++ / CUDA unit and exactness tests, Python checks for the server, Docker and shipped files) |
+| `src/engine/` | `tqllm::Model` (`model.cpp`: opens GGUF or safetensors, runs the memory fit `fit_context.hpp`, creates the engine) and the engine interface `engine.hpp` |
+| `src/models/qwen/qwen35/` | Qwen3.5 / Qwen3.8 engine, dense and qwen35moe: hybrid attention + Gated DeltaNet, prefill, decode, DFlash2 and MTP verify, multi-slot |
+| `src/models/qwen/qwen4exp/` | Flash-Next: model description, kernels (GDN, QSA sparse attention) and the engine (`tqfn_stage.cpp`, served through `tqserve_flashnext.cpp`) |
+| `src/models/qwen/qwen2/` | the draft-model forward kernels |
+| `src/formats/weight/` | weight formats (`tq3`, `tq4`, `tq3_4s`, `q4`, `i8h`, `gsq_q2`, `nvfp4`, `w4s`, `composite`), the registry, k-quant / IQ kernels (`quant.cu`, grids) and the decode rule table (`matvec_rules.hpp`) |
+| `src/formats/kv/` | KV-cache formats (`kv_*`), their registry and the TqCache compaction kernels |
+| `src/kv/` | KV store: positions on the device or in system RAM (TqCache), CUDA virtual memory tiers |
+| `src/experts/` | expert routing, grouped expert GEMM, expert caches (VRAM, host, mixed), the CPU expert path |
+| `src/spec/` | DFlash2 drafting and token-tree verify |
+| `src/vision/` | image encoder for `--mmproj` |
+| `src/core/` | CUDA helpers, int8 / fp8 GEMM, graph capture, GGUF / safetensors readers, tokenizer, options, runtime, generated flags |
+| `tools/` | entry points: `tqserve` (the server, `tools/serve/`) and developer tools: `tqrun`, `tqbench`, `tqkld`, `tqverify`, `tqspec`, `tqgolden`, `tqkbench`, `tqvision`, `tqtokenize`, `tqconvert.py` |
+| `tests/` | CTest suite (C++ / CUDA unit and exactness tests, Python checks for the server, Docker, shipped files and layering) |
 | `bench/` | `relbench.py`, the reproducible speed benchmark behind the README tables |
 | `config/flags.yaml` | the registry of every environment variable; `docs/FLAGS.md` is generated from it |
 | `docker/`, `Dockerfile`, `compose.yaml` | the image and its entrypoint (Docker variables to `tqserve` options) |
-| `third_party/`, `licenses/`, `NOTICE` | bundled code and its licences |
+| `third_party/`, `licenses/`, `NOTICE` | bundled code (jinja, nlohmann json, stb_image) and its licences |
 
 ## Invariants worth knowing
 

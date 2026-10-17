@@ -43,6 +43,8 @@ test in `tests/` and register it in `CMakeLists.txt` with `add_test`.
 
 ## Where things plug in
 
+The source layout and its layering rules are in [AGENTS.md](AGENTS.md); read it first.
+
 Most extensions are a strategy object plus one registration line; the engine does not branch on the type.
 
 ### A weight format
@@ -50,7 +52,7 @@ Most extensions are a strategy object plus one registration line; the engine doe
 Weight formats turn a GGUF tensor into a device matrix and supply its kernels. The interface is
 [src/formats/weight/weight_format.hpp](src/formats/weight/weight_format.hpp).
 
-1. Add `src/formats/<name>.cpp` implementing `WeightFormat`: `load()` (GGUF bytes to device layout), `matvec()` (decode,
+1. Add `src/formats/weight/<name>.cpp` implementing `WeightFormat`: `load()` (GGUF bytes to device layout), `matvec()` (decode,
    up to `max_matvec_cols()` columns), `dequant_h()` (FP16 for the prefill GEMM), and the optional `gemm()`,
    `matvec_ld()` and `row_bytes()` when the format can do them.
 2. Put its CUDA kernels in `src/formats/weight/<name>.cu`, next to its host code.
@@ -68,7 +70,7 @@ Weight formats turn a GGUF tensor into a device matrix and supply its kernels. T
 KV formats own the record size, the cache writer and the attention for verify and prefill. The interface is
 [src/formats/kv/kv_format.hpp](src/formats/kv/kv_format.hpp).
 
-1. Add `src/formats/kv_<name>.cpp` implementing `KvFormat`: `key_bytes()` and `value_bytes()` per context,
+1. Add `src/formats/kv/kv_<name>.cpp` implementing `KvFormat`: `key_bytes()` and `value_bytes()` per context,
    `write_and_attend()`, and the capability flags (`tree_ok()` for tree verify, `compressed()`, `compact_codecs()` for
    TqCache stand-ins).
 2. Fill in `provenance()`: who made it, the source, the licence, and whether the idea or code was borrowed. It is
@@ -84,7 +86,7 @@ one token, `verify()` and `commit()` for speculative decoding, and optional mult
 engine is [src/models/qwen/qwen35/qwen35.cpp](src/models/qwen/qwen35/qwen35.cpp): Qwen3.5 / Qwen3.8 hybrid attention + Gated DeltaNet, dense and mixture-of-experts
 (`qwen35moe`, grouped expert kernels in [src/experts/moe.cu](src/experts/moe.cu)).
 
-1. Add `src/<arch>.cpp` with an `Engine` subclass and a `make_<arch>_engine()` factory. Reuse the weight and KV formats
+1. Add `src/models/<family>/<arch>/` with an `Engine` subclass and a `make_<arch>_engine()` factory (see AGENTS.md). Reuse the weight and KV formats
    through their registries rather than calling kernels directly.
 2. Dispatch to it from [src/engine/model.cpp](src/engine/model.cpp) on the GGUF `general.architecture` (or the safetensors
    `model_type`).
