@@ -3932,6 +3932,9 @@ public:
             tqllm::PrefillTuning tu; tu.sub = g_tune.sub; tu.stage = g_tune.stage;
             tu.dense_cache_bytes = dense_half_pool_bytes(); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
             tu.workspace_bytes = size_t(1024 + std::max(0L, g_tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
+            // above 128K the plan's own estimate has run ~0.1-0.4 GB short (245K at 48 / 56 slots died in the staging allocation
+            // with 62 MB free): keep 768 MB more there, so the plan picks a smaller selection block or chunk instead
+            if (P > 131072) tu.workspace_bytes += size_t(768) << 20;
             int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
             auto context_term = [&](int block) { return tqllm::prefill_context_bytes(g_kv_capacity, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
             // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
