@@ -18,6 +18,55 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MOE_STAGE` | on | 0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics) |  |
 | `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
+| `TQLLM_MLX_AFFINE_FFN` | unset (backend default) | Experimental Apple MLX affine ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_GU` | unset (backend default) | Experimental Apple MLX affine gu override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_HALF` | unset (backend default) | Experimental Apple MLX affine half override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_MIXER` | unset (backend default) | Experimental Apple MLX affine mixer override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_PAD` | unset (backend default) | Experimental Apple MLX affine pad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_TQ4` | unset (backend default) | Experimental Apple MLX affine tq4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_AFFINE_TQ4_FP32` | unset (backend default) | Experimental Apple MLX affine tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_ATTENTION_KV_VIEWS` | unset (backend default) | Experimental Apple MLX attention kv views override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_BATCH_DECODE_DENSE` | unset (backend default) | Experimental Apple MLX batch decode dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_CAPTURE_VERIFY` | unset (backend default) | Experimental Apple MLX capture verify override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_COMPACT_GDN_TAPE` | unset (backend default) | Experimental Apple MLX compact gdn tape override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_COMPILED_GDN` | unset (backend default) | Experimental Apple MLX compiled gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_DECODED_FFN` | unset (backend default) | Experimental Apple MLX decoded ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_DEVICE_SELECTOR` | unset (backend default) | Experimental Apple MLX device selector override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_DRAFT_HEAD4` | unset (backend default) | Experimental Apple MLX draft head4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_DRAFT_HEAD_UNPAD` | unset (backend default) | Experimental Apple MLX draft head unpad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_FUSED_ATTENTION_ROWS` | unset (backend default) | Experimental Apple MLX fused attention rows override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_FUSE_EPILOGUE` | unset (backend default) | Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_GDN_SCAN` | unset (backend default) | Experimental Apple MLX gdn scan override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_INT8_N` | unset (backend default) | Experimental Apple MLX int8 n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_INT8_SIMDS` | unset (backend default) | Experimental Apple MLX int8 simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_INT8_TILE` | unset (backend default) | Experimental Apple MLX int8 tile override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_MATMUL_COLS` | unset (backend default) | Experimental Apple MLX matmul cols override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_MATMUL_SIMDS` | unset (backend default) | Experimental Apple MLX matmul simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_NATIVE_GDN` | unset (backend default) | Experimental Apple MLX native gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_NATIVE_GDN_PREP` | unset (backend default) | Experimental Apple MLX native gdn prep override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_Q6_AFFINE` | unset (backend default) | Experimental Apple MLX q6 affine override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_REUSE_ROTATION` | unset (backend default) | Experimental Apple MLX reuse rotation override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_SERIAL_VERIFY_ATTENTION` | unset (backend default) | Experimental Apple MLX serial verify attention override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_SERIAL_VERIFY_DENSE` | unset (backend default) | Experimental Apple MLX serial verify dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_K` | unset (backend default) | Experimental Apple MLX tensor k override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_M` | unset (backend default) | Experimental Apple MLX tensor m override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_MEMORY` | unset (backend default) | Experimental Apple MLX tensor memory override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_N` | unset (backend default) | Experimental Apple MLX tensor n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_SIMDS` | unset (backend default) | Experimental Apple MLX tensor simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_SPLIT` | unset (backend default) | Experimental Apple MLX tensor split override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_TRANSPOSE` | unset (backend default) | Experimental Apple MLX tensor transpose override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TENSOR_WIDE` | unset (backend default) | Experimental Apple MLX tensor wide override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_DFLASH_FP32` | unset (backend default) | Experimental Apple MLX tiled dflash fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_MIXER_FP32` | unset (backend default) | Experimental Apple MLX tiled mixer fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_TQ3_FP16` | unset (backend default) | Experimental Apple MLX tiled tq3 fp16 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_TQ3_FP32` | unset (backend default) | Experimental Apple MLX tiled tq3 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_TQ4_FP32` | unset (backend default) | Experimental Apple MLX tiled tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TQ3_STREAM` | unset (backend default) | Experimental Apple MLX tq3 stream override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TQ3_SUBGROUP` | unset (backend default) | Experimental Apple MLX tq3 subgroup override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
+| `TQLLM_MLX_TILED_TQ4_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes. |  |
+| `TQLLM_MLX_PAIRED_GATE_UP` | unset (separate projections) | Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required. |  |
+| `TQLLM_MLX_TILED_MIXER_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates. |  |
+| `TQLLM_MLX_WIRED_MIB` | unset (retain MLX default) | Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings. |  |
 
 ## Retired (the tool stops; use the replacement)
 

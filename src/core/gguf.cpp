@@ -61,7 +61,29 @@ uint64_t checked_mul(uint64_t a, uint64_t b, const std::string & name) {
     return a * b;
 }
 
-uint64_t tensor_bytes(uint32_t type, uint64_t n, const std::string & name) {
+uint64_t tensor_bytes(uint32_t type, uint64_t n, const std::string & name, const std::vector<uint64_t> & ne = {}) {
+    switch (type) {
+        case GGML_TQMLX_TILED3: case GGML_TQMLX_TILED4: {  // planes then FP16 scales, rows padded to 32
+            if (ne.size() != 2 || ne[0] % 128) break;
+            const uint64_t tiles = (ne[1] + 31) / 32, bits = type == GGML_TQMLX_TILED3 ? 3 : 4;
+            return checked_mul(tiles, ne[0] * (bits * 4) + ne[0] / 4 * 2, name);
+        }
+        case GGML_TQMLX_MMA8_3: case GGML_TQMLX_MMA8_4: {  // nibble words then FP16 scales, rows padded to 64
+            if (ne.size() != 2 || ne[0] % 128) break;
+            const uint64_t rp = (ne[1] + 63) / 64 * 64;
+            return checked_mul(rp, ne[0] / 2 + ne[0] / 64, name);
+        }
+        case GGML_NAX_A4_G128: case GGML_NAX_A6_G64: case GGML_NAX_A4_G64: {  // codes, high bits, FP16 scales, biases
+            const uint64_t bits = type == GGML_NAX_A6_G64 ? 6 : 4, group = type == GGML_NAX_A4_G128 ? 128 : 64;
+            if (ne.size() != 2 || ne[0] % group || ne[1] % 128) break;
+            return checked_mul(ne[1], ne[0] * bits / 8 + ne[0] / group * 4, name);
+        }
+        case GGML_AFF8_G64: {  // row-major 8-bit codes, then FP16 scales and biases
+            if (ne.size() != 2 || ne[0] % 64) break;
+            return checked_mul(ne[1], ne[0] + ne[0] / 16, name);
+        }
+        default: break;
+    }
     uint64_t blk, bpb;
     if (!gguf_block_layout(type, blk, bpb))
         throw std::runtime_error("unsupported GGUF tensor type " + std::to_string(type) + " for " + name);
@@ -164,6 +186,12 @@ GgufTensor gguf_expert_slice(const GgufTensor & t, uint64_t idx, const std::stri
     return s;
 }
 
+uint64_t gguf_tensor_bytes(uint32_t type, const std::vector<uint64_t> & ne, const std::string & name) {
+    uint64_t n = 1;
+    for (auto e : ne) n = checked_mul(n, e, name);
+    return tensor_bytes(type, n, name, ne);
+}
+
 double GgufFile::num(const std::string & key) const {
     const auto it = kv.find(key);
     if (it == kv.end()) throw std::runtime_error("GGUF missing key " + key);
@@ -214,6 +242,8 @@ GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
         r.value(type, v);
         f.kv.emplace(std::move(key), std::move(v));
     }
+    f.n_kv = n_kv;
+    f.kv_end = uint64_t(r.in.tellg());
     std::vector<std::pair<std::string, GgufTensor>> infos;
     for (uint64_t i = 0; i < n_tensors; ++i) {
         auto name = r.str();
@@ -231,10 +261,11 @@ GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
         t.type = r.get<uint32_t>();
         if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
         t.offset = r.get<uint64_t>();
-        t.bytes = tensor_bytes(t.type, n, name);
+        t.bytes = tensor_bytes(t.type, n, name, t.ne);
         infos.emplace_back(std::move(name), std::move(t));
     }
     const uint64_t align = uint64_t(f.num("general.alignment", 32));
+    f.alignment = align;
     uint64_t data = uint64_t(r.in.tellg());
     if (align == 0 || (align & (align - 1))) throw std::runtime_error("GGUF alignment must be a power of two");
     if (data > std::numeric_limits<uint64_t>::max() - (align - 1))
