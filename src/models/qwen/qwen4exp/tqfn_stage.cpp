@@ -1168,8 +1168,10 @@ struct KvBuf {
     char * at(size_t i) const { return reinterpret_cast<char *>(p) + i * page; }
     explicit KvBuf(size_t n) : bytes(n) {
         auto & m = mem(); const size_t g = m.granule();
-        static const bool off = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) == 0;
-        if (g && !off) {
+        // TQFN_KV_HOST=1 (opt-in): decode then reads the old rows over PCIe, measured 33-35 tok/s at 245K vs 52 with all
+        // K/V on the device (10-17); off, the buffers are plain allocations (no VMM pages to fragment the pool)
+        static const bool on = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0;
+        if (g && on) {
             page = std::max(g, (size_t(32) << 20) / g * g); span = (n + page - 1) / page * page;
             if (void * va = m.reserve(span)) {
                 p = static_cast<__nv_bfloat16 *>(va); vmm = true; on_host.assign(span / page, 0);
@@ -3826,20 +3828,22 @@ public:
             // cannot hold it (it would prefill for minutes and then fail in decode)
             int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
             // in decode the K/V of positions older than TQFN_KV_HOST_KEEP live in host memory (kv_to_host); the indexer keys stay
-            const bool kv_host = !(std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) == 0) && KvBuf::mem().granule();
+            const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0 && KvBuf::mem().granule();
             const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
             const size_t kv_row = size_t(2) * checkpoint.attention_kvheads * checkpoint.attention_dim * 2;  // K + V bf16 per position
             const size_t moved = kv_host && int(context) > 2 * keep ? size_t(attn) * (size_t(context) - size_t(2 * keep)) * kv_row : 0;
             const size_t state = tqllm::prefill_context_bytes(int(context), 16, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim) - moved;
             // decode scratch, the MTP bank rebuilt after a multi-chunk prompt, the prefill staging halves, refill staging
-            const size_t reserve = size_t(2048) << 20;
+            // (2 GB for a long-context server: the 245K cells at 64 / 72 slots failed with 1 GB; a chat server at 33K runs
+            // 140 slots with 1.8 GB free, so short contexts keep 512 MB)
+            const size_t reserve = size_t(context > 65536 ? 2048 : 512) << 20;
             size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
             if (fr < state + reserve) {
                 const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
                 const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;
                 throw std::runtime_error("Flash-Next: " + std::to_string(f.slots) + " expert slots per layer leave " + std::to_string(fr >> 20) +
                                          " MB free, a full " + std::to_string(context) + "-token context needs " + std::to_string((state + reserve) >> 20) +
-                                         " MB (attention state + 2 GB decode reserve): use at most " + std::to_string(std::max(0, f.slots - drop)) +
+                                         " MB (attention state + decode reserve): use at most " + std::to_string(std::max(0, f.slots - drop)) +
                                          " slots (manifest slots=) or a smaller --context");
             }
         }
