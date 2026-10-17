@@ -93,6 +93,35 @@ footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;bord
 @media(max-width:1100px){main{grid-template-columns:1fr}.left{border-right:0;border-bottom:1px solid var(--line)}.right{min-height:460px}}
 @media(max-width:520px){.consoles{grid-template-columns:1fr}.console .big{font-size:22px}.bar .id{display:none}.msg{grid-template-columns:48px minmax(0,1fr)}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+/* Request workbench: follow measured work, rather than a wall of gauges. */
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.bar{padding:14px 24px}.bar .brand{font-size:20px;letter-spacing:-.04em}
+main{grid-template-columns:minmax(0,1fr) minmax(300px,360px)}
+.left{padding:28px;gap:20px}.right{background:var(--panel)}
+.eyebrow{font:11px var(--mono);letter-spacing:.13em;color:var(--muted);text-transform:uppercase}
+h1{font-size:32px;letter-spacing:-.05em;margin:4px 0;font-weight:550}
+.intro p{margin:0;color:var(--muted)}
+.lens{border:1px solid var(--line);border-radius:16px;padding:24px;background:var(--panel)}
+.lens-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.lens-top h2{margin:4px 0 0;font-size:19px;font-weight:550}.lens button{border-radius:20px;padding:7px 12px}
+.journey{display:flex;gap:4px;height:28px;margin:24px 0 10px;border-radius:8px;overflow:hidden;background:var(--line)}
+.journey span{min-width:3px;background:var(--prefill)}.journey span:last-child{background:var(--decode)}
+.journey-caption{display:flex;justify-content:space-between;gap:14px;color:var(--muted);font-size:12px}.journey-caption b{color:var(--text);font-weight:500}
+.lens-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:24px 0 16px}
+.lens-metrics small{display:block;color:var(--muted);font-size:11px}.lens-metrics strong{display:block;font:24px var(--mono);letter-spacing:-.05em;margin:4px 0}
+.lens-note{font-size:12px;color:var(--muted);margin:0;line-height:1.6}
+.compare{margin-top:16px;border-top:1px solid var(--line);padding-top:16px;font-size:12px;color:var(--decode)}.compare[hidden]{display:none}
+.consoles{display:none}.stats{border-radius:10px}.stat{padding:12px}
+.hardware summary{cursor:pointer;color:var(--muted);font-size:12px;padding:4px 0 12px}
+.chart{border-radius:12px;padding:14px 18px}.chart svg{height:54px}
+.log{border:0;background:transparent}.log .head{padding:0 0 12px;border:0}
+th,td{padding:10px 12px;font-size:12px}tbody tr:nth-child(odd){background:transparent}tbody tr{border-top:1px solid var(--line)}
+.request-select{background:transparent;border:1px solid transparent;border-radius:6px;padding:4px 8px}.request-select[aria-pressed="true"]{border-color:var(--decode);color:var(--decode)}
+.chat-head{padding:18px 16px;font-size:10px}.msg{grid-template-columns:1fr;gap:5px}.msg .who{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.1em}
+.msg pre{font:12px/1.7 var(--mono)}#transcript{padding:20px;gap:24px}.compose{padding:14px;grid-template-columns:minmax(0,1fr) auto}.compose .caret{display:none}
+.compose textarea{border-radius:8px;min-height:64px;padding:10px}.compose .buttons{flex-direction:column}button{border-radius:6px}.chat-foot{padding:10px 14px}
+@media(max-width:1100px){main{grid-template-columns:1fr}.right{min-height:420px}}
+@media(max-width:520px){.left{padding:18px 14px;gap:16px}.bar{padding:12px 14px;gap:8px}h1{font-size:27px}.lens{padding:18px}.lens-metrics{gap:8px}.lens-metrics strong{font-size:18px}.journey-caption{font-size:11px}.table-wrap{max-height:240px}.chart .head{font-size:10px;gap:12px}}
 </style>
 </head>
 <body data-connection="connecting">
@@ -108,11 +137,20 @@ footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;bord
   <div id="notice" class="notice" hidden role="alert"></div>
   <form id="auth" hidden><label for="apiKey">api key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="the key configured on tqserve"><button type="submit">connect</button><small>Kept in memory for this tab only; never written to storage or a URL.</small></form>
   <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span></div>
-  <div class="consoles">
+  <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
+  <section class="lens" aria-label="Selected request">
+    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><button type="button" id="pinRequest" disabled>Pin as reference</button></div>
+    <div class="journey" aria-label="Time before and after first output"><span id="journeyWait" style="flex-grow:1"></span><span id="journeyOutput" style="flex-grow:0"></span></div>
+    <div class="journey-caption"><span>Before first output <b id="journeyBefore">--</b></span><span>After first output <b id="journeyAfter">--</b></span></div>
+    <div class="lens-metrics"><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small>OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
+    <p class="lens-note" id="lensNote">Engine measurements, without guessing why a request is waiting.</p>
+    <div class="compare" id="comparison" hidden></div>
+  </section>
+  <div class="consoles" aria-hidden="true">
     <div class="console prefill"><h2>PREFILL</h2><div class="big" id="first">--</div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="prefillLine" d=""/></svg><div class="sub" id="firstNote">time to first output, latest request</div></div>
     <div class="console decode"><h2>DECODE</h2><div class="big"><span id="speed">--</span><small>tok/s</small></div><svg viewBox="0 0 92 30" preserveAspectRatio="none" aria-hidden="true"><path id="decodeLine" d=""/></svg><div class="sub" id="speedNote">sum over decoding requests</div></div>
   </div>
-  <div class="stats">
+  <details class="hardware"><summary>Engine and hardware details</summary><div class="stats">
     <div class="stat"><div class="label">active / queued</div><strong id="queue">--</strong></div>
     <div class="stat"><div class="label">output tokens</div><strong id="tokens">--</strong></div>
     <div class="stat"><div class="label">draft acceptance</div><strong id="acceptance">--</strong></div>
@@ -126,13 +164,14 @@ footer{display:flex;justify-content:space-between;gap:12px;padding:6px 14px;bord
     <div class="stat"><div class="label">device</div><strong id="device">--</strong></div>
     <div class="stat"><div class="label">hardware sample</div><strong id="hardwareAge">--</strong></div>
   </div>
+  </details>
   <div class="chart"><div class="head"><span>output tokens / s, last 60 s</span><span id="chartStart">--</span></div>
     <svg viewBox="0 0 600 78" preserveAspectRatio="none" aria-label="Throughput, last 60 seconds"><line class="grid" x1="0" y1="39" x2="600" y2="39"/><line class="grid" x1="0" y1="77" x2="600" y2="77"/><path id="chartFill" d=""/><path id="chartLine" d=""/></svg></div>
-  <div class="log"><div class="head"><span>requests</span><span id="requestCount">none yet</span></div>
+  <div class="log"><div class="head"><span>Request history / select to inspect</span><span id="requestCount">none yet</span></div>
     <div class="table-wrap"><table aria-label="Recent requests"><thead><tr><th scope="col">id</th><th scope="col">phase</th><th scope="col">prompt / output</th><th scope="col">first out</th><th scope="col">tok/s</th><th scope="col">elapsed</th></tr></thead><tbody id="requests"></tbody></table></div></div>
 </section>
 <section class="right" aria-label="Chat">
-  <div class="chat-head"><span>chat / this instance only / one at a time</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear">clear</button></div>
+  <div class="chat-head"><span>chat / this instance</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear">clear</button></div>
   <div id="transcript"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
   <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" rows="1" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend">send</button><button type="button" id="chatStop" disabled>stop</button></div></form>
   <div class="chat-foot"><span id="chatStatus">idle</span><span id="chatStats"></span></div>
@@ -145,12 +184,14 @@ const $ = id => document.getElementById(id);
 const number = (v, d = 0) => typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}) : '--';
 const terminal = p => ['complete', 'failed', 'cancelled'].includes(p);
 const text = (id, value) => { $(id).textContent = value; };
+let focusedId = null, pinnedRequest = null, currentRows = [];
 let key = '', timer = null, instance = null, samples = [], previous = null, lastSuccess = null, generation = 0;
 const firstHistory = [];  // first_output_ms of the last requests, for the prefill sparkline
 
 function connection(state, message) { document.body.dataset.connection = state; text('connection', message); }
 function notice(message) { $('notice').hidden = !message; text('notice', message); }
 function clearLive() {
+  text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true;
   for (const id of ['speed', 'first', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
   for (const id of ['contextBar', 'gpuMemoryBar', 'ramMemoryBar']) $(id).style.width = '0';
   for (const id of ['prefillLine', 'decodeLine']) $(id).setAttribute('d', '');
@@ -179,10 +220,52 @@ function budget(label, bar, used, total, bytes) {
   const share = ok ? Math.min(1, used / total) : 0, b = $(bar);
   b.style.width = (share * 100).toFixed(1) + '%'; b.className = share > .92 ? 'hot' : share > .75 ? 'warn' : '';
 }
+const seconds = value => Number.isFinite(value) ? number(value / 1000, 2) + ' s' : '--';
+function requestLens() {
+  const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
+  if (!r) {
+    text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
+    for (const id of ['lensFirst','lensRate','lensElapsed','journeyBefore','journeyAfter']) text(id, '--');
+    $('comparison').hidden = true; $('pinRequest').disabled = true;
+    $('journeyWait').style.flexGrow = 1; $('journeyOutput').style.flexGrow = 0;
+    text('lensNote', 'Engine measurements, without guessing why a request is waiting.');
+    return;
+  }
+  if (focusedId !== null && !currentRows.some(row => row.id === focusedId)) focusedId = null;
+  text('lensPhase', r.phase + (focusedId === null ? ' / following latest' : ' / selected request'));
+  text('lensTitle', 'Request ' + r.id + ' / ' + number(r.prompt_tokens) + ' in, ' + number(r.output_tokens) + ' out');
+  const hasFirst = Number.isFinite(r.first_output_ms), elapsed = Math.max(0, r.elapsed_ms || 0);
+  const before = hasFirst ? Math.max(0, r.first_output_ms) : elapsed;
+  const after = hasFirst ? Math.max(0, elapsed - before) : 0;
+  $('journeyWait').style.flexGrow = Math.max(.001, before); $('journeyOutput').style.flexGrow = after;
+  $('journeyWait').hidden = before === 0; $('journeyOutput').hidden = after === 0;
+  text('journeyBefore', hasFirst ? seconds(before) : 'not observed yet'); text('journeyAfter', hasFirst ? seconds(after) : '--');
+  text('lensFirst', seconds(r.first_output_ms)); text('lensElapsed', seconds(r.elapsed_ms));
+  text('lensRate', Number.isFinite(r.decode_tokens_per_second) ? number(r.decode_tokens_per_second, 1) + ' tok/s' : '--');
+  text('lensNote', 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
+    (terminal(r.phase) ? 'Finished request; measurements are retained.' : 'Live snapshot; the journey grows as the request runs.'));
+  $('pinRequest').disabled = !terminal(r.phase);
+  $('pinRequest').textContent = pinnedRequest && pinnedRequest.id === r.id ? 'Clear reference' : 'Pin as reference';
+  $('comparison').hidden = !pinnedRequest;
+  if (pinnedRequest) {
+    const delta = (a,b,unit) => Number.isFinite(a) && Number.isFinite(b) ? (a-b > 0 ? '+' : '') + number(a-b, 1) + unit : 'unavailable';
+    text('comparison', 'Reference #' + pinnedRequest.id + ': first output ' + delta(r.first_output_ms, pinnedRequest.first_output_ms, ' ms') +
+      ' / rate ' + delta(r.decode_tokens_per_second, pinnedRequest.decode_tokens_per_second, ' tok/s') + '. ' +
+      (r.prompt_tokens === pinnedRequest.prompt_tokens && r.output_tokens === pinnedRequest.output_tokens ?
+        'Token counts match; prompt content and other conditions may differ.' : 'Different token counts; this is not a matched benchmark.'));
+  }
+}
+$('pinRequest').addEventListener('click', () => {
+  if (document.body.dataset.connection !== 'live') return;
+  const r = currentRows.find(row => row.id === focusedId) || currentRows.at(-1);
+  if (!r || !terminal(r.phase)) return;
+  pinnedRequest = pinnedRequest && pinnedRequest.id === r.id ? null : {...r}; requestLens();
+});
 function render(data) {
   if (data.schema_version !== 1 || !data.engine || !Array.isArray(data.requests)) throw new Error('Unsupported telemetry schema');
-  if (instance !== data.instance_id) { samples = []; previous = null; firstHistory.length = 0; instance = data.instance_id; }
+  if (instance !== data.instance_id) { samples = []; previous = null; firstHistory.length = 0; focusedId = null; pinnedRequest = null; instance = data.instance_id; }
   const now = performance.now(), rows = data.requests, active = rows.filter(r => !terminal(r.phase)), latest = rows.at(-1);
+  currentRows = rows; requestLens();
   const decoders = active.filter(r => r.phase === 'decode'), total = rows.reduce((n, r) => n + (r.output_tokens || 0), 0);
   // history eviction can lower the retained sum: mark a gap instead of inventing throughput
   let rate = null; if (previous && total >= previous.total) rate = (total - previous.total) * 1000 / (now - previous.at);
@@ -213,6 +296,17 @@ function render(data) {
       typeof r.decode_tokens_per_second === 'number' ? number(r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
     cells.forEach((value, i) => {
       const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
+      if (i === 0) {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'request-select';
+        button.textContent = String(r.id); button.setAttribute('aria-label', 'Inspect request ' + r.id);
+        button.setAttribute('aria-pressed', String(r.id === (focusedId ?? latest?.id)));
+        button.addEventListener('click', () => {
+          if (document.body.dataset.connection !== 'live') return;
+          focusedId = focusedId === r.id ? null : r.id; requestLens();
+          for (const b of $('requests').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.textContent === String(focusedId ?? currentRows.at(-1)?.id)));
+        });
+        td.replaceChildren(button);
+      }
       if (i === 2 && r.phase === 'prefill' && data.capabilities?.prefill_progress === true && r.prompt_tokens > 0 && typeof r.prefill_processed_tokens === 'number') {
         const bar = document.createElement('span'); bar.className = 'progress'; const fill = document.createElement('b'); fill.style.width = (Math.min(1, r.prefill_processed_tokens / r.prompt_tokens) * 100).toFixed(1) + '%'; bar.append(fill); td.append(bar);
       }

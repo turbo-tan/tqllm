@@ -101,6 +101,19 @@ def main():
                 expect(page.locator('#queue')).to_have_text('0 / 1')
                 assert page.locator('#apiKey').input_value() == ''
                 assert page.evaluate('localStorage.length + sessionStorage.length') == 0
+
+                # Inspect a retained request and pin a copy, rather than a live mutable row.
+                page.locator('#requests .request-select').nth(1).click()
+                expect(page.locator('#lensPhase')).to_contain_text('selected request')
+                page.locator('#pinRequest').click()
+                expect(page.locator('#comparison')).to_contain_text('Token counts match')
+                page.locator('#requests .request-select').nth(2).click()
+                expect(page.locator('#comparison')).to_contain_text('Different token counts')
+                expect(page.locator('#lensNote')).to_contain_text('not isolated GPU time')
+                # Clicking the selected row returns to following the latest request.
+                page.locator('#requests .request-select').nth(2).click()
+                expect(page.locator('#lensPhase')).to_contain_text('following latest')
+                expect(page.locator('#pinRequest')).to_be_disabled()
                 streamed = page.evaluate("""async()=>{
                     const response=await fetch('/api/monitor/v1/chat/completions',{
                         method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer browser-test-key'},
@@ -179,6 +192,8 @@ def main():
                 expect(page.locator('#connection')).to_have_text('Disconnected', timeout=8000)
                 expect(page.locator('#tokens')).to_have_text('--')
                 expect(page.locator('#phase')).to_have_text('Telemetry unavailable')
+                expect(page.locator('#lensPhase')).to_have_text('Snapshot unavailable')
+                expect(page.locator('#pinRequest')).to_be_disabled()
                 expect(page.locator('#notice')).to_be_visible()
                 assert not errors, errors
                 results.append({'browser': browser_name, 'passed': True, 'api_mocked': False, 'fixture': True, 'page_errors': errors})

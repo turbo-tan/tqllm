@@ -11,6 +11,21 @@ builds.
 The preview uses explicitly labelled fixture request counters, not a model
 benchmark. [Mobile preview](assets/monitor-mobile.png).
 
+## Request workbench
+
+The page follows the latest request by default. Select a request ID in the history
+to inspect it; selecting it again resumes following the latest request. Its journey
+splits measured wall time before and after first output. The first span includes
+queue time; the second is not isolated GPU time or a GPU bottleneck diagnosis.
+Before first output is observed, no prefill completion percentage is inferred.
+
+Pin a finished request as a reference to compare first-output latency and output
+rate with another request. The reference is an in-memory copy, cleared on an engine
+restart or page reload. Different token counts trigger a comparison warning; even
+equal counts do not establish equal prompts or benchmark conditions. Hardware
+readings live under **Engine and hardware details**. The compact chat dock remains
+available beside the workbench, or below it on small screens.
+
 ## Start
 
 Build from source as described in CONTRIBUTING.md, then:
