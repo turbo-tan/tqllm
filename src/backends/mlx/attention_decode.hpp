@@ -438,6 +438,136 @@ out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
                  {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
 }
 
+// v5: one threadgroup per (KV head, 256-key partition, group of 32 queries); 8 simdgroups = 4 query tiles x 2 output
+// halves. The group's queries sit once in threadgroup memory (half, scaled); 8-key chunks of K, then V, are staged as
+// float. S = Q.K^T per 8x8 tile; the online softmax runs on S's fragment in registers (the 4 lanes of a row meet through
+// xor-1 / xor-8 shuffles in a fixed order) and each lane rescales its own O elements; O += P.V for the simdgroup's 128
+// output dims. Partitions and chunks start at key 0 and every reduction order depends on the key position only, so a
+// row gives the same bits for any row count, AR included (masked keys add exact zeros with factor 1).
+inline mlx::core::array decode_rows_attention_v5(const mlx::core::array& q, const mlx::core::array& k,
+                                                 const mlx::core::array& v, float scale, int valid = -1) {
+    namespace mx = mlx::core;
+    static const int PB = std::getenv("TQLLM_MLX_ATTN_V5_PB") ? std::atoi(std::getenv("TQLLM_MLX_ATTN_V5_PB")) : 256;
+    if (PB < 8 || PB % 8) throw std::invalid_argument("TQLLM_MLX_ATTN_V5_PB must be a multiple of 8");
+    check_decode_rows_shape(q, k, v, valid);
+    const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), kvheads = k.shape(1), length = valid > 0 ? valid : k.shape(2);
+    const int group = heads / kvheads, parts = (length + PB - 1) / PB, qtiles = (n * group + 7) / 8, zgroups = (qtiles + 3) / 4;
+    const uint32_t layout[] = {uint32_t(length), uint32_t(n), uint32_t(parts), uint32_t(k.shape(2)), uint32_t(qtiles)};
+    const auto layout_array = mx::array(layout, {5}, mx::uint32);
+    static auto partial = mx::fast::metal_kernel("tqllm_decode_rows_partial_v5", {"q", "k", "v", "layout", "scale"},
+                                                 {"ms", "ls", "accs"}, R"METAL(
+const uint lane = thread_index_in_simdgroup;
+const uint sg = simdgroup_index_in_threadgroup;
+const uint tid = thread_position_in_threadgroup.x;
+const uint part = threadgroup_position_in_grid.x, g = threadgroup_position_in_grid.y, zq = threadgroup_position_in_grid.z;
+const uint length = layout[0], rows = layout[1], stride = layout[3], qtiles = layout[4];
+const uint parts = layout[2];
+const uint nq = rows * uint(GROUP);
+const uint ql = sg >> 1u, side = sg & 1u, qt = zq * 4u + ql;
+constexpr uint DB = DIM / 8u, DH = DB / 2u;
+threadgroup half qs[32u * DIM];
+threadgroup float kv[8u * DIM];
+for (uint i = tid; i < 32u * DIM; i += 256u) {
+    const uint qi = zq * 32u + i / DIM, d = i % DIM;
+    qs[i] = qi < nq ? half(scale * q[((g * uint(GROUP) + qi % uint(GROUP)) * rows + qi / uint(GROUP)) * DIM + d]) : half(0.0f);
+}
+// fragment element (fm, fn) and (fm, fn + 1) of an 8x8 simdgroup matrix
+const uint fm = ((lane >> 2u) & 4u) | ((lane >> 1u) & 3u), fn = (((lane >> 2u) & 2u) << 1u) | ((lane & 1u) << 1u);
+const bool active = qt < qtiles;
+const uint myq = qt * 8u + fm;
+const uint vis = (active && myq < nq) ? length - rows + myq / uint(GROUP) + 1u : 0u;
+float m = -INFINITY, l = 0.0f;
+simdgroup_float8x8 o[DH];
+for (uint j = 0; j < DH; ++j) o[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+const device KT* kh = k + (size_t)g * stride * DIM;
+const device KT* vh = v + (size_t)g * stride * DIM;
+const uint begin = part * uint(PB), end = min(begin + uint(PB), length);
+const threadgroup half* qrow = qs + (ql * 8u + fm) * DIM + fn;
+for (uint c0 = begin; c0 < end; c0 += 8u) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid * 4u; i < 8u * DIM; i += 1024u) {
+        const uint key = c0 + i / DIM;
+        *(threadgroup float4*)(kv + i) = key < length ? float4(*(const device vec<KT, 4>*)(kh + (size_t)key * DIM + i % DIM)) : float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    if (active) {
+        for (uint d = 0; d < DB; ++d) {
+            simdgroup_float8x8 a, b;
+            a.thread_elements()[0] = float(qrow[d * 8u]);
+            a.thread_elements()[1] = float(qrow[d * 8u + 1u]);
+            simdgroup_load(b, kv + d * 8u, DIM, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(s, a, b, s);
+        }
+        const uint key0 = c0 + fn;
+        const float e0 = key0 < vis ? s.thread_elements()[0] : -INFINITY;
+        const float e1 = key0 + 1u < vis ? s.thread_elements()[1] : -INFINITY;
+        float peak = max(e0, e1);
+        peak = max(peak, simd_shuffle_xor(peak, ushort(1)));
+        peak = max(peak, simd_shuffle_xor(peak, ushort(8)));
+        const float mn = max(m, peak);
+        float p0 = 0.0f, p1 = 0.0f, r = 1.0f;
+        if (mn != -INFINITY) {
+            p0 = e0 == -INFINITY ? 0.0f : fast::exp(e0 - mn);
+            p1 = e1 == -INFINITY ? 0.0f : fast::exp(e1 - mn);
+            r = m == -INFINITY ? 0.0f : fast::exp(m - mn);
+        }
+        float mass = p0 + p1;
+        mass += simd_shuffle_xor(mass, ushort(1));
+        mass += simd_shuffle_xor(mass, ushort(8));
+        l = l * r + mass;
+        m = mn;
+        s.thread_elements()[0] = p0;
+        s.thread_elements()[1] = p1;
+        for (uint j = 0; j < DH; ++j) {o[j].thread_elements()[0] *= r; o[j].thread_elements()[1] *= r;}
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid * 4u; i < 8u * DIM; i += 1024u) {
+        const uint key = c0 + i / DIM;
+        *(threadgroup float4*)(kv + i) = key < length ? float4(*(const device vec<KT, 4>*)(vh + (size_t)key * DIM + i % DIM)) : float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active)
+        for (uint j = 0; j < DH; ++j) {
+            simdgroup_float8x8 b;
+            simdgroup_load(b, kv + (side * DH + j) * 8u, DIM);
+            simdgroup_multiply_accumulate(o[j], s, b, o[j]);
+        }
+}
+if (!active) return;
+const uint slot = ((g * parts + part) * qtiles + qt) * 8u;
+if (side == 0u && (lane & 9u) == 0u) {ms[slot + fm] = m; ls[slot + fm] = l;}
+for (uint j = 0; j < DH; ++j) simdgroup_store(o[j], accs + (size_t)slot * DIM + (side * DH + j) * 8u, DIM);
+)METAL");
+    static auto merge = mx::fast::metal_kernel("tqllm_decode_rows_merge_v5", {"ms", "ls", "accs", "layout"}, {"out"}, R"METAL(
+uint d = thread_position_in_threadgroup.x;
+uint y = threadgroup_position_in_grid.y;
+uint rows = layout[1], parts = layout[2], qtiles = layout[4];
+uint g = y / (qtiles * 8u), qi = y % (qtiles * 8u);
+if (qi >= rows * uint(GROUP)) return;
+uint r = qi / uint(GROUP), h = qi % uint(GROUP);
+float peak = -INFINITY;
+for (uint p = 0; p < parts; ++p) peak = max(peak, ms[((g * parts + p) * qtiles) * 8u + qi]);
+float total = 0.0f, numerator = 0.0f;
+for (uint p = 0; p < parts; ++p) {
+    uint slot = ((g * parts + p) * qtiles) * 8u + qi;
+    float mp = ms[slot];
+    if (mp == -INFINITY) continue;
+    float factor = fast::exp(mp - peak);
+    total += ls[slot] * factor;
+    numerator += accs[slot * uint(DIM) + d] * factor;
+}
+out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
+)METAL");
+    const auto stream = mx::Device(mx::Device::gpu);
+    auto scratch = partial({mx::contiguous(q), mx::contiguous(k), mx::contiguous(v), layout_array, mx::array(scale)},
+                           {{kvheads, parts, qtiles, 8}, {kvheads, parts, qtiles, 8}, {kvheads, parts, qtiles, 8, dim}},
+                           {mx::float32, mx::float32, mx::float32}, {parts * 256, kvheads, zgroups}, {256, 1, 1},
+                           {{"DIM", dim}, {"GROUP", group}, {"PB", PB}, {"KT", k.dtype()}}, std::nullopt, false, stream);
+    return merge({scratch[0], scratch[1], scratch[2], layout_array}, {q.shape()}, {mx::float32}, {dim, kvheads * qtiles * 8, 1},
+                 {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
+}
+
 // v4: MLX's fused SDPA matrix kernel (the 9+ query-row path, j700: 8K x 16 rows 0.49 vs v1 3.05 ms) for every call, AR
 // included. Queries are padded at the front to 16 rows (fewer only while the cache is shorter) so the shape never changes;
 // with the bottom-right causal mask each row's result depends on its own query and visible keys only (masked blocks add
@@ -464,6 +594,8 @@ inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const m
     // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
     static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr, v3 = std::getenv("TQLLM_MLX_ATTN_DECODE_V3") != nullptr;
     static const bool v4 = std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA") && std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA")) != "0";
+    static const bool v5 = std::getenv("TQLLM_MLX_ATTN_DECODE_V5") && std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_V5")) != "0";
+    if (v5) return decode_rows_attention_v5(q, k, v, scale, valid);
     if (v4 && k.dtype() == mlx::core::bfloat16) return decode_rows_attention_v4(q, k, v, scale, valid);
     if (q.shape(2) > 8) return decode_rows_attention_v1(q, k, v, scale, valid);  // v2 / v3 tile 8 rows
     return v3 ? decode_rows_attention_v3(q, k, v, scale, valid)

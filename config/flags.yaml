@@ -83,6 +83,14 @@ flags:
     kind: user
     default: "-"
     doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
+  - name: TQLLM_MLX_ATTN_DECODE_V5
+    kind: user
+    default: "-"
+    doc: "=1: own decode / verify attention v5 (matrix-unit S and P.V, queries staged once per 32, in-register softmax); takes precedence over SDPA / v1"
+  - name: TQLLM_MLX_ATTN_V5_PB
+    kind: debug
+    default: "256"
+    doc: "v5 key partition length (multiple of 8)"
   - name: TQLLM_MLX_ATTN_DECODE_SDPA
     kind: user
     default: "-"
