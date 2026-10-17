@@ -1,7 +1,9 @@
 #pragma once
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <stdexcept>
 #include <mlx/fast.h>
 #include <mlx/ops.h>
@@ -436,10 +438,33 @@ out[((g * uint(GROUP) + h) * rows + r) * uint(DIM) + d] = numerator / total;
                  {dim, 1, 1}, {{"DIM", dim}, {"GROUP", group}}, std::nullopt, false, stream)[0];
 }
 
+// v4: MLX's fused SDPA matrix kernel (the 9+ query-row path, j700: 8K x 16 rows 0.49 vs v1 3.05 ms) for every call, AR
+// included. Queries are padded at the front to 16 rows (fewer only while the cache is shorter) so the shape never changes;
+// with the bottom-right causal mask each row's result depends on its own query and visible keys only (masked blocks add
+// exact zeros), so a row agrees bit for bit across row counts. BF16 queries and output, like the prefill SDPA.
+inline mlx::core::array decode_rows_attention_v4(const mlx::core::array& q, const mlx::core::array& k,
+                                                 const mlx::core::array& v, float scale, int valid = -1) {
+    namespace mx = mlx::core;
+    check_decode_rows_shape(q, k, v, valid);
+    const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), length = valid > 0 ? valid : k.shape(2);
+    const int rows = std::min(16, length);
+    auto query = mx::astype(q, mx::bfloat16);
+    if (rows > n) {
+        auto pad = mx::broadcast_to(mx::slice(query, {0, 0, 0, 0}, {1, heads, 1, dim}), {1, heads, rows - n, dim});
+        query = mx::concatenate({pad, query}, 2);
+    }
+    auto keys = mx::slice(k, {0, 0, 0, 0}, {1, k.shape(1), length, dim});
+    auto values = mx::slice(v, {0, 0, 0, 0}, {1, v.shape(1), length, dim});
+    auto out = mx::fast::scaled_dot_product_attention(query, keys, values, scale, "causal");
+    return mx::astype(mx::slice(out, {0, 0, rows - n, 0}, {1, heads, rows, dim}), mx::float32);
+}
+
 inline mlx::core::array decode_rows_attention(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int valid = -1) {
     // v2 is exact but slower (j573: 16K verify 181-191 vs 113 ms): opt-in only
     static const bool v2 = std::getenv("TQLLM_MLX_ATTN_DECODE_V2") != nullptr, v3 = std::getenv("TQLLM_MLX_ATTN_DECODE_V3") != nullptr;
+    static const bool v4 = std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA") && std::string(std::getenv("TQLLM_MLX_ATTN_DECODE_SDPA")) != "0";
+    if (v4 && k.dtype() == mlx::core::bfloat16) return decode_rows_attention_v4(q, k, v, scale, valid);
     if (q.shape(2) > 8) return decode_rows_attention_v1(q, k, v, scale, valid);  // v2 / v3 tile 8 rows
     return v3 ? decode_rows_attention_v3(q, k, v, scale, valid)
          : v2 ? decode_rows_attention_v2(q, k, v, scale, valid) : decode_rows_attention_v1(q, k, v, scale, valid);
