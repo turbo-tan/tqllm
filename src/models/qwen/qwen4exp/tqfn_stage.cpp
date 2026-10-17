@@ -142,6 +142,9 @@ static void dense_half_release() {
     if (g_dhc.base) cudaFree(g_dhc.base); g_dhc = DenseHalfCache{};
 }
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)
+// release_prefill trims the memory pool only when free device memory is below this (the refill and the MTP bank need
+// it); the trim costs 60-100 ms of idle GPU, so a request whose refill fits without it skips it
+static size_t g_trim_below = SIZE_MAX;
 struct ArenaMark { size_t at = g_arena ? g_arena->used : 0; ~ArenaMark() { if (g_arena) g_arena->used = at; } };
 template<class T> struct Device {
     T * p = nullptr; size_t count; bool owned = true;
@@ -2467,7 +2470,8 @@ struct DecodeModel {
         st.layer = -1; st.cache = nullptr; st.plan.clear(); st.issued = 0;
         g_qsa_batch.reset(); tqllm_cuda::fn_gdn_release_workspaces();
         if (res_keep && res_keep->count > size_t(64) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(64) * width); }
-        cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
+        size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+        if (fr < g_trim_below) { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
     }
     // One trunk layer for a whole prefill chunk (rows of `wide`, replaced in place): the dense part in sub-chunks of
     // --prefill-sub tokens (KV, recurrent and PLE state carried in order), then the routed experts once for every row:
@@ -2506,7 +2510,8 @@ struct DecodeModel {
         }
         using lclk = std::chrono::steady_clock; const auto lt0 = lclk::now(); double lt[4] = {};
         auto lmark = [&](int i) { if (!g_prefill_log) return; ck(cudaDeviceSynchronize()); lt[i] = std::chrono::duration<double, std::milli>(lclk::now() - lt0).count(); };
-        if (st.ids_cap < size_t(A)) { if (st.ids_host) ck(cudaFreeHost(st.ids_host)); ck(cudaMallocHost(reinterpret_cast<void **>(&st.ids_host), size_t(A) * 4)); st.ids_cap = size_t(A); }
+        if (st.ids_cap < size_t(A)) { if (st.ids_host) ck(cudaFreeHost(st.ids_host)); st.ids_cap = std::max({size_t(A), 2 * st.ids_cap, size_t(1) << 20});
+                                     ck(cudaMallocHost(reinterpret_cast<void **>(&st.ids_host), st.ids_cap * 4)); }
         const PrefillSink base{wide, pf_inject->p, pf_xr->p, pf_routed->p, pf_weights->p, pf_sw->p, pf_sd->p, 0};
         for (int d = 0; d < n; d += sub) {
             const int nd = std::min(sub, n - d); ArenaMark scratch;
@@ -2565,7 +2570,8 @@ struct DecodeModel {
             for (size_t i = g0; i < g1; ++i) if (cnt[size_t(st.plan[i])]) { ex.push_back(st.plan[i]); sl.push_back(int(i - g0)); }
             plan_pass(ex, sl, st.K);
         }
-        if (st.idx_cap < total) { if (st.idx_host) ck(cudaFreeHost(st.idx_host)); ck(cudaMallocHost(reinterpret_cast<void **>(&st.idx_host), total * 4)); st.idx_cap = total; }
+        if (st.idx_cap < total) { if (st.idx_host) ck(cudaFreeHost(st.idx_host)); st.idx_cap = std::max({total, 2 * st.idx_cap, size_t(4) << 20});
+                                  ck(cudaMallocHost(reinterpret_cast<void **>(&st.idx_host), st.idx_cap * 4)); }
         for (const auto & ps : passes) {
             int * cn = st.idx_host + ps.at, * gr = cn + ps.W; std::fill(cn, cn + ps.W, 0);
             for (int a = 0; a < A; ++a) { const int sl = ps.slot_of[size_t(ids[a])]; if (sl >= 0) gr[size_t(sl) * ps.cap + size_t(cn[sl]++)] = a; }
@@ -3896,7 +3902,7 @@ public:
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) override {
         auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
         require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
-        S().model_.reset(); S().prompt_res_.reset();
+        S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
         if (g_arena) g_arena->used = 0;
         // the pool keeps what the last request freed (release threshold max); hand it back so plain cudaMalloc users (expert
         // banks, staging, attention workspaces) can have it
@@ -3969,6 +3975,9 @@ public:
                 }
             }
             g_qsa_block = block; g_sub_req = block;
+            // the first chunk's host prep (embedding + PLE gathers, ~0.4 s at 16K) runs while the banks, KV and arena are set up
+            { DecodeModel * m = S().model_.get(); std::vector<int> first(ids.begin(), ids.begin() + std::min(P, chunk));
+              m->prep_next_ = std::async(std::launch::async, [m, first] { return m->prepare_host(first); }); }
             if (P > chunk) f_.mtp_cache->clear();  // a multi-chunk prompt needs the room; one chunk keeps the MTP bank
             tqllm::BankLedger::Ops ops;
             ops.lru_layers = [this] { return f_.cache->banks_lru(); };
@@ -3978,6 +3987,7 @@ public:
             ops.free_bytes = free_now;
             S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
             const auto ev = S().ledger_->borrow(plan, g_tune.borrow, g_tune.borrow_count); S().plan_catchup_bytes_ = plan.catchup_peak;
+            g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
             S().model_->pf_borrowed.assign(size_t(c.layers), 0);
             for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;
             if (!ev.empty() || tqllm::debug_on("mem"))
@@ -4033,6 +4043,7 @@ public:
             }
         };
         S().model_->keep_embeddings = host_res && mtp_lm && chunk >= 256; S().model_->prompt_emb.clear();
+        if (S().model_->keep_embeddings) S().model_->prompt_emb.reserve(size_t(P) * size_t(c.hidden));
         for (int b = 0; b < P; b += chunk) {
             const int e = std::min(P, b + chunk);
             auto tl = pclk::now();
@@ -4106,7 +4117,7 @@ public:
                 std::fprintf(stderr, "tqllm: attention KV: %.0f MB of old positions moved to host memory in %.0f ms\n", freed / 1048576.0,
                              std::chrono::duration<double, std::milli>(kclk::now() - k0).count());
         }
-        refill_borrowed();
+        refill_borrowed(); g_trim_below = SIZE_MAX;
         S().model_->set_spec(true);
         ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();
         if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }
