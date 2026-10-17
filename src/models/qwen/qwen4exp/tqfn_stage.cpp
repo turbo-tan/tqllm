@@ -1393,8 +1393,10 @@ static void attention_core(const Checkpoint & checkpoint, const float * input_p,
         if (has_indexer) {
             ArenaMark scratch;
             if (!carry->qsa) {
-                // the indexer uses plain cudaMalloc: hand back what the async pool keeps reserved first
-                cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
+                // the indexer uses plain cudaMalloc: hand back what the async pool keeps reserved first when memory is short
+                // (a trim per attention layer cost 0.3 s of idle GPU at 128K; the indexer state is tens of MB)
+                { size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+                  if (fr < (size_t(1) << 30)) { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); } }
                 PersistentAlloc keep; carry->qsa = std::make_unique<tqllm_cuda::QsaIndexer>(g_kv_capacity, ratio, top_k, iheads, idim,
                                    std::min(checkpoint.rotary, idim), checkpoint.theta, float(checkpoint.epsilon)); }
             if (carry->qsa->size() > pos) carry->qsa->truncate(pos);  // speculative rollback
@@ -2698,7 +2700,11 @@ struct DecodeModel {
     }
     std::future<HostPrep> prep_next_;
     bool keep_embeddings = false;      // a multi-chunk prefill keeps the prompt's embeddings for the MTP catch-up
-    std::vector<float> prompt_emb;     // [prompt tokens][hidden] fp32 while keep_embeddings
+    // [prompt tokens][hidden] fp32 while keep_embeddings; left uninitialised so each chunk's rows are first touched by the
+    // copy thread, not the launching thread (150 MB of page faults per 16K chunk held the GPU idle ~0.1 s per chunk)
+    struct HostRows { std::unique_ptr<float[]> p; size_t n = 0;
+                      void alloc(size_t k) { p.reset(new float[k]); n = k; } void clear() { p.reset(); n = 0; }
+                      size_t size() const { return n; } const float * data() const { return p.get(); } } prompt_emb;
 
     // Runs n new tokens through the trunk; returns the head-input rows [n][hidden]; keeps the wide rows in res_keep.
     // next: the tokens of the chunk that follows (its host prep starts now, on a thread).
@@ -2712,7 +2718,9 @@ struct DecodeModel {
         if (next && !next->empty()) prep_next_ = std::async(std::launch::async, [this, nx = *next] { return prepare_host(nx); });
         spec_pos0 = position; spec_n = n; spec_hist0 = prep.hist0;
         Device<float> de(prep.embedding.size()); de.put(prep.embedding);
-        if (keep_embeddings) prompt_emb.insert(prompt_emb.end(), prep.embedding.begin(), prep.embedding.end());
+        std::future<void> emb_copy;  // joined before prep goes out of scope
+        if (keep_embeddings) emb_copy = std::async(std::launch::async, [dst = prompt_emb.p.get() + size_t(position) * h, &prep] {
+            std::memcpy(dst, prep.embedding.data(), prep.embedding.size() * sizeof(float)); });
         auto residual = std::make_unique<Device<float>>(size_t(width) * n);
         tqllm_cuda::hc_init(de.p, residual->p, h, c.hc, n, nullptr);
         Device<float> dp(prep.ple.size()); dp.put(prep.ple);
@@ -4043,7 +4051,7 @@ public:
             }
         };
         S().model_->keep_embeddings = host_res && mtp_lm && chunk >= 256; S().model_->prompt_emb.clear();
-        if (S().model_->keep_embeddings) S().model_->prompt_emb.reserve(size_t(P) * size_t(c.hidden));
+        if (S().model_->keep_embeddings) S().model_->prompt_emb.alloc(size_t(P) * size_t(c.hidden));
         for (int b = 0; b < P; b += chunk) {
             const int e = std::min(P, b + chunk);
             auto tl = pclk::now();
@@ -4095,7 +4103,7 @@ public:
                     S().d1_ = S().model_->mtp_prefill(toks, rows->p, emb);
                 }
                 rows.reset(); S().model_->release_prefill();
-                S().model_->prompt_emb.clear(); S().model_->prompt_emb.shrink_to_fit(); S().model_->keep_embeddings = false;
+                S().model_->prompt_emb.clear(); S().model_->keep_embeddings = false;
             } else
             for (int b = 0; b < P; b += chunk)
                 for (int q = b, e = std::min(P, b + chunk); q < e; q += rb) {
