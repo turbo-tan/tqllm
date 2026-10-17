@@ -106,12 +106,13 @@ if(lane==0u) {
 
 mx::array dflash_select(const mx::array& mapped,const mx::array& unary,const mx::array& gate,
     const mx::array& successors,const mx::array& predecessors,uint32_t anchor,int count) {
-    if(mapped.shape()!=mx::Shape{8,16} || mapped.dtype()!=mx::uint32 ||
+    const int R=mapped.ndim()==2?mapped.shape(0):0;  // draft block rows (8, or 16 with TQLLM_MLX_DFLASH_BLOCK)
+    if((R!=8 && R!=16) || mapped.shape()!=mx::Shape{R,16} || mapped.dtype()!=mx::uint32 ||
        unary.shape()!=mapped.shape() || unary.dtype()!=mx::float32 ||
-       gate.shape()!=mx::Shape{8,256} || gate.dtype()!=mx::float32 ||
-       successors.shape()!=mx::Shape{8,16,256} || successors.dtype()!=mx::float32 ||
+       gate.shape()!=mx::Shape{R,256} || gate.dtype()!=mx::float32 ||
+       successors.shape()!=mx::Shape{R,16,256} || successors.dtype()!=mx::float32 ||
        predecessors.ndim()!=2 || predecessors.shape(1)!=256 || predecessors.dtype()!=mx::bfloat16 ||
-       anchor>=uint32_t(predecessors.shape(0)) || count<1 || count>7)
+       anchor>=uint32_t(predecessors.shape(0)) || count<1 || count>R-1)
         throw std::invalid_argument("invalid DFlash selector dimensions");
     static auto select=mx::fast::metal_kernel("tqllm_dflash_select",
         {"mapped","unary","gate","successors","predecessors","anchor"},{"tokens"},R"METAL(
@@ -180,7 +181,7 @@ struct DFlash2::Impl {
         vocab=target.vocabulary();
         for(double id:file.kv.at("dflash.target_layers").arr)features.push_back(int(id));
         const int layers=int(file.num("dflash.block_count"));
-        if(hidden!=5120 || hd!=128 || heads!=32 || kvheads!=8 || block!=8 || group!=16 || rank!=256 ||
+        if(hidden!=5120 || hd!=128 || heads!=32 || kvheads!=8 || (block!=8 && block!=16) || group!=16 || rank!=256 ||
            layers!=5 || mask>=uint32_t(vocab) || file.num("dflash.conv_kernel_size")!=2)
             throw std::invalid_argument("unsupported DFlash2 dimensions");
         for(const auto& [name,tensor]:file.tensors) {
