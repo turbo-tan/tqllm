@@ -3929,13 +3929,18 @@ public:
         if (P >= 256 && chunk >= 256) {
             const auto & c = checkpoint.config;
             tqllm::PrefillShape sh; sh.hidden = c.hidden; sh.hc = c.hc; sh.expert_ff = c.expert_ff; sh.topk = c.topk; sh.experts = c.experts; sh.layers = c.layers;
-            for (int l = 0; l < c.layers && !sh.expert_block_bytes; ++l) if (f_.cache->has_layout(l)) sh.expert_block_bytes = f_.cache->bank_layout(l).block;
+            // the staging halves are sized for the largest expert block of any layer (prefill_layer): mixed-format files have
+            // bigger blocks in some layers (the first layer's block undercounted staging by 170 MB at 245K)
+            for (int l = 0; l < c.layers; ++l) if (f_.cache->has_layout(l)) {
+                const auto lay = f_.cache->bank_layout(l); size_t blk = 0;
+                for (int i = 0; i < 6; ++i) blk += lay.piece[i];
+                sh.expert_block_bytes = std::max(sh.expert_block_bytes, std::max(blk, size_t(lay.block)) + 6 * 256 / std::max(1, g_tune.stage));
+            }
             tqllm::PrefillTuning tu; tu.sub = g_tune.sub; tu.stage = g_tune.stage;
             tu.dense_cache_bytes = dense_half_pool_bytes(); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
             tu.workspace_bytes = size_t(1024 + std::max(0L, g_tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
-            // above 128K the plan's own estimate has run ~0.1-0.4 GB short (245K at 48 / 56 slots died in the staging allocation
-            // with 62 MB free): keep 768 MB more there, so the plan picks a smaller selection block or chunk instead
-            if (P > 131072) tu.workspace_bytes += size_t(768) << 20;
+            // above 128K keep a small margin beyond the plan's own terms (allocator granularity, kernel scratch)
+            if (P > 131072) tu.workspace_bytes += size_t(192) << 20;
             int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
             auto context_term = [&](int block) { return tqllm::prefill_context_bytes(g_kv_capacity, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
             // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
