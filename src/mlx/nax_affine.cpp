@@ -451,45 +451,38 @@ const char* kLevelsRows = R"METAL(
     const uint2 w = ((const device uint2*)W)[((size_t)blk * STEPS + ks) * 32 + lane];
     const int g = int(ks * 16u) / 128;
     const device ushort* sp = S + ((size_t)blk * GPR + g) * 32;
-    const uint c0 = ks * 16u + fm;
-    const float s0 = SM[c0], s1 = SM[c0 + 8];
-    device int8_t* out = Y + (size_t)(blk * 32 + fn) * K + c0;
+    device int8_t* out = Y + (size_t)(blk * 32 + fn) * K + ks * 16u + fm;
     for (short p = 0; p < 4; p++) {
         const float ra = float(as_type<half>(sp[fn + p])) / R[blk * 32 + fn + p];
         const float rb = float(as_type<half>(sp[16 + fn + p])) / R[blk * 32 + 16 + fn + p];
         for (short j = 0; j < 2; j++) {
             const short i = p + 4 * j;
-            const float sj = j ? s1 : s0;
             const uint qa = (w.x >> (4 * i)) & 15u, qb = (w.y >> (4 * i)) & 15u;
-            out[(size_t)p * K + 8 * j] = int8_t(clamp(rint(float(TQ4_LEVEL[qa]) * ra * sj), -127.0f, 127.0f));
-            out[(size_t)(16 + p) * K + 8 * j] = int8_t(clamp(rint(float(TQ4_LEVEL[qb]) * rb * sj), -127.0f, 127.0f));
+            out[(size_t)p * K + 8 * j] = int8_t(clamp(rint(float(TQ4_LEVEL[qa]) * ra), -127.0f, 127.0f));
+            out[(size_t)(16 + p) * K + 8 * j] = int8_t(clamp(rint(float(TQ4_LEVEL[qb]) * rb), -127.0f, 127.0f));
         }
     }
 )METAL";
-// per-row int8 weights [rows, columns] of w * diag(sm) and the row scale [rows]: max over groups of the group scale
-// times the group's largest sm (an upper bound on the row's |w * sm|, so no clamping in the kernel)
-std::pair<mx::array, mx::array> nax_tq4_levels_int8_rows(const NaxAffine& w, const mx::array& sm) {
+// per-row int8 weights [rows, columns] and the row scale [rows] (max of the row's group scales)
+std::pair<mx::array, mx::array> nax_tq4_levels_int8_rows(const NaxAffine& w) {
     if (!w.tq4 || w.columns % 128) throw std::invalid_argument("nax int8 row levels: TQ4 matrices only");
-    const int gpr = w.columns / 128;
-    auto scales = mx::astype(mx::view(w.scales, mx::float16), mx::float32);  // [rows/32, GPR, 32] lane order
-    auto smg = mx::reshape(mx::max(mx::reshape(sm, {gpr, 128}), 1), {1, gpr, 1});
-    auto rowmax = mx::reshape(mx::max(mx::multiply(scales, smg), 1), {w.rows});
-    static auto kernel = mx::fast::metal_kernel("tqllm_nax_tq4_levels_rows", {"W", "S", "R", "SM"}, {"Y"}, kLevelsRows, kHeader);
+    auto scales = mx::view(w.scales, mx::float16);  // [rows/32, GPR, 32] lane order
+    auto rowmax = mx::reshape(mx::astype(mx::max(scales, 1), mx::float32), {w.rows});
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_tq4_levels_rows", {"W", "S", "R"}, {"Y"}, kLevelsRows, kHeader);
     const int blocks = w.rows / 32, steps = w.columns / 16;
-    auto q = kernel({w.words, w.scales, rowmax, sm}, {{w.rows, w.columns}}, {mx::int8}, {blocks * steps * 32, 1, 1}, {256, 1, 1},
-                    {{"K", w.columns}, {"STEPS", steps}, {"BLOCKS", blocks}, {"GPR", gpr}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    auto q = kernel({w.words, w.scales, rowmax}, {{w.rows, w.columns}}, {mx::int8}, {blocks * steps * 32, 1, 1}, {256, 1, 1},
+                    {{"K", w.columns}, {"STEPS", steps}, {"BLOCKS", blocks}, {"GPR", w.columns / 128}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
     return {q, rowmax};
 }
-// per-token int8 of x / diag(sm) (sm = ones leaves the numerics of the plain path untouched)
-std::pair<mx::array, mx::array> nax_quantize_tokens_int8(const mx::array& input, int row_pad, const mx::array& sm) {
+std::pair<mx::array, mx::array> nax_quantize_tokens_int8(const mx::array& input, int row_pad) {
     if (input.ndim() != 2) throw std::invalid_argument("nax int8 token quantize: input must be [m, k]");
     auto x = mx::contiguous(input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16));
     const int m = x.shape(0), k = x.shape(1), mp = ((m + row_pad - 1) / row_pad) * row_pad;
-    static auto kernel = mx::fast::metal_kernel("tqllm_nax_quantize_tokens_int8", {"x", "sm"}, {"q", "s"}, R"METAL(
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_quantize_tokens_int8", {"x"}, {"q", "s"}, R"METAL(
     const uint row = threadgroup_position_in_grid.x, tid = thread_position_in_threadgroup.x;
     const device half* xr = x + size_t(row) * uint(K);
     float amax = 0.0f;
-    if (row < uint(M)) for (uint i = tid; i < uint(K); i += 256u) amax = max(amax, abs(float(xr[i]) / sm[i]));
+    if (row < uint(M)) for (uint i = tid; i < uint(K); i += 256u) amax = max(amax, abs(float(xr[i])));
     amax = simd_max(amax);
     threadgroup float red[8];
     if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
@@ -497,28 +490,12 @@ std::pair<mx::array, mx::array> nax_quantize_tokens_int8(const mx::array& input,
     amax = red[0];
     for (uint g = 1; g < 8u; ++g) amax = max(amax, red[g]);
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
-    for (uint i = tid; i < uint(K); i += 256u) q[size_t(row) * uint(K) + i] = row < uint(M) ? int8_t(clamp(rint(float(xr[i]) / sm[i] / scale), -127.0f, 127.0f)) : int8_t(0);
+    for (uint i = tid; i < uint(K); i += 256u) q[size_t(row) * uint(K) + i] = row < uint(M) ? int8_t(clamp(rint(float(xr[i]) / scale), -127.0f, 127.0f)) : int8_t(0);
     if (tid == 0) s[row] = row < uint(M) ? scale : 0.0f;
 )METAL");
-    auto out = kernel({x, sm}, {{mp, k}, {mp}}, {mx::int8, mx::float32}, {mp * 256, 1, 1}, {256, 1, 1}, {{"K", k}, {"M", m}},
+    auto out = kernel({x}, {{mp, k}, {mp}}, {mx::int8, mx::float32}, {mp * 256, 1, 1}, {256, 1, 1}, {{"K", k}, {"M", m}},
                       std::nullopt, false, mx::Device(mx::Device::gpu));
     return {out[0], out[1]};
-}
-// SmoothQuant-style fold for the fast path: x' = x / s, w' = w * s per input column with s = xmax^a / wmax^(1-a),
-// xmax from the chunk itself (no calibration files), wmax cached per matrix. Outlier channels leave the per-token
-// input quantization for the per-row weight requant. a <= 0 means off (s = 1). The column max lives in the matrix
-// (a cache keyed by array id broke when a freed matrix's id was reused, j641).
-static mx::array nax_int8_smooth(const NaxAffine& w, const mx::array& x, float alpha) {
-    if (!w.colmax) {
-        auto wm = mx::max(mx::abs(mx::astype(nax_affine_dequant(w), mx::float32)), 0);
-        mx::eval(wm);
-        w.colmax = wm;
-    }
-    const auto& wmax = *w.colmax;
-    auto xm = mx::max(mx::abs(mx::astype(x, mx::float32)), 0);
-    auto s = mx::divide(mx::power(xm, mx::array(alpha)), mx::power(wmax, mx::array(1.0f - alpha)));
-    auto ok = mx::logical_and(mx::greater(xm, mx::array(0.0f)), mx::greater(wmax, mx::array(0.0f)));
-    return mx::where(ok, mx::maximum(s, mx::array(1e-5f)), mx::array(1.0f));
 }
 const char* kInt8GemmRows = R"METAL(
     const uint tiles_m = uint(MP) / uint(MT), tiles_n = uint(N) / uint(NT);
@@ -547,7 +524,7 @@ const char* kInt8GemmRows = R"METAL(
         }
     }
 )METAL";
-mx::array nax_int8_gemm_rows(const NaxAffine& w, const mx::array& input, bool round_bf16, float smooth_alpha) {
+mx::array nax_int8_gemm_rows(const NaxAffine& w, const mx::array& input, bool round_bf16) {
     if (!w.tq4 || w.columns % 128 || w.rows % 128) throw std::invalid_argument("nax int8 gemm: TQ4 matrices (rows % 128) only");
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax int8 gemm: input must be [m, columns]");
@@ -559,20 +536,16 @@ mx::array nax_int8_gemm_rows(const NaxAffine& w, const mx::array& input, bool ro
         };
         return std::pair{make(false), make(true)};
     }();
-    auto sm = smooth_alpha > 0 ? nax_int8_smooth(w, input, smooth_alpha) : mx::ones({w.columns}, mx::float32);
-    auto [xq, sa] = nax_quantize_tokens_int8(input, MT, sm);
-    auto [wq, sw] = nax_tq4_levels_int8_rows(w, sm);
+    auto [xq, sa] = nax_quantize_tokens_int8(input, MT);
+    auto [wq, sw] = nax_tq4_levels_int8_rows(w);
     const int m = input.shape(0), mp = xq.shape(0), n = w.rows, k = w.columns;
     return (round_bf16 ? kernels.second : kernels.first)(
         {xq, sa, wq, sw}, {{m, n}}, {mx::float32}, {(n / NT) * (mp / MT) * 32 * SIMDS, 1, 1}, {32 * SIMDS, 1, 1},
         {{"MT", MT}, {"NT", NT}, {"SIMDS", SIMDS}, {"SB", SB}, {"M", m}, {"MP", mp}, {"N", n}, {"K", k}, {"ROUND_BF16", round_bf16}},
         std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
-mx::array nax_int8_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16, bool exact, float smooth_alpha) {
-    if (!exact) {
-        static const float env_alpha = std::getenv("TQLLM_MLX_INT8_SMOOTH") ? float(std::atof(std::getenv("TQLLM_MLX_INT8_SMOOTH"))) : 0.0f;
-        return nax_int8_gemm_rows(w, input, round_bf16, smooth_alpha < 0 ? env_alpha : smooth_alpha);
-    }
+mx::array nax_int8_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16, bool exact) {
+    if (!exact) return nax_int8_gemm_rows(w, input, round_bf16);
     if (!w.tq4 || w.group != 128 || w.columns % 128 || w.rows % 128) throw std::invalid_argument("nax int8 gemm: TQ4 matrices (group 128, rows % 128) only");
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax int8 gemm: input must be [m, columns]");

@@ -189,8 +189,10 @@ struct Qwen35::Impl {
     // prefill GEMMs of TQ4 matrices on the int8 matrix-unit path (exact levels, per-row int8 input); opt-in until gated
     // =1 fast (per-row weights, per-token input), =2 exact group scales (slow)
     int prefill_int8=std::getenv("TQLLM_MLX_PREFILL_INT8")?std::atoi(std::getenv("TQLLM_MLX_PREFILL_INT8")):0;
-    // which GEMMs take the int8 path: 1 = projections through mat(), 2 = FFN gate/up, 4 = FFN down (ablation, j642)
-    int prefill_int8_mask=std::getenv("TQLLM_MLX_PREFILL_INT8_MASK")?std::atoi(std::getenv("TQLLM_MLX_PREFILL_INT8_MASK")):7;
+    // which GEMMs take the int8 path: 1 = projections through mat(), 2 = FFN gate/up, 4 = FFN down. Default gate/up only:
+    // j642 wikitext KL vs exact 0.0038 / 0.0008 (floor 0.0022 / 0.0004) for +8-18 % prefill; the projections alone cost
+    // 0.0151 / 0.0018 and down 0.0047 / 0.0008
+    int prefill_int8_mask=std::getenv("TQLLM_MLX_PREFILL_INT8_MASK")?std::atoi(std::getenv("TQLLM_MLX_PREFILL_INT8_MASK")):2;
     bool fused_epilogue=std::getenv("TQLLM_MLX_FUSE_EPILOGUE")!=nullptr;
     bool fused_swiglu_rotation=std::getenv("TQLLM_MLX_FUSE_SWIGLU_ROTATION")!=nullptr;
     bool lazy_verify_commit=std::getenv("TQLLM_MLX_LAZY_VERIFY_COMMIT")!=nullptr;

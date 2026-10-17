@@ -94,17 +94,6 @@ int main() {
         const double e3 = rel_l2(fp16, ref2);
         std::printf("NAX_INT8 rows=%d m=%d exact: grid_rel_l2=%.2e realistic_rel_l2=%.2e; fast (per-row) realistic_rel_l2=%.2e (fp16 path %.2e)\n", rows, m, e1, e2, e4, e3);
         ok = ok && e1 < 1e-5 && e2 < 1e-2;
-        // 2b. outlier channels (8 columns x 40, as unrotated LLM activations have): per-token input quantization loses the
-        // small channels; smoothing folds the outliers into the per-row weight requant
-        std::vector<float> xo = xr;
-        for (int r = 0; r < m; ++r) for (int c = 0; c < 8; ++c) { float& v = xo[size_t(r) * k + c * 640 + 7]; v = float(mx::float16_t(v * 40.0f)); }
-        auto Xo = mx::array(xo.data(), {m, k}, mx::float32);
-        auto refo = reference(f, xo, m);
-        const double e5 = rel_l2(host(nax_int8_gemm(f.w, Xo, false, false, 0.0f)), refo);
-        const double e6 = rel_l2(host(nax_int8_gemm(f.w, Xo, false, false, 0.5f)), refo);
-        const double e7 = rel_l2(host(nax_int8_gemm(f.w, Xr, false, false, 0.5f)), ref2);
-        std::printf("NAX_INT8_SMOOTH rows=%d outliers x40: fast rel_l2=%.2e smooth(0.5) rel_l2=%.2e; outlier-free smooth(0.5) rel_l2=%.2e (fast %.2e)\n", rows, e5, e6, e7, e4);
-        ok = ok && e6 < e5 && e7 < 2 * e4;
     }
     // 3. throughput at the FFN shapes (gate/up: 17408 x 5120; down: 5120 x 17408), m = 2048
     for (auto [rows, k] : std::vector<std::pair<int, int>>{{17408, 5120}, {5120, 17408}}) {
@@ -114,10 +103,9 @@ int main() {
         const double flop = 2.0 * 2048 * rows * k;
         const double t16 = best_ms([&] { return nax_affine_gemm(f.w, X, true); });
         const double t8 = best_ms([&] { return nax_int8_gemm(f.w, X, true, false); });
-        const double t8s = best_ms([&] { return nax_int8_gemm(f.w, X, true, false, 0.5f); });
         const double t8e = best_ms([&] { return nax_int8_gemm(f.w, X, true, true); });
-        std::printf("NAX_INT8_SPEED rows=%d k=%d m=2048 fp16_gemm_path %.2f ms (%.1f TFLOPS) int8 fast %.2f ms (%.1f TOPS) -> %.2fx; fast+smooth %.2f ms; exact %.2f ms (%.1f TOPS)\n",
-                    rows, k, t16, flop / t16 * 1e-9, t8, flop / t8 * 1e-9, t16 / t8, t8s, t8e, flop / t8e * 1e-9);
+        std::printf("NAX_INT8_SPEED rows=%d k=%d m=2048 fp16_gemm_path %.2f ms (%.1f TFLOPS) int8 fast %.2f ms (%.1f TOPS) -> %.2fx; exact %.2f ms (%.1f TOPS)\n",
+                    rows, k, t16, flop / t16 * 1e-9, t8, flop / t8 * 1e-9, t16 / t8, t8e, flop / t8e * 1e-9);
     }
     std::puts(ok ? "NAX_INT8_PASS" : "NAX_INT8_FAIL");
     return ok ? 0 : 1;
