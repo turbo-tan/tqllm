@@ -21,7 +21,7 @@ TEXT_EXT = (".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc", ".md", ".py", ".yaml", 
 SRC_EXT = (".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc")
 INCLUDE_DIRS = ["src/core", "src/engine", "src/formats/weight", "src/formats/kv", "src/kv", "src/experts", "src/spec",
                 "src/models/qwen/qwen35", "src/models/qwen/qwen2", "src/models/qwen/qwen4exp", "src/vision",
-                "src/formats/weight/x3", "src/models/nemotron", "src/models/glm", "third_party/nlohmann", "third_party/stb"]
+                "src/formats/weight/x3", "src/models/nemotron", "src/models/glm", "third_party/nlohmann", "third_party/stb", "third_party"]
 # literal edits outside plain path renames (applied only where the old text is present)
 LITERAL = {
     "CONTRIBUTING.md": [("Put its CUDA kernels in `kernels/formats/<name>.cu`.",
@@ -87,11 +87,15 @@ def main():
         def fix_quote(m):
             path = m.group(2)
             b = os.path.basename(path)
-            if len(base_new.get(b, ())) != 1:
-                return m.group(0)
             for d in [os.path.dirname(old_loc), "kernels", "src", ".", "tools", "kernels/formats", "src/formats"]:
                 c = os.path.normpath(os.path.join(d, path))
                 if c in full:
+                    if full[c].startswith("third_party/"):  # vendored trees keep their own paths: <lib>/<path> (third_party/ is on the search path)
+                        if os.path.dirname(full[c]) == os.path.dirname(full.get(old_loc, old_loc)):
+                            return m.group(0)
+                        return m.group(1) + full[c][len("third_party/"):] + m.group(3)
+                    if len(base_new.get(b, ())) != 1:
+                        return m.group(0)
                     return m.group(1) + b + m.group(3)
             return m.group(0)
 
