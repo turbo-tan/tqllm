@@ -327,11 +327,61 @@ mx::array nax_affine_dequant(const NaxAffine& w) {
                   {"GS", w.group}, {"TQ4", w.tq4}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+// One thread per output word of MLX's affine layout ([rows, columns/8] uint32, element k at nibble k % 8): its 8 codes
+// come from the lanes of kDequant's fragment order (row blk*32 + fn + p + 16*sel, column ks*16 + fm + 8*j, nibble p + 4*j).
+// The first word of each group also writes its scale and bias, BF16 -> FP16.
+const char* kToMlx = R"METAL(
+    const uint t = thread_position_in_grid.x;
+    const uint kw = t % uint(K / 8), r = t / uint(K / 8);
+    if (r >= uint(N)) return;
+    const uint blk = r / 32u, rr = r % 32u, sel = rr / 16u, fn = rr % 16u & ~3u, p = rr & 3u;
+    const uint ks = kw / 2u, j = kw & 1u;
+    uint word = 0u;
+    for (uint e = 0; e < 8u; e++) {
+        const uint lane = ((e >> 2) << 4) | ((fn >> 3) << 3) | ((e & 3u) << 1) | ((fn >> 2) & 1u);
+        const uint src = W[(((size_t)blk * STEPS + ks) * 32u + lane) * 2u + sel];
+        word |= ((src >> (4u * (p + 4u * j))) & 15u) << (4u * e);
+    }
+    Q[t] = word;
+    if (kw % uint(GS / 8) == 0u) {
+        const uint g = kw * 8u / uint(GS);
+        const size_t s = ((size_t)blk * GPR + g) * 32u + rr;
+        SO[(size_t)r * GPR + g] = half(as_type<float>(uint(S[s]) << 16));
+        BO[(size_t)r * GPR + g] = half(as_type<float>(uint(Bz[s]) << 16));
+    }
+)METAL";
+
+bool nax_affine_mlx_compatible(const NaxAffine& w) {
+    return w.bits == 4 && !w.tq4 && !w.q6 && (w.group == 32 || w.group == 64 || w.group == 128);
+}
+
+NaxMlx nax_affine_to_mlx(const NaxAffine& w) {
+    if (!nax_affine_mlx_compatible(w)) throw std::invalid_argument("nax affine to mlx: needs 4-bit affine, group 32/64/128");
+    static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_to_mlx", {"W", "S", "Bz"}, {"Q", "SO", "BO"}, kToMlx, kHeader);
+    const int gpr = w.columns / w.group;
+    const int threads = w.rows * (w.columns / 8);
+    auto out = kernel({w.words, w.scales, w.biases}, {{w.rows, w.columns / 8}, {w.rows, gpr}, {w.rows, gpr}},
+                      {mx::uint32, mx::float16, mx::float16}, {threads, 1, 1}, {256, 1, 1},
+                      {{"K", w.columns}, {"N", w.rows}, {"STEPS", w.columns / 16}, {"GPR", gpr}, {"GS", w.group}},
+                      std::nullopt, false, mx::Device(mx::Device::gpu));
+    return {out[0], out[1], out[2]};
+}
+
+mx::array nax_affine_product_fp16(const NaxAffine& w, const mx::array& x) {
+    // TQLLM_MLX_PREFILL_QMM: 1 (default) quantized_matmul on weights repacked per call, 0 dequant + matmul
+    static const int qmm = std::getenv("TQLLM_MLX_PREFILL_QMM") ? std::atoi(std::getenv("TQLLM_MLX_PREFILL_QMM")) : 1;
+    if (qmm > 0 && nax_affine_mlx_compatible(w)) {
+        const auto q = nax_affine_to_mlx(w);
+        return mx::quantized_matmul(x, q.words, q.scales, q.biases, true, w.group, 4);
+    }
+    return mx::matmul(x, mx::transpose(nax_affine_dequant(w)));
+}
+
 mx::array nax_affine_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine gemm: input must be [m, columns]");
     auto x = input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16);
-    auto y = mx::matmul(x, mx::transpose(nax_affine_dequant(w)));
+    auto y = nax_affine_product_fp16(w, x);
     // FP16 product -> BF16 rounding -> FP32 as one fused elementwise pass
     static auto to_bf = mx::compile([](const std::vector<mx::array>& a) {
         return std::vector<mx::array>{mx::astype(mx::astype(mx::astype(a[0], mx::float32), mx::bfloat16), mx::float32)};
