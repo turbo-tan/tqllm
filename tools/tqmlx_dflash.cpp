@@ -30,7 +30,7 @@ int main(int argc,char** argv) {
         // with today's 8-row verify paths (speed not representative)
         const bool chain=std::getenv("TQLLM_MLX_DFLASH_CHAIN")!=nullptr;
         if(width<1 || width>15 || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
-        int prefill_chunk=0;
+        int prefill_chunk=2048;  // the server's chunk (model_mlx.cpp); a whole-prompt prefill at 24K needs a 53 GB score buffer (j729)
         if(const char* mode=std::getenv("TQLLM_MLX_PREFILL_CHUNK")) {
             prefill_chunk=std::stoi(mode);
             if(prefill_chunk<128)throw std::invalid_argument("TQLLM_MLX_PREFILL_CHUNK must be >=128");
