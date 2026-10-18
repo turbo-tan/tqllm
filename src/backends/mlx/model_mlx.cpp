@@ -213,7 +213,8 @@ bool Model::spec_advance() {
             d.clear();
             for (int t = 0; t < k; ++t) d.push_back({double(pv[r * k + t]), pi[r * k + t]});
             std::sort(d.begin(), d.end(), [](auto& x, auto& y) {return x.first > y.first;});
-            double z = 0; for (auto& e : d) {e.first = std::exp(e.first - d[0].first); z += e.first;}
+            const double peak = d[0].first;  // read once: the loop overwrites d[0]
+            double z = 0; for (auto& e : d) {e.first = std::exp(e.first - peak); z += e.first;}
             double mass = 0; size_t keep = d.size();
             for (size_t t = 0; t < d.size(); ++t) {mass += d[t].first / z; if (mass >= i.top_p) {keep = t + 1; break;}}
             d.resize(keep); z = 0; for (auto& e : d) z += e.first; for (auto& e : d) e.first /= z;
