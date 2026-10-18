@@ -54,23 +54,28 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
         mx::eval(one, full);
         exact = std::memcmp(one.data<float>(), full.data<float>(), one.size() * sizeof(float)) == 0;
     }
+    const bool rows_exact = exact;
     // a KV buffer longer than the filled length (in-place cache) gives the same bits as the exact-length arrays
+    bool cap_exact = true, bf16_exact = true;
     {
         const int cap = length + 77;
         auto kb = mx::concatenate({k, random_array(rng, {1, kvheads, cap - length, dim}, 1.0f)}, 2);
         auto vb = mx::concatenate({v, random_array(rng, {1, kvheads, cap - length, dim}, 1.0f)}, 2);
         auto yb = mx::contiguous(attend(q, kb, vb, scale, length));
         mx::eval(yb);
-        exact = exact && std::memcmp(yb.data<float>(), y.data<float>(), y.size() * sizeof(float)) == 0;
+        cap_exact = std::memcmp(yb.data<float>(), y.data<float>(), y.size() * sizeof(float)) == 0;
+        exact = exact && cap_exact;
         // BF16 storage of BF16-rounded keys / values gives the same bits as their FP32 copies
         auto kr = mx::astype(mx::astype(kb, mx::bfloat16), mx::float32), vr = mx::astype(mx::astype(vb, mx::bfloat16), mx::float32);
         auto y32 = mx::contiguous(attend(q, kr, vr, scale, length));
         auto y16 = mx::contiguous(attend(q, mx::astype(kb, mx::bfloat16), mx::astype(vb, mx::bfloat16), scale, length));
         mx::eval(y32, y16);
-        exact = exact && std::memcmp(y32.data<float>(), y16.data<float>(), y16.size() * sizeof(float)) == 0;
+        bf16_exact = std::memcmp(y32.data<float>(), y16.data<float>(), y16.size() * sizeof(float)) == 0;
+        exact = exact && bf16_exact;
     }
-    std::printf("DECODE_ROWS v%d heads=%d kv=%d dim=%d length=%d n=%d rel=%.2e batch_invariant=%d %s\n", version, heads, kvheads, dim,
-                length, n, worst / peak, int(exact), ok && exact ? "PASS" : "FAIL");
+    std::printf("DECODE_ROWS v%d heads=%d kv=%d dim=%d length=%d n=%d rel=%.2e batch_invariant=%d (rows %d, cache view %d, bf16 %d) %s\n",
+                version, heads, kvheads, dim, length, n, worst / peak, int(exact), int(rows_exact), int(cap_exact), int(bf16_exact),
+                ok && exact ? "PASS" : "FAIL");
     return ok && exact;
 }
 
@@ -135,7 +140,7 @@ int main() {
     bool ok = true;
     for (int ver : {1, 3, 4}) {
         version = ver;
-        for (int length : {8, 63, 64, 65, 255, 256, 257, 300, 511, 512, 513, 1900, 4100})
+        for (int length : {8, 63, 64, 65, 255, 256, 257, 300, 511, 512, 513, 1900, 4095, 4096, 4097, 4100, 8200})
             for (int n : {1, 3, 8, 16})
                 if (length >= n && !(ver == 3 && n > 8)) ok &= safe_run(24, 4, 256, length, n, rng);
         ok &= safe_run(8, 2, 128, 200, 8, rng);
