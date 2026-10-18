@@ -192,7 +192,9 @@ const char* kDequant = R"METAL(
     const int g = int(ks * 16u) / GS;
     const device ushort* sp = S + ((size_t)blk * GPR + g) * 32;
     const device ushort* bp = Bz + ((size_t)blk * GPR + g) * 32;
-    device half* out = Y + (size_t)(blk * 32 + fn) * K + ks * 16u + fm;
+    // TRANS: [columns, rows] (element (r, c) at c * ROWS + r) for the plain x @ W product
+    const size_t rs = TRANS ? 1 : (size_t)K, cs = TRANS ? (size_t)ROWS : 1;
+    device half* out = Y + (size_t)(blk * 32 + fn) * rs + (ks * 16u + fm) * cs;
     for (short p = 0; p < 4; p++) {
         float sa, sb, ba = 0.0f, bb = 0.0f;
         if (TQ4) {
@@ -211,8 +213,8 @@ const char* kDequant = R"METAL(
                 if (BITS == 6) {qa |= ((h >> (2 * p + 16 * j)) & 3u) << 4; qb |= ((h >> (8 + 2 * p + 16 * j)) & 3u) << 4;}
                 va = half(fma(float(qa), sa, ba)); vb = half(fma(float(qb), sb, bb));
             }
-            out[(size_t)p * K + 8 * j] = va;
-            out[(size_t)(16 + p) * K + 8 * j] = vb;
+            out[(size_t)p * rs + 8 * j * cs] = va;
+            out[(size_t)(16 + p) * rs + 8 * j * cs] = vb;
         }
     }
 )METAL";
@@ -318,20 +320,33 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
                     std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
-mx::array nax_affine_dequant(const NaxAffine& w) {
+namespace {
+mx::array dequant(const NaxAffine& w, bool transposed) {
     if (w.q6) throw std::invalid_argument("nax affine dequant: Q6 mode not supported");
     static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_dequant", {"W", "H", "S", "Bz"}, {"Y"}, kDequant, kHeader);
     const int blocks = w.rows / 32, steps = w.columns / 16, gpr = w.columns / w.group;
-    return kernel({w.words, w.high, w.scales, w.biases}, {{w.rows, w.columns}}, {mx::float16}, {blocks * steps * 32, 1, 1},
-                  {256, 1, 1}, {{"K", w.columns}, {"STEPS", steps}, {"BLOCKS", blocks}, {"GPR", gpr}, {"BITS", w.bits},
-                  {"GS", w.group}, {"TQ4", w.tq4}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    return kernel({w.words, w.high, w.scales, w.biases}, {transposed ? mx::Shape{w.columns, w.rows} : mx::Shape{w.rows, w.columns}},
+                  {mx::float16}, {blocks * steps * 32, 1, 1}, {256, 1, 1},
+                  {{"K", w.columns}, {"ROWS", w.rows}, {"STEPS", steps}, {"BLOCKS", blocks}, {"GPR", gpr}, {"BITS", w.bits},
+                   {"GS", w.group}, {"TQ4", w.tq4}, {"TRANS", transposed}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+}  // namespace
+
+mx::array nax_affine_dequant(const NaxAffine& w, bool transposed) {return dequant(w, transposed);}
+
+mx::array nax_affine_prefill_product(const NaxAffine& w, const mx::array& x) {
+    // long-K matrices (FFN down, out projections): MLX's GEMM is faster on W stored [columns, rows] than on a transposed
+    // view (j719 m 2048: down 25.5 vs 21.2 TFLOPS, gdn out 25.9 vs 24.9; wide matrices unchanged). =0 keeps W.T
+    static const bool trans = !std::getenv("TQLLM_MLX_PREFILL_WT") || std::string(std::getenv("TQLLM_MLX_PREFILL_WT")) != "0";
+    if (trans && w.columns > w.rows) return mx::matmul(x, dequant(w, true));
+    return mx::matmul(x, mx::transpose(dequant(w, false)));
 }
 
 mx::array nax_affine_gemm(const NaxAffine& w, const mx::array& input, bool round_bf16) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine gemm: input must be [m, columns]");
     auto x = input.dtype() == mx::float16 ? input : mx::astype(input, mx::float16);
-    auto y = mx::matmul(x, mx::transpose(nax_affine_dequant(w)));
+    auto y = nax_affine_prefill_product(w, x);
     // FP16 product -> BF16 rounding -> FP32 as one fused elementwise pass
     static auto to_bf = mx::compile([](const std::vector<mx::array>& a) {
         return std::vector<mx::array>{mx::astype(mx::astype(mx::astype(a[0], mx::float32), mx::bfloat16), mx::float32)};

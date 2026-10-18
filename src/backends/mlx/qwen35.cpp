@@ -827,8 +827,8 @@ struct Qwen35::Impl {
             return bf_raw(mx::add(y_gpu,mx::astype(y_ane,mx::float32)));
         }
         const bool int8_gu=prefill_int8 && (prefill_int8_mask&2), int8_down=prefill_int8 && (prefill_int8_mask&4);
-        auto gv=int8_gu && g->tq4?nax_int8_gemm(*g,x16,false,prefill_int8==2):mx::matmul(x16,mx::transpose(nax_affine_dequant(*g)));
-        auto uv=int8_gu && u->tq4?nax_int8_gemm(*u,x16,false,prefill_int8==2):mx::matmul(x16,mx::transpose(nax_affine_dequant(*u)));
+        auto gv=int8_gu && g->tq4?nax_int8_gemm(*g,x16,false,prefill_int8==2):nax_affine_prefill_product(*g,x16);
+        auto uv=int8_gu && u->tq4?nax_int8_gemm(*u,x16,false,prefill_int8==2):nax_affine_prefill_product(*u,x16);
         static auto swiglu16=mx::compile([](const std::vector<mx::array>& a) {
             auto gate=bf_raw(mx::astype(a[0],mx::float32)),up=bf_raw(mx::astype(a[1],mx::float32));
             return std::vector<mx::array>{mx::astype(bf_raw(mx::multiply(bf_raw(mx::multiply(gate,mx::sigmoid(gate))),up)),mx::float16)};
@@ -836,7 +836,7 @@ struct Qwen35::Impl {
         auto h=swiglu16({gv,uv})[0];
         if(stage_profiling)stage("ffn_gate_up",{h});
         auto hin=d->tq4?tq4_rotate_half(h):h;
-        auto y=int8_down && d->tq4?nax_int8_gemm(*d,hin,false,prefill_int8==2):mx::astype(mx::matmul(hin,mx::transpose(nax_affine_dequant(*d))),mx::float32);
+        auto y=int8_down && d->tq4?nax_int8_gemm(*d,hin,false,prefill_int8==2):mx::astype(nax_affine_prefill_product(*d,hin),mx::float32);
         // TQLLM_MLX_ANE_NOISE=<rel>: add Gaussian noise of norm rel * |y| (Neural Engine slice error budget, debug only)
         static const float ane_noise=std::getenv("TQLLM_MLX_ANE_NOISE")?std::stof(std::getenv("TQLLM_MLX_ANE_NOISE")):0.0f;
         if(ane_noise>0) {

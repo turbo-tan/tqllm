@@ -78,6 +78,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_NAX_TQ4` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_PAIRED_SWIGLU_ROTATION` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_PREFILL_GEMM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_PREFILL_WT` | 1 | Apple MLX backend: long-K prefill matrices dequantize straight into [columns, rows] for x @ W (1, default); 0 keeps x @ W.T |  |
 | `TQLLM_MLX_PREFILL_INT8_MASK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_SPLIT_COMMIT_TIMING` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_STAGED_BKM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
