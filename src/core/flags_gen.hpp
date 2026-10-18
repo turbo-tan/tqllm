@@ -200,6 +200,7 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_DRAFT_HEAD_UNPAD", Kind::Debug, "unset (backend default)", "Experimental Apple MLX draft head unpad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_FUSED_ATTENTION_ROWS", Kind::Debug, "unset (backend default)", "Experimental Apple MLX fused attention rows override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_FUSE_EPILOGUE", Kind::Debug, "unset (backend default)", "Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
+    {"TQLLM_MLX_GDN_PREFILL_FAST", Kind::Debug, "-", "Apple MLX backend: prefill chunks (>= 64 rows, no prefix capture) through MLX's chunked gated delta kernel instead of our scan (opt-in until gated)", ""},
     {"TQLLM_MLX_GDN_SCAN", Kind::Debug, "unset (backend default)", "Experimental Apple MLX gdn scan override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_INT8_N", Kind::Debug, "unset (backend default)", "Experimental Apple MLX int8 n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},
     {"TQLLM_MLX_INT8_SIMDS", Kind::Debug, "unset (backend default)", "Experimental Apple MLX int8 simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment.", ""},

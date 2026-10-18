@@ -841,6 +841,10 @@ flags:
     kind: debug
     default: "unset (backend default)"
     doc: "Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
+  - name: TQLLM_MLX_GDN_PREFILL_FAST
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend: prefill chunks (>= 64 rows, no prefix capture) through MLX's chunked gated delta kernel instead of our scan (opt-in until gated)"
   - name: TQLLM_MLX_GDN_SCAN
     kind: debug
     default: "unset (backend default)"

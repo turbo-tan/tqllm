@@ -931,7 +931,11 @@ struct Qwen35::Impl {
             q=gdn_normalize(q,1.0f/std::sqrt(float(dk)),compiled_gdn);
             k=gdn_normalize(k,1,compiled_gdn);
         }
-        if(!native_head_order && !scan_gdn) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
+        // prefill chunks without prefix capture: MLX's chunked gated delta kernel (its value head h reads key head h / (vh/kh),
+        // ours h % kh -> keys gathered); opt-in TQLLM_MLX_GDN_PREFILL_FAST=1 until the KL / speed gate lands
+        static const bool fast_prefill=std::getenv("TQLLM_MLX_GDN_PREFILL_FAST") && std::string(std::getenv("TQLLM_MLX_GDN_PREFILL_FAST"))!="0";
+        const bool scan_here=scan_gdn && !(fast_prefill && !capture_prefix && m>=64);
+        if(!native_head_order && !scan_here) {q=mx::take(q,key_indices,2);k=mx::take(k,key_indices,2);}
         // probe-only ablations (TQLLM_MLX_ABLATE_BLOCKS): gab skips the alpha/beta projections, gz the gate projection,
         // gscan the scan (v passes through, state untouched), gpost the gated norm
         const bool skip_ab=ablate_blocks.find("gab")!=std::string::npos;
@@ -953,7 +957,7 @@ struct Qwen35::Impl {
             return mat(p+"ssm_out.weight",mx::reshape(out,{m,vh*dv}));
         }
         const bool skip_scan=ablate_blocks.find("gscan")!=std::string::npos && c.state.has_value() && m<=8;
-        auto scanned=scan_gdn && !skip_scan?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
+        auto scanned=scan_here && !skip_scan?std::optional<GdnScan>(gdn_scan(q,k,v,decay,beta,c.state,capture_prefix,capture_prefix&&compact_gdn)):std::nullopt;
         if(capture_prefix && scanned) {
             tape.states=scanned->snapshots;
             if(compact_gdn) {tape.keys=k;tape.decay=decay;tape.deltas=scanned->deltas;}
