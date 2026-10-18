@@ -47,5 +47,40 @@ int main() {
         std::printf("VERIFY16 %-8s %5dx%-5d ours affine %.3f ms (%.0f GB/s)  ours tq4 %.3f ms (%.0f GB/s)  mlx qmm %.3f ms (%.0f GB/s)\n",
                     name, rows, k, t_nax, bytes / t_nax * 1e-6, t_tq4, bytes / t_tq4 * 1e-6, t_qmm, bytes / t_qmm * 1e-6);
     }
+    // 1. streaming bandwidth: read 2 x 1 GiB, write 1 GiB
+    {
+        auto a1 = mx::astype(mx::random::normal({1 << 28}), mx::float32), a2 = mx::astype(mx::random::normal({1 << 28}), mx::float32);
+        mx::eval(a1, a2);
+        const double t = ms([&] {mx::eval(mx::add(a1, a2));});
+        std::printf("STREAM add 3 GiB moved: %.2f ms = %.0f GB/s\n", t, 3.0 * (1 << 30) / t * 1e-6);
+    }
+    // 2. the gate|up shape over 16 distinct weight copies (1.4 GB working set, no cache reuse), like 16 layers in a row
+    {
+        const int rows = 17408, k = 5120;
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::vector<uint16_t> sc(size_t(rows) * (k / 64)), bi(sc.size());
+        for (size_t i = 0; i < sc.size(); ++i) {sc[i] = bf(0.002f + float(rng() % 100) * 4e-5f); bi[i] = bf(-0.015f + float(rng() % 100) * 3e-4f);}
+        const auto payload = nax_affine_pack(codes, sc, bi, rows, k, 4, 64);
+        std::vector<NaxAffine> ws;
+        for (int c = 0; c < 16; ++c) {ws.push_back(nax_affine_load(payload, rows, k, 4, 64)); mx::eval(ws.back().words, ws.back().scales, ws.back().biases);}
+        auto x = mx::astype(mx::random::normal({16, k}), mx::float16);
+        mx::eval(x);
+        const double bytes = 16.0 * (double(rows) * k / 2 + double(rows) * (k / 64) * 4);
+        const double t = ms([&] {std::vector<mx::array> o; for (auto& w : ws) o.push_back(nax_affine_matmul(w, x, true)); mx::eval(o);});
+        std::printf("VERIFY16 distinct gate|up x16: %.2f ms = %.0f GB/s (no weight reuse)\n", t, bytes / t * 1e-6);
+        // 3. the same 16 matmuls as a dependent chain (each input is the previous output's first 5120 columns)
+        const double t2 = ms([&] {auto y = x; for (auto& w : ws) y = mx::astype(mx::slice(nax_affine_matmul(w, y, true), {0, 0}, {16, k}), mx::float16); mx::eval(y);});
+        std::printf("VERIFY16 dependent chain x16: %.2f ms = %.0f GB/s (+%.3f ms per dependent step)\n", t2, bytes / t2 * 1e-6, (t2 - t) / 16);
+    }
+    // 4. dependent tiny kernels: per-kernel boundary cost
+    {
+        auto y = mx::astype(mx::random::normal({16, 5120}), mx::float32);
+        mx::eval(y);
+        for (int n : {500, 2000}) {
+            const double t = ms([&] {auto z = y; for (int i = 0; i < n; ++i) z = mx::add(mx::multiply(z, mx::array(0.999f)), mx::array(0.001f)); mx::eval(z);});
+            std::printf("CHAIN %d dependent tiny ops (2 kernels each): %.2f ms = %.1f us per kernel\n", n, t, t * 1000 / (2.0 * n));
+        }
+    }
     std::puts("VERIFY16_DONE");
 }
