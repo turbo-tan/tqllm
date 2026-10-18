@@ -9,9 +9,6 @@ mlx::core::array dflash_top16_sharded(const mlx::core::array& logits);
 mlx::core::array dflash_select(const mlx::core::array& mapped,const mlx::core::array& unary,
     const mlx::core::array& gate,const mlx::core::array& successors,
     const mlx::core::array& predecessors,uint32_t anchor,int count);
-// verify rows per step at this position: the 16-row verify's attention grows with context, so long contexts drop to
-// TQLLM_MLX_VERIFY_NARROW_WIDTH (7) from TQLLM_MLX_VERIFY_NARROW_AT (default 0 = full width; j698: narrowing lost 1-10 %)
-int verify_width(int width,int position);
 class DFlash2 {
 public:
     DFlash2(const std::string& path,Qwen35& target);

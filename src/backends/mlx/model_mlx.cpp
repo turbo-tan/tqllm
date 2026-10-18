@@ -2,6 +2,7 @@
 // spec_tokens / spec_finish) over Qwen35 + the DFlash2 drafter, with the settings of the measured exact configuration as
 // defaults (an environment variable that is already set wins). Greedy is exact (output == the target's own greedy
 // decode); a request with temperature > 0 uses speculative sampling with the same drafter (exact distribution).
+#include "release_defaults.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "dflash.hpp"
@@ -21,7 +22,6 @@
 
 namespace mx = mlx::core;
 using tqllm::mlx_backend::DFlash2;
-using tqllm::mlx_backend::verify_width;
 using tqllm::mlx_backend::filtered_distribution;
 using tqllm::mlx_backend::speculative_pick;
 using tqllm::mlx_backend::draw_excluding;
@@ -33,7 +33,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double us_since(Clock::time_point t) {return std::chrono::duration<double, std::micro>(Clock::now() - t).count();}
 mx::array rows(const mx::array& x, int a, int b) {return mx::slice(x, {a, 0}, {b, x.shape(1)});}
-void default_env(const char* name, const char* value) {setenv(name, value, 0);}
 bool has_tensor(const std::string& path, const std::string& name) {
     return gguf_open(path).tensors.count(name) > 0;
 }
@@ -64,14 +63,7 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     : impl_(std::make_unique<Impl>()) {
     if (slots != 1) throw std::invalid_argument("the MLX backend serves one request at a time (--np 1)");
     if (options.draft_model.empty()) throw std::invalid_argument("the MLX backend needs the DFlash2 drafter (-md DRAFTER.gguf)");
-    // the measured exact configuration (j690-j694): scan GDN with the compact prefix tape, batch-invariant decode-rows
-    // attention, serial dense rows, device-side draft selection, compiled elementwise epilogues, 16-row drafts
-    default_env("MLX_ENABLE_TF32", "0");
-    for (const char* name : {"TQLLM_MLX_GDN_SCAN", "TQLLM_MLX_SERIAL_VERIFY_ATTENTION", "TQLLM_MLX_SERIAL_VERIFY_DENSE",
-                             "TQLLM_MLX_COMPACT_GDN_TAPE", "TQLLM_MLX_DEVICE_SELECTOR", "TQLLM_MLX_BATCH_DECODE_DENSE",
-                             "TQLLM_MLX_ATTN_DECODE_ROWS", "TQLLM_MLX_DRAFT_HEAD_UNPAD", "TQLLM_MLX_FUSE_EW"})
-        default_env(name, "1");
-    default_env("TQLLM_MLX_DFLASH_BLOCK", "16");
+    mlx_backend::apply_release_defaults();
     auto& i = *impl_;
     if (const char* c = std::getenv("TQLLM_MLX_PREFILL_CHUNK")) i.chunk = std::max(128, std::atoi(c));
     i.width = std::atoi(std::getenv("TQLLM_MLX_DFLASH_BLOCK")) >= 16 ? 15 : 7;
@@ -130,23 +122,12 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
     if (!i.head4) i.engine->draft_shortlist(logits, i.shortlist);
     i.pending = mx::argmax(logits).item<uint32_t>();
     if (i.sampling) {
-        // sample the first token from the last prompt position's distribution
-        auto scaled = mx::multiply(mx::astype(mx::reshape(logits, {-1}), mx::float32), mx::array(1.0f / i.temperature));
-        mx::eval(scaled);
-        const float* p = scaled.data<float>(); const size_t v = scaled.size();
-        std::vector<std::pair<float, uint32_t>> top;
+        // sample the first token from the last prompt position's distribution (same filtering as spec_advance)
         const int k = i.top_k > 0 ? i.top_k : 64;
-        for (size_t t = 0; t < v; ++t) {
-            if (int(top.size()) < k) {top.push_back({p[t], uint32_t(t)}); std::push_heap(top.begin(), top.end(), std::greater<>());}
-            else if (p[t] > top.front().first) {std::pop_heap(top.begin(), top.end(), std::greater<>()); top.back() = {p[t], uint32_t(t)}; std::push_heap(top.begin(), top.end(), std::greater<>());}
-        }
-        std::sort(top.rbegin(), top.rend());
-        double z = 0; std::vector<double> w(top.size());
-        for (size_t t = 0; t < top.size(); ++t) {w[t] = std::exp(double(top[t].first - top[0].first)); z += w[t];}
-        double mass = 0; size_t keep = top.size();
-        for (size_t t = 0; t < top.size(); ++t) {mass += w[t] / z; if (mass >= i.top_p) {keep = t + 1; break;}}
-        std::discrete_distribution<size_t> pick(w.begin(), w.begin() + long(keep));
-        i.pending = top[pick(i.rng)].second;
+        auto scaled = mx::multiply(mx::astype(mx::reshape(logits, {1, -1}), mx::float32), mx::array(1.0f / i.temperature));
+        auto [idx, val] = row_topk(scaled, k);
+        mx::eval(idx, val);
+        i.pending = draw_excluding(filtered_distribution(val.data<float>(), idx.data<uint32_t>(), k, i.top_p), UINT32_MAX, i.rng);
     }
     i.output.push_back(i.pending);
     i.prefill_us = us_since(t0);
@@ -158,30 +139,7 @@ bool Model::spec_advance() {
     auto& i = *impl_;
     if (!i.active || i.done) return false;
     const uint32_t limit = i.count;
-    static const bool sample_ar = std::getenv("TQLLM_MLX_SAMPLE_AR") != nullptr;  // debug: token-by-token sampling
-    if (i.sampling && sample_ar) {
-        auto logits = i.engine->forward({&i.pending, 1});
-        auto scaled = mx::multiply(mx::astype(mx::reshape(logits, {-1}), mx::float32), mx::array(1.0f / i.temperature));
-        mx::eval(scaled);
-        const float* p = scaled.data<float>(); const size_t v = scaled.size();
-        std::vector<std::pair<float, uint32_t>> top;
-        const int k = i.top_k > 0 ? i.top_k : 64;
-        for (size_t t = 0; t < v; ++t) {
-            if (int(top.size()) < k) {top.push_back({p[t], uint32_t(t)}); std::push_heap(top.begin(), top.end(), std::greater<>());}
-            else if (p[t] > top.front().first) {std::pop_heap(top.begin(), top.end(), std::greater<>()); top.back() = {p[t], uint32_t(t)}; std::push_heap(top.begin(), top.end(), std::greater<>());}
-        }
-        std::sort(top.rbegin(), top.rend());
-        double z = 0; std::vector<double> w(top.size());
-        for (size_t t = 0; t < top.size(); ++t) {w[t] = std::exp(double(top[t].first - top[0].first)); z += w[t];}
-        double mass = 0; size_t keep = top.size();
-        for (size_t t = 0; t < top.size(); ++t) {mass += w[t] / z; if (mass >= i.top_p) {keep = t + 1; break;}}
-        std::discrete_distribution<size_t> pick(w.begin(), w.begin() + long(keep));
-        i.pending = top[pick(i.rng)].second;
-        i.output.push_back(i.pending); ++i.steps;
-        i.done = i.output.size() >= limit || i.pending == i.eos;
-        return !i.done;
-    }
-    const int pos = i.engine->position(), want = std::min(verify_width(i.width, pos), int(limit - i.output.size()));
+    const int pos = i.engine->position(), want = std::min(i.width, int(limit - i.output.size()));
     if (want < 1) {i.done = true; return false;}
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
     auto drafted = i.drafter->draft_device(i.pending, pos, want);
@@ -221,18 +179,6 @@ bool Model::spec_advance() {
             if (!taken) break;
         }
         if (acc == want) {row_dist(want, d); sampled_ids[size_t(want)] = draw_excluding(d, UINT32_MAX, i.rng);}
-        static const bool debug = std::getenv("TQLLM_MLX_SAMPLE_DEBUG") != nullptr;
-        if (debug && i.steps < 3) {
-            auto arg = mx::argmax(verified, -1); mx::eval(arg);
-            const auto* am = arg.data<uint32_t>();
-            for (int r = 0; r <= std::min(want, 3); ++r) {
-                row_dist(r, d);
-                std::fprintf(stderr, "SAMPLE_DEBUG step %llu row %d argmax %u proposed %u top:", (unsigned long long)i.steps, r, am[r], r < want ? proposed[r] : 0u);
-                for (size_t t = 0; t < std::min<size_t>(d.size(), 3); ++t) std::fprintf(stderr, " %u:%.3f", d[t].second, d[t].first);
-                std::fprintf(stderr, "\n");
-            }
-            std::fprintf(stderr, "SAMPLE_DEBUG verified shape %d x %d, idx %d x %d, acc %d\n", int(verified.shape(0)), verified.ndim() > 1 ? int(verified.shape(1)) : -1, int(idx.shape(0)), int(idx.shape(1)), acc);
-        }
         ids = sampled_ids.data();
     }
     auto features = i.engine->feature_states();

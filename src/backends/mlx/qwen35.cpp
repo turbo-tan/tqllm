@@ -1,3 +1,4 @@
+#include "release_defaults.hpp"
 #include "qwen35.hpp"
 #include <cstdio>
 #include <sstream>
@@ -1414,7 +1415,7 @@ bool apply_tq_mlx_defaults(const std::string& path) {
     return true;
 }
 }
-Qwen35::Qwen35(const std::string& path,int context):impl_((apply_tq_mlx_defaults(path),std::make_unique<Impl>(path,context))) {}
+Qwen35::Qwen35(const std::string& path,int context):impl_((apply_release_defaults(),apply_tq_mlx_defaults(path),std::make_unique<Impl>(path,context))) {}
 Qwen35::~Qwen35()=default;
 void Qwen35::gdn_mode(GdnMode mode) {
     if(impl_->pos!=0)throw std::invalid_argument("cannot change GDN layout during a session");

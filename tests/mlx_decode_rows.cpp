@@ -12,7 +12,6 @@ using namespace tqllm::mlx_backend;
 namespace {
 int version = 1;
 mx::array attend(const mx::array& q, const mx::array& k, const mx::array& v, float scale, int valid = -1) {
-    if (version == 5) return decode_rows_attention_v5(q, k, v, scale, valid);
     if (version == 4) return decode_rows_attention_v4(q, mx::astype(k, mx::bfloat16), mx::astype(v, mx::bfloat16), scale, valid);
     return version == 3 ? decode_rows_attention_v3(q, k, v, scale, valid) : version == 2 ? decode_rows_attention_v2(q, k, v, scale, valid)
                         : decode_rows_attention_v1(q, k, v, scale, valid);
@@ -41,7 +40,7 @@ bool run(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) 
         worst = std::max(worst, double(std::fabs(a[i] - b[i])));
         peak = std::max(peak, double(std::fabs(b[i])));
     }
-    bool ok = worst / peak < (version == 4 ? 2e-2 : version == 5 ? 5e-3 : 2e-5);  // v4: BF16 q / k / out, v5: half q
+    bool ok = worst / peak < (version == 4 ? 2e-2 : 2e-5);  // v4: BF16 q / k / out
     // batch invariance: row t of the n-row call equals the 1-row call over its visible keys, bit for bit
     bool exact = true;
     for (int t = 0; t < n && exact; ++t) {
@@ -109,13 +108,12 @@ void bench(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng
         }
         return mx::astype(mx::concatenate(out, 2), mx::float32);
     };
-    const char* names[] = {"v1", "v3", "sdpa_all", "sdpa_rows", "v4", "v5"};
-    for (int ver = 0; ver < 6; ++ver) {
+    const char* names[] = {"v1", "v3", "sdpa_all", "sdpa_rows", "v4"};
+    for (int ver = 0; ver < 5; ++ver) {
         auto call = [&](int c) {
             return ver == 0 ? decode_rows_attention_v1(qs[c], ks[c], vs[c], scale, length)
                  : ver == 1 ? decode_rows_attention_v3(qs[c], ks[c], vs[c], scale, length)
-                 : ver == 2 ? sdpa_all(c) : ver == 3 ? sdpa_rows(c) : ver == 4 ? decode_rows_attention_v4(qs[c], ks[c], vs[c], scale, length)
-                 : decode_rows_attention_v5(qs[c], ks[c], vs[c], scale, length);
+                 : ver == 2 ? sdpa_all(c) : ver == 3 ? sdpa_rows(c) : decode_rows_attention_v4(qs[c], ks[c], vs[c], scale, length);
         };
         if (ver == 1 && n > 8) continue;
         try {
@@ -135,7 +133,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::mt19937 rng(7);
     bool ok = true;
-    for (int ver : {1, 3, 4, 5}) {
+    for (int ver : {1, 3, 4}) {
         version = ver;
         for (int length : {8, 63, 64, 65, 255, 256, 257, 300, 511, 512, 513, 1900, 4100})
             for (int n : {1, 3, 8, 16})

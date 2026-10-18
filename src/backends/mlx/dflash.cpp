@@ -277,11 +277,6 @@ struct DFlash2::Impl {
 DFlash2::DFlash2(const std::string& path,Qwen35& target):impl_(std::make_unique<Impl>(path,target)) {}
 DFlash2::~DFlash2()=default;
 const std::vector<std::vector<uint32_t>>& DFlash2::candidates() const {return impl_->candidates;}
-int verify_width(int width,int position) {
-    static const int at=std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")?std::atoi(std::getenv("TQLLM_MLX_VERIFY_NARROW_AT")):0;
-    static const int narrow=std::getenv("TQLLM_MLX_VERIFY_NARROW_WIDTH")?std::atoi(std::getenv("TQLLM_MLX_VERIFY_NARROW_WIDTH")):7;
-    return at>0 && position>=at ? std::min(width,std::max(1,narrow)) : width;
-}
 const std::vector<int>& DFlash2::feature_layers() const {return impl_->features;}
 void DFlash2::reset() {impl_->end=0;impl_->rotation.reset();impl_->rotation_half.reset();for(auto& c:impl_->caches)c=Impl::Kv{};}
 void DFlash2::inject(const mx::array& features,int position) {
