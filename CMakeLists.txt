@@ -406,6 +406,10 @@ if(BUILD_TESTING)
   add_executable(test-api-adapters tests/api_adapters.cpp)  # /v1/responses and /v1/messages on the chat path (no CUDA)
   target_include_directories(test-api-adapters PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
   add_test(NAME api_adapters COMMAND test-api-adapters)
+  add_executable(test-stream-incremental tests/stream_incremental.cpp)  # streaming deltas: incremental == whole-prefix reference, O(n)
+  target_include_directories(test-stream-incremental PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
+  target_link_libraries(test-stream-incremental PRIVATE tqllm)
+  add_test(NAME stream_incremental COMMAND test-stream-incremental)
   add_executable(test-jinja tests/jinja_parity.cpp)
   target_include_directories(test-jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
                              ${CUDAToolkit_INCLUDE_DIRS})  # CUDA builds: session.hpp -> vision.hpp -> cuda_runtime.h
