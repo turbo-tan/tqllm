@@ -2,6 +2,7 @@
 // restore. A fake memory with byte budgets stands in for the GPU and pinned host memory.
 #include "kv_store.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -275,8 +276,8 @@ static void test_host_tail() {
     g.device_rows = dev_rows;
     {
         KvPool pool(mem, g, 2, 0);  // two slots
-        const size_t row = 448, page = size_t(ctx) * row, dev = (dev_rows * row + 4095) / 4096 * 4096;
-        const size_t stride = (page + 4095) / 4096 * 4096;
+        const size_t row = 448, gr = mem.gran, page = size_t(ctx) * row, dev = (dev_rows * row + gr - 1) / gr * gr;
+        const size_t stride = (page + gr - 1) / gr * gr;
         CHECK(pool.bytes(KvTier::device) == size_t(2) * 32 * dev, "device bytes: each page's head, rounded to the granule");
         CHECK(pool.bytes(KvTier::host) == size_t(2) * 32 * (stride - dev), "host bytes: each page's tail");
         CHECK(mem.dev_live == pool.bytes(KvTier::device) && mem.host_live == pool.bytes(KvTier::host),
@@ -382,9 +383,10 @@ static void test_staged() {
     CHECK(mem.phys_live == 0 && mem.ranges.empty() && mem.dev_live == 0 && mem.host_live == 0,
           "a staged pool releases every mapping, physical chunk and host copy");
     {
-        KvGeometry tiny{layers, 448, 448, ctx, 8, true};  // window of 8 rows: a 48-row block cannot fit
+        KvGeometry tiny{layers, 448, 448, ctx, 8, true};  // window of 8 rows: a block spanning several granules cannot fit
         KvPool p2(mem, tiny, 1, 0);
-        CHECK(!p2.stage_ensure(0, 48) || !p2.stage_ensure(40, 88), "a block bigger than the window is refused, not corrupted");
+        const int64_t n = std::max<int64_t>(48, int64_t(4 * mem.gran / 448) + 8);  // 48 rows at a 4 KiB granule
+        CHECK(!p2.stage_ensure(0, n) || !p2.stage_ensure(n - 8, 2 * n - 8), "a block bigger than the window is refused, not corrupted");
     }
 }
 
