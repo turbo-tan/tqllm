@@ -279,10 +279,6 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_PREFILL_QMM
-    kind: debug
-    default: "1"
-    doc: "Apple MLX backend: prefill 4-bit affine matrices through mx::quantized_matmul on weights repacked to MLX layout (1, default) or dequant + matmul (0)"
   - name: TQLLM_MLX_PREFILL_INT8
     kind: user
     default: "-"

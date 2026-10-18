@@ -81,7 +81,6 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_PAIRED_SWIGLU_ROTATION", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_PREFILL_CHUNK", Kind::User, "-", "N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best)", ""},
     {"TQLLM_MLX_PREFILL_GEMM", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
-    {"TQLLM_MLX_PREFILL_QMM", Kind::Debug, "1", "Apple MLX backend: prefill 4-bit affine matrices through mx::quantized_matmul on weights repacked to MLX layout (1, default) or dequant + matmul (0)", ""},
     {"TQLLM_MLX_PREFILL_INT8", Kind::User, "-", "1: int8 matrix-unit prefill for FFN gate/up (opt-in, quality changes; 2 = exact slow mode)", ""},
     {"TQLLM_MLX_PREFILL_INT8_MASK", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_SPLIT_COMMIT_TIMING", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
