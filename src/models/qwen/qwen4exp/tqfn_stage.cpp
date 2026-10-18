@@ -2872,7 +2872,6 @@ struct DecodeModel {
     // output (the first draft), and the attention keys / values of a row depend on that row's input alone, so the other
     // rows need no attention, experts or head. Rows go in 2048-row pieces; the caller runs mtp_batch on the last position.
     // Changes drafts at most (the GEMMs may round differently), never the output.
-    bool mtp_kv_ok() const { return !cp.has_tensor("blk." + std::to_string(c.layers) + ".indexer.k_proj.weight"); }
     void mtp_kv_prefill(const std::vector<int> & tokens, const float * h_rows, const float * emb) {
         const int n = int(tokens.size()), L = c.layers;
         const std::string nx = "blk." + std::to_string(L) + ".nextn.", prefix = "blk." + std::to_string(L) + ".";
@@ -2881,6 +2880,7 @@ struct DecodeModel {
         if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
         require(a.len + n <= g_kv_capacity, "MTP KV exceeds the attention KV capacity");
         const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
+        const bool qsa_keys = tqfn_default_on("TQFN_QSA") && cp.has_tensor(prefix + "indexer.k_proj.weight");
         for (int d = 0; d < n; d += 2048) {
             const int m = std::min(2048, n - d); ArenaMark scratch;
             Device<float> de(size_t(m) * h), en(size_t(m) * h), hn(size_t(m) * width), cat(size_t(m) * c.hc * 2 * h), res(size_t(m) * width);
@@ -2914,6 +2914,14 @@ struct DecodeModel {
             tqllm_cuda::f32_to_bf16(v.p, vb.p, v.count, nullptr);
             ck(cudaMemcpyAsync(a.k->p + size_t(a.len) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
             ck(cudaMemcpyAsync(a.v->p + size_t(a.len) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
+            if (qsa_keys) {  // the indexer keys as attention_core appends them
+                if (!a.qsa) { PersistentAlloc keep; a.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(g_kv_capacity, 4, 2048, 4, 128,
+                                  std::min(cp.rotary, 128), cp.theta, float(cp.epsilon)); }
+                if (a.qsa->size() > a.len) a.qsa->truncate(a.len);
+                Device<float> ik(size_t(m) * 128);
+                cp.project(prefix + "indexer.k_proj.weight", mixed.p, ik.p, c.hidden, 128, m);
+                a.qsa->append(ik.p, m, cp.dense_device(prefix + "indexer.k_norm.weight"), nullptr);
+            }
             a.len += m;
         }
     }
@@ -4157,7 +4165,6 @@ public:
                 const auto & pemb = S().model_->prompt_emb; const size_t hd = size_t(c.hidden);
                 std::vector<float> pe;
                 // keys / values for every position but the last, then the full MTP layer for the last one (mtp_kv_prefill)
-                const bool kv_only = S().model_->mtp_kv_ok();
                 for (int q = 0; q < P; q += mb) {
                     const int qe = std::min(P, q + mb);
                     ck(cudaMemcpyAsync(rows->p, f_.res_host + size_t(q) * W, size_t(qe - q) * W * sizeof(float), cudaMemcpyHostToDevice, nullptr));
@@ -4173,7 +4180,6 @@ public:
                         emb = pe.data();
                     }
                     if (g_arena) g_arena->used = 0;
-                    if (!kv_only) { S().d1_ = S().model_->mtp_prefill(toks, rows->p, emb); continue; }
                     const int keep = qe == P ? qe - q - 1 : qe - q;  // the last position runs the whole layer below
                     if (keep > 0) S().model_->mtp_kv_prefill(std::vector<int>(toks.begin(), toks.begin() + keep), rows->p, emb);
                     if (qe == P) { if (g_arena) g_arena->used = 0; S().d1_ = S().model_->mtp_batch({toks.back()}, rows->p + size_t(qe - q - 1) * W); }
