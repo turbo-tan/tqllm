@@ -51,7 +51,7 @@ int main(int argc,char** argv) {
         }
         for(int bad:{0,1,2}) {
             bool caught=false;
-            try {dense_row_views(mx::zeros({bad==0?9:1,128},bad==1?mx::float16:mx::float32));
+            try {dense_row_views(mx::zeros({bad==0?17:1,128},bad==1?mx::float16:mx::float32));
                 if(bad==2)dense_decode_rows(mx::zeros({48,256}),mx::zeros({1,1,128}));}
             catch(const std::invalid_argument&) {caught=true;}
             if(!caught)throw std::runtime_error("invalid singleton dense batch accepted");
