@@ -60,7 +60,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     g_profile_decode_req = prof_req > 0 && req_no == prof_req && prof_decode;
     if (profiling) ck(cudaProfilerStart());
     S().t_begin_ = std::chrono::steady_clock::now(); S().prefill_us_ = S().decode_us_ = 0;
-    S().out_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0;
+    S().out_.clear(); S().out_view_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0;
     // Trunk prefill first, then the MTP catch-up, so their working sets do not add up: a prompt longer than one chunk
     // keeps its residuals in pinned host memory, drops the MTP bank before the trunk and the layer-major buffers
     // after it. The catch-up runs the same batches in the same order as when it followed each chunk.
