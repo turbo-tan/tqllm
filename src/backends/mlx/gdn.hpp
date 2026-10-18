@@ -41,6 +41,9 @@ struct GdnScan {
     std::optional<mlx::core::array> snapshots;
     std::optional<mlx::core::array> deltas;
 };
+// prefill scan (no snapshots) with 8 lanes per state row; gdn_scan routes m >= 64 here (TQLLM_MLX_GDN_SCAN8=0 off)
+GdnScan gdn_scan8(const mlx::core::array& q,const mlx::core::array& k,const mlx::core::array& v,
+    const mlx::core::array& decay,const mlx::core::array& beta,const mlx::core::array& initial);
 GdnScan gdn_scan(const mlx::core::array& q,const mlx::core::array& k,
     const mlx::core::array& v,const mlx::core::array& decay,const mlx::core::array& beta,
     const std::optional<mlx::core::array>& state,bool snapshots=false,bool compact=false);

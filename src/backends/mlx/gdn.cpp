@@ -161,6 +161,43 @@ mx::array gdn_decay(const mx::array& alpha,const mx::array& bias,const mx::array
     static auto fused=mx::compile(decay);
     return compiled?fused({alpha,bias,rate})[0]:decay({alpha,bias,rate})[0];
 }
+// prefill chunks (no snapshots): 8 lanes per state row holding 16 columns each, so each token's two row reductions
+// are 3 shuffle steps instead of 5 and a simdgroup carries 4 rows (fewer instructions per row and token; the scan is
+// issue-bound). Same recurrence, different FP32 summation tree than the 32-lane scan below, which decode, verify and
+// the compact tape keep. TQLLM_MLX_GDN_SCAN8=0 off
+GdnScan gdn_scan8(const mx::array& q,const mx::array& k,const mx::array& v,const mx::array& decay,const mx::array& beta,
+    const mx::array& initial) {
+    const int m=q.shape(1),kh=q.shape(2),vh=v.shape(2);
+    static auto kernel8=mx::fast::metal_kernel("tqllm_gdn_scan8",{"q","k","v","decay","beta","initial"},{"out","states"},R"METAL(
+uint tid=thread_position_in_grid.x,head=thread_position_in_grid.z;
+uint row=tid>>3,sub=tid&7u;
+uint base=(head*128u+row)*128u+sub*16u;
+float s[16];
+for(uint j=0;j<4;++j) {float4 a=*((const device float4*)(initial+base+4u*j));s[4*j]=a.x;s[4*j+1]=a.y;s[4*j+2]=a.z;s[4*j+3]=a.w;}
+for(uint t=0;t<M;++t) {
+ uint at=(t*KH+head%KH)*128u+sub*16u;
+ float key[16],query[16];
+ for(uint j=0;j<4;++j) {
+  float4 a=*((const device float4*)(k+at+4u*j)),b=*((const device float4*)(q+at+4u*j));
+  key[4*j]=a.x;key[4*j+1]=a.y;key[4*j+2]=a.z;key[4*j+3]=a.w;query[4*j]=b.x;query[4*j+1]=b.y;query[4*j+2]=b.z;query[4*j+3]=b.w;
+ }
+ float d=decay[t*VH+head];
+ float memory=0.0f;
+ for(uint j=0;j<16;++j) {s[j]*=d;memory+=s[j]*key[j];}
+ memory+=simd_shuffle_xor(memory,1u);memory+=simd_shuffle_xor(memory,2u);memory+=simd_shuffle_xor(memory,4u);
+ float delta=(v[(t*VH+head)*128u+row]-memory)*beta[t*VH+head];
+ float value=0.0f;
+ for(uint j=0;j<16;++j) {s[j]=s[j]+key[j]*delta;value+=s[j]*query[j];}
+ value+=simd_shuffle_xor(value,1u);value+=simd_shuffle_xor(value,2u);value+=simd_shuffle_xor(value,4u);
+ if(sub==0)out[(t*VH+head)*128u+row]=value;
+}
+for(uint j=0;j<4;++j)*((device float4*)(states+base+4u*j))=float4(s[4*j],s[4*j+1],s[4*j+2],s[4*j+3]);
+)METAL");
+    auto r=kernel8({mx::contiguous(q),mx::contiguous(k),mx::contiguous(v),mx::contiguous(decay),mx::contiguous(beta),
+            mx::contiguous(initial)},{{1,m,vh,128},{1,vh,128,128}},{mx::float32,mx::float32},{1024,1,vh},{256,1,1},
+            {{"M",m},{"KH",kh},{"VH",vh}},std::nullopt,false,mx::Device(mx::Device::gpu));
+    return {r[0],r[1],std::nullopt,std::nullopt};
+}
 GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     const mx::array& decay,const mx::array& beta,const std::optional<mx::array>& state,bool snapshots,bool compact) {
     if(q.ndim()!=4 || q.shape(0)!=1 || q.shape(3)!=128 || q.dtype()!=mx::float32 || k.shape()!=q.shape() ||
@@ -178,6 +215,8 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     static const bool skip_scan=std::getenv("TQLLM_MLX_ABLATE_BLOCKS") && std::string_view(std::getenv("TQLLM_MLX_ABLATE_BLOCKS")).find("gscan")!=std::string_view::npos;
     if(skip_scan && compact)
         return {mx::zeros({1,m,vh,128}),initial,std::nullopt,std::optional<mx::array>(mx::zeros({m,vh,128}))};
+    static const bool scan8=!std::getenv("TQLLM_MLX_GDN_SCAN8") || std::string_view(std::getenv("TQLLM_MLX_GDN_SCAN8"))!="0";
+    if(scan8 && !snapshots && !compact && m>=64)return gdn_scan8(q,k,v,decay,beta,initial);
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states","deltas"},R"METAL(
 uint lane=thread_position_in_threadgroup.x;
 uint row=thread_position_in_grid.y,head=thread_position_in_grid.z;
