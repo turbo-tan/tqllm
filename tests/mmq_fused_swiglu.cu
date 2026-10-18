@@ -75,6 +75,7 @@ int main() {
     bool pass = run_case(14, 256, 64, 3, 200);          // IQ4_NL, small
     pass = run_case(4, 2560, 640, 48, 2000) && pass;    // IQ3_S at the Flash-Next gate/up shape (k = hidden, ff rows, a staging group)
     pass = run_case(4, 640, 2560, 48, 2000) && pass;    // IQ3_S down shape
+    pass = run_case(14, 640, 2560, 48, 2000) && pass;   // IQ4_NL down shape (Flash-Next IQ4_XS file: ffn_down_exps IQ4_NL [640])
     std::printf(pass ? "MMQ_FUSED_SWIGLU PASS\n" : "MMQ_FUSED_SWIGLU FAIL\n");
     return pass ? 0 : 1;
 }

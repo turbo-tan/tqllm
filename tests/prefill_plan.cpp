@@ -119,6 +119,14 @@ int main() {
     auto startup_arena_mb = [](int chunk) { return std::min(chunk, 8192) / 5 + 64; };
     expect(startup_arena_mb(32768) == startup_arena_mb(8192) && startup_arena_mb(8192) == 1702, "start-up arena capped at the 8K-chunk size");
 
+    // 7. hyper-connection norm: chunks of more than 64 tokens skip the fp32 normalized rows only when the mixer projections
+    //    that read them take the BF16 image (BF16 weights). The Flash-Next IQ4_XS file has IQ4_XS hc_attn_down / hc_ffn_down
+    //    (the MTP file Q8_0): their native kernels read the fp32 rows, which were never written (NaN routing at 512 tokens).
+    expect(hc_row_scales_only(512, true, true), "BF16 mixer, long chunk: row scales only");
+    expect(!hc_row_scales_only(64, true, true), "short chunk keeps the fp32 rows");
+    expect(!hc_row_scales_only(512, false, true), "IQ4_XS hc down needs the fp32 rows");
+    expect(!hc_row_scales_only(512, true, false), "non-BF16 inject needs the fp32 rows");
+
     std::printf(fails ? "PREFILL_PLAN FAIL\n" : "PREFILL_PLAN PASS\n");
     return fails ? 1 : 0;
 }

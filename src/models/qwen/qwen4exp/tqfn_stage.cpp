@@ -413,6 +413,7 @@ public:
         }
         return reinterpret_cast<const __nv_bfloat16 *>(r->mem[0]->p);
     }
+    bool is_bf16(const std::string & name) const { return file(name).file().tensors.at(name).type == GGML_BF16; }
     const float * dense_device(const std::string & name) const {
         auto & d = dense_dev_[name];
         if (!d) { PersistentAlloc keep; const auto v = dense(name); d = std::make_unique<Device<float>>(v.size()); d->put(v); }
@@ -1918,9 +1919,10 @@ struct DecodeModel {
             tqllm_cuda::ple_apply(residual->p, gated.p, conv.p, out->p, int(out->count), nullptr); residual = std::move(out);
         }
         // the norms write their BF16 image for the mixer's BF16 projections (no f32 -> bf16 passes); prefill sub-chunks of more
-        // than 64 tokens keep no fp32 normalized rows at all (row scales only, the mix recomputes them; exact)
+        // than 64 tokens with a BF16 mixer keep no fp32 normalized rows at all (row scales only, the mix recomputes them; exact)
         auto normb = std::make_unique<Device<__nv_bfloat16>>(size_t(width) * n);
-        const bool hc_rs = n > 64;
+        const bool hc_rs = tqllm::hc_row_scales_only(n, cp.is_bf16(prefix + "hc_attn_down.weight") && cp.is_bf16(prefix + "hc_ffn_down.weight"),
+                                                     cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight"));
         std::unique_ptr<Device<float>> rs; if (hc_rs) rs = std::make_unique<Device<float>>(size_t(c.hc) * n);
         const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
         if (hc_rs) tqllm_cuda::hc_norm_rs_bf16(residual->p, attn_gamma, rs->p, normb->p, h, c.hc, n, float(cp.epsilon), nullptr);
@@ -2539,6 +2541,10 @@ struct DecodeModel {
         ck(cudaMemcpyAsync(st.ids_host, pf_routed->p, size_t(A) * 4, cudaMemcpyDeviceToHost, nullptr)); ck(cudaStreamSynchronize(nullptr));
         ck(cudaGetLastError());  // a launch that failed (full device) leaves stale routing behind: stop before it is used
         const int * ids = st.ids_host;
+        { int bad = 0, first = -1; for (int a = 0; a < A; ++a) if (ids[a] < 0 || ids[a] >= E) { if (!bad) first = a; ++bad; }
+          require(!bad, "layer-major prefill: layer " + std::to_string(layer) + " routed " + std::to_string(bad) + " of " + std::to_string(A) +
+                        " assignments to an expert outside 0.." + std::to_string(E - 1) + " (first at " + std::to_string(first) + ": " +
+                        std::to_string(bad ? ids[first] : 0) + ")"); }
         std::vector<int> cnt(size_t(E), 0); for (int a = 0; a < A; ++a) ++cnt[size_t(ids[a])];
         const bool borrowed = size_t(layer) < pf_borrowed.size() && pf_borrowed[size_t(layer)] && cache.has_layout(layer);
         if (!cache.bank_ready(layer) && borrowed) {  // every routed expert from staging; refilled right after the prompt
@@ -2898,7 +2904,8 @@ struct DecodeModel {
             // the attention input as layer_forward makes it (hc_attn norm + mix)
             Device<float> norm(size_t(width) * m), mixed(size_t(h) * m), inject(size_t(c.hc) * m);
             Device<__nv_bfloat16> normb(size_t(width) * m);
-            const bool hc_rs = m > 64; std::unique_ptr<Device<float>> rs; if (hc_rs) rs = std::make_unique<Device<float>>(size_t(c.hc) * m);
+            const bool hc_rs = tqllm::hc_row_scales_only(m, cp.is_bf16(prefix + "hc_attn_down.weight"), cp.is_bf16(prefix + "hc_attn_inject.weight"));
+            std::unique_ptr<Device<float>> rs; if (hc_rs) rs = std::make_unique<Device<float>>(size_t(c.hc) * m);
             if (hc_rs) tqllm_cuda::hc_norm_rs_bf16(res.p, attn_gamma, rs->p, normb.p, h, c.hc, m, float(cp.epsilon), nullptr);
             else tqllm_cuda::hc_norm_bf16(res.p, attn_gamma, norm.p, normb.p, h, c.hc, m, float(cp.epsilon), nullptr);
             mix_device(cp, prefix + "hc_attn_", norm.p, m, mixed.p, inject.p, normb.p, hc_rs ? res.p : nullptr, hc_rs ? rs->p : nullptr, hc_rs ? attn_gamma : nullptr);

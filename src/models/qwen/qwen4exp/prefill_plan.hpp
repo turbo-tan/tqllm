@@ -38,6 +38,10 @@ struct PrefillChunkBytes {
 };
 
 inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
+// Hyper-connection norm of a chunk: more than 64 tokens keep only row scales and a BF16 image (the mix recomputes the
+// normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
+// a quantized down / inject reads the fp32 rows.
+inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
 // the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
 // block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB
 // without their scores; 3519+ MB short at 32768 with 3800). 0.15 MB per token + 128 MB; an overflow falls back to the pool.
