@@ -42,6 +42,14 @@ inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 // normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
 // a quantized down / inject reads the fp32 rows.
 inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
+// Expert slots per layer from free device memory (slots=auto): what is free with no expert bank, less the room the
+// context and decode keep, over the bytes one slot takes in every layer; at least 1 (the fit check then reports), at
+// most every expert.
+inline int auto_expert_slots(size_t free_bytes, size_t keep_bytes, size_t slot_bytes_all_layers, int experts) {
+    if (!slot_bytes_all_layers) return experts;
+    if (free_bytes <= keep_bytes) return 1;
+    return int(std::clamp<size_t>((free_bytes - keep_bytes) / slot_bytes_all_layers, 1, size_t(experts)));
+}
 // the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
 // block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB
 // without their scores; 3519+ MB short at 32768 with 3800). 0.15 MB per token + 128 MB; an overflow falls back to the pool.

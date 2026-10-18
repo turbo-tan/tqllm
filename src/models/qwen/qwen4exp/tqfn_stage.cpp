@@ -3751,7 +3751,7 @@ int main(int argc, char ** argv) {
 namespace {
 struct FnServe {
     std::vector<std::string> ggufs; std::string mtp, experts, draft_vocab;
-    int slots = 176, drafts = 3, chunk = 8; double budget_gb = 18; bool gsq_rco = true;
+    int slots = 176, drafts = 3, chunk = 8; double budget_gb = 18; bool gsq_rco = true, slots_auto = false;
     std::vector<std::string> arg_store; std::vector<char *> argv;
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
     std::unique_ptr<MixedExpertCache> cache, mtp_cache; PackedExperts packed; char * mtp_packed = nullptr; size_t mtp_block = 0;
@@ -3811,7 +3811,7 @@ public:
             const auto k = line.substr(0, eq), v = line.substr(eq + 1);
             if (k == "gguf") f.ggufs.push_back(resolve(v)); else if (k == "mtp") f.mtp = resolve(v);
             else if (k == "experts") f.experts = resolve(v); else if (k == "draft_vocab") f.draft_vocab = resolve(v);
-            else if (k == "slots") f.slots = std::stoi(v); else if (k == "budget_gb") f.budget_gb = std::stod(v);
+            else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? 64 : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
             else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = g_tune.chunk > 0 ? g_tune.chunk : std::stoi(v);  // --prefill-chunk (16384) over the manifest
             else if (k == "gsq_rco") f.gsq_rco = v != "0";
             else throw std::runtime_error("unknown Flash-Next manifest key " + k);
@@ -3911,34 +3911,8 @@ public:
         // the warm model's attention state is sized by the context capacity (8 GB at 262144): it must not hold that while
         // the banks are built, or the slots are capped by it; the warm-up only needs its 64 tokens
         const int kv_capacity_full = g_kv_capacity; g_kv_capacity = std::min(g_kv_capacity, 4096);
-        { const auto w0 = std::chrono::steady_clock::now();
-          DecodeModel warm(checkpoint, *f.fixtures, *f.cache, 640);
-          if (warm.miss_stream) f.cache->set_miss_stream(warm.miss_stream);
-          std::vector<int> ids(64); for (int i = 0; i < 64; ++i) ids[size_t(i)] = 1000 + (i * 37) % 50000;
-          auto rows = warm.step(ids); ck(cudaDeviceSynchronize());
-          // then one 512-token layer-major chunk: the prefill kernels' modules load and the pinned buffers and resident
-          // router copies are created now (nsys: 0.3 s of module loads and pinned allocations inside the first prompt)
-          // (needs the prepacked expert file: a GB10 build keeps every expert resident and has none)
-          if (f.cache->has_layout(0) && f.cache->bank_layout(0).src0) {
-            std::vector<int> lm(512); for (int i = 0; i < 512; ++i) lm[size_t(i)] = 2000 + (i * 53) % 50000;
-            (void) warm.step(lm); ck(cudaDeviceSynchronize()); warm.release_prefill(); }
-          (void) checkpoint.head_argmax_rows(rows->p, 1); rows.reset();  // the full LM head loads here, not at the first prompt's first token (1.9 s)
-          warm.mtp_experts = f.mtp_cache.get();  // the MTP layer too: its bank and weights, so the first request does not build them
-          (void) warm.mtp_batch(std::vector<int>(ids.begin(), ids.begin() + 8), warm.res_keep->p); ck(cudaDeviceSynchronize());
-          // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
-          // whole trunk bank in the refill): size them now, the steady state every later request already has
-          f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
-          f.res_host_cap = size_t(context) * size_t(warm.width); ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), f.res_host_cap * sizeof(float)));
-          f.cache->set_miss_stream(nullptr);
-          if (tqllm::debug_on("mem")) checkpoint.resident_report();
-          if (f.arena.size != f.arena_decode) {  // start the first request as every later one: decode-sized arena, more room to borrow
-              ck(cudaFree(f.arena.base)); ck(cudaMalloc(&f.arena.base, f.arena_decode)); f.arena.size = f.arena_decode; f.arena.used = 0; }
-          size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
-          std::fprintf(stderr, "tqllm: Flash-Next warm-up %.1f s: expert banks %.0f MB, %.0f MB free\n",
-                       std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), f.cache->stats().device_bytes / 1048576.0, fr / 1048576.0); }
-        g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
-        {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
-            // cannot hold it (it would prefill for minutes and then fail in decode)
+        // the device memory a full context keeps beside the banks: its attention state and the decode reserve
+        auto context_keep = [&] {
             int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
             // in decode the K/V of positions older than TQFN_KV_HOST_KEEP live in host memory (kv_to_host); the indexer keys stay
             const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0 && KvBuf::mem().granule();
@@ -3950,6 +3924,61 @@ public:
             // (2 GB for a long-context server: the 245K cells at 64 / 72 slots failed with 1 GB; a chat server at 33K runs
             // 140 slots with 1.8 GB free, so short contexts keep 512 MB)
             const size_t reserve = size_t(context > 65536 ? 2048 : 512) << 20;
+            return std::pair<size_t, size_t>{state, reserve};
+        };
+        // the warm-up's steps (64 and 512 tokens) need a fraction of the start-up arena and of the staging halves: hold only
+        // that while the banks are built, so the slot count is not capped by buffers the warm-up does not use
+        if (const size_t warm_arena = std::max(f.arena_decode, tqllm::prefill_arena_bytes(512)); f.arena.size > warm_arena) {
+            ck(cudaFree(f.arena.base)); ck(cudaMalloc(&f.arena.base, warm_arena)); f.arena.size = warm_arena; f.arena.used = 0; }
+        const int stage_full = g_tune.stage; g_tune.stage = std::min(g_tune.stage, 32);
+        { const auto w0 = std::chrono::steady_clock::now();
+          DecodeModel warm(checkpoint, *f.fixtures, *f.cache, 640 + 3 * 64);  // 64 + 512 tokens, then up to three slots=auto rebuilds of 64
+          if (warm.miss_stream) f.cache->set_miss_stream(warm.miss_stream);
+          std::vector<int> ids(64); for (int i = 0; i < 64; ++i) ids[size_t(i)] = 1000 + (i * 37) % 50000;
+          auto rows = warm.step(ids); ck(cudaDeviceSynchronize());
+          // then one 512-token layer-major chunk: the prefill kernels' modules load and the pinned buffers and resident
+          // router copies are created now (nsys: 0.3 s of module loads and pinned allocations inside the first prompt)
+          // (needs the prepacked expert file: a GB10 build keeps every expert resident and has none)
+          if (f.cache->has_layout(0) && f.cache->bank_layout(0).src0) {
+            std::vector<int> lm(512); for (int i = 0; i < 512; ++i) lm[size_t(i)] = 2000 + (i * 53) % 50000;
+            (void) warm.step(lm); ck(cudaDeviceSynchronize()); warm.release_prefill(); }
+          g_tune.stage = stage_full;  // requests stage their full groups (sized again under the request's borrow)
+          (void) checkpoint.head_argmax_rows(rows->p, 1); rows.reset();  // the full LM head loads here, not at the first prompt's first token (1.9 s)
+          warm.mtp_experts = f.mtp_cache.get();  // the MTP layer too: its bank and weights, so the first request does not build them
+          (void) warm.mtp_batch(std::vector<int>(ids.begin(), ids.begin() + 8), warm.res_keep->p); ck(cudaDeviceSynchronize());
+          // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
+          // whole trunk bank in the refill): size them now, the steady state every later request already has
+          f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
+          if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep
+              size_t per = 0; for (int l = 0; l < c.layers; ++l) if (f.cache->has_layout(l)) per += f.cache->bank_layout(l).block;
+              const auto [state, reserve] = context_keep(); const size_t need = state + reserve + (size_t(256) << 20);
+              size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
+              for (int round = 0; round < 3; ++round) {
+                  for (int l = 0; l < c.layers; ++l) f.cache->release_bank(l);
+                  { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
+                  const size_t fr = tqllm::device_free_bytes();
+                  f.slots = tqllm::auto_expert_slots(fr, need + extra, per, c.experts);
+                  f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); apply_layer_slots(*f.cache, f.experts, f.slots);
+                  { auto again = warm.step(ids); ck(cudaDeviceSynchronize()); }  // the banks again, at the new size
+                  const size_t after = tqllm::device_free_bytes();
+                  std::fprintf(stderr, "tqllm: expert slots auto: %.0f MB free without banks, %.0f MB kept, %.1f MB per slot -> %d slots/layer, %.0f MB free after\n",
+                               fr / 1048576.0, (need + extra) / 1048576.0, per / 1048576.0, f.slots, after / 1048576.0);
+                  if (after >= need || f.slots <= 1) break;
+                  extra += need - after;
+              }
+          }
+          f.res_host_cap = size_t(context) * size_t(warm.width); ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), f.res_host_cap * sizeof(float)));
+          f.cache->set_miss_stream(nullptr);
+          if (tqllm::debug_on("mem")) checkpoint.resident_report();
+          if (f.arena.size != f.arena_decode) {  // start the first request as every later one: decode-sized arena, more room to borrow
+              ck(cudaFree(f.arena.base)); ck(cudaMalloc(&f.arena.base, f.arena_decode)); f.arena.size = f.arena_decode; f.arena.used = 0; }
+          size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+          std::fprintf(stderr, "tqllm: Flash-Next warm-up %.1f s: expert banks %.0f MB, %.0f MB free\n",
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), f.cache->stats().device_bytes / 1048576.0, fr / 1048576.0); }
+        g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+        {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
+            // cannot hold it (it would prefill for minutes and then fail in decode)
+            const auto [state, reserve] = context_keep();
             const size_t fr = tqllm::device_free_bytes();
             if (fr < state + reserve) {
                 const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));

@@ -127,6 +127,19 @@ int main() {
     expect(!hc_row_scales_only(512, false, true), "IQ4_XS hc down needs the fp32 rows");
     expect(!hc_row_scales_only(512, true, false), "non-BF16 inject needs the fp32 rows");
 
+    // 8. expert slots from free memory (manifest slots=auto). RTX 3090, Flash-Next IQ4_XS on 10-18: one slot of every
+    //    layer is 121.9 MB (14625 MB of banks at 120 slots); with the banks released ~17.3 GB were free and a 33K context
+    //    needs ~0.6 GB (state) + 0.5 GB (decode reserve). The fixed manifest's 112 slots left 3.5 GB unused.
+    {
+        const size_t per = size_t(121.9 * double(MB)), keep = (600 + 512 + 256) * MB, free_b = 17300 * MB;
+        const int s = auto_expert_slots(free_b, keep, per, 512);
+        expect(s >= 130 && s <= 132, "IQ4_XS 3090: ~131 slots from 17.3 GB free");
+        expect(size_t(s) * per + keep <= free_b, "the chosen slots leave the kept room");
+        expect(auto_expert_slots(keep / 2, keep, per, 512) == 1, "too little memory: one slot, the fit check then reports");
+        expect(auto_expert_slots(size_t(100) << 30, keep, per, 512) == 512, "capped at every expert (GB10)");
+        expect(auto_expert_slots(free_b, keep, 0, 512) == 512, "no per-slot size known: every expert");
+    }
+
     std::printf(fails ? "PREFILL_PLAN FAIL\n" : "PREFILL_PLAN PASS\n");
     return fails ? 1 : 0;
 }
