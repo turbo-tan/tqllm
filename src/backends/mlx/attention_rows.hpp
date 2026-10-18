@@ -86,13 +86,18 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
                                      std::string(std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16")) != "0";
     // only with past keys: a first chunk (no past) was faster on the FP32 path (j605 doc2k 369 vs 345 tok/s, before
     // the shipped epilogue defaults); =2 also runs the first chunk on BF16 (re-measure)
-    static const bool first_bf16 = prefill_bf16 && std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") &&
-                                   std::string(std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16")) == "2";
+    // =3: every prefill chunk (first included) on the FP16 SDPA: same speed as BF16 (j724) with 3 more mantissa bits
+    // for q and P; K / V hold BF16 values, exact in FP16 within its range
+    static const std::string attn_mode = std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ? std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") : "";
+    static const bool first_bf16 = prefill_bf16 && (attn_mode == "2" || attn_mode == "3");
+    static const bool fp16_sdpa = attn_mode == "3";
     if (prefill_bf16 && (kv_valid > n || (first_bf16 && kv_valid == n)) && n > 8 && !decode_order &&
         k.dtype() == mx::bfloat16 && q.shape(0) == 1) {
         auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)});
         auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)});
-        auto out = mx::fast::scaled_dot_product_attention(mx::astype(q, mx::bfloat16), keys, values, scale, "causal");
+        const auto t = fp16_sdpa ? mx::float16 : mx::bfloat16;
+        if (fp16_sdpa) {keys = mx::astype(keys, t); values = mx::astype(values, t);}
+        auto out = mx::fast::scaled_dot_product_attention(mx::astype(q, t), keys, values, scale, "causal");
         return mx::astype(out, q.dtype());
     }
     if (kv_valid > 0 && (kv_valid < k.shape(2) || k.dtype() != q.dtype())) {
