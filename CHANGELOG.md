@@ -41,6 +41,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - CI: `checks` workflow (CPU build, ctest, Python tests) runs on every pull request; required before merge.
 - MoE decode runs the shared expert inside the routed expert launches. MiniCPM-V 4.7 35B-A3B on one RTX 3090:
   IQ3_S 207.8 -> 220.1 tok/s, Q5_K_M (2000 MiB experts in host memory) 176.5 -> 187.1 tok/s. Output identical.
+- Flash-Next long-prompt prefill: QSA top-k over 32-bit score bits, a measured scratch-arena rule (16K chunks fit at
+  245K), first-chunk host prep overlapped with the memory plan, fewer pool trims, and an MTP catch-up that computes only
+  the MTP layer's keys / values (plus its indexer keys) for every prompt position but the last. Qwen3.8-Flash-Next
+  GSQ-RCO IQ3_S on one RTX 3090, first token vs Strata 0.1.45 on the same file: 32K 14.09 vs 15.12 s, 64K 27.57 vs
+  29.50 s, 128K 55.58 vs 58.32 s, 245K 121.6 vs 124.4 s; decode after the prompt 82.0 / 80.1 / 66.0 / 54.1 vs
+  69.5 / 68.5 / 53.8 / 48.1 tok/s. Output identical to the previous build at every length.
+- Source tree: one folder per component and per model architecture (`AGENTS.md` has the map and the layering rules,
+  enforced by test-layering); `tools/dev/relayout.py` moves a branch onto the new layout.
 
 ### Fixed
 - The answer streams when the request carries tool schemas: `StreamWriter` sent no content deltas until the end whenever
@@ -53,6 +61,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   Responses API.
 - A request without `max_tokens` was cut at 64 tokens; it now gets the server's `--max-tokens` (OpenAI clients such as
   Codex leave it out).
+- GB10 / DGX Spark: Flash-Next read free memory from `cudaMemGetInfo`, which on unified memory counts the page cache
+  as used (6.7 GB "free" with 55.8 GB available), and refused a 262K context that fits. The context check, the prefill
+  memory plan and expert-bank eviction now use `MemAvailable` on unified-memory GPUs; discrete cards are unchanged.
+- Flash-Next 245K prompts on a 24 GB card could run out of memory at the expert staging allocation; the plan keeps a
+  448 MB margin above 128K and the allocation trims the memory pool and retries once.
+- Flash-Next IQ4_NL tensors whose rows are not a multiple of 128 columns load as Q8_0 (same values) instead of failing.
 
 ## 1.0.0 - 2026-10-14
 
