@@ -9,6 +9,14 @@ command-line options (`docs/CONFIG.md`).
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |
+| `TQFN_ARENA_MB` | - | MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit) |  |
+| `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (opt-in) |  |
+| `TQFN_DRAFT_VOCAB` | - | FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab) |  |
+| `TQFN_KV` | - | KV format for Flash-Next attention (name from the KV format registry; default bf16) |  |
+| `TQFN_KV_HOST` | off | 1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM, slower decode at long context) |  |
+| `TQFN_KV_HOST_KEEP` | 32768 | positions of K/V kept on the device with TQFN_KV_HOST=1 |  |
+| `TQFN_LAYER_SLOTS` | - | comma list of expert slots per layer (overrides the packed file's .slots profile) |  |
+| `TQFN_MTP_SLOTS` | 256 | MTP expert slots (every expert when the trunk keeps every expert) |  |
 
 ## Debug
 
@@ -18,6 +26,60 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MOE_STAGE` | on | 0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics) |  |
 | `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
+| `TQFN_ALLOW_NP_ABOVE_8` | off | allow Flash-Next servers with more than 8 slots (known to end some requests after one token above 8) |  |
+| `TQFN_ARENA_LOG` | off | print the scratch arena high-water mark after each prefill |  |
+| `TQFN_BF16_ACT` | off | BF16 instead of FP16 activations for the Flash-Next native projections (A/B) |  |
+| `TQFN_CPU_BENCH` | - | THREADS: time the CPU expert-miss pool alone on real expert bytes and exit |  |
+| `TQFN_CPU_CHECK` | off | check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF |  |
+| `TQFN_CPU_GGUF` | off | the CPU miss pool reads the GGUF instead of the pinned packed copy |  |
+| `TQFN_CPU_MISS_MAX` | - | K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses |  |
+| `TQFN_CPU_REFILL` | off | refill the expert banks from the CPU pool's copies (A/B) |  |
+| `TQFN_CPU_SPIN_MS` | 2 | ms the CPU miss workers spin before sleeping |  |
+| `TQFN_DENSE_INT8` | 0 | 1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path) |  |
+| `TQFN_DUMP_GDN` | - | FILE: dump the GDN layer outputs (fixture comparison) |  |
+| `TQFN_EXACT_F32` | off | every Flash-Next projection on the fp32 reference path (slow; numerics gate) |  |
+| `TQFN_EXPERT_GEMM_MIN` | 65 | rows from which prefill experts use the grouped GEMM instead of the dedup kernel |  |
+| `TQFN_F32_ROUTER` | off | the fp32 per-token router kernel instead of the BF16 GEMV / segmented launch |  |
+| `TQFN_GDN_CHUNK_MIN` | 64 | tokens from which GDN prefill uses the chunked (WY) kernel; 0 = off |  |
+| `TQFN_GDN_SEQ_FAST` | on | 0: the plain sequential GDN kernel instead of the fast pass at dim 128 |  |
+| `TQFN_GDN_VPW` | 8 | GDN value columns per warp |  |
+| `TQFN_GDN_WY` | on | 0: GDN chunked prefill without the WY form (A/B) |  |
+| `TQFN_GEMV_TILE` | 16 | router GEMV tile: 8, 16, 164 (16 x 4) or 32 (same output bits) |  |
+| `TQFN_LAST_LOGITS` | - | FILE: write the last prompt position's float32 logits to FILE.<prompt length> (prefill numerics gate) |  |
+| `TQFN_LAYER_MAJOR` | on | 0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer) |  |
+| `TQFN_LAYER_MAJOR_MIN` | 256 | tokens from which a prefill chunk runs layer-major |  |
+| `TQFN_MTP_CATCHUP` | - | positions per MTP catch-up batch when the MTP cache holds every expert |  |
+| `TQFN_MTP_LAYER_MAJOR` | on | 0: the MTP catch-up runs token-major instead of layer-major |  |
+| `TQFN_NO_EOS_STOP` | off | decode past the end-of-sequence token (fixed-length runs) |  |
+| `TQFN_NO_LAYER_RESET` | off | keep the scratch arena across layers (A/B) |  |
+| `TQFN_NO_PIN` | off | do not pin the packed expert file in host memory |  |
+| `TQFN_NO_PREFETCH` | off | no predicted-expert prefetch in decode |  |
+| `TQFN_OLD_Q2_DOT` | off | GSQ Q2_0: one block per row in the dot kernel (A/B) |  |
+| `TQFN_PACK_CHECK` | - | PACKED: check every packed expert part is byte-identical to its GGUF slice and exit |  |
+| `TQFN_PF_EVENTS` | off | the compute stream waits only for the prefetch copies of the slots it reads |  |
+| `TQFN_PF_K` | 6 | prefetch each token's K best predicted experts |  |
+| `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
+| `TQFN_PF_LOGITS` | - | FILE: prefill logits for the numerics gate |  |
+| `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
+| `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
+| `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
+| `TQFN_PREFILL_INT8_FMT` | - | comma list of u4h format ids allowed on the int8 prefill path (default all) |  |
+| `TQFN_PREFILL_LOG` | off | per-layer and per-stage prefill timings (synchronises; slower) |  |
+| `TQFN_PROFILE_DECODE` | off | 1: the TQFN_PROFILE_REQ capture covers decode instead of prefill |  |
+| `TQFN_PROFILE_PROMPT` | - | N: cudaProfilerStart / Stop around the N-th prompt's prefill (nsys --capture-range=cudaProfilerApi) |  |
+| `TQFN_PROFILE_REQ` | - | N: profile the N-th request; also logs where a slow first token goes |  |
+| `TQFN_Q2_DOT_GROUPED` | off | GSQ Q2_0 grouped experts: 1 = the scalar kernel instead of tensor cores (A/B) |  |
+| `TQFN_QSA` | on | 0: dense attention at every length instead of QSA sparse attention past the indexer budget (changes output) |  |
+| `TQFN_QSA_CHECK` | off | QSA selection: compare the top-k select with a full sort (raises on any difference) |  |
+| `TQFN_QSA_SPLIT` | 16 | slices per decode QSA attention row; 0 or 1 = direct attention |  |
+| `TQFN_ROUND32` | - | diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none) |  |
+| `TQFN_ROUTER_GEMM` | off | 1: router as an fp32 cuBLAS GEMM (faster; its summation order can flip near-tie routing) |  |
+| `TQFN_ROUTE_DUMP` | - | FILE: append routed expert ids per trunk layer call |  |
+| `TQFN_SPEC_TRACE` | off | per-step speculative decoding timings |  |
+| `TQFN_STEP_PROBE` | off | time single decode steps after the prompt |  |
+| `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
+| `TQFN_TF_LOGITS` | - | FILE: teacher-forced logits for the KLD gate |  |
+| `TQFN_WAVE_GEMM_AVG` | - | average tokens per expert from which prefill waves use the grouped GEMM |  |
 
 ## Retired (the tool stops; use the replacement)
 
