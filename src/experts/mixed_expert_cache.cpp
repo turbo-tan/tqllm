@@ -1,6 +1,7 @@
 #include "tq3_expert_cache.hpp"
 #include "moe_kernels.cuh"
 #include "debug.hpp"
+#include "device_free_cuda.hpp"
 #include <cstdio>
 #include <algorithm>
 #include <limits>
@@ -525,8 +526,7 @@ std::vector<int> MixedExpertCache::evict_until_free(size_t want, int protect) {
     auto & s = *state_; std::vector<int> out;
     s.wait_misses_impl(); checked(cudaDeviceSynchronize());  // no kernel or copy may still use a victim
     for (;;) {
-        size_t fr = 0, tot = 0; checked(cudaMemGetInfo(&fr, &tot));
-        if (fr >= want) break;
+        if (tqllm::device_free_bytes() >= want) break;
         auto victim = s.banks.end();
         for (auto it = s.banks.begin(); it != s.banks.end(); ++it)
             if (it->first != protect && (victim == s.banks.end() || it->second->touched < victim->second->touched)) victim = it;

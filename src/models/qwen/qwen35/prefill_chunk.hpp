@@ -6,14 +6,9 @@
 #include <cstdint>
 #include <string>
 
+#include "device_free.hpp"
+
 namespace tqllm {
-// MemAvailable from /proc/meminfo text, in bytes (0 if absent). Unified-memory GPUs (GB10) report the page cache as
-// used in cudaMemGetInfo (121 GiB total, 2.9 GiB "free" with 97 GiB available), so their free memory comes from here.
-inline size_t meminfo_available(const std::string & text) {
-    const auto at = text.find("MemAvailable:");
-    if (at == std::string::npos) return 0;
-    return size_t(std::stoull(text.substr(at + 13))) * 1024;
-}
 inline int prefill_chunk(int64_t context, size_t total_bytes, size_t free_bytes, size_t kv_device_bytes) {
     int n = context <= 131072 ? 2048 : context <= 196608 ? 1024 : 512;  // 256K + 2048 would pass 24 GB
     if (context <= 65536 && total_bytes >= (size_t(20) << 30)) n = 4096;  // 27B on the 3090: +4-5%, peak +1 GB at 32K

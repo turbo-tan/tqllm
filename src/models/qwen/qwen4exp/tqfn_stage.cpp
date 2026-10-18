@@ -14,6 +14,7 @@
 #include "gsq_activation.cuh"
 #include "quant_kernels.cuh"
 #include "vision_kernels.cuh"
+#include "device_free_cuda.hpp"
 #include <cublas_v2.h>
 #include <algorithm>
 #include <chrono>
@@ -3942,7 +3943,7 @@ public:
             // (2 GB for a long-context server: the 245K cells at 64 / 72 slots failed with 1 GB; a chat server at 33K runs
             // 140 slots with 1.8 GB free, so short contexts keep 512 MB)
             const size_t reserve = size_t(context > 65536 ? 2048 : 512) << 20;
-            size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+            const size_t fr = tqllm::device_free_bytes();
             if (fr < state + reserve) {
                 const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
                 const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;
@@ -4038,7 +4039,7 @@ public:
             auto context_term = [&](int block) { return tqllm::prefill_context_bytes(g_kv_capacity, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
             // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
             if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
-            auto free_now = [] { size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot)); return fr; };
+            auto free_now = [] { return tqllm::device_free_bytes(); };
             const size_t mtp_room = P > chunk ? f_.mtp_cache->stats().device_bytes : 0;  // a multi-chunk prompt clears the MTP bank first
             std::vector<size_t> bank_bytes; for (int l : f_.cache->banks_lru()) bank_bytes.push_back(f_.cache->bank_bytes(l));
             const int block0 = std::clamp(g_tune.sub, 512, 2048);
