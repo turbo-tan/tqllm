@@ -124,8 +124,8 @@ inline void cpu_q8k_round(std::vector<float> & values) {
 // one buffer that is reset per decode step, so a token makes no allocation calls. State that outlives a step must be
 // allocated under PersistentAlloc.
 struct ScratchArena { char * base = nullptr; size_t size = 0, used = 0, high = 0; };
-inline bool g_prefill_log = std::getenv("TQFN_PREFILL_LOG") != nullptr; static double g_qsa_ms = 0;  // prefill profile (syncs)
-inline ScratchArena * g_arena = nullptr; static int g_persistent = 0;
+inline bool g_prefill_log = std::getenv("TQFN_PREFILL_LOG") != nullptr; inline double g_qsa_ms = 0;  // prefill profile (syncs)
+inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
 inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled request is in its decode
 inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
