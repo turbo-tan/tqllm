@@ -16,7 +16,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         const auto k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "gguf") f.ggufs.push_back(resolve(v)); else if (k == "mtp") f.mtp = resolve(v);
         else if (k == "experts") f.experts = resolve(v); else if (k == "draft_vocab") f.draft_vocab = resolve(v);
-        else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? 64 : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
+        else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? kAutoStartSlots : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
         else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = g_tune.chunk > 0 ? g_tune.chunk : std::stoi(v);  // --prefill-chunk (16384) over the manifest
         else if (k == "gsq_rco") f.gsq_rco = v != "0";
         else throw std::runtime_error("unknown Flash-Next manifest key " + k);

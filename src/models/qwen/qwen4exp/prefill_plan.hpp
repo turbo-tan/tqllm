@@ -45,6 +45,10 @@ inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { r
 // Expert slots per layer from free device memory (slots=auto): what is free with no expert bank, less the room the
 // context and decode keep, over the bytes one slot takes in every layer; at least 1 (the fit check then reports), at
 // most every expert.
+// slots=auto builds the warm-up banks at this provisional size and sizes them after every other buffer (the MTP bank,
+// staging, the dense weights) is in place: a large start (64) left a 12 GB card no room for the MTP bank and the warm-up
+// failed before the sizing ran
+constexpr int kAutoStartSlots = 8;
 inline int auto_expert_slots(size_t free_bytes, size_t keep_bytes, size_t slot_bytes_all_layers, int experts) {
     if (!slot_bytes_all_layers) return experts;
     if (free_bytes <= keep_bytes) return 1;
