@@ -6,6 +6,7 @@
 #include "tqllm/tokenizer.hpp"
 #include "dflash.hpp"
 #include "sampling.hpp"
+#include "sampling_topk.hpp"
 #include "qwen35.hpp"
 #include "wired_limit.hpp"
 #include "gguf.hpp"
@@ -24,6 +25,7 @@ using tqllm::mlx_backend::verify_width;
 using tqllm::mlx_backend::filtered_distribution;
 using tqllm::mlx_backend::speculative_pick;
 using tqllm::mlx_backend::draw_excluding;
+using tqllm::mlx_backend::row_topk;
 using tqllm::mlx_backend::Qwen35;
 
 namespace tqllm {
@@ -205,9 +207,7 @@ bool Model::spec_advance() {
         // The output distribution equals token-by-token sampling from the same filtered p (top-k, then top-p).
         const int rows = want + 1, k = i.top_k > 0 ? i.top_k : 64;
         auto scaled = mx::multiply(mx::astype(mx::reshape(verified, {rows, -1}), mx::float32), mx::array(1.0f / i.temperature));
-        auto idx = mx::slice(mx::argpartition(mx::negative(scaled), k - 1, -1), {0, 0}, {rows, k});
-        auto val = mx::take_along_axis(scaled, idx, -1);
-        idx = mx::astype(idx, mx::uint32);
+        auto [idx, val] = row_topk(scaled, k);
         mx::eval(idx, val, drafted);
         proposed = drafted.data<uint32_t>();
         const auto* pi = idx.data<uint32_t>(); const auto* pv = val.data<float>();
