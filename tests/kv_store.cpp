@@ -13,7 +13,13 @@
 #include <vector>
 
 // mapping granule = the OS page (4 KiB on Linux x86 / arm64 kernels with 4K pages, 16 KiB on macOS arm64)
-static size_t page_granule() {return size_t(sysconf(_SC_PAGESIZE));}
+static size_t page_granule() {
+#ifdef TQLLM_TEST_GRANULE
+    return TQLLM_TEST_GRANULE;  // e.g. -DTQLLM_TEST_GRANULE=16384 exercises the macOS arm64 page on Linux
+#else
+    return size_t(sysconf(_SC_PAGESIZE));
+#endif
+}
 // physical backing for the mapped test ranges: memfd on Linux, an unlinked temp file elsewhere (macOS has no memfd)
 static int phys_fd() {
 #if defined(__linux__)
