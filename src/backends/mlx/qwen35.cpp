@@ -882,6 +882,15 @@ struct Qwen35::Impl {
         kb=mx::slice_update(*kb,k,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         vb=mx::slice_update(*vb,v,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         c.kv_len=need;
+        // debug (KV format study): TQLLM_MLX_DUMP_KV=dir saves the filled K / V and this chunk's rotated q of layers
+        // 3 / 23 / 43 / 63 as FP16 .npy on every prefill chunk (the last chunk leaves the whole prompt)
+        static const char* dump_kv=std::getenv("TQLLM_MLX_DUMP_KV");
+        if(dump_kv && m>16 && (layer==3 || layer==23 || layer==43 || layer==63)) {
+            const std::string d=std::string(dump_kv)+"/l"+std::to_string(layer);
+            mx::save(d+"_k.npy",mx::astype(mx::slice(*kb,{0,0,0,0},{1,kvheads,need,hd}),mx::float16));
+            mx::save(d+"_v.npy",mx::astype(mx::slice(*vb,{0,0,0,0},{1,kvheads,need,hd}),mx::float16));
+            mx::save(d+"_q.npy",mx::astype(q,mx::float16));
+        }
         auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),serial_verify_attention&&capture_prefix,attention_kv_views,fused_attention_rows,need);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         stage("attn_core",{out,*kb,*vb});

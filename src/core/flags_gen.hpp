@@ -43,6 +43,7 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_DRAFT_ABLATE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DRAFT_BUILD_PROFILE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DROP_TILED_ORIGINALS", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
+    {"TQLLM_MLX_DUMP_KV", Kind::Debug, "-", "Apple MLX backend debug: directory for FP16 .npy dumps of K / V / q of attention layers 3, 23, 43, 63 during prefill (KV format study)", ""},
     {"TQLLM_MLX_DUMP_FFN", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DUMP_FFN_SLICE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_EAGER_ACCEPT", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},

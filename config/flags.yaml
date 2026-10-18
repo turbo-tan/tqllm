@@ -127,6 +127,10 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DUMP_KV
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend debug: directory for FP16 .npy dumps of K / V / q of attention layers 3, 23, 43, 63 during prefill (KV format study)"
   - name: TQLLM_MLX_DUMP_FFN
     kind: debug
     default: "-"
