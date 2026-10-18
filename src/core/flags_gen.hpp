@@ -26,7 +26,7 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_ATTN_DECODE_ROWS", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ATTN_DECODE_V2", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ATTN_DECODE_V3", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
-    {"TQLLM_MLX_ATTN_PREFILL_BF16", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
+    {"TQLLM_MLX_ATTN_PREFILL_BF16", Kind::Debug, "3", "Apple MLX backend prefill attention: 3 (default) FP16 SDPA for every chunk, 1 BF16 after an FP32 first chunk, 2 BF16 every chunk, 0 FP32", ""},
     {"TQLLM_MLX_ATTN_Q_CHUNK", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ATTN_V3_PB", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_CACHE_LIMIT_MIB", Kind::User, "-", "MiB: MLX buffer-cache limit for the Mac tools (default 512)", ""},

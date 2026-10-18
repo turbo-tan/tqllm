@@ -86,9 +86,10 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
                                      std::string(std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16")) != "0";
     // only with past keys: a first chunk (no past) was faster on the FP32 path (j605 doc2k 369 vs 345 tok/s, before
     // the shipped epilogue defaults); =2 also runs the first chunk on BF16 (re-measure)
-    // =3: every prefill chunk (first included) on the FP16 SDPA: same speed as BF16 (j724) with 3 more mantissa bits
-    // for q and P; K / V hold BF16 values, exact in FP16 within its range
-    static const std::string attn_mode = std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ? std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") : "";
+    // default: every prefill chunk (first included) on the FP16 SDPA: same speed as BF16 (j724) with 3 more mantissa
+    // bits for q and P; K / V hold BF16 values, exact in FP16 within its range (j735: prefill +0.6-4.1 %, KL below the
+    // chunk-64 floor on 8 of 8 windows). =1 the earlier BF16 path after an FP32 first chunk, =2 BF16 first chunk too
+    static const std::string attn_mode = std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ? std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") : "3";
     static const bool first_bf16 = prefill_bf16 && (attn_mode == "2" || attn_mode == "3");
     static const bool fp16_sdpa = attn_mode == "3";
     if (prefill_bf16 && (kv_valid > n || (first_bf16 && kv_valid == n)) && n > 8 && !decode_order &&

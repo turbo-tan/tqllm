@@ -33,7 +33,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_ATTN_DECODE_ROWS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ATTN_DECODE_V2` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ATTN_DECODE_V3` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_PREFILL_BF16` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_ATTN_PREFILL_BF16` | 3 | Apple MLX backend prefill attention: 3 (default) FP16 SDPA for every chunk, 1 BF16 after an FP32 first chunk, 2 BF16 every chunk, 0 FP32 |  |
 | `TQLLM_MLX_ATTN_Q_CHUNK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ATTN_V3_PB` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_COUNT_NODES` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
