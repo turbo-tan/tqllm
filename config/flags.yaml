@@ -165,8 +165,8 @@ flags:
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_GDN_FUSE_PREFILL
     kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+    default: "1"
+    doc: "Apple MLX backend: fused GDN prep/post kernels for prefill chunks (1, default since j726); 0 runs the separate ops"
   - name: TQLLM_MLX_GDN_STEP
     kind: debug
     default: "-"

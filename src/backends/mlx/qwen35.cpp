@@ -917,8 +917,9 @@ struct Qwen35::Impl {
         }
         // fused prep/post kernels: prefill chunks by default (TQLLM_MLX_GDN_FUSE_PREFILL=0 off), every batch with TQLLM_MLX_GDN_FUSE=1
         static const bool gdn_fuse_all=std::getenv("TQLLM_MLX_GDN_FUSE")!=nullptr;
-        // off by default: j606 neutral at 8K/16K, slower at 2K (362 vs 399 tok/s); =1 enables
-        static const bool gdn_fuse_prefill=std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL") && std::string(std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL"))!="0";
+        // on by default since j726 (shipped config + 8-lane scan: prefill +0.9-6 %, KL below the chunk-64 floor; j606's
+        // loss at 2K was before the shipped epilogues); =0 off
+        static const bool gdn_fuse_prefill=!std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL") || std::string(std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL"))!="0";
         const bool gdn_fuse=gdn_fuse_all || (gdn_fuse_prefill && m>8);
         const bool fused_pre=gdn_fuse && ablate_blocks.find("gnorm")==std::string::npos && dk==128 && dv==128;
         auto result=ablate_blocks.find("gconv")!=std::string::npos?tail_slice(joined,0,conv-1,conv-1+m):
