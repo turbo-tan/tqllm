@@ -47,6 +47,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   GSQ-RCO IQ3_S on one RTX 3090, first token vs Strata 0.1.45 on the same file: 32K 14.09 vs 15.12 s, 64K 27.57 vs
   29.50 s, 128K 55.58 vs 58.32 s, 245K 121.6 vs 124.4 s; decode after the prompt 82.0 / 80.1 / 66.0 / 54.1 vs
   69.5 / 68.5 / 53.8 / 48.1 tok/s. Output identical to the previous build at every length.
+- Flash-Next engine split from its bring-up tool: component units under `src/models/qwen/qwen4exp/` (`fn_runtime`,
+  `fn_checkpoint`, `fn_state`, `fn_cpu_experts`, `fn_layers`, `fn_model` with `fn_layer_forward` / `fn_prefill` /
+  `fn_step` / `fn_mtp`, and the server engine `fn_engine_load` / `fn_engine_prefill` / `fn_engine_decode`); the tool is
+  `tools/tqfn_stage.cpp`. Output and drafts identical to before at 32K and 128K. Every `TQFN_*` variable is in
+  `config/flags.yaml`, checked by `flags_registry`.
+- Flash-Next manifests accept `slots=auto`: the expert banks take the memory a full context does not keep (measured
+  after the banks are built). Opt-in: the slot count can change greedy output (known issue). The warm-up no longer holds
+  the start-up arena and full staging while the banks are built, so more slots fit (IQ4_XS on a 3090: 120 instead of
+  112, chats 56.2 -> 61.1 tok/s, 32K first token 17.2 -> 15.3 s; Strata 0.1.45 on the same file 61.2 tok/s / 15.3 s).
 - Source tree: one folder per component and per model architecture (`AGENTS.md` has the map and the layering rules,
   enforced by test-layering); `tools/dev/relayout.py` moves a branch onto the new layout.
 
@@ -66,6 +75,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   memory plan and expert-bank eviction now use `MemAvailable` on unified-memory GPUs; discrete cards are unchanged.
 - Flash-Next 245K prompts on a 24 GB card could run out of memory at the expert staging allocation; the plan keeps a
   448 MB margin above 128K and the allocation trims the memory pool and retries once.
+- Flash-Next on files with a quantized hyper-connection mixer (the IQ4_XS file; the Q8_0 MTP block): prefill pieces
+  over 64 tokens left the mixer's fp32 rows unwritten. IQ4_XS routed tokens to a non-existent expert and faulted; the
+  MTP layer drafted from stale rows (decode after 128K 66.0 -> 75.3 tok/s with the fix, output unchanged).
 - Flash-Next IQ4_NL tensors whose rows are not a multiple of 128 columns load as Q8_0 (same values) instead of failing.
 
 ## 1.0.0 - 2026-10-14
