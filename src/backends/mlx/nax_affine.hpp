@@ -39,11 +39,10 @@ mlx::core::array nax_affine_gemm_staged(const NaxAffine& w, const mlx::core::arr
 mlx::core::array nax_affine_gemm(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 // The 4-bit affine matrix in MLX's quantized layout ([rows, columns/8] uint32, FP16 scales and biases [rows, columns/group])
 // for mx::quantized_matmul, which dequantizes inside its tiles (j712, m 2048: 26.6-28.8 vs 20.1-23.9 TFLOPS dequant + matmul).
-// TQ4 (group 128) goes in as 8-bit affine with the same FP16 values.
-struct NaxMlx {mlx::core::array words, scales, biases; int bits;};
+struct NaxMlx {mlx::core::array words, scales, biases;};
 bool nax_affine_mlx_compatible(const NaxAffine& weights);
 NaxMlx nax_affine_to_mlx(const NaxAffine& weights);
-// FP16 [m, rows] = FP16 input times the matrix: quantized_matmul when compatible (TQLLM_MLX_PREFILL_QMM: 0 off, 2 TQ4 too), else
+// FP16 [m, rows] = FP16 input times the matrix: quantized_matmul when compatible (TQLLM_MLX_PREFILL_QMM=0 off), else
 // dequant + matmul. Prefill only (not row-invariant with nax_affine_matmul).
 mlx::core::array nax_affine_product_fp16(const NaxAffine& weights, const mlx::core::array& input);
 // Prefill GEMM on the int8 matrix-unit path: TQ4 levels exact as int8 (group scale applied per 128 columns), input
