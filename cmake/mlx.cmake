@@ -157,6 +157,7 @@ endif()
 
 if(BUILD_TESTING)
   add_executable(test-mlx-wired-budget tests/mlx_wired_budget.cpp)
+  target_include_directories(test-mlx-wired-budget PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mlx)
   add_test(NAME mlx_wired_budget COMMAND test-mlx-wired-budget)
 endif()
 
