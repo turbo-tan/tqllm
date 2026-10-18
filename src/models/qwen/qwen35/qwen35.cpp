@@ -4466,7 +4466,7 @@ public:
         } else dflash_step(slots, n, done);
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override { return dflash_finish(stats); }
-    std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
+    const std::vector<uint32_t> & spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {
         if (!dfl.present) return 0;
         const auto P = uint32_t(tokens.size());

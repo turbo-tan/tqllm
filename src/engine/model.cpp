@@ -713,7 +713,7 @@ void Model::spec_step(const std::vector<int> & slots, std::vector<char> & done) 
     done.assign(d.get(), d.get() + slots.size());
 }
 std::vector<uint32_t> Model::spec_finish(uint64_t * stats) { return impl_->e->spec_finish(stats); }
-std::vector<uint32_t> Model::spec_tokens(int slot) const { return impl_->e->spec_tokens(slot); }
+const std::vector<uint32_t> & Model::spec_tokens(int slot) const { return impl_->e->spec_tokens(slot); }
 int Model::drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) {
     return impl_->e->drafter_features(tokens, feats);
 }

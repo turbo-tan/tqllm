@@ -195,7 +195,7 @@ bool Model::spec_advance() {
     return !i.done;
 }
 
-std::vector<uint32_t> Model::spec_tokens(int) const {return impl_->output;}
+const std::vector<uint32_t>& Model::spec_tokens(int) const {return impl_->output;}
 
 std::vector<uint32_t> Model::spec_finish(uint64_t* stats) {
     auto& i = *impl_;

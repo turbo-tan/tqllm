@@ -120,7 +120,7 @@ private:
 
     // after a step: the slot's ids go to the stream and through the repeat guard (tripped -> the request ends)
     bool step_done(Job & job, int slot) {
-        const auto ids = model_.spec_tokens(slot);
+        const auto & ids = model_.spec_tokens(slot);  // read now; publish() copies for the stream thread
         if (job.req.observation) job.req.observation->tokens(static_cast<uint32_t>(ids.size()));
         const bool tripped = job.repeat.check(ids);
         if (job.stream) publish(job, ids);

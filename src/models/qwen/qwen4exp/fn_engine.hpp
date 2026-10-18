@@ -25,7 +25,7 @@ class FlashNextEngine final : public tqllm::Engine {
         std::unique_ptr<tqllm::BankLedger> ledger_;  // this request's borrowed expert banks
         tqllm::ExpertCacheStats stats_at_decode_{}, mtp_stats_at_decode_{};  // TQLLM_DEBUG=mem: cache counters when the decode of this request began
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free
-        std::vector<int> out_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
+        std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
         std::chrono::steady_clock::time_point t_begin_, t_decode_;
         float temp_ = 0.f, top_p_ = 1.f; int top_k_ = 0; std::mt19937_64 rng_{1};
     };
@@ -66,8 +66,12 @@ public:
         S().model_.reset(); S().prompt_res_.reset();
         return r;
     }
-    std::vector<uint32_t> spec_tokens(int s) const override {
-        const auto & o = slots_[size_t(s)].out_; return std::vector<uint32_t>(o.begin(), o.end());
+    // out_ holds int ids: an append-only uint32 mirror per slot (only new ids converted; rebuilt after a reset)
+    const std::vector<uint32_t> & spec_tokens(int s) const override {
+        const auto & o = slots_[size_t(s)].out_; auto & v = slots_[size_t(s)].out_view_;
+        if (v.size() > o.size() || (!v.empty() && v.back() != uint32_t(o[v.size() - 1]))) v.clear();
+        for (size_t i = v.size(); i < o.size(); ++i) v.push_back(uint32_t(o[i]));
+        return v;
     }
     int slots() const override { return int(slots_.size()); }
     void select_slot(int s) override { require(s >= 0 && s < int(slots_.size()), "Flash-Next slot out of range"); cur_ = s; }

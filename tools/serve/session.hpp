@@ -712,7 +712,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
         while (model.spec_advance()) {
-            const auto ids = model.spec_tokens(0);
+            const auto & ids = model.spec_tokens(0);  // used before the next advance only
             if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
             if (guard.check(ids)) break;
         }
@@ -1020,7 +1020,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
     while (model.spec_advance()) {
-        const auto ids = model.spec_tokens(0);
+        const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;
         if (!on_tokens(ids)) { if (req.observation) req.observation->finish("cancelled"); break; }
