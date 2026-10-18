@@ -40,6 +40,8 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_ATTN_Q_CHUNK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ATTN_V3_PB` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_COUNT_NODES` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_SAMPLE_AR` | - | =1: temperature > 0 decodes token by token (no drafter), the pre-speculative-sampling path |  |
+| `TQLLM_MLX_SAMPLE_DEBUG` | - | =1: print per-row top tokens / argmax / proposal for the first 3 speculative sampling steps |  |
 | `TQLLM_MLX_ATTN_V5_PB` | 256 | v5 key partition length (multiple of 8) |  |
 | `TQLLM_MLX_DFLASH_CHAIN` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DFLASH_PIPELINE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |

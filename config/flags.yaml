@@ -83,6 +83,14 @@ flags:
     kind: user
     default: "-"
     doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
+  - name: TQLLM_MLX_SAMPLE_AR
+    kind: debug
+    default: "-"
+    doc: "=1: temperature > 0 decodes token by token (no drafter), the pre-speculative-sampling path"
+  - name: TQLLM_MLX_SAMPLE_DEBUG
+    kind: debug
+    default: "-"
+    doc: "=1: print per-row top tokens / argmax / proposal for the first 3 speculative sampling steps"
   - name: TQLLM_MLX_ATTN_DECODE_V5
     kind: user
     default: "-"

@@ -32,6 +32,8 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MLX_CACHE_LIMIT_MIB", Kind::User, "-", "MiB: MLX buffer-cache limit for the Mac tools (default 512)", ""},
     {"TQLLM_MLX_COUNT_NODES", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_DFLASH_BLOCK", Kind::User, "-", "N: drafter block rows (8, or 16 for block-16 drafts and verify)", ""},
+    {"TQLLM_MLX_SAMPLE_AR", Kind::Debug, "-", "=1: temperature > 0 decodes token by token (no drafter), the pre-speculative-sampling path", ""},
+    {"TQLLM_MLX_SAMPLE_DEBUG", Kind::Debug, "-", "=1: print per-row top tokens / argmax / proposal for the first 3 speculative sampling steps", ""},
     {"TQLLM_MLX_ATTN_DECODE_V5", Kind::User, "-", "=1: own decode / verify attention v5 (matrix-unit S and P.V, queries staged once per 32, in-register softmax); takes precedence over SDPA / v1", ""},
     {"TQLLM_MLX_ATTN_V5_PB", Kind::Debug, "256", "v5 key partition length (multiple of 8)", ""},
     {"TQLLM_MLX_ATTN_DECODE_SDPA", Kind::User, "1", "default on; =0 returns to v1. Decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4)", ""},

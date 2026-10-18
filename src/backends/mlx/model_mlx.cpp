@@ -152,6 +152,29 @@ bool Model::spec_advance() {
     auto& i = *impl_;
     if (!i.active || i.done) return false;
     const uint32_t limit = i.count;
+    static const bool sample_ar = std::getenv("TQLLM_MLX_SAMPLE_AR") != nullptr;  // debug: token-by-token sampling
+    if (i.sampling && sample_ar) {
+        auto logits = i.engine->forward({&i.pending, 1});
+        auto scaled = mx::multiply(mx::astype(mx::reshape(logits, {-1}), mx::float32), mx::array(1.0f / i.temperature));
+        mx::eval(scaled);
+        const float* p = scaled.data<float>(); const size_t v = scaled.size();
+        std::vector<std::pair<float, uint32_t>> top;
+        const int k = i.top_k > 0 ? i.top_k : 64;
+        for (size_t t = 0; t < v; ++t) {
+            if (int(top.size()) < k) {top.push_back({p[t], uint32_t(t)}); std::push_heap(top.begin(), top.end(), std::greater<>());}
+            else if (p[t] > top.front().first) {std::pop_heap(top.begin(), top.end(), std::greater<>()); top.back() = {p[t], uint32_t(t)}; std::push_heap(top.begin(), top.end(), std::greater<>());}
+        }
+        std::sort(top.rbegin(), top.rend());
+        double z = 0; std::vector<double> w(top.size());
+        for (size_t t = 0; t < top.size(); ++t) {w[t] = std::exp(double(top[t].first - top[0].first)); z += w[t];}
+        double mass = 0; size_t keep = top.size();
+        for (size_t t = 0; t < top.size(); ++t) {mass += w[t] / z; if (mass >= i.top_p) {keep = t + 1; break;}}
+        std::discrete_distribution<size_t> pick(w.begin(), w.begin() + long(keep));
+        i.pending = top[pick(i.rng)].second;
+        i.output.push_back(i.pending); ++i.steps;
+        i.done = i.output.size() >= limit || i.pending == i.eos;
+        return !i.done;
+    }
     const int pos = i.engine->position(), want = std::min(verify_width(i.width, pos), int(limit - i.output.size()));
     if (want < 1) {i.done = true; return false;}
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
@@ -210,6 +233,18 @@ bool Model::spec_advance() {
             break;
         }
         if (acc == want) {row_dist(want, d); sampled_ids[size_t(want)] = draw(d, UINT32_MAX);}
+        static const bool debug = std::getenv("TQLLM_MLX_SAMPLE_DEBUG") != nullptr;
+        if (debug && i.steps < 3) {
+            auto arg = mx::argmax(verified, -1); mx::eval(arg);
+            const auto* am = arg.data<uint32_t>();
+            for (int r = 0; r <= std::min(want, 3); ++r) {
+                row_dist(r, d);
+                std::fprintf(stderr, "SAMPLE_DEBUG step %llu row %d argmax %u proposed %u top:", (unsigned long long)i.steps, r, am[r], r < want ? proposed[r] : 0u);
+                for (size_t t = 0; t < std::min<size_t>(d.size(), 3); ++t) std::fprintf(stderr, " %u:%.3f", d[t].second, d[t].first);
+                std::fprintf(stderr, "\n");
+            }
+            std::fprintf(stderr, "SAMPLE_DEBUG verified shape %d x %d, idx %d x %d, acc %d\n", int(verified.shape(0)), verified.ndim() > 1 ? int(verified.shape(1)) : -1, int(idx.shape(0)), int(idx.shape(1)), acc);
+        }
         ids = sampled_ids.data();
     }
     auto features = i.engine->feature_states();
