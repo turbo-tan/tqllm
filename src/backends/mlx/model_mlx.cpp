@@ -5,6 +5,7 @@
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "dflash.hpp"
+#include "sampling.hpp"
 #include "qwen35.hpp"
 #include "wired_limit.hpp"
 #include "gguf.hpp"
@@ -20,6 +21,9 @@
 namespace mx = mlx::core;
 using tqllm::mlx_backend::DFlash2;
 using tqllm::mlx_backend::verify_width;
+using tqllm::mlx_backend::filtered_distribution;
+using tqllm::mlx_backend::speculative_pick;
+using tqllm::mlx_backend::draw_excluding;
 using tqllm::mlx_backend::Qwen35;
 
 namespace tqllm {
@@ -207,33 +211,16 @@ bool Model::spec_advance() {
         mx::eval(idx, val, drafted);
         proposed = drafted.data<uint32_t>();
         const auto* pi = idx.data<uint32_t>(); const auto* pv = val.data<float>();
-        std::uniform_real_distribution<double> unit(0.0, 1.0);
         sampled_ids.assign(size_t(rows), 0u);
-        auto row_dist = [&](int r, std::vector<std::pair<double, uint32_t>>& d) {
-            d.clear();
-            for (int t = 0; t < k; ++t) d.push_back({double(pv[r * k + t]), pi[r * k + t]});
-            std::sort(d.begin(), d.end(), [](auto& x, auto& y) {return x.first > y.first;});
-            const double peak = d[0].first;  // read once: the loop overwrites d[0]
-            double z = 0; for (auto& e : d) {e.first = std::exp(e.first - peak); z += e.first;}
-            double mass = 0; size_t keep = d.size();
-            for (size_t t = 0; t < d.size(); ++t) {mass += d[t].first / z; if (mass >= i.top_p) {keep = t + 1; break;}}
-            d.resize(keep); z = 0; for (auto& e : d) z += e.first; for (auto& e : d) e.first /= z;
-        };
-        auto draw = [&](const std::vector<std::pair<double, uint32_t>>& d, uint32_t skip) {
-            double z = 0; for (auto& e : d) if (e.second != skip) z += e.first;
-            double u = unit(i.rng) * z, c = 0; uint32_t last = d[0].second;
-            for (auto& e : d) {if (e.second == skip) continue; last = e.second; c += e.first; if (u < c) return e.second;}
-            return last;
-        };
+        auto row_dist = [&](int r, std::vector<std::pair<double, uint32_t>>& d) {d = filtered_distribution(pv + r * k, pi + r * k, k, i.top_p);};
         std::vector<std::pair<double, uint32_t>> d;
         for (; acc < want; ++acc) {
             row_dist(acc, d);
-            double px = 0; for (auto& e : d) if (e.second == proposed[acc]) px = e.first;
-            if (unit(i.rng) < px) {sampled_ids[size_t(acc)] = proposed[acc]; continue;}
-            sampled_ids[size_t(acc)] = d.size() == 1 && d[0].second == proposed[acc] ? proposed[acc] : draw(d, proposed[acc]);
-            break;
+            const auto [taken, token] = speculative_pick(d, proposed[acc], i.rng);
+            sampled_ids[size_t(acc)] = token;
+            if (!taken) break;
         }
-        if (acc == want) {row_dist(want, d); sampled_ids[size_t(want)] = draw(d, UINT32_MAX);}
+        if (acc == want) {row_dist(want, d); sampled_ids[size_t(want)] = draw_excluding(d, UINT32_MAX, i.rng);}
         static const bool debug = std::getenv("TQLLM_MLX_SAMPLE_DEBUG") != nullptr;
         if (debug && i.steps < 3) {
             auto arg = mx::argmax(verified, -1); mx::eval(arg);
