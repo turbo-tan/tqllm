@@ -75,8 +75,9 @@ new violation and on an entry that no longer applies, so remove an entry in the 
 
 - Shared kernel primitives (norms, GEMV, attention helpers) still live in `qwen35_kernels.cuh` and `qwen2_kernels.cuh`,
   so several formats include a model header. They move to `src/core`.
-- The Flash-Next engine and its stage tool are one file (`src/models/qwen/qwen4exp/tqfn_stage.cpp`), and it keeps its
-  own K/V buffers (rule 4). Splitting the engine from the tool and moving its K/V onto `src/kv` is the next step.
+- The Flash-Next engine is split from its tool (`fn_*.hpp` components; `tools/tqfn_stage.cpp`), but it still keeps its
+  own K/V buffers (rule 4) and its own projection dispatch instead of the `WeightFormat` registry. Moving K/V onto
+  `src/kv` and the projections onto the registry are the next steps.
 
 `docs/dev/layout-map-20261017.tsv` maps every path from before this layout to its new place, including paths that
 only exist on open branches; use it to move a branch onto this layout.
