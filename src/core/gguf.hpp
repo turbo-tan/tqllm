@@ -28,6 +28,8 @@ enum GgmlType : uint32_t {
     GGML_BF16 = 30,
     GGML_TQ3_4S = 46,
     GGML_TQ4 = 300, GGML_TQ3 = 301,  // TQLLM-only ids
+    GGML_TQMLX_TILED3 = 310, GGML_TQMLX_TILED4 = 311, GGML_TQMLX_MMA8_3 = 312, GGML_TQMLX_MMA8_4 = 313,  // tq_mlx kernel-ready layouts
+    GGML_NAX_A4_G128 = 314, GGML_NAX_A6_G64 = 315, GGML_AFF8_G64 = 316, GGML_NAX_A4_G64 = 317,  // affine, M5 matrix-unit lane order (8-bit: row-major)
     GGML_GSQ_Q2_0 = 302,  // explicit GSQ-RCO dialect: external id42, not fork Q1_0
 };
 
@@ -77,6 +79,7 @@ struct GgufFile {
     std::string path;
     std::map<std::string, GgufValue> kv;
     std::map<std::string, GgufTensor> tensors;
+    uint64_t n_kv = 0, kv_end = 0, alignment = 32;  // kv_end: byte offset just after the metadata block
 
     double num(const std::string & key) const;
     double num(const std::string & key, double fallback) const;
@@ -89,5 +92,6 @@ struct GgufFile {
 
 enum class GgufDialect { Native, GsqRco };
 GgufFile gguf_open(const std::string & path, GgufDialect dialect = GgufDialect::Native);
+uint64_t gguf_tensor_bytes(uint32_t type, const std::vector<uint64_t> & ne, const std::string & name);
 
 } // namespace tqllm

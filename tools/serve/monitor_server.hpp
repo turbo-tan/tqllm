@@ -5,7 +5,7 @@
 #include <atomic>
 #include <stdexcept>
 #include <thread>
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -13,7 +13,7 @@
 #endif
 
 namespace tqserve {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 // Independent telemetry listener and bounded same-instance chat bridge; no engine locks.
 class MonitorServer {
 public:
