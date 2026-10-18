@@ -11,6 +11,18 @@
 #include <unistd.h>
 #include <vector>
 
+// physical backing for the mapped test ranges: memfd on Linux, an unlinked temp file elsewhere (macOS has no memfd)
+static int phys_fd() {
+#if defined(__linux__)
+    return memfd_create("kvphys", 0);
+#else
+    char path[] = "/tmp/tqllm-kvphys-XXXXXX";
+    const int f = mkstemp(path);
+    if (f >= 0) unlink(path);
+    return f;
+#endif
+}
+
 using namespace tqllm;
 
 static int fails = 0;
@@ -80,7 +92,7 @@ struct FakeMemory : KvMemory {
     }
     void * phys_alloc(size_t n) override {
         if (dev_live + n > dev_budget) return nullptr;
-        if (fd < 0) fd = memfd_create("kvphys", 0);
+        if (fd < 0) fd = phys_fd();
         if (fd < 0 || ftruncate(fd, off_t(fd_size + n))) return nullptr;
         dev_live += n;
         ++phys_live;
