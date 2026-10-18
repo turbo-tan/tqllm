@@ -28,10 +28,7 @@ std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<c
 mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
 int nax_affine_splits(const NaxAffine& weights);
 // The stored matrix as FP16 [rows, columns], the values the matmul kernel multiplies.
-mlx::core::array nax_affine_dequant(const NaxAffine& weights, bool transposed = false);  // transposed: [columns, rows]
-// FP16 [m, rows] = FP16 input times the dequantized matrix (prefill): long-K matrices dequantize straight into
-// [columns, rows] for a plain x @ W (TQLLM_MLX_PREFILL_WT=0 keeps x @ W.T).
-mlx::core::array nax_affine_prefill_product(const NaxAffine& weights, const mlx::core::array& input);
+mlx::core::array nax_affine_dequant(const NaxAffine& weights);
 // Prefill GEMM without the FP16 weight copy: each threadgroup decodes its 64 output columns of the packed weights into a
 // double-buffered threadgroup stage, 64 inputs per step, and matmul2d reads the [m, columns] FP16 input from device memory
 // (4-bit affine and TQ4; FP32 [m, rows] out, optionally BF16-rounded). Accumulates in FP32, so it differs from
