@@ -351,28 +351,58 @@ const char* kToMlx = R"METAL(
     }
 )METAL";
 
+// TQ4 as MLX 8-bit affine: code -> level + 128 (1..255), scale s, bias -128 s. quantized_matmul dequantizes
+// float(q) * s + b in FP32 (exact: level * s) and rounds once to FP16, the value TQ4's own kernels use.
+const char* kTq4ToMlx8 = R"METAL(
+    const uint t = thread_position_in_grid.x;
+    const uint kw = t % uint(K / 4), r = t / uint(K / 4);
+    if (r >= uint(N)) return;
+    const uint blk = r / 32u, rr = r % 32u, sel = rr / 16u, fn = rr % 16u & ~3u, p = rr & 3u;
+    const uint ks = kw / 4u, j = (kw >> 1) & 1u, f0 = (kw & 1u) * 4u;
+    uint word = 0u;
+    for (uint e = 0; e < 4u; e++) {
+        const uint fm = f0 + e;
+        const uint lane = ((fm >> 2) << 4) | ((fn >> 3) << 3) | ((fm & 3u) << 1) | ((fn >> 2) & 1u);
+        const uint src = W[(((size_t)blk * STEPS + ks) * 32u + lane) * 2u + sel];
+        const uint code = (src >> (4u * (p + 4u * j))) & 15u;
+        word |= uint(int(TQ4_LEVEL[code]) + 128) << (8u * e);
+    }
+    Q[t] = word;
+    if (kw % uint(GS / 4) == 0u) {
+        const uint g = kw * 4u / uint(GS);
+        const half s = as_type<half>(S[((size_t)blk * GPR + g) * 32u + rr]);
+        SO[(size_t)r * GPR + g] = s;
+        BO[(size_t)r * GPR + g] = s * -128.0h;
+    }
+)METAL";
+
 bool nax_affine_mlx_compatible(const NaxAffine& w) {
-    return w.bits == 4 && !w.tq4 && !w.q6 && (w.group == 32 || w.group == 64 || w.group == 128);
+    if (w.tq4) return w.group == 128;
+    return w.bits == 4 && !w.q6 && (w.group == 32 || w.group == 64 || w.group == 128);
 }
 
 NaxMlx nax_affine_to_mlx(const NaxAffine& w) {
-    if (!nax_affine_mlx_compatible(w)) throw std::invalid_argument("nax affine to mlx: needs 4-bit affine, group 32/64/128");
-    static auto kernel = mx::fast::metal_kernel("tqllm_nax_affine_to_mlx", {"W", "S", "Bz"}, {"Q", "SO", "BO"}, kToMlx, kHeader);
-    const int gpr = w.columns / w.group;
-    const int threads = w.rows * (w.columns / 8);
-    auto out = kernel({w.words, w.scales, w.biases}, {{w.rows, w.columns / 8}, {w.rows, gpr}, {w.rows, gpr}},
-                      {mx::uint32, mx::float16, mx::float16}, {threads, 1, 1}, {256, 1, 1},
-                      {{"K", w.columns}, {"N", w.rows}, {"STEPS", w.columns / 16}, {"GPR", gpr}, {"GS", w.group}},
-                      std::nullopt, false, mx::Device(mx::Device::gpu));
-    return {out[0], out[1], out[2]};
+    if (!nax_affine_mlx_compatible(w)) throw std::invalid_argument("nax affine to mlx: needs 4-bit affine (group 32/64/128) or TQ4");
+    static auto kernel4 = mx::fast::metal_kernel("tqllm_nax_affine_to_mlx", {"W", "S", "Bz"}, {"Q", "SO", "BO"}, kToMlx, kHeader);
+    static auto kernel8 = mx::fast::metal_kernel("tqllm_nax_tq4_to_mlx8", {"W", "S"}, {"Q", "SO", "BO"}, kTq4ToMlx8, kHeader);
+    const int gpr = w.columns / w.group, bits = w.tq4 ? 8 : 4, per_word = 32 / bits;
+    const int threads = w.rows * (w.columns / per_word);
+    const std::vector<mx::Shape> shapes = {{w.rows, w.columns / per_word}, {w.rows, gpr}, {w.rows, gpr}};
+    const std::vector<mx::Dtype> types = {mx::uint32, mx::float16, mx::float16};
+    const std::vector<std::pair<std::string, mx::fast::TemplateArg>> args =
+        {{"K", w.columns}, {"N", w.rows}, {"STEPS", w.columns / 16}, {"GPR", gpr}, {"GS", w.group}};
+    auto out = w.tq4 ? kernel8({w.words, w.scales}, shapes, types, {threads, 1, 1}, {256, 1, 1}, args, std::nullopt, false, mx::Device(mx::Device::gpu))
+                     : kernel4({w.words, w.scales, w.biases}, shapes, types, {threads, 1, 1}, {256, 1, 1}, args, std::nullopt, false, mx::Device(mx::Device::gpu));
+    return {out[0], out[1], out[2], bits};
 }
 
 mx::array nax_affine_product_fp16(const NaxAffine& w, const mx::array& x) {
-    // TQLLM_MLX_PREFILL_QMM: 1 (default) quantized_matmul on weights repacked per call, 0 dequant + matmul
+    // TQLLM_MLX_PREFILL_QMM: 1 (default) quantized_matmul on weights repacked per call for 4-bit affine, 2 also TQ4 (as
+    // 8-bit affine), 0 dequant + matmul
     static const int qmm = std::getenv("TQLLM_MLX_PREFILL_QMM") ? std::atoi(std::getenv("TQLLM_MLX_PREFILL_QMM")) : 1;
-    if (qmm > 0 && nax_affine_mlx_compatible(w)) {
+    if (qmm > 0 && (!w.tq4 || qmm >= 2) && nax_affine_mlx_compatible(w)) {
         const auto q = nax_affine_to_mlx(w);
-        return mx::quantized_matmul(x, q.words, q.scales, q.biases, true, w.group, 4);
+        return mx::quantized_matmul(x, q.words, q.scales, q.biases, true, w.group, q.bits);
     }
     return mx::matmul(x, mx::transpose(nax_affine_dequant(w)));
 }
