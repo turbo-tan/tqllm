@@ -920,7 +920,9 @@ struct Qwen35::Impl {
         // on by default since j726 (shipped config + 8-lane scan: prefill +0.9-6 %, KL below the chunk-64 floor; j606's
         // loss at 2K was before the shipped epilogues); =0 off
         static const bool gdn_fuse_prefill=!std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL") || std::string(std::getenv("TQLLM_MLX_GDN_FUSE_PREFILL"))!="0";
-        const bool gdn_fuse=gdn_fuse_all || (gdn_fuse_prefill && m>8);
+        // prefill chunks only: verify (16 rows, prefix capture) must run the same ops as AR (1 row) or spec != AR
+        // (j743: doc8k x 512 diverged at token 367 when verify's 16 rows took the fused kernels and AR did not)
+        const bool gdn_fuse=gdn_fuse_all || (gdn_fuse_prefill && m>16 && !capture_prefix);
         const bool fused_pre=gdn_fuse && ablate_blocks.find("gnorm")==std::string::npos && dk==128 && dv==128;
         auto result=ablate_blocks.find("gconv")!=std::string::npos?tail_slice(joined,0,conv-1,conv-1+m):
             fused_pre?gdn_pre_fused(joined,weights,kh,1.0f/std::sqrt(float(dk))):
