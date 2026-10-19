@@ -173,6 +173,13 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         Device<__nv_bfloat16> eg(size_t(A) * c.expert_ff), eu(eg.count), ed(size_t(A) * h);
         Device<__half> ax(eg.count);
         const int W = cache.slots(layer);
+        // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
+        // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average.
+        // Decided per layer from slot-independent counts, and only when every slot count runs waves (A > experts):
+        // the GEMM rounds differently from the dedup kernel the split path uses, so a slot-dependent switch changed
+        // greedy text with the slot count (a 23-token prompt: 230 rows, ~8 per expert).
+        static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
+        const bool wave_gemm = gemm_avg > 0 && A > c.experts && A >= gemm_avg * int(u.size());
         for (size_t w0 = 0; w0 < u.size(); w0 += size_t(W)) {
             const std::vector<int> wave(u.begin() + long(w0), u.begin() + long(std::min(u.size(), w0 + size_t(W))));
             const auto wslots = cache.prepare(layer, wave);
@@ -199,11 +206,6 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
             std::vector<int> grp(size_t(W) * wcap, 0), fill(size_t(W), 0);
             for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) grp[size_t(sl) * wcap + size_t(fill[size_t(sl)]++)] = a; }
             Device<int> dcnt(cnt.size()), dgrp(grp.size()); dcnt.put(cnt); dgrp.put(grp);
-            // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
-            // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average
-            static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
-            int wave_a = 0; for (int x : cnt) wave_a += x;
-            const bool wave_gemm = gemm_avg > 0 && wave_a >= gemm_avg * int(wave.size());
             auto gemm_fmt = [](const Mat & mm) {
                 const int id = mm.fmt->u4h_id();
                 return (id == 1 || id == 4 || id == 5 || id == 6 || id == 7 || id == 10 || id == 13 || id == 14) && mm.cols % (id == 14 ? 128 : 256) == 0;
