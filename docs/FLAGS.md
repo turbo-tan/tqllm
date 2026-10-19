@@ -17,13 +17,13 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_PREFILL_INT8` | - | 1: int8 matrix-unit prefill for FFN gate/up (opt-in, quality changes; 2 = exact slow mode) |  |
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |
 | `TQFN_ARENA_MB` | - | MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit) |  |
-| `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (opt-in) |  |
+| `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off) |  |
 | `TQFN_DRAFT_VOCAB` | - | FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab) |  |
 | `TQFN_KV` | - | KV format for Flash-Next attention (name from the KV format registry; default bf16) |  |
 | `TQFN_KV_HOST` | off | 1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM, slower decode at long context) |  |
 | `TQFN_KV_HOST_KEEP` | 32768 | positions of K/V kept on the device with TQFN_KV_HOST=1 |  |
 | `TQFN_LAYER_SLOTS` | - | comma list of expert slots per layer (overrides the packed file's .slots profile) |  |
-| `TQFN_MTP_SLOTS` | 256 | MTP expert slots (every expert when the trunk keeps every expert) |  |
+| `TQFN_MTP_SLOTS` | 256 | MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards) |  |
 
 ## Debug
 
@@ -159,9 +159,9 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_CPU_CHECK` | off | check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF |  |
 | `TQFN_CPU_GGUF` | off | the CPU miss pool reads the GGUF instead of the pinned packed copy |  |
 | `TQFN_CPU_GGUF_ROWS` | off | debug A/B: the CPU miss pool reads GGUF rows instead of rebuilding them from the pinned packed copy |  |
-| `TQFN_AUTO_KEEP_MB` | - | MB slots=auto keeps free beside the expert banks instead of the full-context attention room (12 GB card: 512); long prompts borrow banks |  |
+| `TQFN_AUTO_KEEP_MB` | - | MB slots=auto keeps free beside the expert banks instead of the full-context attention room (small cards: 512); long prompts borrow banks |  |
 | `TQFN_EXPERT_PROFILE` | - | seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune) |  |
-| `TQFN_CPU_MISS_MAX` | - | K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses |  |
+| `TQFN_CPU_MISS_MAX` | - | K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses (small cards: 5) |  |
 | `TQFN_CPU_REFILL` | off | refill the expert banks from the CPU pool's copies (A/B) |  |
 | `TQFN_CPU_SPIN_MS` | 2 | ms the CPU miss workers spin before sleeping |  |
 | `TQFN_DENSE_INT8` | 0 | 1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path) |  |

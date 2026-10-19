@@ -47,6 +47,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.fixtures = std::make_unique<Fixtures>();
     f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true;
     const auto & c = f.cp->config; auto & checkpoint = *f.cp;
+    g_small_card = f.slots_auto && !f.experts.empty() && tqllm::device_free_bytes() < (size_t(16) << 30);
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, size_t(f.budget_gb * 1024 * 1024 * 1024),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     apply_layer_slots(*f.cache, f.experts, f.slots);
@@ -87,7 +88,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         f.packed.tiled = true;
     }
     if (f.packed.tiled) { tqllm_cuda::set_tiled_experts(true); g_tile_experts = true; }
-    if (std::getenv("TQFN_CPU_MISS")) {  // CPU pool reads the pinned copy; the GGUF expert pages would hold the experts twice
+    if (std::getenv("TQFN_CPU_MISS") || g_small_card) {  // CPU pool reads the pinned copy; the GGUF expert pages would hold the experts twice
         static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
         pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
         for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
@@ -98,7 +99,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     // MTP experts prepacked in pinned memory
     // all experts resident (GB10): the MTP block's experts too, so its prefill catch-up can run whole chunks
-    const int mtp_slots = std::getenv("TQFN_MTP_SLOTS") ? std::atoi(std::getenv("TQFN_MTP_SLOTS")) : (f.slots >= c.experts ? c.experts : 256);
+    const int mtp_slots = std::getenv("TQFN_MTP_SLOTS") ? std::atoi(std::getenv("TQFN_MTP_SLOTS")) : g_small_card ? 64 : (f.slots >= c.experts ? c.experts : 256);
     f.mtp_cache = std::make_unique<MixedExpertCache>(c.layers + 1, c.experts, c.hidden, c.expert_ff, mtp_slots, size_t(mtp_slots) * (6u << 20) + (64u << 20),
                     [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     const auto first = repack_expert(checkpoint, c.layers, 0); for (const auto & p : first) f.mtp_block += p.size();
@@ -167,7 +168,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           // TQFN_AUTO_KEEP_MB (debug A/B): what slots=auto keeps free beside the banks, instead of the full-context attention
           // state + decode reserve (a long prompt then borrows banks for its state)
           static const char * keep_env = std::getenv("TQFN_AUTO_KEEP_MB");
-          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : state + reserve + (size_t(256) << 20);
+          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : state + reserve + (size_t(256) << 20);
+          if (g_small_card) std::fprintf(stderr, "tqllm: small card: CPU expert pool, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n");
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
               for (int l = 0; l < c.layers; ++l) f.cache->release_bank(l);

@@ -240,7 +240,8 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         ck(cudaMemcpyAsync(ids_host.p, routed.p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         if (predict) ck(cudaMemcpyAsync(ids_host.p + A, next_ids->p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         static cudaEvent_t ids_ready = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
-        static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : 0;
+        static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))
+                                   : g_small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
         const bool use_cpu = cpu_pool && trunk && n <= 4;
@@ -299,7 +300,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                                sub = r; }
                 if (sub < 0) continue;  // nothing resident in the whole layer: the GPU miss path serves it
                 // TQFN_CPU_MISS_MAX=K: at most K distinct experts per layer call on the CPU, the rest are GPU misses
-                static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : 1 << 30;
+                static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : g_small_card ? 5 : 1 << 30;
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
                 auto [it, fresh] = job_of.try_emplace(e, int(jobs.size()));
                 if (fresh) {
