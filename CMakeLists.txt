@@ -258,6 +258,7 @@ if(TQLLM_CUDA)
   add_executable(test-mixed-expert-cache tests/mixed_expert_cache.cu)
   target_link_libraries(test-mixed-expert-cache PRIVATE tqllm CUDA::cudart)
   add_test(NAME mixed_expert_cache COMMAND test-mixed-expert-cache)
+  set_tests_properties(mixed_expert_cache PROPERTIES RUN_SERIAL TRUE)  # fills the device to test a prefetch with no room
   add_executable(test-pf-events tests/pf_events.cu)
   target_link_libraries(test-pf-events PRIVATE tqllm CUDA::cudart)
   add_test(NAME pf_events COMMAND test-pf-events)
