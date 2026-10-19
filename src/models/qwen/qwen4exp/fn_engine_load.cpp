@@ -1,4 +1,5 @@
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
+#include <fstream>
 #include "fn_engine.hpp"
 
 namespace tqllm::flashnext {
@@ -175,6 +176,25 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               if (after >= need || f.slots <= 1) break;
               extra += need - after;
           }
+      }
+      // TQFN_EXPERT_PROFILE=FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
+      // layer's most-routed experts instead of what the synthetic warm-up prompt happened to route (the first request
+      // otherwise runs on a cold cache)
+      if (const char * prof = std::getenv("TQFN_EXPERT_PROFILE")) {
+          std::ifstream in(prof, std::ios::binary); std::vector<int32_t> cnt(size_t(c.layers) * c.experts);
+          in.read(reinterpret_cast<char *>(cnt.data()), std::streamsize(cnt.size() * 4));
+          if (!in) throw std::runtime_error(std::string("TQFN_EXPERT_PROFILE: cannot read ") + prof + " as int32 [layers][experts]");
+          int seeded = 0;
+          for (int l = 0; l < c.layers; ++l) {
+              if (!f.cache->has_layout(l)) continue;
+              std::vector<int> ids(size_t(c.experts)); for (int e = 0; e < c.experts; ++e) ids[size_t(e)] = e;
+              const int32_t * row = cnt.data() + size_t(l) * c.experts;
+              std::stable_sort(ids.begin(), ids.end(), [&](int x, int y) { return row[x] > row[y]; });
+              ids.resize(size_t(std::min(f.cache->slots(l), c.experts)));
+              (void) f.cache->prepare(l, ids); f.cache->wait_misses(); seeded += int(ids.size());
+          }
+          ck(cudaDeviceSynchronize());
+          std::fprintf(stderr, "tqllm: expert banks seeded from %s: %d experts\n", prof, seeded);
       }
       f.res_host_cap = size_t(context) * size_t(warm.width); ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), f.res_host_cap * sizeof(float)));
       f.cache->set_miss_stream(nullptr);
