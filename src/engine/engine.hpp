@@ -82,7 +82,7 @@ struct Engine {
 
 // Qwen3.5 dense hybrid (Gated DeltaNet + gated attention), BF16 weights read from safetensors in `dir`.
 // `slots` sequences share the weights; each gets `context` positions.
-// Flash-Next (qwen4exp) engine: compiled into tqserve with src/models/qwen/qwen4exp/tqfn_stage.cpp (TQFN_SERVE_ENGINE), which registers it;
+// Flash-Next (qwen4exp) engine: compiled into tqserve with src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which registers it;
 // a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects it.
 using FlashNextFactory = std::unique_ptr<Engine> (*)(const std::string & manifest, const std::string & tokenizer, uint32_t context,
                                                      int slots, const EngineOptions & options);

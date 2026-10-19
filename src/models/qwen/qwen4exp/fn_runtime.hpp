@@ -77,7 +77,11 @@ inline int g_kv_capacity = 2048;
 inline bool g_small_card = false;
 
 using namespace tqllm;
-inline void ck(cudaError_t rc, int line = __builtin_LINE()) { if (rc != cudaSuccess) throw std::runtime_error(std::string(cudaGetErrorString(rc)) + " (tqfn_stage.cpp:" + std::to_string(line) + ")"); }
+inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = __builtin_LINE()) {
+    if (rc == cudaSuccess) return;
+    const char * base = std::strrchr(file, '/');
+    throw std::runtime_error(std::string(cudaGetErrorString(rc)) + " (" + (base ? base + 1 : file) + ":" + std::to_string(line) + ")");
+}
 inline void require(bool ok, const std::string & why) { if (!ok) throw std::runtime_error(why); }
 inline bool exact_f32() { static const bool on = std::getenv("TQFN_EXACT_F32") != nullptr; return on; }
 inline void f32_to_half_host(const float * src, __half * dst, size_t count) {
