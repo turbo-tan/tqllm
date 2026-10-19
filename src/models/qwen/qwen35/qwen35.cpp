@@ -922,7 +922,7 @@ private:
             const auto b = f16_to_bf16_host(host);
             return {put(b.data(), b.size()), GGML_BF16, rows, cols};
         }
-        if (repack)
+        if (repack && t.type != GGML_BF16)  // dense BF16 stays on the engine cuBLAS path
             if (const auto * wf = weight_format(t.type)) return adopt(wf->load(host, rows, cols, uploader(), stream));
         if (t.type != GGML_TQ3_4S && t.type != GGML_Q6_K && t.type != GGML_BF16 &&
             !((t.type == GGML_Q8_0 || t.type == GGML_Q4_K || t.type == GGML_Q3_K || t.type == GGML_Q5_K ||
@@ -1214,7 +1214,8 @@ private:
                 L.w_mix = g_cat(f, {{p + "attn_qkv.weight", qkvd}, {p + "attn_gate.weight", lv},
                                     {p + "ssm_beta.weight", vh}, {p + "ssm_alpha.weight", vh}}, H);
                 const auto bt = gt(f, p + "ssm_beta.weight").type;
-                if (!L.w_mix.p && (bt == GGML_BF16 || bt == GGML_F32 || bt == GGML_F16) && weight_format(gt(f, p + "attn_qkv.weight").type)) {
+                if (!L.w_mix.p && (bt == GGML_BF16 || bt == GGML_F32 || bt == GGML_F16) && gt(f, p + "attn_qkv.weight").type != GGML_BF16 &&
+                    weight_format(gt(f, p + "attn_qkv.weight").type)) {
                     L.w_mix = g_cat(f, {{p + "attn_qkv.weight", qkvd}, {p + "attn_gate.weight", lv}}, H);
                     L.w_ba = g_cat(f, {{p + "ssm_beta.weight", vh}, {p + "ssm_alpha.weight", vh}}, H);
                     if (!L.w_mix.p || L.w_ba.type != GGML_BF16) throw std::runtime_error("W4A16: unexpected Gated DeltaNet types");

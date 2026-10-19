@@ -304,4 +304,8 @@ void bf16_to_h(const __nv_bfloat16 * x, __half * y, int n, cudaStream_t);
 // BF16 -> FP32 copy (activation feed for q6k_matvec).
 void bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t);
 
+// Dense BF16 (bf16 = true) or F16 matrices [rows, k]: y (BF16, or FP32 when f32_out) = W x for 1..8 columns.
+void fp_matvec(bool bf16, const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t,
+               int ldy = 0);  // ldy: output column stride (0 = rows)
+void fp_dequant_h(bool bf16, const void * w, __half * out, size_t n, cudaStream_t);
 } // namespace tqllm_cuda
