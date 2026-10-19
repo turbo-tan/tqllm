@@ -158,6 +158,9 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_CPU_BENCH` | - | THREADS: time the CPU expert-miss pool alone on real expert bytes and exit |  |
 | `TQFN_CPU_CHECK` | off | check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF |  |
 | `TQFN_CPU_GGUF` | off | the CPU miss pool reads the GGUF instead of the pinned packed copy |  |
+| `TQFN_CPU_GGUF_ROWS` | off | debug A/B: the CPU miss pool reads GGUF rows instead of rebuilding them from the pinned packed copy |  |
+| `TQFN_AUTO_KEEP_MB` | - | MB slots=auto keeps free beside the expert banks instead of the full-context attention room (12 GB card: 512); long prompts borrow banks |  |
+| `TQFN_EXPERT_PROFILE` | - | seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune) |  |
 | `TQFN_CPU_MISS_MAX` | - | K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses |  |
 | `TQFN_CPU_REFILL` | off | refill the expert banks from the CPU pool's copies (A/B) |  |
 | `TQFN_CPU_SPIN_MS` | 2 | ms the CPU miss workers spin before sleeping |  |

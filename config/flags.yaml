@@ -982,6 +982,18 @@ flags:
     kind: debug
     default: "off"
     doc: "the CPU miss pool reads the GGUF instead of the pinned packed copy"
+  - name: TQFN_CPU_GGUF_ROWS
+    kind: debug
+    default: "off"
+    doc: "debug A/B: the CPU miss pool reads GGUF rows instead of rebuilding them from the pinned packed copy"
+  - name: TQFN_AUTO_KEEP_MB
+    kind: debug
+    default: "-"
+    doc: "MB slots=auto keeps free beside the expert banks instead of the full-context attention room (12 GB card: 512); long prompts borrow banks"
+  - name: TQFN_EXPERT_PROFILE
+    kind: debug
+    default: "-"
+    doc: "seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune)"
   - name: TQFN_CPU_MISS
     kind: user
     default: "0"
