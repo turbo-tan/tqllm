@@ -1,4 +1,5 @@
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
+#include <fstream>
 #include "fn_engine.hpp"
 
 namespace tqllm::flashnext {
@@ -16,7 +17,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         const auto k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "gguf") f.ggufs.push_back(resolve(v)); else if (k == "mtp") f.mtp = resolve(v);
         else if (k == "experts") f.experts = resolve(v); else if (k == "draft_vocab") f.draft_vocab = resolve(v);
-        else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? 64 : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
+        else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? kAutoStartSlots : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
         else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = g_tune.chunk > 0 ? g_tune.chunk : std::stoi(v);  // --prefill-chunk (16384) over the manifest
         else if (k == "gsq_rco") f.gsq_rco = v != "0";
         else throw std::runtime_error("unknown Flash-Next manifest key " + k);
@@ -86,6 +87,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         f.packed.tiled = true;
     }
     if (f.packed.tiled) { tqllm_cuda::set_tiled_experts(true); g_tile_experts = true; }
+    if (std::getenv("TQFN_CPU_MISS")) {  // CPU pool reads the pinned copy; the GGUF expert pages would hold the experts twice
+        static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
+        pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
+        for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
+        g_cpu_packed = &pv; std::printf("tqllm: CPU miss pool reads the pinned packed experts\n");
+    }
     PackedExperts * pk = &f.packed;
     f.cache->set_prepacked([pk](int layer, int id) -> const char * { return layer < pk->layers ? pk->at(layer, id) : nullptr; }, true);
     }
@@ -156,7 +163,11 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
       if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep
           size_t per = 0; for (int l = 0; l < c.layers; ++l) if (f.cache->has_layout(l)) per += f.cache->bank_layout(l).block;
-          const auto [state, reserve] = context_keep(); const size_t need = state + reserve + (size_t(256) << 20);
+          const auto [state, reserve] = context_keep();
+          // TQFN_AUTO_KEEP_MB (debug A/B): what slots=auto keeps free beside the banks, instead of the full-context attention
+          // state + decode reserve (a long prompt then borrows banks for its state)
+          static const char * keep_env = std::getenv("TQFN_AUTO_KEEP_MB");
+          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : state + reserve + (size_t(256) << 20);
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
               for (int l = 0; l < c.layers; ++l) f.cache->release_bank(l);
@@ -172,6 +183,25 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               extra += need - after;
           }
       }
+      // TQFN_EXPERT_PROFILE=FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
+      // layer's most-routed experts instead of what the synthetic warm-up prompt happened to route (the first request
+      // otherwise runs on a cold cache)
+      if (const char * prof = std::getenv("TQFN_EXPERT_PROFILE")) {
+          std::ifstream in(prof, std::ios::binary); std::vector<int32_t> cnt(size_t(c.layers) * c.experts);
+          in.read(reinterpret_cast<char *>(cnt.data()), std::streamsize(cnt.size() * 4));
+          if (!in) throw std::runtime_error(std::string("TQFN_EXPERT_PROFILE: cannot read ") + prof + " as int32 [layers][experts]");
+          int seeded = 0;
+          for (int l = 0; l < c.layers; ++l) {
+              if (!f.cache->has_layout(l)) continue;
+              std::vector<int> ids(size_t(c.experts)); for (int e = 0; e < c.experts; ++e) ids[size_t(e)] = e;
+              const int32_t * row = cnt.data() + size_t(l) * c.experts;
+              std::stable_sort(ids.begin(), ids.end(), [&](int x, int y) { return row[x] > row[y]; });
+              ids.resize(size_t(std::min(f.cache->slots(l), c.experts)));
+              (void) f.cache->prepare(l, ids); f.cache->wait_misses(); seeded += int(ids.size());
+          }
+          ck(cudaDeviceSynchronize());
+          std::fprintf(stderr, "tqllm: expert banks seeded from %s: %d experts\n", prof, seeded);
+      }
       f.res_host_cap = size_t(context) * size_t(warm.width); ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), f.res_host_cap * sizeof(float)));
       f.cache->set_miss_stream(nullptr);
       if (tqllm::debug_on("mem")) checkpoint.resident_report();
@@ -185,7 +215,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
         const size_t fr = tqllm::device_free_bytes();
-        if (fr < state + reserve) {
+        if (fr < state + reserve && std::getenv("TQFN_AUTO_KEEP_MB")) {
+            std::fprintf(stderr, "tqllm: TQFN_AUTO_KEEP_MB: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
+        } else if (fr < state + reserve) {
             const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
             const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;
             throw std::runtime_error("Flash-Next: " + std::to_string(f.slots) + " expert slots per layer leave " + std::to_string(fr >> 20) +
