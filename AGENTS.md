@@ -75,7 +75,7 @@ new violation and on an entry that no longer applies, so remove an entry in the 
 
 - Shared kernel primitives (norms, GEMV, attention helpers) still live in `qwen35_kernels.cuh` and `qwen2_kernels.cuh`,
   so several formats include a model header. They move to `src/core`.
-- The Flash-Next engine is split from its tool (`fn_*.hpp` components; `tools/tqfn_stage.cpp`), but it still keeps its
+- The Flash-Next engine lives in its `fn_*` components (the old `tqfn_stage.cpp` monolith is in `archive/`, never rebuilt), but it still keeps its
   own K/V buffers (rule 4) and its own projection dispatch instead of the `WeightFormat` registry. Moving K/V onto
   `src/kv` and the projections onto the registry are the next steps.
 

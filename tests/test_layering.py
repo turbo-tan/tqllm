@@ -68,6 +68,15 @@ def violations():
 
 
 class Layering(unittest.TestCase):
+    def test_archive_not_referenced(self):
+        """archive/ holds retired sources (archive/README.md): no build file, source, test or script may name them."""
+        files = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+        archived = [Path(f).name for f in files if f.startswith("archive/") and not f.endswith("README.md")]
+        code = (".txt", ".cmake", ".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc", ".py", ".sh", ".yml", ".yaml")
+        build = [f for f in files if not f.startswith("archive/") and (f.endswith(code) or "Dockerfile" in f) and (REPO / f).is_file()]
+        hits = [f"{f}: {name}" for f in build for name in archived if name in (REPO / f).read_text(errors="ignore")]
+        self.assertEqual(hits, [], "archived sources referenced (move the needed code out of archive/ instead)")
+
     def test_includes_point_down(self):
         allowed = set()
         if ALLOW.exists():

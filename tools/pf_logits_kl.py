@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KL divergence between two TQFN_PF_LOGITS dumps (tqfn-stage): the prefill numerics gate.
+"""KL divergence between two TQFN_PF_LOGITS dumps: the prefill numerics gate.
 
 Each dump holds, per prompt position, the top-32 next-token log-probs as (int32 id, float32 logp). The first file is the
 reference (e.g. fp32 accumulate), the second the candidate. KL(ref || cand) is taken over the reference's top-32 plus one
