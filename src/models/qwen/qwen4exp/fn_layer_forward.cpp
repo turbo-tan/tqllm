@@ -287,7 +287,12 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                 if (cache.resident(layer, e)) continue;
                 int sub = -1;
                 for (int q = 0; q < c.topk && sub < 0; ++q) if (cache.resident(layer, routed_ids[t * c.topk + q])) sub = routed_ids[t * c.topk + q];
-                if (sub < 0) continue;  // nothing resident for this token: the GPU miss path serves it
+                // nothing resident for this token: any resident expert of the layer is the placeholder (its output row is
+                // overwritten by the CPU result before the combine), so the miss is not copied over PCIe
+                if (sub < 0) { static std::vector<int> any_res(c.layers + 1, -1); int & r = any_res[layer];
+                               if (r < 0 || !cache.resident(layer, r)) { r = -1; for (int x = 0; x < c.experts && r < 0; ++x) if (cache.resident(layer, x)) r = x; }
+                               sub = r; }
+                if (sub < 0) continue;  // nothing resident in the whole layer: the GPU miss path serves it
                 // TQFN_CPU_MISS_MAX=K: at most K distinct experts per layer call on the CPU, the rest are GPU misses
                 static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : 1 << 30;
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
@@ -296,7 +301,8 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                     CpuMissPool::Job j; const auto pl = cp.expert_payload(layer, e);
                     const int rows[3] = {c.expert_ff, c.expert_ff, h};
                     for (int m = 0; m < 3; ++m) { j.w[m] = pl[m].bytes.data; j.type[m] = pl[m].type; j.row_bytes[m] = pl[m].bytes.size / size_t(rows[m]); }
-                    if (const auto * pv = g_cpu_packed; pv && layer < pv->layers) {
+                    static const bool gguf_rows = std::getenv("TQFN_CPU_GGUF_ROWS") != nullptr;  // debug A/B: GGUF rows, no rebuild from the packed copy
+                    if (const auto * pv = g_cpu_packed; pv && layer < pv->layers && !gguf_rows) {
                         const char * blk = pv->map + pv->base[layer] + uint64_t(e) * pv->block[layer]; uint64_t off = 0;
                         for (int m = 0; m < 3; ++m) {
                             j.dev[m] = blk + off; j.aux[m] = blk + off + pv->sizes[layer][2 * m]; j.fmt[m] = pv->fmt[layer][m];

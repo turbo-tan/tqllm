@@ -257,6 +257,9 @@ public:
         { std::lock_guard<std::mutex> l(m_); stop_ = true; gen_.fetch_add(1); } cv_.notify_all(); for (auto & w : workers_) w.join();
         if (calls_) std::printf("CPU_MISS pool %.3f ms per layer call busy, host blocked %.3f ms per call (%llu calls)\n",
                                 busy_ms_ / calls_, blocked_ms_ / calls_, (unsigned long long) calls_);
+        if (calls_) std::printf("CPU_MISS per call: %.2f experts, %.2f columns; gate/up phase %.3f ms wall (%.3f ms CPU summed over workers), down phase %.3f ms wall (%.3f ms CPU)\n",
+                                double(jobs_sum_) / calls_, double(cols_sum_) / calls_, gu_wall_ms_ / calls_, cpu_ns_gu_.load() / 1e6 / calls_,
+                                dn_wall_ms_ / calls_, cpu_ns_dn_.load() / 1e6 / calls_);
         for (auto & [t, e] : check_gu_) std::printf("CPU_CHECK gate/up type %u int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", t, e.first, e.second);
         if (std::getenv("TQFN_CPU_CHECK")) std::printf("CPU_CHECK packed-row rebuild mismatches vs GGUF: %llu\n", (unsigned long long) row_mismatch_);
         if (check_mag_ > 0) std::printf("CPU_CHECK down int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", check_err_, check_mag_);
@@ -268,6 +271,7 @@ public:
         cpu_prepare_x(x, x_.data(), xq_.data(), xd_.data(), int(x_.size()));
         jobs_ = std::move(jobs); out_ = out; int cols = 0;
         for (auto & j : jobs_) { j.slot = cols; cols += j.ncols; }
+        jobs_sum_ += jobs_.size(); cols_sum_ += uint64_t(cols);
         act_.assign(size_t(cols) * ff_, 0.f);
         // about two items per worker in each phase, whatever the number of experts (load balance)
         const int k = std::max<int>(1, int(jobs_.size())), tw = 2 * int(workers_.size());
@@ -283,6 +287,8 @@ public:
         const auto t1 = std::chrono::steady_clock::now();
         busy_ms_ += std::chrono::duration<double, std::milli>(t_last_.load() > t_start_ ? t_last_.load() - t_start_ : t1 - t_start_).count();
         blocked_ms_ += std::chrono::duration<double, std::milli>(t1 - t0).count(); ++calls_;
+        gu_wall_ms_ += std::chrono::duration<double, std::milli>(t_gu_.load() - t_start_).count();
+        dn_wall_ms_ += std::chrono::duration<double, std::milli>(t_last_.load() - t_gu_.load()).count();
         pending_ = false;
     }
 private:
@@ -394,15 +400,22 @@ private:
                 if (item >= phase_items_[0] + phase_items_[1]) break;
                 if (item >= phase_items_[0])  // down needs every gate/up item finished
                     while (done_.load(std::memory_order_acquire) < phase_items_[0]) _mm_pause();
-                (void) total; work(item);
-                if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == phase_items_[0] + phase_items_[1]) t_last_.store(std::chrono::steady_clock::now());
+                (void) total;
+                const auto w0 = std::chrono::steady_clock::now();
+                work(item);
+                const auto w1 = std::chrono::steady_clock::now();
+                (item >= phase_items_[0] ? cpu_ns_dn_ : cpu_ns_gu_).fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(w1 - w0).count()));
+                const int d = done_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (d == phase_items_[0]) t_gu_.store(w1);
+                if (d == phase_items_[0] + phase_items_[1]) t_last_.store(std::chrono::steady_clock::now());
             }
         }
     }
     int hidden_, ff_; std::vector<std::thread> workers_; std::atomic<uint64_t> gen_{0}; std::atomic<int> next_{0}, done_{0}, phase_{0};
     std::atomic<bool> stop_{false}; bool pending_ = false; int phase_items_[2] = {0, 0};
     std::mutex m_; std::condition_variable cv_; std::atomic<int> sleepers_{0};
-    std::chrono::steady_clock::time_point t_start_; std::atomic<std::chrono::steady_clock::time_point> t_last_{};
+    std::chrono::steady_clock::time_point t_start_; std::atomic<std::chrono::steady_clock::time_point> t_last_{}, t_gu_{};
+    std::atomic<uint64_t> cpu_ns_gu_{0}, cpu_ns_dn_{0}; double gu_wall_ms_ = 0, dn_wall_ms_ = 0; uint64_t jobs_sum_ = 0, cols_sum_ = 0;
     double busy_ms_ = 0, blocked_ms_ = 0, check_err_ = 0, check_mag_ = 0; uint64_t calls_ = 0, row_mismatch_ = 0;
     std::vector<float> x_, act_, xd_; std::vector<int8_t> xq_; std::map<uint32_t, std::pair<double, double>> check_gu_; std::vector<Job> jobs_; __nv_bfloat16 * out_ = nullptr;
 };

@@ -156,7 +156,11 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
       if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep
           size_t per = 0; for (int l = 0; l < c.layers; ++l) if (f.cache->has_layout(l)) per += f.cache->bank_layout(l).block;
-          const auto [state, reserve] = context_keep(); const size_t need = state + reserve + (size_t(256) << 20);
+          const auto [state, reserve] = context_keep();
+          // TQFN_AUTO_KEEP_MB (debug A/B): what slots=auto keeps free beside the banks, instead of the full-context attention
+          // state + decode reserve (a long prompt then borrows banks for its state)
+          static const char * keep_env = std::getenv("TQFN_AUTO_KEEP_MB");
+          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : state + reserve + (size_t(256) << 20);
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
               for (int l = 0; l < c.layers; ++l) f.cache->release_bank(l);
@@ -185,7 +189,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
         const size_t fr = tqllm::device_free_bytes();
-        if (fr < state + reserve) {
+        if (fr < state + reserve && std::getenv("TQFN_AUTO_KEEP_MB")) {
+            std::fprintf(stderr, "tqllm: TQFN_AUTO_KEEP_MB: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
+        } else if (fr < state + reserve) {
             const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
             const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;
             throw std::runtime_error("Flash-Next: " + std::to_string(f.slots) + " expert slots per layer leave " + std::to_string(fr >> 20) +
