@@ -99,7 +99,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
         if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
         auto free_now = [] { return tqllm::device_free_bytes(); };
-        std::vector<size_t> bank_bytes; for (int l : f_.cache->banks_lru()) bank_bytes.push_back(f_.cache->bank_bytes(l));
+        std::vector<size_t> bank_bytes; size_t banks_total = 0;
+        for (int l : f_.cache->banks_lru()) { bank_bytes.push_back(f_.cache->bank_bytes(l)); banks_total += bank_bytes.back(); }
         const int block0 = std::clamp(g_tune.sub, 512, 2048);
         int block = block0;
         tqllm::PrefillPlan plan; bool park_tried = false;
@@ -109,7 +110,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             arena_req = std::min<size_t>(f_.arena_prefill, tqllm::prefill_arena_bytes(chunk));  // the measured rule at every chunk size
             arena_req += size_t(block) * size_t(checkpoint.attention_heads) * 2052 * 8 + (size_t(64) << 20);  // one block's QSA score scratch + headroom
             tu.arena_bytes = arena_req;
-            plan = tqllm::prefill_plan(sh, tu, P, free_now() + mtp_room);
+            // the plan sees min(measured, budget): the same prompt length plans the same chunk and block (the same text)
+            // whatever earlier requests left behind; parked heads and the MTP bank a multi-chunk prompt drops add to the budget
+            size_t avail = free_now() + mtp_room + banks_total;
+            if (const size_t cap = f_.plan_budget ? f_.plan_budget + mtp_room + heads_parked : 0; cap && avail > cap) avail = cap;
+            else if (cap && tqllm::debug_on("mem")) std::fprintf(stderr, "tqllm: prefill plan: %zu MB available, below the %zu MB budget\n", avail >> 20, cap >> 20);
+            plan = tqllm::prefill_plan(sh, tu, P, std::max(avail, banks_total) - banks_total);
             try { (void) tqllm::banks_to_borrow(plan, bank_bytes, g_tune.borrow, g_tune.borrow_count);
                 // small cards: a multi-chunk prompt parks the LM heads (needed only for the first token) in pinned host
                 // memory and plans again with their room (~635 MB: a bigger chunk streams the experts fewer times)

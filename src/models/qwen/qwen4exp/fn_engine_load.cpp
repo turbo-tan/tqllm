@@ -219,6 +219,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       std::fprintf(stderr, "tqllm: Flash-Next warm-up %.1f s: expert banks %.0f MB, %.0f MB free\n",
                    std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), f.cache->stats().device_bytes / 1048576.0, fr / 1048576.0); }
     g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+    {   // the plan budget: what a prompt may plan with (device free + the expert banks), measured once with the pool trimmed and
+        // rounded down to 256 MB, so the chunk / block a prompt length gets does not follow what earlier requests left in the
+        // pool or in a partly refilled bank (a 100 MB difference flipped a 16K prompt between 3 x 6144 and 4 x 5120, F26)
+        cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
+        const size_t q = size_t(256) << 20;
+        f.plan_budget = (tqllm::device_free_bytes() + f.cache->stats().device_bytes) / q * q;
+    }
     {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
