@@ -103,7 +103,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         for (int l : f_.cache->banks_lru()) { bank_bytes.push_back(f_.cache->bank_bytes(l)); banks_total += bank_bytes.back(); }
         const int block0 = std::clamp(g_tune.sub, 512, 2048);
         int block = block0;
-        tqllm::PrefillPlan plan; bool park_tried = false;
+        tqllm::PrefillPlan plan; bool park_tried = false, borrow_all = false;
         for (;;) {
             tu.chunk = chunk; tu.sub = std::min(g_tune.sub, block); tu.context_bytes = context_term(block);
             const size_t mtp_room = P > chunk ? f_.mtp_cache->stats().device_bytes : 0;  // a multi-chunk prompt clears the MTP bank first
@@ -116,6 +116,10 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             if (const size_t cap = f_.plan_budget ? f_.plan_budget + mtp_room + heads_parked : 0; cap && avail > cap) avail = cap;
             else if (cap && tqllm::debug_on("mem")) std::fprintf(stderr, "tqllm: prefill plan: %zu MB available, below the %zu MB budget\n", avail >> 20, cap >> 20);
             plan = tqllm::prefill_plan(sh, tu, P, std::max(avail, banks_total) - banks_total);
+            // small cards release every bank for a multi-chunk prompt: a kept bank grows by its misses during the prompt
+            // (slots=auto banks start below their cap) and OOMed at "expert bank upload ... 54 MiB free"; the fit check
+            // below still asks whether the plan fits with every bank gone
+            borrow_all = g_small_card && P > chunk && g_tune.borrow == tqllm::BorrowMode::Auto;
             try { (void) tqllm::banks_to_borrow(plan, bank_bytes, g_tune.borrow, g_tune.borrow_count);
                 // small cards: a multi-chunk prompt parks the LM heads (needed only for the first token) in pinned host
                 // memory and plans again with their room (~635 MB: a bigger chunk streams the experts fewer times)
@@ -152,7 +156,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         ops.refill = [this](int l) { auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it != m.pf_refill.end()) f_.cache->prepare(l, it->second); };
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
-        const auto ev = S().ledger_->borrow(plan, g_tune.borrow, g_tune.borrow_count); S().plan_catchup_bytes_ = plan.catchup_peak;
+        const auto ev = S().ledger_->borrow(plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count); S().plan_catchup_bytes_ = plan.catchup_peak;
         g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
         S().model_->pf_borrowed.assign(size_t(c.layers), 0);
         for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;
