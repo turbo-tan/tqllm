@@ -13,7 +13,7 @@ struct ExpertCacheStats {
     size_t device_bytes = 0;
     // prefetch overlap (split mode): prepares whose bank still had copies queued, of those the ones whose copies were
     // still running on the GPU (event not complete), and prepares that waited for copies of experts they do not read
-    uint64_t pf_pending = 0, pf_running = 0, pf_waited_unread = 0;
+    uint64_t pf_pending = 0, pf_running = 0, pf_waited_unread = 0, pf_skipped = 0;  // pf_skipped: no device room for the staging
 };
 
 // One stream owns preparation and projections. Views are valid until the next prepare/clear.

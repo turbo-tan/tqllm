@@ -19,6 +19,7 @@ namespace tqllm {
 namespace {
 void checked(cudaError_t s, int line = __builtin_LINE()) { if (s != cudaSuccess) throw std::runtime_error(std::string(cudaGetErrorString(s)) + " (mixed_expert_cache.cpp:" + std::to_string(line) + ")"); }
 }
+constexpr int kPfBatch = 16;  // experts per staged prefetch batch (the staging buffer is reused in copy-stream order)
 struct MixedExpertCache::State {
     struct Allocation { void * p; size_t bytes; };
     struct Bank {
@@ -73,6 +74,17 @@ struct MixedExpertCache::State {
             throw std::invalid_argument("mixed cache: invalid dimensions or source");
         frequency.resize(size_t(l) * e); mark.assign(size_t(e), 0u); where.assign(size_t(e), -1);
     }
+    // Grows the prefetch staging; false (the old buffer still valid) when the device has no room: prefetches are only
+    // speculative, so the caller skips them. Banks size it when created, before a prefill borrow and refill can take the room.
+    bool grow_pf(size_t need) {
+        if (pf_bytes >= need) return true;
+        char * p = nullptr;
+        if (cudaMalloc(reinterpret_cast<void **>(&p), need) != cudaSuccess) { cudaGetLastError(); return false; }
+        checked(cudaDeviceSynchronize());  // a copy may still read the old buffer
+        if (pf_staging) cudaFree(pf_staging);
+        pf_staging = p; pf_bytes = need; return true;
+    }
+    static size_t expert_bytes(const Bank & b) { size_t t = 0; for (int p = 0; p < 3; ++p) t += b.stride[p] + b.aux_stride[p]; return t; }
     void wait_misses_impl() { if (miss_pending) { checked(cudaStreamWaitEvent(stream, miss_done, 0)); miss_pending = false; } }
     void free(std::vector<Allocation> & memory) {
         cudaStreamSynchronize(stream);
@@ -222,6 +234,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
             if (payload[p].type != first[p].type) throw std::invalid_argument("mixed cache: types vary within a layer projection");
         s.active = -1;
         auto created = s.create(layer, first); bank = created.get(); s.banks.emplace(layer, std::move(created));
+        if (s.prepacked && s.registered) s.grow_pf(kPfBatch * State::expert_bytes(*bank));
     }
     s.active = -1;
     size_t need = 0;
@@ -378,13 +391,9 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
         checked(cudaEventRecord(done, s.stream)); checked(cudaStreamWaitEvent(copy, done, 0)); cudaEventDestroy(done);
     }
     if (s.miss_pending) checked(cudaStreamWaitEvent(copy, s.miss_done, 0));  // demand misses keep the link first
-    size_t total = 0; for (int p = 0; p < 3; ++p) total += bank->stride[p] + bank->aux_stride[p];
-    constexpr int kCap = 16;  // experts per staged batch (the staging buffer is reused in copy-stream order)
-    if (s.pf_bytes < kCap * total) {
-        checked(cudaStreamSynchronize(copy));
-        if (s.pf_staging) cudaFree(s.pf_staging);
-        checked(cudaMalloc(reinterpret_cast<void **>(&s.pf_staging), kCap * total)); s.pf_bytes = kCap * total;
-    }
+    const size_t total = State::expert_bytes(*bank);
+    constexpr int kCap = kPfBatch;
+    if (!s.grow_pf(kCap * total)) { ++s.counters.pf_skipped; return; }
     std::vector<tqllm_cuda::ScatterItem> items; int staged = 0, n_ev = 0;
     auto flush = [&] {
         if (!items.empty()) tqllm_cuda::scatter_copy(items.data(), int(items.size()), copy);

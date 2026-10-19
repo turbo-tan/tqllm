@@ -144,6 +144,28 @@ static void run() {
             current.clear(); compare(0, {0, 1});
             current.set_miss_stream(nullptr);
         }
+        int integrated = 0; check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0));
+        if (!integrated) {  // a full device (bank refill after a prefill borrow) must skip prefetches, not fail or leave freed staging
+            for (int a = 0; a < layers; ++a) {
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                for (int l = 0; l < layers; ++l) compare(l, {0, 1});
+                current.prefetch(a, {2}, copies); check(cudaStreamSynchronize(copies));
+                std::vector<void *> hog;
+                for (size_t chunk = size_t(64) << 20; chunk >= (size_t(1) << 20); chunk /= 2)
+                    for (void * p = nullptr; cudaMalloc(&p, chunk) == cudaSuccess; p = nullptr) hog.push_back(p);
+                cudaGetLastError();
+                std::string failed;
+                for (int l = 0; l < layers; ++l) try { current.prefetch(l, {3, 4}, copies); } catch (const std::exception & e) { if (failed.empty()) failed = e.what(); }
+                check(cudaStreamSynchronize(copies));
+                for (void * p : hog) check(cudaFree(p));
+                try { current.prefetch(a, {4, 2}, copies); compare(a, {2, 4}, true); } catch (const std::exception & e) { if (failed.empty()) failed = e.what(); }
+                if (!failed.empty()) throw std::runtime_error("prefetch on a full device, staged from layer " + std::to_string(a) + ": " + failed);
+                current.set_miss_stream(nullptr);
+            }
+            std::puts("prefetch on a full device: skipped, staging stays valid, later prefetches byte-exact PASS");
+        }
         check(cudaStreamSynchronize(misses)); check(cudaStreamSynchronize(copies));
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",
                     "mapped scatter");
