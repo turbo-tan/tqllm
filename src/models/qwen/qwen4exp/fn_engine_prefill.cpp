@@ -60,17 +60,22 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     g_profile_decode_req = prof_req > 0 && req_no == prof_req && prof_decode;
     if (profiling) ck(cudaProfilerStart());
     S().t_begin_ = std::chrono::steady_clock::now(); S().prefill_us_ = S().decode_us_ = 0;
+    static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;  // TQFN_PROFILE_REQ: host timeline of the request
+    const auto stamp = [&](const char * what) { if (req_log) std::fprintf(stderr, "tqllm: req +%.3f s %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - S().t_begin_).count(), what); };
     S().out_.clear(); S().out_view_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0;
     // Trunk prefill first, then the MTP catch-up, so their working sets do not add up: a prompt longer than one chunk
     // keeps its residuals in pinned host memory, drops the MTP bank before the trunk and the layer-major buffers
     // after it. The catch-up runs the same batches in the same order as when it followed each chunk.
     const int P = int(ids.size()); const int W = S().model_->width;
+    stamp("model ready");
     // the prefill chunk for this request: the engine's chunk, halved while the plan cannot fit even with every bank
     // released (a 128K prompt at 104 slots does not fit 16K chunks on a 24 GB card)
-    // the chunk starts at the whole prompt (every chunk streams every expert once: the fewest chunks that fit) unless
-    // --prefill-chunk set it; the plan below shrinks it until it fits, on small cards with the LM heads parked
+    // Small cards: the chunk starts at the whole prompt (every chunk streams every expert once, and at 12 GB the link is
+    // the bottleneck: 5 x 5,120 streams 327 GB in the 15 s a 3090 takes to compute 25K tokens) and the plan below shrinks
+    // it until it fits, with the LM heads parked. 24 GB keeps the engine chunk: there the streams already hide under the
+    // kernels (nsys 10-19: 25K in 2 x 16K 90.7 % busy, in one chunk 86.3 % and 0.8 s slower).
     constexpr int kMaxChunk = 32768;
-    const int chunk0 = g_tune.chunk_set ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
+    const int chunk0 = g_tune.chunk_set || !g_small_card ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
     int chunk = chunk0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
@@ -159,7 +164,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         if (g_prefill_log) { ck(cudaDeviceSynchronize());
             std::fprintf(stderr, "tqllm: prefill +%.2f s %s\n", std::chrono::duration<double>(pclk::now() - p0).count(), at); }
     };
-    mem_note("banks borrowed");
+    mem_note("banks borrowed"); stamp("plan + banks borrowed");
     if (const size_t back = S().model_->kv_to_device())
         std::fprintf(stderr, "tqllm: attention KV: %.0f MB back on the device for this prompt\n", back / 1048576.0);
     if (host_res) {
@@ -171,6 +176,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     }
     mem_note("residual host buffer ready");
     if (P >= 256 && chunk >= 256) arena_resize(arena_req);  // layer-major prefill; decode shrinks it again
+    stamp("KV + arena ready");
     mem_note("prefill arena ready");
     // TQFN_MTP_CATCHUP: tokens per MTP catch-up batch (each needs topk unique MTP slots)
     // a cache holding every expert takes any width (the whole chunk: grouped GEMM path); else unique experts <= slots
@@ -205,8 +211,6 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         const std::vector<int> next(ids.begin() + e, ids.begin() + std::min(P, e + chunk));
         auto rows = S().model_->step(std::vector<int>(ids.begin() + b, ids.begin() + e), &next);
         lap(trunk_ms, tl);
-        static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;
-        const auto stamp = [&](const char * what) { if (req_log) std::fprintf(stderr, "tqllm: req +%.3f s %s\n", std::chrono::duration<double>(pclk::now() - p0).count(), what); };
         stamp("step returned");
         if (e == P && heads_parked) {  // picked after the trunk buffers go and the heads are back
             PersistentAlloc keep; last_row = std::make_unique<Device<float>>(size_t(c.hidden));
@@ -279,7 +283,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             std::fprintf(stderr, "tqllm: attention KV: %.0f MB of old positions moved to host memory in %.0f ms\n", freed / 1048576.0,
                          std::chrono::duration<double, std::milli>(kclk::now() - k0).count());
     }
-    refill_borrowed(); g_trim_below = SIZE_MAX;
+    stamp("before the bank refill"); refill_borrowed(); g_trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);
     ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();
     if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }
