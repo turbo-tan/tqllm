@@ -87,6 +87,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         f.packed.tiled = true;
     }
     if (f.packed.tiled) { tqllm_cuda::set_tiled_experts(true); g_tile_experts = true; }
+    if (std::getenv("TQFN_CPU_MISS")) {  // CPU pool reads the pinned copy; the GGUF expert pages would hold the experts twice
+        static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
+        pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
+        for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
+        g_cpu_packed = &pv;
+    }
     PackedExperts * pk = &f.packed;
     f.cache->set_prepacked([pk](int layer, int id) -> const char * { return layer < pk->layers ? pk->at(layer, id) : nullptr; }, true);
     }
