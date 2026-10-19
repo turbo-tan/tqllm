@@ -161,6 +161,7 @@ std::vector<int> DecodeModel::mtp_batch_multi(const std::vector<DecodeModel *> &
 
 std::vector<std::vector<int>> DecodeModel::mtp_drafts_multi(const std::vector<DecodeModel *> & ms, const std::vector<int> & d1, int count) {
     std::vector<std::vector<int>> d(ms.size());
+    if (count <= 0) return d;  // drafts=0: plain decode (the length fix-up below assumes at least one draft)
     for (size_t i = 0; i < ms.size(); ++i) d[i] = {d1[i]};
     std::vector<std::unique_ptr<Device<float>>> hc(ms.size());
     for (auto & x : hc) x = std::make_unique<Device<float>>(size_t(width));
@@ -178,6 +179,7 @@ std::vector<std::vector<int>> DecodeModel::mtp_drafts_multi(const std::vector<De
 }
 
 std::vector<int> DecodeModel::mtp_drafts(int d1, int count) {
+    if (count <= 0) return {};  // drafts=0: plain decode (the length fix-up below assumes at least one draft)
     std::vector<int> d{d1};
     Device<float> hcopy{size_t(width)};
     for (int i = 1; i < count; ++i) {
