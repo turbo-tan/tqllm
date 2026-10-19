@@ -163,7 +163,10 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     // TQFN_PREFILL_WAVES (default on): a prefill chunk that routes to more experts than the cache holds runs its MoE in
     // waves of at most `slots` experts; each expert is loaded once per layer per chunk (not once per small chunk).
     std::vector<int> wave_ids;
-    if (trunk && n * c.topk > cache.slots(layer)) {  // incl. the short last chunk of a prompt
+    // prefill (spec off) always takes waves, decode verify (spec on) the split path when it fits: the two paths sum the
+    // down projection in a different order (1 ulp in a few values), so a slot-dependent choice changed greedy text
+    // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
+    if (trunk && (n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();  // one wave when the unique experts fit: the split path's miss accounting assumes small steps
     }
     if (!wave_ids.empty()) {
