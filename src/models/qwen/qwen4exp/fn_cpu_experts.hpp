@@ -237,6 +237,18 @@ inline const char * cpu_gguf_row(int fmt, const char * dev, const char * aux, in
         }
         return out;
     }
+    if (fmt == 13) {  // IQ4_XS 136 B per 256: d, scales_h, scales_l[4], qs[128] (per 32 as IQ4_NL); device: natural pairs + record
+        for (int b = 0; b < kb; ++b) {
+            uint8_t * o = reinterpret_cast<uint8_t *>(out) + b * 136;
+            std::memcpy(o, aux + (int64_t(r) * kb + b) * 8, 8);
+            for (int ib = 0; ib < 8; ++ib) {
+                const uint8_t * d = blk32(b * 8 + ib, 16);
+                auto e = [&](int i) { return (d[i / 2] >> (4 * (i & 1))) & 0xF; };
+                for (int i = 0; i < 16; ++i) o[8 + ib * 16 + i] = uint8_t(e(i) | (e(i + 16) << 4));
+            }
+        }
+        return out;
+    }
     return nullptr;
 }
 // TQFN_CPU_MISS=T: experts that are not resident in the GPU cache are computed by T pinned CPU threads while the GPU
@@ -255,8 +267,8 @@ public:
     }
     ~CpuMissPool() {
         { std::lock_guard<std::mutex> l(m_); stop_ = true; gen_.fetch_add(1); } cv_.notify_all(); for (auto & w : workers_) w.join();
-        if (calls_) std::printf("CPU_MISS pool %.3f ms per layer call busy, host blocked %.3f ms per call (%llu calls)\n",
-                                busy_ms_ / calls_, blocked_ms_ / calls_, (unsigned long long) calls_);
+        if (calls_) std::printf("CPU_MISS pool %.3f ms per layer call busy, host blocked %.3f ms per call (%llu calls), %llu rows read from the GGUF mapping\n",
+                                busy_ms_ / calls_, blocked_ms_ / calls_, (unsigned long long) calls_, (unsigned long long) gguf_rows_.load());
         if (calls_) std::printf("CPU_MISS per call: %.2f experts, %.2f columns; gate/up phase %.3f ms wall (%.3f ms CPU summed over workers), down phase %.3f ms wall (%.3f ms CPU)\n",
                                 double(jobs_sum_) / calls_, double(cols_sum_) / calls_, gu_wall_ms_ / calls_, cpu_ns_gu_.load() / 1e6 / calls_,
                                 dn_wall_ms_ / calls_, cpu_ns_dn_.load() / 1e6 / calls_);
@@ -296,11 +308,19 @@ private:
     // the GGUF bytes of row r of matrix m: rebuilt from the pinned packed copy when available, else the GGUF mapping
     const char * row_src(const Job & j, int m, int r, int cols) {
         const char * gguf = j.w[m] + size_t(r) * j.row_bytes[m];
-        if (!j.dev[m]) return gguf;
+        if (!j.dev[m]) {
+            if (gguf_rows_.fetch_add(1, std::memory_order_relaxed) == 0 && std::getenv("TQLLM_DEBUG"))
+                std::printf("CPU_MISS first GGUF-mapping row: matrix %d has no packed copy (gguf type %u)\n", m, j.type[m]);
+            return gguf;
+        }
         if (j.type[m] == GGML_GSQ_Q2_0) return j.dev[m] + size_t(r) * j.row_bytes[m];  // device layout == GGUF rows
         thread_local std::vector<char> rb[3]; rb[m].resize(j.row_bytes[m]);
         const char * q = cpu_gguf_row(j.fmt[m], j.dev[m], j.aux[m], r, cols, j.tiled, rb[m].data());
-        if (!q) return gguf;
+        if (!q) {
+            if (gguf_rows_.fetch_add(1, std::memory_order_relaxed) == 0 && std::getenv("TQLLM_DEBUG"))
+                std::printf("CPU_MISS first GGUF-mapping row: matrix %d fmt %d gguf type %u\n", m, j.fmt[m], j.type[m]);
+            return gguf;
+        }
         static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
         if (check && std::memcmp(q, gguf, j.row_bytes[m]) != 0) { std::lock_guard<std::mutex> l(m_); ++row_mismatch_; }
         return q;
@@ -415,7 +435,7 @@ private:
     std::atomic<bool> stop_{false}; bool pending_ = false; int phase_items_[2] = {0, 0};
     std::mutex m_; std::condition_variable cv_; std::atomic<int> sleepers_{0};
     std::chrono::steady_clock::time_point t_start_; std::atomic<std::chrono::steady_clock::time_point> t_last_{}, t_gu_{};
-    std::atomic<uint64_t> cpu_ns_gu_{0}, cpu_ns_dn_{0}; double gu_wall_ms_ = 0, dn_wall_ms_ = 0; uint64_t jobs_sum_ = 0, cols_sum_ = 0;
+    std::atomic<uint64_t> cpu_ns_gu_{0}, cpu_ns_dn_{0}, gguf_rows_{0}; double gu_wall_ms_ = 0, dn_wall_ms_ = 0; uint64_t jobs_sum_ = 0, cols_sum_ = 0;
     double busy_ms_ = 0, blocked_ms_ = 0, check_err_ = 0, check_mag_ = 0; uint64_t calls_ = 0, row_mismatch_ = 0;
     std::vector<float> x_, act_, xd_; std::vector<int8_t> xq_; std::map<uint32_t, std::pair<double, double>> check_gu_; std::vector<Job> jobs_; __nv_bfloat16 * out_ = nullptr;
 };

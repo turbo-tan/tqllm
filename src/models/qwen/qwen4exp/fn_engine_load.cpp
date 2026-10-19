@@ -91,7 +91,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
         pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
         for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
-        g_cpu_packed = &pv;
+        g_cpu_packed = &pv; std::printf("tqllm: CPU miss pool reads the pinned packed experts\n");
     }
     PackedExperts * pk = &f.packed;
     f.cache->set_prepacked([pk](int layer, int id) -> const char * { return layer < pk->layers ? pk->at(layer, id) : nullptr; }, true);
