@@ -144,7 +144,8 @@ struct DenseHalfCache { char * base = nullptr; size_t cap = 0, used = 0, high = 
 inline DenseHalfCache g_dhc;
 // layer-major prefill tuning (tqserve parameters --prefill-*, --dense-cache-mb; set before the engine starts)
 struct FnTune { int chunk = 16384, sub = 2048, stage = 192, dense_min = 256, borrow_count = 0; long reserve_mb = 1000, arena_mb = 3800, dense_cache_mb = 600;
-                tqllm::BorrowMode borrow = tqllm::BorrowMode::Auto; };
+                tqllm::BorrowMode borrow = tqllm::BorrowMode::Auto;
+                bool dense_cache_set = false, chunk_set = false, stage_set = false; };  // set: given on the command line
 inline FnTune g_tune;
 inline size_t dense_half_pool_bytes() { return size_t(std::max(0L, g_tune.dense_cache_mb)) << 20; }
 inline void dense_half_release() {

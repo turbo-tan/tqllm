@@ -125,7 +125,7 @@ inline int banks_to_borrow(const PrefillPlan & p, const std::vector<size_t> & ba
     if (mode == BorrowMode::Count) return std::clamp(count, 0, n);
     size_t got = 0; int k = 0;
     while (got < p.release && k < n) got += bank_bytes_lru[size_t(k++)];
-    if (got < p.release) throw std::runtime_error("prefill plan: " + std::to_string(p.release >> 20) + " MB short even with every bank released");
+    if (got < p.release) throw std::runtime_error("prefill plan: " + std::to_string((p.release - got) >> 20) + " MB short with every bank released (" + std::to_string(p.release >> 20) + " MB to release, " + std::to_string(got >> 20) + " MB of banks)");
     return k;
 }
 

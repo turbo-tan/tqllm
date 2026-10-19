@@ -60,6 +60,46 @@ public:
     bool resident = false;
     struct Resident { Mat m; std::vector<std::unique_ptr<Device<char>>> mem; std::unique_ptr<Device<float>> dense; };
     mutable std::map<std::string, std::unique_ptr<Resident>> resident_;
+    // Parking: a resident matrix's device buffers copied to pinned host memory and freed, put back (byte for byte, kernels
+    // tuned by shape) before its next use. Small cards park the LM heads through a layer-outer prefill.
+    struct Parked { std::vector<char *> host; std::vector<size_t> bytes; std::vector<const char *> old; };
+    mutable std::map<std::string, Parked> parked_;
+public:
+    size_t park(const std::string & key) const {
+        const auto it = resident_.find(key);
+        if (it == resident_.end() || !it->second || !it->second->m.fmt || it->second->dense || it->second->mem.empty() || parked_.count(key)) return 0;
+        auto & r = *it->second; Parked pk; size_t total = 0;
+        ck(cudaDeviceSynchronize());
+        for (auto & buf : r.mem) {
+            const size_t n = buf->count; char * h = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&h), n));
+            ck(cudaMemcpy(h, buf->p, n, cudaMemcpyDeviceToHost));
+            pk.host.push_back(h); pk.bytes.push_back(n); pk.old.push_back(buf->p); total += n;
+        }
+        r.mem.clear();
+        parked_[key] = std::move(pk);
+        return total;
+    }
+    void unpark(const std::string & key) const {
+        const auto it = parked_.find(key); if (it == parked_.end()) return;
+        auto & r = *resident_.at(key); auto & pk = it->second; std::vector<const char *> fresh;
+        { PersistentAlloc keep;
+          for (size_t i = 0; i < pk.host.size(); ++i) {
+              auto buf = std::make_unique<Device<char>>(pk.bytes[i]);
+              ck(cudaMemcpy(buf->p, pk.host[i], pk.bytes[i], cudaMemcpyHostToDevice));
+              fresh.push_back(buf->p); r.mem.push_back(std::move(buf));
+          } }
+        auto repoint = [&](const void * q) -> const void * {
+            const char * c = static_cast<const char *>(q);
+            for (size_t i = 0; i < pk.old.size(); ++i) if (c >= pk.old[i] && c < pk.old[i] + pk.bytes[i]) return fresh[i] + (c - pk.old[i]);
+            return q;
+        };
+        require(!r.m.fmt->parts(), "park: composite heads are not supported");
+        r.m.p = repoint(r.m.p); r.m.aux = repoint(r.m.aux);
+        for (char * h : pk.host) ck(cudaFreeHost(h));
+        parked_.erase(it);
+    }
+    size_t park_heads() const { return park("output.weight") + park("draft_head"); }
+    void unpark_heads() const { unpark("output.weight"); unpark("draft_head"); }
     mutable std::map<std::string, std::unique_ptr<Device<float>>> dense_dev_;
     mutable cublasHandle_t blas_ = nullptr;
     cublasHandle_t blas() const { if (!blas_) require(cublasCreate(&blas_) == CUBLAS_STATUS_SUCCESS, "cannot create cuBLAS handle"); return blas_; }

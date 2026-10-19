@@ -48,6 +48,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true;
     const auto & c = f.cp->config; auto & checkpoint = *f.cp;
     g_small_card = f.slots_auto && !f.experts.empty() && tqllm::device_free_bytes() < (size_t(16) << 30);
+    if (g_small_card) {
+        // the dense fp16 cache holds one layer (measured high-water 119 MB on Flash-Next IQ3_S), not 600 MB
+        if (!g_tune.dense_cache_set) g_tune.dense_cache_mb = std::min(g_tune.dense_cache_mb, 160L);
+        // 256 experts stage as two even slices of 128 (192 + 64 at the default): 325 MB less staging, the same slice count
+        if (!g_tune.stage_set) g_tune.stage = std::min(g_tune.stage, 128);
+    }
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, size_t(f.budget_gb * 1024 * 1024 * 1024),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     apply_layer_slots(*f.cache, f.experts, f.slots);
