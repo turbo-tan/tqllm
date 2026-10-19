@@ -383,7 +383,7 @@ public:
             nslots = slots;
             allocate();
             memlog("buffers");
-            if (!opt.draft_model.empty() && gguf) load_dflash(opt.draft_model.c_str());
+            if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
             calibrate_prefill();
             pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
@@ -1137,8 +1137,8 @@ private:
                     throw std::runtime_error(p + "unsupported grouped expert format: " + m->fmt->name());
         };
         const auto mp = "blk." + std::to_string(cfg.layers) + ".";
-        // the MTP head drafts without -md, or beside DFlash2 with --mtp (--mtp-from N: prompts of N+ tokens use MTP)
-        if (f.tensors.count(mp + "nextn.eh_proj.weight") && (opt.draft_model.empty() || opt.native_mtp)) {
+        // the MTP head loads only for --mtp (tqllm::drafters: one drafter per run, never beside DFlash2)
+        if (f.tensors.count(mp + "nextn.eh_proj.weight") && tqllm::drafters(opt).mtp) {
             mtp.present = true;
             mtp.eh_proj = g_mat(f, mp + "nextn.eh_proj.weight", H, 2 * H);
             mtp.enorm = g_f32(f, mp + "nextn.enorm.weight", H);
@@ -3596,12 +3596,9 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) {
         const auto P = uint32_t(prompt.size());
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
-        // --mtp with DFlash2 loaded: MTP for prompts of --mtp-from tokens or more, at --mtp-depth drafts
         // sampled or image requests decode without MTP (exact either way), so no request fails for asking for them
-        const bool use_mtp = opt.native_mtp && mtp.present && !sampling() && mm_pending.empty() &&
-                             (!dfl.present || (opt.mtp_from > 0 && P >= opt.mtp_from));
-        const bool dfl_on = dfl.present && !use_mtp;
-        if (use_mtp && dfl.present) D = opt.mtp_depth;
+        const bool use_mtp = opt.native_mtp && mtp.present && !sampling() && mm_pending.empty();
+        const bool dfl_on = dfl.present;
         if (use_mtp) {
             if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
             if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");

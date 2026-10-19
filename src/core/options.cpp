@@ -94,8 +94,6 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "-md" || a == "--model-draft") o.draft_model = value();
     else if (a == "--draft-vocab") o.draft_vocab = value();
     else if (a == "--mtp") o.native_mtp = true;
-    else if (a == "--mtp-from") o.mtp_from = uint32_t(count(0));
-    else if (a == "--mtp-depth") o.mtp_depth = count(1);
     else if (a == "--draft-window") o.draft_window = count(0);
     else if (a == "--draft-retrieve") o.draft_retrieve = count(0);
     else if (a == "--no-tree") o.tree = false;
@@ -130,7 +128,7 @@ const char * engine_options_usage() {
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"
            "          [--prefill-arena-mb N (3800)] [--dense-cache-mb N (600)] [--prefill-borrow auto|all|N (auto)]\n"
-           "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)] [--mtp (draft with the model's own MTP head; text-only, greedy, --np 1) [--mtp-from N --mtp-depth D with -md: MTP for prompts of N+ tokens]] [-fitl on|off (on: pick KV / context / prefill buffers to fit and announce them; off: refuse instead)] [--gemm-rows N (prefill FP16 weight blocks of N rows; 0 whole matrices)]\n"
+           "          [-fit on|off (on)] [-fitt MiB free after loading (768; 256 under WSL)] [-fitc smallest context the fit may set (4096)] [--mtp (draft with the model's own MTP head; text-only, greedy, --np 1) (not with -md)] [-fitl on|off (on: pick KV / context / prefill buffers to fit and announce them; off: refuse instead)] [--gemm-rows N (prefill FP16 weight blocks of N rows; 0 whole matrices)]\n"
            "          [--slot-reserve MiB free per parallel slot (128)] [--graph-cache captured CUDA graphs kept (256)]\n";
 }
 
@@ -153,5 +151,10 @@ void check_env_flags(const char * tool) {
         }
     }
     if (retired) std::exit(2);
+}
+Drafters drafters(const EngineOptions & o) {
+    if (!o.draft_model.empty() && o.native_mtp)
+        throw std::runtime_error("-md (DFlash2) and --mtp (MTP head) are exclusive: pick one drafter");
+    return {!o.draft_model.empty(), o.native_mtp};
 }
 }  // namespace tqllm
