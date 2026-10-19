@@ -691,7 +691,10 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
             for (const auto & stop : req.stop)
                 if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
         }
-        if (req.tools) extract_tool_calls(result);
+        if (req.tools) {  // the prose before a tool call is trimmed; trim without one too, so a stream can match before it knows
+            extract_tool_calls(result);
+            result.text = trim(result.text);
+        }
     }
 }
 
@@ -901,7 +904,7 @@ public:
             take(gen[k - 1]);
             if (req_.thinking && !emit_view(view(rraw_, rlead_, rlast_), sr_, true)) return false;
             const std::string_view text = answer_view();
-            if (req_.tools) { if (!emit_view(text.substr(0, tool_limit(text)), sc_, false)) return false; }
+            if (req_.tools) { if (!emit_view(text.substr(0, rstrip(text, tool_limit(text))), sc_, false)) return false; }
             else if (!emit_view(text, sc_, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
@@ -954,7 +957,7 @@ public:
     bool flush(const DecodeResult & r) {
         if (!emit(r.reasoning, sr_, true, true)) return false;
         if (!req_.tools) return emit(r.text, sc_, false, true);
-        const size_t end = tool_text_limit(r.text);  // tool markup: nothing past the first block is ours to send
+        const size_t end = rstrip(r.text, tool_text_limit(r.text));  // tool markup: nothing past the first block is ours to send
         return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
     }
     void mark_role_sent() { role_sent_ = true; }
@@ -982,9 +985,14 @@ private:
     }
     static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
     bool emit_tool_text(const std::string & raw, std::string & sent) {
-        const size_t end = tool_text_limit(raw);
-        return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
+        const size_t lead = raw.find_first_not_of(" \t\r\n");
+        if (lead == std::string::npos) return true;
+        const std::string t = raw.substr(lead);
+        const size_t end = rstrip(t, tool_text_limit(t));
+        return end <= sent.size() ? true : emit(t.substr(0, end), sent, false, false);
     }
+    // tools mode holds trailing whitespace: finish() trims the prose before a tool call
+    static size_t rstrip(std::string_view t, size_t end) { while (end > 0 && ws(t[end - 1])) --end; return end; }
     static bool ws(char c) {return c == ' ' || c == '\t' || c == '\r' || c == '\n';}
     static std::string_view view(const std::string & raw, size_t lead, size_t last) {
         return lead == std::string::npos || last <= lead ? std::string_view() : std::string_view(raw).substr(lead, last - lead);
@@ -1002,11 +1010,13 @@ private:
         const size_t from = raw.size();
         raw += tok_.decode({t});
         if (&raw == &rraw_) extend_trim(rraw_, from, rlead_, rlast_);
-        else if (req_.thinking) extend_trim(araw_, from, alead_, alast_);
+        else if (req_.thinking || req_.tools) extend_trim(araw_, from, alead_, alast_);
     }
     // the answer as finish() returns it: trimmed (thinking) or raw, cut at the first stop string
     std::string_view answer_view() {
-        const std::string_view t = req_.thinking ? view(araw_, alead_, alast_) : std::string_view(araw_);
+        const std::string_view t = req_.thinking ? view(araw_, alead_, alast_)
+                                 : req_.tools ? (alead_ == std::string::npos ? std::string_view() : std::string_view(araw_).substr(alead_))
+                                              : std::string_view(araw_);
         if (stop_at_ != std::string::npos) return t.substr(0, std::min(stop_at_, t.size()));
         size_t first = std::string::npos;
         const size_t from = stop_scan_ > hold_ ? stop_scan_ - hold_ : 0;
@@ -1046,6 +1056,7 @@ private:
         if (full.size() <= sent.size()) return true;
         size_t end = full.size() - std::min(full.size(), unstable_tail_view(full));
         if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+        if (!reasoning && req_.tools) end = rstrip(full, end);
         if (end <= sent.size()) return true;
         return send_piece(std::string(full.substr(sent.size(), end - sent.size())), sent, reasoning);
     }
@@ -1055,6 +1066,7 @@ private:
         if (!final) {
             end -= std::min(end, unstable_tail(full));
             if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+            if (!reasoning && req_.tools) end = rstrip(full, end);
         }
         if (end <= sent.size()) return true;
         return send_piece(full.substr(sent.size(), end - sent.size()), sent, reasoning);

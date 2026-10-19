@@ -82,7 +82,7 @@ int main() {
     std::mt19937 rng(23);
     const std::vector<std::string> pieces = {"hello ", "world", "\n", "\n\n", "  ", "\t", "STOP", "ST", "OP", "<tool_call>", "<tool_", "call>",
                                              "<function=", "x", "{\"a\": 1}", "\xc3\xa9", "\xe6\x9d\xb1", "\xf0\x9f\x98\x8a", "end", "."};
-    int failures = 0, cases = 0;
+    int failures = 0, cases = 0, final_failures = 0;
     for (int trial = 0; trial < 600; ++trial) {
         tqserve::ChatRequest req;
         req.chat = trial % 5 != 0;
@@ -107,6 +107,30 @@ int main() {
             for (size_t j = 0; j < step && at < gen.size(); ++j) fed.push_back(gen[at++]);
             a.update(fed); b.update_reference(fed);
         }
+        // the deltas of a whole stream (update() then close()) concatenate to finish()'s non-stream answer
+        std::string content;
+        tqserve::StreamWriter c(tok, req, "m", [&](const std::string & s) {
+            if (s.rfind("data: {", 0) != 0) return true;
+            const auto j = tqllm::parse_json(s.substr(6));
+            const auto * ch = j.get("choices");
+            if (!ch || ch->arr.empty()) return true;
+            const auto * d = req.chat ? ch->arr[0].get("delta") : &ch->arr[0];
+            if (const auto * t = d ? d->get(req.chat ? "content" : "text") : nullptr; t && t->kind == tqllm::Json::String) content += t->str;
+            return true;
+        });
+        std::vector<uint32_t> fed2;
+        for (size_t at = 0; at < gen.size();) {
+            const size_t step = 1 + rng() % 16;
+            for (size_t j = 0; j < step && at < gen.size(); ++j) fed2.push_back(gen[at++]);
+            c.update(fed2);
+        }
+        tqserve::DecodeResult fin;
+        tqserve::finish(tok, req, gen, fin);
+        c.close(fin);
+        auto esc = [](const std::string & x) { std::string o; for (char ch : x.substr(0, 160)) { if (ch == '\n') o += "\\n"; else if (ch == '\t') o += "\\t"; else o += ch; } return o; };
+        if (req.chat && content != fin.text && ++final_failures <= 12)  // completions stream the reasoning as text too
+            std::printf("STREAM != NON-STREAM trial %d thinking %d tools %d stops %zu\n  stream %s\n  final  %s\n", trial, int(req.thinking),
+                        int(req.tools), req.stop.size(), esc(content).c_str(), esc(fin.text).c_str());
         ++cases;
         if (out_new != out_ref) {
             if (++failures <= 3) std::printf("MISMATCH trial %d thinking %d tools %d stops %zu\n  new %s\n  ref %s\n", trial, int(req.thinking), int(req.tools),
@@ -114,6 +138,7 @@ int main() {
         }
     }
     std::printf("STREAM_INCREMENTAL %d / %d streams byte-identical to the whole-prefix reference\n", cases - failures, cases);
+    std::printf("STREAM_FINAL %d / %d streams concatenate to the non-stream answer\n", cases - final_failures, cases);
     // per-token cost: linear in the stream length
     auto per_token = [&](size_t n, bool reference) {
         tqserve::ChatRequest req; req.thinking = true; req.stop = {"STOP"};
@@ -131,7 +156,7 @@ int main() {
     std::printf("STREAM_COST us per token: incremental 2K %.2f, 20K %.2f | reference 2K %.2f, 8K %.2f\n", new2k, new20k, ref2k, ref8k);
     const bool linear = new20k < 3.0 * new2k + 1.0;
     std::filesystem::remove_all(dir);
-    const bool ok = failures == 0 && linear;
+    const bool ok = failures == 0 && final_failures == 0 && linear;
     std::puts(ok ? "STREAM_INCREMENTAL_PASS" : "STREAM_INCREMENTAL_FAIL");
     return ok ? 0 : 1;
 }
