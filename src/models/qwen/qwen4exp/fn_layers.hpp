@@ -165,7 +165,7 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
     if (carry) {
         const size_t row = size_t(kvheads) * dim;
         if (!carry->k) { PersistentAlloc keep; carry->k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); carry->v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
-        require(pos + n <= g_kv_capacity, "decode context exceeds the attention KV capacity");
+        require(pos + n <= g_kv_capacity, "decode context exceeds the attention KV capacity (pos " + std::to_string(pos) + " + " + std::to_string(n) + " > " + std::to_string(g_kv_capacity) + ")");
         ck(cudaMemcpyAsync(carry->k->p + size_t(pos) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         ck(cudaMemcpyAsync(carry->v->p + size_t(pos) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         // QSA (the model's own long-context attention): every token's indexer key is kept; once the context passes the
