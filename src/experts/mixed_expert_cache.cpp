@@ -102,8 +102,22 @@ struct MixedExpertCache::State {
             banks.erase(victim);
         }
         void * p = nullptr;
-        // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so)
-        if (const cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10)); e != cudaSuccess) {
+        // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so).
+        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts the least
+        // recently used bank and tries again, so the bank count follows the free memory instead of failing the request
+        cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10));
+        while (e == cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            auto victim = banks.end();
+            for (auto it = banks.begin(); it != banks.end(); ++it)
+                if (it->first != protect && (victim == banks.end() || it->second->touched < victim->second->touched)) victim = it;
+            if (victim == banks.end()) break;
+            for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
+            if (active == victim->first) active = -1;
+            banks.erase(victim);
+            e = cudaMalloc(&p, bytes + (size_t(64) << 10));
+        }
+        if (e != cudaSuccess) {
             cudaGetLastError(); size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
             throw std::runtime_error(std::string(cudaGetErrorString(e)) + ": expert bank upload of " + std::to_string(bytes >> 20) +
                                      " MiB for layer " + std::to_string(protect) + " (cache " + std::to_string(live >> 20) + " of " +

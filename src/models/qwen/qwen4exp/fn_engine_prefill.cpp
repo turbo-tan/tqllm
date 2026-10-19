@@ -19,7 +19,10 @@ void FlashNextEngine::refill_borrowed() {
     using pclk = std::chrono::steady_clock; const auto r0 = pclk::now();
     const size_t all = led->borrowed_total();
     if (led->state() == tqllm::BankLedger::State::Borrowed) led->buffers_released();
-    const int done = led->refill(); cudaGetLastError();
+    // small cards: stop while the warm-up's keep (512 MB) is still free; a refill to the last megabyte left the first
+    // decode step's bank upload 88 MiB (12 GB, 16K prompt in 2 x 10240): the rest come back as ordinary misses
+    { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
+    const int done = led->refill(g_small_card ? size_t(512) << 20 : 0); cudaGetLastError();
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     S().model_->pf_refill.clear(); led.reset();

@@ -165,6 +165,26 @@ static void run() {
                 current.set_miss_stream(nullptr);
             }
             std::puts("prefetch on a full device: skipped, staging stays valid, later prefetches byte-exact PASS");
+            {   // a bank needed on a full device evicts the least recently used bank instead of failing (a long context's
+                // attention state takes the room the banks had at start-up)
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                for (int l = 0; l + 1 < layers; ++l) compare(l, {0, 1});
+                std::vector<void *> hog;
+                for (size_t chunk = size_t(64) << 20; chunk >= (size_t(1) << 20); chunk /= 2)
+                    for (void * p = nullptr; cudaMalloc(&p, chunk) == cudaSuccess; p = nullptr) hog.push_back(p);
+                cudaGetLastError();
+                const auto ev0 = current.stats().evictions;
+                std::string failed;
+                try { compare(layers - 1, {2, 4}, true); } catch (const std::exception & e) { failed = e.what(); }
+                for (void * p : hog) check(cudaFree(p));
+                if (!failed.empty()) throw std::runtime_error("bank on a full device: " + failed);
+                require(current.stats().evictions > ev0, "bank on a full device: nothing was evicted");
+                compare(0, {0, 3}, true);  // an evicted layer comes back byte-exact
+                current.set_miss_stream(nullptr);
+            }
+            std::puts("bank on a full device: least recently used bank evicted, new bank and reloaded bank byte-exact PASS");
         }
         check(cudaStreamSynchronize(misses)); check(cudaStreamSynchronize(copies));
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",
