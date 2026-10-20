@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <random>
 #include <stdexcept>
+#include <string>
 
 using namespace tqllm;
 static void check(cudaError_t rc) { if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc)); }
@@ -143,6 +144,23 @@ static void run() {
             require(current.prefetch_used() > 0, "registered prefetch was never consumed");
             current.clear(); compare(0, {0, 1});
             current.set_miss_stream(nullptr);
+        }
+        {   // TQueue: the cache owns its miss stream; a caller's miss stream only switches split mode on. A caller (one DecodeModel per
+            // request) destroying that stream must not break the shared cache's later misses and prefetches (old: misses ran on the
+            // caller's destroyed handle -> "context is destroyed", F31)
+            MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+            current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+            cudaStream_t m1, c1; check(cudaStreamCreateWithFlags(&m1, cudaStreamNonBlocking)); check(cudaStreamCreateWithFlags(&c1, cudaStreamNonBlocking));
+            current.set_miss_stream(m1); selected = &current;
+            compare(0, {0, 1}); current.prefetch(1, {3, 4}, c1); compare(1, {3, 4});
+            check(cudaDeviceSynchronize()); check(cudaStreamDestroy(m1));  // the request's miss stream goes; its copy stream stays (c1)
+            std::string failed;
+            try { for (int l = 0; l < layers; ++l) { current.prefetch(l, {2, 4}, c1); compare(l, {2, 0, 4, 2}, true); } check(cudaDeviceSynchronize()); }
+            catch (const std::exception & e) { failed = e.what(); }
+            cudaGetLastError();
+            if (!failed.empty()) throw std::runtime_error("cache used a caller stream after the caller destroyed it: " + failed);
+            current.set_miss_stream(nullptr); check(cudaStreamDestroy(c1));
+            std::puts("cache-owned miss stream: the caller's miss stream destroyed mid-split, later misses / prefetches byte-exact PASS");
         }
         int integrated = 0; check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0));
         if (!integrated) {  // a full device (bank refill after a prefill borrow) must skip prefetches, not fail or leave freed staging

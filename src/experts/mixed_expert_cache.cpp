@@ -20,6 +20,8 @@ namespace {
 void checked(cudaError_t s, int line = __builtin_LINE()) { if (s != cudaSuccess) throw std::runtime_error(std::string(cudaGetErrorString(s)) + " (mixed_expert_cache.cpp:" + std::to_string(line) + ")"); }
 }
 constexpr int kPfBatch = 16;  // experts per staged prefetch batch (the staging buffer is reused in copy-stream order)
+// TQFN_PF_EVENTS: per-slot prefetch completion events (opt-in; with demand misses on a full bank it can find no slot, F33)
+static bool pf_events_on() { return std::getenv("TQFN_PF_EVENTS") != nullptr; }
 struct MixedExpertCache::State {
     struct Allocation { void * p; size_t bytes; };
     struct Bank {
@@ -56,6 +58,9 @@ struct MixedExpertCache::State {
     char * staging = nullptr; size_t staging_bytes = 0;
     char * device_staging = nullptr;  // prepacked misses: one upload per prepare, then device-side scatter
     cudaStream_t miss_stream = nullptr; cudaEvent_t miss_done = nullptr; bool miss_pending = false;
+    // TQueue: the cache owns its demand-miss stream (high priority; a caller's stream only switches split mode on, so the
+    // trunk and MTP caches no longer share one request's stream) and the event that orders a prefetch after the compute stream
+    cudaStream_t own_miss = nullptr; cudaEvent_t order_ev = nullptr;
     std::vector<uint8_t> missed;
     std::vector<uint32_t> mark; std::vector<int> where; uint32_t gen = 0;  // prepare(): flat per-expert bookkeeping
     char * pf_staging = nullptr; size_t pf_bytes = 0;            // prefetch: one DMA per expert, then one scatter launch
@@ -65,7 +70,8 @@ struct MixedExpertCache::State {
     // was evicted still has a layout (bank_layout / bank_mat), so prefill can run its experts from staging
     std::map<int, std::array<Mat, 3>> saved_mat; std::map<int, std::array<size_t, 6>> saved_piece;
     std::map<int, std::array<uint32_t, 3>> saved_type; std::map<int, int> saved_cap;
-    ~State() { if (miss_stream) cudaStreamSynchronize(miss_stream); if (miss_done) cudaEventDestroy(miss_done); banks.clear(); if (staging) cudaFreeHost(staging); if (device_staging) cudaFree(device_staging); if (pf_staging) cudaFree(pf_staging); }
+    ~State() { cudaDeviceSynchronize(); if (miss_done) cudaEventDestroy(miss_done); if (order_ev) cudaEventDestroy(order_ev);
+               if (own_miss) cudaStreamDestroy(own_miss); banks.clear(); if (staging) cudaFreeHost(staging); if (device_staging) cudaFree(device_staging); if (pf_staging) cudaFree(pf_staging); }
     State(int l, int e, int h, int f, int c, size_t b, Source s, cudaStream_t st)
         : layers(l), experts(e), hidden(h), ff(f), capacity(c), budget(b), source(std::move(s)), stream(st) {
         if (l <= 0 || e <= 0 || h <= 0 || f <= 0 || c <= 0 || c > e || !b || !source ||
@@ -87,7 +93,7 @@ struct MixedExpertCache::State {
     static size_t expert_bytes(const Bank & b) { size_t t = 0; for (int p = 0; p < 3; ++p) t += b.stride[p] + b.aux_stride[p]; return t; }
     void wait_misses_impl() { if (miss_pending) { checked(cudaStreamWaitEvent(stream, miss_done, 0)); miss_pending = false; } }
     void free(std::vector<Allocation> & memory) {
-        cudaStreamSynchronize(stream);
+        cudaDeviceSynchronize();  // a miss or prefetch copy may still write the bank, not only the compute stream
         for (const auto & a : memory) { cudaFree(a.p); live -= a.bytes; }
         memory.clear(); counters.device_bytes = live;
     }
@@ -211,7 +217,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     State::Bank * bank = it == s.banks.end() ? nullptr : it->second.get();
     // TQFN_PF_EVENTS: the compute stream waits only for the prefetch copies of slots this call reads (one event per
     // prefetched expert, recorded in priority order); slots still in flight stay pending and are not demand victims.
-    static const bool pf_events = std::getenv("TQFN_PF_EVENTS") != nullptr;
+    static const bool pf_events = pf_events_on();
     if (bank && bank->pending) {
         ++s.counters.pf_pending;
         const bool running = bank->ready && cudaEventQuery(bank->ready) == cudaErrorNotReady;
@@ -401,8 +407,8 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
     if (after_release) checked(cudaStreamWaitEvent(copy, bank->released, 0));  // last reader: the bank's previous use
     else {
         // The compute stream may still read this bank (previous token): order the copies after it.
-        cudaEvent_t done; checked(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-        checked(cudaEventRecord(done, s.stream)); checked(cudaStreamWaitEvent(copy, done, 0)); cudaEventDestroy(done);
+        if (!s.order_ev) checked(cudaEventCreateWithFlags(&s.order_ev, cudaEventDisableTiming));
+        checked(cudaEventRecord(s.order_ev, s.stream)); checked(cudaStreamWaitEvent(copy, s.order_ev, 0));
     }
     if (s.miss_pending) checked(cudaStreamWaitEvent(copy, s.miss_done, 0));  // demand misses keep the link first
     const size_t total = State::expert_bytes(*bank);
@@ -435,7 +441,7 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
         if (bank->ids[target] >= 0) ++s.counters.evictions;
         const char * src = s.prepacked(layer, id); size_t off = 0;
         {
-            static const bool pf_events = std::getenv("TQFN_PF_EVENTS") != nullptr;
+            static const bool pf_events = pf_events_on();
             if (staged == kCap || (pf_events && staged)) flush();
             char * stage = s.pf_staging + size_t(staged) * total;
             checked(cudaMemcpyAsync(stage, src, total, cudaMemcpyHostToDevice, copy));  // the expert's packed block in one DMA
@@ -452,7 +458,7 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
         }
         s.counters.transfer_bytes += off; ++s.prefetch_count;
         bank->ids[target] = id; bank->ages[target] = ++s.clock; bank->speculative[target] = 1; bank->inflight[target] = 1; bank->pf_age[target] = s.clock;
-        if (static const bool pf_events = std::getenv("TQFN_PF_EVENTS") != nullptr; pf_events) {
+        if (static const bool pf_events = pf_events_on(); pf_events) {
             flush();
             if (size_t(n_ev) == bank->pf_ev.size()) { cudaEvent_t e; checked(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); bank->pf_ev.push_back(e); }
             checked(cudaEventRecord(bank->pf_ev[size_t(n_ev)], copy)); bank->pf_seq[target] = n_ev++;
@@ -464,7 +470,15 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
     if (!bank->ready) checked(cudaEventCreateWithFlags(&bank->ready, cudaEventDisableTiming));
     checked(cudaEventRecord(bank->ready, copy)); bank->pending = true;
 }
-void MixedExpertCache::set_miss_stream(cudaStream_t m) { state_->miss_stream = m; }
+void MixedExpertCache::set_miss_stream(cudaStream_t m) {
+    auto & s = *state_;
+    if (!m) { if (s.own_miss) checked(cudaStreamSynchronize(s.own_miss)); s.miss_stream = nullptr; return; }
+    if (!s.own_miss) {
+        int least = 0, greatest = 0; checked(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        checked(cudaStreamCreateWithPriority(&s.own_miss, cudaStreamNonBlocking, greatest));
+    }
+    s.miss_stream = s.own_miss;
+}
 void MixedExpertCache::set_prefetch_strict(int from) { state_->pf_strict_from = from; }
 bool MixedExpertCache::resident(int layer, int expert) const {
     const auto & s = *state_; auto it = s.banks.find(layer); if (it == s.banks.end()) return false;
