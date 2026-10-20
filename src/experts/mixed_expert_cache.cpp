@@ -365,8 +365,10 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         tqllm_cuda::scatter_copy(items.data(), int(items.size()), s.registered ? up : s.stream);
     }
     constexpr int kZeroCopyParts = 2;  // blocks per item for kernel reads of pinned memory
-    if (!direct.empty()) tqllm_cuda::scatter_copy(direct.data(), int(direct.size()), up, kZeroCopyParts);
-    if (split && (!scatter.empty() || !direct.empty())) {
+    // F25: zero-copy misses (kernels reading pinned host memory) run in compute-stream order; on the miss stream beside the compute
+    // stream they faulted / hung the 3090's front end in long decodes (GB10 clean). DMA misses (scatter) keep the miss stream.
+    if (!direct.empty()) tqllm_cuda::scatter_copy(direct.data(), int(direct.size()), s.stream, kZeroCopyParts);
+    if (split && !scatter.empty()) {
         if (!s.miss_done) checked(cudaEventCreateWithFlags(&s.miss_done, cudaEventDisableTiming));
         checked(cudaEventRecord(s.miss_done, up)); s.miss_pending = true;
     }
