@@ -22,6 +22,11 @@ void checked(cudaError_t s, int line = __builtin_LINE()) { if (s != cudaSuccess)
 constexpr int kPfBatch = 16;  // experts per staged prefetch batch (the staging buffer is reused in copy-stream order)
 // TQFN_PF_EVENTS: per-slot prefetch completion events (opt-in; with demand misses on a full bank it can find no slot, F33)
 static bool pf_events_on() { return std::getenv("TQFN_PF_EVENTS") != nullptr; }
+static bool host_coherent() {  // GB10-class: the GPU reads pageable host memory through the host page tables (C2C)
+    static const bool v = [] { int dev = 0, on = 0; cudaGetDevice(&dev);
+        return cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on; }();
+    return v;
+}
 struct MixedExpertCache::State {
     struct Allocation { void * p; size_t bytes; };
     struct Bank {
@@ -279,6 +284,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     const bool skip_inflight = pf_events && bank && bank->pending;
     if (split && !incoming.empty() && bank->ready && !skip_inflight) checked(cudaStreamWaitEvent(up, bank->ready, 0));  // a victim may be an in-flight prefetch
     bool waited_ready = !skip_inflight;
+    bool dma_issued = false;
     size_t offset = 0;
     for (const auto & [id, payload] : incoming) {
         int target = -1;
@@ -305,7 +311,22 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         if (bank->ids[target] >= 0) ++s.counters.evictions;
         bank->ids[target] = -1; bank->speculative[target] = 0;
         const char * packed_src = s.prepacked ? s.prepacked(layer, id) : nullptr;  // null: not in the packed file
-        if (packed_src && s.registered) {
+        if (packed_src && s.registered && split && !host_coherent()) {
+            // F25: on a PCIe GPU split-mode misses go by the copy engine straight into the slot on the miss stream: zero-copy kernels
+            // beside the compute stream faulted / hung the 3090's front end in long decodes, and in compute-stream order they cost ~10 %
+            // decode. GB10 (C2C, coherent host memory) never faulted and reads host memory faster by kernel: it keeps zero-copy.
+            size_t off = 0;
+            for (int p = 0; p < 3; ++p) {
+                const auto & d = bank->matrices[p];
+                checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], packed_src + off, bank->stride[p], cudaMemcpyHostToDevice, up));
+                off += bank->stride[p];
+                if (bank->aux_stride[p]) {
+                    checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.aux)) + size_t(target) * bank->aux_stride[p], packed_src + off, bank->aux_stride[p], cudaMemcpyHostToDevice, up));
+                    off += bank->aux_stride[p];
+                }
+            }
+            s.counters.transfer_bytes += off; dma_issued = true;
+        } else if (packed_src && s.registered) {
             // Kernel reads straight from pinned host memory: demand misses skip the H2D DMA queue behind prefetches.
             size_t off = 0;
             for (int p = 0; p < 3; ++p) {
@@ -365,10 +386,9 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         tqllm_cuda::scatter_copy(items.data(), int(items.size()), s.registered ? up : s.stream);
     }
     constexpr int kZeroCopyParts = 2;  // blocks per item for kernel reads of pinned memory
-    // F25: zero-copy misses (kernels reading pinned host memory) run in compute-stream order; on the miss stream beside the compute
-    // stream they faulted / hung the 3090's front end in long decodes (GB10 clean). DMA misses (scatter) keep the miss stream.
-    if (!direct.empty()) tqllm_cuda::scatter_copy(direct.data(), int(direct.size()), s.stream, kZeroCopyParts);
-    if (split && !scatter.empty()) {
+    // Zero-copy misses: on the miss stream on GB10 (never faulted, fastest there); otherwise only without split mode.
+    if (!direct.empty()) tqllm_cuda::scatter_copy(direct.data(), int(direct.size()), split ? up : s.stream, kZeroCopyParts);
+    if (split && (!scatter.empty() || !direct.empty() || dma_issued)) {
         if (!s.miss_done) checked(cudaEventCreateWithFlags(&s.miss_done, cudaEventDisableTiming));
         checked(cudaEventRecord(s.miss_done, up)); s.miss_pending = true;
     }
