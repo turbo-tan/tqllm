@@ -3409,8 +3409,15 @@ static std::map<std::pair<int, int>, int> & tq3_tuned() {
     return m;
 }
 
+// Tuning launches the matvec on the weights it is given: only for device (or managed) memory. A host-side repack (repack_expert's
+// Upload keeps the bytes on the host) must not run GPU kernels on host pointers: without HMM that is an illegal access at load.
+static bool tune_pointer_ok(const void * p) {
+    cudaPointerAttributes a{};
+    if (!p || cudaPointerGetAttributes(&a, p) != cudaSuccess) { cudaGetLastError(); return false; }
+    return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+}
 void tq3_tune(const void * w, int rows, int k, cudaStream_t s) {
-    if (tq3_tuned().count({rows, k})) return;
+    if (tq3_tuned().count({rows, k}) || !tune_pointer_ok(w)) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
     tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "tq3_tune");
@@ -3820,7 +3827,7 @@ void u4h_matvec_mt(const uint8_t * w4, const __half2 * sm, const __half * xh, __
 
 template <int FMT>
 static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) {
-    if (tuned<FMT>().count({rows, k})) return;
+    if (tuned<FMT>().count({rows, k}) || !tune_pointer_ok(w4)) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
     tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "u4h_tune");
