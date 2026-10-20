@@ -1,4 +1,8 @@
-// AVX2 CPU expert matvec -- IQ4_NL (engine FMT 14, GGUF type 20).
+// CPU expert matvec -- IQ4_NL (engine FMT 14, GGUF type 20).
+//
+// ARCHITECTURES: x86-64 = AVX2+FMA (original). aarch64 = NEON; the int8 path uses the
+// dotprod extension via a function-level target attribute (ARMv8.2-A+; GB10/Grace is
+// ARMv9 where dotprod is mandatory, so every aarch64 target we ship has it).
 //
 // Reference semantics copied from src/formats/weight/dequant.cpp:328-337 (iq4nl) and :380-383 (dispatch):
 //   18 bytes per 32 weights: uint16 fp16 scale d, then 16 code bytes.
@@ -8,7 +12,13 @@
 // I link the project's real half_to_float so the scale interpretation cannot drift.
 #include "cpu_expert_matvec.hpp"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__)
 #include <immintrin.h>
+#else
+#error "cpu_expert_matvec.cpp: no SIMD path for this architecture (x86-64 or aarch64 only)"
+#endif
 #include <cstring>
 #include <cmath>
 #include <vector>   // fp64 diagnostic path scratch
@@ -21,12 +31,20 @@ namespace tqllm { namespace cpu {
 namespace {
 
 // kvalues_iq4nl, copied from src/formats/weight/kvalues_iq4nl.inc (ggml, MIT, (c) ggml authors).
-// Non-linear 16-entry codebook -- this is why IQ4_NL is vpshufb-friendly: a 16-entry
-// table maps directly onto _mm_shuffle_epi8's 16-byte lane table.
+// Non-linear 16-entry codebook -- this is why IQ4_NL is table-lookup-friendly: a 16-entry
+// table maps directly onto vpshufb's / TBL's 16-byte lane table.
 alignas(16) const int8_t KV16[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
        1,   13,  25,  38,  53,  69,  89, 113,
 };
+
+inline float block_scale_f32(const uint8_t *p) {
+    uint16_t h;
+    std::memcpy(&h, p, 2);
+    return half_to_float(h);
+}
+
+#if defined(__x86_64__)
 
 inline __m128i kv_table() { return _mm_load_si128(reinterpret_cast<const __m128i *>(KV16)); }
 
@@ -51,13 +69,40 @@ inline void split_nibbles(__m128i code, __m128i &lo, __m128i &hi) {
     hi = _mm_and_si128(_mm_srli_epi16(code, 4), m);
 }
 
-inline float block_scale_f32(const uint8_t *p) {
-    uint16_t h;
-    std::memcpy(&h, p, 2);
-    return half_to_float(h);
+#else  // __aarch64__
+
+inline int8x16_t kv_table() { return vld1q_s8(KV16); }
+
+// Nibble bytes -> signed codebook bytes via TBL (indices 0..15, always in range).
+inline int8x16_t nib_to_kv(int8x16_t tbl, uint8x16_t nib) { return vqtbl1q_s8(tbl, nib); }
+
+inline float hsum128(float32x4_t v) { return vaddvq_f32(v); }
+
+// Split 16 code bytes into low nibbles (weights 0..15) and high nibbles (weights 16..31).
+// Logical shift right on unsigned bytes: no cross-byte bleed possible, and the high
+// nibble of an unsigned byte lands in 0..15 without needing a mask.
+inline void split_nibbles(uint8x16_t code, uint8x16_t &lo, uint8x16_t &hi) {
+    lo = vandq_u8(code, vdupq_n_u8(0x0F));
+    hi = vshrq_n_u8(code, 4);
 }
 
+// Widen int8x16 -> four float32x4 (exact: |kv| <= 127, int->float conversion lossless),
+// each pre-multiplied by the block scale d -- one fp32 rounding per weight, matching
+// the reference `d * float(kvalues_iq4nl[nib])` exactly.
+inline void kv_to_f32x4(int8x16_t kv, float d, float32x4_t out[4]) {
+    const int16x8_t w16 = vmovl_s8(vget_low_s8(kv));
+    const int16x8_t g16 = vmovl_s8(vget_high_s8(kv));
+    out[0] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))),  d);
+    out[1] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16))), d);
+    out[2] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(g16))),  d);
+    out[3] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(g16))), d);
+}
+
+#endif  // arch
+
 }  // namespace
+
+#if defined(__x86_64__)
 
 // ---------------------------------------------------------------------------
 // EXACT fp32 PATH -- this is the one that must meet <=1e-5 vs dequantize_host.
@@ -233,5 +278,189 @@ void iq4nl_expert_matvec_i16(const uint8_t *W, int rows, int cols, int row_bytes
         for (int t = 0; t < ntok; ++t) y[(int64_t)t * rows + r] = hsum256(accf[t]);
     }
 }
+
+#else  // __aarch64__ -- NEON port, same three kernels, same rounding contract.
+
+// ---------------------------------------------------------------------------
+// EXACT fp32 PATH (NEON) -- <=1e-5 vs dequantize_host, same as the AVX2 contract.
+//
+// Per 32-weight block: TBL the nibbles to signed int8 codebook values (vqtbl1q is the
+// exact analogue of vpshufb for a 16-byte table), widen int8 -> int16 -> int32 -> fp32
+// (every widening exact: |kv| <= 127), multiply by d with ONE fp32 rounding per weight
+// (matches the reference `d * float(kv[j])` bit-for-bit), then FMA against x. W is
+// decoded once per block and reused across all ntok tokens, same as the x86 path.
+// ---------------------------------------------------------------------------
+void iq4nl_expert_matvec_fp32(const uint8_t *W, int rows, int cols, int row_bytes,
+                              const float *x, int ntok, float *y) {
+    if (ntok < 1 || ntok > 4 || cols % 32 != 0 || !W || !x || !y) return;
+    const int nb = cols / 32;
+    const int8x16_t tbl = kv_table();
+
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *wr = W + (int64_t)r * row_bytes;
+        float32x4_t acc[4];
+        for (int t = 0; t < ntok; ++t) acc[t] = vdupq_n_f32(0.0f);
+
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t *p = wr + (int64_t)b * 18;
+            const float d = block_scale_f32(p);
+
+            uint8x16_t lo, hi;
+            split_nibbles(vld1q_u8(p + 2), lo, hi);
+            float32x4_t wl[4], wh[4];
+            kv_to_f32x4(nib_to_kv(tbl, lo), d, wl);   // weights 0..15
+            kv_to_f32x4(nib_to_kv(tbl, hi), d, wh);   // weights 16..31
+
+            const int xb = b * 32;
+            for (int t = 0; t < ntok; ++t) {
+                const float *xp = x + (int64_t)t * cols + xb;
+                acc[t] = vfmaq_f32(acc[t], wl[0], vld1q_f32(xp + 0));
+                acc[t] = vfmaq_f32(acc[t], wl[1], vld1q_f32(xp + 4));
+                acc[t] = vfmaq_f32(acc[t], wl[2], vld1q_f32(xp + 8));
+                acc[t] = vfmaq_f32(acc[t], wl[3], vld1q_f32(xp + 12));
+                acc[t] = vfmaq_f32(acc[t], wh[0], vld1q_f32(xp + 16));
+                acc[t] = vfmaq_f32(acc[t], wh[1], vld1q_f32(xp + 20));
+                acc[t] = vfmaq_f32(acc[t], wh[2], vld1q_f32(xp + 24));
+                acc[t] = vfmaq_f32(acc[t], wh[3], vld1q_f32(xp + 28));
+            }
+        }
+        for (int t = 0; t < ntok; ++t) y[(int64_t)t * rows + r] = hsum128(acc[t]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fp64-ACCUMULATE PATH (NEON) -- identical dequant to the fp32 path (the same
+// kv_to_f32x4 helper), double accumulation. GATE 1 in the test requires this to be
+// BIT-IDENTICAL (max_abs == 0.0) to dequantize_host(type 20): exact int->float
+// widening + one rounded multiply per weight + scalar fp64 dot guarantees that.
+// ---------------------------------------------------------------------------
+void iq4nl_expert_matvec_fp64(const uint8_t *W, int rows, int cols, int row_bytes,
+                              const float *x, int ntok, float *y) {
+    if (ntok < 1 || ntok > 4 || cols % 32 != 0 || !W || !x || !y) return;
+    const int nb = cols / 32;
+    const int8x16_t tbl = kv_table();
+    std::vector<float> row(cols);
+
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *wr = W + (int64_t)r * row_bytes;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t *p = wr + (int64_t)b * 18;
+            const float d = block_scale_f32(p);
+            uint8x16_t lo, hi;
+            split_nibbles(vld1q_u8(p + 2), lo, hi);
+            float32x4_t wl[4], wh[4];
+            kv_to_f32x4(nib_to_kv(tbl, lo), d, wl);
+            kv_to_f32x4(nib_to_kv(tbl, hi), d, wh);
+            vst1q_f32(&row[b*32 + 0],  wl[0]);
+            vst1q_f32(&row[b*32 + 4],  wl[1]);
+            vst1q_f32(&row[b*32 + 8],  wl[2]);
+            vst1q_f32(&row[b*32 + 12], wl[3]);
+            vst1q_f32(&row[b*32 + 16], wh[0]);
+            vst1q_f32(&row[b*32 + 20], wh[1]);
+            vst1q_f32(&row[b*32 + 24], wh[2]);
+            vst1q_f32(&row[b*32 + 28], wh[3]);
+        }
+        for (int t = 0; t < ntok; ++t) {
+            const float *xp = x + (int64_t)t * cols;
+            double acc = 0.0;
+            for (int j = 0; j < cols; ++j) acc += (double)row[j] * (double)xp[j];
+            y[(int64_t)t * rows + r] = (float)acc;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FAST int8 PATH (NEON + dotprod). Same contract as the x86 version: LOSSY, x is
+// requantised to int8 per 32-block, gated at rms_rel <= 1e-2, never inside the 1e-5.
+//
+// Where x86 needs cvtepi8_epi16 + madd_epi16 (two instructions per 16 products, and
+// the maddubs saturation/bias trap documented in the x86 section), ARM's SDOT does
+// signed int8 x int8 -> int32 lane accumulation in ONE instruction with no bias and
+// no saturation: per lane |sum of 4 products| <= 4*127*127 = 64516 << INT32_MAX.
+// Integer accumulation is exact, so the only rounding vs the x86 path is the float
+// conversion order -- orders of magnitude inside the 1e-2 budget.
+//
+// target("+dotprod"): dotprod is optional in ARMv8.0/8.1 but mandatory from ARMv8.2
+// and in all of ARMv9 (GB10/Grace included), so every aarch64 target we ship has it.
+// The attribute scopes the ISA extension to this function alone; the rest of the file
+// stays baseline armv8-a.
+// ---------------------------------------------------------------------------
+__attribute__((target("+dotprod")))
+void iq4nl_expert_matvec_i16(const uint8_t *W, int rows, int cols, int row_bytes,
+                             const float *x, int ntok, float *y) {
+    if (ntok < 1 || ntok > 4 || cols % 32 != 0 || !W || !x || !y) return;
+    const int nb = cols / 32;
+    const int8x16_t tbl = kv_table();
+
+    // PERFORMANCE FIX (same as x86): quantise x ONCE into scratch, reuse for every row.
+    // Scratch: ntok*nb*2 x int8x16 = 4*80*32B = 10 KB at cols=2560.
+    std::vector<int8x16_t> xq_lo((size_t)ntok * nb), xq_hi((size_t)ntok * nb);
+    std::vector<float> rs((size_t)ntok * nb);
+
+    const int32x4_t lim_hi = vdupq_n_s32(127);
+    const int32x4_t lim_lo = vdupq_n_s32(-127);
+
+    // 4 x float32x4 -> clamp(round-to-nearest-even(v*inv)) -> int8x8, two of which
+    // combine into one int8x16. vcvtnq_s32_f32 is round-to-nearest-even, matching
+    // _mm256_cvtps_epi32's default MXCSR mode exactly.
+    auto quant16 = [&](const float32x4_t v[4], float inv) -> int8x16_t {
+        int32x4_t q0 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v[0], inv)), lim_lo), lim_hi);
+        int32x4_t q1 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v[1], inv)), lim_lo), lim_hi);
+        int32x4_t q2 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v[2], inv)), lim_lo), lim_hi);
+        int32x4_t q3 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_n_f32(v[3], inv)), lim_lo), lim_hi);
+        const int16x8_t h01 = vcombine_s16(vmovn_s32(q0), vmovn_s32(q1));
+        const int16x8_t h23 = vcombine_s16(vmovn_s32(q2), vmovn_s32(q3));
+        return vcombine_s8(vmovn_s16(h01), vmovn_s16(h23));   // narrowing is exact: |q| <= 127
+    };
+
+    for (int t = 0; t < ntok; ++t) {
+        for (int b = 0; b < nb; ++b) {
+            const float *xp = x + (int64_t)t * cols + b * 32;
+            float32x4_t v[8];
+            for (int i = 0; i < 8; ++i) v[i] = vld1q_f32(xp + 4 * i);
+            float32x4_t a[8];
+            for (int i = 0; i < 8; ++i) a[i] = vabsq_f32(v[i]);
+            // block max|x|: tree-max the eight lanes, then horizontal max.
+            float32x4_t mm = vmaxq_f32(vmaxq_f32(vmaxq_f32(a[0], a[1]), vmaxq_f32(a[2], a[3])),
+                                       vmaxq_f32(vmaxq_f32(a[4], a[5]), vmaxq_f32(a[6], a[7])));
+            const float maxabs = vmaxvq_f32(mm);
+            const float inv = (maxabs > 0.0f) ? (127.0f / maxabs) : 0.0f;
+            const size_t idx = (size_t)t * nb + b;
+            rs[idx] = (inv > 0.0f) ? (1.0f / inv) : 0.0f;
+            xq_lo[idx] = quant16(v,     inv);   // weights 0..15
+            xq_hi[idx] = quant16(v + 4, inv);   // weights 16..31
+        }
+    }
+
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *wr = W + (int64_t)r * row_bytes;
+        float32x4_t accf[4];
+        for (int t = 0; t < ntok; ++t) accf[t] = vdupq_n_f32(0.0f);
+
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t *p = wr + (int64_t)b * 18;
+            // Weight block scale d -- the bug the x86 path also had to fix: the true
+            // weight is d*kv, so sum(d*kv*x) = d * rs * sum(kv*xq).
+            const float d = block_scale_f32(p);
+
+            uint8x16_t lo, hi;
+            split_nibbles(vld1q_u8(p + 2), lo, hi);
+            const int8x16_t kv_lo = nib_to_kv(tbl, lo);   // signed codebook, weights 0..15
+            const int8x16_t kv_hi = nib_to_kv(tbl, hi);   // signed codebook, weights 16..31
+
+            for (int t = 0; t < ntok; ++t) {
+                const size_t idx = (size_t)t * nb + b;
+                // SDOT: 16 signed int8 products per instruction, exact int32 lanes.
+                int32x4_t mi = vdotq_s32(vdupq_n_s32(0), kv_lo, xq_lo[idx]);
+                mi = vdotq_s32(mi, kv_hi, xq_hi[idx]);
+                // d * rs[t] * sum(kv*xq): fold the weight scale and the x scale together.
+                accf[t] = vfmaq_f32(accf[t], vcvtq_f32_s32(mi), vdupq_n_f32(d * rs[idx]));
+            }
+        }
+        for (int t = 0; t < ntok; ++t) y[(int64_t)t * rows + r] = hsum128(accf[t]);
+    }
+}
+
+#endif  // arch
 
 }}  // namespace tqllm::cpu
