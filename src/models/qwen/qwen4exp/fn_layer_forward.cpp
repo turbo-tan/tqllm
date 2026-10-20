@@ -389,17 +389,20 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         }
         int * dmap[5] = {};
         const int A4 = (A + 3) / 4 * 4;
-        // slot and dedup maps travel in one kernel's parameters (no host-memory reads, which crawl while demand-miss
-        // copies hold the SMs); only the used groups of each dedup map are sent
+        // slot and dedup maps go up in one async copy from this layer's own pinned buffer (F25: sending them in a kernel's
+        // parameters, param_copy, faulted the 3090's front end every ~15-25 min of long decode); only the used groups of each
+        // dedup map are sent. The buffer is rewritten one step later, after this layer's routed-id sync has passed the copy.
         int dpos[5] = {}, used = 3 * A4;
         for (int q = 0; q < 5; ++q) { dpos[q] = used; used += groups[q] * DS; }
         Device<int> maps(size_t(used) + 4);
         {
+            static std::vector<PinnedInts> map_host(c.layers + 1); auto & mh = map_host[layer];
             static std::vector<int> blob; blob.assign(size_t(used), -1);
             for (int q = 0; q < 3; ++q) std::memcpy(blob.data() + size_t(q) * A4, sh.p + size_t(q) * A, size_t(A) * 4);
             for (int q = 0; q < 5; ++q) if (groups[q]) std::memcpy(blob.data() + dpos[q], dh.p + size_t(q) * A * DS, size_t(groups[q]) * DS * 4);
             blob.resize((blob.size() + 3) / 4 * 4, -1);
-            tqllm_cuda::param_copy(blob.data(), blob.size() * 4, maps.p, nullptr);
+            mh.need(blob.size()); std::memcpy(mh.p, blob.data(), blob.size() * 4);
+            ck(cudaMemcpyAsync(maps.p, mh.p, blob.size() * 4, cudaMemcpyHostToDevice, nullptr));
             slots_p = maps.p; hit_p = maps.p + A4; miss_p = maps.p + 2 * A4;
             for (int q = 0; q < 5; ++q) dmap[q] = maps.p + dpos[q];
         }
