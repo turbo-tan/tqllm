@@ -71,8 +71,16 @@ struct MixedExpertCache::State {
     // was evicted still has a layout (bank_layout / bank_mat), so prefill can run its experts from staging
     std::map<int, std::array<Mat, 3>> saved_mat; std::map<int, std::array<size_t, 6>> saved_piece;
     std::map<int, std::array<uint32_t, 3>> saved_type; std::map<int, int> saved_cap;
-    ~State() { cudaDeviceSynchronize(); if (miss_done) cudaEventDestroy(miss_done); if (order_ev) cudaEventDestroy(order_ev);
-               if (own_miss) cudaStreamDestroy(own_miss); banks.clear(); if (staging) cudaFreeHost(staging); if (device_staging) cudaFree(device_staging); if (pf_staging) cudaFree(pf_staging); }
+    ~State() {
+        cudaDeviceSynchronize();
+        if (miss_done) cudaEventDestroy(miss_done);
+        if (order_ev) cudaEventDestroy(order_ev);
+        if (own_miss) cudaStreamDestroy(own_miss);
+        banks.clear();
+        if (staging) cudaFreeHost(staging);
+        if (device_staging) cudaFree(device_staging);
+        if (pf_staging) cudaFree(pf_staging);
+    }
     State(int l, int e, int h, int f, int c, size_t b, Source s, cudaStream_t st)
         : layers(l), experts(e), hidden(h), ff(f), capacity(c), budget(b), source(std::move(s)), stream(st) {
         if (l <= 0 || e <= 0 || h <= 0 || f <= 0 || c <= 0 || c > e || !b || !source ||
