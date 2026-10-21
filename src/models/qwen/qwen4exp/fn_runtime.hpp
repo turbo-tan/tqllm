@@ -191,11 +191,14 @@ template<class T> struct Device {
     }
     ~Device() {
         if (!owned) return;
-        if (!plain) { cudaFreeAsync(p, nullptr); return; }
-        static std::vector<void *> later;  // cudaFree synchronizes: not while a capture is open
-        later.push_back(p);
+        // a free inside a CUDA graph capture (a buffer replaced by a larger one in a captured step) is invalid for pool
+        // memory and synchronizes for cudaMalloc memory: both wait until the capture is closed
+        static std::vector<std::pair<void *, bool>> later;
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) { for (void * q : later) cudaFree(q); later.clear(); }
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) { later.emplace_back(p, plain); return; }
+        for (auto [q, sync] : later) { if (sync) cudaFree(q); else cudaFreeAsync(q, nullptr); }
+        later.clear();
+        if (plain) cudaFree(p); else cudaFreeAsync(p, nullptr);
     }
     void put(const std::vector<T> & v) {
         require(v.size() == count, "device upload size differs");
