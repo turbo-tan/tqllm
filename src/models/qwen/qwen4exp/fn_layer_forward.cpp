@@ -1,11 +1,27 @@
 // Flash-Next layer forward (decode, verify and short prefill chunks) and the router.
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
+#include <map>
+#include <tuple>
 
 void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                    AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
                    const PrefillSink * sink) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
+    // TQFN_GRAPH=1 (opt-in A/B): the part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or
+    // GDN core, routers, top-k) is captured into a CUDA graph each step and the layer's graph is updated in place
+    // (cudaGraphExecUpdate takes the new pointers and positions; a changed shape re-instantiates), then launched: the GPU runs
+    // ~45 small kernels back to back without launch gaps (3090: 1.2 vs 2.1 us per kernel) and capturing costs the host less
+    // than launching. One sequence only (the multi-slot path interleaves per-sequence state).
+    static const bool graph_on = std::getenv("TQFN_GRAPH") != nullptr;
+    struct GraphKey { const void * model; int layer, n; bool operator<(const GraphKey & o) const { return std::tie(model, layer, n) < std::tie(o.model, o.layer, o.n); } };
+    static std::map<GraphKey, std::pair<cudaGraphExec_t, int>> graphs;  // exec, calls seen
+    const GraphKey gkey{this, layer, n};
+    bool capturing = false;
+    if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
+        auto & g = graphs[gkey];
+        if (++g.second > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
+    }
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];
     Device<float> norm(size_t(width) * n), mixed(size_t(h) * n), inject(size_t(c.hc) * n), block(size_t(h) * n), combined(size_t(width) * n);
     if (trunk && ple_rows && std::find(c.ple_layers.begin(), c.ple_layers.end(), layer) != c.ple_layers.end()) {
@@ -142,6 +158,19 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
             tqllm_cuda::moe_topk(nl->p, next_ids->p, nw.p, nsw.p, c.experts, c.topk, n, 1.f, nullptr);
         }
     } else tqllm_cuda::moe_topk(logits.p, routed.p, weights.p, shared_weights.p, c.experts, c.topk, n, 1.f, nullptr);
+    if (capturing) {
+        cudaGraph_t cg = nullptr;
+        const cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &cg);
+        if (e != cudaSuccess || !cg) throw std::runtime_error(std::string("TQFN_GRAPH: capture of layer ") + std::to_string(layer) + " failed: " + cudaGetErrorString(e));
+        auto & exec = graphs[gkey].first;
+        if (exec) {
+            cudaGraphExecUpdateResultInfo info;
+            if (cudaGraphExecUpdate(exec, cg, &info) != cudaSuccess) { cudaGetLastError(); ck(cudaGraphExecDestroy(exec)); exec = nullptr; }
+        }
+        if (!exec) ck(cudaGraphInstantiate(&exec, cg, 0));
+        ck(cudaGraphDestroy(cg));
+        ck(cudaGraphLaunch(exec, cudaStreamPerThread));
+    }
     using clk = std::chrono::steady_clock; auto h0 = clk::now();
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     Device<float> sg(size_t(n) * c.shared_ff), su(sg.count), sa(sg.count), sd(size_t(n) * h), fo(size_t(n) * h);

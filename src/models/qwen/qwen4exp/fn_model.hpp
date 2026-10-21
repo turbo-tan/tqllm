@@ -157,8 +157,9 @@ struct DecodeModel {
 
     // Router logits [n][experts + 1] (last = shared-expert gate). BF16 router weights: per-token GEMVs on the raw weights.
     void router(const std::string & prefix, const float * x, float * logits, int n);
-    static void ck_zero(Device<float> & d) { ck(cudaMemset(d.p, 0, d.count * sizeof(float))); }
-    static void ck_copy(Device<float> & dst, const Device<float> & src) { ck(cudaMemcpy(dst.p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice)); }
+    // stream-ordered on the thread's default stream (capturable; a device-to-device copy never waited for the host anyway)
+    static void ck_zero(Device<float> & d) { ck(cudaMemsetAsync(d.p, 0, d.count * sizeof(float), nullptr)); }
+    static void ck_copy(Device<float> & dst, const Device<float> & src) { ck(cudaMemcpyAsync(dst.p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
     static void ck_copy_n(Device<float> & dst, const float * src, size_t count) { ck(cudaMemcpyAsync(dst.p, src, count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
 };
 
