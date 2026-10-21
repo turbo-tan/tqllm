@@ -1,5 +1,6 @@
 // Flash-Next layer forward (decode, verify and short prefill chunks) and the router.
 #include "fn_model.hpp"
+#include "decode_rules.hpp"
 
 void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                    AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
@@ -169,16 +170,11 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     // prefill (spec off) always takes waves, decode verify (spec on) the split path when it fits: the two paths sum the
     // down projection in a different order (1 ulp in a few values), so a slot-dependent choice changed greedy text
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
+    // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit (TQFN_VERIFY_WAVES=1: old rule)
+    static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
     if (trunk && (n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();  // one wave when the unique experts fit: the split path's miss accounting assumes small steps
-        // F39: a multi-sequence verify block (np > 1: 4 x 4 rows = 160 assignments) passed the slot count by assignments and
-        // ran the waves path, whose down projection sums in another order than the split path one sequence takes: np 4 text
-        // differed from np 1. A verify block takes the split path whenever its distinct experts fit (TQFN_VERIFY_WAVES=1: old rule)
-        static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
-        if (spec && n > 1 && !old_rule) {
-            std::vector<int> u(wave_ids); std::sort(u.begin(), u.end());
-            if (std::unique(u.begin(), u.end()) - u.begin() <= cache.slots(layer)) wave_ids.clear();
-        }
+        if (!tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
     }
     if (!wave_ids.empty()) {
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;

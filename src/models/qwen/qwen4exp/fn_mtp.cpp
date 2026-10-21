@@ -1,5 +1,6 @@
 // Flash-Next MTP drafting: the MTP layer on prompt rows (catch-up) and drafts from its own output.
 #include "fn_model.hpp"
+#include "decode_rules.hpp"
 
 int DecodeModel::mtp_batch(const std::vector<int> & tokens, const float * h_rows) {
     require(mtp_experts, "MTP not loaded (--mtp)");
@@ -186,7 +187,7 @@ std::vector<int> DecodeModel::mtp_drafts(int d1, int count) {
     // TQFN_DRAFT_TAU=t: stop drafting once the last draft's top probability is below t (at least one draft). The verify
     // output does not depend on the block length (greedy text identical for drafts 2-5), so the text is unchanged.
     static const float tau = std::getenv("TQFN_DRAFT_TAU") ? std::strtof(std::getenv("TQFN_DRAFT_TAU"), nullptr) : 0.f;
-    for (int i = 1; i < count && !(tau > 0.f && draft_conf < tau); ++i) {
+    for (int i = 1; i < count && tqllm::flashnext::keep_drafting(tau, draft_conf); ++i) {
         ck(cudaMemcpyAsync(hcopy.p, mtp_h->p, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         d.push_back(mtp_batch({d.back()}, hcopy.p));
     }

@@ -1,6 +1,7 @@
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
 #include "fn_engine.hpp"
+#include "decode_rules.hpp"
 
 namespace tqllm::flashnext {
 
@@ -185,7 +186,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           // every slot (--np) keeps its own full-context attention / recurrent / MTP state beside the banks: sized for one,
           // np 4 at 32K ran out of memory in the second request's state (F38)
           const size_t nseq = slots_.size();
-          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : nseq * state + reserve + nseq * (size_t(256) << 20);
+          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : auto_keep_bytes(nseq, state, reserve);
           if (g_small_card) std::fprintf(stderr, "tqllm: small card: CPU expert pool, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n");
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
