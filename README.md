@@ -395,18 +395,18 @@ the next layer's experts are prefetched while the current one runs. Native MTP d
 stops drafting when the draft is unsure; the output is identical to a fixed 3-token draft (greedy).
 
 Same session, same file ([ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
-IQ3_S) on both engines, RTX 3090 24 GB, greedy; [Strata](https://github.com/Niko1221/Strata) 0.2.0 with `--spec 4`:
+IQ3_S) on both engines, RTX 3090 24 GB, greedy; [Strata](https://github.com/Niko1221/Strata) 0.2.2 (engine 0.1.47) with `--spec 4`:
 
-| | tqLLM | Strata 0.2.0 |
+| | tqLLM | Strata 0.2.2 |
 |---|---:|---:|
-| Short chats (5 x 512 tokens, each a fresh server's first request), tok/s | 91.6 | 91.1 |
-| Time to first token, short chat | 0.32-0.41 s | 1.06-1.25 s |
-| Time to first token, 32K prompt | 14.98 s | 15.16 s |
-| Time to first token, 64K | 28.01 s | 29.36 s |
+| Short chats (5 x 512 tokens, each a fresh server's first request), tok/s | 91.6 | 89.6 |
+| Time to first token, short chat | 0.32-0.41 s | 1.07-1.29 s |
+| Time to first token, 32K prompt | 14.98 s | 15.14 s |
+| Time to first token, 64K | 28.01 s | 29.18 s |
 | Time to first token, 128K | 56.53 s | 58.25 s |
-| Decode after 32K, tok/s | 76.4 | 72.4 |
-| Decode after 64K | 85.1 | 63.7 |
-| Decode after 128K | 77.1 | 47.5 |
+| Decode after 32K, tok/s | 76.4 | 72.2 |
+| Decode after 64K | 85.1 | 63.6 |
+| Decode after 128K | 77.1 | 47.2 |
 
 On a warm server the same five chats run at 95.6 tok/s. Several users at once (`--np` up to 8) give the same text as one user alone. Run it from a manifest (`.tqfn`, one
 `key=value` per line: `gguf=` per shard, `mtp=`, `experts=` (from `tqfn-pack`), `draft_vocab=`, `slots=auto`) with
