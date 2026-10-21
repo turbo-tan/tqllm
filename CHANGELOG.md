@@ -77,6 +77,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   `TQFN_OLD_Q2_DOT`, `TQFN_GDN_VPW`, `TQFN_PF_CHUNK_KB`, `TQFN_CPU_OWNED_COLD` / `_PROFILE`, `TQFN_TQ_AHEAD`.
 
 ### Fixed
+- Docker image build: the Dockerfile copied `kernels/`, removed in the source layout move, so the image no longer
+  built; test `dockerfile_paths` checks every copied path exists.
 - Flash-Next on an RTX 3090 (PCIe): long generations could stop with "unspecified launch failure" (GPU front-end
   Xid 11 / 32 / 69): expert misses read pinned host memory by kernel beside the compute stream. Misses now go by the copy
   engine straight into their slots; GB10 keeps kernel reads (it never faulted). Three 55-72K-token pagoda runs clean.
