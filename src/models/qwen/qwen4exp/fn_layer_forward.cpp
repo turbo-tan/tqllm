@@ -24,6 +24,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     const GraphKey gkey{this, layer, n, 0};
     bool capturing = false;
     if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
+        static int epoch = -1; if (epoch != g_prefill_epoch) { epoch = g_prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
         if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];

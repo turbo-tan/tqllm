@@ -68,7 +68,7 @@ void DecodeModel::release_prefill() {
     auto & st = stage();
     if (!keep) { for (auto & hp : st.half) if (hp) { ck(cudaFree(hp)); hp = nullptr; } st.half_bytes = 0; st.K = 0; }
     st.layer = -1; st.cache = nullptr; st.plan.clear(); st.issued = 0;
-    g_qsa_batch.reset(); tqllm_cuda::fn_gdn_release_workspaces();
+    g_qsa_batch.reset(); tqllm_cuda::fn_gdn_release_workspaces(); ++g_prefill_epoch;
     if (res_keep && res_keep->count > size_t(64) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(64) * width); }
     size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
     if (fr < g_trim_below) { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }

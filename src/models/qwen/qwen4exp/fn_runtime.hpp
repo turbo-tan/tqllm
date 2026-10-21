@@ -136,6 +136,7 @@ inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
 inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled request is in its decode
 inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
+inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
