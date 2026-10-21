@@ -66,9 +66,10 @@ struct MixedExpertCache::State {
         size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
         // the free memory is shared evenly by every layer still without its bank (a refill after a long prompt): the
         // first banks refilled must not take their target and leave the last ones none
-        size_t share = per;
-        for (int l = 0; l < layers; ++l) if (l != layer && !banks.count(l) && saved_piece.count(l)) share += slot_bytes(l);
-        const size_t margin = size_t(256) << 20, fit = fr > margin ? (fr - margin) / share : 0;
+        size_t share = per, pending = 1;
+        for (int l = 0; l < layers; ++l) if (l != layer && !banks.count(l) && saved_piece.count(l)) { share += slot_bytes(l); ++pending; }
+        // each bank's up to six allocations carry upload()'s 64 KB tail beside the slots
+        const size_t margin = (size_t(256) << 20) + pending * 6 * (size_t(64) << 10), fit = fr > margin ? (fr - margin) / share : 0;
         layer_cap[size_t(layer)] = int(std::clamp<size_t>(fit, size_t(floor), size_t(target)));
     }
     size_t budget, live = 0, peak = 0;
@@ -543,12 +544,14 @@ int MixedExpertCache::plan_slots(int layer) {
 int MixedExpertCache::regrow(size_t keep_free) {
     auto & s = *state_; if (s.layer_target.empty()) return 0;
     int n = 0;
+    size_t reserved = 0;  // the full banks the released layers rebuild: their freed slots show as free memory but are spoken for
     for (int l = 0; l < s.layers; ++l) {
         const auto it = s.banks.find(l);
         if (it == s.banks.end() || it->second->cap >= s.layer_target[size_t(l)]) continue;
         size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
         const size_t grow = size_t(s.layer_target[size_t(l)] - it->second->cap) * s.slot_bytes(l);
-        if (fr < keep_free + grow) break;
+        if (fr < keep_free + reserved + grow) break;
+        reserved += size_t(s.layer_target[size_t(l)]) * s.slot_bytes(l);
         release_bank(l); ++n;  // rebuilt at its target by the next prepare (choose_cap)
     }
     return n;

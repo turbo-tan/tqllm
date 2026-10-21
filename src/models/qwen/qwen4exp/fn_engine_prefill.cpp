@@ -1,5 +1,6 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "fn_engine.hpp"
+#include "decode_rules.hpp"
 
 namespace tqllm::flashnext {
 
@@ -39,9 +40,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
     S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
-    // banks a long prompt left below their slot target grow back once its state is gone (a prompt that needs the room
-    // borrows them again below)
-    if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
+    // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
+    // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
+    if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, prompt.size() + count + 16));
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
         if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }

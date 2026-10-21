@@ -39,6 +39,12 @@ int main() {
     std::vector<int> verify6; for (int i = 0; i < 60; ++i) verify6.push_back(i);
     check(!layer_takes_waves(verify6, 6, topk, slot_floor(101, 144, 157), true), "6-row verify keeps the split path at the floor");
 
+    // regrow keep: the request's own state on top of the base, capped at the full context
+    const size_t base = size_t(768) << 20, full = size_t(4000) << 20;
+    check(regrow_keep_bytes(base, full, 65536, 32768) == base + full / 2, "regrow keeps a 32K request's state (half of 64K)");
+    check(regrow_keep_bytes(base, full, 65536, 1 << 20) == base + full, "regrow keep never exceeds the full context's state");
+    check(regrow_keep_bytes(base, full, 0, 32768) == base, "no state size known: the base only");
+
     // adaptive drafts
     check(keep_drafting(0.f, 0.01f), "tau 0: fixed draft count");
     check(keep_drafting(0.9f, 0.95f) && !keep_drafting(0.9f, 0.5f), "tau 0.9: stop below, continue at or above");

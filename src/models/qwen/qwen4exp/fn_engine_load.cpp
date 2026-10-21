@@ -251,6 +251,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
+        f.state_full = state; f.state_tokens = int(context);
         const size_t fr = tqllm::device_free_bytes();
         // slots=auto with one sequence keeps only the reserve on purpose (decode_rules.hpp auto_keep_bytes): long prompts borrow
         if (fr < state + reserve && (std::getenv("TQFN_AUTO_KEEP_MB") || g_small_card || (f.slots_auto && slots_.size() == 1))) {

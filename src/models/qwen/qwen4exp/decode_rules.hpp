@@ -37,6 +37,13 @@ inline int slot_floor(int target, int tier_a, int tier_b) {
     return std::min(target, std::max(64, int(int64_t(target) * tier_a / tier_b)));
 }
 
+// What regrow() at a request's start keeps free: the base room plus the request's own state, scaled from one sequence's
+// full-context state (a long request after a long request keeps the smaller banks instead of rebuilding them unchanged).
+inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens, size_t tokens) {
+    if (state_tokens <= 0) return base;
+    return base + size_t(double(state_full) * double(std::min(tokens, size_t(state_tokens))) / double(state_tokens));
+}
+
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }
 

@@ -88,6 +88,28 @@ int main() {
         int top_slot = 0; for (int x : slots) top_slot = std::max(top_slot, x);
         expect(planned < target && cache.slots(1) == planned && top_slot < planned, "planned bank size is the size prepare builds");
     }
+    {   // regrow releases a shrunk bank only while the memory also holds the full banks of those it already released: a
+        // released bank's slots show as free memory, and counting them twice let the next bank go too, so both rebuilt
+        // below their target (residency thrown away for no capacity)
+        MixedExpertCache cache(layers, experts, hidden, ff, target, size_t(4) << 30, source, nullptr);
+        cache.set_layer_slots(std::vector<int>(layers, target)); cache.set_layer_tiers(std::vector<int>(layers, floor));
+        for (int l = 0; l < layers; ++l) { cache.prepare(l, all); cache.wait_misses(); }
+        const size_t per = cache.bank_layout(2).block, margin = size_t(256) << 20;
+        cache.release_bank(2); cache.release_bank(3);
+        size_t fr = 0, tot = 0; check(cudaMemGetInfo(&fr, &tot));
+        void * hog = nullptr; check(cudaMalloc(&hog, fr - (margin + size_t(target) * per + (size_t(4) << 20))));
+        for (int l : {2, 3}) { const int c = cache.plan_slots(l); cache.prepare(l, std::vector<int>(all.begin(), all.begin() + c)); cache.wait_misses(); }
+        const int half = cache.slots(2);
+        check(cudaDeviceSynchronize()); check(cudaFree(hog));
+        // room beyond the margin for one and a half banks' growth: one bank can regrow, not both
+        check(cudaMemGetInfo(&fr, &tot));
+        const size_t g = size_t(target - half) * per;
+        check(cudaMalloc(&hog, fr - (margin + g * 3 / 2)));
+        const int released = cache.regrow(margin);
+        bool full = true; for (int l : {2, 3}) if (!cache.bank_ready(l)) full = full && cache.plan_slots(l) == target;
+        expect(half < target && released == 1 && full, "regrow releases only the banks the memory can rebuild at their target");
+        check(cudaFree(hog));
+    }
     int s0 = 0; bool kept0 = false, grow0 = false, bytes0 = false; size_t free0 = 0;
     scenario(false, s0, kept0, grow0, bytes0, free0);
     expect(!kept0 || free0 < (size_t(240) << 20), "control (no tiers): the same refill takes the decode's room or evicts a bank");
