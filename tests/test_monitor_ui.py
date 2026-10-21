@@ -255,10 +255,16 @@ def main():
 
                 mode.write_text('prefill')
                 expect(page.locator('#phase')).to_have_text('Prefilling prompt')
-                assert page.locator('#requests .progress').count() == 0, 'context allocation is not measured prefill progress'
+                expect(page.locator('#requests .progress')).to_have_count(1)
+                expect(page.locator('#prefillStatus')).to_be_visible()
+                page.wait_for_function("() => document.querySelector('#prefillSpeed').textContent !== '--'")
+                expect(page.locator('#prefillCount')).to_contain_text('/ 8,192 tokens')
+                expect(page.locator('#lensRateLabel')).to_have_text('PREFILL RATE')
+                expect(page.locator('#lensRate')).to_contain_text('tok/s')
                 assert 'prompt tok/s' not in page.locator('#lensNote').inner_text()
                 expect(page.locator('#speed')).to_have_text('--')
                 expect(page.locator('#context')).to_contain_text('8,192')
+                page.screenshot(path=str(args.output / f'monitor-{browser_name}-prefill.png'), full_page=True)
                 mode.write_text('decode')
                 expect(page.locator('#phase')).to_have_text('Generating output')
                 page.wait_for_function("() => document.querySelector('#speed').textContent!=='--'")

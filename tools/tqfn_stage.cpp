@@ -1,3 +1,4 @@
+#include "../src/prefill_observer_cuda.hpp"
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "../src/tq3_expert_cache.hpp"
 #include "../src/qwen4exp.hpp"
@@ -3109,6 +3110,7 @@ public:
                 S().d1_ = S().model_->mtp_batch(toks, S().model_->res_keep->p + size_t(q - b) * S().model_->width);
             }
             lap(mtp_ms, tl);
+            tqllm::prefill_completed(nullptr,uint32_t(e),uint32_t(P));
         }
         if (g_prefill_log) std::fprintf(stderr, "tqllm: prefill %d tokens %.1f s: trunk %.1f s (QSA %.1f s), MTP catch-up %.1f s\n", P,
             std::chrono::duration<double>(pclk::now() - p0).count(), trunk_ms / 1000, g_qsa_ms / 1000, mtp_ms / 1000);

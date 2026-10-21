@@ -1,3 +1,4 @@
+#include "prefill_observer_cuda.hpp"
 // Qwen3.5 dense hybrid decode engine (text path): Gated DeltaNet + gated full attention, BF16 weights.
 #include "dev_alloc.cuh"
 #include "debug.hpp"
@@ -3715,6 +3716,7 @@ public:
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                     }
                     if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
+                    tqllm::prefill_completed(stream,t+uint32_t(m),P,P0);
                     if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
                         std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f tok/s)\n", t + uint32_t(m), P,

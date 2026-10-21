@@ -153,13 +153,13 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
 <section class="left" aria-label="Telemetry">
   <div id="notice" class="notice" hidden role="alert"></div>
   <form id="auth" hidden><label for="apiKey">api key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="the key configured on tqserve"><button type="submit">connect</button><small>Kept in memory for this tab only; never written to storage or a URL.</small></form>
-  <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
+  <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span id="prefillStatus" class="status-rate" title="Completed prefill tokens per second, excluding cached tokens" hidden><span id="prefillSpeed">--</span> tok/s prefill <span id="prefillCount"></span></span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
   <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
   <section class="lens" id="requestLens" aria-label="Selected request">
     <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><div class="lens-actions"><button type="button" id="followLatest" hidden title="Follow the latest request">Follow latest</button><button type="button" id="pinRequest" disabled>Pin as reference</button></div></div>
     <div class="journey" aria-label="Time before and after first output"><span id="journeyWait" style="flex-grow:1"></span><span id="journeyOutput" style="flex-grow:0"></span></div>
     <div class="journey-caption"><span>Before first output <b id="journeyBefore">--</b></span><span>After first output <b id="journeyAfter">--</b></span></div>
-    <div class="lens-metrics"><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small>OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
+    <div class="lens-metrics"><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small id="lensRateLabel">OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
     <p class="lens-note" id="lensNote">Engine measurements, without guessing why a request is waiting.</p>
     <div class="compare" id="comparison" hidden><span id="comparisonText"></span><button type="button" id="clearReference" class="icon-button" title="Clear reference" aria-label="Clear reference"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
   </section>
@@ -208,6 +208,7 @@ function connection(state, message) { document.body.dataset.connection = state; 
 function notice(message) { $('notice').hidden = !message; text('notice', message); }
 function clearLive() {
   text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true; $('followLatest').disabled = true;
+  $('prefillStatus').hidden = true;
   for (const id of ['speed', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
   for (const id of ['contextBar', 'gpuMemoryBar', 'ramMemoryBar']) $(id).style.width = '0';
   $('requestLens').setAttribute('data-stale', 'true'); monitorPanels.invalidate();
@@ -241,7 +242,7 @@ function requestLens() {
   document.querySelector('.journey').hidden = !r;
   $('followLatest').hidden = focusedId === null;
   if (!r) {
-    text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
+    text('lensRateLabel', 'OUTPUT RATE'); text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
     for (const id of ['lensFirst','lensRate','lensElapsed','journeyBefore','journeyAfter']) text(id, '--');
     $('comparison').hidden = true; $('pinRequest').disabled = true;
     $('journeyWait').style.flexGrow = 1; $('journeyOutput').style.flexGrow = 0;
@@ -257,8 +258,10 @@ function requestLens() {
   $('journeyWait').hidden = before === 0; $('journeyOutput').hidden = after === 0;
   text('journeyBefore', hasFirst ? seconds(before) : 'not observed yet'); text('journeyAfter', hasFirst ? seconds(after) : '--');
   text('lensFirst', seconds(r.first_output_ms)); text('lensElapsed', seconds(r.elapsed_ms));
-  text('lensRate', Number.isFinite(r.decode_tokens_per_second) ? number(r.decode_tokens_per_second, 1) + ' tok/s' : '--');
-  text('lensNote', 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
+  const lensRate = r.phase === 'prefill' ? r.prefill_tokens_per_second : r.decode_tokens_per_second;
+  text('lensRateLabel', r.phase === 'prefill' ? 'PREFILL RATE' : 'OUTPUT RATE');
+  text('lensRate', Number.isFinite(lensRate) ? number(lensRate, 1) + ' tok/s' : '--');
+  text('lensNote', (r.phase === 'prefill' ? 'Prefill: ' + number(r.prefill_processed_tokens ?? 0) + ' / ' + number(r.prompt_tokens) + ' tokens. ' : '') + 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
     (terminal(r.phase) ? 'Finished request; measurements are retained.' : 'Live snapshot; the journey grows as the request runs.'));
   $('pinRequest').disabled = !terminal(r.phase); $('followLatest').disabled = false;
   $('pinRequest').textContent = pinnedRequest && pinnedRequest.id === r.id ? 'Clear reference' : 'Pin as reference';
@@ -294,6 +297,11 @@ function render(data) {
   text('model', data.engine.model || 'tqLLM'); text('host', data.engine.host || 'local'); text('build', data.engine.build || 'unknown');
   text('slots', number(data.engine.slots) + (data.engine.slots === 1 ? ' slot' : ' slots'));
   text('phase', active.length ? active.some(r => r.phase === 'prefill') ? 'Prefilling prompt' : decoders.length ? 'Generating output' : 'Requests queued' : 'Ready for your next request');
+  const prefilling = active.filter(r => r.phase === 'prefill');
+  const prefillFocus = prefilling.at(-1) || [...rows].reverse().find(r => Number.isFinite(r.prefill_tokens_per_second));
+  $('prefillStatus').hidden = !prefillFocus;
+  text('prefillSpeed', Number.isFinite(prefillFocus?.prefill_tokens_per_second) ? number(prefillFocus.prefill_tokens_per_second, 1) : '--');
+  text('prefillCount', prefilling.length && prefillFocus ? (typeof prefillFocus.prefill_processed_tokens === 'number' ? number(prefillFocus.prefill_processed_tokens) : '0') + ' / ' + number(prefillFocus.prompt_tokens) + ' tokens' : '');
   const measured = decoders.filter(r => typeof r.decode_tokens_per_second === 'number');
   text('speed', measured.length ? number(measured.reduce((n, r) => n + r.decode_tokens_per_second, 0), 1) : '--');
   text('queue', active.filter(r => r.phase !== 'queued').length + ' / ' + active.filter(r => r.phase === 'queued').length);
@@ -305,7 +313,7 @@ function render(data) {
   $('requests').replaceChildren(...rows.slice(-14).reverse().map(r => {
     const tr = document.createElement('tr');
     const cells = [r.id, r.phase, number(r.prompt_tokens) + ' / ' + number(r.output_tokens), typeof r.first_output_ms === 'number' ? number(r.first_output_ms) + ' ms' : '--',
-      typeof r.decode_tokens_per_second === 'number' ? number(r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
+      typeof (r.phase === 'prefill' ? r.prefill_tokens_per_second : r.decode_tokens_per_second) === 'number' ? number(r.phase === 'prefill' ? r.prefill_tokens_per_second : r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
     cells.forEach((value, i) => {
       const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
       if (i === 0) {

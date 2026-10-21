@@ -1,6 +1,7 @@
 #pragma once
 // Read-only serving telemetry. Writers publish counters; readers never touch an engine.
 #include "json_out.hpp"
+#include "src/prefill_observer.hpp"
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -16,7 +17,9 @@ class Monitor {
     struct Entry {
         uint64_t id;
         std::string phase = "queued";
-        std::optional<uint32_t> prompt, output, context;
+        std::optional<uint32_t> prompt, output, context, prefill_done;
+        uint32_t cached = 0;
+        Clock::time_point prefill_start = Clock::now();
         uint32_t previous_output = 0, passes = 1;
         double previous_prefill = 0, previous_decode = 0;
         uint64_t previous_drafted = 0, previous_accepted = 0;
@@ -45,8 +48,16 @@ public:
                 e.decode_ms.reset(); e.prefill_ms.reset(); ++e.passes;
             }
             e.phase = "prefill"; e.prompt = total; e.context = total;
+            e.prefill_start=Clock::now(); e.prefill_done.reset(); e.cached=0;
         }); }
-        void decoding() { update([](Entry & e) { e.phase = "decode"; e.decode = Clock::now(); }); }
+        void progress(uint32_t done, uint32_t total, uint32_t cached=0) { update([&](Entry & e) {
+            if (e.phase!="prefill" || !e.prompt || total!=*e.prompt || done>total || cached>done) return;
+            e.prefill_done=std::max(e.prefill_done.value_or(0),done); e.cached=cached;
+        }); }
+        void decoding() { update([](Entry & e) {
+            e.phase = "decode"; e.decode = Clock::now();
+            e.prefill_ms=e.previous_prefill+milliseconds(e.decode-e.prefill_start);
+        }); }
         void tokens(uint32_t count) {
             update([&](Entry & e) {
                 if (count && !e.first_ms) e.first_ms = milliseconds(Clock::now() - e.start);
@@ -106,6 +117,15 @@ public:
             field(out, "prompt_tokens", e.prompt); field(out, "output_tokens", e.output); field(out, "context_tokens", e.context);
             field(out, "first_output_ms", e.first_ms); field(out, "prefill_ms", e.prefill_ms);
             field(out, "decode_ms", e.decode_ms);
+            field(out, "prefill_processed_tokens", e.prefill_done);
+            out += ",\"prefill_cached_tokens\":" + std::to_string(e.cached);
+            const double prefill_time=e.phase=="prefill" ? milliseconds(now-e.prefill_start) : e.prefill_ms.value_or(0)-e.previous_prefill;
+            std::optional<double> prefill_rate;
+            if (prefill_time>0 && e.prompt) {
+                const auto processed=e.phase=="prefill" ? e.prefill_done : e.prompt;
+                if(processed && *processed>e.cached) prefill_rate=(*processed-e.cached)*1000.0/prefill_time;
+            }
+            field(out, "prefill_tokens_per_second", prefill_rate);
             const auto n = e.output.value_or(0);
             const double ms = e.decode_ms.value_or(e.previous_decode + milliseconds(now - e.decode));
             std::optional<double> rate;
@@ -120,7 +140,7 @@ public:
         field(out, "gpu_used_bytes", hardware_.gpu_used_bytes); field(out, "gpu_total_bytes", hardware_.gpu_total_bytes);
         field(out, "gpu_celsius", hardware_.gpu_celsius); field(out, "gpu_watts", hardware_.gpu_watts);
         out += ",\"device_name\":"; jstr(out, hardware_.device_name);
-        return out + "},\"capabilities\":{\"live_tokens\":true,\"prefill_progress\":false,\"expert_cache\":false,\"cancel\":false}}";
+        return out + "},\"capabilities\":{\"live_tokens\":true,\"prefill_progress\":true,\"expert_cache\":false,\"cancel\":false}}";
     }
 private:
     static bool terminal(const std::string & s) { return s == "complete" || s == "failed" || s == "cancelled"; }
@@ -136,4 +156,7 @@ private:
     Hardware hardware_;
     std::optional<Clock::time_point> hardware_time_;
 };
+inline tqllm::PrefillObserver observe_prefill(const std::shared_ptr<Monitor::Request> & ticket) {
+    return ticket ? tqllm::PrefillObserver([ticket](uint32_t done,uint32_t total,uint32_t cached) { ticket->progress(done,total,cached); }) : tqllm::PrefillObserver{};
+}
 } // namespace tqserve

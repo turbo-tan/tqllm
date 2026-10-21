@@ -708,7 +708,8 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
-        model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+        { tqllm::PrefillObservation progress(observe_prefill(req.observation));
+        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
         while (model.spec_advance()) {
@@ -1016,7 +1017,8 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
-    model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+    { tqllm::PrefillObservation progress(observe_prefill(req.observation));
+        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
     while (model.spec_advance()) {

@@ -94,6 +94,7 @@ int main(int argc, char ** argv) {
                     if (mode == "cancelled") job->finish("cancelled");
                     last_mode = mode;
                 }
+                if (mode == "prefill") job->progress(uint32_t(std::min(8192, (step+1)*128)),8192);
                 if (mode == "decode") job->tokens(uint32_t(step % 512 + 1));
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
@@ -111,6 +112,18 @@ int main(int argc, char ** argv) {
         r->prefill(4096);
         check(latest(snapshot(m)).get("prompt_tokens")->num == 4096, "actual prompt count");
         check(latest(snapshot(m)).get("output_tokens")->kind == tqllm::Json::Null, "no invented output");
+        check(latest(snapshot(m)).get("prefill_tokens_per_second")->kind == tqllm::Json::Null, "no invented prefill rate");
+        {
+            tqllm::PrefillObservation progress(tqserve::observe_prefill(r));
+            tqllm::prefill_observer(2048,4096,1024);
+            tqllm::prefill_observer(1024,4096,1024);
+            check(latest(snapshot(m)).get("prefill_processed_tokens")->num==2048, "progress monotonic");
+            tqllm::prefill_observer(5000,4096,0);
+            tqllm::prefill_observer(3000,5000,0);
+            check(latest(snapshot(m)).get("prefill_processed_tokens")->num==2048, "invalid progress rejected");
+            check(latest(snapshot(m)).get("prefill_tokens_per_second")->num>0, "live prefill rate");
+        }
+        check(!tqllm::prefill_observer, "prefill callback scope restored");
         r->decoding(); r->tokens(20);
         r->timings(4096, 20, 100, 190, 30, 18);
         j = snapshot(m);
@@ -138,11 +151,31 @@ int main(int argc, char ** argv) {
         std::thread writer([&] { parallel->prefill(2000); parallel->decoding(); for (int n=0;n<1000;++n) parallel->tokens(n); parallel->finish(); done=true; });
         while (!done) check(snapshot(m).get("schema_version")->num == 1, "concurrent snapshot valid");
         writer.join();
+        auto cached=m.begin(); cached->prefill(4096); cached->progress(4096,4096,3072);
+        cached->decoding(); cached->timings(4096,1,1000,0,0,0);
+        check(latest(snapshot(m)).get("prefill_tokens_per_second")->num==1024, "cached tokens excluded from rate");
+        cached->finish();
         // Tickets can outlive the monitor owner safely.
         std::shared_ptr<Monitor::Request> orphan;
         { Monitor temporary({}); orphan = temporary.begin(); }
         orphan.reset();
 #if defined(__linux__)
+        {
+            tqserve::MonitorServer same_port(m,"127.0.0.1",0,"test-key","",0,false);
+            check(same_port.port()==0,"sampler must not open a listener");
+            auto route=[&](const std::string & path,const std::string & key) {
+                int pair[2]; check(::socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0,"socketpair");
+                tqserve::Request req; req.method="GET"; req.path=path; req.authorization=key;
+                check(!same_port.serve(pair[0],req),"GET ownership"); ::close(pair[0]);
+                std::string data; char bytes[4096]; ssize_t n;
+                while((n=::recv(pair[1],bytes,sizeof(bytes),0))>0)data.append(bytes,size_t(n));
+                ::close(pair[1]); return data;
+            };
+            check(route("/monitor","").find("200 OK")!=std::string::npos,"same-port page");
+            check(route("/monitor/","").find("200 OK")!=std::string::npos,"trailing slash");
+            check(route("/api/monitor/v1/snapshot","").find("401")!=std::string::npos,"same-port authentication");
+            check(route("/api/monitor/v1/snapshot","Bearer test-key").find("200 OK")!=std::string::npos,"same-port metrics");
+        }
         chat_proxy_gate();
         tqserve::MonitorServer server(m, "127.0.0.1", 0, "test-key");
         const auto html = get(server.port(), "/");

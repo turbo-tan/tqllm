@@ -195,7 +195,8 @@ private:
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     if (job->req.observation) job->req.observation->prefill(job->result.prompt_tokens);
-                    model_.spec_begin(job->prompt, job->count, draft_length());
+                    { tqllm::PrefillObservation progress(observe_prefill(job->req.observation));
+                    model_.spec_begin(job->prompt, job->count, draft_length()); }
                     if (job->req.observation) job->req.observation->decoding();
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500

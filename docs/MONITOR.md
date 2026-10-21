@@ -1,7 +1,6 @@
 # Runtime monitor
 
-A runtime dashboard built into `tqserve`, with read-only telemetry and a same-origin chat bridge. It runs on a separate, optional
-listener so a long single-slot prefill cannot block monitoring requests. There
+A runtime dashboard built into `tqserve`, with read-only telemetry and a same-origin chat bridge. It shares the API port by default and remains responsive during a long single-slot prefill. An optional separate listener is also available. There
 is no JavaScript build step, CDN, database, Python service or extra runtime
 package. The page is embedded in the executable, including installed/container
 builds.
@@ -35,15 +34,14 @@ available beside the workbench, or below it on small screens.
 Build from source as described in CONTRIBUTING.md, then:
 
 ```sh
-./build/tqserve --model models/model.gguf --port 8086 --monitor-port 8087
+./build/tqserve --model models/model.gguf --port 8086
 ```
 
-Open `http://127.0.0.1:8087/`. Inference stays on port 8086. The monitor binds
-to the same IPv4 address as `--host`. Omit `--monitor-port` to disable it;
-its port must differ from the inference port. If using a container built from
-this source, additionally publish the monitor port (`-p 8087:8087`) and append
-`--monitor-port 8087` to the container arguments. Existing release images need
-rebuilding to include this feature.
+Open `http://127.0.0.1:8086/` or `http://127.0.0.1:8086/monitor`.
+Inference and monitoring share one port; a container needs only `-p 8086:8086`.
+For a separate dashboard listener, add `--monitor-port 8087`; the dashboard
+still works on the API port. `--monitor-port 8086` explicitly selects the shared
+port without binding another listener. Existing binaries/images need rebuilding.
 
 `--api-key` and `--api-key-file` protect monitor data with the same Bearer key.
 The static page can load without a key, then asks for it. The key stays in page
@@ -56,7 +54,7 @@ other applications should proxy the authenticated JSON from their own backend.
 
 - `GET /` or `/monitor`: the embedded dashboard.
 - `GET /api/monitor/v1/snapshot`: cached engine/request counters and hardware.
-- `GET /health`: health of the monitor listener, **not** a GPU readiness probe.
+- `GET /health`: normal API health on the shared port; the optional separate listener reports monitor health only.
 - `POST /api/monitor/v1/chat/completions`: normal OpenAI chat-completions JSON,
   including `stream: true`, proxied to this instance's inference endpoint. This
   route requires the same Bearer key, JSON content type and same-origin requests
@@ -90,6 +88,8 @@ error strings. Engine calls never occur in the monitoring thread.
 | `context_tokens` | Current pass's prompt + generated IDs; logical sequence length, not resident KV bytes |
 | `first_output_ms` | Time from admission to first observed output batch, including queue time; not a per-token device timestamp |
 | `decode_tokens_per_second` | Mean decode rate; first prefill-produced token excluded per pass. Live uses host elapsed time; completed uses the engine's timings |
+| `prefill_processed_tokens`, `prefill_cached_tokens` | Completed prompt positions and reused prefix positions; not allocated context |
+| `prefill_tokens_per_second` | Live mean uncached tokens/s during prefill, retained after completion; null until work is observed |
 | `prefill_ms`, `decode_ms` | Engine timings after a pass completes; cumulative across continuation passes |
 | `drafted`, `accepted` | Engine-reported draft counters, populated after a generation pass |
 | `elapsed_ms` | Request lifetime, including queue time; frozen at termination |
@@ -113,11 +113,13 @@ Linux/POSIX support; it does not add a Metal server.
 
 ## Limits
 
-Intermediate prefill completion, cached-prefix counts, resident KV bytes and
-expert-cache statistics are not yet exported. `capabilities.prefill_progress`,
-`expert_cache` and `cancel` are false. The page shows prefill as a phase with
-elapsed time, not an inaccurate completion percentage. Long prefills may have
-no new token counters until the model returns from `spec_begin`.
+The quantized Qwen3.5/Qwen3.8 path and Flash-Next publish completed prefill chunks in CUDA stream order,
+without adding a device synchronization. The dashboard displays completed/total
+prompt tokens and live mean prefill tok/s. Cached-prefix tokens are counted in
+progress but excluded from throughput. The rate becomes available after the first
+completed chunk; unsupported engines show phase/elapsed time until final timings
+arrive. A chunk may take several seconds on a large prompt. Resident KV bytes and
+expert-cache statistics are not yet exported; `expert_cache` and `cancel` remain false.
 
 The monitor starts after model load. It is an engine dashboard; it does not
 include Arena's multi-provider chat, tools, rooms or fleet orchestration. A

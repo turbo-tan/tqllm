@@ -114,7 +114,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature T --top-p P --top-k K (defaults for requests that set none; default greedy)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--monitor-port N (optional read-only dashboard)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
+                 "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
                  "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n";
@@ -239,7 +239,7 @@ int main(int argc, char ** argv) {
             if (tokenizer_path.empty()) tokenizer_path = model_dir + "/tokenizer.tqtok";
         }
         tokenizer_path = tqllm::tokenizer_for(model_path, tokenizer_path);
-        if (model_path.empty() || tokenizer_path.empty() || port == 0 || port > 65535 || monitor_port == port || context == 0 || max_tokens == 0 || name.empty() || np == 0 || np > 64) {
+        if (model_path.empty() || tokenizer_path.empty() || port == 0 || port > 65535 || context == 0 || max_tokens == 0 || name.empty() || np == 0 || np > 64) {
             usage();
             return 2;
         }
@@ -265,17 +265,18 @@ int main(int argc, char ** argv) {
         tqllm::Model & model = *model_ptr;
         std::unique_ptr<tqserve::Monitor> monitor;
         std::unique_ptr<tqserve::MonitorServer> monitor_server;
-        if (monitor_port) {
+        {
             char hostname[256]{}, pci[32]{}; ::gethostname(hostname, sizeof(hostname) - 1);
             int device = 0;
             if (cudaGetDevice(&device) == cudaSuccess) cudaDeviceGetPCIBusId(pci, sizeof(pci), device);
             monitor = std::make_unique<tqserve::Monitor>(tqserve::Monitor::Info{name, TQLLM_COMMIT, hostname, pci, slot_context, np});
-            monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port));
-            std::cerr << "tqserve: monitor http://" << host << ':' << monitor_port << "/ (read-only)\n";
+            monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port), monitor_port && monitor_port != port);
+            std::cerr << "tqserve: monitor http://" << host << ':' << (monitor_port ? monitor_port : port) << "/monitor (read-only)\n";
         }
         std::unique_ptr<tqserve::Scheduler> scheduler;
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
         std::atomic<int> inflight{0};
+        std::mutex generation_mutex;
         listener = bind_socket(host, static_cast<uint16_t>(port));
         if (listener < 0) throw std::runtime_error("socket bind/listen failed: " + std::string(std::strerror(errno)));
         std::signal(SIGINT, stop_server);
@@ -320,7 +321,7 @@ int main(int argc, char ** argv) {
                   << ")\n";
 
         while (running) {
-            if (!scheduler && model.kv_idle_pending()) {  // idle: compact one old block, unless a client is waiting
+            if (!scheduler && inflight == 0 && model.kv_idle_pending()) {  // idle: compact one old block, unless a client is waiting
                 pollfd pf{listener, POLLIN, 0};
                 if (::poll(&pf, 1, 20) == 0) {
                     model.kv_idle_step();
@@ -342,6 +343,11 @@ int main(int argc, char ** argv) {
             if (!receive_request(client, request, error, status)) {
                 send_all(client, response(status, tqserve::json_error(error)));
                 ::close(client);
+                return;
+            }
+            if (request.path == "/" || request.path == "/monitor" || request.path == "/monitor/" ||
+                request.path == "/api/monitor/v1/snapshot" || request.path == "/api/monitor/v1/chat/completions") {
+                if (!monitor_server->serve(client, request)) ::close(client);
                 return;
             }
             if (!api_key.empty() && request.authorization != "Bearer " + api_key) {
@@ -387,6 +393,8 @@ int main(int argc, char ** argv) {
                 std::string in(request.body.begin(), request.body.end()), adapt_error;
                 if (api == tqserve::Api::Responses) in = tqserve::responses_to_chat(in, adapt_error);
                 else if (api == tqserve::Api::Messages) in = tqserve::messages_to_chat(in, adapt_error);
+                std::unique_lock<std::mutex> generation_lock(generation_mutex, std::defer_lock);
+                if (!scheduler) generation_lock.lock();
                 auto parsed = adapt_error.empty()
                     ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
                     : tqserve::ChatRequest{};
@@ -521,18 +529,23 @@ int main(int argc, char ** argv) {
             send_all(client, response(status, body));
             ::close(client);
             };
-            if (scheduler) {
+            if (scheduler || monitor) {
+                if (inflight >= 64) {
+                    send_all(client,response(503,tqserve::json_error("too many connections"))); ::close(client); continue;
+                }
                 ++inflight;
-                std::thread([handle, &inflight] {
-                    handle();
+                try { std::thread([handle, &inflight, client] {
+                    try { handle(); }
+                    catch (...) { ::close(client); }
                     --inflight;
-                }).detach();
+                }).detach(); }
+                catch (...) { --inflight; ::close(client); }
             } else {
                 handle();
             }
         }
         scheduler.reset();  // fails queued and running requests so their connection threads can answer
-        for (int i = 0; i < 500 && inflight > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        for (; inflight > 0;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (listener >= 0) ::close(listener);
         listener = -1;
         return 0;
