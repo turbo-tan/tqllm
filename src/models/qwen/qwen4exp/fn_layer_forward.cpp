@@ -4,9 +4,28 @@
 #include <map>
 #include <tuple>
 
+// A step whose captured part fails (an operation not allowed in a capture: a weight uploaded on its first use, a handle
+// created) runs again without a graph; nothing in an open capture has executed, so the plain run starts from the same
+// state. Its layer key then takes two plain calls again before the next capture.
 void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                    AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
                    const PrefillSink * sink) {
+    try { layer_forward_step(layer, residual, n, ple_rows, attn, cache, segs, sink, false); }
+    catch (const std::exception & e) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) != cudaSuccess || cs == cudaStreamCaptureStatusNone) throw;
+        cudaGraph_t cg = nullptr; (void) cudaStreamEndCapture(cudaStreamPerThread, &cg);
+        if (cg) (void) cudaGraphDestroy(cg);
+        (void) cudaGetLastError();
+        static int logged = 0;
+        if (logged++ < 4) std::fprintf(stderr, "tqllm: layer %d graph capture failed (%s); the step runs without a graph\n", layer, e.what());
+        layer_forward_step(layer, residual, n, ple_rows, attn, cache, segs, sink, true);
+    }
+}
+
+void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
+                   AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
+                   const PrefillSink * sink, bool plain) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
     // The part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or GDN core, routers,
     // top-k) is captured into a CUDA graph each step, updated in place and launched: the GPU runs ~45 small kernels back to
@@ -25,6 +44,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     bool capturing = false;
     if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
         static int epoch = -1; if (epoch != g_prefill_epoch) { epoch = g_prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
+        if (plain) calls[gkey] = 0;
         if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];

@@ -61,6 +61,9 @@ struct DecodeModel {
     void layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                        AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs = nullptr,
                        const PrefillSink * sink = nullptr);
+    void layer_forward_step(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
+                            AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
+                            const PrefillSink * sink, bool plain);
 
     // Layer-major prefill: staging banks for the experts a layer's cache bank does not hold, filled by the copy engine.
     // The next layer's first two groups are queued before its routing is known (its non-resident experts by id), so
