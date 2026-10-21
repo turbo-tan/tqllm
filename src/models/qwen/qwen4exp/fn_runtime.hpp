@@ -158,7 +158,7 @@ inline void dense_half_release() {
 inline size_t g_trim_below = SIZE_MAX;
 struct ArenaMark { size_t at = g_arena ? g_arena->used : 0; ~ArenaMark() { if (g_arena) g_arena->used = at; } };
 template<class T> struct Device {
-    T * p = nullptr; size_t count; bool owned = true;
+    T * p = nullptr; size_t count; bool owned = true, plain = false;
     struct View {};
     Device(View, T * q, size_t n) : p(q), count(n), owned(false) {}  // non-owning view of persistent memory
     explicit Device(size_t n) : count(n) {
@@ -172,13 +172,30 @@ template<class T> struct Device {
             static bool warned = false;
             if (!warned) { warned = true; std::fprintf(stderr, "tqllm: scratch arena full (%zu of %zu MB): allocating from the pool\n", g_arena->used >> 20, g_arena->size >> 20); }
         }
+        // during a CUDA graph capture (TQFN_GRAPH) a pool allocation would become graph-owned memory, remapped at every
+        // launch: state allocated lazily there (raw keys, carries) is taken outside the graph instead
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed; ck(cudaThreadExchangeStreamCaptureMode(&mode));
+            const cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&p), bytes);
+            ck(cudaThreadExchangeStreamCaptureMode(&mode));
+            if (e != cudaSuccess) { cudaGetLastError(); throw std::runtime_error(std::string(cudaGetErrorString(e)) + ": device buffer of " + std::to_string(bytes >> 20) + " MiB in a graph capture"); }
+            plain = true; return;
+        }
         if (const cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&p), bytes, nullptr); e != cudaSuccess) {
             cudaGetLastError(); size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
             throw std::runtime_error(std::string(cudaGetErrorString(e)) + ": device buffer of " + std::to_string(bytes >> 20) + " MiB (" +
                                      (g_persistent ? "persistent" : "temporary") + "), " + std::to_string(fr >> 20) + " MiB free");
         }
     }
-    ~Device() { if (owned) cudaFreeAsync(p, nullptr); }
+    ~Device() {
+        if (!owned) return;
+        if (!plain) { cudaFreeAsync(p, nullptr); return; }
+        static std::vector<void *> later;  // cudaFree synchronizes: not while a capture is open
+        later.push_back(p);
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) { for (void * q : later) cudaFree(q); later.clear(); }
+    }
     void put(const std::vector<T> & v) {
         require(v.size() == count, "device upload size differs");
         ck(cudaMemcpy(p, v.data(), count * sizeof(T), cudaMemcpyHostToDevice));

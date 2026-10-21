@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 #include "gdn_seq_fast.cuh"
 // TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
 static inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); return !v || (v[0] && v[0] != '0'); }
@@ -1108,6 +1109,22 @@ void fn_gdn_set_chunk_min(int n) { g_gdn_chunk_min = n; }
 // grow-only GDN prefill workspaces (sized by the largest chunk), visible to the server's memory ledger and released after
 // a prompt (decode steps are small)
 static struct { float * work = nullptr; size_t cap = 0; float * gram = nullptr; size_t gcap = 0; float * wbuf = nullptr; size_t wcap = 0; } g_gdn_ws;
+// grows a GDN workspace; inside a CUDA graph capture (TQFN_GRAPH: the first decode step after a prefill released the
+// workspaces) the buffer is taken outside the graph and the old one freed after the capture
+static bool gdn_ws_grow(float *& p, size_t & cap, size_t need, cudaStream_t s) {
+    static std::vector<float *> later;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone; cudaStreamIsCapturing(s, &cs);
+    const bool capturing = cs != cudaStreamCaptureStatusNone;
+    if (!capturing) { for (float * q : later) cudaFree(q); later.clear(); }
+    if (p) { if (capturing) later.push_back(p); else cudaFree(p); }
+    p = nullptr; cap = 0;
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    if (capturing) cudaThreadExchangeStreamCaptureMode(&mode);
+    const bool ok = cudaMalloc(&p, need * sizeof(float)) == cudaSuccess;
+    if (capturing) cudaThreadExchangeStreamCaptureMode(&mode);
+    if (ok) cap = need; else { cudaGetLastError(); p = nullptr; }
+    return ok;
+}
 size_t fn_gdn_workspace_bytes() { return (g_gdn_ws.cap + g_gdn_ws.gcap + g_gdn_ws.wcap) * sizeof(float); }
 void fn_gdn_release_workspaces() {
     cudaDeviceSynchronize();
@@ -1127,13 +1144,7 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
     {
         float *& work = g_gdn_ws.work; size_t & cap = g_gdn_ws.cap;
         const size_t need = size_t(n) * 2 * kh * dim + size_t(n) * vh * 2;
-        if (need > cap) {
-            cudaStreamCaptureStatus cs; cudaStreamIsCapturing(s, &cs);
-            if (cs != cudaStreamCaptureStatusNone) throw std::runtime_error("Flash-Next GDN: workspace must grow outside capture");
-            if (work) cudaFree(work);
-            if (cudaMalloc(&work, need * sizeof(float)) != cudaSuccess) throw std::runtime_error("Flash-Next GDN: workspace allocation failed");
-            cap = need;
-        }
+        if (need > cap && !gdn_ws_grow(work, cap, need, s)) throw std::runtime_error("Flash-Next GDN: workspace allocation failed");
         float * qk = work, * gates = work + size_t(n) * 2 * kh * dim;
         fn_gdn_prep_k<<<dim3(n, kh), 32, 0, s>>>(qkv, qk, kh, vh, dim, eps);
         fn_gdn_gates_k<<<(n * vh + 127) / 128, 128, 0, s>>>(alpha, beta, neg_a, bias, gates, vh, n);
@@ -1154,19 +1165,13 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             const int chunks = (n + C - 1) / C;
             float *& gram = g_gdn_ws.gram; size_t & gcap = g_gdn_ws.gcap;
             const size_t gneed = size_t(kh) * chunks * 2 * C * C;
-            if (gneed > gcap) { if (gram) cudaFree(gram); if (cudaMalloc(&gram, gneed * sizeof(float)) != cudaSuccess) throw std::runtime_error("GDN chunk: gram allocation failed"); gcap = gneed; }
+            if (gneed > gcap && !gdn_ws_grow(gram, gcap, gneed, s)) throw std::runtime_error("GDN chunk: gram allocation failed");
             static const bool wy = !std::getenv("TQFN_GDN_WY") || std::atoi(std::getenv("TQFN_GDN_WY")) != 0;
             if (wy) {  // parallel per-chunk WY terms, then the sequential state pass
                 float *& wbuf = g_gdn_ws.wbuf; size_t & wcap = g_gdn_ws.wcap;
                 const size_t per = size_t(vh) * chunks;
                 const size_t wneed = per * C * dim * 2 + per * C * C + per * C;
-                if (wneed > wcap) {
-                    cudaStreamCaptureStatus cs; cudaStreamIsCapturing(s, &cs);
-                    if (cs != cudaStreamCaptureStatusNone) throw std::runtime_error("GDN WY: workspace must grow outside capture");
-                    if (wbuf) cudaFree(wbuf);
-                    if (cudaMalloc(&wbuf, wneed * sizeof(float)) != cudaSuccess) throw std::runtime_error("GDN WY: allocation failed");
-                    wcap = wneed;
-                }
+                if (wneed > wcap && !gdn_ws_grow(wbuf, wcap, wneed, s)) throw std::runtime_error("GDN WY: allocation failed");
                 float * U = wbuf, * W = U + per * C * dim, * Mg = W + per * C * dim, * lg = Mg + per * C * C;
                 const size_t wsm = (3 * size_t(C) * (dim + 1) + 2 * size_t(C) * (C + 1) + 3 * C) * sizeof(float);
                 const size_t ssm = (size_t(VS) * (dim + 1) + 3 * size_t(C) * (dim + 1) + size_t(C) * (VS + 1) + size_t(C) * C + 2 * C) * sizeof(float);
