@@ -16,6 +16,10 @@ static int failures = 0;
 static void expect(bool ok, const char * what) { if (!ok) { std::printf("FAIL %s\n", what); ++failures; } }
 
 int main() {
+    // the scenarios fill the device's free memory; on a GPU that shares system memory (GB10) that is the host's memory
+    {   int dev = 0, shared = 0; cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&shared, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && shared) {
+            std::printf("expert slot tiers: skipped (device memory is system memory)\n"); return 77; } }
     const int layers = 4, experts = 96, hidden = 2560, ff = 640, target = 40, floor = 8;
     const std::array<uint32_t, 3> types{18, 18, 20};
     std::vector<std::array<std::vector<char>, 3>> raw(size_t(layers) * experts);
