@@ -185,9 +185,9 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
 | `TQFN_CPU_OWNED_COLD` | off | N: with TQFN_CPU_OWNED_PROFILE, the CPU pool owns each layer's N least-routed experts |  |
 | `TQFN_CPU_OWNED_PROFILE` | off | routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD |  |
-| `TQFN_DRAFT_TAU` | off | t: stop MTP drafting once the last draft's top probability is below t (text unchanged) |  |
+| `TQFN_DRAFT_TAU` | 0.9 (PCIe, np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off |  |
 | `TQFN_PF_CHUNK_KB` | off | K: prefetch DMAs in K KB chunks (A/B) |  |
-| `TQFN_PREDICT_N` | 4 | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
+| `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
 | `TQFN_TQ_AHEAD` | off | K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
 | `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |

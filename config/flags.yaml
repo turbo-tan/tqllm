@@ -1120,15 +1120,15 @@ flags:
     doc: "routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD"
   - name: TQFN_DRAFT_TAU
     kind: debug
-    default: "off"
-    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged)"
+    default: "0.9 (PCIe, np 1)"
+    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off"
   - name: TQFN_PF_CHUNK_KB
     kind: debug
     default: "off"
     doc: "K: prefetch DMAs in K KB chunks (A/B)"
   - name: TQFN_PREDICT_N
     kind: debug
-    default: "4"
+    default: "4 (6 with adaptive drafts)"
     doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
   - name: TQFN_TQ_AHEAD
     kind: debug

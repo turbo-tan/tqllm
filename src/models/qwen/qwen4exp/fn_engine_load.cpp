@@ -24,6 +24,18 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     require(!f.ggufs.empty() && !f.mtp.empty(), "manifest needs gguf and mtp lines");
     if (!f.draft_vocab.empty()) setenv("TQFN_DRAFT_VOCAB", f.draft_vocab.c_str(), 1);
+    // PCIe card, one sequence: adaptive draft length by default (up to 5 drafts, stop below a 0.9 draft probability, next-layer
+    // prediction for 6-token blocks): 3090 chat +0.6 %, 32K +3 %, text identical to drafts=3 (verify is batch-invariant).
+    // TQFN_DRAFT_TAU=0 turns it off; --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
+    if (const char * t = std::getenv("TQFN_DRAFT_TAU"); slots_.size() == 1 && f.drafts >= 1 && (!t || std::strtof(t, nullptr) > 0.f)) {
+        int dev = 0, coherent = 0; ck(cudaGetDevice(&dev));
+        if (cudaDeviceGetAttribute(&coherent, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) { cudaGetLastError(); coherent = 0; }
+        if (!coherent) {
+            if (!t) setenv("TQFN_DRAFT_TAU", "0.9", 1);
+            if (!std::getenv("TQFN_PREDICT_N")) setenv("TQFN_PREDICT_N", "6", 1);
+            f.drafts = std::max(f.drafts, 5);
+        }
+    }
     g_kv_capacity = int(context);  // per slot
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); uint64_t keep = UINT64_MAX;
       ck(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep)); }
