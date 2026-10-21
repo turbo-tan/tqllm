@@ -1125,8 +1125,8 @@ flags:
     replaced_by: "removed with TQFN_CPU_OWNED_COLD"
   - name: TQFN_DRAFT_TAU
     kind: debug
-    default: "0.9 (PCIe, np 1)"
-    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off"
+    default: "0.9 (np 1)"
+    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off"
   - name: TQFN_PF_CHUNK_KB
     kind: retired
     default: "-"

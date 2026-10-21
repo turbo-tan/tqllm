@@ -269,7 +269,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_PF_KEEP", Kind::Debug, "off", "1: keep the layer-major buffers and staging halves across requests", ""},
     {"TQFN_CPU_OWNED_COLD", Kind::Retired, "-", "removed", "removed (profile-owned cold experts lost on the 3090); TQFN_CPU_OWNED stays"},
     {"TQFN_CPU_OWNED_PROFILE", Kind::Retired, "-", "removed", "removed with TQFN_CPU_OWNED_COLD"},
-    {"TQFN_DRAFT_TAU", Kind::Debug, "0.9 (PCIe, np 1)", "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off", ""},
+    {"TQFN_DRAFT_TAU", Kind::Debug, "0.9 (np 1)", "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off", ""},
     {"TQFN_PF_CHUNK_KB", Kind::Retired, "-", "removed", "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"},
     {"TQFN_VERIFY_WAVES", Kind::Debug, "off", "1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1)", ""},
     {"TQFN_PREDICT_N", Kind::Debug, "4 (6 with adaptive drafts)", "next-layer prediction (prefetch) for verify blocks of up to N tokens", ""},
