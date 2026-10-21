@@ -1,6 +1,7 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
+#include "prefill_observer_cuda.hpp"
 
 namespace tqllm::flashnext {
 
@@ -240,6 +241,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         if (host_res) ck(cudaMemcpyAsync(f_.res_host + size_t(b) * W, S().model_->res_keep->p, size_t(e - b) * W * sizeof(float), cudaMemcpyDeviceToHost, nullptr));
         if (host_res) mem_note("chunk done");
         else { catch_up(b, e, S().model_->res_keep->p); lap(mtp_ms, tl); }
+        tqllm::prefill_completed(nullptr, uint32_t(e), uint32_t(P));
     }
     if (host_res) {
         mem_note("after trunk prefill");

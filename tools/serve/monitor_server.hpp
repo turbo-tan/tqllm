@@ -18,8 +18,9 @@ namespace tqserve {
 class MonitorServer {
 public:
     MonitorServer(Monitor & monitor, const std::string & host, uint16_t port,
-                  std::string key, std::string pci = {}, uint16_t inference_port = 0)
+                  std::string key, std::string pci = {}, uint16_t inference_port = 0, bool listen = true)
         : monitor_(monitor), key_(std::move(key)), pci_(std::move(pci)), inference_host_(host == "0.0.0.0" ? "127.0.0.1" : host), inference_port_(inference_port) {
+        if (listen) {
         socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (socket_ < 0) throw std::runtime_error("monitor socket failed");
         int one = 1; ::setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -30,6 +31,7 @@ public:
         }
         socklen_t size = sizeof(address); ::getsockname(socket_, reinterpret_cast<sockaddr *>(&address), &size);
         port_ = ntohs(address.sin_port);
+        }
         try { thread_ = std::thread([this] {
             try { run(); } catch (...) { stop_ = true; std::fputs("tqserve: monitor listener stopped\n", stderr); }
         }); }
@@ -37,7 +39,7 @@ public:
     }
     ~MonitorServer() {
         stop_ = true;
-        ::shutdown(socket_, SHUT_RDWR);
+        if (socket_ >= 0) ::shutdown(socket_, SHUT_RDWR);
         thread_.join();
         {
             std::lock_guard<std::mutex> lock(chat_mutex_);
@@ -48,6 +50,10 @@ public:
         ::close(socket_);
     }
     uint16_t port() const { return port_; }
+    bool serve(int fd, const Request & req) {
+        timeval timeout{1,0}; ::setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+        return handle_request(fd,req);
+    }
     MonitorServer(const MonitorServer &) = delete;
     MonitorServer & operator=(const MonitorServer &) = delete;
 private:
@@ -77,7 +83,11 @@ private:
         }
         const auto req = reader.request();
         if (!req.ok()) { send_response(fd, 400, "{\"error\":\"invalid request\"}"); return false; }
-        if (req.method == "GET" && (req.path == "/" || req.path == "/monitor")) { send_response(fd, 200, monitor_page, true); return false; }
+        return handle_request(fd,req);
+    }
+    bool handle_request(int fd, const Request & req) {
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
+        if (req.method == "GET" && (req.path == "/" || req.path == "/monitor" || req.path == "/monitor/")) { send_response(fd, 200, monitor_page, true); return false; }
         if (!key_.empty() && req.authorization != "Bearer " + key_) {
             send_response(fd, 401, "{\"error\":\"API key required\"}"); return false;
         }
@@ -165,6 +175,7 @@ private:
         while (!stop_) {
             const auto now = std::chrono::steady_clock::now();
             if (now - sampled >= hardware_interval) { monitor_.hardware(collector.sample()); sampled = now; }
+            if (socket_ < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
             pollfd p{socket_, POLLIN, 0};
             if (::poll(&p, 1, 200) <= 0 || !(p.revents & POLLIN)) continue;
             const int fd = ::accept(socket_, nullptr, nullptr);
@@ -177,7 +188,7 @@ private:
     Monitor & monitor_;
     std::string key_, pci_, inference_host_;
     uint16_t inference_port_ = 0;
-    std::mutex chat_mutex_;
+    std::mutex chat_mutex_, request_mutex_;
     int chat_client_ = -1, chat_upstream_ = -1;
     std::atomic<bool> chat_active_{false};
     std::thread chat_;

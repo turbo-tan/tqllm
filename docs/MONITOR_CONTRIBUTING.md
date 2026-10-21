@@ -11,10 +11,12 @@ extension or monitoring service. Browser tooling below is for contributors only.
 | Trusted panel registration and failure isolation | `tools/serve/monitor_panels.js` |
 | Snapshot schema and thread-safe request counters | `tools/serve/monitor.hpp` |
 | Optional NVML and Linux host measurements | `tools/serve/monitor_host.hpp` |
-| Independent HTTP listener and same-instance chat bridge | `tools/serve/monitor_server.hpp` |
+| Shared API-port routes, optional separate listener and same-instance chat bridge | `tools/serve/monitor_server.hpp` |
 | Embedding both frontend files into the executable | `CMakeLists.txt`, `tools/serve/monitor_page.hpp.in` |
-| Listener, authentication and cancellation tests | `tests/monitor.cpp` |
+| Progress counters, routes, authentication and cancellation tests | `tests/monitor.cpp` |
 | Real-listener browser regression gate | `tests/test_monitor_ui.py` |
+
+GPU prefill callbacks live in `src/prefill_observer_cuda.hpp`; the scoped host observer is `src/prefill_observer.hpp`. Callbacks publish completed chunk counts in stream order and must not invoke CUDA or engine methods. `tests/prefill_observer.cu` checks ordering, lifetime and exception isolation.
 
 There are no runtime asset requests. CMake tracks the HTML and panel source and
 embeds them in the executable. Rebuild after editing either file.
