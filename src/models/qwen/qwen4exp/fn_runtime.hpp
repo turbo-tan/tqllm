@@ -173,7 +173,7 @@ template<class T> struct Device {
             static bool warned = false;
             if (!warned) { warned = true; std::fprintf(stderr, "tqllm: scratch arena full (%zu of %zu MB): allocating from the pool\n", g_arena->used >> 20, g_arena->size >> 20); }
         }
-        // during a CUDA graph capture (TQFN_GRAPH) a pool allocation would become graph-owned memory, remapped at every
+        // during a CUDA graph capture (decode graphs) a pool allocation would become graph-owned memory, remapped at every
         // launch: state allocated lazily there (raw keys, carries) is taken outside the graph instead
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {

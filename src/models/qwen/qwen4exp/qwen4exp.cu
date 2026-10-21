@@ -1109,7 +1109,7 @@ void fn_gdn_set_chunk_min(int n) { g_gdn_chunk_min = n; }
 // grow-only GDN prefill workspaces (sized by the largest chunk), visible to the server's memory ledger and released after
 // a prompt (decode steps are small)
 static struct { float * work = nullptr; size_t cap = 0; float * gram = nullptr; size_t gcap = 0; float * wbuf = nullptr; size_t wcap = 0; } g_gdn_ws;
-// grows a GDN workspace; inside a CUDA graph capture (TQFN_GRAPH: the first decode step after a prefill released the
+// grows a GDN workspace; inside a CUDA graph capture (decode graphs: the first decode step after a prefill released the
 // workspaces) the buffer is taken outside the graph and the old one freed after the capture
 static bool gdn_ws_grow(float *& p, size_t & cap, size_t need, cudaStream_t s) {
     static std::vector<float *> later;

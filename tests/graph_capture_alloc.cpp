@@ -1,4 +1,4 @@
-// Flash-Next device buffers inside a CUDA graph capture (TQFN_GRAPH): a buffer replaced (freed) or created during a
+// Flash-Next device buffers inside a CUDA graph capture (decode graphs): a buffer replaced (freed) or created during a
 // captured decode step must leave no error and stay valid after the graph runs.
 #include "models/qwen/qwen4exp/fn_runtime.hpp"
 #include <cstdio>

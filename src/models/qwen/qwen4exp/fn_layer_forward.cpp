@@ -8,12 +8,12 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                    AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
                    const PrefillSink * sink) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
-    // TQFN_GRAPH=1 (opt-in A/B): the part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or
-    // GDN core, routers, top-k) is captured into a CUDA graph each step and the layer's graph is updated in place
-    // (cudaGraphExecUpdate takes the new pointers and positions; a changed shape re-instantiates), then launched: the GPU runs
-    // ~45 small kernels back to back without launch gaps (3090: 1.2 vs 2.1 us per kernel) and capturing costs the host less
-    // than launching. One sequence only (the multi-slot path interleaves per-sequence state).
-    static const bool graph_on = std::getenv("TQFN_GRAPH") != nullptr;
+    // The part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or GDN core, routers,
+    // top-k) is captured into a CUDA graph each step, updated in place and launched: the GPU runs ~45 small kernels back to
+    // back without launch gaps and capturing costs the host less than launching (3090 chat +2.5 %, text identical). One
+    // sequence only (the multi-slot path interleaves per-sequence state); PCIe GPUs only until gated on a GB10.
+    static const bool graph_on = [] { int dev = 0, on = 0; cudaGetDevice(&dev);
+        return !(cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on); }();
     // Every step updates all kernel parameters (weights included), so layers of one kind share an exec, keyed by its
     // topology: the node count changes with the position in attention layers and with the draft in the MTP layer.
     // One exec per layer and variant (~11 x 49) held ~1.3 GB the expert banks had taken (out of memory on a 3090).
@@ -166,7 +166,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     if (capturing) {
         cudaGraph_t cg = nullptr;
         const cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &cg);
-        if (e != cudaSuccess || !cg) throw std::runtime_error(std::string("TQFN_GRAPH: capture of layer ") + std::to_string(layer) + " failed: " + cudaGetErrorString(e));
+        if (e != cudaSuccess || !cg) throw std::runtime_error(std::string("CUDA graph: capture of layer ") + std::to_string(layer) + " failed: " + cudaGetErrorString(e));
         size_t nodes = 0; ck(cudaGraphGetNodes(cg, nullptr, &nodes));
         const bool ple = trunk && ple_rows && std::find(c.ple_layers.begin(), c.ple_layers.end(), layer) != c.ple_layers.end();
         const int kind = !trunk ? -1 : (attention ? 2 * c.compress_ratios[layer] : 0) + ple;
