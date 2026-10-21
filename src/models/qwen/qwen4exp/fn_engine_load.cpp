@@ -244,6 +244,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                                      " slots (manifest slots=) or a smaller --context");
         }
     }
+    // the default stream is per thread: the engine thread's stream is not ordered after the loading thread's work
+    ck(cudaDeviceSynchronize());
 }
 
 }  // namespace tqllm::flashnext

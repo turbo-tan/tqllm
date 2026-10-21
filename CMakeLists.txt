@@ -70,6 +70,10 @@ if(TQLLM_CUDA)
     message(FATAL_ERROR "CUDA builds need CMake 3.25 or newer (this is ${CMAKE_VERSION}); python3 -m pip install cmake")
   endif()
   add_compile_definitions(TQLLM_WITH_CUDA=1)  # session.hpp: image input (vision encoder) only in CUDA builds
+  # No legacy default stream: stream 0 is per thread (host code and kernels alike), so it does not implicitly synchronize
+  # with every other blocking stream and its work can be captured into CUDA graphs
+  add_compile_definitions(CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
+  string(APPEND CMAKE_CUDA_FLAGS " --default-stream per-thread")
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
