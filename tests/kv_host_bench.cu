@@ -26,7 +26,7 @@ int main(int argc, char ** argv) {
     const int iters = argc > 3 ? std::atoi(argv[3]) : 10;
     const int heads = 24, kvh = 4, hd = 256, nver = 12, nbuf = 512;
     cudaStream_t st;
-    cudaStreamCreate(&st);
+    st = cudaStreamPerThread;
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     const KvFormat * f = kv_format("tq3");

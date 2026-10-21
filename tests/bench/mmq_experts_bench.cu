@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
     CK(cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice)); CK(cudaMemcpy(dr, rec.data(), rec.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dxh, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dcnt, counts.data(), E * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dgrp, groups.data(), groups.size() * 4, cudaMemcpyHostToDevice));
-    cudaStream_t st; CK(cudaStreamCreate(&st));
+    cudaStream_t st = cudaStreamPerThread;
 
     // stock: libggml-cuda's mul_mat_id (its MMQ, routing helpers, quantizer), output [T][TOPK][ROWS] fp32
     ggml_backend_t be = ggml_backend_cuda_init(0);

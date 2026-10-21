@@ -27,7 +27,7 @@ int main() {
     const int heads = 24, kvh = 4, hd = 256, nver = 12, nbuf = 512;
     const int64_t ctx = 65536, dev_rows = 30000;  // the device head rounds up to a 2 MiB granule (row 32768 for 448 B rows)
     cudaStream_t st;
-    CK(cudaStreamCreate(&st));
+    st = cudaStreamPerThread;
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     auto mem = make_cuda_kv_memory(st);

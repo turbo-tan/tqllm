@@ -82,7 +82,7 @@ static void run(int cols, int n, bool per_expert) {
         require(std::abs(f[size_t(a) * m.rows + r] - expect) <= 2e-6 * std::abs(expect) + 2e-6, "Q2 F32 dot differs from oracle");
     }
     cudaGraph_t graph{}; cudaGraphExec_t exec{}; cudaStream_t stream{};
-    check(cudaStreamCreate(&stream)); check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    stream = cudaStreamPerThread; check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     format->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, stream);
     check(cudaStreamEndCapture(stream, &graph)); check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
     check(cudaGraphLaunch(exec, stream)); check(cudaStreamSynchronize(stream));
@@ -94,7 +94,7 @@ static void run(int cols, int n, bool per_expert) {
     check(cudaGraphLaunch(exec, stream)); check(cudaStreamSynchronize(stream));
     const auto changed_replay = dy.get(y.size());
     require(std::memcmp(changed.data(), changed_replay.data(), changed.size() * sizeof(y[0])) == 0, "Q2 graph ignored changed device IDs");
-    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); 
     ids[0] = experts; di.put(ids);
     format->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, nullptr);
     y = dy.get(y.size()); require(std::isnan(__bfloat162float(y[0])), "invalid device expert ID did not fail closed");

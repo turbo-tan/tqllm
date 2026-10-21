@@ -65,7 +65,7 @@ int main(int argc, char ** argv) {
 
     setvbuf(stdout, nullptr, _IONBF, 0);
     ggml_backend_cuda_context & ctx = *new ggml_backend_cuda_context(0);
-    cudaStream_t st; CK(cudaStreamCreate(&st));
+    cudaStream_t st = cudaStreamPerThread;
     char * dw, * dc, * dct; uint8_t * dr; float * dx, * dy; int32_t * dsrc, * ddst, * dbnd; char * dq;
     CK(cudaMalloc(&dw, nblk * sizeof(block_iq3_xxs))); CK(cudaMalloc(&dc, codes.size())); CK(cudaMalloc(&dct, codes.size()));
     CK(cudaMalloc(&dr, rec.size())); CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMalloc(&dy, size_t(NA) * ROWS * 4));
