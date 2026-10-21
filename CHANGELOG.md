@@ -8,8 +8,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ### Added
 - Native MTP drafting on mixture-of-experts (qwen35moe) files that carry an MTP block (`--mtp`): the block's experts
   load like the trunk's and stay in VRAM. Qwen3.6-35B-A3B UD-Q4_K_XL on an RTX 3090 (default settings: the memory
-  fit moves the int8 LM head and the token embeddings to host memory, every expert stays on the GPU): 248.7-328.8 tok/s
-  over five chats (177.8-182.6 without MTP), 268.0 after a 4K prompt (179.3); output identical with and without MTP.
+  fit moves the int8 LM head and the token embeddings to host memory, every expert stays on the GPU): 246.2-329.6 tok/s
+  over five chats (177.5-182.8 without MTP), 251.3 after a 4K prompt (179.7); output identical with and without MTP.
 - `--moe-host-mb auto` (default for files larger than the free GPU memory): the experts beyond it go to system RAM,
   spread over the layers when there is no routing profile; `--moe-cache-mb auto` sizes the VRAM cache of host experts.
 - Optional `tqserve --monitor-port` instrument panel with request telemetry, host/device readings and a right-hand
