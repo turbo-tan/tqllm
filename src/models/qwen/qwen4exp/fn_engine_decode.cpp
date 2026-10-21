@@ -34,7 +34,7 @@ bool FlashNextEngine::spec_advance() {
     std::vector<int> block{y}; block.insert(block.end(), dr.begin(), dr.end());
     auto rows = S().model_->step(block);
     const auto v = pick(rows->p, int(block.size()));
-    int m = 1; while (m <= drafts && v[m - 1] == dr[m - 1]) ++m;
+    int m = 1; while (m <= int(dr.size()) && v[m - 1] == dr[m - 1]) ++m;
     for (int i = 0; i < m && int(S().out_.size()) < S().generate_; ++i) { S().out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
     S().model_->accept(m); ++S().steps_; S().toks_ += m;
     S().d1_ = S().model_->mtp_batch(std::vector<int>(v.begin(), v.begin() + m), S().model_->res_keep->p);

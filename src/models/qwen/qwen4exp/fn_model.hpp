@@ -16,6 +16,7 @@ struct DecodeModel {
     std::unique_ptr<Device<float>> pingpong[2];  // prefill residual between layers (layer scratch is reset)
     std::unique_ptr<Device<float>> res_keep;  // [n][width] of the last step, persistent (grows with the prefill chunk)
     AttentionState mtp_att; std::unique_ptr<Device<float>> mtp_h;  // MTP block KV and its last wide output
+    float draft_conf = 1.f;  // top probability of the last MTP draft (TQFN_DRAFT_TAU)
     // After a long prompt: the trunk's K/V pages wholly below len - keep move to pinned host memory (same addresses);
     // returns the device bytes freed. TQFN_KV_HOST_KEEP: positions kept on the device (32768); TQFN_KV_HOST=0: off.
     size_t kv_to_host() {

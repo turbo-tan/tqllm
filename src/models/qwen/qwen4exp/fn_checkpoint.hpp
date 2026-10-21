@@ -333,9 +333,10 @@ public:
         }
         return ids.empty() ? nullptr : &ids;
     }
-    int draft_head_argmax_device(const float * rows, int count) const {
+    // conf (optional): the draft's top softmax probability over the draft vocabulary (TQFN_DRAFT_TAU)
+    int draft_head_argmax_device(const float * rows, int count, float * conf = nullptr) const {
         const auto * ids = draft_vocab();
-        if (!ids) return head_argmax_device(rows, count);
+        if (!ids) { if (conf) *conf = 1.f; return head_argmax_device(rows, count); }
         auto & r = resident_["draft_head"]; if (!r) r = std::make_unique<Resident>();
         if (!r->m.fmt) {
             PersistentAlloc keep;
@@ -356,6 +357,7 @@ public:
         Device<__half> input(config.hidden); Device<float> output(ids->size());
         tqllm_cuda::vis_f32_to_h(rows + size_t(count - 1) * config.hidden, input.p, config.hidden, nullptr);
         r->m.fmt->matvec_f32(r->m, input.p, output.p, 1, nullptr);
+        if (conf) { Device<float> pk(1); tqllm_cuda::fn_softmax_peak(output.p, int(ids->size()), pk.p, nullptr); *conf = pk.get()[0]; }
         return (*ids)[size_t(argmax_rows(output.p, int(ids->size()), 1)[0])];
     }
     const Resident & head_resident() const {

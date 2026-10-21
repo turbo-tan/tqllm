@@ -1342,6 +1342,25 @@ void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int
     if (rows >= 8) fn_gemv_bf16_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
     else fn_gemv_bf16_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
 }
+// Top softmax probability of one logit row (1 / sum exp(l - max)): the MTP draft confidence (one block).
+__global__ void fn_softmax_peak_k(const float * x, int n, float * out) {
+    __shared__ float red[32]; const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    float m = -INFINITY;
+    for (int i = tid; i < n; i += blockDim.x) m = fmaxf(m, x[i]);
+    for (int d = 16; d; d >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
+    if (!lane) red[warp] = m; __syncthreads();
+    if (tid < 32) { float v = tid < nw ? red[tid] : -INFINITY; for (int d = 16; d; d >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, d)); if (!tid) red[0] = v; }
+    __syncthreads(); const float mx = red[0]; __syncthreads();
+    float s = 0.f;
+    for (int i = tid; i < n; i += blockDim.x) s += __expf(x[i] - mx);
+    for (int d = 16; d; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+    if (!lane) red[warp] = s; __syncthreads();
+    if (tid < 32) { float v = tid < nw ? red[tid] : 0.f; for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d); if (!tid) *out = 1.f / v; }
+}
+void fn_softmax_peak(const float * x, int n, float * out, cudaStream_t s) {
+    if (n <= 0 || !x || !out) throw std::invalid_argument("Flash-Next softmax peak: invalid shape or pointer");
+    fn_softmax_peak_k<<<1, 1024, 0, s>>>(x, n, out);
+}
 void fn_round_bf16(const float * x, __nv_bfloat16 * xb, int64_t n, cudaStream_t s) {
     if (n <= 0) return;
     fn_round_bf16_k<<<unsigned((n / 4 + 255) / 256 + 1), 256, 0, s>>>(x, xb, n);
