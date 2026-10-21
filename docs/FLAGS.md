@@ -182,7 +182,6 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
 | `TQFN_DRAFT_TAU` | 0.9 (PCIe, np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
-| `TQFN_TQ_AHEAD` | off | K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
 | `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
 | `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
@@ -294,4 +293,5 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_CPU_OWNED_COLD` | - | removed | removed (profile-owned cold experts lost on the 3090); TQFN_CPU_OWNED stays |
 | `TQFN_CPU_OWNED_PROFILE` | - | removed | removed with TQFN_CPU_OWNED_COLD |
 | `TQFN_PF_CHUNK_KB` | - | removed | fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090) |
+| `TQFN_TQ_AHEAD` | - | removed | TQueue prefetch queue lives on branch tqllm/tqueue (not in the release) |
 | `TQFN_ROUTER_GEMM` | - | removed | fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing) |

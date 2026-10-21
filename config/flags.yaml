@@ -1137,9 +1137,10 @@ flags:
     default: "4 (6 with adaptive drafts)"
     doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
   - name: TQFN_TQ_AHEAD
-    kind: debug
-    default: "off"
-    doc: "K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "TQueue prefetch queue lives on branch tqllm/tqueue (not in the release)"
   - name: TQFN_PF_MMQ_CHECK
     kind: debug
     default: "0"

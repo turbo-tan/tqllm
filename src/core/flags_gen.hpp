@@ -272,7 +272,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_DRAFT_TAU", Kind::Debug, "0.9 (PCIe, np 1)", "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off", ""},
     {"TQFN_PF_CHUNK_KB", Kind::Retired, "-", "removed", "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"},
     {"TQFN_PREDICT_N", Kind::Debug, "4 (6 with adaptive drafts)", "next-layer prediction (prefetch) for verify blocks of up to N tokens", ""},
-    {"TQFN_TQ_AHEAD", Kind::Debug, "off", "K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses", ""},
+    {"TQFN_TQ_AHEAD", Kind::Retired, "-", "removed", "TQueue prefetch queue lives on branch tqllm/tqueue (not in the release)"},
     {"TQFN_PF_MMQ_CHECK", Kind::Debug, "0", "N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel", ""},
     {"TQFN_PRED_DUMP", Kind::Debug, "-", "FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation)", ""},
     {"TQFN_PREFILL_INT8", Kind::Debug, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
