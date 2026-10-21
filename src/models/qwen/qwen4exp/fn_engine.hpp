@@ -63,6 +63,9 @@ public:
                          100.0 * double(s.hits - b.hits) / std::max<double>(1, double(s.hits - b.hits + s.misses - b.misses)),
                          double(s.transfer_bytes - b.transfer_bytes) / 1e9, s.device_bytes / 1048576.0,
                          (unsigned long long) (m.hits - mb.hits), (unsigned long long) (m.misses - mb.misses), double(m.transfer_bytes - mb.transfer_bytes) / 1e9, m.device_bytes / 1048576.0);
+            std::fprintf(stderr, "LEDGER decode rounds %llu | since start: prefetched %llu used %llu, pf pending %llu running %llu waited-unread %llu skipped %llu\n",
+                         (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
+                         (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);
         }
         S().model_.reset(); S().prompt_res_.reset();
         return r;
