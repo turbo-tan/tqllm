@@ -52,6 +52,7 @@ struct MixedExpertCache::State {
     // largest count that fits but never below its floor, instead of evicting other layers' whole banks (a long prompt's
     // attention state left two layers without room: each step their bank evicted another layer's, 67 -> 4.9 tok/s).
     std::vector<int> layer_target, layer_floor;
+    std::vector<char> planned;  // plan_slots sized the layer's next bank: prepare builds it at that size (no second decision)
     size_t slot_bytes(int layer) const {
         const auto it = saved_piece.find(layer); if (it == saved_piece.end()) return 0;
         size_t b = 0; for (size_t x : it->second) b += x; return b;
@@ -239,7 +240,8 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     }
     std::sort(needed.begin(), needed.end());  // same order as the former std::set: same slot assignment
     auto is_needed = [&](int e) { return e >= 0 && s.mark[e] == s.gen; };
-    if (!s.banks.count(layer)) s.choose_cap(layer);
+    if (!s.banks.count(layer) && !(layer < int(s.planned.size()) && s.planned[size_t(layer)])) s.choose_cap(layer);
+    if (layer < int(s.planned.size())) s.planned[size_t(layer)] = 0;
     if (needed.size() > size_t(s.cap_of(layer))) throw std::invalid_argument("mixed cache: active set exceeds slots");
     if (s.miss_stream && s.active >= 0) {
         auto & prev = *s.banks.at(s.active);
@@ -534,7 +536,8 @@ void MixedExpertCache::set_layer_tiers(const std::vector<int> & floor) {
     for (int l = 0; l < s.layers; ++l) s.layer_floor[size_t(l)] = std::clamp(floor[size_t(l)], 1, s.layer_target[size_t(l)]);
 }
 int MixedExpertCache::plan_slots(int layer) {
-    auto & s = *state_; if (!s.banks.count(layer)) s.choose_cap(layer);
+    auto & s = *state_;
+    if (!s.banks.count(layer)) { s.choose_cap(layer); if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0); s.planned[size_t(layer)] = 1; }
     return s.cap_of(layer);
 }
 int MixedExpertCache::regrow(size_t keep_free) {

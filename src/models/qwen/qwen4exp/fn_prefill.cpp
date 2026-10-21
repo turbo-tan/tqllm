@@ -166,7 +166,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
         for (size_t i = 0; i < experts.size(); ++i) { ps.slot_of[size_t(experts[i])] = slots[i]; ps.cap = std::max(ps.cap, cnt[size_t(experts[i])]); }
         ps.at = total; total += size_t(W) * (1 + ps.cap); passes.push_back(std::move(ps));
     };
-    if (!hot.empty()) plan_pass(hot, cache.prepare(layer, hot), cache.slots(layer));
+    if (!hot.empty()) { const int cap = cache.plan_slots(layer); const auto slots = cache.prepare(layer, hot); plan_pass(hot, slots, cap); }
     for (int g = 0; g < groups; ++g) {
         const size_t g0 = size_t(g) * st.K, g1 = std::min(st.plan.size(), g0 + size_t(st.K));
         std::vector<int> ex, sl;

@@ -73,6 +73,21 @@ int main() {
     expect(bytes1, "tiers: the shrunk bank holds the source expert bytes");
     expect(grow1, "tiers: regrow brings the banks back to their target once the memory is free");
     expect(free1 >= (size_t(240) << 20), "tiers: the refill leaves the decode's 256 MB");
+    {   // the size plan_slots gives a released bank is the size prepare builds, even when memory frees in between (the prompt
+        // path sized its slot maps from slots() and prepare then built a larger bank: writes past them, heap corruption)
+        MixedExpertCache cache(layers, experts, hidden, ff, target, size_t(4) << 30, source, nullptr);
+        cache.set_layer_slots(std::vector<int>(layers, target)); cache.set_layer_tiers(std::vector<int>(layers, floor));
+        for (int l = 0; l < layers; ++l) { cache.prepare(l, all); cache.wait_misses(); }
+        const size_t per = cache.bank_layout(1).block;
+        cache.release_bank(1);
+        size_t fr = 0, tot = 0; check(cudaMemGetInfo(&fr, &tot));
+        void * hog = nullptr; check(cudaMalloc(&hog, fr - ((size_t(256) << 20) + size_t(target / 2) * per)));
+        const int planned = cache.plan_slots(1);
+        check(cudaFree(hog));  // room for the full target now
+        const auto slots = cache.prepare(1, std::vector<int>(all.begin(), all.begin() + planned)); cache.wait_misses();
+        int top_slot = 0; for (int x : slots) top_slot = std::max(top_slot, x);
+        expect(planned < target && cache.slots(1) == planned && top_slot < planned, "planned bank size is the size prepare builds");
+    }
     int s0 = 0; bool kept0 = false, grow0 = false, bytes0 = false; size_t free0 = 0;
     scenario(false, s0, kept0, grow0, bytes0, free0);
     expect(!kept0 || free0 < (size_t(240) << 20), "control (no tiers): the same refill takes the decode's room or evicts a bank");

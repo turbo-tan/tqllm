@@ -225,7 +225,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         Device<__half> xr(mixed.count); tqllm_cuda::vis_f32_to_h(mixed.p, xr.p, int64_t(mixed.count), nullptr);
         Device<__nv_bfloat16> eg(size_t(A) * c.expert_ff), eu(eg.count), ed(size_t(A) * h);
         Device<__half> ax(eg.count);
-        const int W = cache.slots(layer);
+        const int W = cache.plan_slots(layer);  // the bank's size before prepare (a released bank is rebuilt at a new size)
         // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
         // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average.
         // Decided per layer from slot-independent counts, and only when every slot count runs waves (A > experts):
