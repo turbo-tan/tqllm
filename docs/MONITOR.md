@@ -115,7 +115,7 @@ Linux/POSIX support; it does not add a Metal server.
 
 The quantized Qwen3.5/Qwen3.8 path and Flash-Next publish completed prefill chunks in CUDA stream order,
 without adding a device synchronization. The dashboard displays completed/total
-prompt tokens and live mean prefill tok/s. Cached-prefix tokens are counted in
+prompt tokens and live mean prefill tok/s. Prefill and output rates are separate, persistent values in the same request card; both remain visible after completion. Cached-prefix tokens are counted in
 progress but excluded from throughput. The rate becomes available after the first
 completed chunk; unsupported engines show phase/elapsed time until final timings
 arrive. A chunk may take several seconds on a large prompt. Resident KV bytes and

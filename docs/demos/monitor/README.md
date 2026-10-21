@@ -24,7 +24,7 @@ cmake --build build --target tqserve -j4
 
 1. Open **http://localhost:8086/** or **http://localhost:8086/monitor**. No extra port is required.
 2. Send a long prompt in the chat panel, or call `/v1/chat/completions` from your client. The dashboard observes both.
-3. During prefill, watch completed/total prompt tokens and **PREFILL RATE**. The rate appears after a chunk finishes. Cached-prefix tokens count toward progress, but not throughput.
+3. During prefill, watch completed/total prompt tokens and **PREFILL RATE**. The rate appears after a chunk finishes. Prefill and output rates stay visible together in the same card after generation starts and after completion. Cached-prefix tokens count toward progress, but not throughput.
 4. Select a request in the history and use **Pin as reference** to compare it with another request.
 5. Use the theme icon for light/dark mode. Hardware samples refresh every three seconds; request telemetry refreshes every second.
 

@@ -82,7 +82,7 @@ def main():
                 page.screenshot(path=str(args.output/'failure.png'))
                 (args.output/'failure.json').write_text(json.dumps({'phase':page.locator('#phase').inner_text(),'chat':page.locator('#chatStatus').inner_text(),'page_errors':errors,'messages':page.locator('#transcript').inner_text()[-2000:]},indent=2))
                 raise
-            page.wait_for_function("() => document.querySelector('#lensRateLabel').textContent === 'PREFILL RATE' && document.querySelector('#lensRate').textContent.includes('tok/s')", timeout=90000)
+            page.wait_for_function("() => document.querySelector('#lensPrefill').textContent.includes('tok/s')", timeout=90000)
             clear_caption()
             page.screenshot(path=str(args.output/'prefill.png'))
             caption('Live prefill, before generation', 'The rate comes from completed GPU chunks. Cached tokens are excluded; no completion percentage is guessed.')

@@ -86,10 +86,13 @@ int main(int argc, char ** argv) {
             for (int step = 0; step < 1200; ++step) {
                 std::ifstream file(argv[2]); std::string mode; file >> mode;
                 if (mode != last_mode) {
-                    if (job) job->finish();
+                    if (job) {
+                        if (last_mode=="decode") job->timings(8192,128,1000,1200,0,0);
+                        job->finish();
+                    }
                     if (mode != "idle" && mode != "empty") job = m.begin();
                     if (mode == "prefill" || mode == "decode") job->prefill(8192);
-                    if (mode == "decode") job->decoding();
+                    if (mode == "decode") { std::this_thread::sleep_for(std::chrono::seconds(1)); job->progress(8192,8192); job->decoding(); }
                     if (mode == "failed") job->finish("failed");
                     if (mode == "cancelled") job->finish("cancelled");
                     last_mode = mode;

@@ -259,8 +259,10 @@ def main():
                 expect(page.locator('#prefillStatus')).to_be_visible()
                 page.wait_for_function("() => document.querySelector('#prefillSpeed').textContent !== '--'")
                 expect(page.locator('#prefillCount')).to_contain_text('/ 8,192 tokens')
-                expect(page.locator('#lensRateLabel')).to_have_text('PREFILL RATE')
-                expect(page.locator('#lensRate')).to_contain_text('tok/s')
+                expect(page.locator('#lensPrefillLabel')).to_have_text('PREFILL RATE')
+                expect(page.locator('#lensRateLabel')).to_have_text('OUTPUT RATE')
+                expect(page.locator('#lensPrefill')).to_contain_text('tok/s')
+                expect(page.locator('#lensRate')).to_have_text('--')
                 assert 'prompt tok/s' not in page.locator('#lensNote').inner_text()
                 expect(page.locator('#speed')).to_have_text('--')
                 expect(page.locator('#context')).to_contain_text('8,192')
@@ -268,6 +270,8 @@ def main():
                 mode.write_text('decode')
                 expect(page.locator('#phase')).to_have_text('Generating output')
                 page.wait_for_function("() => document.querySelector('#speed').textContent!=='--'")
+                expect(page.locator('#lensPrefill')).to_contain_text('tok/s')
+                expect(page.locator('#lensRate')).to_contain_text('tok/s')
                 page.wait_for_timeout(1200)
                 assert page.locator('#chartLine').get_attribute('d')
                 page.screenshot(path=str(args.output / f'monitor-{browser_name}-desktop.png'), full_page=True)
@@ -278,6 +282,8 @@ def main():
                     page.set_viewport_size({'width':width,'height':844})
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), ('overflow',width)
                     expect(page.locator('#model')).to_be_visible()
+                    rates=[page.locator('#'+id).bounding_box() for id in ('lensPrefill','lensRate')]
+                    assert abs(rates[0]['y']-rates[1]['y'])<1, ('rates must share one row',width,rates)
                     controls=[page.locator('#'+id).bounding_box() for id in ('themeButton','keyButton')]
                     assert abs(controls[0]['y']-controls[1]['y']) < 1, ('header alignment',width,controls)
                     buttons=[page.locator('#'+id).bounding_box() for id in ('chatSend','chatStop')]
@@ -285,6 +291,10 @@ def main():
                 page.set_viewport_size({'width': 390, 'height': 844})
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'mobile overflow'
                 page.screenshot(path=str(args.output / f'monitor-{browser_name}-mobile.png'), full_page=True)
+                mode.write_text('idle')
+                expect(page.locator('#phase')).to_have_text('Ready for your next request')
+                expect(page.locator('#lensPrefill')).to_contain_text('tok/s')
+                expect(page.locator('#lensRate')).to_contain_text('tok/s')
                 mode.write_text('failed')
                 expect(page.locator('#requests tr').first).to_contain_text('failed')
                 mode.write_text('idle')

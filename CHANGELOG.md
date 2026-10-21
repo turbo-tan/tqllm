@@ -6,7 +6,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased (next: 1.0.1)
 
 ### Added
-- Live completed-token prefill progress and throughput in the runtime monitor, with cached-prefix counts excluded from speed.
+- Live completed-token prefill progress and throughput in the runtime monitor, with cached-prefix counts excluded from speed. Prefill and output rates remain visible together in the request card, including after completion.
 - Native MTP drafting on mixture-of-experts (qwen35moe) files that carry an MTP block (`--mtp`): the block's experts
   load like the trunk's and stay in VRAM. Qwen3.6-35B-A3B UD-Q4_K_XL on an RTX 3090 (default settings: the memory
   fit moves the int8 LM head and the token embeddings to host memory, every expert stays on the GPU): 248.7-328.8 tok/s
