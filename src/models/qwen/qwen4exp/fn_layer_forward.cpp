@@ -171,6 +171,14 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
     if (trunk && (n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();  // one wave when the unique experts fit: the split path's miss accounting assumes small steps
+        // F39: a multi-sequence verify block (np > 1: 4 x 4 rows = 160 assignments) passed the slot count by assignments and
+        // ran the waves path, whose down projection sums in another order than the split path one sequence takes: np 4 text
+        // differed from np 1. A verify block takes the split path whenever its distinct experts fit (TQFN_VERIFY_WAVES=1: old rule)
+        static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
+        if (spec && n > 1 && !old_rule) {
+            std::vector<int> u(wave_ids); std::sort(u.begin(), u.end());
+            if (std::unique(u.begin(), u.end()) - u.begin() <= cache.slots(layer)) wave_ids.clear();
+        }
     }
     if (!wave_ids.empty()) {
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
