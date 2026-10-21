@@ -108,7 +108,10 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                hc_rs ? comb : nullptr, hc_rs ? rs->p : nullptr, hc_rs ? cp.dense_device(prefix + "hc_ffn_norm.weight") : nullptr);
     Device<float> logits(size_t(n) * (c.experts + 1)), weights(size_t(n) * c.topk), shared_weights(n);
     Device<int> routed(weights.count);
-    const bool predict = prefetch_on && n <= 4 && trunk && layer + 1 < c.layers;
+    // TQFN_PREDICT_N=N (default 4): next-layer prediction (prefetch) for verify blocks of up to N tokens; above 4 the routers
+    // run unfused (placement only: the output does not change)
+    static const int predict_n = std::getenv("TQFN_PREDICT_N") ? std::atoi(std::getenv("TQFN_PREDICT_N")) : 4;
+    const bool predict = prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
     const std::string np = "blk." + std::to_string(layer + 1) + ".";
     std::unique_ptr<Device<float>> nl;
     if (predict) nl = std::make_unique<Device<float>>(size_t(n) * (c.experts + 1));
