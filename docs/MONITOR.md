@@ -184,3 +184,19 @@ engine timings; the mobile page had no horizontal overflow or JavaScript errors.
 These are scoped runtime/parity checks, not a throughput benchmark, a general
 quality evaluation, or proof across all models/platforms/speculative modes.
 [Inputs, model/binary hashes and per-case output evidence](validation/monitor-3095140.json).
+
+## Shared-port and prefill validation
+
+The [recorded walkthrough](demos/monitor/README.md) shows the API-port dashboard,
+a long prompt, live prefill, request selection and theme controls on a real model.
+The recorder is included; no API responses or telemetry are mocked in that video.
+
+The shared-port change passed the full CPU suite (31 tests), Chromium/Firefox/WebKit
+monitor tests, a CUDA stream-callback ordering/lifetime test, and a real-model
+shared-port smoke test. A matched RTX 3090 check compared main `d617986` with
+source `ce4ce2a`: all 18 responses had identical output hashes, token counts and
+finish reasons. Settings: Qwen3.8-27B-TQ4_L, 16K context, 512-token prefill chunks,
+greedy, no drafter, at most 32 output tokens. These are bounded functional checks,
+not a broad numerical parity proof or a speed-win claim.
+
+[Raw output hashes, model/binary hashes, timings and settings](validation/monitor-ce4ce2a.json).

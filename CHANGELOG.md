@@ -6,13 +6,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased (next: 1.0.1)
 
 ### Added
+- Live completed-token prefill progress and throughput in the runtime monitor, with cached-prefix counts excluded from speed.
 - Native MTP drafting on mixture-of-experts (qwen35moe) files that carry an MTP block (`--mtp`): the block's experts
   load like the trunk's and stay in VRAM. Qwen3.6-35B-A3B UD-Q4_K_XL on an RTX 3090 (default settings: the memory
   fit moves the int8 LM head and the token embeddings to host memory, every expert stays on the GPU): 248.7-328.8 tok/s
   over five chats (177.8-182.6 without MTP), 268.0 after a 4K prompt (179.3); output identical with and without MTP.
 - `--moe-host-mb auto` (default for files larger than the free GPU memory): the experts beyond it go to system RAM,
   spread over the layers when there is no routing profile; `--moe-cache-mb auto` sizes the VRAM cache of host experts.
-- Optional `tqserve --monitor-port` instrument panel with request telemetry, host/device readings and a right-hand
+- Built-in `tqserve` monitor on the API port (optional separate `--monitor-port`) with request telemetry, host/device readings and a right-hand
   terminal chat. Includes in-memory theme/key controls, thinking toggle, Stop/Escape and explicit unknown counters.
   The request workbench adds selectable request journeys, pinned-reference latency/rate comparisons and visible hardware details sampled every three seconds. Theme switching uses a sun/moon icon.
 - `tqllm launch pi` (the pi coding agent) and `tqllm launch dsh` (DeepSeek Harness, `web` or `headless` profile): each
@@ -31,6 +32,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   to the server (`ANTHROPIC_BASE_URL`). `tqllm launch codex` / `claude` now point the agent at the server directly.
 
 ### Changed
+- The runtime monitor is available at `/` and `/monitor` on the API port by default; `--monitor-port` remains optional.
+- Shortened the project README and moved detailed setup, options, formats, agent instructions, benchmarks and credits into linked guides; added a recorded monitor walkthrough.
 - Monitor: aligned accessible icon controls, keyboard/IME handling, stable request focus, non-disruptive streaming scroll and retryable errors. Trusted panel extensions have isolated snapshots, a contributor guide and Chromium/Firefox/WebKit CI coverage.
 - `tqllm launch`: `--max-tokens` default 8192 -> 32768 (an agent's reasoning used up 8192 before it wrote the file); the
   drafter and vocabulary are also found one folder down in a model folder (e.g. `~/models/dflash2/`); a second Ctrl+C

@@ -1,0 +1,865 @@
+{
+  "base": {
+    "health": {
+      "status": "ok",
+      "engine": "d617986",
+      "fit": ""
+    },
+    "binary_sha256": "24f6f52f1ef981e72673083c21c3ac1ce4b91a39488799e77e6017e179a18ac5",
+    "rows": [
+      {
+        "case": "arithmetic",
+        "repeat": 0,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 83.316,
+          "prompt_per_second": 324.067,
+          "predicted_n": 4,
+          "predicted_ms": 57.409,
+          "predicted_per_second": 52.257,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "arithmetic",
+        "repeat": 1,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 83.319,
+          "prompt_per_second": 324.056,
+          "predicted_n": 4,
+          "predicted_ms": 54.845,
+          "predicted_per_second": 54.7,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "arithmetic",
+        "repeat": 2,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 82.529,
+          "prompt_per_second": 327.158,
+          "predicted_n": 4,
+          "predicted_ms": 54.673,
+          "predicted_per_second": 54.872,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 0,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 81.726,
+          "prompt_per_second": 367.08,
+          "predicted_n": 4,
+          "predicted_ms": 54.632,
+          "predicted_per_second": 54.913,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 1,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 81.55,
+          "prompt_per_second": 367.872,
+          "predicted_n": 4,
+          "predicted_ms": 54.532,
+          "predicted_per_second": 55.014,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 2,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 81.004,
+          "prompt_per_second": 370.352,
+          "predicted_n": 4,
+          "predicted_ms": 54.419,
+          "predicted_per_second": 55.128,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 0,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 81.513,
+          "prompt_per_second": 466.183,
+          "predicted_n": 2,
+          "predicted_ms": 18.074,
+          "predicted_per_second": 55.328,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 1,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 79.69,
+          "prompt_per_second": 476.848,
+          "predicted_n": 2,
+          "predicted_ms": 18.081,
+          "predicted_per_second": 55.307,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 2,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 78.983,
+          "prompt_per_second": 481.116,
+          "predicted_n": 2,
+          "predicted_ms": 17.999,
+          "predicted_per_second": 55.559,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 0,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 76.661,
+          "prompt_per_second": 313.067,
+          "predicted_n": 16,
+          "predicted_ms": 274.325,
+          "predicted_per_second": 54.68,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 1,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 80.918,
+          "prompt_per_second": 296.597,
+          "predicted_n": 16,
+          "predicted_ms": 274.601,
+          "predicted_per_second": 54.625,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 2,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 80.86,
+          "prompt_per_second": 296.809,
+          "predicted_n": 16,
+          "predicted_ms": 274.486,
+          "predicted_per_second": 54.648,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 0,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1187.097,
+          "prompt_per_second": 1312.445,
+          "predicted_n": 23,
+          "predicted_ms": 405.969,
+          "predicted_per_second": 54.191,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 1,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1072.56,
+          "prompt_per_second": 1452.599,
+          "predicted_n": 23,
+          "predicted_ms": 405.964,
+          "predicted_per_second": 54.192,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 2,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1073.973,
+          "prompt_per_second": 1450.688,
+          "predicted_n": 23,
+          "predicted_ms": 405.797,
+          "predicted_per_second": 54.214,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 0,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3252.427,
+          "prompt_per_second": 1482.585,
+          "predicted_n": 16,
+          "predicted_ms": 281.565,
+          "predicted_per_second": 53.274,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 1,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3252.957,
+          "prompt_per_second": 1482.344,
+          "predicted_n": 16,
+          "predicted_ms": 281.47,
+          "predicted_per_second": 53.292,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 2,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3258.009,
+          "prompt_per_second": 1480.045,
+          "predicted_n": 16,
+          "predicted_ms": 281.737,
+          "predicted_per_second": 53.241,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      }
+    ]
+  },
+  "candidate": {
+    "health": {
+      "status": "ok",
+      "engine": "ce4ce2a",
+      "fit": ""
+    },
+    "binary_sha256": "94ada3542ec9b10e9276af73291014a349987aa59130784d490bcdc6a93f3020",
+    "rows": [
+      {
+        "case": "arithmetic",
+        "repeat": 0,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 83.444,
+          "prompt_per_second": 323.57,
+          "predicted_n": 4,
+          "predicted_ms": 60.366,
+          "predicted_per_second": 49.697,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "arithmetic",
+        "repeat": 1,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 83.872,
+          "prompt_per_second": 321.919,
+          "predicted_n": 4,
+          "predicted_ms": 54.773,
+          "predicted_per_second": 54.772,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "arithmetic",
+        "repeat": 2,
+        "prompt_sha256": "81c2281fdea0d73d2768a8bb976ef7c99fddf9900cbfed809d70605fa0679ee6",
+        "output_sha256": "a934c244755c66aebb0d6f9f5687038ffae8f00b00b28b4e17521016393f38b9",
+        "output_text": "391",
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "total_tokens": 31
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 27,
+          "prompt_ms": 83.595,
+          "prompt_per_second": 322.986,
+          "predicted_n": 4,
+          "predicted_ms": 54.599,
+          "predicted_per_second": 54.946,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 0,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 81.66,
+          "prompt_per_second": 367.377,
+          "predicted_n": 4,
+          "predicted_ms": 54.643,
+          "predicted_per_second": 54.902,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 1,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 80.903,
+          "prompt_per_second": 370.814,
+          "predicted_n": 4,
+          "predicted_ms": 54.602,
+          "predicted_per_second": 54.943,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "fraction",
+        "repeat": 2,
+        "prompt_sha256": "1b511c2a10f39200ad51a66b85016754f776880a162d2080d065d62691f1f111",
+        "output_sha256": "fc5755dd88ccc67dae22b275accd73534cff79d13189ef7c90da6db72f075178",
+        "output_text": "7/8",
+        "usage": {
+          "prompt_tokens": 30,
+          "completion_tokens": 4,
+          "total_tokens": 34
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 30,
+          "prompt_ms": 80.922,
+          "prompt_per_second": 370.727,
+          "predicted_n": 4,
+          "predicted_ms": 54.472,
+          "predicted_per_second": 55.074,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 0,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 81.642,
+          "prompt_per_second": 465.447,
+          "predicted_n": 2,
+          "predicted_ms": 18.084,
+          "predicted_per_second": 55.298,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 1,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 79.319,
+          "prompt_per_second": 479.078,
+          "predicted_n": 2,
+          "predicted_ms": 18.048,
+          "predicted_per_second": 55.408,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "logic",
+        "repeat": 2,
+        "prompt_sha256": "1f5509e098248daf7fc10e5f0fd338638c24f2aed425dc1d321b55b5508dbd52",
+        "output_sha256": "23794d91c53ae875c8e247d72561e35d9d06ee07c70c9e0dbcc977a6d161504a",
+        "output_text": "NO",
+        "usage": {
+          "prompt_tokens": 38,
+          "completion_tokens": 2,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 38,
+          "prompt_ms": 78.611,
+          "prompt_per_second": 483.393,
+          "predicted_n": 2,
+          "predicted_ms": 18.051,
+          "predicted_per_second": 55.399,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 0,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 76.351,
+          "prompt_per_second": 314.338,
+          "predicted_n": 16,
+          "predicted_ms": 274.567,
+          "predicted_per_second": 54.631,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 1,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 79.563,
+          "prompt_per_second": 301.648,
+          "predicted_n": 16,
+          "predicted_ms": 274.658,
+          "predicted_per_second": 54.613,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "code",
+        "repeat": 2,
+        "prompt_sha256": "308158538c968f1d5535d229fe30bac9d88f82898ffe8fc70e218b11f3428b3d",
+        "output_sha256": "a61d136e47d247fb46d5b229e8226ef53f168ea6345de93f8f9cd52e0fc29b2b",
+        "output_text": "```python\ndef square(x):\n    return x * x\n```",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 16,
+          "total_tokens": 40
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 24,
+          "prompt_ms": 80.744,
+          "prompt_per_second": 297.236,
+          "predicted_n": 16,
+          "predicted_ms": 274.798,
+          "predicted_per_second": 54.586,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 0,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1198.884,
+          "prompt_per_second": 1299.542,
+          "predicted_n": 23,
+          "predicted_ms": 406.567,
+          "predicted_per_second": 54.112,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 1,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1074.73,
+          "prompt_per_second": 1449.666,
+          "predicted_n": 23,
+          "predicted_ms": 406.577,
+          "predicted_per_second": 54.11,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "document",
+        "repeat": 2,
+        "prompt_sha256": "d982b2f594f77029e853a4ca2290ed87f2773583b2544d78f8bcb05635411664",
+        "output_sha256": "455f2f878af405386345bc335e4e63ef69c8b50bc5c2ae52beb4526b706e1c77",
+        "output_text": "The provided text contains no advice to summarize, as it consists solely of a repeated statement about a responsive service.",
+        "usage": {
+          "prompt_tokens": 1558,
+          "completion_tokens": 23,
+          "total_tokens": 1581
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 1558,
+          "prompt_ms": 1075.852,
+          "prompt_per_second": 1448.155,
+          "predicted_n": 23,
+          "predicted_ms": 406.401,
+          "predicted_per_second": 54.134,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 0,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3268.48,
+          "prompt_per_second": 1475.304,
+          "predicted_n": 16,
+          "predicted_ms": 281.998,
+          "predicted_per_second": 53.192,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 1,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3271.58,
+          "prompt_per_second": 1473.906,
+          "predicted_n": 16,
+          "predicted_ms": 281.697,
+          "predicted_per_second": 53.249,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      },
+      {
+        "case": "long_document",
+        "repeat": 2,
+        "prompt_sha256": "5bb83e2dec162b38cd45473cefe8fe55f753960b7efc23a50f5dd071481b9872",
+        "output_sha256": "0abe56a38f771ff227069a99f01990a7acfea24ab1c1aa822bbca1a192a0686d",
+        "output_text": "Process requests fairly, keep original tasks intact, and report results in order.",
+        "usage": {
+          "prompt_tokens": 4822,
+          "completion_tokens": 16,
+          "total_tokens": 4838
+        },
+        "finish_reason": "stop",
+        "timings": {
+          "prompt_n": 4822,
+          "prompt_ms": 3274.208,
+          "prompt_per_second": 1472.723,
+          "predicted_n": 16,
+          "predicted_ms": 281.794,
+          "predicted_per_second": 53.23,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        }
+      }
+    ]
+  },
+  "gate": {
+    "passed": true,
+    "same_output_and_counts": "18/18",
+    "gpu": "RTX 3090",
+    "model_file": "Qwen3.8-27B-TQ4_L.gguf",
+    "model_sha256": "79e514a140006ca171458709c2f4a802a7cec62b9420c86059a557407aa32949",
+    "context": 16384,
+    "ubatch": 512,
+    "temperature": 0,
+    "drafter": false,
+    "max_output_tokens": 32,
+    "note": "One sequential base/candidate load, warmup then3repeats per prompt; smoke measurements, not a performance-win claim.",
+    "base_commit": "d617986",
+    "candidate_source_commit": "ce4ce2a"
+  }
+}
