@@ -1132,6 +1132,10 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"
+  - name: TQFN_VERIFY_WAVES
+    kind: debug
+    default: "off"
+    doc: "1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1)"
   - name: TQFN_PREDICT_N
     kind: debug
     default: "4 (6 with adaptive drafts)"

@@ -181,6 +181,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_PF_K` | 6 | prefetch each token's K best predicted experts |  |
 | `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
 | `TQFN_DRAFT_TAU` | 0.9 (PCIe, np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off |  |
+| `TQFN_VERIFY_WAVES` | off | 1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1) |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
 | `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
