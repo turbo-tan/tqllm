@@ -6,9 +6,12 @@ search path), so each include is resolved through the unique basenames of the tr
 tests/layering_allowlist.txt; the list may only shrink: a new violation fails, and so does an entry that no longer applies.
 """
 import re
-import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from repo_files import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 ALLOW = REPO / "tests" / "layering_allowlist.txt"
@@ -37,7 +40,7 @@ def layer(path):
 
 
 def violations():
-    files = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+    files = repo_files(REPO)
     by_base = {}
     for f in files:
         by_base.setdefault(Path(f).name, []).append(f)
@@ -70,7 +73,7 @@ def violations():
 class Layering(unittest.TestCase):
     def test_archive_not_referenced(self):
         """archive/ holds retired sources (archive/README.md): no build file, source, test or script may name them."""
-        files = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+        files = repo_files(REPO)
         archived = [Path(f).name for f in files if f.startswith("archive/") and not f.endswith("README.md")]
         code = (".txt", ".cmake", ".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc", ".py", ".sh", ".yml", ".yaml")
         build = [f for f in files if not f.startswith("archive/") and (f.endswith(code) or "Dockerfile" in f) and (REPO / f).is_file()]

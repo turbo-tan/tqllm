@@ -2,9 +2,12 @@
 
 The patterns are assembled from fragments so this file does not contain the strings it forbids.
 """
-import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from repo_files import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -29,10 +32,8 @@ SELF = "tests/test_no_private_paths.py"
 
 
 def tracked_text_files():
-    out = subprocess.run(["git", "-C", str(REPO), "ls-files"],
-                         capture_output=True, text=True, check=True).stdout
     files = []
-    for line in out.splitlines():
+    for line in repo_files(REPO):
         p = line.strip()
         if not p or p == SELF:
             continue
