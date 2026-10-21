@@ -174,7 +174,10 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           // TQFN_AUTO_KEEP_MB (debug A/B): what slots=auto keeps free beside the banks, instead of the full-context attention
           // state + decode reserve (a long prompt then borrows banks for its state)
           static const char * keep_env = std::getenv("TQFN_AUTO_KEEP_MB");
-          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : state + reserve + (size_t(256) << 20);
+          // every slot (--np) keeps its own full-context attention / recurrent / MTP state beside the banks: sized for one,
+          // np 4 at 32K ran out of memory in the second request's state (F38)
+          const size_t nseq = slots_.size();
+          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : nseq * state + reserve + nseq * (size_t(256) << 20);
           if (g_small_card) std::fprintf(stderr, "tqllm: small card: CPU expert pool, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n");
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
