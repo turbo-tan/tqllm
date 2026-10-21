@@ -24,8 +24,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--image-max-tokens")) mx = std::atoi(argv[i + 1]);
     }
     try {
-        cudaStream_t s;
-        cudaStreamCreate(&s);
+        cudaStream_t s = cudaStreamPerThread;  // ordered with the synchronous copies (stream 0 is per thread)
         auto enc = tqllm::VisionEncoder::load(argv[1], s);
         enc->set_token_limits(mn, mx);
         std::ifstream in(argv[2], std::ios::binary);
