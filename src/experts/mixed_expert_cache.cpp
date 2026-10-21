@@ -20,8 +20,6 @@ namespace {
 void checked(cudaError_t s, int line = __builtin_LINE()) { if (s != cudaSuccess) throw std::runtime_error(std::string(cudaGetErrorString(s)) + " (mixed_expert_cache.cpp:" + std::to_string(line) + ")"); }
 }
 constexpr int kPfBatch = 16;  // experts per staged prefetch batch (the staging buffer is reused in copy-stream order)
-// TQFN_PF_EVENTS: per-slot prefetch completion events (opt-in; with demand misses on a full bank it can find no slot, F33)
-static bool pf_events_on() { return std::getenv("TQFN_PF_EVENTS") != nullptr; }
 static bool host_coherent() {  // GB10-class: the GPU reads pageable host memory through the host page tables (C2C)
     static const bool v = [] { int dev = 0, on = 0; cudaGetDevice(&dev);
         return cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on; }();
@@ -44,11 +42,9 @@ struct MixedExpertCache::State {
         std::vector<uint8_t> speculative;  // slot filled by prefetch and not yet used by a prepare
         std::vector<uint8_t> inflight;     // slot written by the bank's pending prefetch (ready not yet waited for)
         std::vector<uint64_t> pf_age;      // clock of the slot's last prefetch fill (TQFN_VALUE_VICTIM)
-        std::vector<int> pf_seq;           // TQFN_PF_EVENTS: index of the event recorded after the slot's prefetch copy
-        std::vector<cudaEvent_t> pf_ev;
         std::vector<uint8_t> queued;       // TQFN_TQ_AHEAD: slot assigned to a prefetch whose copy is not submitted yet
-        Bank(State & s, int c) : owner(s), cap(c), ids(c, -1), ages(c), speculative(c, 0), inflight(c, 0), pf_age(c, 0), pf_seq(c, -1), queued(c, 0) {}
-        ~Bank() { if (ready) cudaEventDestroy(ready); if (released) cudaEventDestroy(released); for (auto e : pf_ev) cudaEventDestroy(e); owner.free(memory); }
+        Bank(State & s, int c) : owner(s), cap(c), ids(c, -1), ages(c), speculative(c, 0), inflight(c, 0), pf_age(c, 0), queued(c, 0) {}
+        ~Bank() { if (ready) cudaEventDestroy(ready); if (released) cudaEventDestroy(released); owner.free(memory); }
     };
     int layers, experts, hidden, ff, capacity, active = -1;
     std::vector<int> layer_cap;  // per-layer slots (TQFN_LAYER_SLOTS); empty: capacity for every layer
@@ -113,9 +109,7 @@ struct MixedExpertCache::State {
         if (miss_pending) checked(cudaStreamWaitEvent(copy, miss_done, 0));  // demand misses keep the link first
         const size_t total = expert_bytes(bank);
         char * stage = pf_staging + size_t(pf_ring++ % kPfBatch) * total; const char * src = prepacked(layer, id);
-        static const size_t chunk = std::getenv("TQFN_PF_CHUNK_KB") ? size_t(std::atoll(std::getenv("TQFN_PF_CHUNK_KB"))) << 10 : 0;
-        for (size_t at = 0; at < total; at += chunk ? chunk : total)
-            checked(cudaMemcpyAsync(stage + at, src + at, std::min(total - at, chunk ? chunk : total), cudaMemcpyHostToDevice, copy));
+        checked(cudaMemcpyAsync(stage, src, total, cudaMemcpyHostToDevice, copy));  // the expert's packed block in one DMA
         std::vector<tqllm_cuda::ScatterItem> items; size_t off = 0;
         for (int p = 0; p < 3; ++p) {
             const auto & d = bank.matrices[p];
@@ -269,28 +263,14 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         if (is_needed(bank->ids[j])) { s.submit(*bank, layer, j, bank->ids[j], s.pf_last ? s.pf_last : s.stream); ++s.pf_promoted; }
         else { bank->queued[size_t(j)] = 0; bank->ids[j] = -1; bank->speculative[j] = 0; bank->inflight[j] = 0; ++s.pf_dropped; }
     }
-    // TQFN_PF_EVENTS: the compute stream waits only for the prefetch copies of slots this call reads (one event per
-    // prefetched expert, recorded in priority order); slots still in flight stay pending and are not demand victims.
-    static const bool pf_events = pf_events_on();
     if (bank && bank->pending) {
         ++s.counters.pf_pending;
         const bool running = bank->ready && cudaEventQuery(bank->ready) == cudaErrorNotReady;
         if (running) ++s.counters.pf_running;
-        if (running && !pf_events) {  // the bank-wide wait below also covers copies of experts this call does not read
+        if (running) {  // the bank-wide wait below also covers copies of experts this call does not read
             for (int j = 0; j < bank->cap; ++j) if (bank->inflight[j] && !is_needed(bank->ids[j])) { ++s.counters.pf_waited_unread; break; }
         }
     }
-    if (bank && bank->pending && pf_events && s.miss_stream && s.registered && s.prepacked) {
-        // Event indices restart with every prefetch call, so the highest index is not the latest copy: wait for each
-        // read slot's own event (an index re-recorded by a later call is a later point on the copy stream: still safe).
-        std::vector<uint8_t> waited(bank->pf_ev.size(), 0);
-        for (int j = 0; j < bank->cap; ++j) if (bank->inflight[j] && is_needed(bank->ids[j])) {
-            const int e = bank->pf_seq[j];
-            if (!waited[size_t(e)]) { checked(cudaStreamWaitEvent(s.stream, bank->pf_ev[size_t(e)], 0)); waited[size_t(e)] = 1; }
-            bank->inflight[j] = 0;
-        }
-        bank->pending = std::any_of(bank->inflight.begin(), bank->inflight.end(), [](uint8_t f) { return f != 0; });
-    } else
     if (bank && bank->pending) { checked(cudaStreamWaitEvent(s.stream, bank->ready, 0)); bank->pending = false; std::fill(bank->inflight.begin(), bank->inflight.end(), 0); }
     if (bank) for (int j = 0; j < bank->cap; ++j) if (is_needed(bank->ids[j])) {
         s.where[bank->ids[j]] = j;
@@ -330,22 +310,13 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     const bool split = s.miss_stream && s.registered && s.prepacked;
     cudaStream_t up = split ? s.miss_stream : s.stream;
     if (split && !incoming.empty() && bank->used) checked(cudaStreamWaitEvent(up, bank->released, 0));
-    const bool skip_inflight = pf_events && bank && bank->pending;
-    if (split && !incoming.empty() && bank->ready && !skip_inflight) checked(cudaStreamWaitEvent(up, bank->ready, 0));  // a victim may be an in-flight prefetch
-    bool waited_ready = !skip_inflight;
+    if (split && !incoming.empty() && bank->ready) checked(cudaStreamWaitEvent(up, bank->ready, 0));  // a victim may be an in-flight prefetch
     bool dma_issued = false;
     size_t offset = 0;
     for (const auto & [id, payload] : incoming) {
         int target = -1;
-        for (int pass = 0; pass < 2 && target < 0; ++pass) {
-        if (pass == 1) {
-            if (waited_ready) break;
-            if (split && bank->ready) checked(cudaStreamWaitEvent(up, bank->ready, 0));  // every free slot is in flight
-            waited_ready = true;
-        }
         for (int j = 0; j < bank->cap; ++j) {
             const int old = bank->ids[j]; if (is_needed(old)) continue;
-            if (pass == 0 && skip_inflight && bank->inflight[j]) continue;
             if (target < 0 || old < 0) target = j;
             else {
                 const double vj = slot_value(*bank, j, s.frequency[size_t(layer) * s.experts + old], s.clock);
@@ -353,7 +324,6 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
                 if (vj < vt || (vj == vt && s.clock - bank->ages[j] < s.clock - bank->ages[target])) target = j;
             }
             if (old < 0) break;
-        }
         }
         if (target < 0) throw std::logic_error("mixed cache: no unpinned slot");
         bank->inflight[target] = 0; bank->queued[size_t(target)] = 0;
@@ -485,7 +455,7 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
     const size_t total = State::expert_bytes(*bank);
     constexpr int kCap = kPfBatch;
     if (!s.grow_pf(kCap * total)) { ++s.counters.pf_skipped; return; }
-    std::vector<tqllm_cuda::ScatterItem> items; int staged = 0, n_ev = 0;
+    std::vector<tqllm_cuda::ScatterItem> items; int staged = 0;
     auto flush = [&] {
         if (!items.empty()) tqllm_cuda::scatter_copy(items.data(), int(items.size()), copy);
         items.clear(); staged = 0;
@@ -519,14 +489,9 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
         }
         const char * src = s.prepacked(layer, id); size_t off = 0;
         {
-            static const bool pf_events = pf_events_on();
-            if (staged == kCap || (pf_events && staged)) flush();
+            if (staged == kCap) flush();
             char * stage = s.pf_staging + size_t(staged) * total;
-            // TQFN_PF_CHUNK_KB=K: the expert's packed block in K KB DMAs, so a demand miss on the miss stream waits for at most
-            // one chunk of a prefetch already on the copy engine (default: one DMA)
-            static const size_t chunk = std::getenv("TQFN_PF_CHUNK_KB") ? size_t(std::atoll(std::getenv("TQFN_PF_CHUNK_KB"))) << 10 : 0;
-            for (size_t at = 0; at < total; at += chunk ? chunk : total)
-                checked(cudaMemcpyAsync(stage + at, src + at, std::min(total - at, chunk ? chunk : total), cudaMemcpyHostToDevice, copy));
+            checked(cudaMemcpyAsync(stage, src, total, cudaMemcpyHostToDevice, copy));  // the expert's packed block in one DMA
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
                 items.push_back({stage + off, static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], bank->stride[p]});
@@ -540,11 +505,6 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
         }
         s.counters.transfer_bytes += off; ++s.prefetch_count;
         bank->ids[target] = id; bank->ages[target] = ++s.clock; bank->speculative[target] = 1; bank->inflight[target] = 1; bank->pf_age[target] = s.clock;
-        if (static const bool pf_events = pf_events_on(); pf_events) {
-            flush();
-            if (size_t(n_ev) == bank->pf_ev.size()) { cudaEvent_t e; checked(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); bank->pf_ev.push_back(e); }
-            checked(cudaEventRecord(bank->pf_ev[size_t(n_ev)], copy)); bank->pf_seq[target] = n_ev++;
-        }
         ++s.frequency[size_t(layer) * s.experts + id];
         keep.insert(id);
     }

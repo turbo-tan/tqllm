@@ -258,24 +258,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         // or not the cache holds them, so the CPU / GPU split (AVX2 fp32 dots vs the GPU kernels: last-bit differences that
         // flip a near-tie) does not depend on what earlier requests left resident, and neither does the greedy text
         static const int cpu_owned = !cpu_pool ? 0 : std::getenv("TQFN_CPU_OWNED") ? std::atoi(std::getenv("TQFN_CPU_OWNED")) : g_small_card ? 1 : 0;
-        // TQFN_CPU_OWNED_PROFILE=counts (int32 [layers + 1][experts], routed counts from a calibration run) with
-        // TQFN_CPU_OWNED_COLD=N: the CPU owns the N least-routed experts of each layer instead of the hash eighths
-        static const std::vector<uint8_t> cold = [&] {
-            std::vector<uint8_t> v; const char * p = std::getenv("TQFN_CPU_OWNED_PROFILE"); const char * n = std::getenv("TQFN_CPU_OWNED_COLD");
-            if (!p || !n || !cpu_pool) return v;
-            std::vector<int32_t> cnt(size_t(c.layers + 1) * c.experts); FILE * f = std::fopen(p, "rb");
-            if (!f || std::fread(cnt.data(), 4, cnt.size(), f) != cnt.size()) throw std::runtime_error("TQFN_CPU_OWNED_PROFILE: cannot read " + std::string(p));
-            std::fclose(f); v.assign(size_t(c.layers + 1) * c.experts, 0); const int k = std::min(std::atoi(n), c.experts);
-            for (int l = 0; l <= c.layers; ++l) {  // row c.layers: the MTP layer
-                std::vector<int> ids(c.experts); std::iota(ids.begin(), ids.end(), 0);
-                std::stable_sort(ids.begin(), ids.end(), [&](int a, int b) { return cnt[size_t(l) * c.experts + a] < cnt[size_t(l) * c.experts + b]; });
-                for (int i = 0; i < k; ++i) v[size_t(l) * c.experts + ids[i]] = 1;
-            }
-            return v;
-        }();
-        auto owned = [&](int e) { return !cold.empty() ? cold[size_t(layer) * c.experts + e] != 0
-                                                       : cpu_owned > 0 && int((uint32_t(e) * 2654435761u + uint32_t(layer) * 40503u) >> 29) < cpu_owned; };
-        const bool own_mode = cpu_owned > 0 || !cold.empty();
+        auto owned = [&](int e) { return cpu_owned > 0 && int((uint32_t(e) * 2654435761u + uint32_t(layer) * 40503u) >> 29) < cpu_owned; };
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
         const bool use_cpu = cpu_pool && trunk && n <= 4;
         if (use_cpu) {
@@ -323,7 +306,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
             std::vector<CpuMissPool::Job> jobs; std::map<int, int> job_of;
             for (int a = 0; a < A; ++a) {
                 const int e = routed_ids[a], t = a / c.topk;
-                if (own_mode ? !owned(e) : cache.resident(layer, e)) continue;
+                if (cpu_owned > 0 ? !owned(e) : cache.resident(layer, e)) continue;
                 int sub = -1;
                 for (int q = 0; q < c.topk && sub < 0; ++q) if (cache.resident(layer, routed_ids[t * c.topk + q])) sub = routed_ids[t * c.topk + q];
                 // nothing resident for this token: any resident expert of the layer is the placeholder (its output row is
@@ -331,7 +314,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
                 if (sub < 0) { static std::vector<int> any_res(c.layers + 1, -1); int & r = any_res[layer];
                                if (r < 0 || !cache.resident(layer, r)) { r = -1; for (int x = 0; x < c.experts && r < 0; ++x) if (cache.resident(layer, x)) r = x; }
                                sub = r; }
-                if (sub < 0) { if (!own_mode) continue; sub = e; }  // nothing resident in the whole layer: the GPU miss path serves it (an owned expert loads as a miss too; the CPU row still overwrites it)
+                if (sub < 0) { if (cpu_owned <= 0) continue; sub = e; }  // nothing resident in the whole layer: the GPU miss path serves it (an owned expert loads as a miss too; the CPU row still overwrites it)
                 // TQFN_CPU_MISS_MAX=K: at most K distinct experts per layer call on the CPU, the rest are GPU misses
                 static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : g_small_card ? 5 : 1 << 30;
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
@@ -563,24 +546,12 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
 
 void DecodeModel::router(const std::string & prefix, const float * x, float * logits, int n) {
     const bool bf16 = cp.file(prefix + "ffn_gate_inp.weight").file().tensors.at(prefix + "ffn_gate_inp.weight").type == GGML_BF16;
-    // default: the tiled GEMV (exact, the per-token kernel's sums); TQFN_ROUTER_GEMM=1: fp32 cuBLAS GEMM (faster, but
-    // its summation order flips near-tie top-k choices: 64K text changed on 10-17)
-    static const bool router_gemv = !(std::getenv("TQFN_ROUTER_GEMM") && std::atoi(std::getenv("TQFN_ROUTER_GEMM")) != 0);
-    if (bf16 && router_gemv && n > 64) {
+    // prefill chunks: the tiled GEMV (exact, the per-token kernel's sums; an fp32 cuBLAS GEMM flipped near-tie top-k)
+    if (bf16 && n > 64) {
         Device<__nv_bfloat16> xb(size_t(n) * h);  // x rounded once for both GEMVs (they round it per product anyway)
         tqllm_cuda::fn_round_bf16(x, xb.p, int64_t(n) * h, nullptr);
         tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp.weight"), xb.p, logits, c.experts, h, n, c.experts + 1, nullptr);
         tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), xb.p, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
-    } else if (bf16 && n > 64) {
-        // prefill chunks: fp32 GEMM on an exact f32 copy of the bf16 weights (4 MB per layer, resident), products exact,
-        // sums in cuBLAS order; TF32 off for these calls so the logits stay within f32 rounding of the per-token GEMV
-        const float one = 1.f, zero = 0.f; const int ld = c.experts + 1;
-        cublasMath_t mode = CUBLAS_DEFAULT_MATH; cublasGetMathMode(cp.blas(), &mode); cublasSetMathMode(cp.blas(), CUBLAS_PEDANTIC_MATH);
-        require(cublasSgemm(cp.blas(), CUBLAS_OP_T, CUBLAS_OP_N, c.experts, n, h, &one, cp.dense_device(prefix + "ffn_gate_inp.weight"), h,
-                            x, h, &zero, logits, ld) == CUBLAS_STATUS_SUCCESS, "router GEMM failed: " + prefix);
-        require(cublasSgemm(cp.blas(), CUBLAS_OP_T, CUBLAS_OP_N, 1, n, h, &one, cp.dense_device(prefix + "ffn_gate_inp_shexp.weight"), h,
-                            x, h, &zero, logits + c.experts, ld) == CUBLAS_STATUS_SUCCESS, "shared-gate GEMM failed: " + prefix);
-        cublasSetMathMode(cp.blas(), mode);
     } else if (bf16 && std::getenv("TQFN_F32_ROUTER") == nullptr) {
         // straight into the [n][experts + 1] logits (no staging copies)
         tqllm_cuda::fn_gemv_bf16_tokens_ld(cp.bf16_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);

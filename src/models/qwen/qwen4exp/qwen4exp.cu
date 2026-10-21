@@ -1188,11 +1188,7 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             fn_gdn_chunk_k<C, VS><<<dim3(vh, dim / VS), 256, smem, s>>>(qkv, qk, gates, gram, state, next, out, kh, vh, dim, n);
             return;
         }
-        // TQFN_GDN_VPW (default 8): value columns per warp (each column's arithmetic is the same for any value)
-        static const int vpw = std::getenv("TQFN_GDN_VPW") ? std::atoi(std::getenv("TQFN_GDN_VPW")) : 8;
-        if (dim % 32 == 0 && vpw == 4) fn_gdn_main_k<4><<<dim3(vh, dim / 16), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
-        else if (dim % 32 == 0 && vpw == 2) fn_gdn_main_k<2><<<dim3(vh, dim / 8), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
-        else if (dim % 32 == 0) fn_gdn_main_k<8><<<dim3(vh, dim / 32), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);  // 8 value columns per warp
+        if (dim % 32 == 0) fn_gdn_main_k<8><<<dim3(vh, dim / 32), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);  // 8 value columns per warp
         else fn_gdn_main_k<1><<<dim3(vh, dim / 4), dim3(32, 4), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
     }
 }

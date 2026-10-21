@@ -1039,9 +1039,10 @@ flags:
     default: "on"
     doc: "0: the plain sequential GDN kernel instead of the fast pass at dim 128"
   - name: TQFN_GDN_VPW
-    kind: debug
-    default: "8"
-    doc: "GDN value columns per warp"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "fixed behaviour (8 value columns per warp, bit-identical)"
   - name: TQFN_GDN_WY
     kind: debug
     default: "on"
@@ -1095,13 +1096,15 @@ flags:
     default: "off"
     doc: "no predicted-expert prefetch in decode"
   - name: TQFN_OLD_Q2_DOT
-    kind: debug
-    default: "off"
-    doc: "GSQ Q2_0: one block per row in the dot kernel (A/B)"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "fixed behaviour (warp-per-row GSQ Q2_0 dot)"
   - name: TQFN_PF_EVENTS
-    kind: debug
-    default: "off"
-    doc: "the compute stream waits only for the prefetch copies of the slots it reads"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33)"
   - name: TQFN_PF_K
     kind: debug
     default: "6"
@@ -1111,21 +1114,24 @@ flags:
     default: "off"
     doc: "1: keep the layer-major buffers and staging halves across requests"
   - name: TQFN_CPU_OWNED_COLD
-    kind: debug
-    default: "off"
-    doc: "N: with TQFN_CPU_OWNED_PROFILE, the CPU pool owns each layer's N least-routed experts"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "removed (profile-owned cold experts lost on the 3090); TQFN_CPU_OWNED stays"
   - name: TQFN_CPU_OWNED_PROFILE
-    kind: debug
-    default: "off"
-    doc: "routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "removed with TQFN_CPU_OWNED_COLD"
   - name: TQFN_DRAFT_TAU
     kind: debug
     default: "0.9 (PCIe, np 1)"
     doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off"
   - name: TQFN_PF_CHUNK_KB
-    kind: debug
-    default: "off"
-    doc: "K: prefetch DMAs in K KB chunks (A/B)"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"
   - name: TQFN_PREDICT_N
     kind: debug
     default: "4 (6 with adaptive drafts)"
@@ -1183,9 +1189,10 @@ flags:
     default: "-"
     doc: "diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none)"
   - name: TQFN_ROUTER_GEMM
-    kind: debug
-    default: "off"
-    doc: "1: router as an fp32 cuBLAS GEMM (faster; its summation order can flip near-tie routing)"
+    kind: retired
+    default: "-"
+    doc: "removed"
+    replaced_by: "fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing)"
   - name: TQFN_ROUTE_DUMP
     kind: debug
     default: "-"

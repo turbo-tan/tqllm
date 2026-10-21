@@ -15,29 +15,6 @@ __device__ float value(const unsigned char * data, int64_t element) {
     const float scale = __half2float(*reinterpret_cast<const __half *>(block));
     return scale * (int((block[2 + j / 4] >> (2 * (j % 4))) & 3u) - 1);
 }
-template<class T> __global__ void dot(const unsigned char * weights, const __half * x, T * y,
-                                     int rows, int cols, int experts, const int * ids, int topk, bool per_expert) {
-    const int row = blockIdx.x, assignment = blockIdx.y;
-    const int expert = ids ? ids[assignment] : 0;
-    const int input = per_expert ? assignment : assignment / topk;
-    float sum = 0.f;
-    if (expert >= 0 && expert < experts)
-        for (int j = threadIdx.x; j < cols; j += blockDim.x)
-            sum += value(weights, (int64_t(expert) * rows + row) * cols + j) * __half2float(x[int64_t(input) * cols + j]);
-    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
-    __shared__ float partial[4];
-    if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        sum = threadIdx.x < 4 ? partial[threadIdx.x] : 0.f;
-        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
-        if (!threadIdx.x) {
-            if (expert < 0 || expert >= experts) sum = nanf("");
-            if constexpr (std::is_same_v<T, float>) y[int64_t(assignment) * rows + row] = sum;
-            else y[int64_t(assignment) * rows + row] = __float2bfloat16_rn(sum);
-        }
-    }
-}
 // Warp per (row, assignment): each 64-weight block (18 bytes) is read by the whole warp, 2 weights per lane.
 template<class T> __global__ void dot_warp(const unsigned char * weights, const __half * x, T * y,
                                           int rows, int cols, int experts, const int * ids, int topk, bool per_expert) {
@@ -198,7 +175,6 @@ __global__ void decode(const unsigned char * weights, __half * out, int64_t coun
     const int64_t j = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (j < count) out[j] = __float2half_rn(value(weights, j));
 }
-bool old_dot() { static const bool v = std::getenv("TQFN_OLD_Q2_DOT") != nullptr; return v; }  // A/B: one block per row
 void shape(const void * w, const void * x, const void * y, int rows, int cols, int n, int topk = 1) {
     if (!w || !x || !y || rows <= 0 || cols <= 0 || cols % 64 || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
         throw std::invalid_argument("GSQ Q2_0: invalid pointer, shape or grid");
@@ -206,21 +182,18 @@ void shape(const void * w, const void * x, const void * y, int rows, int cols, i
 }
 void gsq_q2_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, int n, cudaStream_t s) {
     shape(w, x, y, r, k, n);
-    if (old_dot()) dot<<<dim3(unsigned(r), unsigned(n)), 128, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
-    else dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
+    dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
 }
 void gsq_q2_matvec_f32(const void * w, const __half * x, float * y, int r, int k, int n, cudaStream_t s) {
     shape(w, x, y, r, k, n);
-    if (old_dot()) dot<<<dim3(unsigned(r), unsigned(n)), 128, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
-    else dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
+    dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
 }
 void gsq_q2_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k,
                           int experts, const int * ids, int n, int topk, bool per_expert, cudaStream_t s) {
     shape(w, x, y, r, k, n, topk);
     if (!ids || experts <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid expert dimensions");
-    if (old_dot()) dot<<<dim3(unsigned(r), unsigned(n * topk)), 128, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
-    else dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
 }
 void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, const int * counts, const int * groups,
                            int capacity, int experts, int topk, bool per_expert, cudaStream_t s) {

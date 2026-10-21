@@ -170,7 +170,6 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_F32_ROUTER` | off | the fp32 per-token router kernel instead of the BF16 GEMV / segmented launch |  |
 | `TQFN_GDN_CHUNK_MIN` | 64 | tokens from which GDN prefill uses the chunked (WY) kernel; 0 = off |  |
 | `TQFN_GDN_SEQ_FAST` | on | 0: the plain sequential GDN kernel instead of the fast pass at dim 128 |  |
-| `TQFN_GDN_VPW` | 8 | GDN value columns per warp |  |
 | `TQFN_GDN_WY` | on | 0: GDN chunked prefill without the WY form (A/B) |  |
 | `TQFN_GEMV_TILE` | 16 | router GEMV tile: 8, 16, 164 (16 x 4) or 32 (same output bits) |  |
 | `TQFN_LAYER_MAJOR` | on | 0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer) |  |
@@ -179,14 +178,9 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_MTP_LAYER_MAJOR` | on | 0: the MTP catch-up runs token-major instead of layer-major |  |
 | `TQFN_NO_LAYER_RESET` | off | keep the scratch arena across layers (A/B) |  |
 | `TQFN_NO_PREFETCH` | off | no predicted-expert prefetch in decode |  |
-| `TQFN_OLD_Q2_DOT` | off | GSQ Q2_0: one block per row in the dot kernel (A/B) |  |
-| `TQFN_PF_EVENTS` | off | the compute stream waits only for the prefetch copies of the slots it reads |  |
 | `TQFN_PF_K` | 6 | prefetch each token's K best predicted experts |  |
 | `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
-| `TQFN_CPU_OWNED_COLD` | off | N: with TQFN_CPU_OWNED_PROFILE, the CPU pool owns each layer's N least-routed experts |  |
-| `TQFN_CPU_OWNED_PROFILE` | off | routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD |  |
 | `TQFN_DRAFT_TAU` | 0.9 (PCIe, np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); PCIe cards with one sequence default to 0.9 and up to 5 drafts; 0 = off |  |
-| `TQFN_PF_CHUNK_KB` | off | K: prefetch DMAs in K KB chunks (A/B) |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
 | `TQFN_TQ_AHEAD` | off | K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
@@ -201,7 +195,6 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_QSA_CHECK` | off | QSA selection: compare the top-k select with a full sort (raises on any difference) |  |
 | `TQFN_QSA_SPLIT` | 16 | slices per decode QSA attention row; 0 or 1 = direct attention |  |
 | `TQFN_ROUND32` | - | diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none) |  |
-| `TQFN_ROUTER_GEMM` | off | 1: router as an fp32 cuBLAS GEMM (faster; its summation order can flip near-tie routing) |  |
 | `TQFN_ROUTE_DUMP` | - | FILE: append routed expert ids per trunk layer call |  |
 | `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
 | `TQFN_WAVE_GEMM_AVG` | - | average tokens per expert from which prefill waves use the grouped GEMM |  |
@@ -295,3 +288,10 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_U4H` | - | removed | removed |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
 | `TQLLM_MOE_DEV` | - | removed | nothing: qwen35moe (MoE) models load by default |
+| `TQFN_GDN_VPW` | - | removed | fixed behaviour (8 value columns per warp, bit-identical) |
+| `TQFN_OLD_Q2_DOT` | - | removed | fixed behaviour (warp-per-row GSQ Q2_0 dot) |
+| `TQFN_PF_EVENTS` | - | removed | fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33) |
+| `TQFN_CPU_OWNED_COLD` | - | removed | removed (profile-owned cold experts lost on the 3090); TQFN_CPU_OWNED stays |
+| `TQFN_CPU_OWNED_PROFILE` | - | removed | removed with TQFN_CPU_OWNED_COLD |
+| `TQFN_PF_CHUNK_KB` | - | removed | fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090) |
+| `TQFN_ROUTER_GEMM` | - | removed | fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing) |
