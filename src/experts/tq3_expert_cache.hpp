@@ -90,6 +90,7 @@ public:
     // the slots set so far become each layer's target; a bank built while the free memory cannot hold the target gets the
     // largest count that fits, not below floor[layer]
     void set_layer_tiers(const std::vector<int> & floor);
+    int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
     int regrow(size_t keep_free);  // releases banks built below their target while the free memory holds the target (+ keep_free)
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;

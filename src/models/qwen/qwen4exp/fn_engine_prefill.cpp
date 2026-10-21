@@ -160,7 +160,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         ops.lru_layers = [this] { return f_.cache->banks_lru(); };
         ops.bank_bytes = [this](int l) { return f_.cache->bank_bytes(l); };
         ops.release = [this](int l) { f_.cache->release_bank(l); };
-        ops.refill = [this](int l) { auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it != m.pf_refill.end()) f_.cache->prepare(l, it->second); };
+        ops.refill = [this](int l) {  // each layer's most-routed experts, as many as its rebuilt bank holds
+            auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it == m.pf_refill.end()) return;
+            auto top = it->second; top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         const auto ev = S().ledger_->borrow(plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count); S().plan_catchup_bytes_ = plan.catchup_peak;

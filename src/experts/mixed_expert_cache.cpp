@@ -63,8 +63,12 @@ struct MixedExpertCache::State {
         if (!per) { layer_cap[size_t(layer)] = target; return; }
         { cudaMemPool_t pool; if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0); }
         size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
-        const size_t margin = size_t(256) << 20, fit = fr > margin ? (fr - margin) / per : 0;
-        layer_cap[size_t(layer)] = fit >= size_t(target) ? target : std::max(floor, int(fit));
+        // the free memory is shared evenly by every layer still without its bank (a refill after a long prompt): the
+        // first banks refilled must not take their target and leave the last ones none
+        size_t share = per;
+        for (int l = 0; l < layers; ++l) if (l != layer && !banks.count(l) && saved_piece.count(l)) share += slot_bytes(l);
+        const size_t margin = size_t(256) << 20, fit = fr > margin ? (fr - margin) / share : 0;
+        layer_cap[size_t(layer)] = int(std::clamp<size_t>(fit, size_t(floor), size_t(target)));
     }
     size_t budget, live = 0, peak = 0;
     Source source;
@@ -171,14 +175,16 @@ struct MixedExpertCache::State {
     }
     std::unique_ptr<Bank> create(int layer, const std::array<ExpertPayload, 3> & sample) {
         auto bank = std::make_unique<Bank>(*this, cap_of(layer)); const int capacity = bank->cap;
-        // a layer whose bank existed before at this size: its layout is known, so the bank is just device memory (no zero
-        // payload repacked on the CPU and uploaded); every slot starts empty and is written before it is read
-        if (const auto c = saved_cap.find(layer); c != saved_cap.end() && c->second == capacity) {
+        // a layer whose bank existed before: its per-slot layout is known, so the bank is just device memory at any slot
+        // count (no zero payload repacked on the CPU and uploaded: a slot tier refill at a new size took 4.8 s instead of
+        // 0.76 s); every slot starts empty and is written before it is read
+        if (const auto c = saved_cap.find(layer); c != saved_cap.end() && c->second > 0) {
+            const int saved = c->second;
             const auto & sm = saved_mat.at(layer); const auto & sp = saved_piece.at(layer); const auto & st = saved_type.at(layer);
             for (int p = 0; p < 3; ++p) {
                 bank->types[p] = st[size_t(p)]; bank->raw_stride[p] = sample[p].bytes.size;
                 bank->stride[p] = sp[size_t(2 * p)]; bank->aux_stride[p] = sp[size_t(2 * p + 1)];
-                Mat m = sm[size_t(p)];
+                Mat m = sm[size_t(p)]; m.rows = m.rows / saved * capacity;
                 m.p = upload(nullptr, bank->stride[p] * size_t(capacity), bank->memory, layer);
                 m.aux = bank->aux_stride[p] ? upload(nullptr, bank->aux_stride[p] * size_t(capacity), bank->memory, layer) : nullptr;
                 bank->matrices[p] = m;
@@ -526,6 +532,10 @@ void MixedExpertCache::set_layer_tiers(const std::vector<int> & floor) {
     if (s.layer_cap.empty()) s.layer_cap.assign(size_t(s.layers), s.capacity);
     s.layer_target = s.layer_cap; s.layer_floor = floor;
     for (int l = 0; l < s.layers; ++l) s.layer_floor[size_t(l)] = std::clamp(floor[size_t(l)], 1, s.layer_target[size_t(l)]);
+}
+int MixedExpertCache::plan_slots(int layer) {
+    auto & s = *state_; if (!s.banks.count(layer)) s.choose_cap(layer);
+    return s.cap_of(layer);
 }
 int MixedExpertCache::regrow(size_t keep_free) {
     auto & s = *state_; if (s.layer_target.empty()) return 0;

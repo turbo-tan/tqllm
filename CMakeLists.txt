@@ -271,6 +271,11 @@ if(TQLLM_CUDA)
   target_link_libraries(test-mixed-expert-cache PRIVATE tqllm CUDA::cudart)
   add_test(NAME mixed_expert_cache COMMAND test-mixed-expert-cache)
   set_tests_properties(mixed_expert_cache PROPERTIES RUN_SERIAL TRUE)  # fills the device to test a prefetch with no room
+  add_executable(test-expert-slot-tiers tests/expert_slot_tiers.cu)
+  target_include_directories(test-expert-slot-tiers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/experts)
+  target_link_libraries(test-expert-slot-tiers PRIVATE tqllm CUDA::cudart)
+  add_test(NAME expert_slot_tiers COMMAND test-expert-slot-tiers)
+  set_tests_properties(expert_slot_tiers PROPERTIES RUN_SERIAL TRUE)  # fills the device
   add_executable(test-tune-host-pointer tests/tune_host_pointer.cu)
   target_include_directories(test-tune-host-pointer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight)
   target_link_libraries(test-tune-host-pointer PRIVATE tqllm CUDA::cudart)

@@ -208,9 +208,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               const size_t fr = tqllm::device_free_bytes() + f.cache->stats().device_bytes;
               const int tier_a = std::min(f.slots, tqllm::auto_expert_slots(fr, state + reserve + (size_t(256) << 20) + extra, per, c.experts));
               std::vector<int> floor(size_t(c.layers));
-              for (int l = 0; l < c.layers; ++l) floor[size_t(l)] = slot_floor(f.cache->slots(l), tier_a, f.slots);
+              for (int l = 0; l < c.layers; ++l) floor[size_t(l)] = slot_floor(f.cache->slots(l), 0, f.slots);  // the F39-safe minimum
               f.cache->set_layer_tiers(floor);
-              std::fprintf(stderr, "tqllm: expert slots: %d per layer, at least %d while a long prompt's state needs the room\n", f.slots, tier_a);
+              std::fprintf(stderr, "tqllm: expert slots: %d per layer (%d with a full context's state kept; a long prompt's layers share what is free)\n", f.slots, tier_a);
           }
       }
       // TQFN_EXPERT_PROFILE=FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
