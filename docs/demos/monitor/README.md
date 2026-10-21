@@ -10,7 +10,7 @@ The animation is a 20-second preview; the MP4 shows the full walkthrough at its 
 
 ![Completed request](completed.png)
 
-[Light-theme screenshot](light.png).
+[Live-prefill screenshot](../../assets/monitor-prefill.png) / [Light-theme screenshot](light.png).
 
 ## Try it
 

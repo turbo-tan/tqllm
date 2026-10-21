@@ -7,7 +7,7 @@
   "hostname_blurred": true,
   "page_errors": [],
   "prompt_characters": 38389,
-  "duration_seconds": 49.72,
+  "duration_seconds": 49.84,
   "preview_seconds": 20,
   "model_file": "Qwen3.8-27B-TQ4_L.gguf",
   "gpu": "RTX 3090",
@@ -15,6 +15,7 @@
   "ubatch": 512,
   "temperature": 0,
   "drafter": false,
-  "source_commit": "ce4ce2a",
-  "note": "Real requests and telemetry. Captions and hostname blur only; not a speed benchmark."
+  "source_commit": "f913655",
+  "note": "Real requests and telemetry. Captions and hostname blur only; not a speed benchmark.",
+  "rates_together": true
 }

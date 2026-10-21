@@ -20,7 +20,7 @@ Watch prefill, output rates and hardware use in one view. Both rates stay in the
 same request card. Open `http://localhost:8086/` or `/monitor` on the API port.
 No frontend build, extra service or second port is required.
 
-![Live prefill in the tqLLM monitor](docs/assets/monitor-prefill.png)
+![Prefill and output rates together in the tqLLM monitor](docs/demos/monitor/completed.png)
 
 <details>
 <summary>Watch the 50-second monitor walkthrough</summary>
