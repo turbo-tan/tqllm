@@ -388,6 +388,29 @@ Speed with the drafter follows how often its guesses are accepted. Summaries of 
 of the drafted tokens; reasoning text accepts more, and the LocalMaxxing reasoning prompt runs at 256 tok/s (median of
 3) on the RTX 3090 with the same files.
 
+### Qwen3.8-Flash-Next (125B, 6B active) on one RTX 3090
+
+The routed experts live in system RAM; the GPU keeps a cache of expert slots, misses go over PCIe by the copy engine and
+the next layer's experts are prefetched while the current one runs. Native MTP drafts up to 5 tokens per step and
+stops drafting when the draft is unsure; the output is identical to a fixed 3-token draft (greedy).
+
+Same session, same file ([ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
+IQ3_S) on both engines, RTX 3090 24 GB, greedy; [Strata](https://github.com/Niko1221/Strata) 0.2.0 with `--spec 4`:
+
+| | tqLLM | Strata 0.2.0 |
+|---|---:|---:|
+| Time to first token, 32K prompt | 14.16 s | 15.07 s |
+| Time to first token, 64K | 28.04 s | 29.39 s |
+| Time to first token, 128K | 56.47 s | 58.48 s |
+| Decode after 32K, tok/s | 76.8 | 72.8 |
+| Decode after 64K | 78.9 | 63.3 |
+| Decode after 128K | 65.9 | 46.9 |
+| Short chats (5 x 512 tokens, each a fresh server's first request) | 88.9 | 92.0 |
+
+Several users at once (`--np` up to 8) give the same text as one user alone. Run it from a manifest (`.tqfn`, one
+`key=value` per line: `gguf=` per shard, `mtp=`, `experts=` (from `tqfn-pack`), `draft_vocab=`, `slots=auto`) with
+`tqserve --model FILE.tqfn --tokenizer TOKENIZER.gguf`.
+
 ### Reproduce
 
 ```sh

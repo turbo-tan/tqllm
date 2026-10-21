@@ -30,6 +30,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Native Anthropic Messages API (`POST /v1/messages`, plus `/v1/messages/count_tokens`): Claude Code connects straight
   to the server (`ANTHROPIC_BASE_URL`). `tqllm launch codex` / `claude` now point the agent at the server directly.
 
+- Flash-Next adaptive draft length (default for one sequence): up to 5 MTP drafts per step, drafting stops once the
+  draft's top probability is below 0.9 (`TQFN_DRAFT_TAU`, 0 = off). Greedy output identical to a fixed 3-token draft;
+  RTX 3090 chats +1.5 %, decode after 32K +3 %; GB10 decode after 32K +4.4 %.
+- `tools/rc_gate.py`: release-candidate gate (an old and a new build on one GPU: identical greedy text per setting, a
+  decode-loss limit, and `--np N` answers equal to `--np 1`).
+
 ### Changed
 - Monitor: aligned accessible icon controls, keyboard/IME handling, stable request focus, non-disruptive streaming scroll and retryable errors. Trusted panel extensions have isolated snapshots, a contributor guide and Chromium/Firefox/WebKit CI coverage.
 - `tqllm launch`: `--max-tokens` default 8192 -> 32768 (an agent's reasoning used up 8192 before it wrote the file); the
@@ -59,7 +65,20 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Source tree: one folder per component and per model architecture (`AGENTS.md` has the map and the layering rules,
   enforced by test-layering); `tools/dev/relayout.py` moves a branch onto the new layout.
 
+- CUDA builds use the per-thread default stream (no legacy stream): stream 0 no longer synchronizes with every other
+  blocking stream, and decode work can be captured into CUDA graphs. Output identical; 27B and Flash-Next speed unchanged.
+- Retired A/B switches (setting one stops the tool and names the replacement): `TQFN_PF_EVENTS`, `TQFN_ROUTER_GEMM`,
+  `TQFN_OLD_Q2_DOT`, `TQFN_GDN_VPW`, `TQFN_PF_CHUNK_KB`, `TQFN_CPU_OWNED_COLD` / `_PROFILE`, `TQFN_TQ_AHEAD`.
+
 ### Fixed
+- Flash-Next on an RTX 3090 (PCIe): long generations could stop with "unspecified launch failure" (GPU front-end
+  Xid 11 / 32 / 69): expert misses read pinned host memory by kernel beside the compute stream. Misses now go by the copy
+  engine straight into their slots; GB10 keeps kernel reads (it never faulted). Three 55-72K-token pagoda runs clean.
+- Flash-Next `--np N`: answers differed from `--np 1` (F39). A multi-sequence verify block passed the slot count by
+  assignments and took the expert path that sums the down projection in another order; it now takes the same path as one
+  sequence whenever its distinct experts fit. `--np` 2 / 4 / 8 identical to `--np 1` (RTX 3090 and GB10).
+- Flash-Next `slots=auto` with `--np 4` at 32K ran out of memory in the second request's state: the fit kept room for one
+  sequence's attention / recurrent / MTP state; it keeps it for every sequence (F38).
 - The answer streams when the request carries tool schemas: `StreamWriter` sent no content deltas until the end whenever
   `tools` was non-empty, so agent clients saw the thinking live and then the whole answer at once. Prose before the first
   tool-call marker now streams, and a tail that could still become a marker is held back. Found and fixed by Andrew Zhu
