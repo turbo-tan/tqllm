@@ -1110,6 +1110,30 @@ flags:
     kind: debug
     default: "off"
     doc: "1: keep the layer-major buffers and staging halves across requests"
+  - name: TQFN_CPU_OWNED_COLD
+    kind: debug
+    default: "off"
+    doc: "N: with TQFN_CPU_OWNED_PROFILE, the CPU pool owns each layer's N least-routed experts"
+  - name: TQFN_CPU_OWNED_PROFILE
+    kind: debug
+    default: "off"
+    doc: "routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD"
+  - name: TQFN_DRAFT_TAU
+    kind: debug
+    default: "off"
+    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged)"
+  - name: TQFN_PF_CHUNK_KB
+    kind: debug
+    default: "off"
+    doc: "K: prefetch DMAs in K KB chunks (A/B)"
+  - name: TQFN_PREDICT_N
+    kind: debug
+    default: "4"
+    doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
+  - name: TQFN_TQ_AHEAD
+    kind: debug
+    default: "off"
+    doc: "K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses"
   - name: TQFN_PF_MMQ_CHECK
     kind: debug
     default: "0"

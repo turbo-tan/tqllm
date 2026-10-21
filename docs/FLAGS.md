@@ -183,6 +183,12 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_PF_EVENTS` | off | the compute stream waits only for the prefetch copies of the slots it reads |  |
 | `TQFN_PF_K` | 6 | prefetch each token's K best predicted experts |  |
 | `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
+| `TQFN_CPU_OWNED_COLD` | off | N: with TQFN_CPU_OWNED_PROFILE, the CPU pool owns each layer's N least-routed experts |  |
+| `TQFN_CPU_OWNED_PROFILE` | off | routed-count profile (int32 [layers + 1][experts]) for TQFN_CPU_OWNED_COLD |  |
+| `TQFN_DRAFT_TAU` | off | t: stop MTP drafting once the last draft's top probability is below t (text unchanged) |  |
+| `TQFN_PF_CHUNK_KB` | off | K: prefetch DMAs in K KB chunks (A/B) |  |
+| `TQFN_PREDICT_N` | 4 | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
+| `TQFN_TQ_AHEAD` | off | K: TQConsumer prefetch queue, at most K expert copies submitted after the demand misses |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
 | `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
 | `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
