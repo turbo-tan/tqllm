@@ -399,15 +399,16 @@ IQ3_S) on both engines, RTX 3090 24 GB, greedy; [Strata](https://github.com/Niko
 
 | | tqLLM | Strata 0.2.0 |
 |---|---:|---:|
-| Time to first token, 32K prompt | 14.16 s | 15.07 s |
-| Time to first token, 64K | 28.04 s | 29.39 s |
-| Time to first token, 128K | 56.47 s | 58.48 s |
-| Decode after 32K, tok/s | 76.8 | 72.8 |
-| Decode after 64K | 78.9 | 63.3 |
-| Decode after 128K | 65.9 | 46.9 |
-| Short chats (5 x 512 tokens, each a fresh server's first request) | 88.9 | 92.0 |
+| Short chats (5 x 512 tokens, each a fresh server's first request), tok/s | 91.6 | 91.1 |
+| Time to first token, short chat | 0.32-0.41 s | 1.06-1.25 s |
+| Time to first token, 32K prompt | 14.98 s | 15.16 s |
+| Time to first token, 64K | 28.01 s | 29.36 s |
+| Time to first token, 128K | 56.53 s | 58.25 s |
+| Decode after 32K, tok/s | 76.4 | 72.4 |
+| Decode after 64K | 85.1 | 63.7 |
+| Decode after 128K | 77.1 | 47.5 |
 
-Several users at once (`--np` up to 8) give the same text as one user alone. Run it from a manifest (`.tqfn`, one
+On a warm server the same five chats run at 95.6 tok/s. Several users at once (`--np` up to 8) give the same text as one user alone. Run it from a manifest (`.tqfn`, one
 `key=value` per line: `gguf=` per shard, `mtp=`, `experts=` (from `tqfn-pack`), `draft_vocab=`, `slots=auto`) with
 `tqserve --model FILE.tqfn --tokenizer TOKENIZER.gguf`.
 

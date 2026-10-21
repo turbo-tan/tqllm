@@ -33,6 +33,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Flash-Next adaptive draft length (default for one sequence): up to 5 MTP drafts per step, drafting stops once the
   draft's top probability is below 0.9 (`TQFN_DRAFT_TAU`, 0 = off). Greedy output identical to a fixed 3-token draft;
   RTX 3090 chats +1.5 %, decode after 32K +3 %; GB10 decode after 32K +4.4 %.
+- Flash-Next CUDA graphs (default on PCIe GPUs; GB10 keeps eager launches): each decode layer's attention part is
+  replayed from a graph shared by every layer of its kind. RTX 3090 warm chats 92.1 -> 94.1 tok/s, output identical.
+- Flash-Next expert slot tiers (one sequence, `slots=auto`): the banks keep only the decode reserve free (144 -> 157
+  slots per layer on a 3090); a long prompt borrows banks for its state, the banks refilled after it share the free
+  memory evenly (never below a 64-slot floor), and they grow back at the next request. RTX 3090 warm chats 94.2 ->
+  100.4 tok/s, decode after 32K 67.3 -> 71.2, after 64K 63.3 -> 69.3; text identical, `--np 2/4/8` unchanged.
 - `tools/rc_gate.py`: release-candidate gate (an old and a new build on one GPU: identical greedy text per setting, a
   decode-loss limit, and `--np N` answers equal to `--np 1`).
 
