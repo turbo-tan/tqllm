@@ -58,7 +58,11 @@ void fn_norm_rope(const float * x, const float * weight, float * out, int heads,
                   int tokens, int position, int rotary, float theta, float epsilon, bool interleaved, cudaStream_t);
 // Correctness path below the indexer's budget; refuses longer contexts instead of omitting QSA.
 void fn_dense_attention(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
-                        float * out, int heads, int kvheads, int dim, int tokens, int position, cudaStream_t);
+                        float * out, int heads, int kvheads, int dim, int tokens, int position, cudaStream_t,
+                        float * workspace = nullptr);
+// floats of split workspace fn_dense_attention uses (0: none); a caller's workspace keeps the call free of allocations
+// (capturable: a cudaMallocAsync in a CUDA graph becomes graph-owned memory mapped at every launch)
+size_t fn_dense_attention_workspace(int heads, int dim, int tokens, int position);
 void fn_attention_gate(float * out, const float * query_gate, int heads, int dim, int tokens, cudaStream_t);
 // Decode elementwise ops (device-resident step): routed SwiGLU BF16 -> FP16, shared SwiGLU F32, and
 // out[t] = sum_k w[t][k] * routed[t][k] + shared_w[t] * shared[t].

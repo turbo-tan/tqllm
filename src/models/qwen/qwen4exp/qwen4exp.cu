@@ -1214,8 +1214,14 @@ void fn_norm_rope(const float * x, const float * weight, float * out, int heads,
         throw std::invalid_argument("Flash-Next norm/RoPE: invalid shape, position, pointer or epsilon");
     fn_norm_rope_k<<<heads * n, 32, 0, s>>>(x, weight, out, heads, dim, pos, rot, theta, eps, interleaved ? 2 : 1);
 }
+size_t fn_dense_attention_workspace(int heads, int dim, int n, int pos) {
+    if (heads <= 0 || dim <= 0 || n <= 0 || pos < 0 || dim % 32 || dim > 256) return 0;
+    const int chunk = 128, max_splits = (pos + n + chunk - 1) / chunk;
+    const size_t per_query = size_t(heads) * max_splits * (dim + 2);
+    return std::max<size_t>(1, std::min<size_t>(size_t(n), (size_t(64) << 20) / (per_query * sizeof(float)))) * per_query;
+}
 void fn_dense_attention(const float * q, const __nv_bfloat16 * k, const __nv_bfloat16 * v, float * out,
-                        int heads, int kvheads, int dim, int n, int pos, cudaStream_t s) {
+                        int heads, int kvheads, int dim, int n, int pos, cudaStream_t s, float * workspace) {
     if (heads <= 0 || heads > 65535 || kvheads <= 0 || heads % kvheads || dim <= 0 || dim > 256 || n <= 0 ||
         pos < 0 || int64_t(pos) + n > (1 << 20) || !q || !k || !v || !out || out == q)
         throw std::invalid_argument("Flash-Next dense attention: invalid shape or context exceeds QSA budget");
@@ -1224,8 +1230,8 @@ void fn_dense_attention(const float * q, const __nv_bfloat16 * k, const __nv_bfl
         // queries in blocks so the split workspace stays <= 64 MB (each block is the same causal call at pos + b)
         const size_t per_query = size_t(heads) * max_splits * (dim + 2) * sizeof(float);
         const int block = int(std::max<size_t>(1, std::min<size_t>(size_t(n), (size_t(64) << 20) / per_query)));
-        float * part = nullptr;
-        if (cudaMallocAsync(reinterpret_cast<void **>(&part), size_t(block) * per_query, s) != cudaSuccess)
+        float * part = workspace;
+        if (!part && cudaMallocAsync(reinterpret_cast<void **>(&part), size_t(block) * per_query, s) != cudaSuccess)
             throw std::runtime_error("Flash-Next attention: workspace allocation failed");
         for (int b = 0; b < n; b += block) {
             const int nb = std::min(block, n - b), splits = (pos + b + nb + chunk - 1) / chunk;
@@ -1233,7 +1239,7 @@ void fn_dense_attention(const float * q, const __nv_bfloat16 * k, const __nv_bfl
             fn_attention_split_k<<<dim3(heads, nb, splits), 256, (chunk + 8 * dim) * sizeof(float), s>>>(qb, k, v, part, heads, kvheads, dim, pos + b, chunk, splits);
             fn_attention_merge_k<<<dim3(heads, nb), 128, 0, s>>>(part, ob, heads, dim, splits);
         }
-        cudaFreeAsync(part, s);
+        if (!workspace) cudaFreeAsync(part, s);
         return;
     }
     fn_attention_k<<<dim3(heads, n), 128, (pos + n) * sizeof(float), s>>>(q, k, v, out, heads, kvheads, dim, pos);

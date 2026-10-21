@@ -216,9 +216,15 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                 }
                 kv_fmt().attend_selected(att);
             }
-        } else tqllm_cuda::fn_dense_attention(q.p, carry->k->p, carry->v->p, out.p, heads, kvheads, dim, n, pos, nullptr);
+        } else {
+            Device<float> ws(tqllm_cuda::fn_dense_attention_workspace(heads, dim, n, pos));
+            tqllm_cuda::fn_dense_attention(q.p, carry->k->p, carry->v->p, out.p, heads, kvheads, dim, n, pos, nullptr, ws.p);
+        }
         carry->len += n;
-    } else tqllm_cuda::fn_dense_attention(q.p, kb.p, vb.p, out.p, heads, kvheads, dim, n, 0, nullptr);
+    } else {
+        Device<float> ws(tqllm_cuda::fn_dense_attention_workspace(heads, dim, n, 0));
+        tqllm_cuda::fn_dense_attention(q.p, kb.p, vb.p, out.p, heads, kvheads, dim, n, 0, nullptr, ws.p);
+    }
     if (fixtures && fixtures->has("attn_pregate" + suffix))
         compare("attention_causal_output" + suffix, out.get(), fixtures->values("attn_pregate" + suffix), .02);
     if (raw_out) return;

@@ -14,13 +14,17 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     // ~45 small kernels back to back without launch gaps (3090: 1.2 vs 2.1 us per kernel) and capturing costs the host less
     // than launching. One sequence only (the multi-slot path interleaves per-sequence state).
     static const bool graph_on = std::getenv("TQFN_GRAPH") != nullptr;
-    struct GraphKey { const void * model; int layer, n; bool operator<(const GraphKey & o) const { return std::tie(model, layer, n) < std::tie(o.model, o.layer, o.n); } };
-    static std::map<GraphKey, std::pair<cudaGraphExec_t, int>> graphs;  // exec, calls seen
-    const GraphKey gkey{this, layer, n};
+    // Every step updates all kernel parameters (weights included), so layers of one kind share an exec, keyed by its
+    // topology: the node count changes with the position in attention layers and with the draft in the MTP layer.
+    // One exec per layer and variant (~11 x 49) held ~1.3 GB the expert banks had taken (out of memory on a 3090).
+    struct GraphKey { const void * model; int kind, n; size_t nodes; bool operator<(const GraphKey & o) const { return std::tie(model, kind, n, nodes) < std::tie(o.model, o.kind, o.n, o.nodes); } };
+    static std::map<GraphKey, int> calls;  // kind = layer here: calls 1-2 of each layer run plain
+    struct GraphSlot { cudaGraphExec_t exec = nullptr; cudaEvent_t done = nullptr; };
+    static std::map<GraphKey, std::vector<GraphSlot>> graphs;
+    const GraphKey gkey{this, layer, n, 0};
     bool capturing = false;
     if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
-        auto & g = graphs[gkey];
-        if (++g.second > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
+        if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];
     Device<float> norm(size_t(width) * n), mixed(size_t(h) * n), inject(size_t(c.hc) * n), block(size_t(h) * n), combined(size_t(width) * n);
@@ -162,14 +166,23 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         cudaGraph_t cg = nullptr;
         const cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &cg);
         if (e != cudaSuccess || !cg) throw std::runtime_error(std::string("TQFN_GRAPH: capture of layer ") + std::to_string(layer) + " failed: " + cudaGetErrorString(e));
-        auto & exec = graphs[gkey].first;
-        if (exec) {
+        size_t nodes = 0; ck(cudaGraphGetNodes(cg, nullptr, &nodes));
+        const bool ple = trunk && ple_rows && std::find(c.ple_layers.begin(), c.ple_layers.end(), layer) != c.ple_layers.end();
+        const int kind = !trunk ? -1 : (attention ? 2 * c.compress_ratios[layer] : 0) + ple;
+        // an exec still queued on the GPU (another layer's launch) is not updated: each shape keeps a few, one per launch in flight
+        auto & pool = graphs[GraphKey{this, kind, n, nodes}];
+        GraphSlot * slot = nullptr;
+        for (auto & g : pool) if (cudaEventQuery(g.done) == cudaSuccess) { slot = &g; break; }
+        if (!slot && pool.size() < 8) { pool.push_back({}); slot = &pool.back(); ck(cudaEventCreateWithFlags(&slot->done, cudaEventDisableTiming)); }
+        if (!slot) { slot = &pool.front(); ck(cudaEventSynchronize(slot->done)); }
+        if (slot->exec) {
             cudaGraphExecUpdateResultInfo info;
-            if (cudaGraphExecUpdate(exec, cg, &info) != cudaSuccess) { cudaGetLastError(); ck(cudaGraphExecDestroy(exec)); exec = nullptr; }
+            if (cudaGraphExecUpdate(slot->exec, cg, &info) != cudaSuccess) { cudaGetLastError(); ck(cudaGraphExecDestroy(slot->exec)); slot->exec = nullptr; }
         }
-        if (!exec) ck(cudaGraphInstantiate(&exec, cg, 0));
+        if (!slot->exec) ck(cudaGraphInstantiate(&slot->exec, cg, 0));
         ck(cudaGraphDestroy(cg));
-        ck(cudaGraphLaunch(exec, cudaStreamPerThread));
+        ck(cudaGraphLaunch(slot->exec, cudaStreamPerThread));
+        ck(cudaEventRecord(slot->done, cudaStreamPerThread));
     }
     using clk = std::chrono::steady_clock; auto h0 = clk::now();
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
