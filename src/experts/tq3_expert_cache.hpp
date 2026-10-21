@@ -87,6 +87,10 @@ public:
     int slots() const;           // the largest layer's slots
     int slots(int layer) const;
     void set_layer_slots(const std::vector<int> & per_layer);  // before the first prepare; same total bytes is the caller's choice
+    // the slots set so far become each layer's target; a bank built while the free memory cannot hold the target gets the
+    // largest count that fits, not below floor[layer]
+    void set_layer_tiers(const std::vector<int> & floor);
+    int regrow(size_t keep_free);  // releases banks built below their target while the free memory holds the target (+ keep_free)
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;
     bool has_layout(int layer) const;  // a bank existed once: bank_layout / bank_mat answer without one (no device pointers)

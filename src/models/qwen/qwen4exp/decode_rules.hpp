@@ -2,6 +2,7 @@
 // Flash-Next decode decisions that change exactness or memory, as pure functions (no CUDA) so tests/decode_rules.cpp can
 // check them on any machine.
 #include <algorithm>
+#include <cstdint>
 #include <cstddef>
 #include <vector>
 
@@ -28,9 +29,13 @@ inline size_t auto_keep_bytes(size_t sequences, size_t state, size_t reserve) {
     if (sequences <= 1) return reserve + (size_t(256) << 20);
     return sequences * state + reserve + sequences * (size_t(256) << 20);
 }
-// Free device memory the bank refill after a prefill leaves: the decode's lazy state (MTP and recurrent rollback
-// buffers, scratch) is allocated after it (a refill to the last megabyte left 75 MB and the decode ran out of memory).
-inline constexpr size_t kRefillKeepBytes = size_t(512) << 20;
+// A layer's slot floor (tier A) from its target: scaled like the slot total (tier_a of tier_b per layer on average), and
+// never below 64: a 6-row verify block routes to at most 60 distinct experts, so layer_takes_waves keeps the split path at
+// every bank size (F39) and the text does not depend on how much a long prompt took.
+inline int slot_floor(int target, int tier_a, int tier_b) {
+    if (tier_b <= 0 || target <= 0) return target;
+    return std::min(target, std::max(64, int(int64_t(target) * tier_a / tier_b)));
+}
 
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }

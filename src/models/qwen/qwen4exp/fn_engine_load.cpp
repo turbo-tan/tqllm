@@ -202,6 +202,16 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               if (after >= need || f.slots <= 1) break;
               extra += need - after;
           }
+          // tier A (the floor a bank never drops below): the slots a full-context state leaves, as with one sequence's whole
+          // state kept free; tier B (the target) is what the smaller keep allows (decode_rules.hpp auto_keep_bytes)
+          if (nseq == 1 && !keep_env && !g_small_card) {
+              const size_t fr = tqllm::device_free_bytes() + f.cache->stats().device_bytes;
+              const int tier_a = std::min(f.slots, tqllm::auto_expert_slots(fr, state + reserve + (size_t(256) << 20) + extra, per, c.experts));
+              std::vector<int> floor(size_t(c.layers));
+              for (int l = 0; l < c.layers; ++l) floor[size_t(l)] = slot_floor(f.cache->slots(l), tier_a, f.slots);
+              f.cache->set_layer_tiers(floor);
+              std::fprintf(stderr, "tqllm: expert slots: %d per layer, at least %d while a long prompt's state needs the room\n", f.slots, tier_a);
+          }
       }
       // TQFN_EXPERT_PROFILE=FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
       // layer's most-routed experts instead of what the synthetic warm-up prompt happened to route (the first request

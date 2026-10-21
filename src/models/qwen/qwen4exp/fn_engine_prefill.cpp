@@ -1,6 +1,5 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "fn_engine.hpp"
-#include "decode_rules.hpp"
 
 namespace tqllm::flashnext {
 
@@ -20,10 +19,11 @@ void FlashNextEngine::refill_borrowed() {
     using pclk = std::chrono::steady_clock; const auto r0 = pclk::now();
     const size_t all = led->borrowed_total();
     if (led->state() == tqllm::BankLedger::State::Borrowed) led->buffers_released();
-    // stop while 512 MB is still free (decode_rules.hpp): a refill to the last megabyte left the first decode step's bank
-    // upload 88 MiB (12 GB, 16K prompt in 2 x 10240) and the 3090's decode state 75 MB: the rest come back as misses
+    // small cards: stop while the warm-up's keep (512 MB) is still free; a refill to the last megabyte left the first
+    // decode step's bank upload 88 MiB (12 GB, 16K prompt in 2 x 10240): the rest come back as ordinary misses. With slot
+    // tiers each refilled bank is sized to what is free (MixedExpertCache choose_cap keeps 256 MB).
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
-    const int done = led->refill(tqllm::flashnext::kRefillKeepBytes); cudaGetLastError();
+    const int done = led->refill(g_small_card ? size_t(512) << 20 : 0); cudaGetLastError();
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     S().model_->pf_refill.clear(); led.reset();
@@ -39,6 +39,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
     S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
+    // banks a long prompt left below their slot target grow back once its state is gone (a prompt that needs the room
+    // borrows them again below)
+    if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
         if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }

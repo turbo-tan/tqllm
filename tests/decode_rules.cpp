@@ -32,6 +32,13 @@ int main() {
     check(auto_keep_bytes(1, state, reserve) == reserve + (size_t(256) << 20), "one sequence keeps the reserve only (long prompts borrow banks)");
     check(auto_keep_bytes(2, state, reserve) >= 2 * state, "several sequences keep every state");
 
+    // slot tiers: the floor scales with the slot total, never exceeds the target, never drops below 64 (F39: a 6-row verify
+    // routes to at most 60 distinct experts, so the split path holds at every bank size)
+    check(slot_floor(157, 144, 157) == 144 && slot_floor(247, 144, 157) == 226, "floor scales each layer's target like the total");
+    check(slot_floor(70, 40, 157) == 64 && slot_floor(50, 40, 157) == 50, "floor never below 64, never above the target");
+    std::vector<int> verify6; for (int i = 0; i < 60; ++i) verify6.push_back(i);
+    check(!layer_takes_waves(verify6, 6, topk, slot_floor(101, 144, 157), true), "6-row verify keeps the split path at the floor");
+
     // adaptive drafts
     check(keep_drafting(0.f, 0.01f), "tau 0: fixed draft count");
     check(keep_drafting(0.9f, 0.95f) && !keep_drafting(0.9f, 0.5f), "tau 0.9: stop below, continue at or above");

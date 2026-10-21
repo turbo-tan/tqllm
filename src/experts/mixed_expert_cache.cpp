@@ -48,6 +48,24 @@ struct MixedExpertCache::State {
     int layers, experts, hidden, ff, capacity, active = -1;
     std::vector<int> layer_cap;  // per-layer slots (TQFN_LAYER_SLOTS); empty: capacity for every layer
     int cap_of(int layer) const { return layer_cap.empty() ? capacity : layer_cap[size_t(layer)]; }
+    // Two slot tiers (set_layer_tiers): a layer's bank is built at its target when the free memory holds it, else at the
+    // largest count that fits but never below its floor, instead of evicting other layers' whole banks (a long prompt's
+    // attention state left two layers without room: each step their bank evicted another layer's, 67 -> 4.9 tok/s).
+    std::vector<int> layer_target, layer_floor;
+    size_t slot_bytes(int layer) const {
+        const auto it = saved_piece.find(layer); if (it == saved_piece.end()) return 0;
+        size_t b = 0; for (size_t x : it->second) b += x; return b;
+    }
+    void choose_cap(int layer) {
+        if (layer_target.empty() || layer_cap.empty()) return;
+        const int target = layer_target[size_t(layer)], floor = layer_floor[size_t(layer)];
+        const size_t per = slot_bytes(layer);
+        if (!per) { layer_cap[size_t(layer)] = target; return; }
+        { cudaMemPool_t pool; if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0); }
+        size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+        const size_t margin = size_t(256) << 20, fit = fr > margin ? (fr - margin) / per : 0;
+        layer_cap[size_t(layer)] = fit >= size_t(target) ? target : std::max(floor, int(fit));
+    }
     size_t budget, live = 0, peak = 0;
     Source source;
     cudaStream_t stream;
@@ -215,6 +233,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     }
     std::sort(needed.begin(), needed.end());  // same order as the former std::set: same slot assignment
     auto is_needed = [&](int e) { return e >= 0 && s.mark[e] == s.gen; };
+    if (!s.banks.count(layer)) s.choose_cap(layer);
     if (needed.size() > size_t(s.cap_of(layer))) throw std::invalid_argument("mixed cache: active set exceeds slots");
     if (s.miss_stream && s.active >= 0) {
         auto & prev = *s.banks.at(s.active);
@@ -500,6 +519,26 @@ void MixedExpertCache::set_layer_slots(const std::vector<int> & caps) {
     if (int(caps.size()) != s.layers) throw std::invalid_argument("mixed cache: per-layer slots need one count per layer");
     for (int c : caps) if (c <= 0 || c > s.experts) throw std::invalid_argument("mixed cache: per-layer slot count out of range");
     s.layer_cap = caps;
+}
+void MixedExpertCache::set_layer_tiers(const std::vector<int> & floor) {
+    auto & s = *state_;
+    if (int(floor.size()) != s.layers) throw std::invalid_argument("mixed cache: slot tiers need one floor per layer");
+    if (s.layer_cap.empty()) s.layer_cap.assign(size_t(s.layers), s.capacity);
+    s.layer_target = s.layer_cap; s.layer_floor = floor;
+    for (int l = 0; l < s.layers; ++l) s.layer_floor[size_t(l)] = std::clamp(floor[size_t(l)], 1, s.layer_target[size_t(l)]);
+}
+int MixedExpertCache::regrow(size_t keep_free) {
+    auto & s = *state_; if (s.layer_target.empty()) return 0;
+    int n = 0;
+    for (int l = 0; l < s.layers; ++l) {
+        const auto it = s.banks.find(l);
+        if (it == s.banks.end() || it->second->cap >= s.layer_target[size_t(l)]) continue;
+        size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+        const size_t grow = size_t(s.layer_target[size_t(l)] - it->second->cap) * s.slot_bytes(l);
+        if (fr < keep_free + grow) break;
+        release_bank(l); ++n;  // rebuilt at its target by the next prepare (choose_cap)
+    }
+    return n;
 }
 int MixedExpertCache::experts() const { return state_->experts; }
 int MixedExpertCache::layers() const { return state_->layers; }
