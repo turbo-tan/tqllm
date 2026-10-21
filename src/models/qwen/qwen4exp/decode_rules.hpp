@@ -19,11 +19,18 @@ inline bool layer_takes_waves(const std::vector<int> & routed, int n, int topk, 
     return std::unique(u.begin(), u.end()) - u.begin() > slots;
 }
 
-// Device bytes slots=auto keeps free beside the expert banks: every sequence (--np) holds its own full-context attention /
-// recurrent / MTP state and 256 MB of working room; sized for one sequence, np 4 at 32K ran out of memory (F38).
+// Device bytes slots=auto keeps free beside the expert banks. One sequence keeps only the decode reserve and 256 MB of
+// working room: a long prompt borrows banks for its attention state and the refill after it stops short of the last
+// 512 MB (keeping its full-context state free cost 3090 chats ~16 slots per layer, 85.9 vs 95.7 tok/s at 140 vs 157).
+// Several sequences (--np) each keep their own full-context attention / recurrent / MTP state and working room: sized
+// for one, np 4 at 32K ran out of memory (F38).
 inline size_t auto_keep_bytes(size_t sequences, size_t state, size_t reserve) {
+    if (sequences <= 1) return reserve + (size_t(256) << 20);
     return sequences * state + reserve + sequences * (size_t(256) << 20);
 }
+// Free device memory the bank refill after a prefill leaves: the decode's lazy state (MTP and recurrent rollback
+// buffers, scratch) is allocated after it (a refill to the last megabyte left 75 MB and the decode ran out of memory).
+inline constexpr size_t kRefillKeepBytes = size_t(512) << 20;
 
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }

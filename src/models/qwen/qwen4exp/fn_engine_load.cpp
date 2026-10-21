@@ -242,8 +242,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
         const size_t fr = tqllm::device_free_bytes();
-        if (fr < state + reserve && (std::getenv("TQFN_AUTO_KEEP_MB") || g_small_card)) {
-            std::fprintf(stderr, "tqllm: TQFN_AUTO_KEEP_MB: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
+        // slots=auto with one sequence keeps only the reserve on purpose (decode_rules.hpp auto_keep_bytes): long prompts borrow
+        if (fr < state + reserve && (std::getenv("TQFN_AUTO_KEEP_MB") || g_small_card || (f.slots_auto && slots_.size() == 1))) {
+            std::fprintf(stderr, "tqllm: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
         } else if (fr < state + reserve) {
             const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
             const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;

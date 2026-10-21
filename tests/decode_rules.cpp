@@ -27,9 +27,10 @@ int main() {
 
     // F38: the keep grows with every sequence
     const size_t state = size_t(900) << 20, reserve = size_t(1200) << 20;
-    check(auto_keep_bytes(4, state, reserve) - auto_keep_bytes(1, state, reserve) == 3 * (state + (size_t(256) << 20)),
+    check(auto_keep_bytes(4, state, reserve) - auto_keep_bytes(2, state, reserve) == 2 * (state + (size_t(256) << 20)),
           "slots=auto keeps each extra sequence's state and working room");
-    check(auto_keep_bytes(1, state, reserve) == state + reserve + (size_t(256) << 20), "one sequence keeps one state");
+    check(auto_keep_bytes(1, state, reserve) == reserve + (size_t(256) << 20), "one sequence keeps the reserve only (long prompts borrow banks)");
+    check(auto_keep_bytes(2, state, reserve) >= 2 * state, "several sequences keep every state");
 
     // adaptive drafts
     check(keep_drafting(0.f, 0.01f), "tau 0: fixed draft count");
