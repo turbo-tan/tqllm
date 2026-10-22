@@ -93,5 +93,23 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 // discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
 // keeps every expert resident and needs no pack.
 inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu) { return !has_pack_file && !integrated_gpu; }
+// Prefill chunk: the engine's --prefill-chunk setting (default 16384), whether or not the manifest names one; the
+// manifest value counts only when that setting is off. A manifest without chunk= once prefilled in chunks of 8 (32K: 263 s).
+inline int prefill_chunk(int tune_chunk, int manifest_chunk) { return tune_chunk > 0 ? tune_chunk : manifest_chunk; }
+// Byte cap of the expert banks. slots=auto sizes the banks from free device memory itself, so its cap is the device; a
+// fixed budget_gb (taken from one card) capped a GB10's 512 resident slots at 18 GB and evicted layers mid-prompt.
+inline size_t bank_budget_bytes(bool slots_auto, double budget_gb, size_t device_total) {
+    return slots_auto ? device_total : size_t(budget_gb * 1024.0 * 1024.0 * 1024.0);
+}
+// Per-layer expert slots from a plan (counts per layer, any scale): scaled to slots x layers, each in [1, experts].
+// When every expert fits (slots >= experts, e.g. a GB10) the plan is a cache plan for smaller cards: every layer keeps all.
+inline std::vector<int> scale_layer_slots(std::vector<int> caps, int slots, int experts) {
+    if (slots >= experts) return std::vector<int>(caps.size(), experts);
+    long total = 0; for (int c : caps) total += c;
+    const long want = long(slots) * long(caps.size());
+    if (total != want && total > 0)
+        for (int & c : caps) c = std::max(1, std::min(experts, int(double(c) * double(want) / double(total) + 0.5)));
+    return caps;
+}
 
 }  // namespace tqllm::flashnext

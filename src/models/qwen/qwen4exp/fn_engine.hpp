@@ -1,7 +1,8 @@
 #pragma once
 // Flash-Next behind the tqllm Engine interface (tqserve). The model is a manifest file NAME.tqfn of key=value lines:
 //   gguf=<shard> (one line per shard, in order), mtp=<MTP gguf>, experts=<packed experts>, draft_vocab=<file>,
-//   slots=176, budget_gb=18, drafts=3, chunk=8, gsq_rco=1
+//   optional overrides: slots=N|auto (default auto: sized from the device), budget_gb (fixed slots only), drafts=3,
+//   chunk (--prefill-chunk wins), gsq_rco=1, layer_slots=<per-layer routing plan, scaled to the slots>
 // One slot, greedy MTP speculative decoding (exact: tokens identical to plain greedy). A fresh DecodeModel per request
 // resets the recurrent, PLE, attention and MTP state; the expert caches persist across requests.
 #include "fn_model.hpp"

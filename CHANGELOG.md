@@ -3,6 +3,18 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.2.2 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next on GB10 / DGX Spark with the Hugging Face manifest: every request failed ("mixed cache: active set
+  exceeds slots"). The manifest's 3090 cache plan and its 18 GB bank cap no longer limit a device that holds every
+  expert: with `slots=auto` (now the default) the engine sizes the expert cache and its cap from the device at start-up.
+- A Flash-Next manifest without `chunk=` prefilled in chunks of 8 tokens (a 32K prompt took 263 s instead of 15 s). The
+  prefill chunk is now always the engine's setting (`--prefill-chunk`, 16384). For about 30 minutes on 22 Oct the
+  Hugging Face manifest lacked that line, which made long prompts slow on 1.2.1; it is restored.
+- Releases are now gated by running the Hugging Face card's commands verbatim on an RTX 3090 and a GB10 (health, known
+  answers, a 27K-token prompt).
+
 ## 1.2.1 (2026-10-22)
 
 ### Fixed

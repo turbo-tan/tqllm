@@ -13,6 +13,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
+    bool slots_given = false;
     for (std::string line; std::getline(in, line);) {
         if (line.empty() || line[0] == '#') continue;
         const auto eq = line.find('='); require(eq != std::string::npos, "manifest line without '=': " + line);
@@ -20,12 +21,14 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         if (k == "gguf") f.ggufs.push_back(resolve(v)); else if (k == "mtp") f.mtp = resolve(v);
         else if (k == "experts") f.experts = resolve(v); else if (k == "draft_vocab") f.draft_vocab = resolve(v);
         else if (k == "layer_slots") f.layer_slots = v;
-        else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? kAutoStartSlots : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
-        else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = g_tune.chunk > 0 ? g_tune.chunk : std::stoi(v);  // --prefill-chunk (16384) over the manifest
+        else if (k == "slots") { slots_given = true; f.slots_auto = v == "auto"; f.slots = f.slots_auto ? kAutoStartSlots : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
+        else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = std::stoi(v);
         else if (k == "gsq_rco") f.gsq_rco = v != "0";
         else throw std::runtime_error("unknown Flash-Next manifest key " + k);
     }
     require(!f.ggufs.empty() && !f.mtp.empty(), "manifest needs gguf and mtp lines");
+    if (!slots_given) { f.slots_auto = true; f.slots = kAutoStartSlots; }  // sized from the device at start-up
+    f.chunk = prefill_chunk(g_tune.chunk, f.chunk);  // --prefill-chunk (16384) over the manifest, also when it has none
     if (!f.draft_vocab.empty()) setenv("TQFN_DRAFT_VOCAB", f.draft_vocab.c_str(), 1);
     g_kv_capacity = int(context);  // per slot
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); uint64_t keep = UINT64_MAX;
@@ -71,7 +74,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         // 256 experts stage as two even slices of 128 (192 + 64 at the default): 325 MB less staging, the same slice count
         if (!g_tune.stage_set) g_tune.stage = std::min(g_tune.stage, 128);
     }
-    f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, size_t(f.budget_gb * 1024 * 1024 * 1024),
+    size_t device_total = 0; (void) tqllm::device_free_bytes(&device_total);
+    f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with

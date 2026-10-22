@@ -9,6 +9,7 @@
 #include "prefill_plan.hpp"
 #include "kv_store.hpp"
 #include "kv_format.hpp"
+#include "decode_rules.hpp"
 #include "qwen4exp.hpp"
 #include "dequant.hpp"
 #include "moe_kernels.cuh"
@@ -62,10 +63,7 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     if (text.empty()) return;
     std::vector<int> caps; size_t at = 0;
     while (at <= text.size()) { const size_t e = std::min(text.find(',', at), text.size()); caps.push_back(std::stoi(text.substr(at, e - at))); at = e + 1; }
-    long total = 0; for (int c : caps) total += c;
-    const long want = long(slots) * long(caps.size());
-    if (total != want && total > 0)
-        for (int & c : caps) c = std::max(1, std::min(cache.experts(), int(std::lround(double(c) * double(want) / double(total)))));
+    caps = tqllm::flashnext::scale_layer_slots(caps, slots, cache.experts());
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }

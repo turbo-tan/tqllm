@@ -17,7 +17,7 @@ with an OpenAI-compatible HTTP server.
 **New: Qwen3.8-Flash-Next (125B MoE, 6B active) on one RTX 3090.** Against Strata 0.2.2 on the same card, file and
 session: decode 1.63x after a 128K prompt (77.1 against 47.2 tok/s), 1.34x after 64K, first token sooner at every
 length, and up to 8 users at once with the same text as one. [Details](docs/BENCHMARKS.md#qwen38-flash-next-125b-6b-active-on-one-rtx-3090).
-Run it with image 1.2.1 or newer: [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
+Run it with image 1.2.2 or newer (RTX 30 or newer with 24 GB, or a GB10): [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
 GGUF plus a few small files; 24 GB GPU, 64 GB RAM or more; an optional 50.9 GB pack file gives full decode speed).
 
 ## See what your model is doing

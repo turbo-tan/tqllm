@@ -87,6 +87,17 @@ int main() {
     check(!build_pack_in_memory(true, false), "a pack file is used as given");
     check(!build_pack_in_memory(false, true) && !build_pack_in_memory(true, true) == true, "GB10 (integrated): no pack built");
 
+    {   // the HF manifest's 3090 plan on a GB10 (512 slots = every expert): no layer below 512
+        const std::vector<int> plan{314, 291, 269, 160, 189, 219, 248, 239, 208, 135, 212, 160, 128, 145};
+        const auto all = scale_layer_slots(plan, 512, 512);
+        check(*std::min_element(all.begin(), all.end()) == 512, "every expert fits: each layer keeps all experts");
+        const auto some = scale_layer_slots(plan, 200, 512); long sum = 0; for (int c : some) sum += c;
+        check(std::abs(sum - 200L * long(plan.size())) <= long(plan.size()) && some[0] > some[9], "smaller card: plan scaled to the budget, shape kept");
+    }
+    check(bank_budget_bytes(true, 18.0, size_t(120) << 30) == size_t(120) << 30, "slots=auto: banks capped by the device, not budget_gb");
+    check(bank_budget_bytes(false, 18.0, size_t(120) << 30) == size_t(18) << 30, "fixed slots: budget_gb as given");
+    check(prefill_chunk(16384, 8) == 16384 && prefill_chunk(16384, 8192) == 16384, "prefill chunk: the engine setting, manifest key or not");
+    check(prefill_chunk(0, 8192) == 8192, "prefill chunk: the manifest value only when the setting is off");
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }
