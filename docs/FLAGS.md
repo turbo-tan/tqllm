@@ -18,7 +18,6 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |
 | `TQFN_ARENA_MB` | - | MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit) |  |
 | `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off) |  |
-| `TQFN_CPU_OWNED` | small cards 1, else 0 | K: K eighths of every layer's experts are computed by the CPU pool whether or not they are resident, so the CPU / GPU split and the greedy text do not depend on what earlier requests left in the cache (0: non-resident experts go to the pool, history-dependent) |  |
 | `TQFN_DRAFT_VOCAB` | - | FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab) |  |
 | `TQFN_KV` | - | KV format for Flash-Next attention (name from the KV format registry; default bf16) |  |
 | `TQFN_KV_HOST` | off | 1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM, slower decode at long context) |  |
@@ -288,10 +287,11 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_U4H` | - | removed | removed |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
 | `TQLLM_MOE_DEV` | - | removed | nothing: qwen35moe (MoE) models load by default |
+| `TQFN_CPU_OWNED` | - | removed | removed: the fixed CPU-owned eighth cost 12 GB decode 2-4 tok/s (ec0cf00 47.9 / 49.1 vs 49.7 / 51.0 without); the CPU pool serves non-resident experts |
 | `TQFN_GDN_VPW` | - | removed | fixed behaviour (8 value columns per warp, bit-identical) |
 | `TQFN_OLD_Q2_DOT` | - | removed | fixed behaviour (warp-per-row GSQ Q2_0 dot) |
 | `TQFN_PF_EVENTS` | - | removed | fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33) |
-| `TQFN_CPU_OWNED_COLD` | - | removed | removed (profile-owned cold experts lost on the 3090); TQFN_CPU_OWNED stays |
+| `TQFN_CPU_OWNED_COLD` | - | removed | removed (profile-owned cold experts lost on the 3090) |
 | `TQFN_CPU_OWNED_PROFILE` | - | removed | removed with TQFN_CPU_OWNED_COLD |
 | `TQFN_PF_CHUNK_KB` | - | removed | fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090) |
 | `TQFN_TQ_AHEAD` | - | removed | TQueue prefetch queue lives on branch tqllm/tqueue (not in the release) |

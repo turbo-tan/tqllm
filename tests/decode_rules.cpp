@@ -50,6 +50,16 @@ int main() {
     check(keep_drafting(0.9f, 0.95f) && !keep_drafting(0.9f, 0.5f), "tau 0.9: stop below, continue at or above");
     check(keep_drafting(0.9f, 0.9f), "tau 0.9: equal continues");
 
+    // one sequence's draft count: a verify block (drafts + 1 rows) must fit the CPU expert pool when there is one
+    for (int m : {1, 3, 5}) {
+        const DraftPlan small = one_sequence_drafts(m, true);
+        check(small.drafts + 1 <= kCpuPoolRows && !small.adaptive, "CPU pool: the verify block fits the pool's rows, fixed length");
+        check(small.drafts >= 1 && small.drafts <= m, "CPU pool: at least one draft, never more than the manifest's");
+    }
+    check(one_sequence_drafts(3, false).drafts == 5 && one_sequence_drafts(3, false).adaptive, "no CPU pool: adaptive, up to 5");
+    check(one_sequence_drafts(7, false).drafts == 7, "no CPU pool: a larger manifest count stays");
+    check(one_sequence_drafts(0, false).drafts == 0 && !one_sequence_drafts(0, true).adaptive, "no MTP: no drafts");
+
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

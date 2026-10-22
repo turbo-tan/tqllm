@@ -47,4 +47,17 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }
 
+// Rows a decode layer call may have for the CPU expert pool to serve its misses (its pinned input / output buffers).
+constexpr int kCpuPoolRows = 4;
+
+// One sequence's draft count. Without a CPU expert pool: adaptive length, up to 5 drafts (3090 chat +0.6 %, 32K +3 %).
+// With one (small cards): a verify block must fit the pool's rows, or every miss of the step goes over PCIe instead
+// (12 GB 3090: 5 drafts 44.8 / 44.6 tok/s, 3 drafts 49-50).
+struct DraftPlan { int drafts; bool adaptive; };
+inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool) {
+    if (manifest_drafts < 1) return {manifest_drafts, false};
+    if (cpu_pool) return {std::min(manifest_drafts, kCpuPoolRows - 1), false};
+    return {std::max(manifest_drafts, 5), true};
+}
+
 }  // namespace tqllm::flashnext

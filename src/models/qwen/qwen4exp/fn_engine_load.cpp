@@ -25,14 +25,6 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     require(!f.ggufs.empty() && !f.mtp.empty(), "manifest needs gguf and mtp lines");
     if (!f.draft_vocab.empty()) setenv("TQFN_DRAFT_VOCAB", f.draft_vocab.c_str(), 1);
-    // One sequence: adaptive draft length by default (up to 5 drafts, stop below a 0.9 draft probability, next-layer prediction
-    // for 6-token blocks): 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant).
-    // TQFN_DRAFT_TAU=0 turns it off; --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
-    if (const char * t = std::getenv("TQFN_DRAFT_TAU"); slots_.size() == 1 && f.drafts >= 1 && (!t || std::strtof(t, nullptr) > 0.f)) {
-        if (!t) setenv("TQFN_DRAFT_TAU", "0.9", 1);
-        if (!std::getenv("TQFN_PREDICT_N")) setenv("TQFN_PREDICT_N", "6", 1);
-        f.drafts = std::max(f.drafts, 5);
-    }
     g_kv_capacity = int(context);  // per slot
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); uint64_t keep = UINT64_MAX;
       ck(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep)); }
@@ -57,6 +49,18 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true;
     const auto & c = f.cp->config; auto & checkpoint = *f.cp;
     g_small_card = f.slots_auto && !f.experts.empty() && tqllm::device_free_bytes() < (size_t(16) << 30);
+    // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
+    // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
+    // cards: their CPU expert pool takes blocks of at most kCpuPoolRows rows (decode_rules.hpp one_sequence_drafts).
+    // TQFN_DRAFT_TAU=0 turns it off; --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
+    if (const char * t = std::getenv("TQFN_DRAFT_TAU"); slots_.size() == 1 && (!t || std::strtof(t, nullptr) > 0.f)) {
+        const DraftPlan plan = one_sequence_drafts(f.drafts, g_small_card);
+        f.drafts = plan.drafts;
+        if (plan.adaptive) {
+            if (!t) setenv("TQFN_DRAFT_TAU", "0.9", 1);
+            if (!std::getenv("TQFN_PREDICT_N")) setenv("TQFN_PREDICT_N", "6", 1);
+        }
+    }
     if (g_small_card) {
         // the dense fp16 cache holds one layer (measured high-water 119 MB on Flash-Next IQ3_S), not 600 MB
         if (!g_tune.dense_cache_set) g_tune.dense_cache_mb = std::min(g_tune.dense_cache_mb, 160L);
