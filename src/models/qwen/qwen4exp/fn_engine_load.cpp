@@ -84,7 +84,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     if (pack_in_memory) {  // no experts file: the same bytes, built from the GGUF (decode_rules.hpp build_pack_in_memory)
         const auto t0 = std::chrono::steady_clock::now();
         f.packed = build_packed(checkpoint, std::max(4, std::min(32, int(std::thread::hardware_concurrency()))));
-        checkpoint.release_pages();  // the GGUF page cache would otherwise sit beside the pinned pack
+        checkpoint.release_expert_pages();  // the expert pages would otherwise sit beside the pinned pack
         std::fprintf(stderr, "tqllm: packed experts built from the GGUF in memory: %.1f GB in %.0f s\n", f.packed.bytes / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
@@ -131,6 +131,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     PackedExperts * pk = &f.packed;
     f.cache->set_prepacked([pk](int layer, int id) -> const char * { return layer < pk->layers ? pk->at(layer, id) : nullptr; }, true);
+    }
+    {   // the per-layer token embedding is read at every token: cold pages cost each new token a disk wait (decode_rules.hpp)
+        const auto t0 = std::chrono::steady_clock::now();
+        if (const size_t n = checkpoint.warm_tensors(8))
+            std::fprintf(stderr, "tqllm: per-layer token embedding cached: %.1f GB in %.0f s\n", n / 1e9,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     // MTP experts prepacked in pinned memory
     // all experts resident (GB10): the MTP block's experts too, so its prefill catch-up can run whole chunks

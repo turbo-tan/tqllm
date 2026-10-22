@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next weights: the GGUF checkpoint, resident tensors and the dense projection dispatch; stage fixtures.
+#include "decode_rules.hpp"
 #include "fn_runtime.hpp"
 struct Stage { std::string file, name; size_t elements; std::vector<uint64_t> shape; };
 class Fixtures {
@@ -50,7 +51,12 @@ class Checkpoint {
     std::vector<std::unique_ptr<MappedGguf>> files_;
     std::map<std::string, size_t> owners_;
 public:
-    void release_pages() const { for (const auto & f : files_) f->release_pages(); }
+    // after the experts are in pinned memory: drop the trunk expert pages, keep every tensor read per token cached
+    void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
+    size_t warm_tensors(int threads) const {
+        size_t n = 0; for (const auto & [name, i] : owners_) if (tqllm::flashnext::warm_at_start(name)) n += files_[i]->warm_tensor(name, threads);
+        return n;
+    }
     Qwen4ExpConfig config;
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;
