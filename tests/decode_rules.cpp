@@ -82,6 +82,11 @@ int main() {
         check(bank_experts(cnt, 7, 1000, false).size() == size_t(512 - std::count(cnt.begin(), cnt.end(), 0)), "no pool: every routed expert");
     }
 
+    // packed experts without a pack file: built in memory on a discrete GPU, never on a GPU sharing system memory
+    check(build_pack_in_memory(false, false), "no pack file, discrete GPU: build the pack from the GGUF");
+    check(!build_pack_in_memory(true, false), "a pack file is used as given");
+    check(!build_pack_in_memory(false, true) && !build_pack_in_memory(true, true) == true, "GB10 (integrated): no pack built");
+
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

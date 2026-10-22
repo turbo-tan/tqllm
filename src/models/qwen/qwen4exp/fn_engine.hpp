@@ -10,6 +10,7 @@
 namespace tqllm::flashnext {
 struct FnServe {
     std::vector<std::string> ggufs; std::string mtp, experts, draft_vocab;
+    std::string layer_slots;  // manifest layer_slots=: per-layer expert slots when no experts file carries a .slots plan
     int slots = 176, drafts = 3, chunk = 8; double budget_gb = 18; bool gsq_rco = true, slots_auto = false;
     std::vector<std::string> arg_store; std::vector<char *> argv;
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
