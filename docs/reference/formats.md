@@ -25,6 +25,6 @@ rotated with the same 128-point rotation before the product. Dense matrices that
 stored in that rotated basis too: in the Qwen3.8 TQ_L file the 96 BF16 Gated DeltaNet `ssm_alpha` / `ssm_beta`
 matrices equal the original weights times the rotation (relative error 0.006 against a Q8_0 copy rotated the same way,
 1.42 unrotated). A reader that multiplies such a dense matrix by the plain input gets wrong recurrent gates: the Apple
-backend did, and its KL against the CUDA engine dropped from about 0.53 to the format's own error once fixed
-(2026-10-22). Rule for any reader (CPU paths, other backends, ports): in a TQ3 / TQ4 model, rotate the input of every
+backend did (2026-10-22): swapping only these two tensor families into a K-quant file reproduced its whole 0.53 KL gap
+against the CUDA engine. Rule for any reader (CPU paths, other backends, ports): in a TQ3 / TQ4 model, rotate the input of every
 matrix that shares an input with a TQ matrix, whatever its storage type.
