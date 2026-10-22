@@ -46,8 +46,8 @@ IQ3_S) on both engines, RTX 3090 24 GB, greedy; [Strata](https://github.com/Niko
 | Decode after 128K | 77.1 | 47.2 |
 
 On a warm server the same five chats run at 95.6 tok/s. Several users at once (`--np` up to 8) give the same text as one user alone. Run it from a manifest (`.tqfn`, one
-`key=value` per line: `gguf=` per shard, `mtp=`, `experts=` (from `tqfn-pack`), `draft_vocab=`, `slots=auto`) with
-`tqserve --model FILE.tqfn --tokenizer TOKENIZER.gguf`.
+`key=value` per line: `gguf=` per shard, `mtp=`, `draft_vocab=`; the engine sizes the expert cache on the device) with
+`tqserve --model FILE.tqfn --tokenizer TOKENIZER.gguf`. Ready-made files and steps: [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
 
 ### Reproduce
 
