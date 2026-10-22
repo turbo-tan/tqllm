@@ -1,4 +1,54 @@
-# AGENTS.md: how tqLLM is organised
+# AGENTS.md
+
+Two parts: **Setting tqLLM up for a user** (for coding agents asked to install and run tqLLM) and **How tqLLM is
+organised** (for anyone changing the code).
+
+## Setting tqLLM up for a user
+
+tqLLM is an OpenAI-compatible inference server for Qwen3.8 models on NVIDIA GPUs (RTX 30 / 40 / 50, GB10 / DGX
+Spark), Linux or Windows with WSL 2. Steps, in order:
+
+1. **Check the hardware.** Run `nvidia-smi` and note the GPU and its memory. Docker needs the NVIDIA Container
+   Toolkit (`docker run --rm --gpus all ubuntu nvidia-smi` must print the GPU).
+2. **Pick a model file** from [YTan2000/Qwen3.8-27B-TQ](https://huggingface.co/YTan2000/Qwen3.8-27B-TQ) by GPU memory:
+
+   | GPU memory | File | Size |
+   |---|---|---|
+   | 16 GB | `Qwen3.8-27B-TQ_XS.gguf` (most room for context) or `Qwen3.8-27B-TQ_S.gguf` | 11.85 / 12.55 GB |
+   | 16-24 GB | `Qwen3.8-27B-TQ_M.gguf` | 13.14 GB |
+   | 24 GB and GB10 | `Qwen3.8-27B-TQ_L.gguf` (closest to the original model) | 14.72 GB |
+
+   Also download the drafter and its vocabulary (exact speculative decoding: same output, faster):
+   ```bash
+   hf download YTan2000/Qwen3.8-27B-TQ Qwen3.8-27B-TQ_L.gguf drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
+     mtp-vocab/atx_65536.txt --local-dir models
+   ```
+3. **Run the server** (Docker, x86-64 and arm64 in one tag):
+   ```bash
+   docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" \
+     -e MODEL_FILE=/models/Qwen3.8-27B-TQ_L.gguf \
+     -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
+     -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
+     -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
+     ytan2000/tqllm:1.2.0
+   ```
+   The server fits the KV cache and context to the free memory by itself and prints what it chose. On a 16 GB GPU
+   use `-e CONTEXT=16384 -e KV_FORMAT=tq3`. Without Docker: build `tqserve` from source (README, "Build").
+4. **Check it.** `curl -s http://localhost:8086/health` must answer `{"status":"ok",...}`; then
+   ```bash
+   curl http://localhost:8086/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":64}'
+   ```
+5. **Connect the user's tools.** Any OpenAI-compatible client: base URL `http://localhost:8086/v1`, model `tqllm`, any
+   API key. Codex uses the Responses API (`wire_api = "responses"`). Or let the launcher start the server and the
+   agent together: `python3 tools/launch/tqllm.py launch opencode` (also `claude`, `codex`, `pi`, `dsh`;
+   `--list` shows the model catalog and downloads with a sha256 check).
+
+If it fails: no GPU in the container -> install the NVIDIA Container Toolkit; out of memory -> a smaller file or a
+smaller `CONTEXT`; a GPU older than RTX 30 is not supported. Qwen3.8 Flash-Next (125B MoE) on one 24 GB GPU needs
+extra files beside the GGUF; its setup guide is not published yet, so do not improvise one.
+
+## How tqLLM is organised
 
 Read this before adding or moving code. It applies to people and to coding agents alike.
 

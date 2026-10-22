@@ -28,7 +28,7 @@ docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" \
   -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
   -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
   -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-  ghcr.io/turbo-tan/tqllm:1.0.0
+  ghcr.io/turbo-tan/tqllm:1.2.0
 ```
 
 With Compose, set the same names: `DRAFT_NAME=drafters/Qwen3.8-27B-DFlash2-TQ3.gguf

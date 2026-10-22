@@ -63,6 +63,6 @@ base_url = "http://localhost:8086/v1"
 wire_api = "responses"
 ```
 
-- Needs a server with `/v1/responses`: a [native build](quickstart.md#native-build) of this repository. The 1.0.0 Docker image
-  predates it; the next image tag includes it.
+- Needs a server with `/v1/responses`: Docker image 1.2.0 or newer, or a [native build](quickstart.md#native-build) of
+  this repository.
 - Codex 0.16x no longer accepts `wire_api = "chat"`. Tested with Codex 0.162.1.
