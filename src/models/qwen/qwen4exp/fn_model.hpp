@@ -191,31 +191,6 @@ inline PackedExperts open_packed(const std::string & path) {
     void * m = ::mmap(nullptr, pe.bytes, PROT_READ, MAP_SHARED, fd, 0); ::close(fd);
     require(m != MAP_FAILED, "cannot map " + path); pe.map = static_cast<const char *>(m); return pe;
 }
-// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (tiled), without the file
-inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
-    const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
-    g_tile_experts = true;
-    uint64_t off = 0;
-    for (int l = 0; l < c.layers; ++l) {
-        const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
-        for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
-        pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
-    }
-    pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
-    std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
-    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
-        for (int64_t i; (i = next++) < total;) {
-            const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
-            for (int k = 0; k < 6; ++k) {
-                require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
-                std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
-            }
-        }
-    });
-    for (auto & t : pool) t.join();
-    pe.map = host; pe.tiled = true; return pe;
-}
 // u4h kernel id of each projection's device format (what the grouped kernels see), from one expert's load
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
     const auto & c = checkpoint.config; std::array<int, 3> ids{}; const auto payload = checkpoint.expert_payload(layer, 0);
@@ -256,4 +231,29 @@ inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpo
         }
     }
     return parts;
+}
+// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (tiled), without the file
+inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
+    const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
+    g_tile_experts = true;
+    uint64_t off = 0;
+    for (int l = 0; l < c.layers; ++l) {
+        const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
+        for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
+        pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
+    }
+    pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
+    std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
+    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
+        for (int64_t i; (i = next++) < total;) {
+            const int l = int(i / c.experts), e = int(i % c.experts);
+            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+            for (int k = 0; k < 6; ++k) {
+                require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
+                std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
+            }
+        }
+    });
+    for (auto & t : pool) t.join();
+    pe.map = host; pe.tiled = true; return pe;
 }
