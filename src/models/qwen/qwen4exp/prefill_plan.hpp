@@ -145,14 +145,18 @@ public:
 
     explicit BankLedger(Ops ops) : ops_(std::move(ops)) {}
 
-    // Releases banks for the plan; returns the layers released (prefill streams all of their experts).
-    std::vector<int> borrow(const PrefillPlan & plan, BorrowMode mode, int count = 0) {
+    // Releases banks for the plan; returns the layers released (prefill streams all of their experts). With mode All the
+    // layers that have no bank (released by regrow at the request start) join them: the refill after the prompt rebuilds
+    // every layer from one free-memory share, instead of some banks built mid-prompt at whatever the history left free
+    // (12 GB: the same 16K prompt twice gave different text).
+    std::vector<int> borrow(const PrefillPlan & plan, BorrowMode mode, int count = 0, const std::vector<int> & bankless = {}) {
         if (state_ != State::Idle && state_ != State::Refilled) throw std::logic_error("BankLedger::borrow: previous request not refilled");
         const auto lru = ops_.lru_layers();
         std::vector<size_t> bytes; for (int l : lru) bytes.push_back(ops_.bank_bytes(l));
         const int k = banks_to_borrow(plan, bytes, mode, count);
         borrowed_.assign(lru.begin(), lru.begin() + k); borrowed_bytes_ = 0;
         for (int l : borrowed_) { borrowed_bytes_ += ops_.bank_bytes(l); ops_.release(l); }
+        if (mode == BorrowMode::All) for (int l : bankless) if (!borrowed(l)) borrowed_.push_back(l);
         if (ops_.free_bytes() < plan.need)
             throw std::runtime_error("prefill plan: " + std::to_string(plan.need >> 20) + " MB needed, " +
                                      std::to_string(ops_.free_bytes() >> 20) + " MB free after releasing " + std::to_string(k) + " banks");

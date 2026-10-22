@@ -167,7 +167,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             auto top = it->second; top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
-        const auto ev = S().ledger_->borrow(plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count); S().plan_catchup_bytes_ = plan.catchup_peak;
+        std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
+        const auto ev = S().ledger_->borrow(plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
         g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
         S().model_->pf_borrowed.assign(size_t(c.layers), 0);
         for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;

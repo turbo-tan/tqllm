@@ -87,6 +87,17 @@ int main() {
         dev.held = 0; ledger.buffers_released();
         expect(ledger.refill() == 48 && dev.banks.size() == 48 && ledger.state() == BankLedger::State::Refilled, "after the release every bank refills");
     }
+    // 4b. borrow all with layers that have no bank (regrow released them): they join the refill, so every layer comes back
+    {
+        MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
+        dev.banks.erase(5); dev.banks.erase(9);
+        BankLedger ledger(dev.ops());
+        const auto plan = prefill_plan(s, tuning(32768), 30892, dev.free());
+        const auto got = ledger.borrow(plan, BorrowMode::All, 0, {5, 9});
+        expect(got.size() == 48 && ledger.borrowed(5) && ledger.borrowed(9), "borrow all: the bankless layers 5 and 9 join the 46 released");
+        ledger.buffers_released();
+        expect(ledger.refill() == 48 && dev.banks.size() == 48, "every layer has a bank after the refill (12 GB 16K a != b)");
+    }
     // 5. a refill that runs out of memory stops and reports how many came back; auto borrows the LRU banks first
     {
         MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
