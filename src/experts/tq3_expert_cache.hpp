@@ -89,7 +89,7 @@ public:
     void set_layer_slots(const std::vector<int> & per_layer);  // before the first prepare; same total bytes is the caller's choice
     // the slots set so far become each layer's target; a bank built while the free memory cannot hold the target gets the
     // largest count that fits, not below floor[layer]
-    void set_layer_tiers(const std::vector<int> & floor);
+    void set_layer_tiers(const std::vector<int> & floor, size_t keep_bytes = size_t(256) << 20);  // keep: left free beside the banks
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
     int regrow(size_t keep_free);  // releases banks built below their target while the free memory holds the target (+ keep_free)
     int experts() const; int layers() const;

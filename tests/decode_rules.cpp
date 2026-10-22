@@ -36,6 +36,10 @@ int main() {
     // routes to at most 60 distinct experts, so the split path holds at every bank size)
     check(slot_floor(157, 144, 157) == 144 && slot_floor(247, 144, 157) == 226, "floor scales each layer's target like the total");
     check(slot_floor(70, 40, 157) == 64 && slot_floor(50, 40, 157) == 50, "floor never below 64, never above the target");
+    check(verify_slot_min(5, 10) == 64 && verify_slot_min(3, 10) == 40, "verify floor: 6 rows x top-10 -> 64, 4 rows -> 40");
+    check(slot_floor(57, 0, 57, verify_slot_min(3, 10)) == 40, "small card: a 57-slot layer can share down to 40");
+    check(slot_tiers(1, false), "one sequence: slot tiers, small cards included (12 GB refill left 4 of 48 layers without a bank)");
+    check(!slot_tiers(4, false) && !slot_tiers(1, true), "np > 1 or a keep override: no tiers");
     std::vector<int> verify6; for (int i = 0; i < 60; ++i) verify6.push_back(i);
     check(!layer_takes_waves(verify6, 6, topk, slot_floor(101, 144, 157), true), "6-row verify keeps the split path at the floor");
 

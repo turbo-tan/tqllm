@@ -51,7 +51,7 @@ struct MixedExpertCache::State {
     // Two slot tiers (set_layer_tiers): a layer's bank is built at its target when the free memory holds it, else at the
     // largest count that fits but never below its floor, instead of evicting other layers' whole banks (a long prompt's
     // attention state left two layers without room: each step their bank evicted another layer's, 67 -> 4.9 tok/s).
-    std::vector<int> layer_target, layer_floor;
+    std::vector<int> layer_target, layer_floor; size_t tier_keep = size_t(256) << 20;
     std::vector<char> planned;  // plan_slots sized the layer's next bank: prepare builds it at that size (no second decision)
     size_t slot_bytes(int layer) const {
         const auto it = saved_piece.find(layer); if (it == saved_piece.end()) return 0;
@@ -69,7 +69,7 @@ struct MixedExpertCache::State {
         size_t share = per, pending = 1;
         for (int l = 0; l < layers; ++l) if (l != layer && !banks.count(l) && saved_piece.count(l)) { share += slot_bytes(l); ++pending; }
         // each bank's up to six allocations carry upload()'s 64 KB tail beside the slots
-        const size_t margin = (size_t(256) << 20) + pending * 6 * (size_t(64) << 10), fit = fr > margin ? (fr - margin) / share : 0;
+        const size_t margin = tier_keep + pending * 6 * (size_t(64) << 10), fit = fr > margin ? (fr - margin) / share : 0;
         layer_cap[size_t(layer)] = int(std::clamp<size_t>(fit, size_t(floor), size_t(target)));
     }
     size_t budget, live = 0, peak = 0;
@@ -529,8 +529,8 @@ void MixedExpertCache::set_layer_slots(const std::vector<int> & caps) {
     for (int c : caps) if (c <= 0 || c > s.experts) throw std::invalid_argument("mixed cache: per-layer slot count out of range");
     s.layer_cap = caps;
 }
-void MixedExpertCache::set_layer_tiers(const std::vector<int> & floor) {
-    auto & s = *state_;
+void MixedExpertCache::set_layer_tiers(const std::vector<int> & floor, size_t keep_bytes) {
+    auto & s = *state_; s.tier_keep = keep_bytes;
     if (int(floor.size()) != s.layers) throw std::invalid_argument("mixed cache: slot tiers need one floor per layer");
     if (s.layer_cap.empty()) s.layer_cap.assign(size_t(s.layers), s.capacity);
     s.layer_target = s.layer_cap; s.layer_floor = floor;

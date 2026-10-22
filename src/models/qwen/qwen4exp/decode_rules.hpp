@@ -29,13 +29,21 @@ inline size_t auto_keep_bytes(size_t sequences, size_t state, size_t reserve) {
     if (sequences <= 1) return reserve + (size_t(256) << 20);
     return sequences * state + reserve + sequences * (size_t(256) << 20);
 }
+// The fewest slots a bank keeps: every distinct expert of the largest verify block (drafts + 1 rows of topk), rounded up
+// to 8 (5 drafts x top-10: 64; a small card's 3 drafts: 40), so layer_takes_waves keeps the split path at every bank size.
+inline int verify_slot_min(int drafts, int topk) { return ((std::max(drafts, 0) + 1) * topk + 7) / 8 * 8; }
+
 // A layer's slot floor (tier A) from its target: scaled like the slot total (tier_a of tier_b per layer on average), and
-// never below 64: a 6-row verify block routes to at most 60 distinct experts, so layer_takes_waves keeps the split path at
-// every bank size (F39) and the text does not depend on how much a long prompt took.
-inline int slot_floor(int target, int tier_a, int tier_b) {
+// never below min_slots (verify_slot_min, F39), so the text does not depend on how much a long prompt took.
+inline int slot_floor(int target, int tier_a, int tier_b, int min_slots = 64) {
     if (tier_b <= 0 || target <= 0) return target;
-    return std::min(target, std::max(64, int(int64_t(target) * tier_a / tier_b)));
+    return std::min(target, std::max(min_slots, int(int64_t(target) * tier_a / tier_b)));
 }
+
+// Slot tiers (a bank sized to what is free, the free memory shared by every layer a refill rebuilds) for one sequence,
+// small cards included: without them a 12 GB refill after a 16K prompt rebuilt full banks down to its keep and left 4 of
+// 48 layers without one (every expert of those layers a PCIe miss: decode 9.5 tok/s instead of ~48).
+inline bool slot_tiers(size_t sequences, bool keep_override) { return sequences == 1 && !keep_override; }
 
 // What regrow() at a request's start keeps free: the base room plus the request's own state, scaled from one sequence's
 // full-context state (a long request after a long request keeps the smaller banks instead of rebuilding them unchanged).

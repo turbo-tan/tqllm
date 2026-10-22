@@ -208,12 +208,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           }
           // tier A (the floor a bank never drops below): the slots a full-context state leaves, as with one sequence's whole
           // state kept free; tier B (the target) is what the smaller keep allows (decode_rules.hpp auto_keep_bytes)
-          if (nseq == 1 && !keep_env && !g_small_card) {
+          if (slot_tiers(nseq, keep_env != nullptr)) {
               const size_t fr = tqllm::device_free_bytes() + f.cache->stats().device_bytes;
               const int tier_a = std::min(f.slots, tqllm::auto_expert_slots(fr, state + reserve + (size_t(256) << 20) + extra, per, c.experts));
               std::vector<int> floor(size_t(c.layers));
-              for (int l = 0; l < c.layers; ++l) floor[size_t(l)] = slot_floor(f.cache->slots(l), 0, f.slots);  // the F39-safe minimum
-              f.cache->set_layer_tiers(floor);
+              for (int l = 0; l < c.layers; ++l) floor[size_t(l)] = slot_floor(f.cache->slots(l), 0, f.slots, verify_slot_min(f.drafts, c.topk));  // the F39-safe minimum
+              f.cache->set_layer_tiers(floor, g_small_card ? size_t(512) << 20 : size_t(256) << 20);  // small cards: the refill's keep
               std::fprintf(stderr, "tqllm: expert slots: %d per layer (%d with a full context's state kept; a long prompt's layers share what is free)\n", f.slots, tier_a);
           }
       }
