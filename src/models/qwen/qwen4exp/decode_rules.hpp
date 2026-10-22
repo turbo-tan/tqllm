@@ -68,4 +68,24 @@ inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool) {
     return {std::max(manifest_drafts, 5), true};
 }
 
+// CPU-owned experts (small cards, F26): a fixed eighth of each layer's experts, a pure function of (layer, expert), runs
+// on the CPU expert pool and is kept out of the GPU banks; every other expert runs on the GPU, resident or not. Which
+// device computes an expert (AVX2 fp32 dots vs the GPU kernels: last-bit differences that flip a near-tie) then does not
+// depend on what is resident, and neither does the greedy text (12 GB: the pool computing whatever missed made the same
+// 16K prompt twice differ). Owned experts in the banks only took slots decode never used (ec0cf00: -2 tok/s).
+inline bool cpu_owned(int layer, int expert) { return (uint32_t(expert) * 2654435761u + uint32_t(layer) * 40503u) >> 29 == 0; }
+inline bool runs_on_cpu(int layer, int expert, bool resident, bool pool_serves_call) {
+    (void) resident;
+    return pool_serves_call && cpu_owned(layer, expert);
+}
+// The experts a layer's bank is built with: the most routed first (ties by id), at most cap, owned experts left out when
+// a CPU pool computes them.
+inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int layer, size_t cap, bool cpu_pool) {
+    std::vector<int> top;
+    for (int e = 0; e < int(routed_count.size()); ++e) if (routed_count[size_t(e)] && !(cpu_pool && cpu_owned(layer, e))) top.push_back(e);
+    std::stable_sort(top.begin(), top.end(), [&](int a, int b) { return routed_count[size_t(a)] > routed_count[size_t(b)]; });
+    if (top.size() > cap) top.resize(cap);
+    return top;
+}
+
 }  // namespace tqllm::flashnext

@@ -75,6 +75,7 @@ inline int g_kv_capacity = 2048;
 // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
 // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
 inline bool g_small_card = false;
+inline bool g_cpu_owned = false;  // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
 
 using namespace tqllm;
 inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = __builtin_LINE()) {

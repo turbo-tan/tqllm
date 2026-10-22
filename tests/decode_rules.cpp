@@ -64,6 +64,24 @@ int main() {
     check(one_sequence_drafts(7, false).drafts == 7, "no CPU pool: a larger manifest count stays");
     check(one_sequence_drafts(0, false).drafts == 0 && !one_sequence_drafts(0, true).adaptive, "no MTP: no drafts");
 
+    // CPU-owned experts: the device an expert runs on does not depend on residency (F26), owned experts stay out of banks
+    {
+        int owned = 0, same = 1;
+        for (int l = 0; l < 48; ++l) for (int e = 0; e < 512; ++e) {
+            owned += cpu_owned(l, e);
+            same &= runs_on_cpu(l, e, true, true) == runs_on_cpu(l, e, false, true);
+            same &= !runs_on_cpu(l, e, false, false);
+        }
+        check(same != 0, "an expert runs on the same device whether it is resident or not; no pool: always the GPU");
+        check(owned > 48 * 512 / 8 * 9 / 10 && owned < 48 * 512 / 8 * 11 / 10, "about an eighth of the experts are owned");
+        std::vector<int> cnt(512, 0); for (int e = 0; e < 512; ++e) cnt[size_t(e)] = (e * 37) % 11;
+        const auto top = bank_experts(cnt, 7, 57, true); bool clean = top.size() == 57;
+        for (int e : top) clean &= !cpu_owned(7, e) && cnt[size_t(e)] > 0;
+        for (size_t i = 1; i < top.size(); ++i) clean &= cnt[size_t(top[i - 1])] >= cnt[size_t(top[i])];
+        check(clean, "a bank's experts: most routed first, no owned expert when the pool computes them");
+        check(bank_experts(cnt, 7, 1000, false).size() == size_t(512 - std::count(cnt.begin(), cnt.end(), 0)), "no pool: every routed expert");
+    }
+
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

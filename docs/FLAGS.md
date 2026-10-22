@@ -287,7 +287,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_U4H` | - | removed | removed |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
 | `TQLLM_MOE_DEV` | - | removed | nothing: qwen35moe (MoE) models load by default |
-| `TQFN_CPU_OWNED` | - | removed | removed: the fixed CPU-owned eighth cost 12 GB decode 2-4 tok/s (ec0cf00 47.9 / 49.1 vs 49.7 / 51.0 without); the CPU pool serves non-resident experts |
+| `TQFN_CPU_OWNED` | - | removed | removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks |
 | `TQFN_GDN_VPW` | - | removed | fixed behaviour (8 value columns per warp, bit-identical) |
 | `TQFN_OLD_Q2_DOT` | - | removed | fixed behaviour (warp-per-row GSQ Q2_0 dot) |
 | `TQFN_PF_EVENTS` | - | removed | fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33) |

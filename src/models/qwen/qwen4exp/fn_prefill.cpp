@@ -1,5 +1,6 @@
 // Flash-Next layer-major prefill: dense sub-chunks, then the routed experts once per layer from the expert banks and the staged groups.
 #include "fn_model.hpp"
+#include "decode_rules.hpp"
 
 std::vector<int> DecodeModel::stage_plan(const MixedExpertCache & cache, int layer) {
     std::vector<int> plan; const bool bank = cache.bank_ready(layer);
@@ -128,17 +129,13 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     std::vector<int> cnt(size_t(E), 0); for (int a = 0; a < A; ++a) ++cnt[size_t(ids[a])];
     const bool borrowed = size_t(layer) < pf_borrowed.size() && pf_borrowed[size_t(layer)] && cache.has_layout(layer);
     if (!cache.bank_ready(layer) && borrowed) {  // every routed expert from staging; refilled right after the prompt
-        { std::vector<int> top; for (int e = 0; e < E; ++e) if (cnt[size_t(e)]) top.push_back(e);
-          std::stable_sort(top.begin(), top.end(), [&](int a, int b) { return cnt[size_t(a)] > cnt[size_t(b)]; });
-          top.resize(std::min(top.size(), size_t(cache.slots(layer)))); pf_refill[layer] = top; }  // most routed first: the refill keeps what its bank holds
+        pf_refill[layer] = tqllm::flashnext::bank_experts(cnt, layer, size_t(cache.slots(layer)), g_cpu_owned);  // most routed first: the refill keeps what its bank holds
         size_t off[6]; const auto lay = cache.bank_layout(layer); stage_offsets(lay, stage_k, off);
         const size_t need = off[5] + align256(size_t(stage_k) * lay.piece[5]);
         if (!st.copy || st.K != stage_k || need > st.half_bytes) stage_alloc(st, std::max(st.half_bytes, need), stage_k);
         if (st.layer != layer || st.cache != &cache) { st.cache = &cache; st.layer = layer; st.plan.clear(); st.issued = 0; }
     } else if (!cache.bank_ready(layer)) {  // first use of this layer: its bank takes the most routed experts (later decode hits)
-        std::vector<int> top; for (int e = 0; e < E; ++e) if (cnt[size_t(e)]) top.push_back(e);
-        std::stable_sort(top.begin(), top.end(), [&](int a, int b) { return cnt[size_t(a)] > cnt[size_t(b)]; });
-        top.resize(std::min(top.size(), size_t(cache.plan_slots(layer)))); std::sort(top.begin(), top.end());
+        std::vector<int> top = tqllm::flashnext::bank_experts(cnt, layer, size_t(cache.plan_slots(layer)), g_cpu_owned); std::sort(top.begin(), top.end());
         cache.prepare(layer, top); ck(cudaStreamSynchronize(nullptr));
         { size_t off[6]; const auto lay = cache.bank_layout(layer); stage_offsets(lay, stage_k, off);
           const size_t need = off[5] + align256(size_t(stage_k) * lay.piece[5]);

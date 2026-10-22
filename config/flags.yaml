@@ -998,7 +998,7 @@ flags:
     kind: retired
     default: "-"
     doc: "removed"
-    replaced_by: "removed: the fixed CPU-owned eighth cost 12 GB decode 2-4 tok/s (ec0cf00 47.9 / 49.1 vs 49.7 / 51.0 without); the CPU pool serves non-resident experts"
+    replaced_by: "removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks"
   - name: TQFN_CPU_REFILL
     kind: debug
     default: "off"

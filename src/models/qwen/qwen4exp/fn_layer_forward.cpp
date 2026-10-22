@@ -313,6 +313,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))
                                    : g_small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
+        g_cpu_owned = cpu_pool != nullptr;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
         const bool use_cpu = cpu_pool && trunk && n <= tqllm::flashnext::kCpuPoolRows;
         if (use_cpu) {
@@ -360,7 +361,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             std::vector<CpuMissPool::Job> jobs; std::map<int, int> job_of;
             for (int a = 0; a < A; ++a) {
                 const int e = routed_ids[a], t = a / c.topk;
-                if (cache.resident(layer, e)) continue;
+                if (!tqllm::flashnext::runs_on_cpu(layer, e, cache.resident(layer, e), true)) continue;
                 int sub = -1;
                 for (int q = 0; q < c.topk && sub < 0; ++q) if (cache.resident(layer, routed_ids[t * c.topk + q])) sub = routed_ids[t * c.topk + q];
                 // nothing resident for this token: any resident expert of the layer is the placeholder (its output row is
@@ -368,7 +369,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 if (sub < 0) { static std::vector<int> any_res(c.layers + 1, -1); int & r = any_res[layer];
                                if (r < 0 || !cache.resident(layer, r)) { r = -1; for (int x = 0; x < c.experts && r < 0; ++x) if (cache.resident(layer, x)) r = x; }
                                sub = r; }
-                if (sub < 0) continue;  // nothing resident in the whole layer: the GPU miss path serves it
+                if (sub < 0) sub = e;  // nothing resident in the whole layer: the expert loads as a miss (its CPU row still overwrites it)
                 // TQFN_CPU_MISS_MAX=K: at most K distinct experts per layer call on the CPU, the rest are GPU misses
                 static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : g_small_card ? 5 : 1 << 30;
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
@@ -417,9 +418,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             static const int pf_k = std::getenv("TQFN_PF_K") ? std::atoi(std::getenv("TQFN_PF_K")) : 6;  // 6 of 10: +3.3 % vs all (10-11)
             std::vector<int> want; want.reserve(A);
             constexpr int high = 3;  // ranks 1-3 are admitted first, ranks 4..pf_k only over stale or rarely used victims
-            for (int t = 0; t < n; ++t) for (int j = 0; j < std::min(high, c.topk); ++j) want.push_back(ids_host.p[A + t * c.topk + j]);
+            for (int t = 0; t < n; ++t) for (int j = 0; j < std::min(high, c.topk); ++j) if (const int id = ids_host.p[A + t * c.topk + j]; !(cpu_pool && tqllm::flashnext::cpu_owned(layer + 1, id))) want.push_back(id);
             cache.set_prefetch_strict(int(want.size()));
-            for (int t = 0; t < n; ++t) for (int j = high; j < std::min(pf_k, c.topk); ++j) want.push_back(ids_host.p[A + t * c.topk + j]);
+            for (int t = 0; t < n; ++t) for (int j = high; j < std::min(pf_k, c.topk); ++j) if (const int id = ids_host.p[A + t * c.topk + j]; !(cpu_pool && tqllm::flashnext::cpu_owned(layer + 1, id))) want.push_back(id);
             cache.prefetch(layer + 1, want, copy_stream);
         };
         const auto h3 = clk::now();

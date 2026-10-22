@@ -238,7 +238,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_EXPERT_PROFILE", Kind::Debug, "-", "seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune)", ""},
     {"TQFN_CPU_MISS", Kind::User, "0", "N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off)", ""},
     {"TQFN_CPU_MISS_MAX", Kind::Debug, "-", "K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses (small cards: 5)", ""},
-    {"TQFN_CPU_OWNED", Kind::Retired, "-", "removed", "removed: the fixed CPU-owned eighth cost 12 GB decode 2-4 tok/s (ec0cf00 47.9 / 49.1 vs 49.7 / 51.0 without); the CPU pool serves non-resident experts"},
+    {"TQFN_CPU_OWNED", Kind::Retired, "-", "removed", "removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks"},
     {"TQFN_CPU_REFILL", Kind::Debug, "off", "refill the expert banks from the CPU pool's copies (A/B)", ""},
     {"TQFN_CPU_SPIN_MS", Kind::Debug, "2", "ms the CPU miss workers spin before sleeping", ""},
     {"TQFN_DENSE_INT8", Kind::Debug, "0", "1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path)", ""},
