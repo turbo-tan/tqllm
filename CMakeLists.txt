@@ -442,7 +442,10 @@ if(BUILD_TESTING)
   add_test(NAME drafter_choice COMMAND test-drafter-choice)
   add_executable(test-stream-incremental tests/stream_incremental.cpp)  # streaming deltas: incremental == whole-prefix reference, O(n)
   target_include_directories(test-stream-incremental PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
-  target_link_libraries(test-stream-incremental PRIVATE tqllm CUDA::cudart)  # session.hpp reaches vision.hpp (cuda_runtime.h)
+  target_link_libraries(test-stream-incremental PRIVATE tqllm)
+  if(TQLLM_CUDA)  # session.hpp reaches vision.hpp (cuda_runtime.h); CUDA::cudart exists only in a CUDA build
+    target_link_libraries(test-stream-incremental PRIVATE CUDA::cudart)
+  endif()
   add_test(NAME stream_incremental COMMAND test-stream-incremental)
   add_executable(test-jinja tests/jinja_parity.cpp)
   target_include_directories(test-jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools
