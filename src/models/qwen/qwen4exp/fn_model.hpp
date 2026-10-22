@@ -232,10 +232,10 @@ inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpo
     }
     return parts;
 }
-// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (tiled), without the file
+// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
 inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
     const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
-    g_tile_experts = true;
+    g_tile_experts = false;  // untiled, as in the file: the loader tiles both the same way
     uint64_t off = 0;
     for (int l = 0; l < c.layers; ++l) {
         const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
@@ -255,5 +255,5 @@ inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
         }
     });
     for (auto & t : pool) t.join();
-    pe.map = host; pe.tiled = true; return pe;
+    pe.map = host; pe.tiled = false; return pe;
 }
