@@ -3,6 +3,17 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.2.1 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next no longer needs the 51 GB packed-expert file: at start-up the engine arranges the experts of the
+  IQ3_S GGUF in pinned memory itself (about 50 s; server ready in about 2 min, as with the file), byte-identical to the
+  file, and then drops the GGUF's page cache. The manifest may carry the per-layer cache plan as `layer_slots=`.
+  Known gap: on an RTX 3090 short chats decode about 15 % slower this way (79-87 against 93-102 tok/s) and a 32K prompt
+  takes 17.3 s to first token instead of 14.6 s; long-context decode is the same. For full speed, write the file once
+  with `tqfn-pack` (now in the image, about 90 s and 51 GB of disk) and add `experts=` to the manifest.
+  Setup: https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM
+
 ## 1.2.0 (2026-10-22)
 
 ### Added

@@ -30,7 +30,7 @@ Spark), Linux or Windows with WSL 2. Steps, in order:
      -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
      -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
      -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-     ytan2000/tqllm:1.2.0
+     ytan2000/tqllm:1.2.1
    ```
    The server fits the KV cache and context to the free memory by itself and prints what it chose. On a 16 GB GPU
    use `-e CONTEXT=16384 -e KV_FORMAT=tq3`. Without Docker: build `tqserve` from source (README, "Build").
@@ -45,8 +45,14 @@ Spark), Linux or Windows with WSL 2. Steps, in order:
    `--list` shows the model catalog and downloads with a sha256 check).
 
 If it fails: no GPU in the container -> install the NVIDIA Container Toolkit; out of memory -> a smaller file or a
-smaller `CONTEXT`; a GPU older than RTX 30 is not supported. Qwen3.8 Flash-Next (125B MoE) on one 24 GB GPU needs
-extra files beside the GGUF; its setup guide is not published yet, so do not improvise one.
+smaller `CONTEXT`; a GPU older than RTX 30 is not supported.
+
+Qwen3.8 Flash-Next (125B MoE) on one 24 GB GPU: needs 64 GB of system RAM or more (tested with 128 GB) and image
+1.2.1 or newer. Follow the run steps on https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM exactly: the ISTA-DASLab
+IQ3_S GGUF plus the small files there in one folder, then `tqserve --model <folder>/flashnext.tqfn`. Start-up takes
+about two minutes (the experts are arranged in RAM for the GPU cache); wait for `/health` before the first request.
+For full decode speed the card's optional step writes the 51 GB pack file once with `tqfn-pack`; ask the user first
+(it needs 51 GB of free disk).
 
 ## How tqLLM is organised
 

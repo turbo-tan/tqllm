@@ -2,6 +2,8 @@
 // Flash-Next model: DecodeModel (decode, layer-major prefill, MTP drafting) and the packed expert file.
 #include "fn_layers.hpp"
 #include "fn_cpu_experts.hpp"
+#include <atomic>
+#include <thread>
 struct PinnedInts { int * p = nullptr; size_t n = 0; void need(size_t k) { if (k > n) { if (p) cudaFreeHost(p); ck(cudaMallocHost(reinterpret_cast<void **>(&p), k * sizeof(int))); n = k; } } };
 inline double g_host_ms[3];  // decode host time blocked in: routed ids D2H, cache prepare, prefetch issue
 struct DecodeModel {
@@ -229,4 +231,29 @@ inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpo
         }
     }
     return parts;
+}
+// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
+inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
+    const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
+    g_tile_experts = false;  // untiled, as in the file: the loader tiles both the same way
+    uint64_t off = 0;
+    for (int l = 0; l < c.layers; ++l) {
+        const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
+        for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
+        pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
+    }
+    pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
+    std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
+    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
+        for (int64_t i; (i = next++) < total;) {
+            const int l = int(i / c.experts), e = int(i % c.experts);
+            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+            for (int k = 0; k < 6; ++k) {
+                require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
+                std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
+            }
+        }
+    });
+    for (auto & t : pool) t.join();
+    pe.map = host; pe.tiled = false; return pe;
 }

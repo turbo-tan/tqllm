@@ -49,9 +49,12 @@ inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); r
 // Expert slots per trunk layer: TQFN_LAYER_SLOTS=c0,c1,... or, by default, EXPERTS.slots beside the packed experts (one
 // line of comma-separated counts from docs/steering/tqllm/flashnext/tools/alloc.py, fitted on a routing trace of other
 // prompts). Counts fitted for another --slots are scaled to keep the same total; without either, every layer gets --slots.
-inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string & experts_path, int slots) {
+// A manifest's layer_slots= line (the same counts) is used when there is no experts file beside it.
+inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string & experts_path, int slots,
+                              const std::string & manifest_slots = "") {
     std::string text, from;
     if (const char * v = std::getenv("TQFN_LAYER_SLOTS"); v && *v) { text = v; from = "TQFN_LAYER_SLOTS"; }
+    else if (!manifest_slots.empty()) { text = manifest_slots; from = "manifest layer_slots"; }
     else if (!experts_path.empty()) {
         std::ifstream f(experts_path + ".slots");
         if (f && std::getline(f, text)) from = experts_path + ".slots";

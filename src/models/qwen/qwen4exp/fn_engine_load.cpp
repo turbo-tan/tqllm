@@ -2,6 +2,7 @@
 #include <fstream>
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
+#include <chrono>
 
 namespace tqllm::flashnext {
 
@@ -18,6 +19,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         const auto k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "gguf") f.ggufs.push_back(resolve(v)); else if (k == "mtp") f.mtp = resolve(v);
         else if (k == "experts") f.experts = resolve(v); else if (k == "draft_vocab") f.draft_vocab = resolve(v);
+        else if (k == "layer_slots") f.layer_slots = v;
         else if (k == "slots") { f.slots_auto = v == "auto"; f.slots = f.slots_auto ? kAutoStartSlots : std::stoi(v); } else if (k == "budget_gb") f.budget_gb = std::stod(v);
         else if (k == "drafts") f.drafts = std::stoi(v); else if (k == "chunk") f.chunk = g_tune.chunk > 0 ? g_tune.chunk : std::stoi(v);  // --prefill-chunk (16384) over the manifest
         else if (k == "gsq_rco") f.gsq_rco = v != "0";
@@ -48,7 +50,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.fixtures = std::make_unique<Fixtures>();
     f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true;
     const auto & c = f.cp->config; auto & checkpoint = *f.cp;
-    g_small_card = f.slots_auto && !f.experts.empty() && tqllm::device_free_bytes() < (size_t(16) << 30);
+    int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
+    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0);
+    g_small_card = f.slots_auto && (!f.experts.empty() || pack_in_memory) && tqllm::device_free_bytes() < (size_t(16) << 30);
     // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
     // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
     // cards: their CPU expert pool takes blocks of at most kCpuPoolRows rows (decode_rules.hpp one_sequence_drafts).
@@ -69,10 +73,17 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, size_t(f.budget_gb * 1024 * 1024 * 1024),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
-    apply_layer_slots(*f.cache, f.experts, f.slots);
+    apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
-    if (!f.experts.empty()) {
+    if (!f.experts.empty() || pack_in_memory) {
+    if (pack_in_memory) {  // no experts file: the same bytes, built from the GGUF (decode_rules.hpp build_pack_in_memory)
+        const auto t0 = std::chrono::steady_clock::now();
+        f.packed = build_packed(checkpoint, std::max(4, std::min(32, int(std::thread::hardware_concurrency()))));
+        checkpoint.release_pages();  // the GGUF page cache would otherwise sit beside the pinned pack
+        std::fprintf(stderr, "tqllm: packed experts built from the GGUF in memory: %.1f GB in %.0f s\n", f.packed.bytes / 1e9,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    } else {
     f.packed = open_packed(f.experts);
     require(f.packed.layers == c.layers && f.packed.experts == c.experts, "packed experts do not match the model");
     char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), f.packed.bytes));
@@ -83,6 +94,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       }
       ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); ::close(fd); }
     ::munmap(const_cast<char *>(f.packed.map), f.packed.bytes); f.packed.map = host;
+    }
     if (!f.packed.tiled) {
         for (int l = 0; l < f.packed.layers; ++l) {
             size_t off = 0; const auto ids = expert_u4h_ids(checkpoint, l);
@@ -95,7 +107,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                     for (int w = 0; w < 16; ++w) th.emplace_back([&, w] {
                         std::vector<char> tmp(dsz);
                         for (int e = w; e < f.packed.experts; e += 16) {
-                            char * d = host + f.packed.base[l] + uint64_t(e) * f.packed.block[l] + off;
+                            char * d = const_cast<char *>(f.packed.map) + f.packed.base[l] + uint64_t(e) * f.packed.block[l] + off;
                             tqllm_cuda::tile_expert_rows(d, tmp.data(), rows, cols, bpb); std::memcpy(d, tmp.data(), dsz);
                         }
                     });
@@ -198,7 +210,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
               const size_t fr = tqllm::device_free_bytes();
               f.slots = tqllm::auto_expert_slots(fr, need + extra, per, c.experts);
-              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); apply_layer_slots(*f.cache, f.experts, f.slots);
+              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
               { auto again = warm.step(ids); ck(cudaDeviceSynchronize()); }  // the banks again, at the new size
               const size_t after = tqllm::device_free_bytes();
               std::fprintf(stderr, "tqllm: expert slots auto: %.0f MB free without banks, %.0f MB kept, %.1f MB per slot -> %d slots/layer, %.0f MB free after\n",

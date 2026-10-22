@@ -15,12 +15,13 @@ COPY third_party ./third_party
 RUN arch="${CUDA_ARCHITECTURES}"; \
     if [ -z "$arch" ]; then case "${TARGETARCH:-$(dpkg --print-architecture)}" in arm64) arch=121 ;; *) arch="86;89;120" ;; esac; fi; \
     echo "CUDA architectures: $arch"; \
-    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING=OFF && cmake --build build --target tqserve tqtokenize -j "${BUILD_JOBS}"
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING=OFF && cmake --build build --target tqserve tqtokenize tqfn-pack -j "${BUILD_JOBS}"
 
 FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/tqserve /usr/local/bin/tqserve
 COPY --from=build /src/build/tqtokenize /usr/local/bin/tqtokenize
+COPY --from=build /src/build/tqfn-pack /usr/local/bin/tqfn-pack
 COPY docker/entrypoint.sh /usr/local/bin/tqllm-entrypoint
 # Ship the licence and notices with the distributed image (Apache-2.0 requires the licence
 # text and third-party notices travel with the binaries). These come from the build context

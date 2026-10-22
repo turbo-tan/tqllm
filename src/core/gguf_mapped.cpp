@@ -17,7 +17,8 @@ namespace tqllm {
 struct MappedGguf::Mapping {
     const char * data = nullptr;
     size_t size = 0;
-    explicit Mapping(const std::string & path) {
+    std::string path;
+    explicit Mapping(const std::string & p) : path(p) {
 #ifndef _WIN32
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) throw std::runtime_error("GGUF map open: " + std::string(std::strerror(errno)));
@@ -44,6 +45,13 @@ struct MappedGguf::Mapping {
 MappedGguf::MappedGguf(const std::string & path, GgufDialect dialect)
     : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open(path, dialect)) {}
 MappedGguf::~MappedGguf() = default;
+void MappedGguf::release_pages() const {
+#ifndef _WIN32
+    madvise(const_cast<char *>(mapping_->data), mapping_->size, MADV_DONTNEED);
+    const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+#endif
+}
 GgufBytes MappedGguf::checked(const GgufTensor & t) const {
     if (t.offset > mapping_->size || t.bytes > mapping_->size - t.offset)
         throw std::runtime_error("GGUF mapped view exceeds file");

@@ -88,4 +88,10 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
     return top;
 }
 
+// Packed experts (one contiguous block per expert in the decode cache's row layout, so a cache miss is one copy): read
+// from the manifest's experts file when it names one; otherwise built in pinned memory from the GGUF at start-up on a
+// discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
+// keeps every expert resident and needs no pack.
+inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu) { return !has_pack_file && !integrated_gpu; }
+
 }  // namespace tqllm::flashnext

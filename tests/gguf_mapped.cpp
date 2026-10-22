@@ -48,6 +48,11 @@ static void unit_test() {
         float values[6]; std::memcpy(values, view.data, sizeof(values));
         for (int i = 0; i < 6; ++i) require(values[i] == expert * 100 + (i / 2) * 10 + i % 2, "wrong expert mapped");
     }
+    mapped.release_pages();  // views stay valid: the bytes fault back in from the file
+    for (int expert = 0; expert < 4; ++expert) {
+        float values[6]; std::memcpy(values, mapped.expert("experts", expert).data, sizeof(values));
+        for (int i = 0; i < 6; ++i) require(values[i] == expert * 100 + (i / 2) * 10 + i % 2, "bytes changed after release_pages");
+    }
     const auto rows = mapped.gather_rows("embeddings", {4, 1, 4, 0});
     for (int i = 0; i < 4; ++i) for (int col = 0; col < 32; ++col)
         require(rows[i * 32 + col] == (i == 0 || i == 2 ? 40 : i == 1 ? 10 : 0) + col - 16,
