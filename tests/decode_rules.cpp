@@ -83,9 +83,13 @@ int main() {
     }
 
     // packed experts without a pack file: built in memory on a discrete GPU, never on a GPU sharing system memory
-    check(build_pack_in_memory(false, false), "no pack file, discrete GPU: build the pack from the GGUF");
-    check(!build_pack_in_memory(true, false), "a pack file is used as given");
-    check(!build_pack_in_memory(false, true) && !build_pack_in_memory(true, true) == true, "GB10 (integrated): no pack built");
+    const double GB = 1e9;
+    check(build_pack_in_memory(false, false, false, 51 * GB, 128 * GB), "no pack file, discrete GPU, 128 GB RAM: build the pack from the GGUF");
+    check(!build_pack_in_memory(true, false, false, 51 * GB, 128 * GB), "a pack file is used as given");
+    check(!build_pack_in_memory(false, true, false, 51 * GB, 128 * GB), "GB10 (integrated): no pack built");
+    check(!build_pack_in_memory(false, false, true, 51 * GB, 128 * GB), "hot/cold manages expert memory: no pack built");
+    check(!build_pack_in_memory(false, false, false, 51 * GB, 64 * GB) && !build_pack_in_memory(false, false, false, 51 * GB, 24 * GB),
+          "a 51 GB pack is not pinned on a 64 GB or 24 GB machine");
 
     {   // the HF manifest's 3090 plan on a GB10 (512 slots = every expert): no layer below 512
         const std::vector<int> plan{314, 291, 269, 160, 189, 219, 248, 239, 208, 135, 212, 160, 128, 145};

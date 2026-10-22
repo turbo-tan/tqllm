@@ -93,7 +93,12 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 // from the manifest's experts file when it names one; otherwise built in pinned memory from the GGUF at start-up on a
 // discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
 // keeps every expert resident and needs no pack.
-inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu) { return !has_pack_file && !integrated_gpu; }
+// Build the packed experts in pinned memory only on a discrete GPU without a pack file, outside hot/cold (its tiers manage
+// expert memory) and when the pack fits in 60 % of the machine's RAM; otherwise the cache reads experts from the GGUF on
+// demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB.
+inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes) {
+    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= 0.6 * host_ram_bytes;
+}
 // Pages that may be dropped once the experts sit in pinned memory: the trunk expert tensors only. The per-layer token
 // embedding (Flash-Next: 28.8 GB, one 90-byte row per token and layer) is read from the file at every token; with its
 // pages dropped each new token waited on the disk (3090: chats 79-88 instead of 94-103 tok/s, 32K first token +2.7 s).

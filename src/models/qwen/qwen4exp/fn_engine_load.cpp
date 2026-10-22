@@ -113,7 +113,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true; f.cp->reclaim_expert_pages=f.cold_reclaim_hot;
     const auto & c = f.cp->config; auto & checkpoint = *f.cp;
     int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
-    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0);
+    double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
+    for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
+    const double host_ram = double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGESIZE));
+    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
+    if (f.experts.empty() && !integrated && !pack_in_memory)
+        std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
+                     "a pinned pack would not fit this machine's RAM");
     g_small_card = f.slots_auto && (!f.experts.empty() || pack_in_memory) && tqllm::device_free_bytes() < (size_t(16) << 30);
     // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
     // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
