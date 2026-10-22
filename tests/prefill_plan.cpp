@@ -98,6 +98,19 @@ int main() {
         ledger.buffers_released();
         expect(ledger.refill() == 48 && dev.banks.size() == 48, "every layer has a bank after the refill (12 GB 16K a != b)");
     }
+    // 4c. a release frees a little less than the bank's bytes: auto borrows the next bank instead of failing a few MB short
+    {
+        MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
+        BankLedger::Ops o = dev.ops();
+        o.release = [&dev](int l) { dev.banks.erase(l); dev.other += 8 * MB; };  // 8 MB of each bank stays allocated
+        BankLedger ledger(o);
+        auto plan = prefill_plan(s, tuning(8192), 30892, dev.free());
+        plan.need = dev.free() + 2 * 274 * MB;  // needs exactly two banks' bytes
+        plan.release = 2 * 274 * MB;
+        bool ok = true; std::vector<int> got;
+        try { got = ledger.borrow(plan, BorrowMode::Auto); } catch (const std::runtime_error &) { ok = false; }
+        expect(ok && got.size() == 3 && dev.free() >= plan.need, "auto borrow: two banks fall 16 MB short, the third covers it (GB10 12789 vs 12785 MB)");
+    }
     // 5. a refill that runs out of memory stops and reports how many came back; auto borrows the LRU banks first
     {
         MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);

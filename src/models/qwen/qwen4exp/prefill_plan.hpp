@@ -156,10 +156,17 @@ public:
         const int k = banks_to_borrow(plan, bytes, mode, count);
         borrowed_.assign(lru.begin(), lru.begin() + k); borrowed_bytes_ = 0;
         for (int l : borrowed_) { borrowed_bytes_ += ops_.bank_bytes(l); ops_.release(l); }
+        // a release frees a little less than the bank's bytes (allocator rounding, pool blocks): when the plan still does
+        // not fit, release the next least recently used bank instead of failing a few MB short (GB10: 12789 MB needed,
+        // 12785 MB free after 2 banks)
+        size_t next = size_t(k);
+        while (ops_.free_bytes() < plan.need && mode != BorrowMode::Count && next < lru.size()) {
+            const int l = lru[next++]; borrowed_.push_back(l); borrowed_bytes_ += ops_.bank_bytes(l); ops_.release(l);
+        }
         if (mode == BorrowMode::All) for (int l : bankless) if (!borrowed(l)) borrowed_.push_back(l);
         if (ops_.free_bytes() < plan.need)
             throw std::runtime_error("prefill plan: " + std::to_string(plan.need >> 20) + " MB needed, " +
-                                     std::to_string(ops_.free_bytes() >> 20) + " MB free after releasing " + std::to_string(k) + " banks");
+                                     std::to_string(ops_.free_bytes() >> 20) + " MB free after releasing " + std::to_string(next) + " banks");
         state_ = State::Borrowed;
         return borrowed_;
     }
