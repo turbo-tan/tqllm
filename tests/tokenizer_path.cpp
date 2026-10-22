@@ -1,5 +1,5 @@
 // tqserve and tqkld pick the tokenizer the same way: --tokenizer, else the GGUF model itself.
-#include "../src/tokenizer_path.hpp"
+#include "tokenizer_path.hpp"
 
 #include <cstdio>
 

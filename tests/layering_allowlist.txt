@@ -1,0 +1,19 @@
+# Known layering violations (tests/test_layering.py). This list may only shrink; remove an entry in the PR that fixes it.
+# includer<TAB>included. Most are the shared kernel primitives that still live in qwen35_kernels.cuh / qwen2_kernels.cuh
+# (norms, gemv, attention helpers): moving them to src/core is the follow-up that clears the formats/ rows.
+src/core/gguf_mapped.cpp	src/formats/weight/dequant.hpp
+src/formats/kv/kv_compact.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_dense.cpp	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/formats/kv/kv_dense.cpp	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_split.cpp	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_tq3.cpp	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_tq3.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/formats/kv/kv_tq3.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_tq3k_tq2v.cpp	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/kv/kv_turbo.cpp	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/weight/tq4.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/formats/weight/tq4.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/formats/weight/w4s.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/formats/weight/w4s.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
+src/models/qwen/qwen35/attention.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/models/qwen/qwen35/qwen35.cpp	src/models/qwen/qwen2/qwen2_kernels.cuh

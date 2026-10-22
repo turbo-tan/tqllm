@@ -127,7 +127,7 @@ static void attention_test(int heads, int kvheads, int dim, int pos, int n) {
             expected[base + d] = value;
         }
     }
-    cudaStream_t stream; ck(cudaStreamCreate(&stream));
+    cudaStream_t stream = cudaStreamPerThread;
     auto run = [&] { tqllm_cuda::fn_dense_attention(dq.p, dk.p, dv.p, out.p, heads, kvheads, dim, n, pos, stream); };
     run(); ck(cudaStreamSynchronize(stream)); const auto got = out.get(); compare(got, expected);
     cudaGraph_t graph; cudaGraphExec_t exec;
@@ -141,7 +141,7 @@ static void attention_test(int heads, int kvheads, int dim, int pos, int n) {
     try { tqllm_cuda::fn_dense_attention(dq.p, dk.p, dv.p, out.p, heads, kvheads, dim, n, 1 << 20, stream); }  // past the 1M-position budget
     catch (const std::invalid_argument &) { rejected = true; }
     require(rejected, "a context past the dense-attention budget was accepted");
-    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); ck(cudaStreamDestroy(stream));
+    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); 
     std::printf("Flash-Next text attention heads=%d kv=%d dim=%d pos=%d n=%d BF16/causal/gate/oracle/graph: PASS\n", heads, kvheads, dim, pos, n);
 }
 
@@ -181,7 +181,7 @@ static void recurrence_test(int kh, int vh, int dim, int n, float input_scale) {
     }
     Device<float> dx(x.size()), da(a.size()), db(b.size()), dn(vh), dw(vh), ds(state_count), next(state_count), dy(expected.size());
     dx.put(x); da.put(a); db.put(b); dn.put(neg); dw.put(bias); ds.put(initial);
-    cudaStream_t stream; ck(cudaStreamCreate(&stream));
+    cudaStream_t stream = cudaStreamPerThread;
     auto run = [&] { tqllm_cuda::fn_gdn(dx.p, da.p, db.p, dn.p, dw.p, ds.p, next.p, dy.p, kh, vh, dim, n, eps, stream); };
     run(); ck(cudaStreamSynchronize(stream)); const auto got = dy.get(), final = next.get();
     compare(got, expected); compare(final, state);
@@ -216,7 +216,7 @@ static void recurrence_test(int kh, int vh, int dim, int n, float input_scale) {
     try { tqllm_cuda::fn_gdn(dx.p, da.p, db.p, dn.p, dw.p, ds.p, dy.p, dy.p, kh, vh, dim, n, eps, stream); }
     catch (const std::invalid_argument &) { rejected = true; }
     require(rejected, "aliased GDN state/output accepted");
-    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); ck(cudaStreamDestroy(stream));
+    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); 
     std::printf("Flash-Next GDN kh=%d vh=%d dim=%d n=%d scale=%g oracle/chunk/reset/graph: PASS\n", kh, vh, dim, n, input_scale);
 }
 static void shape_overflow_test() {

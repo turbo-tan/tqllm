@@ -2,9 +2,9 @@
 #include "monitor.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
-#include <src/json.hpp>
+#include <third_party/nlohmann/json.hpp>
 #if TQLLM_WITH_CUDA
-#include <src/vision.hpp>
+#include <src/vision/vision.hpp>
 #endif
 #include "json_out.hpp"
 
@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -690,7 +691,10 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
             for (const auto & stop : req.stop)
                 if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
         }
-        if (req.tools) extract_tool_calls(result);
+        if (req.tools) {  // the prose before a tool call is trimmed; trim without one too, so a stream can match before it knows
+            extract_tool_calls(result);
+            result.text = trim(result.text);
+        }
     }
 }
 
@@ -708,11 +712,12 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
-        model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+        { tqllm::PrefillObservation progress(observe_prefill(req.observation));
+        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
         while (model.spec_advance()) {
-            const auto ids = model.spec_tokens(0);
+            const auto & ids = model.spec_tokens(0);  // used before the next advance only
             if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
             if (guard.check(ids)) break;
         }
@@ -889,8 +894,25 @@ public:
           created_(std::to_string(std::time(nullptr))) {
         plain_.tools = false;
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
+        const auto te = tok_.encode("</think>");  // finish() splits on this id only when it is one token
+        think_id_ = te.size() == 1 ? int64_t(te[0]) : -1;
     }
-    bool update(const std::vector<uint32_t> & gen) {  // one delta per new token (clients count deltas as tokens)
+    // One delta per new token (clients count deltas as tokens). Incremental: each token's bytes are appended once and
+    // only the still-unstable tail (incomplete UTF-8, a possible stop or tool-marker prefix, trailing whitespace) is looked
+    // at again, so a stream costs O(n) in its length; the deltas equal update_reference(), which re-finishes the prefix.
+    bool update(const std::vector<uint32_t> & gen) {
+        for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
+            take(gen[k - 1]);
+            if (req_.thinking && !emit_view(view(rraw_, rlead_, rlast_), sr_, true)) return false;
+            const std::string_view text = answer_view();
+            if (req_.tools) { if (!emit_view(text.substr(0, rstrip(text, tool_limit(text))), sc_, false)) return false; }
+            else if (!emit_view(text, sc_, false)) return false;
+        }
+        seen_ = std::max(seen_, gen.size());
+        return true;
+    }
+    // the original whole-prefix algorithm (O(n) per token): the test oracle for update()
+    bool update_reference(const std::vector<uint32_t> & gen) {
         for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
@@ -936,7 +958,7 @@ public:
     bool flush(const DecodeResult & r) {
         if (!emit(r.reasoning, sr_, true, true)) return false;
         if (!req_.tools) return emit(r.text, sc_, false, true);
-        const size_t end = tool_text_limit(r.text);  // tool markup: nothing past the first block is ours to send
+        const size_t end = rstrip(r.text, tool_text_limit(r.text));  // tool markup: nothing past the first block is ours to send
         return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
     }
     void mark_role_sent() { role_sent_ = true; }
@@ -964,8 +986,80 @@ private:
     }
     static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
     bool emit_tool_text(const std::string & raw, std::string & sent) {
-        const size_t end = tool_text_limit(raw);
-        return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
+        const size_t lead = raw.find_first_not_of(" \t\r\n");
+        if (lead == std::string::npos) return true;
+        const std::string t = raw.substr(lead);
+        const size_t end = rstrip(t, tool_text_limit(t));
+        return end <= sent.size() ? true : emit(t.substr(0, end), sent, false, false);
+    }
+    // tools mode holds trailing whitespace: finish() trims the prose before a tool call
+    static size_t rstrip(std::string_view t, size_t end) { while (end > 0 && ws(t[end - 1])) --end; return end; }
+    static bool ws(char c) {return c == ' ' || c == '\t' || c == '\r' || c == '\n';}
+    static std::string_view view(const std::string & raw, size_t lead, size_t last) {
+        return lead == std::string::npos || last <= lead ? std::string_view() : std::string_view(raw).substr(lead, last - lead);
+    }
+    // trim() bounds kept as bytes arrive: first non-whitespace byte and one past the last
+    static void extend_trim(const std::string & raw, size_t from, size_t & lead, size_t & last) {
+        for (size_t i = from; i < raw.size(); ++i)
+            if (!ws(raw[i])) {if (lead == std::string::npos) lead = i; last = i + 1;}
+    }
+    void take(uint32_t t) {  // the same token handling as finish(): stop at EOS, split reasoning at </think>
+        if (done_) return;
+        if (t == tok_.eos_id()) {done_ = true; return;}
+        if (req_.thinking && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
+        std::string & raw = req_.thinking && !in_answer_ ? rraw_ : araw_;
+        const size_t from = raw.size();
+        raw += tok_.decode({t});
+        if (&raw == &rraw_) extend_trim(rraw_, from, rlead_, rlast_);
+        else if (req_.thinking || req_.tools) extend_trim(araw_, from, alead_, alast_);
+    }
+    // the answer as finish() returns it: trimmed (thinking) or raw, cut at the first stop string
+    std::string_view answer_view() {
+        const std::string_view t = req_.thinking ? view(araw_, alead_, alast_)
+                                 : req_.tools ? (alead_ == std::string::npos ? std::string_view() : std::string_view(araw_).substr(alead_))
+                                              : std::string_view(araw_);
+        if (stop_at_ != std::string::npos) return t.substr(0, std::min(stop_at_, t.size()));
+        size_t first = std::string::npos;
+        const size_t from = stop_scan_ > hold_ ? stop_scan_ - hold_ : 0;
+        for (const auto & st : req_.stop)
+            if (!st.empty())
+                if (const auto p = t.find(st, from); p != std::string::npos) first = std::min(first, p);
+        stop_scan_ = t.size();
+        if (first != std::string::npos) {stop_at_ = first; return t.substr(0, first);}
+        return t;
+    }
+    // tool_stream_limit() on the answer: the first marker found once, the partial-marker hold-back on the tail only
+    size_t tool_limit(std::string_view t) {
+        static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
+        if (tool_at_ == std::string::npos) {
+            const size_t from = tool_scan_ > 10 ? tool_scan_ - 10 : 0;
+            for (const auto & m : markers) if (const auto p = t.find(m, from); p != std::string::npos) tool_at_ = std::min(tool_at_, p);
+            tool_scan_ = t.size();
+        }
+        size_t end = std::min(t.size(), tool_at_);
+        for (const auto & m : markers)
+            for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
+                if (t.compare(end - k, k, m, 0, k) == 0) {end -= k; break;}
+        return end;
+    }
+    static size_t unstable_tail_view(std::string_view t) {
+        if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
+        for (size_t k = 1; k <= 3 && k <= t.size(); ++k) {
+            const auto c = static_cast<unsigned char>(t[t.size() - k]);
+            if ((c & 0xC0) == 0x80) continue;
+            const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            return need > k ? k : 0;
+        }
+        return 0;
+    }
+    // emit() for a growing view: what was sent is a prefix by construction, so no prefix compare
+    bool emit_view(std::string_view full, std::string & sent, bool reasoning) {
+        if (full.size() <= sent.size()) return true;
+        size_t end = full.size() - std::min(full.size(), unstable_tail_view(full));
+        if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+        if (!reasoning && req_.tools) end = rstrip(full, end);
+        if (end <= sent.size()) return true;
+        return send_piece(std::string(full.substr(sent.size(), end - sent.size())), sent, reasoning);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
@@ -973,9 +1067,12 @@ private:
         if (!final) {
             end -= std::min(end, unstable_tail(full));
             if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+            if (!reasoning && req_.tools) end = rstrip(full, end);
         }
         if (end <= sent.size()) return true;
-        const std::string piece = full.substr(sent.size(), end - sent.size());
+        return send_piece(full.substr(sent.size(), end - sent.size()), sent, reasoning);
+    }
+    bool send_piece(const std::string & piece, std::string & sent, bool reasoning) {
         sent += piece;
         std::string out = head() + "\"choices\":[{\"index\":0,";
         if (req_.chat) {
@@ -1001,6 +1098,12 @@ private:
     std::string created_, sr_, sc_;
     size_t hold_ = 0, seen_ = 0;
     bool role_sent_ = false;
+    // incremental update() state
+    int64_t think_id_ = -1;
+    bool done_ = false, in_answer_ = false;
+    std::string rraw_, araw_;
+    size_t rlead_ = std::string::npos, rlast_ = 0, alead_ = std::string::npos, alast_ = 0;
+    size_t stop_at_ = std::string::npos, stop_scan_ = 0, tool_at_ = std::string::npos, tool_scan_ = 0;
 };
 
 // np = 1 streaming: begin / advance / finish on the model, `on_tokens` after every step (false: client gone, stop).
@@ -1016,11 +1119,12 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
-    model.spec_begin(prompt, count, draft_length(model.native_mtp()));
+    { tqllm::PrefillObservation progress(observe_prefill(req.observation));
+        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
     while (model.spec_advance()) {
-        const auto ids = model.spec_tokens(0);
+        const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;
         if (!on_tokens(ids)) { if (req.observation) req.observation->finish("cancelled"); break; }

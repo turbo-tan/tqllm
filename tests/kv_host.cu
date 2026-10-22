@@ -1,8 +1,8 @@
 // GPU test: KV rows split between device memory and a host-memory tail (KvPool with device_rows) give byte-identical
 // cache contents and attention outputs to an all-device cache, through the real KV-format kernels (prefill chunks and
 // verify blocks that cross the device/host boundary).
-#include "src/formats/kv_format.hpp"
-#include "src/kv_store.hpp"
+#include "kv_format.hpp"
+#include "kv_store.hpp"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
 
@@ -27,7 +27,7 @@ int main() {
     const int heads = 24, kvh = 4, hd = 256, nver = 12, nbuf = 512;
     const int64_t ctx = 65536, dev_rows = 30000;  // the device head rounds up to a 2 MiB granule (row 32768 for 448 B rows)
     cudaStream_t st;
-    CK(cudaStreamCreate(&st));
+    st = cudaStreamPerThread;
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     auto mem = make_cuda_kv_memory(st);

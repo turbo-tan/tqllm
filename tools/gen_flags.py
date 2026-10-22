@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate src/flags_gen.hpp and docs/FLAGS.md from config/flags.yaml (the single registry of TQLLM_* flags).
+"""Generate src/core/flags_gen.hpp and docs/FLAGS.md from config/flags.yaml (the single registry of TQLLM_* / TQFN_* flags).
 
---check: fail if the generated files are stale, if code reads a TQLLM_* variable that is not registered, or if a
+--check: fail if the generated files are stale, if code reads a TQLLM_* or TQFN_* variable that is not registered, or if a
 registered flag is read nowhere (stdlib only; the YAML is a fixed subset: a list of name/kind/default/doc/replaced_by)."""
 import pathlib, re, sys
 
@@ -76,18 +76,17 @@ def gen_md(flags):
 
 def used_names():
     names = set()
-    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("kernels/**/*.cu*")) + \
-             list(ROOT.glob("kernels/**/*.hpp")):
+    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")):
         if p.name == "flags_gen.hpp":
             continue
-        names |= set(re.findall(r'"(TQLLM_[A-Z0-9_]+)"', p.read_text(errors="ignore")))
+        names |= set(re.findall(r'"((?:TQLLM|TQFN)_[A-Z0-9_]+)"', p.read_text(errors="ignore")))
     return names
 
 
 def main():
     flags = load()
     hpp, md = gen_hpp(flags), gen_md(flags)
-    targets = {ROOT / "src/flags_gen.hpp": hpp, ROOT / "docs/FLAGS.md": md}
+    targets = {ROOT / "src/core/flags_gen.hpp": hpp, ROOT / "docs/FLAGS.md": md}
     if "--check" not in sys.argv:
         for p, t in targets.items():
             p.write_text(t)

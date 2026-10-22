@@ -1,4 +1,4 @@
-// Gate for the MoE routing primitive (src/moe.cpp). Host-only: no CUDA, no GPU, no model.
+// Gate for the MoE routing primitive (src/experts/moe.cpp). Host-only: no CUDA, no GPU, no model.
 //
 // The reference implementation below is deliberately written as a DIFFERENT algorithm from the
 // one under test - repeated max-scan selection instead of sort-then-slice - so agreement is

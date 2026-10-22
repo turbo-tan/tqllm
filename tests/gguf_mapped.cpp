@@ -52,6 +52,12 @@ static void unit_test() {
     for (int i = 0; i < 4; ++i) for (int col = 0; col < 32; ++col)
         require(rows[i * 32 + col] == (i == 0 || i == 2 ? 40 : i == 1 ? 10 : 0) + col - 16,
                 "Q8 gather lost row order, signs, scale or duplicates");
+    {   // a prefill-sized gather runs on several threads: same rows in the same order
+        std::vector<uint64_t> many(5000); for (size_t i = 0; i < many.size(); ++i) many[i] = (i * 7 + 3) % 5;
+        const auto big = mapped.gather_rows("embeddings", many);
+        for (size_t i = 0; i < many.size(); ++i) for (int col = 0; col < 32; ++col)
+            require(big[i * 32 + col] == float(many[i] * 10) + col - 16, "threaded gather lost row order");
+    }
     require(mapped.gather_rows("embeddings", {}).empty(), "empty gather not empty");
     bool rejected = false;
     try { mapped.expert("experts", 4); } catch (const std::exception &) { rejected = true; }

@@ -1,10 +1,11 @@
-#include "../src/tq3_expert_cache.hpp"
+#include "tq3_expert_cache.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <random>
 #include <stdexcept>
+#include <string>
 
 using namespace tqllm;
 static void check(cudaError_t rc) { if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc)); }
@@ -143,6 +144,65 @@ static void run() {
             require(current.prefetch_used() > 0, "registered prefetch was never consumed");
             current.clear(); compare(0, {0, 1});
             current.set_miss_stream(nullptr);
+        }
+        {   // TQueue: the cache owns its miss stream; a caller's miss stream only switches split mode on. A caller (one DecodeModel per
+            // request) destroying that stream must not break the shared cache's later misses and prefetches (old: misses ran on the
+            // caller's destroyed handle -> "context is destroyed", F31)
+            MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+            current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+            cudaStream_t m1, c1; check(cudaStreamCreateWithFlags(&m1, cudaStreamNonBlocking)); check(cudaStreamCreateWithFlags(&c1, cudaStreamNonBlocking));
+            current.set_miss_stream(m1); selected = &current;
+            compare(0, {0, 1}); current.prefetch(1, {3, 4}, c1); compare(1, {3, 4});
+            check(cudaDeviceSynchronize()); check(cudaStreamDestroy(m1));  // the request's miss stream goes; its copy stream stays (c1)
+            std::string failed;
+            try { for (int l = 0; l < layers; ++l) { current.prefetch(l, {2, 4}, c1); compare(l, {2, 0, 4, 2}, true); } check(cudaDeviceSynchronize()); }
+            catch (const std::exception & e) { failed = e.what(); }
+            cudaGetLastError();
+            if (!failed.empty()) throw std::runtime_error("cache used a caller stream after the caller destroyed it: " + failed);
+            current.set_miss_stream(nullptr); check(cudaStreamDestroy(c1));
+            std::puts("cache-owned miss stream: the caller's miss stream destroyed mid-split, later misses / prefetches byte-exact PASS");
+        }
+        int integrated = 0; check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0));
+        if (!integrated) {  // a full device (bank refill after a prefill borrow) must skip prefetches, not fail or leave freed staging
+            for (int a = 0; a < layers; ++a) {
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                for (int l = 0; l < layers; ++l) compare(l, {0, 1});
+                current.prefetch(a, {2}, copies); check(cudaStreamSynchronize(copies));
+                std::vector<void *> hog;
+                for (size_t chunk = size_t(64) << 20; chunk >= (size_t(1) << 20); chunk /= 2)
+                    for (void * p = nullptr; cudaMalloc(&p, chunk) == cudaSuccess; p = nullptr) hog.push_back(p);
+                cudaGetLastError();
+                std::string failed;
+                for (int l = 0; l < layers; ++l) try { current.prefetch(l, {3, 4}, copies); } catch (const std::exception & e) { if (failed.empty()) failed = e.what(); }
+                check(cudaStreamSynchronize(copies));
+                for (void * p : hog) check(cudaFree(p));
+                try { current.prefetch(a, {4, 2}, copies); compare(a, {2, 4}, true); } catch (const std::exception & e) { if (failed.empty()) failed = e.what(); }
+                if (!failed.empty()) throw std::runtime_error("prefetch on a full device, staged from layer " + std::to_string(a) + ": " + failed);
+                current.set_miss_stream(nullptr);
+            }
+            std::puts("prefetch on a full device: skipped, staging stays valid, later prefetches byte-exact PASS");
+            {   // a bank needed on a full device evicts the least recently used bank instead of failing (a long context's
+                // attention state takes the room the banks had at start-up)
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                for (int l = 0; l + 1 < layers; ++l) compare(l, {0, 1});
+                std::vector<void *> hog;
+                for (size_t chunk = size_t(64) << 20; chunk >= (size_t(1) << 20); chunk /= 2)
+                    for (void * p = nullptr; cudaMalloc(&p, chunk) == cudaSuccess; p = nullptr) hog.push_back(p);
+                cudaGetLastError();
+                const auto ev0 = current.stats().evictions;
+                std::string failed;
+                try { compare(layers - 1, {2, 4}, true); } catch (const std::exception & e) { failed = e.what(); }
+                for (void * p : hog) check(cudaFree(p));
+                if (!failed.empty()) throw std::runtime_error("bank on a full device: " + failed);
+                require(current.stats().evictions > ev0, "bank on a full device: nothing was evicted");
+                compare(0, {0, 3}, true);  // an evicted layer comes back byte-exact
+                current.set_miss_stream(nullptr);
+            }
+            std::puts("bank on a full device: least recently used bank evicted, new bank and reloaded bank byte-exact PASS");
         }
         check(cudaStreamSynchronize(misses)); check(cudaStreamSynchronize(copies));
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",

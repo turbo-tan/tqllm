@@ -8,7 +8,7 @@ WORKDIR /src
 COPY CMakeLists.txt ./
 COPY src ./src
 COPY include ./include
-COPY kernels ./kernels
+COPY cmake ./cmake
 COPY tools ./tools
 COPY tests ./tests
 COPY third_party ./third_party

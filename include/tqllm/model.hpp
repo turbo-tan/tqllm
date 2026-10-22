@@ -61,7 +61,8 @@ public:
     // Batched step: one verify pass over all listed slots (weights read once); done[i] = slot slots[i] finished.
     void spec_step(const std::vector<int> & slots, std::vector<char> & done);
     std::vector<uint32_t> spec_finish(uint64_t * stats = nullptr);
-    std::vector<uint32_t> spec_tokens(int slot = 0) const;  // ids generated so far by a begun slot (streaming)
+    // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
+    const std::vector<uint32_t> & spec_tokens(int slot = 0) const;
     // Drafter target features [P][nf * hidden] (BF16 bits) of every position of `tokens` (prefilled from 0); returns nf.
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats);
     // Prefill tokens at positions [pos, pos + n) without the LM head (KV and recurrent state only); false: unsupported.

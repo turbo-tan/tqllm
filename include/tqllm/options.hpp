@@ -11,7 +11,7 @@ struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
-    std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv_store.hpp; flat, paged, tiered)
+    std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
                            // stand-ins R times smaller that the GPU reads directly (approximate; staged + tq3 KV only)
@@ -25,9 +25,7 @@ struct EngineOptions {
                            // link speed (one slot, compressed KV); off: the newest positions stay in host memory
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
                         // decides (0 when the context fits, else the fewest that do)
-    std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (none: native MTP heads when the model has them)
-    uint32_t mtp_from = 0;     // --mtp-from N with -md: prompts of N+ tokens draft with MTP, shorter ones with DFlash2
-    int mtp_depth = 4;         // --mtp-depth N: MTP drafts per step when DFlash2 is loaded too (else --draft-max)
+    std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (the MTP head is then not loaded)
     bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 4 by default)
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
     int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
@@ -36,6 +34,14 @@ struct EngineOptions {
     int lookup = 0;            // --lookup L: prompt-lookup chain of up to L tokens beside the draft tree (copy tasks)
     int lookup_first = 0;      // --lookup-first K: a lookup match of >= K tokens takes the whole verify block
     int ubatch = 0;            // -ub / --ubatch-size: prefill buffer columns (0: engine default)
+    // Flash-Next layer-major prefill (.tqfn); -1 = the engine default
+    int prefill_chunk = -1;       // --prefill-chunk N: prompt tokens per prefill chunk (default: the manifest's chunk=)
+    int prefill_sub = -1;         // --prefill-sub N: tokens per dense sub-chunk inside a chunk (2048)
+    int prefill_stage = -1;       // --prefill-stage N: experts per staging bank half for streamed experts (192)
+    long prefill_reserve_mb = -1; // --prefill-reserve-mb N: extra memory freed (expert banks borrowed) per long prompt (3400)
+    long prefill_arena_mb = -1;   // --prefill-arena-mb N: prefill scratch arena (3800)
+    long dense_cache_mb = -1;     // --dense-cache-mb N: FP16 dense weight images reused by a chunk's sub-chunks (600; 0 off)
+    std::string prefill_borrow;   // --prefill-borrow auto|all|N: expert banks released for a long prompt (auto: the fewest the plan needs)
     // memory placement; the fit (Model) sets them when the device is short
     bool embed_host = false;   // token embeddings in host memory
     bool head_host = false;    // int8 LM head in host memory
@@ -61,6 +67,11 @@ struct EngineOptions {
 
     std::string kv_format() const;  // the KV format name these options select ("bf16" when none)
 };
+
+// The one drafter a run loads: DFlash2 with -md, the model's MTP head with --mtp, neither without them. Throws for -md
+// with --mtp: the unused drafter is never loaded or run.
+struct Drafters { bool dflash = false, mtp = false; };
+Drafters drafters(const EngineOptions & o);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

@@ -1,7 +1,7 @@
 // Grouped expert GEMM (prefill) on plain and TQFN_TILED banks: every u4h expert format must implement it, the tiled bank
 // must give the same bytes as the plain one, and the result must match the dedup matvec within FP16 / BF16 rounding.
-#include "../src/formats/weight_format.hpp"
-#include "../src/gguf.hpp"
+#include "weight_format.hpp"
+#include "gguf.hpp"
 #include "quant_kernels.cuh"
 #include <cmath>
 #include <cstdio>

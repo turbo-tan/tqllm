@@ -1,6 +1,6 @@
 // Parallel-slot memory guard: tqserve's startup precheck (fit_slots) and the bounded graph cache (GraphLru).
-#include "../src/fit_context.hpp"
-#include "../src/graph_lru.hpp"
+#include "fit_context.hpp"
+#include "graph_lru.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <vector>

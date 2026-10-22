@@ -5,11 +5,11 @@
 // position t (predicting t + 1) are compared with the reference: KL(ref || model) over the reference's top K plus one
 // bucket for the rest, top-1 agreement and the model's NLL of the actual next token.
 // Writes PREFIX.kld.f32, PREFIX.top1.u8, PREFIX.nll.f32 ([chunks][L-1]; positions < skip are NaN / 255) and a summary.
-#include "../src/tokenizer_path.hpp"
+#include "tokenizer_path.hpp"
 #include "tqllm/options.hpp"
 #include <cstring>
 #include "tqllm/model.hpp"
-#include <src/json.hpp>
+#include <third_party/nlohmann/json.hpp>
 
 #include <cuda_runtime.h>
 

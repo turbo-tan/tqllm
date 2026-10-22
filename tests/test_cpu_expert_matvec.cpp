@@ -1,12 +1,12 @@
 // Test + bench harness for the AVX2 IQ4_NL expert matvec.
 //
 // CORRECTNESS REFERENCE: the project's REAL tqllm::dequantize_host(type 20, ...) linked
-// from src/dequant.cpp -- not a re-implementation. So "<=1e-5 vs dequantize_host" is
+// from src/formats/weight/dequant.cpp -- not a re-implementation. So "<=1e-5 vs dequantize_host" is
 // measured against the same code the engine uses, which is what Claude asked for.
 //
 // The i16/int8 path is LOSSY by design (x requantised per 32-block). Its error is measured
 // and reported SEPARATELY, never folded into the fp32 accuracy claim.
-#include "../src/cpu_expert_matvec.hpp"
+#include "cpu_expert_matvec.hpp"
 
 #include <cstdio>
 #include <cstdlib>

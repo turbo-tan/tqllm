@@ -1,6 +1,6 @@
 // fn_gdn at the Flash-Next decode shape: writes out + next state to argv[1] and prints the time per call.
 // Run once without and once with TQFN_GDN_FAST=1, then compare the two files byte for byte.
-#include "../kernels/qwen4exp_kernels.cuh"
+#include "qwen4exp_kernels.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>

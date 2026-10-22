@@ -1,0 +1,4 @@
+Files in this directory are copied from llama.cpp (https://github.com/ggml-org/llama.cpp), ggml/src/ggml-cuda, commit
+fb4b273, MIT License, Copyright (c) 2023-2026 The ggml authors. tqLLM changes: the tile loaders of the codebook expert
+formats read tqLLM's bank layout (U4hTile) instead of GGUF blocks. Idea of launching MMQ directly per expert group from
+the prefill path: Strata (MIT, Copyright (c) 2026 Niko1221 and the Strata contributors).

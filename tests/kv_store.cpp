@@ -1,7 +1,8 @@
-// Host-only tests for KV storage (src/kv_store.hpp): pool accounting, flat layout, paging, rollback, tiered offload and
+// Host-only tests for KV storage (src/kv/kv_store.hpp): pool accounting, flat layout, paging, rollback, tiered offload and
 // restore. A fake memory with byte budgets stands in for the GPU and pinned host memory.
-#include "src/kv_store.hpp"
+#include "kv_store.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,26 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
+
+// mapping granule = the OS page (4 KiB on Linux x86 / arm64 kernels with 4K pages, 16 KiB on macOS arm64)
+static size_t page_granule() {
+#ifdef TQLLM_TEST_GRANULE
+    return TQLLM_TEST_GRANULE;  // e.g. -DTQLLM_TEST_GRANULE=16384 exercises the macOS arm64 page on Linux
+#else
+    return size_t(sysconf(_SC_PAGESIZE));
+#endif
+}
+// physical backing for the mapped test ranges: memfd on Linux, an unlinked temp file elsewhere (macOS has no memfd)
+static int phys_fd() {
+#if defined(__linux__)
+    return memfd_create("kvphys", 0);
+#else
+    char path[] = "/tmp/tqllm-kvphys-XXXXXX";
+    const int f = mkstemp(path);
+    if (f >= 0) unlink(path);
+    return f;
+#endif
+}
 
 using namespace tqllm;
 
@@ -80,7 +101,7 @@ struct FakeMemory : KvMemory {
     }
     void * phys_alloc(size_t n) override {
         if (dev_live + n > dev_budget) return nullptr;
-        if (fd < 0) fd = memfd_create("kvphys", 0);
+        if (fd < 0) fd = phys_fd();
         if (fd < 0 || ftruncate(fd, off_t(fd_size + n))) return nullptr;
         dev_live += n;
         ++phys_live;
@@ -256,13 +277,13 @@ static void test_host_tail() {
     // flat page of 4096 positions, last 1000 in host memory; granule 4 KiB (2 MiB on GPUs)
     const int64_t ctx = 4096, dev_rows = ctx - 1000;
     FakeMemory mem(size_t(1) << 30, size_t(1) << 30);
-    mem.gran = 4096;
+    mem.gran = page_granule();
     KvGeometry g = geom(ctx);
     g.device_rows = dev_rows;
     {
         KvPool pool(mem, g, 2, 0);  // two slots
-        const size_t row = 448, page = size_t(ctx) * row, dev = (dev_rows * row + 4095) / 4096 * 4096;
-        const size_t stride = (page + 4095) / 4096 * 4096;
+        const size_t row = 448, gr = mem.gran, page = size_t(ctx) * row, dev = (dev_rows * row + gr - 1) / gr * gr;
+        const size_t stride = (page + gr - 1) / gr * gr;
         CHECK(pool.bytes(KvTier::device) == size_t(2) * 32 * dev, "device bytes: each page's head, rounded to the granule");
         CHECK(pool.bytes(KvTier::host) == size_t(2) * 32 * (stride - dev), "host bytes: each page's tail");
         CHECK(mem.dev_live == pool.bytes(KvTier::device) && mem.host_live == pool.bytes(KvTier::host),
@@ -286,7 +307,7 @@ static void test_host_tail() {
     CHECK(mem.dev_live == 0 && mem.host_live == 0 && mem.ranges.empty(), "pool release unmaps both tiers");
     {
         FakeMemory small(size_t(1) << 30, 4096);  // host budget too small for the tails
-        small.gran = 4096;
+        small.gran = page_granule();
         bool threw = false;
         try { KvPool pool(small, g, 2, 0); } catch (const std::runtime_error & e) { threw = std::strstr(e.what(), "out of memory"); }
         CHECK(threw, "host tails that do not fit throw out of memory");
@@ -311,7 +332,7 @@ static void test_staged() {
     const int64_t ctx = 2048, window = 512, blk = 48;
     const int layers = 4;
     FakeMemory mem(size_t(1) << 30, size_t(1) << 30);
-    mem.gran = 4096;  // 448 B rows straddle granules, as tq3 rows do on 2 MiB
+    mem.gran = page_granule();  // 448 B rows straddle granules, as tq3 rows do on 2 MiB
     KvGeometry g{layers, 448, 448, ctx, window, true};
     {
     KvPool pool(mem, g, 1, 0);
@@ -368,9 +389,10 @@ static void test_staged() {
     CHECK(mem.phys_live == 0 && mem.ranges.empty() && mem.dev_live == 0 && mem.host_live == 0,
           "a staged pool releases every mapping, physical chunk and host copy");
     {
-        KvGeometry tiny{layers, 448, 448, ctx, 8, true};  // window of 8 rows: a 48-row block cannot fit
+        KvGeometry tiny{layers, 448, 448, ctx, 8, true};  // window of 8 rows: a block spanning several granules cannot fit
         KvPool p2(mem, tiny, 1, 0);
-        CHECK(!p2.stage_ensure(0, 48) || !p2.stage_ensure(40, 88), "a block bigger than the window is refused, not corrupted");
+        const int64_t n = std::max<int64_t>(48, int64_t(4 * mem.gran / 448) + 8);  // 48 rows at a 4 KiB granule
+        CHECK(!p2.stage_ensure(0, n) || !p2.stage_ensure(n - 8, 2 * n - 8), "a block bigger than the window is refused, not corrupted");
     }
 }
 

@@ -3,8 +3,8 @@
 // Declares tqllm_cuda::iq3_matvec_bf16, used below as the decode reference for GGUF 21.
 // The target's include dir is ${CMAKE_CURRENT_SOURCE_DIR}/kernels, so a bare name resolves.
 #include "quant_kernels.cuh"
-#include "../src/formats/weight_format.hpp"
-#include "../src/moe.hpp"
+#include "weight_format.hpp"
+#include "moe.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -75,7 +75,7 @@ static void route_test() {
 
 // Every GGUF type whose runtime format now has grouped-expert support, so the identity suite
 // covers the whole u4h family instead of only the three formats that were wired first.
-//   bytes        = encoded size of one block (src/gguf.cpp gguf_block_layout)
+//   bytes        = encoded size of one block (src/core/gguf.cpp gguf_block_layout)
 //   scale_off    = half-scale offset(s) inside the block that the loader memcpys; the generator
 //                  writes a varying non-zero scale there (never 0 -> no inf/nan reciprocals)
 //   clamp        = byte range the loader uses as a divisor/table index, forced to 1..32
@@ -151,7 +151,7 @@ static void grouped_test(unsigned type, int n, bool per_expert, bool use_gemm = 
     Device<int> di(ids.size()); di.put(ids);
     Device<int> counts(e), groups(e * n);
     Device<__nv_bfloat16> out(n * k * rows), ref(n * k * rows);
-    cudaStream_t stream; ck(cudaStreamCreate(&stream));
+    cudaStream_t stream = cudaStreamPerThread;
     // Device IDs must remain device-side and valid during CUDA graph replay.
     ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     if (use_gemm) {
@@ -212,7 +212,7 @@ static void grouped_test(unsigned type, int n, bool per_expert, bool use_gemm = 
     ck(cudaStreamSynchronize(stream));
     const auto y = out.get(n * k * rows), yr = ref.get(n * k * rows);
     require(std::memcmp(y.data(), yr.data(), y.size() * 2) == 0, "grouped expert differs from row-sliced reference");
-    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); ck(cudaStreamDestroy(stream));
+    ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph)); 
     for (void * p : allocations) ck(cudaFree(p));
     std::printf("GGUF %2u (%s) grouped %s n=%d per_expert=%d graph replay + tail rows: bit-identical%s\n", sp.type,
                 sp.name, use_gemm ? "GEMM" : "matvec", n, per_expert, sp.legacy_iq3 ? " (vs legacy dense)" : "");
@@ -254,7 +254,7 @@ static void pair_test(unsigned type, int n) {
     Device<__half> dx(x.size()); dx.put(x);
     Device<int> di(ids.size()); di.put(ids);
     Device<__nv_bfloat16> ya(n * k * rows), yb(n * k * rows), ra(n * k * rows), rb(n * k * rows);
-    cudaStream_t stream; ck(cudaStreamCreate(&stream));
+    cudaStream_t stream = cudaStreamPerThread;
     a.fmt->expert_matvec2(a, b, dx.p, ya.p, yb.p, rows, di.p, n, k, stream);
     a.fmt->expert_matvec(a, dx.p, ra.p, rows, di.p, n, k, false, stream);
     b.fmt->expert_matvec(b, dx.p, rb.p, rows, di.p, n, k, false, stream);
@@ -262,7 +262,7 @@ static void pair_test(unsigned type, int n) {
     const auto y1 = ya.get(n * k * rows), y2 = yb.get(n * k * rows), r1 = ra.get(n * k * rows), r2 = rb.get(n * k * rows);
     require(std::memcmp(y1.data(), r1.data(), y1.size() * 2) == 0, "paired expert (gate) differs from expert_matvec");
     require(std::memcmp(y2.data(), r2.data(), y2.size() * 2) == 0, "paired expert (up) differs from expert_matvec");
-    ck(cudaStreamDestroy(stream));
+    
     for (void * p : allocations) ck(cudaFree(p));
     std::printf("GGUF %2u (%s) paired gate + up n=%d: bit-identical\n", sp.type, sp.name, n);
 }
@@ -367,7 +367,7 @@ static void split_test(unsigned type, int n, bool per_expert, bool use_gemm, con
     di.put(ids); dhs.put(hot_slot); dcs.put(cold_slot);
     Device<int> counts(e), groups(e * n), counts2(e), groups2(e * n);
     Device<__nv_bfloat16> ref(n * k * rows), out(n * k * rows);
-    cudaStream_t stream; ck(cudaStreamCreate(&stream));
+    cudaStream_t stream = cudaStreamPerThread;
     auto launch = [&](const tqllm::Mat & mm, const int * id, int experts, int * cn, int * gr, __nv_bfloat16 * y) {
         if (use_gemm) {
             tqllm_cuda::moe_group(id, cn, gr, experts, n, k, stream);
@@ -394,7 +394,7 @@ static void split_test(unsigned type, int n, bool per_expert, bool use_gemm, con
                      __bfloat162float(y[i]), __bfloat162float(yr[i]));
         throw std::runtime_error("hot / cold split differs from the single launch");
     }
-    ck(cudaStreamDestroy(stream));
+    
     for (void * p : allocations) ck(cudaFree(p));
     std::printf("GGUF %2u (%s) hot/cold split %s n=%d per_expert=%d cold=%zu: bit-identical\n", sp.type, sp.name,
                 use_gemm ? "GEMM" : "matvec", n, per_expert, cold.size());

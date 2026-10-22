@@ -1,5 +1,5 @@
 // tqkbench: TQ3_4S single-column matvec variants on real model shapes; reports effective weight GB/s.
-// Variants are templated so the fastest can be ported to kernels/quant.cu once it also passes test-quant.
+// Variants are templated so the fastest can be ported to src/formats/weight/quant.cu once it also passes test-quant.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

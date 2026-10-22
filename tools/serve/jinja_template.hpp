@@ -2,7 +2,7 @@
 // Chat template rendering with llama.cpp's Jinja engine (vendored in third_party/jinja, MIT, (c) the ggml authors).
 // The native Qwen renderer in session.hpp stays the default; this path renders any template from the GGUF or a file,
 // like llama.cpp --jinja, and is the reference the native renderer is tested against.
-#include "src/json.hpp"
+#include "nlohmann/json.hpp"
 
 #include <memory>
 #include <string>

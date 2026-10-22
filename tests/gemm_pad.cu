@@ -1,6 +1,6 @@
 // Prefill GEMM padding: rows [n, padded) of the GEMM input are zeroed before the FP8 activation quantisation reads them,
 // so no padding row carries stale data (NaN here) into the codes or scales; the real rows are untouched.
-#include "src/gemm_pad.hpp"
+#include "gemm_pad.hpp"
 #include "fp8_gemm.cuh"
 
 #include <cuda_fp16.h>

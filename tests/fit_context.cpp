@@ -1,4 +1,4 @@
-#include "../src/fit_context.hpp"
+#include "fit_context.hpp"
 #include <algorithm>
 #include <cstdio>
 

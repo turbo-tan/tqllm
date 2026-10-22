@@ -1,7 +1,7 @@
 // Image embeddings from an mmproj GGUF: [int32 nx, ny, n_tok, n_embd] + float[n_tok][n_embd] (the layout of
 // llama.cpp mtmd_get_output_embd, for parity checks).
 // usage: tqvision MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N]
-#include "../src/vision.hpp"
+#include "vision.hpp"
 
 #include <cuda_runtime.h>
 
@@ -24,8 +24,7 @@ int main(int argc, char ** argv) {
         else if (!std::strcmp(argv[i], "--image-max-tokens")) mx = std::atoi(argv[i + 1]);
     }
     try {
-        cudaStream_t s;
-        cudaStreamCreate(&s);
+        cudaStream_t s = cudaStreamPerThread;  // ordered with the synchronous copies (stream 0 is per thread)
         auto enc = tqllm::VisionEncoder::load(argv[1], s);
         enc->set_token_limits(mn, mx);
         std::ifstream in(argv[2], std::ios::binary);

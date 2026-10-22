@@ -8,11 +8,11 @@ This product includes third-party code under its own licence:
 * third_party/jinja - the Jinja chat-template engine from llama.cpp.
   MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: third_party/jinja/LICENSE.
 
-* kernels/*_grid.inc, kernels/ksigns_iq2xs.inc, kernels/kvalues_iq4nl.inc - the IQ quantisation grids, sign tables and
+* src/formats/weight/*_grid.inc, src/formats/weight/ksigns_iq2xs.inc, src/formats/weight/kvalues_iq4nl.inc - the IQ quantisation grids, sign tables and
   IQ4_NL codebook from ggml (llama.cpp), used only to read GGUF files stored in those formats.
   MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
 
-* src/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
+* third_party/stb/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
 

@@ -43,22 +43,24 @@ test in `tests/` and register it in `CMakeLists.txt` with `add_test`.
 
 ## Where things plug in
 
+The source layout and its layering rules are in [AGENTS.md](AGENTS.md); read it first.
+
 Most extensions are a strategy object plus one registration line; the engine does not branch on the type.
 
 ### A weight format
 
 Weight formats turn a GGUF tensor into a device matrix and supply its kernels. The interface is
-[src/formats/weight_format.hpp](src/formats/weight_format.hpp).
+[src/formats/weight/weight_format.hpp](src/formats/weight/weight_format.hpp).
 
-1. Add `src/formats/<name>.cpp` implementing `WeightFormat`: `load()` (GGUF bytes to device layout), `matvec()` (decode,
+1. Add `src/formats/weight/<name>.cpp` implementing `WeightFormat`: `load()` (GGUF bytes to device layout), `matvec()` (decode,
    up to `max_matvec_cols()` columns), `dequant_h()` (FP16 for the prefill GEMM), and the optional `gemm()`,
    `matvec_ld()` and `row_bytes()` when the format can do them.
-2. Put its CUDA kernels in `kernels/formats/<name>.cu`.
-3. Register it: add `register_<name>()` to the list in [src/formats/registry.cpp](src/formats/registry.cpp) with the
+2. Put its CUDA kernels in `src/formats/weight/<name>.cu`, next to its host code.
+3. Register it: add `register_<name>()` to the list in [src/formats/weight/registry.cpp](src/formats/weight/registry.cpp) with the
    GGUF type id it loads. Ids of 300 and above are reserved for tqLLM-only formats; pick the next free one and say so in
    the PR.
 4. If the format has more than one decode kernel, add rows to the rule table in
-   [kernels/formats/matvec_rules.hpp](kernels/formats/matvec_rules.hpp). Each rule cites the measurement that justified
+   [src/formats/weight/matvec_rules.hpp](src/formats/weight/matvec_rules.hpp). Each rule cites the measurement that justified
    it.
 5. Tests: matvec against a dequantise-then-multiply reference, width independence (one column at a time equals a batch),
    and, for formats used by MoE experts, the grouped-expert tests in `tests/`.
@@ -66,27 +68,27 @@ Weight formats turn a GGUF tensor into a device matrix and supply its kernels. T
 ### A KV-cache format
 
 KV formats own the record size, the cache writer and the attention for verify and prefill. The interface is
-[src/formats/kv_format.hpp](src/formats/kv_format.hpp).
+[src/formats/kv/kv_format.hpp](src/formats/kv/kv_format.hpp).
 
-1. Add `src/formats/kv_<name>.cpp` implementing `KvFormat`: `key_bytes()` and `value_bytes()` per context,
+1. Add `src/formats/kv/kv_<name>.cpp` implementing `KvFormat`: `key_bytes()` and `value_bytes()` per context,
    `write_and_attend()`, and the capability flags (`tree_ok()` for tree verify, `compressed()`, `compact_codecs()` for
    TqCache stand-ins).
 2. Fill in `provenance()`: who made it, the source, the licence, and whether the idea or code was borrowed. It is
    printed by `tqserve --list-kv`.
-3. Register it by name in [src/formats/kv_registry.cpp](src/formats/kv_registry.cpp). Users select it with `--kv <name>`.
+3. Register it by name in [src/formats/kv/kv_registry.cpp](src/formats/kv/kv_registry.cpp). Users select it with `--kv <name>`.
 4. Tests: attention against the BF16 cache within the stated tolerance (or bit-identical if the format claims so),
    tree verify if `tree_ok()`, and the memory count in `tests/kv_mem_count.cu`.
 
 ### A model architecture (engine)
 
-Each architecture is an engine behind `tqllm::Model`. The interface is [src/engine.hpp](src/engine.hpp): `step()` for
+Each architecture is an engine behind `tqllm::Model`. The interface is [src/engine/engine.hpp](src/engine/engine.hpp): `step()` for
 one token, `verify()` and `commit()` for speculative decoding, and optional multi-slot and drafter methods. Today's
-engine is [src/qwen35.cpp](src/qwen35.cpp): Qwen3.5 / Qwen3.8 hybrid attention + Gated DeltaNet, dense and mixture-of-experts
-(`qwen35moe`, grouped expert kernels in [kernels/moe.cu](kernels/moe.cu)).
+engine is [src/models/qwen/qwen35/qwen35.cpp](src/models/qwen/qwen35/qwen35.cpp): Qwen3.5 / Qwen3.8 hybrid attention + Gated DeltaNet, dense and mixture-of-experts
+(`qwen35moe`, grouped expert kernels in [src/experts/moe.cu](src/experts/moe.cu)).
 
-1. Add `src/<arch>.cpp` with an `Engine` subclass and a `make_<arch>_engine()` factory. Reuse the weight and KV formats
+1. Add `src/models/<family>/<arch>/` with an `Engine` subclass and a `make_<arch>_engine()` factory (see AGENTS.md). Reuse the weight and KV formats
    through their registries rather than calling kernels directly.
-2. Dispatch to it from [src/model.cpp](src/model.cpp) on the GGUF `general.architecture` (or the safetensors
+2. Dispatch to it from [src/engine/model.cpp](src/engine/model.cpp) on the GGUF `general.architecture` (or the safetensors
    `model_type`).
 3. Validate the config at load and refuse clearly what is not implemented yet.
 4. Tests: greedy tokens against a reference implementation on a few prompts (a golden file under `tests/`, produced by a
@@ -98,7 +100,7 @@ Please open an issue before starting a new architecture, so the work is not dupl
 
 Settings are command-line options. Environment variables are only for diagnostics or overrides without a CLI form, and
 every one is declared in [config/flags.yaml](config/flags.yaml) (`kind: user`, `debug` or `retired`). Run
-`python3 tools/gen_flags.py` to regenerate `docs/FLAGS.md` and `src/flags_gen.hpp`; the `flags_registry` test fails if
+`python3 tools/gen_flags.py` to regenerate `docs/FLAGS.md` and `src/core/flags_gen.hpp`; the `flags_registry` test fails if
 they are out of date. A/B switches used while developing are removed before merge, keeping the winner as the default.
 
 ### Plugins (experimental)

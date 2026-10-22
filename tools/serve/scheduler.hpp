@@ -120,7 +120,7 @@ private:
 
     // after a step: the slot's ids go to the stream and through the repeat guard (tripped -> the request ends)
     bool step_done(Job & job, int slot) {
-        const auto ids = model_.spec_tokens(slot);
+        const auto & ids = model_.spec_tokens(slot);  // read now; publish() copies for the stream thread
         if (job.req.observation) job.req.observation->tokens(static_cast<uint32_t>(ids.size()));
         const bool tripped = job.repeat.check(ids);
         if (job.stream) publish(job, ids);
@@ -195,7 +195,8 @@ private:
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     if (job->req.observation) job->req.observation->prefill(job->result.prompt_tokens);
-                    model_.spec_begin(job->prompt, job->count, draft_length());
+                    { tqllm::PrefillObservation progress(observe_prefill(job->req.observation));
+                    model_.spec_begin(job->prompt, job->count, draft_length()); }
                     if (job->req.observation) job->req.observation->decoding();
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500

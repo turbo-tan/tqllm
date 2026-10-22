@@ -17,7 +17,7 @@ using namespace tqllm_cuda;
 int main() {
     constexpr int NB = 8192, KVH = 4, H = 24, D = 256, R = 256;
     cudaStream_t st;
-    cudaStreamCreate(&st);
+    st = cudaStreamPerThread;
     std::mt19937 g(5);
     std::normal_distribution<float> nd;
     const int ts = 2 * KVH * D;

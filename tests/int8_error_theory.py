@@ -8,7 +8,7 @@ import math
 
 print("=== int8 x-quantisation error: THEORY vs MEASURED (gate/up 640x2560, ntok=1) ===\n")
 
-# Codebook kvalues_iq4nl (16 signed entries) -- from kernels/kvalues_iq4nl.inc.
+# Codebook kvalues_iq4nl (16 signed entries) -- from src/formats/weight/kvalues_iq4nl.inc.
 kv = [-127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113]
 kv_rms = math.sqrt(sum(v*v for v in kv)/len(kv))
 print(f"  |kv| RMS               = {kv_rms:.2f}")

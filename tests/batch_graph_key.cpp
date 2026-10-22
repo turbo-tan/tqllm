@@ -1,4 +1,4 @@
-#include "../src/batch_graph_key.hpp"
+#include "batch_graph_key.hpp"
 #include <cstdio>
 #include <set>
 

@@ -1,9 +1,9 @@
 // TQ3_4S / Q6_K kernels vs a CPU reference that follows llama.cpp-tq3's dequantize_row_tq3_4s / dequantize_row_q6_K.
 #include "quant_kernels.cuh"
-#include "formats/matvec_rules.hpp"
+#include "matvec_rules.hpp"
 #include "qwen35_kernels.cuh"
-#include "../src/dequant.hpp"
-#include "../src/formats/weight_format.hpp"
+#include "dequant.hpp"
+#include "weight_format.hpp"
 #include <cuda_fp8.h>
 
 #include <cuda_fp16.h>
@@ -411,7 +411,7 @@ int main() {
         for (auto & c : codes) c = uint8_t(byte(g) % 8);
         for (int r = 0; r < tr; ++r)
             for (int b = 0; b < nb; ++b) {
-                uint32_t a[2] = {0, 0}, cs = 0;  // nibble-sliced planes (kernels/formats/tq4.cu)
+                uint32_t a[2] = {0, 0}, cs = 0;  // nibble-sliced planes (src/formats/weight/tq4.cu)
                 for (int i = 0; i < 32; ++i) {
                     const uint32_t c = codes[size_t(r) * tk + b * 32 + i];
                     a[i / 16] |= (c & 3u) << (4 * (i % 8) + 2 * ((i / 8) % 2));

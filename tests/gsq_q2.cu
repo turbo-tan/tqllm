@@ -1,6 +1,6 @@
-#include "../src/formats/weight_format.hpp"
-#include "../src/gguf.hpp"
-#include "formats/gsq_q2.cuh"
+#include "weight_format.hpp"
+#include "gguf.hpp"
+#include "gsq_q2.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -56,6 +56,23 @@ static void run(int cols, int n, bool per_expert) {
         const float got = __bfloat162float(y[a * rows + r]);
         require(std::abs(got - expect) <= .005 * std::abs(expect) + 2e-5, "Q2 grouped dot differs from independent double oracle");
     }
+    {   // grouped experts (prefill): tensor-core kernel, and the scalar one with TQFN_Q2_DOT_GROUPED=1
+        const int capacity = n * topk;
+        std::vector<int> counts(experts, 0), groups(size_t(experts) * capacity, 0);
+        for (int a = 0; a < n * topk; ++a) groups[size_t(ids[a]) * capacity + counts[ids[a]]++] = a;
+        Device<int> dc(counts.size()), dg(groups.size()); dc.put(counts); dg.put(groups);
+        Device<__nv_bfloat16> dyg(size_t(rows) * ids.size());
+        check(cudaMemset(dyg.p, 0, size_t(rows) * ids.size() * sizeof(__nv_bfloat16)));
+        require(format->expert_gemm(m, dx.p, dyg.p, rows, dc.p, dg.p, capacity, experts, topk, per_expert, nullptr), "Q2 expert_gemm unsupported");
+        check(cudaDeviceSynchronize());
+        auto yg = dyg.get(size_t(rows) * ids.size());
+        for (size_t a = 0; a < ids.size(); ++a) for (int r = 0; r < rows; ++r) {
+            double expect = 0;
+            for (int j = 0; j < cols; ++j)
+                expect += double(decoded[(size_t(ids[a]) * rows + r) * cols + j]) * __half2float(x[(per_expert ? a : a / topk) * cols + j]);
+            require(std::abs(__bfloat162float(yg[a * rows + r]) - expect) <= .005 * std::abs(expect) + 2e-5, "Q2 grouped GEMM differs from independent double oracle");
+        }
+    }
     Device<float> logits(size_t(m.rows) * n);
     format->matvec_f32(m, dx.p, logits.p, n, nullptr);
     auto f = logits.get(size_t(m.rows) * n);
@@ -65,7 +82,7 @@ static void run(int cols, int n, bool per_expert) {
         require(std::abs(f[size_t(a) * m.rows + r] - expect) <= 2e-6 * std::abs(expect) + 2e-6, "Q2 F32 dot differs from oracle");
     }
     cudaGraph_t graph{}; cudaGraphExec_t exec{}; cudaStream_t stream{};
-    check(cudaStreamCreate(&stream)); check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    stream = cudaStreamPerThread; check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     format->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, stream);
     check(cudaStreamEndCapture(stream, &graph)); check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
     check(cudaGraphLaunch(exec, stream)); check(cudaStreamSynchronize(stream));
@@ -77,7 +94,7 @@ static void run(int cols, int n, bool per_expert) {
     check(cudaGraphLaunch(exec, stream)); check(cudaStreamSynchronize(stream));
     const auto changed_replay = dy.get(y.size());
     require(std::memcmp(changed.data(), changed_replay.data(), changed.size() * sizeof(y[0])) == 0, "Q2 graph ignored changed device IDs");
-    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); 
     ids[0] = experts; di.put(ids);
     format->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, nullptr);
     y = dy.get(y.size()); require(std::isnan(__bfloat162float(y[0])), "invalid device expert ID did not fail closed");
@@ -88,7 +105,7 @@ static void run(int cols, int n, bool per_expert) {
 }
 int main() {
     try {
-        for (int k : {64, 640, 2560}) for (int n : {1, 8, 12}) for (bool per : {false, true}) run(k, n, per);
-        std::puts("GSQ Q2_0: 18 code/scale/oracle/grouped/F32/graph/bounds scenarios PASS"); return 0;
+        for (int k : {64, 640, 2560}) for (int n : {1, 8, 12, 200}) for (bool per : {false, true}) run(k, n, per);
+        std::puts("GSQ Q2_0: 24 code/scale/oracle/grouped/F32/graph/bounds scenarios PASS"); return 0;
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

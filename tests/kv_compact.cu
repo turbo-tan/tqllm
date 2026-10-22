@@ -94,8 +94,9 @@ static double rel_rms(const std::vector<float> & a, const std::vector<float> & b
 
 int main() {
     const int N = 4096, C = 1024;  // cache positions, stand-in boundary (multiple of 32)
-    cudaStream_t st;
-    CK(cudaStreamCreate(&st));
+    // the thread's default stream: the synchronous cudaMemcpy calls below are ordered with these kernels (a created
+    // blocking stream no longer synchronizes with stream 0 now that it is per thread)
+    cudaStream_t st = cudaStreamPerThread;
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     std::mt19937 g(11);

@@ -1,4 +1,4 @@
-// Per-primitive numerical tests for kernels/qwen2.cu against FP32 CPU references computed from the same inputs.
+// Per-primitive numerical tests for src/models/qwen/qwen2/qwen2.cu against FP32 CPU references computed from the same inputs.
 // Gates: FP32 outputs max abs err <= 1e-5 (relative for dot products); BF16 outputs max abs <= 2e-2 and
 // rel-RMS <= 5e-3; argmax exact.
 #include "qwen2_kernels.cuh"

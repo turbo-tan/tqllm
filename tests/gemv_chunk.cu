@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 static void check(cudaError_t x) { if (x != cudaSuccess) throw std::runtime_error(cudaGetErrorString(x)); }
-static bool run(int rows, int cols, int tokens) {
+static bool run(int rows, int cols, int tokens, bool bx) {
     std::mt19937 rng(rows * 131 + cols + tokens); std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<__nv_bfloat16> w(size_t(rows) * cols); std::vector<float> x(size_t(cols) * tokens);
     for (auto & v : w) v = __float2bfloat16_rn(0.05f * nd(rng));
@@ -22,6 +22,9 @@ static bool run(int rows, int cols, int tokens) {
     check(cudaMemset(dy, 0xff, size_t(ldy) * tokens * 4));
     tqllm_cuda::fn_gemv_bf16_tokens(dw, dx, dref, rows, cols, tokens, nullptr);
     tqllm_cuda::fn_gemv_bf16_chunk(dw, dx, dy, rows, cols, tokens, ldy, nullptr);
+    if (bx) { __nv_bfloat16 * dxb; check(cudaMalloc(&dxb, x.size() * 2)); check(cudaMemset(dy, 0xff, size_t(ldy) * tokens * 4));
+              tqllm_cuda::fn_round_bf16(dx, dxb, int64_t(x.size()), nullptr);
+              tqllm_cuda::fn_gemv_bf16_chunk_bx(dw, dxb, dy, rows, cols, tokens, ldy, nullptr); check(cudaDeviceSynchronize()); cudaFree(dxb); }
     check(cudaDeviceSynchronize());
     std::vector<float> ref(size_t(rows) * tokens), y(size_t(ldy) * tokens);
     check(cudaMemcpy(ref.data(), dref, ref.size() * 4, cudaMemcpyDeviceToHost)); check(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
@@ -31,13 +34,14 @@ static bool run(int rows, int cols, int tokens) {
         for (int64_t r = rows; r < ldy; ++r) { uint32_t b; std::memcpy(&b, &y[size_t(t) * ldy + r], 4); if (b != 0xffffffffu) ++pad; }
     }
     cudaFree(dw); cudaFree(dx); cudaFree(dref); cudaFree(dy);
-    std::printf("rows %4d cols %5d tokens %4d: %d token rows differ, %d stride cells written\n", rows, cols, tokens, diff, pad);
+    std::printf("rows %4d cols %5d tokens %4d%s: %d token rows differ, %d stride cells written\n", rows, cols, tokens, bx ? " (bf16 x)" : "", diff, pad);
     return !diff && !pad;
 }
 int main() {
     bool ok = true;
     for (const int rows : {512, 1, 16, 9})
-        for (const int tokens : {1, 3, 4, 5, 8, 63, 64, 65, 1023, 1024}) ok = run(rows, 2560, tokens) && ok;
+        for (const int tokens : {1, 3, 4, 5, 8, 63, 64, 65, 1023, 1024})
+            for (const bool bx : {false, true}) ok = run(rows, 2560, tokens, bx) && ok;
     std::puts(ok ? "gemv_chunk PASS" : "gemv_chunk FAIL");
     return ok ? 0 : 1;
 }
