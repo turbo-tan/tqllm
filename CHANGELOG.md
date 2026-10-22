@@ -3,6 +3,16 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.2.3 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next from the Hugging Face files now runs at full speed with no pack file (RTX 3090, cold page cache:
+  chats 96-103 tok/s, 32K prompt first token 14.6 s; output identical). The gap 1.2.1 and 1.2.2 showed (79-88 tok/s,
+  17.3 s) was not the expert layout. The per-layer token embedding (28.8 GB, read row by row at every token) was not
+  cached, so each new token waited on the disk, and 1.2.1's page release made that worse. The engine now reads it once
+  at start-up (about 6 s) and only drops the expert pages after building the cache.
+- Correction to the 1.2.1 notes: the optional 50.9 GB pack file does not change speed, and is no longer needed.
+
 ## 1.2.2 (2026-10-22)
 
 ### Fixed
