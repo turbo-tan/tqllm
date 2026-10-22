@@ -22,6 +22,8 @@ public:
     const GgufFile & file() const { return file_; }
     GgufBytes tensor(const std::string & name) const;
     GgufBytes expert(const std::string & name, uint64_t index) const;
+    // Drop this file's pages from memory; views stay valid and fault back in on access.
+    void release_pages() const;
     // Gather only requested rows into a small F32 buffer, preserving order and duplicates.
     std::vector<float> gather_rows(const std::string & name, const std::vector<uint64_t> & rows) const;
 };

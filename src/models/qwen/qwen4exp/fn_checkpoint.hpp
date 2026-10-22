@@ -50,6 +50,7 @@ class Checkpoint {
     std::vector<std::unique_ptr<MappedGguf>> files_;
     std::map<std::string, size_t> owners_;
 public:
+    void release_pages() const { for (const auto & f : files_) f->release_pages(); }
     Qwen4ExpConfig config;
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;

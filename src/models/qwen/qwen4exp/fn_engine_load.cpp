@@ -80,6 +80,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     if (pack_in_memory) {  // no experts file: the same bytes, built from the GGUF (decode_rules.hpp build_pack_in_memory)
         const auto t0 = std::chrono::steady_clock::now();
         f.packed = build_packed(checkpoint, std::max(4, std::min(32, int(std::thread::hardware_concurrency()))));
+        checkpoint.release_pages();  // the GGUF page cache would otherwise sit beside the pinned pack
         std::fprintf(stderr, "tqllm: packed experts built from the GGUF in memory: %.1f GB in %.0f s\n", f.packed.bytes / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
