@@ -51,8 +51,8 @@ Qwen3.8 Flash-Next (125B MoE) on one 24 GB GPU: needs 64 GB of system RAM or mor
 1.2.1 or newer. Follow the run steps on https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM exactly: the ISTA-DASLab
 IQ3_S GGUF plus the small files there in one folder, then `tqserve --model <folder>/flashnext.tqfn`. Start-up takes
 about two minutes (the experts are arranged in RAM for the GPU cache); wait for `/health` before the first request.
-For full decode speed the card's optional step writes the 51 GB pack file once with `tqfn-pack`; ask the user first
-(it needs 51 GB of free disk).
+For full decode speed the card's optional step adds the 50.9 GB pack file (download it, or write it once with
+`tqfn-pack`); ask the user first (51 GB of disk).
 
 ## How tqLLM is organised
 

@@ -10,8 +10,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   IQ3_S GGUF in pinned memory itself (about 50 s; server ready in about 2 min, as with the file), byte-identical to the
   file, and then drops the GGUF's page cache. The manifest may carry the per-layer cache plan as `layer_slots=`.
   Known gap: on an RTX 3090 short chats decode about 15 % slower this way (79-87 against 93-102 tok/s) and a 32K prompt
-  takes 17.3 s to first token instead of 14.6 s; long-context decode is the same. For full speed, write the file once
-  with `tqfn-pack` (now in the image, about 90 s and 51 GB of disk) and add `experts=` to the manifest.
+  takes 17.3 s to first token instead of 14.6 s; long-context decode is the same. For full speed, download the pack
+  file (`hf download YTan2000/Qwen3.8-Flash-Next-tqLLM experts-packed.tqfnexp`, 50.9 GB, byte-identical to the
+  in-memory build) or write it once with `tqfn-pack` (now in the image, about 90 s), and add `experts=` to the manifest.
+- Coming next: a single, more compact Flash-Next file with the experts already arranged (no side files, full speed
+  from the start).
   Setup: https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM
 
 ## 1.2.0 (2026-10-22)
