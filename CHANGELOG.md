@@ -3,7 +3,7 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased (next: 1.0.1)
+## 1.0.1 (2026-10-22)
 
 ### Added
 - Live completed-token prefill progress and throughput in the runtime monitor, with cached-prefix counts excluded from speed. Prefill and output rates remain visible together in the request card, including after completion.
@@ -80,6 +80,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   `TQFN_OLD_Q2_DOT`, `TQFN_GDN_VPW`, `TQFN_PF_CHUNK_KB`, `TQFN_CPU_OWNED_COLD` / `_PROFILE`, `TQFN_TQ_AHEAD`.
 
 ### Fixed
+- Flash-Next on small cards (12 GB VRAM + 64 GB RAM, RTX 3090 held to 12 GB): chats 44.6 / 46.2 -> 45.9 / 46.4 tok/s and
+  decode after a 16K prompt 10 -> 45-50 tok/s. A verify block now fits the CPU expert pool (3 drafts there; adaptive
+  length stays on larger cards), every layer gets an expert bank back after a long prompt (slot tiers on small cards),
+  and the CPU-owned experts are a fixed rule kept out of the GPU banks: the same prompt gives the same text whatever the
+  server ran before. 24 GB unchanged (text identical, chat 100.6 tok/s).
 - Docker image build: the Dockerfile copied `kernels/`, removed in the source layout move, so the image no longer
   built; test `dockerfile_paths` checks every copied path exists.
 - Flash-Next on an RTX 3090 (PCIe): long generations could stop with "unspecified launch failure" (GPU front-end
