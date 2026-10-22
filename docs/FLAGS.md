@@ -29,6 +29,7 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
+| `TQFN_KEEP_MAP` | - | FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path |  |
 | `TQLLM_MLX_ABLATE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ABLATE_BLOCKS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ABLATE_SMALL` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |

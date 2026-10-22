@@ -3,6 +3,10 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQFN_KEEP_MAP
+    kind: debug
+    default: "-"
+    doc: "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path"
   - name: TQLLM_MLX_ABLATE
     kind: debug
     default: "-"

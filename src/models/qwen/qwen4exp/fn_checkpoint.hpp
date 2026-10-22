@@ -1,6 +1,8 @@
 #pragma once
 // Flash-Next weights: the GGUF checkpoint, resident tensors and the dense projection dispatch; stage fixtures.
+#include "decode_rules.hpp"
 #include "fn_runtime.hpp"
+#include <functional>
 struct Stage { std::string file, name; size_t elements; std::vector<uint64_t> shape; };
 class Fixtures {
     std::filesystem::path root_;
@@ -50,7 +52,12 @@ class Checkpoint {
     std::vector<std::unique_ptr<MappedGguf>> files_;
     std::map<std::string, size_t> owners_;
 public:
-    void release_pages() const { for (const auto & f : files_) f->release_pages(); }
+    // after the experts are in pinned memory: drop the trunk expert pages, keep every tensor read per token cached
+    void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
+    size_t warm_tensors(int threads) const {
+        size_t n = 0; for (const auto & [name, i] : owners_) if (tqllm::flashnext::warm_at_start(name)) n += files_[i]->warm_tensor(name, threads);
+        return n;
+    }
     Qwen4ExpConfig config;
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;
@@ -59,6 +66,14 @@ public:
     bool cpu_q8_projection = false;
     // Decode mode: projections keep their loaded matrices, dense vectors and the head on the device.
     bool resident = false;
+    bool reclaim_expert_pages = false;
+    std::function<void(int,const std::vector<int> &)> cold_prefetch;
+    int cold_overlap = 0;
+    bool discard_source_pages() const noexcept {
+        bool ok=true;
+        for(const auto & f:files_)if(!f->discard_pages())ok=false;
+        return ok;
+    }
     struct Resident { Mat m; std::vector<std::unique_ptr<Device<char>>> mem; std::unique_ptr<Device<float>> dense; };
     mutable std::map<std::string, std::unique_ptr<Resident>> resident_;
     // Parking: a resident matrix's device buffers copied to pinned host memory and freed, put back (byte for byte, kernels
@@ -232,6 +247,10 @@ public:
             require(t.ne == std::vector<uint64_t>{uint64_t(i == 2 ? config.expert_ff : config.hidden),
                 uint64_t(i == 2 ? config.hidden : config.expert_ff), uint64_t(config.experts)}, "mixed expert shape differs");
             result[i] = {t.type, f.expert(name, id)};
+            if(reclaim_expert_pages) {
+                const auto view=result[i].bytes;
+                result[i].owner=std::shared_ptr<const void>(view.data,[&f,view](const void *) { (void)f.discard_pages(view); });
+            }
         }
         return result;
     }

@@ -9,6 +9,7 @@
 #include "prefill_plan.hpp"
 #include "kv_store.hpp"
 #include "kv_format.hpp"
+#include "decode_rules.hpp"
 #include "qwen4exp.hpp"
 #include "dequant.hpp"
 #include "moe_kernels.cuh"
@@ -62,10 +63,7 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     if (text.empty()) return;
     std::vector<int> caps; size_t at = 0;
     while (at <= text.size()) { const size_t e = std::min(text.find(',', at), text.size()); caps.push_back(std::stoi(text.substr(at, e - at))); at = e + 1; }
-    long total = 0; for (int c : caps) total += c;
-    const long want = long(slots) * long(caps.size());
-    if (total != want && total > 0)
-        for (int & c : caps) c = std::max(1, std::min(cache.experts(), int(std::lround(double(c) * double(want) / double(total)))));
+    caps = tqllm::flashnext::scale_layer_slots(caps, slots, cache.experts());
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }
@@ -142,6 +140,10 @@ inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): th
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
 inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
+// TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
+inline const std::vector<int32_t> * g_hot_map = nullptr;
+inline MixedExpertCache * g_cold_cache = nullptr;
+inline const float * g_keep_mask = nullptr;
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
 // 256-token sub-chunk of that layer (the pool is a prefill borrow: counted in the bank eviction, freed with the prefill buffers)

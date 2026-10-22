@@ -35,7 +35,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     // chunk (routed experts copied once per layer, prefill_layer); the residual stays in res_keep, updated in place
     static const bool layer_major = tqfn_default_on("TQFN_LAYER_MAJOR");
     static const int lm_min = std::getenv("TQFN_LAYER_MAJOR_MIN") ? std::atoi(std::getenv("TQFN_LAYER_MAJOR_MIN")) : 256;
-    if (layer_major && !spec && n >= lm_min && g_arena) {
+    if (!g_hot_map && layer_major && !spec && n >= lm_min && g_arena) {
         if (res_keep->count < size_t(n) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(n) * width); }
         ck(cudaMemcpyAsync(res_keep->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         residual.reset(); const size_t base = g_arena->used;

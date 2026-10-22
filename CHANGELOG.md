@@ -3,6 +3,28 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.2.3 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next from the Hugging Face files now runs at full speed with no pack file (RTX 3090, cold page cache:
+  chats 96-103 tok/s, 32K prompt first token 14.6 s; output identical). The gap 1.2.1 and 1.2.2 showed (79-88 tok/s,
+  17.3 s) was not the expert layout. The per-layer token embedding (28.8 GB, read row by row at every token) was not
+  cached, so each new token waited on the disk, and 1.2.1's page release made that worse. The engine now reads it once
+  at start-up (about 6 s) and only drops the expert pages after building the cache.
+- Correction to the 1.2.1 notes: the optional 50.9 GB pack file does not change speed, and is no longer needed.
+
+## 1.2.2 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next on GB10 / DGX Spark with the Hugging Face manifest: every request failed ("mixed cache: active set
+  exceeds slots"). The manifest's 3090 cache plan and its 18 GB bank cap no longer limit a device that holds every
+  expert: with `slots=auto` (now the default) the engine sizes the expert cache and its cap from the device at start-up.
+- A Flash-Next manifest without `chunk=` prefilled in chunks of 8 tokens (a 32K prompt took 263 s instead of 15 s). The
+  prefill chunk is now always the engine's setting (`--prefill-chunk`, 16384). For about 30 minutes on 22 Oct the
+  Hugging Face manifest lacked that line, which made long prompts slow on 1.2.1; it is restored.
+- Releases are now gated by running the Hugging Face card's commands verbatim on an RTX 3090 and a GB10 (health, known
+  answers, a 27K-token prompt).
+
 ## 1.2.1 (2026-10-22)
 
 ### Fixed
@@ -10,8 +32,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   IQ3_S GGUF in pinned memory itself (about 50 s; server ready in about 2 min, as with the file), byte-identical to the
   file, and then drops the GGUF's page cache. The manifest may carry the per-layer cache plan as `layer_slots=`.
   Known gap: on an RTX 3090 short chats decode about 15 % slower this way (79-87 against 93-102 tok/s) and a 32K prompt
-  takes 17.3 s to first token instead of 14.6 s; long-context decode is the same. For full speed, write the file once
-  with `tqfn-pack` (now in the image, about 90 s and 51 GB of disk) and add `experts=` to the manifest.
+  takes 17.3 s to first token instead of 14.6 s; long-context decode is the same. For full speed, download the pack
+  file (`hf download YTan2000/Qwen3.8-Flash-Next-tqLLM experts-packed.tqfnexp`, 50.9 GB, byte-identical to the
+  in-memory build) or write it once with `tqfn-pack` (now in the image, about 90 s), and add `experts=` to the manifest.
+- Coming next: a single, more compact Flash-Next file with the experts already arranged (no side files, full speed
+  from the start).
   Setup: https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM
 
 ## 1.2.0 (2026-10-22)
