@@ -98,6 +98,10 @@ int main() {
     check(bank_budget_bytes(false, 18.0, size_t(120) << 30) == size_t(18) << 30, "fixed slots: budget_gb as given");
     check(prefill_chunk(16384, 8) == 16384 && prefill_chunk(16384, 8192) == 16384, "prefill chunk: the engine setting, manifest key or not");
     check(prefill_chunk(0, 8192) == 8192, "prefill chunk: the manifest value only when the setting is off");
+    check(drop_after_pack("blk.7.ffn_gate_exps.weight") && drop_after_pack("blk.47.ffn_down_exps.weight"), "trunk expert pages may be dropped after the pack");
+    check(!drop_after_pack("per_layer_token_embd.weight") && !drop_after_pack("token_embd.weight") && !drop_after_pack("blk.0.attn_qkv.weight"),
+          "the per-layer token embedding and dense tensors stay cached");
+    check(warm_at_start("per_layer_token_embd.weight") && !warm_at_start("blk.0.ffn_gate_exps.weight"), "the per-layer token embedding is read at start-up");
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

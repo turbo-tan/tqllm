@@ -1,5 +1,6 @@
 #include "gguf_mapped.hpp"
 #include "dequant.hpp"
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -45,6 +46,35 @@ struct MappedGguf::Mapping {
 MappedGguf::MappedGguf(const std::string & path, GgufDialect dialect)
     : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open(path, dialect)) {}
 MappedGguf::~MappedGguf() = default;
+void MappedGguf::release_tensor(const std::string & name) const {
+#ifndef _WIN32
+    const auto v = tensor(name); const size_t page = size_t(sysconf(_SC_PAGESIZE));
+    const uintptr_t a = (reinterpret_cast<uintptr_t>(v.data) + page - 1) / page * page, b = (reinterpret_cast<uintptr_t>(v.data) + v.size) / page * page;
+    if (b > a) madvise(reinterpret_cast<void *>(a), b - a, MADV_DONTNEED);
+    const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { posix_fadvise(fd, off_t(v.data - mapping_->data), off_t(v.size), POSIX_FADV_DONTNEED); close(fd); }
+#endif
+}
+size_t MappedGguf::warm_tensor(const std::string & name, int threads) const {
+#ifndef _WIN32
+    const auto v = tensor(name); const off_t base = off_t(v.data - mapping_->data);
+    const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    constexpr size_t step = size_t(1) << 24; std::atomic<size_t> next{0}, done{0};
+    std::vector<std::thread> pool;
+    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
+        std::vector<char> buf(step);
+        for (size_t at; (at = next.fetch_add(step)) < v.size;) {
+            const ssize_t r = pread(fd, buf.data(), std::min(step, v.size - at), base + off_t(at));
+            if (r > 0) done += size_t(r);
+        }
+    });
+    for (auto & t : pool) t.join();
+    close(fd); return done;
+#else
+    (void) name; (void) threads; return 0;
+#endif
+}
 void MappedGguf::release_pages() const {
 #ifndef _WIN32
     madvise(const_cast<char *>(mapping_->data), mapping_->size, MADV_DONTNEED);

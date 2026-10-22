@@ -24,6 +24,10 @@ public:
     GgufBytes expert(const std::string & name, uint64_t index) const;
     // Drop this file's pages from memory; views stay valid and fault back in on access.
     void release_pages() const;
+    // Drop one tensor's pages (whole pages inside it); its view stays valid and faults back in on access.
+    void release_tensor(const std::string & name) const;
+    // Read one tensor once so its pages are cached; returns the bytes read.
+    size_t warm_tensor(const std::string & name, int threads) const;
     // Gather only requested rows into a small F32 buffer, preserving order and duplicates.
     std::vector<float> gather_rows(const std::string & name, const std::vector<uint64_t> & rows) const;
 };
