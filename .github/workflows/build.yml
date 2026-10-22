@@ -59,7 +59,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
   # Combines the two per-arch images into one multi-platform tag on both registries,
-  # e.g. ghcr.io/turbo-tan/tqllm:1.0.1 and ytan2000/tqllm:1.0.1
+  # e.g. ghcr.io/turbo-tan/tqllm:1.2.0 and ytan2000/tqllm:1.2.0
   publish:
     if: github.ref_type == 'tag'
     needs: build
