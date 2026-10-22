@@ -106,7 +106,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                     for (int w = 0; w < 16; ++w) th.emplace_back([&, w] {
                         std::vector<char> tmp(dsz);
                         for (int e = w; e < f.packed.experts; e += 16) {
-                            char * d = host + f.packed.base[l] + uint64_t(e) * f.packed.block[l] + off;
+                            char * d = const_cast<char *>(f.packed.map) + f.packed.base[l] + uint64_t(e) * f.packed.block[l] + off;
                             tqllm_cuda::tile_expert_rows(d, tmp.data(), rows, cols, bpb); std::memcpy(d, tmp.data(), dsz);
                         }
                     });
