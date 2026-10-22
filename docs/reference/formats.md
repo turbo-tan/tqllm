@@ -19,3 +19,12 @@ TQ3_4S-v2, and why TQ4 at about the same size as TQ3_4S is much closer to the or
 The release files `Qwen3.8-27B-TQ_XS.gguf` (11.85 GB), `TQ_S` (12.55 GB) and `TQ4_L` (14.97 GB) are built from these
 formats. Type ids 300
 and 301 are tqLLM's own (above the ggml range), so these files need tqLLM; llama.cpp cannot load them.
+
+**Reading a TQ3 / TQ4 file: the input basis.** A TQ3 / TQ4 matrix is stored in the rotated basis, so its input must be
+rotated with the same 128-point rotation before the product. Dense matrices that read the same input as TQ matrices are
+stored in that rotated basis too: in the Qwen3.8 TQ_L file the 96 BF16 Gated DeltaNet `ssm_alpha` / `ssm_beta`
+matrices equal the original weights times the rotation (relative error 0.006 against a Q8_0 copy rotated the same way,
+1.42 unrotated). A reader that multiplies such a dense matrix by the plain input gets wrong recurrent gates: the Apple
+backend did, and its KL against the CUDA engine dropped from about 0.53 to the format's own error once fixed
+(2026-10-22). Rule for any reader (CPU paths, other backends, ports): in a TQ3 / TQ4 model, rotate the input of every
+matrix that shares an input with a TQ matrix, whatever its storage type.
