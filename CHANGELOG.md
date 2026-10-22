@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.2.1 (2026-10-22)
+
+### Fixed
+- Qwen3.8 Flash-Next no longer needs the 51 GB packed-expert file: at start-up the engine arranges the experts of the
+  IQ3_S GGUF in pinned memory itself (44-53 s on a 32-thread host, server ready in about the same time as with the
+  file) and then drops the GGUF's page cache. Output is identical to the file path. The manifest may carry the
+  per-layer cache plan as `layer_slots=`. Setup: https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM
+
 ## 1.2.0 (2026-10-22)
 
 ### Added

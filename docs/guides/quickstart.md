@@ -8,9 +8,9 @@ The prebuilt image is public on the GitHub container registry and on Docker Hub.
 (RTX 30 / 40 / 50) and arm64 (GB10 / DGX Spark); `docker pull` picks the right one.
 
 ```sh
-docker pull ghcr.io/turbo-tan/tqllm:1.2.0
+docker pull ghcr.io/turbo-tan/tqllm:1.2.1
 # or
-docker pull ytan2000/tqllm:1.2.0
+docker pull ytan2000/tqllm:1.2.1
 ```
 
 `latest` always points to the newest release.

@@ -19,7 +19,7 @@ The agents' own configuration files are never written: each gets its provider th
 """
 import argparse, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
-IMAGE = "ghcr.io/turbo-tan/tqllm:1.2.0"
+IMAGE = "ghcr.io/turbo-tan/tqllm:1.2.1"
 NAME = "tqllm"
 
 
