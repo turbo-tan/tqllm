@@ -95,23 +95,24 @@ template<int C> __global__ void __launch_bounds__(256) dot_grouped(const unsigne
 // Grouped experts on tensor cores: CTA = 64 rows x 64 of one expert's tokens, warp w takes row tile w & 3 and k half
 // w >> 2 (u4h_gemm_k's layout). Lane t of a warp owns one 32-weight half of a Q2_0 block per 256-k step; scale * (code - 1)
 // is exact in FP16, so only the FP32 summation order differs from dot_grouped.
+template<int NT>
 __global__ void __launch_bounds__(256) q2_gemm_grouped(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int k,
                                                        const int * counts, const int * groups, int capacity, int topk, bool per_expert) {
     using namespace tqllm_dev;
     const int expert = blockIdx.z, ncols = counts[expert];
-    if (int(blockIdx.y) * 64 >= ncols) return;
+    if (int(blockIdx.y) * (NT*8) >= ncols) return;
     groups += int64_t(expert) * capacity;
-    constexpr int NT = 8, XS = 33;
-    __shared__ uint4 xt[64 * XS];
+    constexpr int XS = 33;
+    __shared__ uint4 xt[NT*8 * XS];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     const int rt = warp & 3, ks = warp >> 2;
-    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * 64, nb = k / 32, row_bytes = k / 64 * 18;
+    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * (NT*8), nb = k / 32, row_bytes = k / 64 * 18;
     const unsigned char * wa = weights + (int64_t(expert) * rows + min(row0 + g, rows - 1)) * row_bytes;
     const unsigned char * wb = weights + (int64_t(expert) * rows + min(row0 + g + 8, rows - 1)) * row_bytes;
     float c[NT][4] = {};
     for (int base = 0; base < nb; base += 8) {
         __syncthreads();
-        for (int i = threadIdx.x; i < 64 * 32; i += 256) {
+        for (int i = threadIdx.x; i < NT*8 * 32; i += 256) {
             const int col = i / 32, q = i % 32, blk = base + q / 4;
             uint4 v = make_uint4(0, 0, 0, 0);
             if (col0 + col < ncols && blk < nb) {
@@ -203,7 +204,9 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     // TQFN_Q2_DOT_GROUPED=1: the scalar kernel (A/B); default: tensor cores when k is a multiple of 64
     static const bool scalar = std::getenv("TQFN_Q2_DOT_GROUPED") && std::atoi(std::getenv("TQFN_Q2_DOT_GROUPED")) != 0;
     if (!scalar && capacity <= 65535 * 64) {
-        q2_gemm_grouped<<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts)), 256, 0, s>>>(
+        if(capacity<=8)q2_gemm_grouped<1><<<dim3(unsigned((r+63)/64),1,unsigned(experts)),256,0,s>>>(
+            static_cast<const unsigned char *>(w),x,y,r,k,counts,groups,capacity,topk,per_expert);
+        else q2_gemm_grouped<8><<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts)), 256, 0, s>>>(
             static_cast<const unsigned char *>(w), x, y, r, k, counts, groups, capacity, topk, per_expert);
         return;
     }

@@ -3,6 +3,7 @@
 #include "decode_rules.hpp"
 #include <map>
 #include <tuple>
+#include "hot_cold_policy.hpp"
 
 // A step whose captured part fails (an operation not allowed in a capture: a weight uploaded on its first use, a handle
 // created) runs again without a graph; nothing in an open capture has executed, so the plain run starts from the same
@@ -153,7 +154,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // TQFN_PREDICT_N=N (default 4): next-layer prediction (prefetch) for verify blocks of up to N tokens; above 4 the routers
     // run unfused (placement only: the output does not change)
     static const int predict_n = std::getenv("TQFN_PREDICT_N") ? std::atoi(std::getenv("TQFN_PREDICT_N")) : 4;
-    const bool predict = prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
+    const bool predict = (!g_hot_map || bool(cp.cold_prefetch)) && prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
     const std::string np = "blk." + std::to_string(layer + 1) + ".";
     std::unique_ptr<Device<float>> nl;
     if (predict) nl = std::make_unique<Device<float>>(size_t(n) * (c.experts + 1));
@@ -173,6 +174,10 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     } else {
         router(prefix, mixed.p, logits.p, n);
         if (predict) router(np, mixed.p, nl->p, n);
+    }
+    if (g_keep_mask && trunk) {  // TQFN_KEEP_MAP: pruned experts never win the top-k
+        tqllm_cuda::logits_mask(logits.p, g_keep_mask + size_t(layer) * c.experts, n, c.experts + 1, c.experts, nullptr);
+        if (predict) tqllm_cuda::logits_mask(nl->p, g_keep_mask + size_t(layer + 1) * c.experts, n, c.experts + 1, c.experts, nullptr);
     }
     std::unique_ptr<Device<int>> next_ids;
     if (predict) {
@@ -235,9 +240,18 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
     // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit (TQFN_VERIFY_WAVES=1: old rule)
     static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
-    if (trunk && (n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
-        wave_ids = routed.get();  // one wave when the unique experts fit: the split path's miss accounting assumes small steps
-        if (!tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
+    if (trunk && (g_hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
+        wave_ids = routed.get();
+        if(predict && g_hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
+        if (g_hot_map) for (int id : wave_ids) if (id < 0 || id >= c.experts) {
+            const auto ls = logits.get(); const auto xs = mixed.get(); size_t bad_l = 0, bad_x = 0;
+            for (float v : ls) bad_l += !std::isfinite(v);
+            for (float v : xs) bad_x += !std::isfinite(v);
+            throw std::runtime_error("hot/cold invalid route: layer=" + std::to_string(layer) + " id=" + std::to_string(id) +
+                    " nonfinite_logits=" + std::to_string(bad_l) + " nonfinite_input=" + std::to_string(bad_x));
+        }
+        // one wave when the unique experts fit: the split path's miss accounting assumes small steps
+        if (!g_hot_map && !tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
     }
     if (!wave_ids.empty()) {
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
@@ -245,58 +259,82 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         Device<__half> xr(mixed.count); tqllm_cuda::vis_f32_to_h(mixed.p, xr.p, int64_t(mixed.count), nullptr);
         Device<__nv_bfloat16> eg(size_t(A) * c.expert_ff), eu(eg.count), ed(size_t(A) * h);
         Device<__half> ax(eg.count);
-        const int W = cache.plan_slots(layer);  // the bank's size before prepare (a released bank is rebuilt at a new size)
-        // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
-        // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average.
-        // Decided per layer from slot-independent counts, and only when every slot count runs waves (A > experts):
-        // the GEMM rounds differently from the dedup kernel the split path uses, so a slot-dependent switch changed
-        // greedy text with the slot count (a 23-token prompt: 230 rows, ~8 per expert).
-        static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
-        const bool wave_gemm = gemm_avg > 0 && A > c.experts && A >= gemm_avg * int(u.size());
-        for (size_t w0 = 0; w0 < u.size(); w0 += size_t(W)) {
-            const std::vector<int> wave(u.begin() + long(w0), u.begin() + long(std::min(u.size(), w0 + size_t(W))));
-            const auto wslots = cache.prepare(layer, wave);
-            if (cache.split()) cache.wait_misses();
-            std::vector<int> slot_of(size_t(c.experts), -1);
-            for (size_t i = 0; i < wave.size(); ++i) slot_of[size_t(wave[i])] = wslots[i];
-            std::vector<int> hm(size_t(2) * A * DS); int groups[2] = {0, 0};
-            for (int part = 0; part < 2; ++part) {  // 0: gate/up (token input), 1: down (assignment input)
-                int * out = hm.data() + size_t(part) * A * DS; std::vector<int> open_at(size_t(W) + 1, -1); int g = 0;
-                for (int a = 0; a < A; ++a) {
-                    const int sl = slot_of[size_t(wave_ids[size_t(a)])];
-                    if (sl < 0) continue;
-                    int & at = open_at[size_t(sl)];
-                    if (at < 0 || out[at * DS + 1] == DC) { at = g++; out[at * DS] = sl; out[at * DS + 1] = 0; }
-                    int * e = out + at * DS; const int col = e[1]++;
-                    e[2 + col] = part ? a : a / c.topk; e[2 + DC + col] = a;
+        bool shared_queued = false;
+        // Each assignment is written by exactly one bank; weights and original router ids are untouched.
+        for (int bank_index = 0; bank_index < (g_hot_map && trunk ? 2 : 1); ++bank_index) {
+            // Keep independent shared-expert work on the GPU while the CPU prepares cold demand reads.
+            if (cp.cold_overlap >= 2 && bank_index == 1) { shared_expert(xr.p); shared_queued = true; }
+            MixedExpertCache & selected = bank_index ? *g_cold_cache : cache;
+            std::vector<int> bank_ids;
+            for (int id : u) if (!g_hot_map || !trunk || expert_is_hot(*g_hot_map, layer, c.experts, id) == (bank_index == 0)) bank_ids.push_back(id);
+            const int W = selected.plan_slots(layer);
+            // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
+            // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average.
+            // Decided per layer from slot-independent counts, and only when every slot count runs waves (A > experts):
+            // the GEMM rounds differently from the dedup kernel the split path uses, so a slot-dependent switch changed
+            // greedy text with the slot count (a 23-token prompt: 230 rows, ~8 per expert).
+            static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
+            const bool wave_gemm = gemm_avg > 0 && A > c.experts && A >= gemm_avg * int(u.size());
+            for (size_t w0 = 0; w0 < bank_ids.size(); w0 += size_t(W)) {
+                const std::vector<int> wave(bank_ids.begin() + long(w0), bank_ids.begin() + long(std::min(bank_ids.size(), w0 + size_t(W))));
+                if (bank_index) selected.set_miss_stream(miss_stream);
+                const auto wslots = selected.prepare(layer, wave);
+                if (selected.split()) selected.wait_misses();
+                std::vector<int> slot_of(size_t(c.experts), -1);
+                for (size_t i = 0; i < wave.size(); ++i) slot_of[size_t(wave[i])] = wslots[i];
+                std::vector<int> hm(size_t(2) * A * DS); int groups[2] = {0, 0};
+                for (int part = 0; part < 2; ++part) {  // 0: gate/up (token input), 1: down (assignment input)
+                    int * out = hm.data() + size_t(part) * A * DS; std::vector<int> open_at(size_t(W) + 1, -1); int g = 0;
+                    for (int a = 0; a < A; ++a) {
+                        const int sl = slot_of[size_t(wave_ids[size_t(a)])];
+                        if (sl < 0) continue;
+                        int & at = open_at[size_t(sl)];
+                        if (at < 0 || out[at * DS + 1] == DC) { at = g++; out[at * DS] = sl; out[at * DS + 1] = 0; }
+                        int * e = out + at * DS; const int col = e[1]++;
+                        e[2 + col] = part ? a : a / c.topk; e[2 + DC + col] = a;
+                    }
+                    groups[part] = g;
                 }
-                groups[part] = g;
-            }
-            Device<int> dmap(hm.size()); dmap.put(hm);
-            // formats without a dedup kernel (GSQ Q2_0) take the grouped GEMM path: per-slot lists of this wave
-            std::vector<int> cnt(size_t(W), 0); int wcap = 1;
-            for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) wcap = std::max(wcap, ++cnt[size_t(sl)]); }
-            std::vector<int> grp(size_t(W) * wcap, 0), fill(size_t(W), 0);
-            for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) grp[size_t(sl) * wcap + size_t(fill[size_t(sl)]++)] = a; }
-            Device<int> dcnt(cnt.size()), dgrp(grp.size()); dcnt.put(cnt); dgrp.put(grp);
-            auto gemm_fmt = [](const Mat & mm) {
-                const int id = mm.fmt->u4h_id();
-                return (id == 1 || id == 4 || id == 5 || id == 6 || id == 7 || id == 10 || id == 13 || id == 14) && mm.cols % (id == 14 ? 128 : 256) == 0;
-            };
-            auto proj = [&](const Mat & mm, const __half * x, __nv_bfloat16 * y, int rows, bool per_expert) {
-                if (mm.fmt->has_expert_dedup() && !(wave_gemm && gemm_fmt(mm))) mm.fmt->expert_matvec_dedup(mm, x, y, rows, dmap.p + (per_expert ? size_t(A) * DS : 0), groups[per_expert], nullptr);
-                else require(mm.fmt->expert_gemm(mm, x, y, rows, dcnt.p, dgrp.p, wcap, W, c.topk, per_expert, nullptr),
-                             std::string("prefill waves: no grouped kernel for ") + mm.fmt->name());
-            };
-            auto m = cache.gate(), u2 = cache.up();
-            if (m.fmt == u2.fmt && m.fmt->has_expert_dedup() && !(wave_gemm && gemm_fmt(m))) m.fmt->expert_matvec_dedup2(m, u2, xr.p, eg.p, eu.p, c.expert_ff, dmap.p, groups[0], nullptr);
-            else { proj(m, xr.p, eg.p, c.expert_ff, false); proj(u2, xr.p, eu.p, c.expert_ff, false); }
-            tqllm_cuda::fn_swiglu_bf16_h(eg.p, eu.p, ax.p, int64_t(eg.count), nullptr);
-            proj(cache.down(), ax.p, ed.p, h, true);
-            ck(cudaStreamSynchronize(nullptr));  // the next wave's prepare may evict these slots
+                Device<int> dmap(hm.size()); dmap.put(hm);
+                // formats without a dedup kernel (GSQ Q2_0) take the grouped GEMM path: per-slot lists of this wave
+                std::vector<int> cnt(size_t(W), 0); int wcap = 1;
+                for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) wcap = std::max(wcap, ++cnt[size_t(sl)]); }
+                std::vector<int> grp(size_t(W) * wcap, 0), fill(size_t(W), 0);
+                for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) grp[size_t(sl) * wcap + size_t(fill[size_t(sl)]++)] = a; }
+                Device<int> dcnt(cnt.size()), dgrp(grp.size()); dcnt.put(cnt); dgrp.put(grp);
+                auto gemm_fmt = [](const Mat & mm) {
+                    const int id = mm.fmt->u4h_id();
+                    return (id == 1 || id == 4 || id == 5 || id == 6 || id == 7 || id == 10 || id == 13 || id == 14) && mm.cols % (id == 14 ? 128 : 256) == 0;
+                };
+                auto proj = [&](const Mat & mm, const __half * x, __nv_bfloat16 * y, int rows, bool per_expert) {
+                    if (mm.fmt->has_expert_dedup() && !(wave_gemm && gemm_fmt(mm))) mm.fmt->expert_matvec_dedup(mm, x, y, rows, dmap.p + (per_expert ? size_t(A) * DS : 0), groups[per_expert], nullptr);
+                    else require(mm.fmt->expert_gemm(mm, x, y, rows, dcnt.p, dgrp.p, wcap, W, c.topk, per_expert, nullptr),
+                                 std::string("prefill waves: no grouped kernel for ") + mm.fmt->name());
+                };
+                auto m = selected.gate(), u2 = selected.up();
+                if (m.fmt == u2.fmt && m.fmt->has_expert_dedup() && !(wave_gemm && gemm_fmt(m))) m.fmt->expert_matvec_dedup2(m, u2, xr.p, eg.p, eu.p, c.expert_ff, dmap.p, groups[0], nullptr);
+                else { proj(m, xr.p, eg.p, c.expert_ff, false); proj(u2, xr.p, eu.p, c.expert_ff, false); }
+                tqllm_cuda::fn_swiglu_bf16_h(eg.p, eu.p, ax.p, int64_t(eg.count), nullptr);
+                proj(selected.down(), ax.p, ed.p, h, true);
+                // Same-bank waves still wait before reusing slots. The separate cold bank may prepare
+                // its demand reads and DMA while the final hot wave remains in flight.
+                if (!cp.cold_overlap || !g_hot_map || !trunk || bank_index != 0 || w0 + size_t(W) < bank_ids.size())
+                    ck(cudaStreamSynchronize(nullptr));
         }
-        shared_expert();
+        }
+        if (!shared_queued) shared_expert();
         tqllm_cuda::fn_moe_combine(ed.p, weights.p, sd.p, shared_weights.p, fo.p, h, c.topk, n, nullptr);
+        if (g_hot_map && trunk) {
+            const auto out = fo.get();
+            if (std::any_of(out.begin(), out.end(), [](float v) { return !std::isfinite(v); })) {
+                const auto a = ed.get(), b = eg.get(), d = eu.get(); size_t ea = 0, eb = 0, eu_bad = 0;
+                for (auto v : a) ea += !std::isfinite(float(v));
+                for (auto v : b) eb += !std::isfinite(float(v));
+                for (auto v : d) eu_bad += !std::isfinite(float(v));
+                throw std::runtime_error("hot/cold nonfinite MoE: layer=" + std::to_string(layer) + " down=" + std::to_string(ea) +
+                        " gate=" + std::to_string(eb) + " up=" + std::to_string(eu_bad));
+            }
+        }
     } else if (cache.split()) {
         // Shared expert and hit experts run while the host prepares the cache and misses land on the miss stream.
         const int A = n * c.topk;

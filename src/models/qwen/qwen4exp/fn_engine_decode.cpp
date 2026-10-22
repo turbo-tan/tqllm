@@ -42,6 +42,24 @@ bool FlashNextEngine::spec_advance() {
     if (S().done_ && g_profile_decode_req) { ck(cudaDeviceSynchronize()); ck(cudaProfilerStop()); g_profile_decode_req = false; }
     if (S().done_) { S().model_->set_spec(false); ck(cudaDeviceSynchronize());
                  S().decode_us_ = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - S().t_decode_).count()); }
+    if (S().done_ && f_.cold_cache && tqllm::debug_on("mem")) {
+        const auto c = f_.cold_cache->stats(); const auto b = S().cold_at_decode_;
+        const auto d = f_.cold_store ? f_.cold_store->stats() : ColdExpertStore::Stats{};
+        const auto a = S().cold_store_at_decode_;
+        std::fprintf(stderr, "COLD_DECODE tokens=%zu steps=%llu hits=%llu misses=%llu h2d_bytes=%llu loads=%llu read_bytes=%llu read_ms=%.3f checksum_ms=%.3f mapped_fault_verify_ms=%.3f\n",
+            S().out_.size()-1, (unsigned long long)S().steps_, (unsigned long long)(c.hits-b.hits),
+            (unsigned long long)(c.misses-b.misses), (unsigned long long)(c.transfer_bytes-b.transfer_bytes),
+            (unsigned long long)(d.loads-a.loads), (unsigned long long)(d.bytes-a.bytes),
+            (d.read_ns-a.read_ns)/1e6, (d.checksum_ns-a.checksum_ns)/1e6, (d.mapped_ns-a.mapped_ns)/1e6);
+    }
+    if (S().done_ && f_.cold_fetch_queue && tqllm::debug_on("mem")) {
+        const auto q = f_.cold_fetch_queue->stats(), b = S().cold_fetch_at_decode_;
+        std::fprintf(stderr, "COLD_QUEUE prefetched=%llu used=%llu promoted=%llu deduplicated=%llu expired=%llu rejected=%llu demand_reads=%llu completed=%llu\n",
+            (unsigned long long)(q.prefetched-b.prefetched), (unsigned long long)(q.used-b.used),
+            (unsigned long long)(q.promoted-b.promoted), (unsigned long long)(q.deduplicated-b.deduplicated),
+            (unsigned long long)(q.expired-b.expired), (unsigned long long)(q.rejected-b.rejected),
+            (unsigned long long)(q.demand_reads-b.demand_reads), (unsigned long long)(q.completed-b.completed));
+    }
     return !S().done_;
 }
 

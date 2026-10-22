@@ -12,6 +12,7 @@ struct Flag {
     const char * replaced_by;
 };
 inline constexpr Flag ALL[] = {
+    {"TQFN_KEEP_MAP", Kind::Debug, "-", "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path", ""},
     {"TQLLM_MLX_ABLATE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ABLATE_BLOCKS", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ABLATE_SMALL", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
