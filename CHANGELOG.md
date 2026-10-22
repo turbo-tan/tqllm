@@ -85,6 +85,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   length stays on larger cards), every layer gets an expert bank back after a long prompt (slot tiers on small cards),
   and the CPU-owned experts are a fixed rule kept out of the GPU banks: the same prompt gives the same text whatever the
   server ran before. 24 GB unchanged (text identical, chat 100.6 tok/s).
+- Flash-Next on GB10: a long prompt could fail with "prefill plan: ... MB needed, ... MB free after releasing N
+  expert banks" a few MB short (releasing a bank frees a little less than its size); the prefill now releases the next
+  bank until the plan fits.
 - Docker image build: the Dockerfile copied `kernels/`, removed in the source layout move, so the image no longer
   built; test `dockerfile_paths` checks every copied path exists.
 - Flash-Next on an RTX 3090 (PCIe): long generations could stop with "unspecified launch failure" (GPU front-end
