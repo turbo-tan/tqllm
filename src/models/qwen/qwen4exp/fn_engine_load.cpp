@@ -317,7 +317,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     {   // the per-layer token embedding is read at every token: cold pages cost each new token a disk wait (decode_rules.hpp)
         const auto t0 = std::chrono::steady_clock::now();
-        if (const size_t n = checkpoint.warm_tensors(8))
+        if (const size_t n = checkpoint.warm_tensors(8, host_ram))
             std::fprintf(stderr, "tqllm: per-layer token embedding cached: %.1f GB in %.0f s\n", n / 1e9,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }

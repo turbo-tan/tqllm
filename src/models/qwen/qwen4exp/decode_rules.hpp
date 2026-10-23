@@ -106,8 +106,11 @@ inline bool drop_after_pack(const std::string & tensor) {
     const auto exps = tensor.find("_exps.weight");
     return tensor.rfind("blk.", 0) == 0 && exps != std::string::npos && exps + 12 == tensor.size();
 }
-// Read at start-up so the first requests do not fault it in from the disk
-inline bool warm_at_start(const std::string & tensor) { return tensor == "per_layer_token_embd.weight"; }
+// Read at start-up so the first requests do not fault it in from the disk, when it fits half the RAM: on a small host
+// (.231: 23 GiB, 28.8 GB embedding) the read only cycles the page cache and evicts the cold experts.
+inline bool warm_at_start(const std::string & tensor, double tensor_bytes, double host_ram_bytes) {
+    return tensor == "per_layer_token_embd.weight" && tensor_bytes <= 0.5 * host_ram_bytes;
+}
 // Prefill chunk: the engine's --prefill-chunk setting (default 16384), whether or not the manifest names one; the
 // manifest value counts only when that setting is off. A manifest without chunk= once prefilled in chunks of 8 (32K: 263 s).
 inline int prefill_chunk(int tune_chunk, int manifest_chunk) { return tune_chunk > 0 ? tune_chunk : manifest_chunk; }

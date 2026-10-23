@@ -105,7 +105,9 @@ int main() {
     check(drop_after_pack("blk.7.ffn_gate_exps.weight") && drop_after_pack("blk.47.ffn_down_exps.weight"), "trunk expert pages may be dropped after the pack");
     check(!drop_after_pack("per_layer_token_embd.weight") && !drop_after_pack("token_embd.weight") && !drop_after_pack("blk.0.attn_qkv.weight"),
           "the per-layer token embedding and dense tensors stay cached");
-    check(warm_at_start("per_layer_token_embd.weight") && !warm_at_start("blk.0.ffn_gate_exps.weight"), "the per-layer token embedding is read at start-up");
+    check(warm_at_start("per_layer_token_embd.weight", 28.8e9, 128e9) && !warm_at_start("blk.0.ffn_gate_exps.weight", 1e9, 128e9),
+          "the per-layer token embedding is read at start-up");
+    check(!warm_at_start("per_layer_token_embd.weight", 28.8e9, 24.7e9), "no start-up read of a 28.8 GB embedding on a 23 GiB host");
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

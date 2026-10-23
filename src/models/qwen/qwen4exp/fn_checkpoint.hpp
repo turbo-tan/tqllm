@@ -54,8 +54,10 @@ class Checkpoint {
 public:
     // after the experts are in pinned memory: drop the trunk expert pages, keep every tensor read per token cached
     void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
-    size_t warm_tensors(int threads) const {
-        size_t n = 0; for (const auto & [name, i] : owners_) if (tqllm::flashnext::warm_at_start(name)) n += files_[i]->warm_tensor(name, threads);
+    size_t warm_tensors(int threads, double host_ram_bytes) const {
+        size_t n = 0;
+        for (const auto & [name, i] : owners_)
+            if (tqllm::flashnext::warm_at_start(name, double(files_[i]->tensor(name).size), host_ram_bytes)) n += files_[i]->warm_tensor(name, threads);
         return n;
     }
     Qwen4ExpConfig config;
