@@ -691,7 +691,7 @@ __global__ void __launch_bounds__(256) fn_gdn_seq_k(const float * qk, const floa
     for (int i = tid; i < VS * dim; i += blockDim.x) next[(int64_t(head) * dim + v0 + i / dim) * dim + i % dim] = S[(i / dim) * P + i % dim];
 }
 __global__ void fn_gated_rms_k(const float * x, const float * gate, const float * weight, float * out,
-                               int dim, float eps) {
+                               int dim, float eps, bool silu) {
     const int row = blockIdx.x, lane = threadIdx.x;
     float squared = 0.f;
     for (int i = lane; i < dim; i += 32) squared += x[int64_t(row) * dim + i] * x[int64_t(row) * dim + i];
@@ -699,11 +699,12 @@ __global__ void fn_gated_rms_k(const float * x, const float * gate, const float 
     const float inv = rsqrtf(squared / dim + eps);
     for (int i = lane; i < dim; i += 32) {
         const int64_t at = int64_t(row) * dim + i;
-        out[at] = __fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), 1.f / (1.f + expf(-gate[at])));
+        const float g = 1.f / (1.f + expf(-gate[at]));
+        out[at] = __fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), silu ? __fmul_rn(gate[at], g) : g);
     }
 }
 // fn_gated_rms8_k writing the FP16 image of its output (what a conversion of the fp32 output gives) for the next projection
-template<class G> __global__ void fn_gated_rms8_h_k(const float * x, const G * gate, const float * weight, __half * out, int rows, int dim, float eps) {
+template<class G> __global__ void fn_gated_rms8_h_k(const float * x, const G * gate, const float * weight, __half * out, int rows, int dim, float eps, bool silu) {
     const int row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (row >= rows) return;
     float squared = 0.f;
@@ -712,11 +713,12 @@ template<class G> __global__ void fn_gated_rms8_h_k(const float * x, const G * g
     const float inv = rsqrtf(squared / dim + eps);
     for (int i = lane; i < dim; i += 32) {
         const int64_t at = int64_t(row) * dim + i;
-        out[at] = __float2half_rn(__fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), 1.f / (1.f + expf(-ldf(gate[at])))));
+        const float z = ldf(gate[at]), g = 1.f / (1.f + expf(-z));
+        out[at] = __float2half_rn(__fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), silu ? __fmul_rn(z, g) : g));
     }
 }
 // fn_gated_rms_k at 8 rows per block (prefill blocks; the same per-row arithmetic)
-__global__ void fn_gated_rms8_k(const float * x, const float * gate, const float * weight, float * out, int rows, int dim, float eps) {
+__global__ void fn_gated_rms8_k(const float * x, const float * gate, const float * weight, float * out, int rows, int dim, float eps, bool silu) {
     const int row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (row >= rows) return;
     float squared = 0.f;
@@ -725,7 +727,8 @@ __global__ void fn_gated_rms8_k(const float * x, const float * gate, const float
     const float inv = rsqrtf(squared / dim + eps);
     for (int i = lane; i < dim; i += 32) {
         const int64_t at = int64_t(row) * dim + i;
-        out[at] = __fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), 1.f / (1.f + expf(-gate[at])));
+        const float g = 1.f / (1.f + expf(-gate[at]));
+        out[at] = __fmul_rn(__fmul_rn(__fmul_rn(x[at], inv), weight[i]), silu ? __fmul_rn(gate[at], g) : g);
     }
 }
 __global__ void fn_norm_rope_k(const float * x, const float * weight, float * out,
@@ -1470,12 +1473,12 @@ void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t s) {
     if (n > 0) h_to_f32_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(x, y, n);
 }
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
-                  int heads, int dim, int n, float eps, cudaStream_t s) {
+                  int heads, int dim, int n, float eps, cudaStream_t s, bool silu) {
     if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n ||
         !std::isfinite(eps) || eps <= 0.f || !x || !gate || !weight || !out || out == weight)
         throw std::invalid_argument("Flash-Next gated RMS: invalid shape, pointer or epsilon");
-    if (n >= 64) { fn_gated_rms8_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps); return; }
-    fn_gated_rms_k<<<heads * n, 32, 0, s>>>(x, gate, weight, out, dim, eps);
+    if (n >= 64) { fn_gated_rms8_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps, silu); return; }
+    fn_gated_rms_k<<<heads * n, 32, 0, s>>>(x, gate, weight, out, dim, eps, silu);
 }
 void fn_norm_rope(const float * x, const float * weight, float * out, int heads, int dim,
                   int n, int pos, int rot, float theta, float eps, bool interleaved, cudaStream_t s) {
@@ -1573,17 +1576,17 @@ void fn_attention_gate_h(const float * in, const float * qg, __half * out, int h
     const int count = heads * dim * n;
     fn_attention_gate_h_k<<<(int64_t(count) + 255) / 256, 256, 0, s>>>(in, qg, out, dim, count);
 }
-void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int n, float eps, cudaStream_t s) {
+void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int n, float eps, cudaStream_t s, bool silu) {
     if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n ||
         !std::isfinite(eps) || eps <= 0.f || !x || !gate || !weight || !out)
         throw std::invalid_argument("Flash-Next gated RMS (fp16): invalid shape, pointer or epsilon");
-    fn_gated_rms8_h_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps);
+    fn_gated_rms8_h_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps, silu);
 }
-void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, __half * out, int heads, int dim, int n, float eps, cudaStream_t s) {
+void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, __half * out, int heads, int dim, int n, float eps, cudaStream_t s, bool silu) {
     if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n ||
         !std::isfinite(eps) || eps <= 0.f || !x || !gate || !weight || !out)
         throw std::invalid_argument("Flash-Next gated RMS (fp16 gate): invalid shape, pointer or epsilon");
-    fn_gated_rms8_h_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps);
+    fn_gated_rms8_h_k<<<(heads * n + 7) / 8, 256, 0, s>>>(x, gate, weight, out, heads * n, dim, eps, silu);
 }
 void fn_attention_gate(float * out, const float * qg, int heads, int dim, int n, cudaStream_t s) {
     if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n || !out || !qg || out == qg)
