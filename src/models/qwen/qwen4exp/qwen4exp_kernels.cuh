@@ -51,8 +51,9 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
 void fn_gdn_set_chunk_min(int n);
 void fn_gdn_set_kh(int on);
 void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);
+// output gate sigmoid(z) (Flash-Next) or, with silu, z * sigmoid(z) (Qwen3.5 / Qwen3.8 dense)
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
-                  int heads, int dim, int tokens, float epsilon, cudaStream_t);
+                  int heads, int dim, int tokens, float epsilon, cudaStream_t, bool silu = false);
 // Text-only positions. An interleaved query input stores [q|gate] per head.
 void fn_norm_rope(const float * x, const float * weight, float * out, int heads, int dim,
                   int tokens, int position, int rotary, float theta, float epsilon, bool interleaved, cudaStream_t);

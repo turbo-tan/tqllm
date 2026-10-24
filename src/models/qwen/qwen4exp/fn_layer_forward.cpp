@@ -50,38 +50,26 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];
     Device<float> norm(size_t(width) * n), mixed(size_t(h) * n), inject(size_t(c.hc) * n), block(size_t(h) * n), combined(size_t(width) * n);
     if (trunk && ple_rows && std::find(c.ple_layers.begin(), c.ple_layers.end(), layer) != c.ple_layers.end()) {
-        Device<float> key(size_t(width) * n), value(size_t(h) * n), kn(key.count), qn(key.count), gates(size_t(c.hc) * n), gated(key.count);
-        {
-            const Checkpoint::SharedInput shared_in(cp, ple_rows, size_t(n) * h);
-            cp.project(prefix + "ple_key.weight", ple_rows, key.p, h, width, n);
-            cp.project(prefix + "ple_value.weight", ple_rows, value.p, h, h, n);
-        }
-        tqllm_cuda::hc_norm(key.p, cp.dense_device(prefix + "ple_norm_key.weight"), kn.p, h, c.hc, n, float(cp.epsilon), nullptr);
-        tqllm_cuda::hc_norm(residual->p, cp.dense_device(prefix + "ple_norm_query.weight"), qn.p, h, c.hc, n, float(cp.epsilon), nullptr);
-        tqllm_cuda::ple_gate(kn.p, qn.p, gates.p, h, c.hc, n, nullptr);
-        tqllm_cuda::ple_broadcast(value.p, gates.p, gated.p, h, c.hc, n, nullptr);
         const int hist = (c.ple_kernel - 1) * c.ple.ngram;
-        Device<float> pn(key.count), conv(key.count);
-        auto out = std::make_unique<Device<float>>(key.count);
-        tqllm_cuda::hc_norm(gated.p, cp.dense_device(prefix + "ple_norm_conv.weight"), pn.p, h, c.hc, n, float(cp.epsilon), nullptr);
-        auto ple_state = [&](DecodeModel & m, int off, int nn) {  // the conv history is per sequence
-            if (!m.ple_past[layer]) { PersistentAlloc keep; m.ple_past[layer] = std::make_unique<Device<float>>(size_t(hist) * width); ck_zero(*m.ple_past[layer]); }
-            Device<float> next(m.ple_past[layer]->count);
-            const size_t rows = size_t(nn) * width; const float * pseg = pn.p + size_t(off) * width;
-            if (m.spec) {
-                PersistentAlloc keep;
-                if (!m.ple_old[layer]) m.ple_old[layer] = std::make_unique<Device<float>>(m.ple_past[layer]->count);
-                if (!m.ple_saved[layer] || m.ple_saved[layer]->count < rows) m.ple_saved[layer] = std::make_unique<Device<float>>(rows);
-                ck_copy_n(*m.ple_old[layer], m.ple_past[layer]->p, m.ple_past[layer]->count);
-                ck_copy_n(*m.ple_saved[layer], pseg, rows);
-            }
-            tqllm_cuda::ple_conv(pseg, m.ple_past[layer]->p, cp.dense_device(prefix + "ple_conv1d.weight"), conv.p + size_t(off) * width, next.p,
-                                 width, nn, c.ple_kernel, c.ple.ngram, nullptr);
-            ck_copy(*m.ple_past[layer], next);
-        };
-        if (segs) for (const auto & sg : *segs) ple_state(*sg.m, sg.off, sg.n);
-        else ple_state(*this, 0, n);
-        tqllm_cuda::ple_apply(residual->p, gated.p, conv.p, out->p, int(out->count), nullptr); residual = std::move(out);
+        ple_block(cp, layer, residual, n, ple_rows, [&](const float * pn, float * conv) {
+            auto ple_state = [&](DecodeModel & m, int off, int nn) {  // the conv history is per sequence
+                if (!m.ple_past[layer]) { PersistentAlloc keep; m.ple_past[layer] = std::make_unique<Device<float>>(size_t(hist) * width); ck_zero(*m.ple_past[layer]); }
+                Device<float> next(m.ple_past[layer]->count);
+                const size_t rows = size_t(nn) * width; const float * pseg = pn + size_t(off) * width;
+                if (m.spec) {
+                    PersistentAlloc keep;
+                    if (!m.ple_old[layer]) m.ple_old[layer] = std::make_unique<Device<float>>(m.ple_past[layer]->count);
+                    if (!m.ple_saved[layer] || m.ple_saved[layer]->count < rows) m.ple_saved[layer] = std::make_unique<Device<float>>(rows);
+                    ck_copy_n(*m.ple_old[layer], m.ple_past[layer]->p, m.ple_past[layer]->count);
+                    ck_copy_n(*m.ple_saved[layer], pseg, rows);
+                }
+                tqllm_cuda::ple_conv(pseg, m.ple_past[layer]->p, cp.dense_device(prefix + "ple_conv1d.weight"), conv + size_t(off) * width, next.p,
+                                     width, nn, c.ple_kernel, c.ple.ngram, nullptr);
+                ck_copy(*m.ple_past[layer], next);
+            };
+            if (segs) for (const auto & sg : *segs) ple_state(*sg.m, sg.off, sg.n);
+            else ple_state(*this, 0, n);
+        });
     }
     // the norms write their BF16 image for the mixer's BF16 projections (no f32 -> bf16 passes); prefill sub-chunks of more
     // than 64 tokens with a BF16 mixer keep no fp32 normalized rows at all (row scales only, the mix recomputes them; exact)
@@ -127,7 +115,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 const GdnPre pre{qkvB.p + size_t(sg.off) * channels, zB.p + size_t(sg.off) * vh * sd, aB.p + size_t(sg.off) * vh, bB.p + size_t(sg.off) * vh};
                 recurrent_core(cp, nullptr, nullptr, sg.n, layer, nullptr, &sg.m->rec[layer], &pre, roB.p + size_t(sg.off) * vh * sd);
             }
-            tqllm_cuda::fn_gated_rms(roB.p, zB.p, cp.dense_device(pf + "ssm_norm.weight"), gB.p, vh, sd, n, float(cp.epsilon), nullptr);
+            tqllm_cuda::fn_gated_rms(roB.p, zB.p, cp.dense_device(pf + "ssm_norm.weight"), gB.p, vh, sd, n, float(cp.epsilon), nullptr, c.gdn_silu_gate);
             cp.project(pf + "ssm_out.weight", gB.p, block.p, vh * sd, h, n);
         }
     } else if (segs) {

@@ -14,14 +14,16 @@ struct PleHashConfig {
 };
 
 struct Qwen4ExpConfig {
-    int layers = 0, hidden = 0, experts = 0, topk = 0, expert_ff = 0, shared_ff = 0;
+    int layers = 0, hidden = 0, experts = 0, topk = 0, expert_ff = 0, shared_ff = 0, dense_ff = 0;  // experts = 0: dense FFN
     int hc = 0, hc_low_rank = 0, ple_kernel = 0, ple_dim = 0;
     int index_heads = 0, index_dim = 0, index_topk = 0;
+    bool gdn_silu_gate = false;  // ssm.gate_activation = "silu": GDN output gate z * sigmoid(z) instead of sigmoid(z)
     std::vector<int> ple_layers, compress_ratios;
     PleHashConfig ple;
     bool operator==(const Qwen4ExpConfig &) const = default;
 };
 Qwen4ExpConfig qwen4exp_config(const GgufFile &);
+std::string qwen4exp_prefix(const GgufFile &);  // "qwen4exp." or "qwen4."
 
 // One instance per sequence. Rejected speculative tokens are removed before the next append.
 class PleTokenHistory {

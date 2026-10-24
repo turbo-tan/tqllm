@@ -65,6 +65,11 @@ static void gate_test(bool legacy) {
     tqllm_cuda::fn_gated_rms(dx.p, dz.p, dw.p, dx.p, heads, dim, tokens, eps, nullptr);
     require(dx.get() == got, "in-place gated RMS differs");
     std::puts("Flash-Next sigmoid output gate (zero/saturated/mixed/in-place): PASS");
+    for (int r = 0; r < heads * tokens; ++r) for (int j = 0; j < dim; ++j) expected[r * dim + j] *= z[r * dim + j];
+    dx.put(x);
+    tqllm_cuda::fn_gated_rms(dx.p, dz.p, dw.p, dy.p, heads, dim, tokens, eps, nullptr, true);
+    compare(dy.get(), expected);
+    std::puts("Qwen dense SiLU output gate z * sigmoid(z): PASS");
 }
 static void legacy_normalization_test() {
     constexpr int dim = 128;

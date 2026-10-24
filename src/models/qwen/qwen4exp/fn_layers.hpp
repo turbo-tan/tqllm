@@ -103,7 +103,7 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
         compare("gdn_recurrent_state" + suffix, next_state.get(), fixtures->values("new_state" + suffix), .02);
     if (raw_out) return;
     Device<float> gated(out.count); struct Out { float * p; } projected{result};
-    tqllm_cuda::fn_gated_rms(out.p, z.p, checkpoint.dense_device(prefix + "ssm_norm.weight"), gated.p, vh, dim, n, float(checkpoint.epsilon), nullptr);
+    tqllm_cuda::fn_gated_rms(out.p, z.p, checkpoint.dense_device(prefix + "ssm_norm.weight"), gated.p, vh, dim, n, float(checkpoint.epsilon), nullptr, c.gdn_silu_gate);
     if (fixtures && fixtures->has("final_output" + suffix))
         compare("gdn_sigmoid_norm" + suffix, gated.get(), fixtures->values("final_output" + suffix), .02);
     checkpoint.project(prefix + "ssm_out.weight", gated.p, projected.p, vh * dim, c.hidden, n);
@@ -240,6 +240,30 @@ struct MixerResult { std::vector<float> mixed, inject; };
 // the low-rank activation is written with its image too, so no projection converts its input
 // rs (prefill sub-chunks > 64 tokens): `normalized` is only a key for the BF16 image; the mix recomputes the normalized rows from
 // (rs_x, rs, rs_gamma), the inputs the norm read
+// Per-layer embedding (PLE) of a PLE layer: key / value projections of the tokens' hashed n-gram rows (ple_rows [n][hidden]),
+// a gate per stream from the normalised key and residual, the gated value broadcast to every stream, then a causal conv
+// over it whose history the caller keeps per sequence (conv(normalised [n][width], out [n][width])); the residual becomes
+// residual + gated + conv. Shared by Flash-Next (DecodeModel) and the dense Qwen4 graph.
+template <class Conv>
+inline void ple_block(const Checkpoint & cp, int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows, Conv && conv) {
+    const auto & c = cp.config; const int h = c.hidden, width = h * c.hc;
+    const std::string prefix = "blk." + std::to_string(layer) + ".";
+    Device<float> key(size_t(width) * n), value(size_t(h) * n), kn(key.count), qn(key.count), gates(size_t(c.hc) * n), gated(key.count);
+    {
+        const Checkpoint::SharedInput shared_in(cp, ple_rows, size_t(n) * h);
+        cp.project(prefix + "ple_key.weight", ple_rows, key.p, h, width, n);
+        cp.project(prefix + "ple_value.weight", ple_rows, value.p, h, h, n);
+    }
+    tqllm_cuda::hc_norm(key.p, cp.dense_device(prefix + "ple_norm_key.weight"), kn.p, h, c.hc, n, float(cp.epsilon), nullptr);
+    tqllm_cuda::hc_norm(residual->p, cp.dense_device(prefix + "ple_norm_query.weight"), qn.p, h, c.hc, n, float(cp.epsilon), nullptr);
+    tqllm_cuda::ple_gate(kn.p, qn.p, gates.p, h, c.hc, n, nullptr);
+    tqllm_cuda::ple_broadcast(value.p, gates.p, gated.p, h, c.hc, n, nullptr);
+    Device<float> pn(key.count), cv(key.count);
+    auto out = std::make_unique<Device<float>>(key.count);
+    tqllm_cuda::hc_norm(gated.p, cp.dense_device(prefix + "ple_norm_conv.weight"), pn.p, h, c.hc, n, float(cp.epsilon), nullptr);
+    conv(static_cast<const float *>(pn.p), cv.p);
+    tqllm_cuda::ple_apply(residual->p, gated.p, cv.p, out->p, int(out->count), nullptr); residual = std::move(out);
+}
 inline void mix_device(const Checkpoint & checkpoint, const std::string & prefix, const float * normalized, int n,
                        float * mixed, float * inject, const __nv_bfloat16 * normalized_bf16 = nullptr,
                        const float * rs_x = nullptr, const float * rs = nullptr, const float * rs_gamma = nullptr) {
