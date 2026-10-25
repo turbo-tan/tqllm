@@ -3,6 +3,13 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- Qwen4.0 preparation: a dense Qwen4 graph built on the Flash-Next block (hyper-connection mixer, gated attention with
+  QSA, GDN) with a dense SwiGLU feed-forward, and per-layer embeddings shared with Flash-Next. Ready for the Qwen4 27B
+  weights when they are published; Flash-Next output is unchanged.
+
 ## 1.2.3 (2026-10-22)
 
 ### Fixed

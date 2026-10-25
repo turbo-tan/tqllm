@@ -160,16 +160,17 @@ public:
             auto file = std::make_unique<MappedGguf>(argv[i], dialect); const auto & metadata = file->file();
             if (files_.empty()) {
                 config = qwen4exp_config(metadata); expected = int(metadata.num("split.count", 1));
-                epsilon = metadata.num("qwen4exp.attention.layer_norm_rms_epsilon");
-                key_heads = int(metadata.num("qwen4exp.ssm.group_count"));
-                value_heads = int(metadata.num("qwen4exp.ssm.time_step_rank"));
-                state_dim = int(metadata.num("qwen4exp.ssm.state_size"));
-                conv_kernel = int(metadata.num("qwen4exp.ssm.conv_kernel"));
-                attention_heads = int(metadata.num("qwen4exp.attention.head_count"));
-                attention_kvheads = int(metadata.num("qwen4exp.attention.head_count_kv"));
-                attention_dim = int(metadata.num("qwen4exp.attention.key_length"));
-                rotary = int(metadata.num("qwen4exp.rope.dimension_count"));
-                theta = float(metadata.num("qwen4exp.rope.freq_base"));
+                const std::string pre = qwen4exp_prefix(metadata);
+                epsilon = metadata.num(pre + "attention.layer_norm_rms_epsilon");
+                key_heads = int(metadata.num(pre + "ssm.group_count"));
+                value_heads = int(metadata.num(pre + "ssm.time_step_rank"));
+                state_dim = int(metadata.num(pre + "ssm.state_size"));
+                conv_kernel = int(metadata.num(pre + "ssm.conv_kernel"));
+                attention_heads = int(metadata.num(pre + "attention.head_count"));
+                attention_kvheads = int(metadata.num(pre + "attention.head_count_kv"));
+                attention_dim = int(metadata.num(pre + "attention.key_length"));
+                rotary = int(metadata.num(pre + "rope.dimension_count"));
+                theta = float(metadata.num(pre + "rope.freq_base"));
             } else if (metadata.has("general.architecture")) require(qwen4exp_config(metadata) == config, "shard architecture differs");
             require(metadata.num("split.count", 1) == expected, "shard count differs");
             const int part = int(metadata.num("split.no", 0));
