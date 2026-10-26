@@ -12,6 +12,16 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   at 16K context, 492 tok/s at 32K.
 - GLM-5.3-Flash (GSQ GGUF): sparse attention with the DSA indexer, contexts up to 128K on a GB10, prompt chunks of
   512 tokens (prefill ~100 tok/s), end-of-turn stop and reasoning split.
+- Hugging Face checkpoint folders served in place (`--model FOLDER`): safetensors shards, tokenizer and chat template read
+  as published, no conversion and no second copy on disk. Encodings: EXL3 trellis, MXFP8, BF16 / F16 / F32.
+- Guide: [MiniMax-M3.1-Flash and GLM-5.3-Flash on one GB10](docs/guides/gb10-big-moe.md).
+
+### Fixed
+- Qwen3.5 / 3.8 TQ4 files (e.g. Qwen3.8-27B TQ_L): the Gated DeltaNet [b|a] rows and the MoE router read the rotated
+  activation again. Builds after 1.2.3 fed them an un-rotated copy meant only for hub TQ3_4S files, and greedy decode
+  could loop (40-question MMLU-Pro subset 23/40 -> 36/40). Released 1.2.x builds were not affected.
+- MiniMax raw completions start with the model's beginning-of-document token (without it the first tokens degenerate).
+- Builds with GCC 12 (Ubuntu 22.04), test fixes for x86 builds and GPU stream ordering in the test suite.
 
 ## 1.2.3 (2026-10-22)
 
