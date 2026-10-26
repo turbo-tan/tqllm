@@ -93,7 +93,12 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 // from the manifest's experts file when it names one; otherwise built in pinned memory from the GGUF at start-up on a
 // discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
 // keeps every expert resident and needs no pack.
-inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu) { return !has_pack_file && !integrated_gpu; }
+// Build the packed experts in pinned memory only on a discrete GPU without a pack file, outside hot/cold (its tiers manage
+// expert memory) and when the pack fits in 60 % of the machine's RAM; otherwise the cache reads experts from the GGUF on
+// demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB.
+inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes) {
+    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= 0.6 * host_ram_bytes;
+}
 // Pages that may be dropped once the experts sit in pinned memory: the trunk expert tensors only. The per-layer token
 // embedding (Flash-Next: 28.8 GB, one 90-byte row per token and layer) is read from the file at every token; with its
 // pages dropped each new token waited on the disk (3090: chats 79-88 instead of 94-103 tok/s, 32K first token +2.7 s).
@@ -101,8 +106,11 @@ inline bool drop_after_pack(const std::string & tensor) {
     const auto exps = tensor.find("_exps.weight");
     return tensor.rfind("blk.", 0) == 0 && exps != std::string::npos && exps + 12 == tensor.size();
 }
-// Read at start-up so the first requests do not fault it in from the disk
-inline bool warm_at_start(const std::string & tensor) { return tensor == "per_layer_token_embd.weight"; }
+// Read at start-up so the first requests do not fault it in from the disk, when it fits half the RAM: on a small host
+// (.231: 23 GiB, 28.8 GB embedding) the read only cycles the page cache and evicts the cold experts.
+inline bool warm_at_start(const std::string & tensor, double tensor_bytes, double host_ram_bytes) {
+    return tensor == "per_layer_token_embd.weight" && tensor_bytes <= 0.5 * host_ram_bytes;
+}
 // Prefill chunk: the engine's --prefill-chunk setting (default 16384), whether or not the manifest names one; the
 // manifest value counts only when that setting is off. A manifest without chunk= once prefilled in chunks of 8 (32K: 263 s).
 inline int prefill_chunk(int tune_chunk, int manifest_chunk) { return tune_chunk > 0 ? tune_chunk : manifest_chunk; }

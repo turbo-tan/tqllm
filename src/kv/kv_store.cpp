@@ -10,11 +10,14 @@ namespace tqllm {
 // ---- pool ----
 
 KvPool::KvPool(KvMemory & mem, const KvGeometry & g, int64_t device_pages, int64_t host_pages) : mem_(mem), g_(g) {
-    if (g.layers <= 0 || g.page <= 0 || !g.key_row || !g.value_row || device_pages < 0 || host_pages < 0 || g.device_rows > g.page)
+    if (g.layers <= 0 || g.page <= 0 || !g.key_row || device_pages < 0 || host_pages < 0 || g.device_rows > g.page)
         throw std::invalid_argument("KV pool: bad geometry");
     if (g.device_rows == g.page) g_.device_rows = -1, g_.staged = false;
     if (g_.staged && (g_.device_rows <= 0 || device_pages != 1 || host_pages))
         throw std::invalid_argument("KV pool: a staged host tail needs one page and a device window");
+    // value_row 0: one row per position is both the key and the value (the GLM nope-MLA latent cache). The staging scheme
+    // copies the two sides into one granule-sized buffer each, so it keeps requiring both.
+    if (!g_.value_row && g_.staged) throw std::invalid_argument("KV pool: a staged host tail needs a V side");
     try {
         if (g_.staged) stage_alloc();
         else alloc(dev_, KvTier::device, device_pages);
@@ -157,6 +160,11 @@ void KvPool::alloc(Arena & a, KvTier t, int64_t pages) {
     for (int l = 0; l < g_.layers; ++l)
         for (int side = 0; side < 2; ++side) {
             const size_t row = side ? g_.value_row : g_.key_row, pb = size_t(g_.page) * row;
+            if (!row) {  // no V side: keep the [layer * 2 + side] indexing, hold nothing
+                a.base.push_back(nullptr);
+                a.stride.push_back(0);
+                continue;
+            }
             if (!a.split) {
                 void * p = t == KvTier::host ? mem_.host_alloc(pb * size_t(pages)) : mem_.device_alloc(pb * size_t(pages));
                 if (!p) throw std::runtime_error("out of memory");
@@ -184,6 +192,7 @@ void KvPool::alloc(Arena & a, KvTier t, int64_t pages) {
 
 void KvPool::release(Arena & a, KvTier t) {
     for (size_t i = 0; i < a.base.size(); ++i) {
+        if (!a.base[i]) continue;  // a side this geometry does not hold
         if (a.split) mem_.unreserve(a.base[i], a.stride[i] * size_t(a.pages));
         else t == KvTier::host ? mem_.host_free(a.base[i]) : mem_.device_free(a.base[i]);
     }
@@ -205,6 +214,7 @@ size_t KvPool::page_bytes() const { return size_t(g_.layers) * size_t(g_.page) *
 size_t KvPool::bytes(KvTier t) const { return t == KvTier::host ? host_.host_bytes + dev_.host_bytes : dev_.dev_bytes; }
 
 void * KvPool::page_ptr(KvTier t, int layer, bool key, int32_t page) const {
+    if (!key && !g_.value_row) return nullptr;  // a cache with no V side
     const auto & a = arena(t);
     const size_t i = size_t(layer) * 2 + (key ? 0 : 1);
     return static_cast<char *>(a.base[i]) + size_t(page) * a.stride[i];
@@ -212,8 +222,11 @@ void * KvPool::page_ptr(KvTier t, int layer, bool key, int32_t page) const {
 
 void KvPool::move(KvTier from, int32_t pf, KvTier to, int32_t pt) {
     for (int l = 0; l < g_.layers; ++l)
-        for (bool key : {true, false})
-            mem_.copy(page_ptr(to, l, key, pt), page_ptr(from, l, key, pf), size_t(g_.page) * (key ? g_.key_row : g_.value_row));
+        for (bool key : {true, false}) {
+            const size_t row = key ? g_.key_row : g_.value_row;
+            if (!row) continue;
+            mem_.copy(page_ptr(to, l, key, pt), page_ptr(from, l, key, pf), size_t(g_.page) * row);
+        }
 }
 
 // ---- store ----
@@ -300,6 +313,7 @@ void KvStore::pin(int64_t positions) {
 }
 
 void * KvStore::row(int layer, bool key, int64_t pos) const {
+    if (!key && !pool_.geometry().value_row) return nullptr;  // a cache with no V side
     const int64_t lp = pos / page();
     if (pos < 0 || lp >= pages() || tier_[size_t(lp)] != KvTier::device) return nullptr;
     const auto & g = pool_.geometry();

@@ -31,6 +31,8 @@ namespace tqllm_cuda {
 // Same arithmetic as ggml's quantize_mmq_q8_1 on the fp32 values of the halves.
 // Columns k .. kpad - 1 (kpad: k rounded up to MMQ's 256-wide K step) are written as zeros.
 // rows_of != null: blockIdx.z is a slot, blockIdx.x its column (< counts[z]), the row = rows_of[z cap + column]
+// DS4 (IQ1_S): a 16-bit scale and the 32 values' sum (before quantisation, as ggml's quantize_mmq_q8_1) per 32 instead of D4.
+template <bool DS4 = false>
 __device__ __forceinline__ void mmq_quant_row(const __half * __restrict__ x, block_q8_1_mmq * __restrict__ y, int rows, int k,
                                               int row, int i0) {
     const uint2 raw = i0 < k ? *reinterpret_cast<const uint2 *>(x + int64_t(row) * k + i0) : make_uint2(0, 0);
@@ -39,19 +41,28 @@ __device__ __forceinline__ void mmq_quant_row(const __half * __restrict__ x, blo
     float amax = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(b.x), fabsf(b.y)));
 #pragma unroll
     for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o, 32));
+    float sum = a.x + a.y + b.x + b.y;
+    if constexpr (DS4) {
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, o, 32);
+    }
     const float d_inv = amax > 0.0f || i0 < k ? 127.0f / amax : 0.0f;
     char4 q;
     q.x = roundf(a.x * d_inv); q.y = roundf(a.y * d_inv); q.z = roundf(b.x * d_inv); q.w = roundf(b.y * d_inv);
     block_q8_1_mmq & blk = y[int64_t(i0 / QK8_1_MMQ) * rows + row];
     const int iqs = i0 % QK8_1_MMQ;
     reinterpret_cast<char4 *>(blk.qs)[iqs / 4] = q;
-    if (iqs % 32 == 0) blk.d4[iqs / 32] = i0 < k ? 1.0f / d_inv : 0.0f;
+    if (iqs % 32 == 0) {
+        if constexpr (DS4) blk.ds4[iqs / 32] = make_half2(i0 < k ? 1.0f / d_inv : 0.0f, i0 < k ? sum : 0.0f);
+        else blk.d4[iqs / 32] = i0 < k ? 1.0f / d_inv : 0.0f;
+    }
 }
+template <bool DS4 = false>
 __global__ void mmq_quant_d4_k(const __half * __restrict__ x, block_q8_1_mmq * __restrict__ y, int rows, int k, int kpad) {
     const int row = blockIdx.x;
     const int i0 = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
     if (i0 >= kpad) return;
-    mmq_quant_row(x, y, rows, k, row, i0);
+    mmq_quant_row<DS4>(x, y, rows, k, row, i0);
 }
 // the rows of a grouped pass: blockIdx.x strides over the slot's rows (a cap x slots grid would launch mostly empty blocks)
 __global__ void mmq_quant_rows_k(const __half * __restrict__ x, block_q8_1_mmq * __restrict__ y, int rows, int k, int kpad,
@@ -65,11 +76,13 @@ __global__ void mmq_quant_rows_k(const __half * __restrict__ x, block_q8_1_mmq *
 static int mmq_kpad(int k) { return (k + MMQ_ITER_K - 1) / MMQ_ITER_K * MMQ_ITER_K; }
 size_t mmq_act_bytes(int rows, int k) { return size_t(mmq_kpad(k) / QK8_1_MMQ) * size_t(rows) * sizeof(block_q8_1_mmq); }
 
-void mmq_quantize_act(const __half * x, int rows, int k, void * yq, cudaStream_t s) {
+void mmq_quantize_act(const __half * x, int rows, int k, void * yq, cudaStream_t s, bool ds4) {
     if (rows <= 0) return;
     if (k % QK8_1_MMQ) throw std::invalid_argument("mmq_quantize_act: k must be a multiple of 128");
     const int kpad = mmq_kpad(k);
-    mmq_quant_d4_k<<<dim3(unsigned(rows), unsigned((kpad / 4 + 127) / 128)), 128, 0, s>>>(x, static_cast<block_q8_1_mmq *>(yq), rows, k, kpad);
+    const dim3 grid(unsigned(rows), unsigned((kpad / 4 + 127) / 128));
+    if (ds4) mmq_quant_d4_k<true><<<grid, 128, 0, s>>>(x, static_cast<block_q8_1_mmq *>(yq), rows, k, kpad);
+    else mmq_quant_d4_k<false><<<grid, 128, 0, s>>>(x, static_cast<block_q8_1_mmq *>(yq), rows, k, kpad);
 }
 
 // the rows of a layer-major pass only (rows_of / counts / cap / slots: the pass's groups); rows = the buffer's row count
@@ -169,19 +182,20 @@ size_t mmq_warm() {
     size_t f0 = 0, f1 = 0, tot = 0; cudaMemGetInfo(&f0, &tot);
     warm_one<GGML_TYPE_IQ3_S, 8>(); warm_one<GGML_TYPE_IQ3_XXS, 8>(); warm_one<GGML_TYPE_IQ2_S, 8>();
     warm_one<GGML_TYPE_IQ4_XS, 8>(); warm_one<GGML_TYPE_IQ4_NL, 8>();
-    mmq_quant_d4_k<<<1, 128>>>(nullptr, nullptr, 0, 0, 0);  // k = 0: returns at once, loads the quantizer
+    warm_one<GGML_TYPE_IQ1_S, 8>(); warm_one<GGML_TYPE_IQ2_XXS, 8>();
+    mmq_quant_d4_k<false><<<1, 128>>>(nullptr, nullptr, 0, 0, 0); mmq_quant_d4_k<true><<<1, 128>>>(nullptr, nullptr, 0, 0, 0);  // k = 0: returns at once, loads the quantizer
     cudaDeviceSynchronize(); cudaGetLastError(); cudaMemGetInfo(&f1, &tot);
     return f0 > f1 ? f0 - f1 : 0;
 }
 
-// fmt: u4h_matvec_k's FMT (4 IQ3_S, 5 IQ3_XXS, 10 IQ2_S, 13 IQ4_XS, 14 IQ4_NL). rows / k per slot, slot z's rows at z * rows of the bank. yq: mmq_quantize_act
+// fmt: u4h_matvec_k's FMT (4 IQ3_S, 5 IQ3_XXS, 8 IQ2_XXS, 10 IQ2_S, 11 IQ1_S, 13 IQ4_XS, 14 IQ4_NL). rows / k per slot, slot z's rows at z * rows of the bank. yq: mmq_quantize_act
 // of ny input rows; column j of slot z reads row groups[z cap + j] / div and writes y[groups[z cap + j] * rows + r].
 // counts_host: the slots' column counts (the launch lists only the tiles that hold columns); tiles: a device buffer of
 // at least mmq_max_tiles(cap, slots) int2.
 int mmq_max_tiles(int cap, int slots) { return slots * ((cap + 7) / 8); }
 bool mmq_supports(int fmt, int k) {
     const int qk = fmt == 14 ? 32 : 256;
-    return (fmt == 4 || fmt == 5 || fmt == 10 || fmt == 13 || fmt == 14) && k % qk == 0 && k % QK8_1_MMQ == 0;
+    return (fmt == 4 || fmt == 5 || fmt == 8 || fmt == 10 || fmt == 11 || fmt == 13 || fmt == 14) && k % qk == 0 && k % QK8_1_MMQ == 0;
 }
 bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tiled, int rows, int k, const int * counts,
                      const int * counts_host, const int * groups, int cap, int slots, int div, const void * yq, int ny,
@@ -190,7 +204,9 @@ bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tile
     switch (fmt) {
         case 4: type = GGML_TYPE_IQ3_S; qk = ggml_cuda_type_traits<GGML_TYPE_IQ3_S>::qk; break;
         case 5: type = GGML_TYPE_IQ3_XXS; qk = ggml_cuda_type_traits<GGML_TYPE_IQ3_XXS>::qk; break;
+        case 8: type = GGML_TYPE_IQ2_XXS; qk = ggml_cuda_type_traits<GGML_TYPE_IQ2_XXS>::qk; break;
         case 10: type = GGML_TYPE_IQ2_S; qk = ggml_cuda_type_traits<GGML_TYPE_IQ2_S>::qk; break;
+        case 11: type = GGML_TYPE_IQ1_S; qk = ggml_cuda_type_traits<GGML_TYPE_IQ1_S>::qk; break;
         case 13: type = GGML_TYPE_IQ4_XS; qk = ggml_cuda_type_traits<GGML_TYPE_IQ4_XS>::qk; break;
         case 14: type = GGML_TYPE_IQ4_NL; qk = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk; break;
         default: return false;
@@ -210,6 +226,8 @@ bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tile
         case GGML_TYPE_IQ3_S: run<GGML_TYPE_IQ3_S>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
         case GGML_TYPE_IQ3_XXS: run<GGML_TYPE_IQ3_XXS>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
         case GGML_TYPE_IQ2_S: run<GGML_TYPE_IQ2_S>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
+        case GGML_TYPE_IQ2_XXS: run<GGML_TYPE_IQ2_XXS>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
+        case GGML_TYPE_IQ1_S: run<GGML_TYPE_IQ1_S>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
         case GGML_TYPE_IQ4_XS: run<GGML_TYPE_IQ4_XS>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
         case GGML_TYPE_IQ4_NL: run<GGML_TYPE_IQ4_NL>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;
         case GGML_TYPE_Q8_0: run<GGML_TYPE_Q8_0>(a, Plan{counts_host, slots, tiles, tiles_cap}, s); break;

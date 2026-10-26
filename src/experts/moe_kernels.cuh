@@ -18,6 +18,8 @@ constexpr int kParamCopyMax = 8192;  // bytes per launch (kernel parameters, CUD
 void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream);
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,
               int experts, int topk, int n, float scale, cudaStream_t);
+// TQFN_KEEP_MAP pruning: logits[t][e] += mask[e] (0 kept / -inf pruned) for e < experts, rows of stride ld
+void logits_mask(float * logits, const float * mask, int n, int ld, int experts, cudaStream_t);
 // moe_topk on two routings in one launch (this layer's and the next layer's prediction); e <= 1024, warp path.
 void moe_topk2(const float * logits, int * ids, float * weights, float * shared_weights,
                const float * logits2, int * ids2, float * weights2, float * shared_weights2, int e, int k, int n, float scale, cudaStream_t);

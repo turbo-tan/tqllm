@@ -2,6 +2,7 @@
 #include "gguf.hpp"
 #include "gsq_q2.cuh"
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -17,8 +18,8 @@ template<class T> struct Device {
     void put(const std::vector<T> & x) { check(cudaMemcpy(p, x.data(), x.size() * sizeof(T), cudaMemcpyHostToDevice)); }
     std::vector<T> get(size_t n) { std::vector<T> x(n); check(cudaMemcpy(x.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return x; }
 };
-static void run(int cols, int n, bool per_expert) {
-    const int experts = 4, rows = 19, topk = 3;
+static void run(int cols, int n, bool per_expert, int rows=19) {
+    const int experts = 4, topk = 3;
     std::mt19937 rng(cols + n);
     const size_t weights = size_t(experts) * rows * cols;
     std::vector<char> raw(weights / 64 * 18);
@@ -56,6 +57,7 @@ static void run(int cols, int n, bool per_expert) {
         const float got = __bfloat162float(y[a * rows + r]);
         require(std::abs(got - expect) <= .005 * std::abs(expect) + 2e-5, "Q2 grouped dot differs from independent double oracle");
     }
+    std::vector<__nv_bfloat16> full_grouped;
     {   // grouped experts (prefill): tensor-core kernel, and the scalar one with TQFN_Q2_DOT_GROUPED=1
         const int capacity = n * topk;
         std::vector<int> counts(experts, 0), groups(size_t(experts) * capacity, 0);
@@ -65,12 +67,56 @@ static void run(int cols, int n, bool per_expert) {
         check(cudaMemset(dyg.p, 0, size_t(rows) * ids.size() * sizeof(__nv_bfloat16)));
         require(format->expert_gemm(m, dx.p, dyg.p, rows, dc.p, dg.p, capacity, experts, topk, per_expert, nullptr), "Q2 expert_gemm unsupported");
         check(cudaDeviceSynchronize());
-        auto yg = dyg.get(size_t(rows) * ids.size());
+        auto yg = dyg.get(size_t(rows) * ids.size()); full_grouped = yg;
+        const int tight=*std::max_element(counts.begin(),counts.end());
+        if(tight<=8) {
+            std::vector<__nv_bfloat16> comparison;
+            float elapsed[2]={};
+            int arm=0;
+            for(int cap:{tight,9}) {
+                std::vector<int> packed(size_t(experts)*cap,0);
+                for(int e=0;e<experts;++e)for(int j=0;j<counts[e];++j)packed[size_t(e)*cap+j]=groups[size_t(e)*capacity+j];
+                Device<int> dp(packed.size());dp.put(packed);
+                format->expert_gemm(m,dx.p,dyg.p,rows,dc.p,dp.p,cap,experts,topk,per_expert,nullptr);
+                auto got=dyg.get(size_t(rows)*ids.size());
+                if(comparison.empty())comparison=got;
+                else require(std::memcmp(comparison.data(),got.data(),got.size()*sizeof(got[0]))==0,"Q2 narrow vs wide tile not bit exact");
+                require(std::memcmp(full_grouped.data(),got.data(),got.size()*sizeof(got[0]))==0,"Q2 compact groups changed output bits");
+                if(rows!=19) {
+                    cudaEvent_t begin,end;check(cudaEventCreate(&begin));check(cudaEventCreate(&end));check(cudaEventRecord(begin));
+                    for(int rep=0;rep<40;++rep)format->expert_gemm(m,dx.p,dyg.p,rows,dc.p,dp.p,cap,experts,topk,per_expert,nullptr);
+                    check(cudaEventRecord(end));check(cudaEventSynchronize(end));check(cudaEventElapsedTime(&elapsed[arm],begin,end));
+                    cudaEventDestroy(begin);cudaEventDestroy(end);
+                }
+                ++arm;
+            }
+            if(rows!=19)std::printf("Q2_TILE rows=%d k=%d n=%d per=%d narrow_us=%.3f wide_us=%.3f exact=1\n",rows,cols,n,int(per_expert),elapsed[0]*25,elapsed[1]*25);
+        }
         for (size_t a = 0; a < ids.size(); ++a) for (int r = 0; r < rows; ++r) {
             double expect = 0;
             for (int j = 0; j < cols; ++j)
                 expect += double(decoded[(size_t(ids[a]) * rows + r) * cols + j]) * __half2float(x[(per_expert ? a : a / topk) * cols + j]);
             require(std::abs(__bfloat162float(yg[a * rows + r]) - expect) <= .005 * std::abs(expect) + 2e-5, "Q2 grouped GEMM differs from independent double oracle");
+        }
+    }
+    { // Hot/cold banks must write disjoint assignment rows, retaining rows written by the other bank.
+        const int capacity = int(ids.size());
+        Device<__nv_bfloat16> merged(size_t(rows) * ids.size());
+        const auto sentinel = __float2bfloat16(-123.f);
+        merged.put(std::vector<__nv_bfloat16>(size_t(rows) * ids.size(), sentinel));
+        for (int parity = 0; parity < 2; ++parity) {
+            std::vector<int> counts(experts, 0), groups(size_t(experts) * capacity, 0);
+            for (int a = parity; a < n * topk; a += 2) groups[size_t(ids[a]) * capacity + counts[ids[a]]++] = a;
+            Device<int> dc(counts.size()), dg(groups.size()); dc.put(counts); dg.put(groups);
+            require(format->expert_gemm(m, dx.p, merged.p, rows, dc.p, dg.p, capacity, experts, topk, per_expert, nullptr),
+                    "Q2 subset grouped dispatch unavailable");
+            check(cudaDeviceSynchronize());
+            const auto got = merged.get(size_t(rows) * ids.size());
+            for (size_t a = 0; a < ids.size(); ++a) for (int r = 0; r < rows; ++r) {
+                const auto v = got[a * rows + r];
+                if (!parity && (a & 1)) require(std::memcmp(&v, &sentinel, sizeof(v)) == 0, "Q2 overwrote another bank's row");
+                else require(std::memcmp(&v, &full_grouped[a * rows + r], sizeof(v)) == 0, "Q2 subset merge differs from full assignment dispatch");
+            }
         }
     }
     Device<float> logits(size_t(m.rows) * n);
@@ -105,7 +151,9 @@ static void run(int cols, int n, bool per_expert) {
 }
 int main() {
     try {
-        for (int k : {64, 640, 2560}) for (int n : {1, 8, 12, 200}) for (bool per : {false, true}) run(k, n, per);
-        std::puts("GSQ Q2_0: 24 code/scale/oracle/grouped/F32/graph/bounds scenarios PASS"); return 0;
+        for (int k : {64, 640, 2560}) for (int n : {1, 2, 4, 6, 8, 12, 200}) for (bool per : {false, true}) run(k, n, per);
+        for(int n:{1,2,4,6}) {run(2560,n,false,640);run(640,n,true,2560);}
+        for (int n : {1, 2, 8}) { run(6144, n, false, 96); run(3072, n, true, 64); }  // wide rows (MiniMax): dot_wide
+        std::puts("GSQ Q2_0: 42 generic +8 real-shape code/scale/oracle/grouped/F32/graph/bounds scenarios PASS"); return 0;
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

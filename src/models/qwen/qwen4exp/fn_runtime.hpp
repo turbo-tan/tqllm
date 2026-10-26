@@ -6,6 +6,7 @@
 #include "../src/cuda_recover.hpp"
 #include "dev_alloc.cuh"
 #include "tq3_expert_cache.hpp"
+#include "packed_experts.hpp"
 #include "prefill_plan.hpp"
 #include "kv_store.hpp"
 #include "kv_format.hpp"
@@ -140,6 +141,10 @@ inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): th
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
 inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
+// TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
+inline const std::vector<int32_t> * g_hot_map = nullptr;
+inline MixedExpertCache * g_cold_cache = nullptr;
+inline const float * g_keep_mask = nullptr;
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
 // 256-token sub-chunk of that layer (the pool is a prefill borrow: counted in the bank eviction, freed with the prefill buffers)

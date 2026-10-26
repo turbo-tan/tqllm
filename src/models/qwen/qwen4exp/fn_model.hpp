@@ -168,69 +168,15 @@ struct DecodeModel {
     static void ck_copy_n(Device<float> & dst, const float * src, size_t count) { ck(cudaMemcpyAsync(dst.p, src, count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
 };
 
-// Packed expert file (TQFNEXP1): header, then per layer [6 x uint64 sizes: gate data/aux, up data/aux, down data/aux],
-// then every expert of every layer as one contiguous block in the decode cache's row layout (no repack on a miss).
-struct PackedExperts {
-    int layers = 0, experts = 0; std::vector<std::array<uint64_t, 6>> sizes; std::vector<uint64_t> base, block;
-    const char * map = nullptr; size_t bytes = 0; bool tiled = false;
-    const char * at(int layer, int id) const { return map + base[layer] + uint64_t(id) * block[layer]; }
-};
-inline PackedExperts open_packed(const std::string & path) {
-    PackedExperts pe; FILE * f = std::fopen(path.c_str(), "rb"); require(f, "cannot open " + path);
-    char magic[8]; int32_t dims[2];
-    require(std::fread(magic, 1, 8, f) == 8 && (std::memcmp(magic, "TQFNEXP1", 8) == 0 || std::memcmp(magic, "TQFNEXPT", 8) == 0) &&
-            std::fread(dims, 4, 2, f) == 2, "not a TQFNEXP1 / TQFNEXPT file");
-    pe.tiled = std::memcmp(magic, "TQFNEXPT", 8) == 0;
-    pe.layers = dims[0]; pe.experts = dims[1]; pe.sizes.resize(pe.layers);
-    for (auto & z : pe.sizes) require(std::fread(z.data(), 8, 6, f) == 6, "packed header truncated");
-    uint64_t off = 16 + uint64_t(pe.layers) * 48;
-    for (int l = 0; l < pe.layers; ++l) { uint64_t b = 0; for (auto v : pe.sizes[l]) b += v; pe.base.push_back(off); pe.block.push_back(b); off += b * pe.experts; }
-    std::fseek(f, 0, SEEK_END); pe.bytes = size_t(std::ftell(f)); std::fclose(f);
-    require(pe.bytes == off, "packed file size differs from its header");
-    const int fd = ::open(path.c_str(), O_RDONLY); require(fd >= 0, "cannot open " + path);
-    void * m = ::mmap(nullptr, pe.bytes, PROT_READ, MAP_SHARED, fd, 0); ::close(fd);
-    require(m != MAP_FAILED, "cannot map " + path); pe.map = static_cast<const char *>(m); return pe;
-}
-// u4h kernel id of each projection's device format (what the grouped kernels see), from one expert's load
+// The packed expert file (TQFNEXP1 / TQFNEXPT), its reader and the per-expert repack are shared components now
+// (src/experts/packed_experts.hpp): GLM-5.3-Flash writes and reads the same file. These are the Checkpoint-shaped
+// wrappers the Flash-Next engine and tqfn-stage call.
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
-    const auto & c = checkpoint.config; std::array<int, 3> ids{}; const auto payload = checkpoint.expert_payload(layer, 0);
-    for (int p = 0; p < 3; ++p) {
-        const int cols = p == 2 ? c.expert_ff : c.hidden, rows = p == 2 ? c.hidden : c.expert_ff;
-        std::vector<std::vector<char>> keep_bytes;
-        Upload keep = [&](const void * data, size_t bytes) {
-            keep_bytes.emplace_back(static_cast<const char *>(data), static_cast<const char *>(data) + bytes); return keep_bytes.back().data(); };
-        ids[p] = weight_format(payload[p].type)->load(
-            std::vector<char>(payload[p].bytes.data, payload[p].bytes.data + payload[p].bytes.size), rows, cols, keep, nullptr).fmt->u4h_id();
-    }
-    return ids;
+    return tqllm::expert_u4h_ids(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
 }
-// One expert in the device layout (data, aux per projection), as the packed file and the MTP prepack store it.
 inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id) {
-    const auto & c = checkpoint.config;
-    std::array<std::vector<char>, 6> parts; const auto payload = checkpoint.expert_payload(layer, id);
-    for (int p = 0; p < 3; ++p) {
-        const int cols = p == 2 ? c.expert_ff : c.hidden, rows = p == 2 ? c.hidden : c.expert_ff;
-        std::vector<std::vector<char>> pieces; std::vector<const void *> where; pieces.reserve(4);
-        Upload keep = [&](const void * data, size_t bytes) {
-            pieces.emplace_back(static_cast<const char *>(data), static_cast<const char *>(data) + bytes);
-            where.push_back(pieces.back().data()); return pieces.back().data();
-        };
-        const auto m = weight_format(payload[p].type)->load(
-            std::vector<char>(payload[p].bytes.data, payload[p].bytes.data + payload[p].bytes.size), rows, cols, keep, nullptr);
-        for (size_t k = 0; k < pieces.size(); ++k) {
-            if (where[k] == m.p) parts[2 * p] = std::move(pieces[k]);
-            else if (where[k] == m.aux) parts[2 * p + 1] = std::move(pieces[k]);
-        }
-        require(!parts[2 * p].empty(), "loader produced no row data");
-        // TQFN_TILED: lane-contiguous code tiles for the grouped expert kernels (bytes permuted, values unchanged)
-        const int bpb = g_tile_experts ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;
-        if (bpb && rows % 16 == 0 && (cols / 32) % 4 == 0 && parts[2 * p].size() == size_t(rows) * (cols / 32) * bpb) {
-            std::vector<char> t(parts[2 * p].size());
-            tqllm_cuda::tile_expert_rows(parts[2 * p].data(), t.data(), rows, cols, bpb);
-            parts[2 * p] = std::move(t);
-        }
-    }
-    return parts;
+    return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
+                                g_tile_experts);
 }
 // The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
 inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {

@@ -25,7 +25,7 @@ int main(int argc, char ** argv) {
         int expected_shards = 0;
         std::set<int> shard_ids;
         for (size_t i = 0; i < paths.size(); ++i) {
-            const auto f = tqllm::gguf_open(paths[i], dialect);
+            const auto f = tqllm::gguf_open_shard(paths[i], dialect);
             const auto c = i == 0 || f.has("general.architecture") ? tqllm::qwen4exp_config(f) : config;
             if (i == 0) {
                 config = c;

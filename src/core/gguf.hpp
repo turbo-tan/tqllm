@@ -1,6 +1,7 @@
 #pragma once
 // Minimal GGUF v3 reader: metadata (scalars and arrays) and tensor directory.
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -31,6 +32,9 @@ enum GgmlType : uint32_t {
     GGML_TQMLX_TILED3 = 310, GGML_TQMLX_TILED4 = 311, GGML_TQMLX_MMA8_3 = 312, GGML_TQMLX_MMA8_4 = 313,  // tq_mlx kernel-ready layouts
     GGML_NAX_A4_G128 = 314, GGML_NAX_A6_G64 = 315, GGML_AFF8_G64 = 316, GGML_NAX_A4_G64 = 317,  // affine, M5 matrix-unit lane order (8-bit: row-major)
     GGML_GSQ_Q2_0 = 302,  // explicit GSQ-RCO dialect: external id42, not fork Q1_0
+    GGML_I16 = 25,        // EXL3 trellis words, 1 elem / 2 B
+    GGML_MXFP8 = 321,     // OCP MXFP8: per row cols E4M3, then the row's cols / 32 E8M0 scales (32 weights in 33 B)
+    GGML_X3 = 320,        // X3 (EXL3 mul1 trellis): X3Record row groups of trellis / suh / svh (303 / 304 are TQ4S / TQ3S)
 };
 
 
@@ -38,8 +42,15 @@ struct GgufTensor {
     uint32_t type = 0;
     std::vector<uint64_t> ne;  // ne[0] is the contiguous (column) dimension
     uint64_t offset = 0;       // absolute file offset
+    std::string file;          // shard holding the bytes (split GGUFs); empty = GgufFile::path
     uint64_t bytes = 0;
     uint64_t type_header_offset = 0; // original type field, for explicit dialect reader adapters
+    // Virtual tensors (the PAW adapter's GGML_X3 view): the payload is `header` followed by every part's bytes,
+    // which may live at unrelated file offsets; read() concatenates exactly that. Empty for an ordinary tensor.
+    std::vector<char> header;
+    std::vector<GgufTensor> parts;  // each part: its own header (if any), then `bytes` at `offset` of its file
+    std::function<std::vector<char>()> make;  // a tensor built on read (EXL3 folders: norms 1 + w, MXFP8 -> BF16)
+    bool built() const { return make || !parts.empty() || !header.empty(); }
 };
 
 // Block layout of a quantised GGUF type: `elems` weights per block, `bytes` per block.
@@ -91,7 +102,13 @@ struct GgufFile {
 };
 
 enum class GgufDialect { Native, GsqRco };
+// Opens a GGUF. A split GGUF (`split.count` > 1, files `<prefix>-00001-of-0000N.gguf`) opens as one file from any of
+// its shards: metadata from the first shard, tensors from all of them (each tensor's `file` names its shard).
+// general.architecture of a GGUF file (its first shard's header only) or of a Hugging Face checkpoint folder; "" if none.
+std::string gguf_architecture(const std::string & path);
 GgufFile gguf_open(const std::string & path, GgufDialect dialect = GgufDialect::Native);
+// One file only, split or not (its own tensors and metadata): for callers that map each shard themselves.
+GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect = GgufDialect::Native);
 uint64_t gguf_tensor_bytes(uint32_t type, const std::vector<uint64_t> & ne, const std::string & name);
 
 } // namespace tqllm

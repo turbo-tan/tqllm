@@ -1,10 +1,13 @@
 #pragma once
-// Flash-Next layer-major prefill: the memory plan and the bank ledger.
+// Flash-Next layer-major prefill: the memory plan.
 //
 // PrefillPlan is a pure function of the request and the engine parameters: how many device bytes each prefill buffer
 // takes, what the chunk's peak is, and how many expert banks the request must borrow (release) before its first kernel.
-// BankLedger owns the borrow: which banks were released, in which state the request is, and that the refill happens
-// only after the prefill buffers are gone. Both are CUDA-free so tests/prefill_plan.cpp can check them on any machine.
+// The byte-to-slot arithmetic and the ledger that owns the borrow are shared with every engine that keeps expert banks and
+// live in src/experts/expert_bank_plan.hpp; this file keeps what is Flash-Next's own buffer layout. CUDA-free, so
+// tests/prefill_plan.cpp can check it on any machine.
+#include "expert_bank_plan.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -42,18 +45,6 @@ inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 // normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
 // a quantized down / inject reads the fp32 rows.
 inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
-// Expert slots per layer from free device memory (slots=auto): what is free with no expert bank, less the room the
-// context and decode keep, over the bytes one slot takes in every layer; at least 1 (the fit check then reports), at
-// most every expert.
-// slots=auto builds the warm-up banks at this provisional size and sizes them after every other buffer (the MTP bank,
-// staging, the dense weights) is in place: a large start (64) left a 12 GB card no room for the MTP bank and the warm-up
-// failed before the sizing ran
-constexpr int kAutoStartSlots = 8;
-inline int auto_expert_slots(size_t free_bytes, size_t keep_bytes, size_t slot_bytes_all_layers, int experts) {
-    if (!slot_bytes_all_layers) return experts;
-    if (free_bytes <= keep_bytes) return 1;
-    return int(std::clamp<size_t>((free_bytes - keep_bytes) / slot_bytes_all_layers, 1, size_t(experts)));
-}
 // the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
 // block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB
 // without their scores; 3519+ MB short at 32768 with 3800). 0.15 MB per token + 128 MB; an overflow falls back to the pool.
@@ -101,8 +92,6 @@ struct PrefillPlan {
     size_t host_copies = 0;  // expert bytes streamed from host over the whole prompt (all experts once per layer-chunk)
 };
 
-enum class BorrowMode { Auto, All, Count };
-
 inline PrefillPlan prefill_plan(const PrefillShape & s, const PrefillTuning & t, int prompt_tokens, size_t free_bytes) {
     if (prompt_tokens <= 0) throw std::invalid_argument("prefill_plan: no tokens");
     PrefillPlan p;
@@ -118,89 +107,13 @@ inline PrefillPlan prefill_plan(const PrefillShape & s, const PrefillTuning & t,
     return p;
 }
 
-// How many banks a plan borrows: all of them, a fixed count, or the fewest (least recently used first) that cover the plan.
+// the plan's own two numbers, as the shared bank arithmetic names them
 inline int banks_to_borrow(const PrefillPlan & p, const std::vector<size_t> & bank_bytes_lru, BorrowMode mode, int count = 0) {
-    const int n = int(bank_bytes_lru.size());
-    if (mode == BorrowMode::All) return n;
-    if (mode == BorrowMode::Count) return std::clamp(count, 0, n);
-    size_t got = 0; int k = 0;
-    while (got < p.release && k < n) got += bank_bytes_lru[size_t(k++)];
-    if (got < p.release) throw std::runtime_error("prefill plan: " + std::to_string((p.release - got) >> 20) + " MB short with every bank released (" + std::to_string(p.release >> 20) + " MB to release, " + std::to_string(got >> 20) + " MB of banks)");
-    return k;
+    return banks_to_borrow(p.release, bank_bytes_lru, mode, count);
 }
-
-// The borrow of one request. The ledger does not touch CUDA: the engine supplies release / refill / free callbacks
-// (tests supply a mock). Order enforced: borrow -> trunk -> buffers released -> catch-up -> refill. A refill before
-// the buffers are released is the bug of 2026-10-16 (OOM half way through the refill) and throws here.
-class BankLedger {
-public:
-    struct Ops {
-        std::function<std::vector<int>()> lru_layers;        // layers with a bank, least recently used first
-        std::function<size_t(int)> bank_bytes;               // device bytes of that layer's bank
-        std::function<void(int)> release;                    // free the bank
-        std::function<void(int)> refill;                     // rebuild it (may throw: out of memory)
-        std::function<size_t()> free_bytes;                  // device bytes free now
-    };
-    enum class State { Idle, Borrowed, BuffersReleased, Refilled };
-
-    explicit BankLedger(Ops ops) : ops_(std::move(ops)) {}
-
-    // Releases banks for the plan; returns the layers released (prefill streams all of their experts). With mode All the
-    // layers that have no bank (released by regrow at the request start) join them: the refill after the prompt rebuilds
-    // every layer from one free-memory share, instead of some banks built mid-prompt at whatever the history left free
-    // (12 GB: the same 16K prompt twice gave different text).
-    std::vector<int> borrow(const PrefillPlan & plan, BorrowMode mode, int count = 0, const std::vector<int> & bankless = {}) {
-        if (state_ != State::Idle && state_ != State::Refilled) throw std::logic_error("BankLedger::borrow: previous request not refilled");
-        const auto lru = ops_.lru_layers();
-        std::vector<size_t> bytes; for (int l : lru) bytes.push_back(ops_.bank_bytes(l));
-        const int k = banks_to_borrow(plan, bytes, mode, count);
-        borrowed_.assign(lru.begin(), lru.begin() + k); borrowed_bytes_ = 0;
-        for (int l : borrowed_) { borrowed_bytes_ += ops_.bank_bytes(l); ops_.release(l); }
-        // a release frees a little less than the bank's bytes (allocator rounding, pool blocks): when the plan still does
-        // not fit, release the next least recently used bank instead of failing a few MB short (GB10: 12789 MB needed,
-        // 12785 MB free after 2 banks)
-        size_t next = size_t(k);
-        while (ops_.free_bytes() < plan.need && mode != BorrowMode::Count && next < lru.size()) {
-            const int l = lru[next++]; borrowed_.push_back(l); borrowed_bytes_ += ops_.bank_bytes(l); ops_.release(l);
-        }
-        if (mode == BorrowMode::All) for (int l : bankless) if (!borrowed(l)) borrowed_.push_back(l);
-        if (ops_.free_bytes() < plan.need)
-            throw std::runtime_error("prefill plan: " + std::to_string(plan.need >> 20) + " MB needed, " +
-                                     std::to_string(ops_.free_bytes() >> 20) + " MB free after releasing " + std::to_string(next) + " banks");
-        state_ = State::Borrowed;
-        return borrowed_;
-    }
-    bool borrowed(int layer) const { return std::find(borrowed_.begin(), borrowed_.end(), layer) != borrowed_.end(); }
-    const std::vector<int> & borrowed_layers() const { return borrowed_; }
-    size_t borrowed_bytes() const { return borrowed_bytes_; }
-
-    // The engine calls this once the trunk buffers (and the pool's cached blocks) are gone.
-    void buffers_released() {
-        if (state_ != State::Borrowed) throw std::logic_error("BankLedger::buffers_released: nothing borrowed");
-        state_ = State::BuffersReleased;
-    }
-    // Rebuilds the borrowed banks; returns how many came back this call. With keep_free > 0 it stops before the free
-    // memory would drop below keep_free (an overlapped refill beside the MTP catch-up) and leaves the rest for the next
-    // call; without it, a refill that runs out of memory stops and the rest refill on their first use in decode.
-    int refill(size_t keep_free = 0) {
-        if (state_ == State::Idle || borrowed_.empty()) { state_ = State::Refilled; return 0; }
-        if (state_ != State::BuffersReleased) throw std::logic_error("BankLedger::refill: prefill buffers still held");
-        int done = 0; size_t i = 0;
-        for (; i < borrowed_.size(); ++i) {
-            const int l = borrowed_[i];
-            if (keep_free && ops_.free_bytes() < keep_free + ops_.bank_bytes(l)) break;
-            try { ops_.refill(l); ++done; } catch (const std::exception &) { i = borrowed_.size(); break; }
-        }
-        refilled_ += done;
-        if (keep_free && i < borrowed_.size()) { borrowed_.erase(borrowed_.begin(), borrowed_.begin() + long(i)); return done; }
-        borrowed_.clear(); borrowed_bytes_ = 0; state_ = State::Refilled;
-        return done;
-    }
-    size_t borrowed_total() const { return borrowed_.size() + refilled_; }  // released this request (refilled or not yet)
-    State state() const { return state_; }
-
-private:
-    Ops ops_; std::vector<int> borrowed_; size_t borrowed_bytes_ = 0, refilled_ = 0; State state_ = State::Idle;
-};
+inline std::vector<int> borrow_banks(BankLedger & ledger, const PrefillPlan & p, BorrowMode mode, int count = 0,
+                                     const std::vector<int> & bankless = {}) {
+    return ledger.borrow(p.release, mode, count, p.need, bankless);
+}
 
 }  // namespace tqllm

@@ -19,9 +19,10 @@ struct MappedGguf::Mapping {
     const char * data = nullptr;
     size_t size = 0;
     std::string path;
+    int fd = -1;
     explicit Mapping(const std::string & p) : path(p) {
 #ifndef _WIN32
-        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) throw std::runtime_error("GGUF map open: " + std::string(std::strerror(errno)));
         struct stat info{};
         if (fstat(fd, &info) || info.st_size <= 0 || uint64_t(info.st_size) > std::numeric_limits<size_t>::max()) {
@@ -30,8 +31,7 @@ struct MappedGguf::Mapping {
         size = size_t(info.st_size);
         void * base = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
         const int error = errno;
-        close(fd);
-        if (base == MAP_FAILED) throw std::runtime_error("GGUF mmap: " + std::string(std::strerror(error)));
+        if (base == MAP_FAILED) { close(fd); fd=-1; throw std::runtime_error("GGUF mmap: " + std::string(std::strerror(error))); }
         data = static_cast<const char *>(base);
 #else
         throw std::runtime_error("GGUF mapping: use Linux/WSL or macOS; native Windows mapping is not implemented");
@@ -40,11 +40,16 @@ struct MappedGguf::Mapping {
     ~Mapping() {
 #ifndef _WIN32
         if (data) munmap(const_cast<char *>(data), size);
+        if (fd>=0) close(fd);
 #endif
     }
 };
 MappedGguf::MappedGguf(const std::string & path, GgufDialect dialect)
-    : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open(path, dialect)) {}
+    : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open_shard(path, dialect)) {}
+MappedGguf::MappedGguf(const std::string & path, Raw) : mapping_(std::make_unique<Mapping>(path)) { file_.path = path; }
+std::unique_ptr<MappedGguf> MappedGguf::raw(const std::string & path) {
+    return std::unique_ptr<MappedGguf>(new MappedGguf(path, Raw{}));
+}
 MappedGguf::~MappedGguf() = default;
 void MappedGguf::release_tensor(const std::string & name) const {
 #ifndef _WIN32
@@ -80,6 +85,30 @@ void MappedGguf::release_pages() const {
     madvise(const_cast<char *>(mapping_->data), mapping_->size, MADV_DONTNEED);
     const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+#endif
+}
+bool MappedGguf::discard_pages() const noexcept { return discard_pages({mapping_->data,mapping_->size}); }
+bool MappedGguf::discard_pages(GgufBytes bytes) const noexcept {
+#ifndef _WIN32
+    const auto base=reinterpret_cast<uintptr_t>(mapping_->data), at=reinterpret_cast<uintptr_t>(bytes.data);
+    if(at<base || at-base>mapping_->size || bytes.size>mapping_->size-(at-base))return false;
+    if(!bytes.size)return true;
+    const long page=sysconf(_SC_PAGESIZE);
+    if(page<=0)return false;
+    const size_t first=(at-base)/size_t(page)*size_t(page);
+    const size_t end=at-base+bytes.size;
+    // Keep shared boundary pages: another tensor's view may be in use concurrently.
+    const size_t start=first+(first<at-base ? size_t(page) : 0);
+    const size_t stop=end/size_t(page)*size_t(page);
+    if(stop<=start)return true;
+    if(madvise(const_cast<char *>(mapping_->data)+start,stop-start,MADV_DONTNEED))return false;
+#if defined(__linux__)
+    return posix_fadvise(mapping_->fd,off_t(start),off_t(stop-start),POSIX_FADV_DONTNEED)==0;
+#else
+    return true;
+#endif
+#else
+    (void)bytes;return false;
 #endif
 }
 GgufBytes MappedGguf::checked(const GgufTensor & t) const {

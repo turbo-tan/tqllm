@@ -1,5 +1,6 @@
 #include "tqllm/tokenizer.hpp"
 #include "gguf.hpp"
+#include "hf_folder.hpp"
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -47,6 +48,7 @@ int code_to_byte(uint32_t cp) {
 }
 
 void Tokenizer::load(const std::string & path) {
+    if (hf_folder(path)) { load_gguf(path); return; }  // gguf_open() presents the folder's tokenizer.json as GGUF keys
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open tokenizer: " + path);
     char magic[8]; in.read(magic, 8);
@@ -76,7 +78,7 @@ void Tokenizer::load_gguf(const std::string & path) {
         return it->second;
     };
     const auto & pre = key("tokenizer.ggml.pre").str;
-    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35"))
+    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35" && pre != "minimax-m3" && pre != "glm4"))
         throw std::runtime_error("GGUF tokenizer differs from the implemented Qwen byte-level BPE (pre " + pre + "); pass --tokenizer");
     const auto & tokens = key("tokenizer.ggml.tokens").strs;
     const auto & types = key("tokenizer.ggml.token_type").arr;
@@ -98,8 +100,86 @@ void Tokenizer::load_gguf(const std::string & path) {
         merge_rank_.emplace(a + char(0) + b, uint32_t(i)); merges_.emplace_back(std::move(a), std::move(b));
     }
     eos_id_ = uint32_t(g.num("tokenizer.ggml.eos_token_id"));
+    if (g.has("tokenizer.ggml.eot_token_id")) eot_id_ = uint32_t(g.num("tokenizer.ggml.eot_token_id"));
+    if (g.has("tokenizer.ggml.eom_token_id")) eom_id_ = uint32_t(g.num("tokenizer.ggml.eom_token_id"));
     unicode_ranges_.assign(std::begin(ranges), std::end(ranges));
     marks_in_letters_ = pre == "qwen35";
+    o200k_ = pre == "minimax-m3";
+    digits3_ = pre == "glm4";
+    static const std::tuple<uint32_t, uint32_t, uint8_t> cases[] = {
+#include "unicode_case_ranges.inc"
+    };
+    case_ranges_.assign(std::begin(cases), std::end(cases));
+}
+
+uint8_t Tokenizer::letter_case(uint32_t cp) const {
+    auto it=std::upper_bound(case_ranges_.begin(),case_ranges_.end(),cp,[](uint32_t x,const auto & r){return x<std::get<0>(r);});
+    if (it==case_ranges_.begin()) return 0;
+    --it; return cp<=std::get<1>(*it)?std::get<2>(*it):0;
+}
+
+// The MiniMax-M3 split (tokenizer.json, Split invert / ByteLevel without its own regex), alternatives in regex order:
+//   A [^\r\n\p{L}\p{N}]?[Lu Lt Lm Lo M]*[Ll Lm Lo M]+('s|'t|'re|'ve|'m|'ll|'d)?   (contractions case-insensitive)
+//   B [^\r\n\p{L}\p{N}]?[Lu Lt Lm Lo M]+[Ll Lm Lo M]*('s|...)?
+//   C \p{N}{1,3}    D  ?[^\s\p{L}\p{N}]+[\r\n/]*    E \s*[\r\n]+    F \s+(?!\S)    G \s+
+// with the regex engine's greedy-then-backtrack choices made explicitly.
+std::vector<std::string> Tokenizer::pretokenize_o200k(const std::string & text) const {
+    std::vector<std::string> out; const auto rs=runes(text); const size_t n=rs.size();
+    auto cat=[&](size_t p){return p<n?category(rs[p].cp):uint8_t(0);};
+    auto letter=[&](size_t p){return p<n&&(cat(p)&1);};
+    auto mark=[&](size_t p){return p<n&&(cat(p)&2);};
+    auto num=[&](size_t p){return p<n&&(cat(p)&4);};
+    auto space=[&](size_t p){return p<n&&(cat(p)&8);};
+    auto nl=[&](size_t p){return p<n&&(rs[p].cp=='\r'||rs[p].cp=='\n');};
+    auto up=[&](size_t p){ if(p>=n) return false; if(mark(p)) return true; if(!letter(p)) return false; return (letter_case(rs[p].cp)&32)==0; };  // Lu Lt Lm Lo M
+    auto lo=[&](size_t p){ if(p>=n) return false; if(mark(p)) return true; if(!letter(p)) return false; return (letter_case(rs[p].cp)&16)==0; };  // Ll Lm Lo M
+    auto prefix_ok=[&](size_t p){return p<n&&!nl(p)&&!letter(p)&&!num(p);};
+    auto contraction=[&](size_t p)->size_t{
+        if(p>=n||rs[p].cp!='\'') return 0;
+        static const char * suffix[]={"s","t","re","ve","m","ll","d"};
+        for(const char * x:suffix){size_t m=0;while(x[m])++m; if(p+1+m>n) continue; bool ok=true;
+            for(size_t k=0;k<m;++k){uint32_t c=rs[p+1+k].cp; if(c>127||char(std::tolower(int(c)))!=x[k]){ok=false;break;}} if(ok) return 1+m;}
+        return 0;
+    };
+    // A / B from s (s already past any prefix); returns the end or 0 when the alternative does not match here
+    auto alt_a=[&](size_t s)->size_t{
+        size_t u=0; while(up(s+u))++u;
+        for(size_t k=u+1;k-->0;){ size_t l=0; while(lo(s+k+l))++l; if(l){ size_t e=s+k+l; return e+contraction(e);} }
+        return 0;
+    };
+    auto alt_b=[&](size_t s)->size_t{
+        size_t u=0; while(up(s+u))++u;
+        if(!u) return 0;
+        size_t e=s+u; while(lo(e))++e;
+        return e+contraction(e);
+    };
+    size_t i=0;
+    while(i<n) {
+        size_t j=0;
+        for(int alt=0; alt<2 && !j; ++alt){  // A then B, each with the optional prefix tried first
+            auto f=[&](size_t s){return alt==0?alt_a(s):alt_b(s);};
+            if(prefix_ok(i)) j=f(i+1);
+            if(!j) j=f(i);
+        }
+        if(!j && num(i)) { j=i; while(j<n&&j<i+3&&num(j))++j; }
+        if(!j) {
+            for(size_t s : {i+1, i}) {
+                if(s==i+1 && !(rs[i].cp==' ')) continue;
+                if(s<n && !space(s) && !letter(s) && !num(s)) { size_t e=s; while(e<n&&!space(e)&&!letter(e)&&!num(e))++e; while(e<n&&(nl(e)||rs[e].cp=='/'))++e; j=e; break; }
+            }
+        }
+        if(!j && space(i)) {
+            size_t w=i; while(space(w))++w;
+            size_t last=n; for(size_t p=i;p<w;++p) if(nl(p)) last=p;
+            if(last<n) j=last+1;                          // E
+            else if(w==n) j=w;                             // F at the end
+            else if(w-i>=2) j=w-1;                         // F: the last space goes with the next token
+            else j=w;                                      // G
+        }
+        if(!j) j=i+1;
+        out.push_back(text.substr(rs[i].begin, rs[j-1].end-rs[i].begin)); i=j;
+    }
+    return out;
 }
 
 uint8_t Tokenizer::category(uint32_t cp) const {
@@ -110,6 +190,7 @@ uint8_t Tokenizer::category(uint32_t cp) const {
 bool Tokenizer::is_letter(uint32_t cp) const { const auto c=category(cp); return (c&3)!=0; }
 
 std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const {
+    if (o200k_) return pretokenize_o200k(text);
     std::vector<std::string> out; const auto rs=runes(text); size_t i=0;
     auto has=[&](size_t p,uint8_t mask){return p<rs.size()&&(category(rs[p].cp)&mask)!=0;};
     const uint8_t let=marks_in_letters_?(1|2):1;  // letter-run class
@@ -127,7 +208,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const 
             if(!word(p)&&rs[p].cp!='\r'&&rs[p].cp!='\n'&&p+1<rs.size()&&has(p+1,let))++p;
             if(has(p,let)){j=p+1;while(has(j,let))++j;}
         }
-        if(j==i && has(i,4)) j=i+1;
+        if(j==i && has(i,4)) { j=i+1; if(digits3_) while(j<i+3&&has(j,4))++j; }  // \p{N} (Qwen) or \p{N}{1,3} (GLM-4 / 5)
         if(j==i) {
             size_t p=i;
             if(rs[p].cp==' '&&p+1<rs.size()&&!has(p+1,8)&&!nopunct(p+1))++p;

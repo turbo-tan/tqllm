@@ -3,6 +3,16 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- MiniMax-M3.1-Flash from the EXL3 2.15 bpw pack (Hugging Face folder, no conversion) on one GB10 / DGX Spark, with the
+  DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
+  when the context needs it, and a draft length that follows the measured acceptance. Prefill 537 tok/s on an 8K prompt
+  at 16K context, 492 tok/s at 32K.
+- GLM-5.3-Flash (GSQ GGUF): sparse attention with the DSA indexer, contexts up to 128K on a GB10, prompt chunks of
+  512 tokens (prefill ~100 tok/s), end-of-turn stop and reasoning split.
+
 ## 1.2.3 (2026-10-22)
 
 ### Fixed

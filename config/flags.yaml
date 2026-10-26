@@ -3,6 +3,10 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQFN_KEEP_MAP
+    kind: debug
+    default: "-"
+    doc: "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path"
   - name: TQLLM_MLX_ABLATE
     kind: debug
     default: "-"
@@ -327,6 +331,38 @@ flags:
     kind: user
     default: "-"
     doc: "override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)"
+  - name: TQLLM_GLM_NO_GRAPH
+    kind: debug
+    default: "off"
+    doc: "set (any value): the GLM-5.3-Flash engine decodes eagerly instead of replaying one captured single-token CUDA graph (same tokens, slower). The bring-up scripts' GLM_NO_GRAPH is read as well"
+  - name: TQLLM_GLM_DUMP
+    kind: debug
+    default: "off"
+    doc: "set (any value): GLM-5.3-Flash prints the per-stage sums of the forward (same names as glm-ref and llama-eval-callback); implies TQLLM_GLM_NO_GRAPH. The bring-up scripts' GLM_DUMP is read as well"
+  - name: TQLLM_MINIMAX_DUMP
+    kind: debug
+    default: "off"
+    doc: "FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py"
+  - name: TQLLM_MINIMAX_ROUTES
+    kind: debug
+    default: "off"
+    doc: "FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map"
+  - name: TQLLM_GLM_EXPERT_SLOTS
+    kind: user
+    default: "0"
+    doc: "GLM-5.3-Flash: keep only this many routed experts of every MoE layer resident, in a MixedExpertCache bank (0: the whole expert stack on the device). The experts a token needs are streamed from the GGUF / the packed file, so the tokens do not change; it also turns off the decode CUDA graph"
+  - name: TQLLM_GLM_EXPERT_BUDGET_MB
+    kind: user
+    default: "banks + 25 %"
+    doc: "GLM-5.3-Flash: device bytes the expert banks plus loader staging may hold. With TQLLM_GLM_EXPERT_SLOTS it caps them; on its own it turns on the shared byte-budget plan (src/experts/expert_bank_plan.hpp), which gives every MoE layer top-k slots and the rest of the bytes to the layers whose routing spreads over more experts (measured over the prompt, re-planned when it ends)"
+  - name: TQLLM_GLM_EXPERT_PF
+    kind: debug
+    default: "on"
+    doc: "0: GLM-5.3-Flash does not prefetch the experts a MoE layer wanted at the previous token while that layer runs its attention (needs a pinned TQLLM_GLM_EXPERTS file; placement only, the tokens do not change)"
+  - name: TQLLM_GLM_EXPERTS
+    kind: user
+    default: "-"
+    doc: "GLM-5.3-Flash: packed expert file (glm-pack-experts MODEL.gguf OUT.tqfnexp) for the expert banks: a bank miss copies the expert instead of repacking it; the engine page-locks it when it is at most half the host RAM, which also lets it prefetch (TQLLM_GLM_EXPERT_PF); a bigger file copies misses through pinned staging"
   - name: TQLLM_ATTN_NBUF
     kind: retired
     default: "-"

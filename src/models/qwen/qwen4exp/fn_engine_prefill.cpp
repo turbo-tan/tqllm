@@ -168,7 +168,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
-        const auto ev = S().ledger_->borrow(plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
+        const auto ev = tqllm::borrow_banks(*S().ledger_, plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
         g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
         S().model_->pf_borrowed.assign(size_t(c.layers), 0);
         for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;
@@ -312,6 +312,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }
     S().prefill_us_ = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(S().t_decode_ - S().t_begin_).count());
     if (profiling) ck(cudaProfilerStop());
+    if (f_.cold_cache) S().cold_at_decode_ = f_.cold_cache->stats();
+    if (f_.cold_store) S().cold_store_at_decode_ = f_.cold_store->stats();
+    if (f_.cold_fetch_queue) S().cold_fetch_at_decode_ = f_.cold_fetch_queue->stats();
     if (g_profile_decode_req) ck(cudaProfilerStart());
     if (g_arena && std::getenv("TQFN_ARENA_LOG")) std::fprintf(stderr, "tqllm: prefill %d tokens, arena high %.0f MB of %.0f\n", P, g_arena->high / 1048576.0, g_arena->size / 1048576.0);
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());

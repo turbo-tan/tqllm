@@ -3,6 +3,7 @@
 #include "gguf_mapped.hpp"
 #include <array>
 #include <functional>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -37,7 +38,12 @@ public:
     void clear();
 };
 
-struct ExpertPayload { uint32_t type; GgufBytes bytes; };
+struct ExpertPayload {
+    uint32_t type; GgufBytes bytes;
+    // Optional lifetime token for a source with evictable host buffers. prepare() retains it through repacking.
+    std::shared_ptr<const void> owner = {};
+    bool row_layout = false;  // data already matches the bank, without an auxiliary plane
+};
 // Per-layer stacked banks retain their native quantized layout. The byte budget includes loader staging.
 class MixedExpertCache {
     struct State;
@@ -49,6 +55,11 @@ public:
     ~MixedExpertCache();
     MixedExpertCache(const MixedExpertCache &) = delete;
     MixedExpertCache & operator=(const MixedExpertCache &) = delete;
+    using BatchSource = std::function<std::vector<std::array<ExpertPayload,3>>(int layer,const std::vector<int> &)>;
+    void set_batch_source(BatchSource);
+    // Ordered read futures; known staged banks start copying each record before later reads finish.
+    using AsyncBatchSource = std::function<std::vector<std::shared_future<std::array<ExpertPayload,3>>>(int,const std::vector<int> &)>;
+    void set_async_batch_source(AsyncBatchSource);
     std::vector<int> prepare(int layer, const std::vector<int> & expert_ids);
     // Optional source of experts already in the bank row layout: one contiguous block per expert,
     // [gate data][gate aux][up data][up aux][down data][down aux]. Misses then skip the loader repack.
@@ -66,6 +77,7 @@ public:
     // Split mode: misses upload on their own stream; the compute stream waits only in wait_misses(), so routed
     // experts that hit (last_missed() == 0 per assignment of the last prepare) can run while misses land.
     void set_miss_stream(cudaStream_t);
+    void set_staged_misses(bool enabled);
     bool split() const;
     const std::vector<uint8_t> & last_missed() const;
     void wait_misses();
@@ -111,4 +123,10 @@ public:
     Mat bank_mat(int layer, int projection) const;          // gate 0, up 1, down 2
     void add_device_counters(uint64_t hits, uint64_t misses, uint64_t prefetched, uint64_t bytes);
 };
+
+// Expert slots per layer: the fitted caps of this model (`env`, or a "<experts>.slots" file beside its packed experts,
+// read by layer_slots_text and scaled to `slots` per layer by parse_layer_slots). Applied before the first bank; prints
+// what it applied; a no-op when neither exists.
+void apply_layer_slots(MixedExpertCache & cache, const std::string & experts_path, int slots,
+                       const char * env = "TQFN_LAYER_SLOTS");
 } // namespace tqllm
