@@ -41,9 +41,14 @@ jobs:
   monitor-browser:
     name: monitor / Chromium, Firefox, WebKit
     runs-on: ubuntu-24.04
+    # browsers and their system libraries come with the image: `playwright install --with-deps` stalled on the runner's
+    # apt mirror (gstreamer1.0-plugins-bad, three runs in a row) until the job timed out
+    container: mcr.microsoft.com/playwright/python:v1.64.0-noble
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install the build tools
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake g++ make python3-venv
       - name: Configure and build the monitor fixture (CPU only)
         run: |
           cmake -S . -B build-monitor -DTQLLM_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
@@ -52,7 +57,6 @@ jobs:
         run: |
           python3 -m venv .venv-monitor
           .venv-monitor/bin/pip install playwright==1.64.0
-          .venv-monitor/bin/python -m playwright install --with-deps chromium firefox webkit
       - name: Browser regression gate (no model or GPU)
         run: .venv-monitor/bin/python tests/test_monitor_ui.py --binary build-monitor/test-monitor --output build-monitor/monitor-artifacts
       - uses: actions/upload-artifact@v4
