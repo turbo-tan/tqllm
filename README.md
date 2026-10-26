@@ -61,6 +61,7 @@ updates. See [installation and requirements](docs/guides/quickstart.md).
 | You want to... | Read |
 |---|---|
 | Download a model and add a drafter | [DFlash2 and MTP](docs/guides/speculative-decoding.md) |
+| Run MiniMax-M3.1-Flash or GLM-5.3-Flash on a DGX Spark / GB10 | [Big MoE models on one GB10](docs/guides/gb10-big-moe.md) |
 | Use a local coding agent | [Agent setup](docs/guides/coding-agents.md) |
 | Serve several users or tune memory | [Server options](docs/reference/options.md) |
 | Run a longer context | [TqCache](docs/guides/long-context.md) |
