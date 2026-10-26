@@ -45,6 +45,12 @@ static void check_case(const char * name, const std::function<void()> & tune) {
 }
 
 int main() {
+    // filling the device on unified memory (GB10) takes the host's memory too and has hung a box: skip there
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && integrated) {
+        std::printf("SKIP: tune_oom fills device memory, which is host memory on an integrated GPU\n");
+        return 0;
+    }
     const int rows = 512, k = 4096;
     void * w = nullptr, * aux = nullptr;
     if (cudaMalloc(&w, size_t(rows) * k) != cudaSuccess || cudaMalloc(&aux, size_t(rows) * k / 8) != cudaSuccess) {

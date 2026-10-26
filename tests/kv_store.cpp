@@ -396,6 +396,53 @@ static void test_staged() {
     }
 }
 
+// a cache with no V side (value_row 0): the GLM nope-MLA latent cache, one row per position that is both key and value
+static void test_no_v_side() {
+    const int64_t ctx = 8192, row = 512 * 4;  // kv_lora_rank 512, FP32
+    const int layers = 11;                    // the MLA layers of glm5-next
+    FakeMemory mem(size_t(1) << 30, size_t(1) << 30);
+    const KvGeometry g{layers, size_t(row), 0, ctx};
+    const auto * pol = kv_store_policy("tiered");
+    const int64_t pg = pol->page(ctx);
+    KvPool pool(mem, KvGeometry{layers, size_t(row), 0, pg}, 4, 8);
+    auto s = pol->make(pool, ctx);
+    s->pin(pg);  // the head page never leaves the device
+    CHECK(s->reserve(4 * pg), "the K-only pool fills its device pages");
+    CHECK(pool.page_bytes() == size_t(layers) * size_t(pg) * size_t(row), "a page holds only the K side (%zu)", pool.page_bytes());
+    CHECK(pool.bytes(KvTier::device) == size_t(layers) * size_t(pg) * size_t(row) * 4, "no V memory is held (%zu)",
+          pool.bytes(KvTier::device));
+    CHECK(mem.dev_live == pool.bytes(KvTier::device), "the V side costs nothing in memory either");
+    bool nulls = true;
+    for (int l = 0; l < layers && nulls; ++l) nulls = s->row(l, false, 3) == nullptr && s->base(l, false) == nullptr;
+    CHECK(nulls, "row(layer, false, pos) and base(layer, false) are null with no V side");
+    auto byte_of = [](int l, int64_t pos) { return uint8_t(pos * 7 + l * 31); };
+    auto write = [&](int64_t pos) {
+        for (int l = 0; l < layers; ++l)
+            if (auto * p = static_cast<char *>(s->row(l, true, pos))) std::memset(p, byte_of(l, pos), size_t(row));
+    };
+    auto reads = [&](int64_t pos) {
+        int bad = 0;
+        for (int l = 0; l < layers; ++l) {
+            const auto * p = static_cast<const uint8_t *>(s->row(l, true, pos));
+            if (!p) { ++bad; continue; }
+            for (size_t i = 0; i < size_t(row); i += 512) bad += p[i] != byte_of(l, pos);
+        }
+        return bad;
+    };
+    for (int64_t p = 0; p < 4 * pg; ++p) write(p);
+    CHECK(reads(pg + 7) == 0, "K rows read back");
+    CHECK(s->reserve(5 * pg) && s->tier(1) == KvTier::host, "the oldest unpinned page offloads");
+    CHECK(s->row(0, true, pg + 7) == nullptr, "an offloaded row has no device address");
+    CHECK(s->restore(1) && reads(pg + 7) == 0, "rows read after the tier move are identical");
+    CHECK(s->tier(1) == KvTier::device, "restore put the page back on the device");
+    s->truncate(0);
+    CHECK(pool.free_pages(KvTier::device) == 4 && pool.free_pages(KvTier::host) == 8, "both tiers come back whole");
+    bool threw = false;
+    try { KvPool bad(mem, KvGeometry{layers, size_t(row), 0, 4096, 2048, true}, 1, 0); }
+    catch (const std::invalid_argument &) { threw = true; }
+    CHECK(threw, "a staged host tail is refused without a V side");
+}
+
 static void test_out_of_memory() {
     FakeMemory mem(1 << 20, 0);  // far too small
     bool threw = false;
@@ -412,6 +459,7 @@ int main() {
     test_newest_page_stays();
     test_host_tail();
     test_staged();
+    test_no_v_side();
     test_out_of_memory();
     if (fails) std::printf("kv_store: %d failure(s)\n", fails);
     else std::printf("kv_store: ok\n");

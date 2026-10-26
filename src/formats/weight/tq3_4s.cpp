@@ -32,7 +32,9 @@ struct Tq3_4s final : WeightFormat {
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert, cudaStream_t s) const override {
-        if (rows <= 0 || int64_t(rows) * experts != m.rows)
+        // the stack may hold more experts than the grouped map addresses: the qwen35 engine appends the shared
+        // expert to the routed stack for decode, and a grouped launch simply never selects the extra slots.
+        if (rows <= 0 || int64_t(rows) * experts > m.rows)
             throw std::invalid_argument("TQ3_4S: invalid stacked experts");
         tqllm_cuda::tq3_expert_gemm(m.p, x, y, rows, m.cols, counts, groups, capacity, experts,
                                   topk, per_expert, s);

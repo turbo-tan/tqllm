@@ -6,6 +6,7 @@
 #if TQLLM_WITH_CUDA
 #include <src/vision/vision.hpp>
 #endif
+#include <src/core/debug.hpp>
 #include "json_out.hpp"
 
 #if TQLLM_WITH_CUDA
@@ -23,6 +24,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string_view>
 #include <string>
 #include <vector>
@@ -32,6 +34,10 @@ namespace tqserve {
 struct ServeOptions {
     int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
+    // the model's thinking tags (single special tokens): Qwen <think> / </think>, MiniMax-M3 <mm:think> / </mm:think>;
+    // think_off: what a Jinja-rendered prompt still needs when thinking is off (the MiniMax template has no
+    // enable_thinking: its answer starts right after the end tag; the Qwen template closes the block itself)
+    std::string think_open = "<think>", think_close = "</think>", think_off;
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
@@ -84,11 +90,13 @@ inline std::string json_error(const std::string & message, const char * type = "
     return out;
 }
 
-// Sampling for requests that set none (--temperature / --top-p / --top-k). Agents such as Codex send no temperature;
+// Sampling for requests that set none (--temperature (alias --temp) / --top-p / --top-k / --presence-penalty). Agents such
+// as Codex send no temperature;
 // greedy decoding (the default) can repeat itself on repetitive output, so `tqllm launch` sets the model's recommended values.
 struct SamplingDefaults {
     float temperature = 0.f, top_p = 1.f;
     int top_k = 0;
+    float presence_penalty = 0.f;  // Qwen: 1.5 against phrase loops in long sampled thinking
 };
 inline SamplingDefaults & sampling_defaults() {
     static SamplingDefaults d;
@@ -113,7 +121,9 @@ struct ChatRequest {
     float temperature = sampling_defaults().temperature;  // 0 = greedy (TQLLM samples from the exact top-16 logits)
     float top_p = sampling_defaults().top_p;
     int top_k = sampling_defaults().top_k;
+    float presence_penalty = sampling_defaults().presence_penalty;  // sampling only: logit - penalty, last 64 output tokens
     uint64_t seed = 0;
+    bool ignore_eos = false;  // decode to max_tokens through end-of-sequence tokens (vLLM / llama.cpp field)
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
     bool return_token_ids = false;  // add the generated token ids to the response (choices[0].token_ids)
@@ -184,6 +194,8 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
 
         const auto * stream = root.get("stream");
         req.stream = stream && stream->kind == tqllm::Json::Bool && stream->num != 0;
+        const auto * ieos = root.get("ignore_eos");
+        req.ignore_eos = ieos && ieos->kind == tqllm::Json::Bool && ieos->num != 0;
         const auto * rti = root.get("return_token_ids");
         req.return_token_ids = rti && rti->kind == tqllm::Json::Bool && rti->num != 0;
 
@@ -193,6 +205,7 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         };
         double tv = 0;
         if (num("temperature", tv)) req.temperature = float(tv);
+        if (num("presence_penalty", tv)) req.presence_penalty = float(tv);
         if (num("top_p", tv)) req.top_p = float(tv);
         if (const auto * x = root.get("top_k"); x && x->kind != tqllm::Json::Null) {
             if (x->kind != tqllm::Json::Number || !std::isfinite(x->num) || x->num < 0 ||
@@ -211,6 +224,8 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 return req;
             }
             req.seed = uint64_t(x->num);
+        } else if (req.temperature > 0.f) {
+            req.seed = std::random_device{}();  // sampling without a seed: a fresh one per request (llama.cpp), so a retry is not a replay
         }
         const auto * max_tokens = root.get("max_tokens");
         if (!max_tokens) max_tokens = root.get("max_completion_tokens");
@@ -338,6 +353,7 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 }
                 req.tools = tools && tools->kind == tqllm::Json::Array && !tools->arr.empty();
                 req.prompt_text = (*renderer)(msgs, req.tools ? tools : nullptr, kw);
+                if (!req.thinking) req.prompt_text += serve_options().think_off;
                 req.ok = true;
                 return req;
             }
@@ -446,12 +462,13 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                     std::string reasoning;
                     for (const char * key : {"reasoning_content", "thinking"})
                         if (const auto * rc = message.get(key); rc && rc->kind == tqllm::Json::String) { reasoning = rc->str; break; }
-                    if (const auto end = text.find("</think>"); end != std::string::npos) {
+                    if (const auto end = text.find(serve_options().think_close); end != std::string::npos) {
                         if (reasoning.empty()) {
                             reasoning = text.substr(0, end);
-                            if (const auto start = reasoning.rfind("<think>"); start != std::string::npos) reasoning = reasoning.substr(start + 7);
+                            if (const auto start = reasoning.rfind(serve_options().think_open); start != std::string::npos)
+                                reasoning = reasoning.substr(start + serve_options().think_open.size());
                         }
-                        text = trim(text.substr(end + 8));
+                        text = trim(text.substr(end + serve_options().think_close.size()));
                     }
                     reasoning = trim(reasoning);
                     if ((preserve || i - first_message > last_query) && !reasoning.empty())
@@ -645,6 +662,12 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
 inline std::vector<uint32_t> prepare(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, uint32_t context,
                                      DecodeResult & result, uint32_t & count, PreparedImages * images = nullptr) {
     auto prompt = tokenizer.encode(req.prompt_text);
+    // MiniMax M3 conditions every sequence on its beginning-of-document token (the chat template's first token); a raw
+    // completion without it degenerates from the first token ("def f():" -> "   二:\n   2:\n ..."), so it is added
+    if (!req.chat) {
+        const uint32_t bod = tokenizer.special_id("]~!b[");
+        if (bod != ~0u && (prompt.empty() || prompt.front() != bod)) prompt.insert(prompt.begin(), bod);
+    }
     if (!req.images.empty()) {
         result.error = images ? expand_images(req, prompt, *images) : "this path does not take images";
         if (!result.error.empty()) return prompt;
@@ -660,6 +683,18 @@ inline std::vector<uint32_t> prepare(const tqllm::Tokenizer & tokenizer, const C
 }
 
 // Generated ids of the speculative path -> text, finish reason, stop strings, reasoning split, tool calls.
+// like vLLM's reasoning parser: the answer is what follows </think>; truncated thinking -> empty answer. </think> is a
+// special token (decode() drops it), so the split is on its id. Both decode paths (speculative finish() and plain) use it.
+inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & output,
+                            DecodeResult & result) {
+    if (!req.thinking) return;
+    static const auto think_end = tokenizer.encode(serve_options().think_close);
+    const auto at = think_end.size() == 1 ? std::find(output.begin(), output.end(), think_end[0]) : output.end();
+    result.reasoning = trim(tokenizer.decode({output.begin(), at}));
+    result.text = at == output.end() ? std::string() : trim(tokenizer.decode({at + 1, output.end()}));
+    for (const auto & stop : req.stop)
+        if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
+}
 inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & gen,
                    DecodeResult & result) {
     {
@@ -667,7 +702,8 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
         result.finish_reason = "length";
         for (const uint32_t tok : gen) {
             ++result.completion_tokens;
-            if (tok == tokenizer.eos_id()) {
+            if (tokenizer.is_eog(tok)) {
+                if (req.ignore_eos) continue;  // counted, not printed; decoding goes on to max_tokens
                 result.finish_reason = "stop";
                 break;
             }
@@ -682,15 +718,7 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
                 result.finish_reason = "stop";
             }
         }
-        if (req.thinking) {  // like vLLM's reasoning parser: answer after </think>; truncated thinking -> empty answer
-            // </think> is a special token (decode() drops it), so split on its id
-            static const auto think_end = tokenizer.encode("</think>");
-            const auto at = think_end.size() == 1 ? std::find(output.begin(), output.end(), think_end[0]) : output.end();
-            result.reasoning = trim(tokenizer.decode({output.begin(), at}));
-            result.text = at == output.end() ? std::string() : trim(tokenizer.decode({at + 1, output.end()}));
-            for (const auto & stop : req.stop)
-                if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
-        }
+        split_reasoning(tokenizer, req, output, result);
         if (req.tools) {  // the prose before a tool call is trimmed; trim without one too, so a stream can match before it knows
             extract_tool_calls(result);
             result.text = trim(result.text);
@@ -710,7 +738,8 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // verify path (quantized qwen35 GGUF): chunked prefill, then DFlash2 drafts or one verified token per step.
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
-        model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
+        model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        model.set_ignore_eos(req.ignore_eos);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         { tqllm::PrefillObservation progress(observe_prefill(req.observation));
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
@@ -727,7 +756,9 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         return result;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t i = 0; i + 1 < prompt.size(); ++i) model.forward(prompt[i], i, false);
+    // engines with a chunked prompt path take all but the last token at once; the rest step token by token
+    if (prompt.size() < 2 || !model.prefill_state(std::vector<uint32_t>(prompt.begin(), prompt.end() - 1), 0))
+        for (uint32_t i = 0; i + 1 < prompt.size(); ++i) model.forward(prompt[i], i, false);
     uint32_t next = model.forward(prompt.back(), static_cast<uint32_t>(prompt.size() - 1), true);
     const auto t1 = std::chrono::steady_clock::now();
     if (req.observation) req.observation->decoding();
@@ -742,11 +773,11 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     RepeatGuard guard;
     for (uint32_t i = 0; i < count; ++i) {
         ++result.completion_tokens;
-        if (next == tokenizer.eos_id()) {
+        if (tokenizer.is_eog(next) && !req.ignore_eos) {
             result.finish_reason = "stop";
             break;
         }
-        output.push_back(next);
+        if (!tokenizer.is_eog(next)) output.push_back(next);
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(output.size()));
         if (guard.check(output)) break;
         result.text = tokenizer.decode(output);
@@ -767,6 +798,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         if (i + 1 < count) next = model.forward(next, static_cast<uint32_t>(prompt.size()) + i, true);
     }
     if (req.return_token_ids) result.token_ids = output;
+    split_reasoning(tokenizer, req, output, result);
     if (req.tools) extract_tool_calls(result);
     return result;
 }
@@ -881,6 +913,16 @@ inline void usage_timings(std::string & out, const DecodeResult & result) {
     out += ",\"predicted_n\":" + std::to_string(n) + ",\"predicted_ms\":" + num(result.decode_ms);
     out += ",\"predicted_per_second\":" + num(result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0);
     out += ",\"draft_n\":" + std::to_string(result.draft_n) + ",\"draft_n_accepted\":" + std::to_string(result.draft_accepted) + "}";
+    // TQLLM_DEBUG=reqlog: one line per finished request with the same tok/s the client gets (llama.cpp-style:
+    // decode rate excludes the first token, which the prefill produced).
+    if (tqllm::debug_on("reqlog")) {
+        const double pre_tps = result.prefill_ms > 0 ? result.prompt_tokens * 1000.0 / result.prefill_ms : 0;
+        const double dec_tps = result.decode_ms > 0 && n > 1 ? (n - 1) * 1000.0 / result.decode_ms : 0;
+        std::fprintf(stderr, "reqlog: prompt %u tokens %.1f ms (%.1f tok/s) | decode %u tokens %.1f ms (%.1f tok/s) | draft %llu/%llu (%.0f%%)\n",
+                     result.prompt_tokens, result.prefill_ms, pre_tps, n, result.decode_ms, dec_tps,
+                     (unsigned long long) result.draft_accepted, (unsigned long long) result.draft_n,
+                     result.draft_n ? 100.0 * result.draft_accepted / result.draft_n : 0.0);
+    }
 }
 
 // SSE output of one request. update() sends what the ids generated so far add to the reasoning / content texts that
@@ -894,7 +936,7 @@ public:
           created_(std::to_string(std::time(nullptr))) {
         plain_.tools = false;
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
-        const auto te = tok_.encode("</think>");  // finish() splits on this id only when it is one token
+        const auto te = tok_.encode(serve_options().think_close);  // finish() splits on this id only when it is one token
         think_id_ = te.size() == 1 ? int64_t(te[0]) : -1;
     }
     // One delta per new token (clients count deltas as tokens). Incremental: each token's bytes are appended once and
@@ -1005,7 +1047,7 @@ private:
     }
     void take(uint32_t t) {  // the same token handling as finish(): stop at EOS, split reasoning at </think>
         if (done_) return;
-        if (t == tok_.eos_id()) {done_ = true; return;}
+        if (tok_.is_eog(t)) {if (!req_.ignore_eos) done_ = true; return;}  // ignore_eos: counted, not printed
         if (req_.thinking && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
         std::string & raw = req_.thinking && !in_answer_ ? rraw_ : araw_;
         const size_t from = raw.size();
@@ -1117,7 +1159,8 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     const auto prompt = prepare(tokenizer, req, context, result, count, &images);
     if (!result.error.empty()) return result;
     if (req.observation) req.observation->prefill(result.prompt_tokens);
-    model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed);
+    model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        model.set_ignore_eos(req.ignore_eos);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
     { tqllm::PrefillObservation progress(observe_prefill(req.observation));
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }

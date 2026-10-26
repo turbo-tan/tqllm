@@ -866,6 +866,7 @@ struct Q5_K final : WeightFormat {
 // bytes, per row and 256 weights a record of its scalars (src/formats/weight/quant_kernels.cuh, udq_*).
 struct Udq final : WeightFormat {
     int u4h_id() const override { return fmt == 10 ? 10 : -1; }
+    int gemm_f32_id() const override { return fmt; }
     bool has_expert_matvec() const override { return true; }  // every UD format (grouped kernels cover u4h fmt 0..15)
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                        const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {

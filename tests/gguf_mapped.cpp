@@ -40,7 +40,16 @@ static void unit_test() {
     const auto path = std::filesystem::temp_directory_path() / ("tqllm-map-" + std::to_string(getpid()) + ".gguf");
     struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove(path); } } cleanup{path};
     { std::ofstream out(path, std::ios::binary); out.write(header.data(), header.size()); out.write(payload.data(), payload.size()); }
+    std::filesystem::resize_file(path,16384);
     MappedGguf mapped(path.string());
+    const auto before_discard=mapped.tensor("experts");
+    const GgufBytes large_view{before_discard.data,8192};
+    const std::vector<char> original(large_view.data,large_view.data+large_view.size);
+    require(mapped.discard_pages(large_view),"discard valid mapped pages failed");
+    require(std::equal(original.begin(),original.end(),before_discard.data),"discard invalidated existing view");
+    char foreign=0;
+    require(!mapped.discard_pages({&foreign,1}),"discard accepted foreign view");
+    require(!mapped.discard_pages({before_discard.data,size_t(-1)}),"discard accepted overflowing view");
     require(mapped.tensor("experts").size == 96, "mapped tensor size differs");
     for (int expert = 0; expert < 4; ++expert) {
         const auto view = mapped.expert("experts", expert);
@@ -63,6 +72,8 @@ static void unit_test() {
         for (size_t i = 0; i < many.size(); ++i) for (int col = 0; col < 32; ++col)
             require(big[i * 32 + col] == float(many[i] * 10) + col - 16, "threaded gather lost row order");
     }
+    require(mapped.discard_pages(),"whole mapping reclaim failed");
+    require(mapped.gather_rows("embeddings", {4,1,4,0})==rows,"whole mapping reclaim changed row values");
     require(mapped.gather_rows("embeddings", {}).empty(), "empty gather not empty");
     bool rejected = false;
     try { mapped.expert("experts", 4); } catch (const std::exception &) { rejected = true; }

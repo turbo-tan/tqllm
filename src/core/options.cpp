@@ -92,6 +92,10 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--yarn-beta-fast") o.rope.beta_fast = std::stof(value());
     else if (a == "--yarn-beta-slow") o.rope.beta_slow = std::stof(value());
     else if (a == "-md" || a == "--model-draft") o.draft_model = value();
+    else if (a == "--tp-rank") o.tp_rank = std::stoi(value()), o.tp_world = 2;
+    else if (a == "--tp-peer") o.tp_peer = value();
+    else if (a == "--tp-port") o.tp_port = std::stoi(value());
+    else if (a == "--hot-map") o.hot_map = value();
     else if (a == "--draft-vocab") o.draft_vocab = value();
     else if (a == "--mtp") o.native_mtp = true;
     else if (a == "--draft-window") o.draft_window = count(0);

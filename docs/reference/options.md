@@ -43,7 +43,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 |---|---|---|
 | `-md FILE` | | DFlash2 drafter GGUF (exact: the output equals decoding without it) |
 | `--draft-vocab FILE` | | the drafter's token list (65,536 ids) |
-| `--draft-max N` | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there |
+| `--draft-max N` | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there. MiniMax with its DSpark drafter: unset, the length follows the measured acceptance (1 to the drafter's block of 7); set, it is fixed |
 | `--no-tree` | tree on | verify a single draft chain instead of a token tree |
 | `--draft-window N` | GGUF value | drafter attention window over the context (0 = whole context) |
 | `--lookup L [--lookup-first K]` | off | prompt-lookup drafts (copies of earlier text) next to the tree; shares the verify budget |

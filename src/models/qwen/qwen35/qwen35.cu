@@ -978,11 +978,12 @@ void cache_write_multi_t4kv(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, 
 // window size but fills C x 16 of it with the far-context chunks the anchor query scores highest, moved (re-rotated)
 // to sit right before the recent part, so the drafter sees them at distances it was trained on.
 namespace {
-constexpr int RCHUNK = 16;
+constexpr int RCHUNK = tqllm_cuda::kDflRetrChunk;
+using tqllm_cuda::kDflRetrMaxChunks;
 
 // score[h][c - first] = max over the chunk's 16 keys of <mean of the anchor query over head h's group, key>
 __global__ void __launch_bounds__(128) dfl_chunk_score_k(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, int kd,
-                                                         int first, int heads, int kvheads, float * score, int nsc) {
+                                                         int first, int heads, int kvheads, float * score, int nsc, int ring) {
     const int c = first + blockIdx.x, h = blockIdx.y, d = threadIdx.x, grp = heads / kvheads;
     float qm = 0.f;
     for (int g = 0; g < grp; ++g) qm += __bfloat162float(q[(h * grp + g) * 128 + d]);
@@ -990,7 +991,8 @@ __global__ void __launch_bounds__(128) dfl_chunk_score_k(const __nv_bfloat16 * q
     __shared__ float red[4];
     float best = -3.4e38f;
     for (int t = 0; t < RCHUNK; ++t) {
-        float v = qm * __bfloat162float(kc[int64_t(c * RCHUNK + t) * kd + h * 128 + d]);
+        const int p = ring ? (c * RCHUNK + t) % ring : c * RCHUNK + t;
+        float v = qm * __bfloat162float(kc[int64_t(p) * kd + h * 128 + d]);
         for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
         if (d % 32 == 0) red[d / 32] = v;
         __syncthreads();
@@ -1002,8 +1004,8 @@ __global__ void __launch_bounds__(128) dfl_chunk_score_k(const __nv_bfloat16 * q
 
 // per head: the top `take` of n scores (n <= 4096), chunk ids (first + index) ascending -> sel[h][take]
 __global__ void __launch_bounds__(1024) dfl_chunk_top_k(const float * score, int nsc, int n, int take, int first, int * sel) {
-    __shared__ float s[4096];
-    __shared__ int ix[4096];
+    __shared__ float s[kDflRetrMaxChunks];
+    __shared__ int ix[kDflRetrMaxChunks];
     const int h = blockIdx.x;
     int m = 1;
     while (m < n) m <<= 1;
@@ -1039,7 +1041,7 @@ __global__ void __launch_bounds__(1024) dfl_chunk_top_k(const float * score, int
 // scratch row i (per head): i < R: chunk sel[i / 16], token i % 16, key rotated from its position to vbase + i;
 // i >= R: position F + (i - R), copied. vbase = F - R, so the recent part keeps its own positions.
 __global__ void __launch_bounds__(128) dfl_gather_k(const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, int kd,
-                                                    const int * sel, int take, int F, float theta,
+                                                    const int * sel, int take, int F, float theta, int ring,
                                                     __nv_bfloat16 * sk, __nv_bfloat16 * sv) {
     const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x, R = take * RCHUNK;
     int src;
@@ -1050,9 +1052,10 @@ __global__ void __launch_bounds__(128) dfl_gather_k(const __nv_bfloat16 * kc, co
     } else {
         src = F + (i - R);
     }
-    const __nv_bfloat16 * ks = kc + int64_t(src) * kd + h * 128;
+    const int row = ring ? src % ring : src;
+    const __nv_bfloat16 * ks = kc + int64_t(row) * kd + h * 128;
     __nv_bfloat16 * kd_ = sk + int64_t(i) * kd + h * 128;
-    sv[int64_t(i) * kd + h * 128 + d] = vc[int64_t(src) * kd + h * 128 + d];
+    sv[int64_t(i) * kd + h * 128 + d] = vc[int64_t(row) * kd + h * 128 + d];
     if (d < 64) {
         const float a = __bfloat162float(ks[d]), b = __bfloat162float(ks[d + 64]);
         if (delta != 0.f) {  // rotate by delta (RoPE angles add); no mscale (it is already in the stored key)
@@ -1071,15 +1074,15 @@ __global__ void __launch_bounds__(128) dfl_gather_k(const __nv_bfloat16 * kc, co
 namespace tqllm_cuda {
 int dflash_retrieve_build(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, int kd, int heads,
                           int kvheads, int pos, int nq, int recent, int chunks, float theta, float * score, int * sel,
-                          __nv_bfloat16 * sk, __nv_bfloat16 * sv, cudaStream_t s) {
+                          __nv_bfloat16 * sk, __nv_bfloat16 * sv, cudaStream_t s, int ring) {
     const int F = pos - recent;  // positions below F are far context
     const int nc = F > 0 ? F / RCHUNK : 0;
     if (nc <= 0 || chunks <= 0) return -1;
-    const int n = std::min(nc, 4096), first = nc - n, take = std::min(chunks, std::min(n, 128));
-    dfl_chunk_score_k<<<dim3(n, kvheads), 128, 0, s>>>(q, kc, kd, first, heads, kvheads, score, 4096);
-    dfl_chunk_top_k<<<kvheads, 1024, 0, s>>>(score, 4096, n, take, first, sel);
+    const int n = std::min(nc, kDflRetrMaxChunks), first = nc - n, take = std::min(chunks, std::min(n, 128));
+    dfl_chunk_score_k<<<dim3(n, kvheads), 128, 0, s>>>(q, kc, kd, first, heads, kvheads, score, kDflRetrMaxChunks, ring);
+    dfl_chunk_top_k<<<kvheads, 1024, 0, s>>>(score, kDflRetrMaxChunks, n, take, first, sel);
     const int rows = take * RCHUNK + recent + nq;
-    dfl_gather_k<<<dim3(rows, kvheads), 128, 0, s>>>(kc, vc, kd, sel, take, F, theta, sk, sv);
+    dfl_gather_k<<<dim3(rows, kvheads), 128, 0, s>>>(kc, vc, kd, sel, take, F, theta, ring, sk, sv);
     return take * RCHUNK;  // R: scratch rows before the recent part
 }
 }  // namespace tqllm_cuda

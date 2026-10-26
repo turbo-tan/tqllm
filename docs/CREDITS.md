@@ -15,6 +15,9 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Trellis-coded KV idea (tcq codecs; codebooks and kernels ours) | spiritbuun (buun), [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) |
 | Learned rotations for quantisation | Avarok, TorQuant |
 | Fixed chat template (v22, embedded in our files) | froggeric, [Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) |
+| Trellis weight codec behind X3 / X3.1 and the EXL3 packs (mul1 codebook, Hadamard + suh / svh); X3 kernels ported from it via llama-paw (see NOTICE) | turboderp, [ExLlamaV3](https://github.com/turboderp-org/exllamav3); Tseng et al., QTIP ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235)) |
+| X3 / X3.1 GGUF layout and PAW-27B-X3.1 weights; llama-paw X3 kernels (ported, see NOTICE) | PAW, llama-paw |
+| Window GEMV design for X3 decode (one decode per tile into the mma, no grid barrier) | TRUSS (trellis-kernel) |
 | FlashAttention tiling | Tri Dao et al., [flash-attention](https://github.com/Dao-AILab/flash-attention) |
 | Speculative sampling | Leviathan, Kalman, Matias ([arXiv 2211.17192](https://arxiv.org/abs/2211.17192)); Chen et al. ([arXiv 2302.01318](https://arxiv.org/abs/2302.01318)) |
 | Token-tree verification (our hybrid Gated DeltaNet tree kernels build on it) | SpecInfer, Miao et al. ([arXiv 2305.09781](https://arxiv.org/abs/2305.09781)); [Medusa](https://github.com/FasterDecoding/Medusa), Cai et al.; [EAGLE](https://github.com/SafeAILab/EAGLE), Li et al. |

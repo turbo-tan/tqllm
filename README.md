@@ -73,7 +73,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and contribution
 requirements, and [the architecture guide](docs/ARCHITECTURE.md) for the source map.
 
 Built on work from Qwen, ggml/llama.cpp, Google Research, z-lab, Tom Turney,
-spiritbuun and the contributors listed in [Credits](docs/CREDITS.md).
+spiritbuun, turboderp ([ExLlamaV3](https://github.com/turboderp-org/exllamav3): the trellis format and kernels behind
+X3 and our EXL3 support) and the contributors listed in [Credits](docs/CREDITS.md).
 Third-party notices remain in [NOTICE](NOTICE). Thank you to our community testers.
 
 tqLLM is Apache-2.0 licensed. Model weights and third-party components retain

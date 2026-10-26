@@ -59,6 +59,7 @@ std::string mock(const std::string & dir) {
     for (int b = 0; b < 256; ++b) {tokens.push_back(utf8(code[b])); types.push_back(1);}
     tokens.push_back("<|im_end|>"); types.push_back(3);   // 256: EOS
     tokens.push_back("</think>"); types.push_back(3);     // 257
+    tokens.push_back("<|user|>"); types.push_back(3);     // 258: end of turn (GLM ends a turn with it, not with EOS)
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_str("tokenizer.ggml.model", "gpt2");
@@ -67,6 +68,7 @@ std::string mock(const std::string & dir) {
     w.kv_i32s("tokenizer.ggml.token_type", types);
     w.kv_strs("tokenizer.ggml.merges", {});
     w.kv_u32("tokenizer.ggml.eos_token_id", 256);
+    w.kv_u32("tokenizer.ggml.eot_token_id", 258);
     const auto path = dir + "/mock_stream.gguf";
     w.write(path);
     return path;
@@ -155,8 +157,26 @@ int main() {
     const double new2k = per_token(2000, false), new20k = per_token(20000, false), ref2k = per_token(2000, true), ref8k = per_token(8000, true);
     std::printf("STREAM_COST us per token: incremental 2K %.2f, 20K %.2f | reference 2K %.2f, 8K %.2f\n", new2k, new20k, ref2k, ref8k);
     const bool linear = new20k < 3.0 * new2k + 1.0;
+    // end of turn: the GGUF's eot id stops generation like EOS (finish() used to print past it)
+    bool eog_ok = tok.is_eog(256) && tok.is_eog(258) && !tok.is_eog('a');
+    {
+        tqserve::ChatRequest req; req.chat = true;
+        tqserve::DecodeResult r;
+        auto gen = bytes("hi"); gen.push_back(258); for (auto b : bytes("tail")) gen.push_back(b);
+        tqserve::finish(tok, req, gen, r);
+        eog_ok = eog_ok && r.text == "hi" && r.finish_reason == "stop";
+    }
+    // the plain decode path splits reasoning with the same helper as finish()
+    {
+        tqserve::ChatRequest req; req.chat = true; req.thinking = true;
+        tqserve::DecodeResult r;
+        auto out = bytes("think it over"); out.push_back(257); for (auto b : bytes("answer")) out.push_back(b);
+        tqserve::split_reasoning(tok, req, out, r);
+        eog_ok = eog_ok && r.reasoning == "think it over" && r.text == "answer";
+    }
+    std::printf("STREAM_EOG end of turn + reasoning split: %s\n", eog_ok ? "PASS" : "FAIL");
     std::filesystem::remove_all(dir);
-    const bool ok = failures == 0 && final_failures == 0 && linear;
+    const bool ok = failures == 0 && final_failures == 0 && linear && eog_ok;
     std::puts(ok ? "STREAM_INCREMENTAL_PASS" : "STREAM_INCREMENTAL_FAIL");
     return ok ? 0 : 1;
 }

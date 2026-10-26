@@ -1,0 +1,82 @@
+{
+  "model": "ornith-15",
+  "gguf": "/mnt/data2t/gguf/ornith-1.5-35b-a3b/Ornith-1.5-35B-A3B-TQ3_4S.gguf",
+  "port": 18132,
+  "reasoning": "off",
+  "context": 40960,
+  "server_log": "/tmp/tqs_ornith-15.log",
+  "engine": "turbo-tan/tqllm aa5ab0c",
+  "source_commit": "aa5ab0c",
+  "gguf_bytes": "18051687776",
+  "sha256": "07ec68966341e3915d7fde699cbf70af11f1b1e01a26a45692a1399420473740",
+  "gguf_meta": {
+    "error": "Traceback (most recent call last):\n  File \"<stdin>\", line 70, in <module>\n  File \"<stdin>\", line 38, in main\n  File \"<stdin>\", line 18, in read_string\nMemoryError"
+  },
+  "host_free_gb_before": "26",
+  "measured_at": "2026-10-22 09:13:49",
+  "chats": [
+    {
+      "prompt": "What is the capital of France?",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 106.16,
+      "content_head": ",moelay\u4e00\u76f4\u4e00\u76f4\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00String\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00 = **\u4e00\u4e00\u4e00v\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00v\u4e00\u4e00vvvvvvvv\u4e00\u4e00\u4e00v\u4e00\u062a\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00"
+    },
+    {
+      "prompt": "Explain gravity in one sentence.",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 107.27,
+      "content_head": "\n\n\u4e00\u4e00\u4e00\u4e00\u76f4\u4e00\u4e00\u4e00\u76f4\u4e00\u76f4\u4e00\u4e00\u76f4\u062a\u4e00\u76f4\u062a\u062a\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u062a\u062a\u062a\u4e00\u062a\u062a\u5f00\u59cb\u4e00\u062a\u5f00\u59cb\u4e00\u5f00\u59cb\u4e00\u5f00\u59cb\u4e00\u4e00\u062a\u4e00\u062a\u062a\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00"
+    },
+    {
+      "prompt": "What is 2+2?",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 107.48,
+      "content_head": "(... h\u4e00\u76f4\u4e00\u76f4\u4e00\u76f4\n\n p p-h-h-h-h-h\n\n-h-h-h-h-h\n\n\n\n\n\n\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+    },
+    {
+      "prompt": "Name three primary colors.",
+      "prompt_tokens": 17,
+      "completion_tokens": 128,
+      "decode_tok_s": 107.28,
+      "content_head": "\nak\u4e00\u4e00\u4e00\u4e00-h-h-ph-ph\u4e00-h-ph\u4e00-h-h-h-h-h\u4e00-h-h-h-c-ch-ch\u4e00\u4e00\u4e00-c-ch-ch-ch-imageAPH\u4e00\u4e00\u4e00\u4e00-h-n"
+    },
+    {
+      "prompt": "Write a haiku about the sea.",
+      "prompt_tokens": 20,
+      "completion_tokens": 128,
+      "decode_tok_s": 107.58,
+      "content_head": "  (g t\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00 p\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u062a\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u5173\u4e8e\u4e00\u4e00\u6709\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00-ch\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00"
+    }
+  ],
+  "decode": {
+    "chats": 5,
+    "predicted_n_minus_1": 635,
+    "predicted_ms": 5926.2,
+    "tok_s": 107.15
+  },
+  "tokens_per_filler_unit": 18.188,
+  "prefill": {
+    "4096": {
+      "prompt_tokens": 4014,
+      "prefill_tok_s": 3317.9,
+      "prompt_ms": 1209.8,
+      "first_token_s": 1.268
+    },
+    "16384": {
+      "prompt_tokens": 16182,
+      "prefill_tok_s": 3118.2,
+      "prompt_ms": 5189.5,
+      "first_token_s": 5.259
+    },
+    "32768": {
+      "prompt_tokens": 32400,
+      "prefill_tok_s": 2910.9,
+      "prompt_ms": 11130.4,
+      "first_token_s": 11.213
+    }
+  },
+  "host_free_gb_after": "26"
+}

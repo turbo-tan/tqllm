@@ -1579,19 +1579,27 @@ __global__ void __launch_bounds__(256, GROUPED ? 4 : U4H_DENSE_MINB) u4h_matvec_
     // (per row the k split, MMA order and 8-warp reduction do not depend on MT: bit-identical results)
     constexpr int NT = (NCOL + 7) / 8;
     __shared__ float red[8][32][4 * NT];
-    __shared__ uint32_t grid[ud_grid_words(FMT)];
+    // grids up to 8 KB are staged in shared memory once per CTA; IQ1_S's 16 KB grid is read through L1 instead (staging
+    // it cost each 16-row CTA as many bytes as its weights: MiniMax IQ1_S experts ran at ~150 GB/s on a GB10). Same values.
+    constexpr bool GRID_SMEM = ud_grid_words(FMT) <= 2048;
+    __shared__ uint32_t grid_sm[GRID_SMEM ? ud_grid_words(FMT) : 1];
+    const uint32_t * grid = grid_sm;
     if constexpr (FMT == 4) {
-        for (int i = threadIdx.x; i < 512; i += blockDim.x) grid[i] = iq3s_grid_d[i];
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) grid_sm[i] = iq3s_grid_d[i];
         __syncthreads();
     }
     if constexpr (FMT == 5) {
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) grid[i] = iq3xxs_grid_d[i];
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) grid_sm[i] = iq3xxs_grid_d[i];
         __syncthreads();
     }
     if constexpr (FMT >= 8 && FMT <= 11) {
         const uint32_t * src = ud_grid_src<FMT>();
-        for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) grid[i] = src[i];
-        __syncthreads();
+        if constexpr (GRID_SMEM) {
+            for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) grid_sm[i] = src[i];
+            __syncthreads();
+        } else {
+            grid = src;
+        }
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     const int row0 = blockIdx.x * 16 * MT;
@@ -3674,7 +3682,9 @@ void i8h_matvec_bf16(const int8_t * w8, const __half * sc, const __half * xh, __
     }
 }
 
-// Per-shape row tiling for <= 8 columns (u4h_tune; bit-identical for every MT), one map per format.
+// Per-shape row tiling for <= 8 columns (u4h_tune; bit-identical for every MT), one map per format, keyed by
+// (rows, k * 2 + wide): one column (decode) and 2..8 columns (verify) are timed apart - the 8-column winner applied to
+// one column ran MiniMax's 6144 x 6144 shared experts at ~150 GB/s instead of ~280 on a GB10.
 template <int FMT>
 static std::map<std::pair<int, int>, int> & tuned() {
     static std::map<std::pair<int, int>, int> m;
@@ -3687,7 +3697,7 @@ static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh
     if (k % 64) throw std::invalid_argument("u4h_matvec: k must be a multiple of 64");
     if (mt < 0 && ncols <= 8) {
         auto & tm = tuned<FMT>();
-        const auto it = tm.find({rows, k});
+        const auto it = tm.find({rows, k * 2 + (ncols > 1 ? 1 : 0)});
         mt = it == tm.end() ? 1 : it->second;
     }
     if (ncols <= 8 && mt == 5) {  // MT 1 with prefetch
@@ -3827,7 +3837,7 @@ void u4h_matvec_mt(const uint8_t * w4, const __half2 * sm, const __half * xh, __
 
 template <int FMT>
 static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) {
-    if (tuned<FMT>().count({rows, k}) || !tune_pointer_ok(w4)) return;
+    if (tuned<FMT>().count({rows, k * 2}) || !tune_pointer_ok(w4)) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
     tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "u4h_tune");
@@ -3835,23 +3845,26 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    int best = 1;
-    float best_ms = 1e30f;
-    for (int mt : {1, 2, 4, 5}) {  // 5: MT 1 with prefetch
-        for (int i = 0; i < 10; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, 8, s, mt);
-        cudaEventRecord(e0, s);
-        for (int i = 0; i < 30; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, 8, s, mt);
-        cudaEventRecord(e1, s);
-        cudaEventSynchronize(e1);
-        float ms = 0.f;
-        cudaEventElapsedTime(&ms, e0, e1);
-        if (ms < best_ms * 0.98f) best_ms = ms, best = mt;
+    for (int cols : {1, 8}) {
+        int best = 1;
+        float best_ms = 1e30f;
+        for (int mt : {1, 2, 4, 5}) {  // 5: MT 1 with prefetch
+            for (int i = 0; i < 10; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, cols, s, mt);
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < 30; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, cols, s, mt);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (ms < best_ms * 0.98f) best_ms = ms, best = mt;
+        }
+        tuned<FMT>()[{rows, k * 2 + (cols > 1 ? 1 : 0)}] = best;
+        if (tqllm::debug_on("tune"))
+            std::fprintf(stderr, "u4h_tune fmt %d %d x %d, %d col -> MT %d (%.1f us)\n", FMT, rows, k, cols, best, best_ms * 1000.f / 30.f);
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     tune_done(x, y, "u4h_tune");
-    tuned<FMT>()[{rows, k}] = best;
-    if (tqllm::debug_on("tune")) std::fprintf(stderr, "u4h_tune fmt %d %d x %d -> MT %d (%.1f us)\n", FMT, rows, k, best, best_ms * 1000.f / 30.f);
 }
 
 void u4h_tune(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) { tune_impl<0>(w4, sm, rows, k, s); }

@@ -12,6 +12,7 @@ struct Flag {
     const char * replaced_by;
 };
 inline constexpr Flag ALL[] = {
+    {"TQFN_KEEP_MAP", Kind::Debug, "-", "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path", ""},
     {"TQLLM_MLX_ABLATE", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ABLATE_BLOCKS", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
     {"TQLLM_MLX_ABLATE_SMALL", Kind::Debug, "-", "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)", ""},
@@ -93,6 +94,14 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_MOE_PROFILE", Kind::Debug, "-", "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill", ""},
     {"TQLLM_DEBUG", Kind::Debug, "off", "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)", ""},
     {"TQLLM_MATVEC_RULE", Kind::User, "-", "override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)", ""},
+    {"TQLLM_GLM_NO_GRAPH", Kind::Debug, "off", "set (any value): the GLM-5.3-Flash engine decodes eagerly instead of replaying one captured single-token CUDA graph (same tokens, slower). The bring-up scripts' GLM_NO_GRAPH is read as well", ""},
+    {"TQLLM_GLM_DUMP", Kind::Debug, "off", "set (any value): GLM-5.3-Flash prints the per-stage sums of the forward (same names as glm-ref and llama-eval-callback); implies TQLLM_GLM_NO_GRAPH. The bring-up scripts' GLM_DUMP is read as well", ""},
+    {"TQLLM_MINIMAX_DUMP", Kind::Debug, "off", "FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py", ""},
+    {"TQLLM_MINIMAX_ROUTES", Kind::Debug, "off", "FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map", ""},
+    {"TQLLM_GLM_EXPERT_SLOTS", Kind::User, "0", "GLM-5.3-Flash: keep only this many routed experts of every MoE layer resident, in a MixedExpertCache bank (0: the whole expert stack on the device). The experts a token needs are streamed from the GGUF / the packed file, so the tokens do not change; it also turns off the decode CUDA graph", ""},
+    {"TQLLM_GLM_EXPERT_BUDGET_MB", Kind::User, "banks + 25 %", "GLM-5.3-Flash: device bytes the expert banks plus loader staging may hold. With TQLLM_GLM_EXPERT_SLOTS it caps them; on its own it turns on the shared byte-budget plan (src/experts/expert_bank_plan.hpp), which gives every MoE layer top-k slots and the rest of the bytes to the layers whose routing spreads over more experts (measured over the prompt, re-planned when it ends)", ""},
+    {"TQLLM_GLM_EXPERT_PF", Kind::Debug, "on", "0: GLM-5.3-Flash does not prefetch the experts a MoE layer wanted at the previous token while that layer runs its attention (needs a pinned TQLLM_GLM_EXPERTS file; placement only, the tokens do not change)", ""},
+    {"TQLLM_GLM_EXPERTS", Kind::User, "-", "GLM-5.3-Flash: packed expert file (glm-pack-experts MODEL.gguf OUT.tqfnexp) for the expert banks: a bank miss copies the expert instead of repacking it; the engine page-locks it when it is at most half the host RAM, which also lets it prefetch (TQLLM_GLM_EXPERT_PF); a bigger file copies misses through pinned staging", ""},
     {"TQLLM_ATTN_NBUF", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
     {"TQLLM_BATCH_COLS", Kind::Retired, "-", "removed", "automatic (per GPU)"},
     {"TQLLM_COMPOSITE", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},

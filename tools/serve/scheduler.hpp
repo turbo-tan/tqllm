@@ -192,7 +192,8 @@ private:
                 if (!job || std::find(admitted.begin(), admitted.end(), job) == admitted.end()) continue;
                 try {
                     model_.select_slot(int(s));
-                    model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed);
+                    model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed, job->req.presence_penalty);
+                    model_.set_ignore_eos(job->req.ignore_eos);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     if (job->req.observation) job->req.observation->prefill(job->result.prompt_tokens);
                     { tqllm::PrefillObservation progress(observe_prefill(job->req.observation));

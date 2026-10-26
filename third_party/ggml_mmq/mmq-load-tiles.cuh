@@ -1077,6 +1077,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nrows = warp_size / threads_per_row;
     const int kqsx = threadIdx.x % threads_per_row;
 
+    [[maybe_unused]] const int tq_r0 = TQ_ON ? kbx0 / tq_u4h.nbq : 0, tq_sb = TQ_ON ? kbx0 - tq_r0*tq_u4h.nbq : 0;  // i*stride adds whole rows
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
@@ -1085,12 +1087,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_iq1_s * bxi = (const block_iq1_s *) x + kbx0 + i*stride;
-
-        const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+        int qs_packed, qh;
+        float dh;
+        if constexpr (TQ_ON) {  // tqLLM bank: 4 bytes per 32 weights (qs); record 20 B per 256: d, qh[8] x uint16
+            const int r = tq_r0 + i, sb = tq_sb;
+            qs_packed = __ldg((const int *) (x + tq_u4h_block_off(r, 8*sb + kqsx, 4)));
+            const uint8_t * rc = tq_u4h.rec + ((int64_t) r*tq_u4h.nbq + sb)*20;
+            qh = __ldg((const unsigned short *) (rc + 2) + kqsx); dh = __half2float(__ldg((const half *) rc));
+        } else {
+            const block_iq1_s * bxi = (const block_iq1_s *) x + kbx0 + i*stride;
+            qs_packed = get_int_b2(bxi->qs, kqsx); qh = bxi->qh[kqsx]; dh = __half2float(bxi->d);
+        }
         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-
-        const int qh = bxi->qh[kqsx];
 
     #pragma unroll
         for (int l = 0; l < QR1_S/2; ++l) {
@@ -1108,7 +1116,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 
-        const float  d1q   = __half2float(bxi->d) * (((qh >> 11) & 0x0E) + 1);
+        const float  d1q   = dh * (((qh >> 11) & 0x0E) + 1);
         const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1139,6 +1147,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nrows = warp_size / threads_per_row;
     const int kqsx = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
 
+    [[maybe_unused]] const int tq_r0 = TQ_ON ? kbx0 / tq_u4h.nbq : 0, tq_sb = TQ_ON ? kbx0 - tq_r0*tq_u4h.nbq : 0;  // i*stride adds whole rows
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
@@ -1147,11 +1157,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_iq2_xxs * bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
-
-        const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
+        int q2; uint32_t aux32; float d;
+        if constexpr (TQ_ON) {  // tqLLM bank: 8 bytes per 32 weights (the block's qs pair); record 4 B per 256: d
+            const int r = tq_r0 + i, sb = tq_sb;
+            const uint32_t * p = (const uint32_t *) (x + tq_u4h_block_off(r, 8*sb + kqsx, 8));
+            q2 = int(__ldg(p)); aux32 = __ldg(p + 1);
+            d = __half2float(__ldg((const half *) (tq_u4h.rec + ((int64_t) r*tq_u4h.nbq + sb)*4)));
+        } else {
+            const block_iq2_xxs * bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
+            q2 = get_int_b2(bxi->qs, 2*kqsx+0); aux32 = get_int_b2(bxi->qs, 2*kqsx+1); d = bxi->d;
+        }
         const uint8_t * aux8 = (const uint8_t *) &q2;
-        const uint32_t aux32 = get_int_b2(bxi->qs, 2*kqsx+1);
 
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
@@ -1174,7 +1190,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
         const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-        const float d = bxi->d;
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride             + kqsx] = d * ls / 8; // (d * scale + d / 2) / 4
 #else

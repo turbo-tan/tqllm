@@ -42,6 +42,42 @@ template<class T> __global__ void dot_warp(const unsigned char * weights, const 
         else y[int64_t(assignment) * rows + row] = __float2bfloat16_rn(sum);
     }
 }
+// Wide rows (cols >= 3072, MiniMax): warp per (row, assignment), 4 blocks per step: 8 lanes per block, each lane 2 code
+// bytes (8 weights) and one 16-byte load of the 8 inputs. 4x the bytes per load of dot_warp, whose byte-wide reads ran a
+// 3072 x 6144 expert at ~85 GB/s on a GB10. Its own summation order: not bit-identical to dot_warp.
+template<class T> __global__ void dot_wide(const unsigned char * weights, const __half * x, T * y,
+                                          int rows, int cols, int experts, const int * ids, int topk, bool per_expert) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, assignment = blockIdx.y;
+    if (row >= rows) return;
+    const int expert = ids ? ids[assignment] : 0;
+    const int input = per_expert ? assignment : assignment / topk;
+    float sum = 0.f;
+    if (expert >= 0 && expert < experts) {
+        const int nb = cols / 64, sub = lane & 7, which = lane >> 3;
+        const unsigned char * r = weights + (int64_t(expert) * rows + row) * nb * 18;
+        const __half * xr = x + int64_t(input) * cols;
+        for (int b = which; b < nb; b += 4) {
+            const unsigned char * block = r + b * 18;
+            const float scale = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned q = *reinterpret_cast<const uint16_t *>(block + 2 + sub * 2);
+            const uint4 xv = *reinterpret_cast<const uint4 *>(xr + b * 64 + sub * 8);
+            const __half2 * xh = reinterpret_cast<const __half2 *>(&xv);
+            float part = 0.f;
+            for (int i = 0; i < 4; ++i) {
+                const float2 xx = __half22float2(xh[i]);
+                part += (int((q >> (4 * i)) & 3u) - 1) * xx.x;
+                part += (int((q >> (4 * i + 2)) & 3u) - 1) * xx.y;
+            }
+            sum += scale * part;
+        }
+    }
+    for (int d = 16; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
+    if (!lane) {
+        if (expert < 0 || expert >= experts) sum = nanf("");
+        if constexpr (std::is_same_v<T, float>) y[int64_t(assignment) * rows + row] = sum;
+        else y[int64_t(assignment) * rows + row] = __float2bfloat16_rn(sum);
+    }
+}
 // Grouped experts (moe_group lists): warp per (row, expert, up to C of its tokens); the row's blocks are read once for
 // all C tokens. Per token the products and their order are those of dot_warp (bit-identical).
 // Grouped experts (moe_group lists): block = 64 rows (8 warps x 8 rows) of one expert; the expert's tokens C at a time
@@ -95,23 +131,24 @@ template<int C> __global__ void __launch_bounds__(256) dot_grouped(const unsigne
 // Grouped experts on tensor cores: CTA = 64 rows x 64 of one expert's tokens, warp w takes row tile w & 3 and k half
 // w >> 2 (u4h_gemm_k's layout). Lane t of a warp owns one 32-weight half of a Q2_0 block per 256-k step; scale * (code - 1)
 // is exact in FP16, so only the FP32 summation order differs from dot_grouped.
+template<int NT>
 __global__ void __launch_bounds__(256) q2_gemm_grouped(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int k,
                                                        const int * counts, const int * groups, int capacity, int topk, bool per_expert) {
     using namespace tqllm_dev;
     const int expert = blockIdx.z, ncols = counts[expert];
-    if (int(blockIdx.y) * 64 >= ncols) return;
+    if (int(blockIdx.y) * (NT*8) >= ncols) return;
     groups += int64_t(expert) * capacity;
-    constexpr int NT = 8, XS = 33;
-    __shared__ uint4 xt[64 * XS];
+    constexpr int XS = 33;
+    __shared__ uint4 xt[NT*8 * XS];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     const int rt = warp & 3, ks = warp >> 2;
-    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * 64, nb = k / 32, row_bytes = k / 64 * 18;
+    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * (NT*8), nb = k / 32, row_bytes = k / 64 * 18;
     const unsigned char * wa = weights + (int64_t(expert) * rows + min(row0 + g, rows - 1)) * row_bytes;
     const unsigned char * wb = weights + (int64_t(expert) * rows + min(row0 + g + 8, rows - 1)) * row_bytes;
     float c[NT][4] = {};
     for (int base = 0; base < nb; base += 8) {
         __syncthreads();
-        for (int i = threadIdx.x; i < 64 * 32; i += 256) {
+        for (int i = threadIdx.x; i < NT*8 * 32; i += 256) {
             const int col = i / 32, q = i % 32, blk = base + q / 4;
             uint4 v = make_uint4(0, 0, 0, 0);
             if (col0 + col < ncols && blk < nb) {
@@ -193,7 +230,10 @@ void gsq_q2_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, i
     shape(w, x, y, r, k, n, topk);
     if (!ids || experts <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid expert dimensions");
-    dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    if (k >= 3072)
+        dot_wide<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    else
+        dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
 }
 void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, const int * counts, const int * groups,
                            int capacity, int experts, int topk, bool per_expert, cudaStream_t s) {
@@ -203,7 +243,9 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     // TQFN_Q2_DOT_GROUPED=1: the scalar kernel (A/B); default: tensor cores when k is a multiple of 64
     static const bool scalar = std::getenv("TQFN_Q2_DOT_GROUPED") && std::atoi(std::getenv("TQFN_Q2_DOT_GROUPED")) != 0;
     if (!scalar && capacity <= 65535 * 64) {
-        q2_gemm_grouped<<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts)), 256, 0, s>>>(
+        if(capacity<=8)q2_gemm_grouped<1><<<dim3(unsigned((r+63)/64),1,unsigned(experts)),256,0,s>>>(
+            static_cast<const unsigned char *>(w),x,y,r,k,counts,groups,capacity,topk,per_expert);
+        else q2_gemm_grouped<8><<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts)), 256, 0, s>>>(
             static_cast<const unsigned char *>(w), x, y, r, k, counts, groups, capacity, topk, per_expert);
         return;
     }

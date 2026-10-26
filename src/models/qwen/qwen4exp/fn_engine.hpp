@@ -3,15 +3,30 @@
 //   gguf=<shard> (one line per shard, in order), mtp=<MTP gguf>, experts=<packed experts>, draft_vocab=<file>,
 //   optional overrides: slots=N|auto (default auto: sized from the device), budget_gb (fixed slots only), drafts=3,
 //   chunk (--prefill-chunk wins), gsq_rco=1, layer_slots=<per-layer routing plan, scaled to the slots>
+// Pilot only: hot_map=<int32 map>, cold_slots=16, cold_host_mb=3072, cold_readers=0; no packed bank or pruning.
 // One slot, greedy MTP speculative decoding (exact: tokens identical to plain greedy). A fresh DecodeModel per request
 // resets the recurrent, PLE, attention and MTP state; the expert caches persist across requests.
 #include "fn_model.hpp"
 #include "engine.hpp"
+#include "cold_expert_store.hpp"
+#include "cold_expert_memo.hpp"
+#include "expert_read_pool.hpp"
+#include "expert_fetch_queue.hpp"
 
 namespace tqllm::flashnext {
+using ColdFetchQueue=ExpertFetchQueue<std::array<ExpertPayload,3>>;
 struct FnServe {
-    std::vector<std::string> ggufs; std::string mtp, experts, draft_vocab;
+    std::vector<std::string> ggufs; std::string mtp, experts, draft_vocab, hot_map_path, cold_store_path;
     std::string layer_slots;  // manifest layer_slots=: per-layer expert slots when no experts file carries a .slots plan
+    std::unique_ptr<ColdExpertStore> cold_store;
+    bool cold_fast = false, cold_reclaim_hot = false, cold_mmap = false, cold_streaming = false;
+    int cold_overlap = 0;
+    int cold_readers = 0,cold_prefetch_k=0;
+    std::unique_ptr<ColdFetchQueue> cold_fetch_queue;
+    std::unique_ptr<ExpertReadPool> cold_read_pool;
+    std::vector<int32_t> hot_map; int cold_slots = 16, hot_slots = 0;
+    std::unique_ptr<MixedExpertCache> cold_cache;
+    ColdExpertMemo cold_host{size_t(3) << 30};
     int slots = 176, drafts = 3, chunk = 8; double budget_gb = 18; bool gsq_rco = true, slots_auto = false;
     std::vector<std::string> arg_store; std::vector<char *> argv;
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
@@ -28,6 +43,9 @@ class FlashNextEngine final : public tqllm::Engine {
         std::unique_ptr<DecodeModel> model_; std::unique_ptr<Device<float>> prompt_res_;
         std::unique_ptr<tqllm::BankLedger> ledger_;  // this request's borrowed expert banks
         tqllm::ExpertCacheStats stats_at_decode_{}, mtp_stats_at_decode_{};  // TQLLM_DEBUG=mem: cache counters when the decode of this request began
+        ExpertCacheStats cold_at_decode_{};
+        ColdExpertStore::Stats cold_store_at_decode_{};
+        ColdFetchQueue::Stats cold_fetch_at_decode_{};
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free
         std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
         std::chrono::steady_clock::time_point t_begin_, t_decode_;
@@ -87,7 +105,8 @@ public:
     void spec_step(const int * ids, int n, bool * done) override;
     bool incremental() const override { return true; }
     bool has_drafter() const override { return true; }
-    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) override {
+    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) override {
+        (void) presence;
         S().temp_ = temperature; S().top_p_ = top_p > 0.f && top_p <= 1.f ? top_p : 1.f; S().top_k_ = top_k; S().rng_.seed(seed ? seed : 0x9e3779b97f4a7c15ull);
     }
     uint32_t step(uint32_t, uint32_t, bool, float *) override { throw std::runtime_error("Flash-Next serves through spec_begin / spec_advance"); }

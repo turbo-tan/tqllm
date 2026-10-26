@@ -1,4 +1,5 @@
 #pragma once
+#include "hf_folder.hpp"
 #include <string>
 
 namespace tqllm {
@@ -7,6 +8,7 @@ inline std::string tokenizer_for(const std::string & model, const std::string & 
     if (!tokenizer.empty()) return tokenizer;
     const std::string ext = ".gguf";
     if (model.size() > ext.size() && model.compare(model.size() - ext.size(), ext.size(), ext) == 0) return model;
+    if (hf_folder(model)) return model;  // tokenizer.json of the folder
     return "";
 }
 }  // namespace tqllm

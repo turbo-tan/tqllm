@@ -1,4 +1,5 @@
-// Flash-Next prefill memory plan and bank ledger (src/models/qwen/qwen4exp/prefill_plan.hpp), on a mock device: the plan's sizes at the
+// Flash-Next prefill memory plan (src/models/qwen/qwen4exp/prefill_plan.hpp) and the shared bank ledger
+// (src/experts/expert_bank_plan.hpp), on a mock device: the plan's sizes at the
 // Flash-Next shape, the borrow policies, and the request order (the 2026-10-16 refill-while-buffers-held OOM and the
 // start-up arena sized by a 32K chunk reproduce here).
 #include "prefill_plan.hpp"
@@ -79,7 +80,7 @@ int main() {
         MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);  // 13.1 GB banks + 8.5 GB fixed -> 2.3 GB free
         BankLedger ledger(dev.ops());
         const auto plan = prefill_plan(s, tuning(32768), 30892, dev.free());
-        const auto got = ledger.borrow(plan, BorrowMode::All);
+        const auto got = borrow_banks(ledger, plan, BorrowMode::All);
         expect(got.size() == 48 && dev.banks.empty() && dev.free() >= plan.need, "borrow all: 48 banks released, the 32K plan fits");
         dev.held = plan.trunk_peak;  // the trunk runs
         bool logic = false; try { ledger.refill(); } catch (const std::logic_error &) { logic = true; }
@@ -93,7 +94,7 @@ int main() {
         dev.banks.erase(5); dev.banks.erase(9);
         BankLedger ledger(dev.ops());
         const auto plan = prefill_plan(s, tuning(32768), 30892, dev.free());
-        const auto got = ledger.borrow(plan, BorrowMode::All, 0, {5, 9});
+        const auto got = borrow_banks(ledger, plan, BorrowMode::All, 0, {5, 9});
         expect(got.size() == 48 && ledger.borrowed(5) && ledger.borrowed(9), "borrow all: the bankless layers 5 and 9 join the 46 released");
         ledger.buffers_released();
         expect(ledger.refill() == 48 && dev.banks.size() == 48, "every layer has a bank after the refill (12 GB 16K a != b)");
@@ -108,7 +109,7 @@ int main() {
         plan.need = dev.free() + 2 * 274 * MB;  // needs exactly two banks' bytes
         plan.release = 2 * 274 * MB;
         bool ok = true; std::vector<int> got;
-        try { got = ledger.borrow(plan, BorrowMode::Auto); } catch (const std::runtime_error &) { ok = false; }
+        try { got = borrow_banks(ledger, plan, BorrowMode::Auto); } catch (const std::runtime_error &) { ok = false; }
         expect(ok && got.size() == 3 && dev.free() >= plan.need, "auto borrow: two banks fall 16 MB short, the third covers it (GB10 12789 vs 12785 MB)");
     }
     // 5. a refill that runs out of memory stops and reports how many came back; auto borrows the LRU banks first
@@ -117,7 +118,7 @@ int main() {
         dev.lru = {7, 3, 11, 0};  for (int l = 0; l < 48; ++l) if (l != 7 && l != 3 && l != 11 && l != 0) dev.lru.push_back(l);
         BankLedger ledger(dev.ops());
         const auto plan = prefill_plan(s, tuning(8192), 30892, dev.free());
-        const auto got = ledger.borrow(plan, BorrowMode::Auto);
+        const auto got = borrow_banks(ledger, plan, BorrowMode::Auto);
         expect(got.size() >= 4 && got[0] == 7 && got[1] == 3 && got[2] == 11 && got[3] == 0, "auto releases least recently used banks first");
         expect(ledger.borrowed(7) && !ledger.borrowed(47), "borrowed() answers per layer");
         ledger.buffers_released();
@@ -130,7 +131,7 @@ int main() {
         MockDevice dev(24 * size_t(1024) * MB, 274 * MB, 8500 * MB, 48);
         BankLedger ledger(dev.ops());
         const auto plan = prefill_plan(s, tuning(16384), 30892, dev.free());
-        const auto got = ledger.borrow(plan, BorrowMode::All);
+        const auto got = borrow_banks(ledger, plan, BorrowMode::All);
         ledger.buffers_released();
         const size_t keep = 9000 * MB;
         const int first = ledger.refill(keep);

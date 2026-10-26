@@ -43,6 +43,8 @@ struct KvGeometry {
     int layers = 0;      // attention layers that hold KV
     size_t key_row = 0;  // bytes of one position (all KV heads) in the cache's format
     size_t value_row = 0;
+    // 0 = a cache with no V side (one row per position is both the key and the value: the GLM nope-MLA latent cache).
+    // `row(layer, false, pos)` is then nullptr and no V memory is allocated. A staged host tail needs both sides.
     int64_t page = 0;    // positions per page
     // Positions of each device page backed by device memory; the rest of the page (its tail) is host memory reached
     // through the same pointer (needs KvMemory::granule). -1: the whole page on the device.
