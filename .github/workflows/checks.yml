@@ -48,13 +48,12 @@ jobs:
         run: |
           cmake -S . -B build-monitor -DTQLLM_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
           cmake --build build-monitor --target test-monitor -j 2
-      - name: Install contributor browser tooling
-        run: |
-          python3 -m venv .venv-monitor
-          .venv-monitor/bin/pip install playwright==1.64.0
-          .venv-monitor/bin/python -m playwright install --with-deps chromium firefox webkit
+      # the browsers and their system libraries come with the Playwright image: `playwright install --with-deps` on the
+      # runner stalled on its apt mirror (gstreamer1.0-plugins-bad) until the job timed out, three runs in a row
       - name: Browser regression gate (no model or GPU)
-        run: .venv-monitor/bin/python tests/test_monitor_ui.py --binary build-monitor/test-monitor --output build-monitor/monitor-artifacts
+        run: |
+          docker run --rm --ipc=host -v "$PWD:/w" -w /w mcr.microsoft.com/playwright/python:v1.64.0-noble bash -c \
+            "pip install -q --break-system-packages playwright==1.64.0 && python3 tests/test_monitor_ui.py --binary build-monitor/test-monitor --output build-monitor/monitor-artifacts"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
