@@ -7,8 +7,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(TQLLM_CUDA "Build CUDA inference and device diagnostics" ON)
 option(TQLLM_MLX "Build experimental Apple MLX operators" OFF)
+option(TQLLM_ANDROID "Build native Android/Arm CPU inference" OFF)
 include(GNUInstallDirs)
 include(CTest)
+if(TQLLM_ANDROID)
+  include(cmake/android.cmake)
+endif()
 # Source layout (AGENTS.md): one folder per component and per model architecture, host and device code together.
 # Includes name the file only; these folders are the search path.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/engine ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/experts ${CMAKE_CURRENT_SOURCE_DIR}/src/spec ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen2 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp ${CMAKE_CURRENT_SOURCE_DIR}/src/models/glm ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax ${CMAKE_CURRENT_SOURCE_DIR}/src/vision ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${CMAKE_CURRENT_SOURCE_DIR}/third_party)

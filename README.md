@@ -81,3 +81,9 @@ Third-party notices remain in [NOTICE](NOTICE). Thank you to our community teste
 
 tqLLM is Apache-2.0 licensed. Model weights and third-party components retain
 their own licences.
+
+### Android (experimental)
+
+Native Arm CPU text inference for the Galaxy S25 Ultra is opt-in. See the
+[Android build and run guide](docs/android/S25_ULTRA.md) for the selected 4B model,
+NDK build, ADB deployment and validation limits.
