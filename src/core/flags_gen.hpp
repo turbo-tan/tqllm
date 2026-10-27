@@ -262,7 +262,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_GDN_WY", Kind::Debug, "on", "0: GDN chunked prefill without the WY form (A/B)", ""},
     {"TQFN_GEMV_TILE", Kind::Debug, "16", "router GEMV tile: 8, 16, 164 (16 x 4) or 32 (same output bits)", ""},
     {"TQFN_KV", Kind::User, "-", "KV format for Flash-Next attention (name from the KV format registry; default bf16)", ""},
-    {"TQFN_KV_HOST", Kind::User, "off", "1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM, slower decode at long context)", ""},
+    {"TQFN_KV_HOST", Kind::User, "off", "1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM for expert banks; decode copies only the selected rows)", ""},
     {"TQFN_KV_HOST_KEEP", Kind::User, "32768", "positions of K/V kept on the device with TQFN_KV_HOST=1", ""},
     {"TQFN_LAYER_MAJOR", Kind::Debug, "on", "0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer)", ""},
     {"TQFN_LAYER_MAJOR_MIN", Kind::Debug, "256", "tokens from which a prefill chunk runs layer-major", ""},
