@@ -10,7 +10,7 @@
 | Connect coding agents | [Agent setup](guides/coding-agents.md) |
 | Add DFlash2 or native MTP drafting | [Speculative decoding](guides/speculative-decoding.md) |
 | Fit a long context into GPU and host memory | [TqCache](guides/long-context.md) |
-| Choose model weight formats | [Formats](reference/formats.md) |
+| Choose model weight formats | [Formats](reference/formats.md), [illustrated](reference/formats.html) |
 | Configure serving, sampling and memory | [Options](reference/options.md) |
 | Reproduce performance measurements | [Benchmarks](BENCHMARKS.md) |
 | Understand source layout | [Architecture](ARCHITECTURE.md) |
