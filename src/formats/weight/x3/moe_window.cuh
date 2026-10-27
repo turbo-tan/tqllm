@@ -181,9 +181,10 @@ template <class Codec>
 __device__ __forceinline__ void xw_pmoe_item(const XwPart& P, int cols, int n, int item) {
     using G = XwGeom;
     constexpr int NB = 2;
+    constexpr bool PACKED = Codec::packed_wnt(G::WNT);
     constexpr int TWORDS = Codec::u32words;
     constexpr int LOADS = Codec::loads(G::WNT);
-    constexpr int LSTRIDE = Codec::ld_stride;
+    constexpr int LSTRIDE = Codec::ld_stride_wnt(G::WNT);
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int ntiles = P.rows / 16;
     const int groups = P.rows / XW_PMOE_COLS;
@@ -194,8 +195,8 @@ __device__ __forceinline__ void xw_pmoe_item(const XwPart& P, int cols, int n, i
     const size_t slice_stride = (size_t) ntiles * TWORDS;
     const uint32_t* bp = P.B + (size_t) x3_tile_offset(ks0, tile0, ntiles) * TWORDS + lane;
     auto ld_b = [&](int i, int l) -> uint32_t {
-        if constexpr (Codec::ld_lanes < 32)
-            return lane < Codec::ld_lanes ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+        if constexpr (Codec::ld_lanes_wnt(G::WNT) < 32)
+            return lane < Codec::ld_lanes_wnt(G::WNT) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
         else
             return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
     };
@@ -256,7 +257,7 @@ __device__ __forceinline__ void xw_pmoe_item(const XwPart& P, int cols, int n, i
             #pragma unroll
             for (int t = 0; t < G::WNT; ++t) {
                 FragB f0, f1;
-                codec.tile(bw, t, f0, f1);
+                codec.template tile<PACKED>(bw, t, f0, f1);
                 #pragma unroll
                 for (int h = 0; h < NB; ++h) xw_mma(f0, f1, alo[h], ahi[h], ch[t][h]);
             }

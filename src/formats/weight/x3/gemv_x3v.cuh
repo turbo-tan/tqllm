@@ -54,8 +54,9 @@ void x3v_gemv_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B,
     constexpr int COLS = WNT * 16;
 
     constexpr int TWORDS = Codec::u32words;      // uint32 per 16x16 tile
+    constexpr bool PACKED = Codec::packed_wnt(WNT);
     constexpr int LOADS  = Codec::loads(WNT);    // warp loads per k-slice
-    constexpr int LSTRIDE = Codec::ld_stride;
+    constexpr int LSTRIDE = Codec::ld_stride_wnt(WNT);
 
     auto grid = cg_::this_grid();
 
@@ -103,8 +104,8 @@ void x3v_gemv_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B,
         const uint32_t* bp = B32 + (size_t) x3_tile_offset(ks0, group * WNT, ntiles) * TWORDS + lane;
 
         auto ld_b = [&](int i, int l) -> uint32_t {
-            if constexpr (Codec::ld_lanes < 32)
-                return lane < Codec::ld_lanes ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+            if constexpr (Codec::ld_lanes_wnt(WNT) < 32)
+                return lane < Codec::ld_lanes_wnt(WNT) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
         };
@@ -147,7 +148,7 @@ void x3v_gemv_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B,
             #pragma unroll
             for (int t = 0; t < WNT; ++t) {
                 FragB f0, f1;
-                Codec::regs_decode(bw, t, lane, f0, f1);
+                Codec::template regs_decode<PACKED>(bw, t, lane, f0, f1);
                 x3v_mma_ab_h(a01, a23, f0, ch[t][0]);
                 x3v_mma_ab_h(a01, a23, f1, ch[t][1]);
             }

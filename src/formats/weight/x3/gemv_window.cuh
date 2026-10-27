@@ -135,9 +135,10 @@ inline size_t xw_gemv_smem(int n, int k_slices) {
 template <class Codec, int NB, class List>
 __device__ __forceinline__ void xw_item(const List& L, int item) {
     using G = XwGeom;
+    constexpr bool PACKED = Codec::packed_wnt(G::WNT);
     constexpr int TWORDS = Codec::u32words;
     constexpr int LOADS = Codec::loads(G::WNT);
-    constexpr int LSTRIDE = Codec::ld_stride;
+    constexpr int LSTRIDE = Codec::ld_stride_wnt(G::WNT);
 
     int pi = 0;
     while (pi + 1 < L.count && item >= L.p[pi + 1].item0) ++pi;
@@ -156,8 +157,8 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
     const size_t slice_stride = (size_t) ntiles * TWORDS;
     const uint32_t* bp = P.B + (size_t) x3_tile_offset(ks0, group * G::WNT, ntiles) * TWORDS + lane;
     auto ld_b = [&](int i, int l) -> uint32_t {
-        if constexpr (Codec::ld_lanes < 32)
-            return lane < Codec::ld_lanes ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+        if constexpr (Codec::ld_lanes_wnt(G::WNT) < 32)
+            return lane < Codec::ld_lanes_wnt(G::WNT) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
         else
             return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
     };
@@ -225,7 +226,7 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
             #pragma unroll
             for (int t = 0; t < G::WNT; ++t) {
                 FragB f0, f1;
-                codec.tile(bw, t, f0, f1);
+                codec.template tile<PACKED>(bw, t, f0, f1);
                 #pragma unroll
                 for (int h = 0; h < NB; ++h) xw_mma(f0, f1, alo[h], ahi[h], ch[t][h]);
             }
