@@ -37,6 +37,9 @@ int main() {
     expect(host_ram_limit(125 * GiB, ""), 125 * GiB, "no cgroup file");
     expect(host_ram_limit(31 * GiB, "9223372036854771712\n"), 31 * GiB, "cgroup v1 unlimited");
     expect(host_ram_limit(125 * GiB, "x"), 125 * GiB, "unreadable limit");
+    if (tqllm::cgroup_v2_path("0::/user.slice/run-x.scope\n") != "/user.slice/run-x.scope") { std::fprintf(stderr, "FAIL cgroup path\n"); ++failures; }
+    if (tqllm::cgroup_v2_path("0::/\n") != "/") { std::fprintf(stderr, "FAIL cgroup root path\n"); ++failures; }
+    if (!tqllm::cgroup_v2_path("12:memory:/x\n").empty()) { std::fprintf(stderr, "FAIL v1-only text\n"); ++failures; }
     if (failures) return 1;
     std::puts("device_free: ok");
     return 0;
