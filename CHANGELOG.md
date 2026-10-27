@@ -30,7 +30,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   of host RAM with a 117 GB limit and kept hitting the limit while loading).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact
   device buffer instead of reading every old position over PCIe, and the expert banks grow back into the VRAM the
-  host KV frees. RTX 3090 at 128K with a 109 GB RAM limit: 14-19 -> 70.7 tok/s (68 with device KV), output identical.
+  host KV frees. RTX 3090 at 128K with a 109 GB RAM limit: 70.7 tok/s against 68 with all K/V on the device, output identical
+  (the old path read every position over PCIe: 14-19 tok/s on a 5090).
 - Qwen3.5 / 3.8 TQ4 files (e.g. Qwen3.8-27B TQ_L): the Gated DeltaNet [b|a] rows and the MoE router read the rotated
   activation again. Builds after 1.2.3 fed them an un-rotated copy meant only for hub TQ3_4S files, and greedy decode
   could loop (40-question MMLU-Pro subset 23/40 -> 36/40). Released 1.2.x builds were not affected.
