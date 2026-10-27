@@ -15,8 +15,19 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Hugging Face checkpoint folders served in place (`--model FOLDER`): safetensors shards, tokenizer and chat template read
   as published, no conversion and no second copy on disk. Encodings: EXL3 trellis, MXFP8, BF16 / F16 / F32.
 - Guide: [MiniMax-M3.1-Flash and GLM-5.3-Flash on one GB10](docs/guides/gb10-big-moe.md).
+- Guide: [RTX 5090](docs/guides/rtx-5090.md): Flash-Next and Qwen3.8-27B numbers and what the engine sizes by itself.
+
+### Changed
+- Flash-Next decode launches its per-layer kernels directly on PCIe cards and keeps CUDA graphs for unified-memory GPUs
+  (GB10 / DGX Spark, +5-6 % decode). RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s; RTX 3090
+  unchanged. Output identical.
+- Flash-Next: an expert bank lent to a long prompt's prefill comes back with the experts it held before the prompt
+  (64K context on an RTX 5090: +3 % decode).
 
 ### Fixed
+- System memory is the machine's RAM capped by the container limit (cgroup `memory.max`): in a Docker / cloud container
+  with less memory than the host, Flash-Next no longer pins an expert pack sized for the host (a 5090 pod reported 944 GB
+  of host RAM with a 117 GB limit and kept hitting the limit while loading).
 - Qwen3.5 / 3.8 TQ4 files (e.g. Qwen3.8-27B TQ_L): the Gated DeltaNet [b|a] rows and the MoE router read the rotated
   activation again. Builds after 1.2.3 fed them an un-rotated copy meant only for hub TQ3_4S files, and greedy decode
   could loop (40-question MMLU-Pro subset 23/40 -> 36/40). Released 1.2.x builds were not affected.
