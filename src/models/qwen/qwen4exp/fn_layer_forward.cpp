@@ -29,11 +29,12 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                    const PrefillSink * sink, bool plain) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
     // The part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or GDN core, routers,
-    // top-k) is captured into a CUDA graph each step, updated in place and launched: the GPU runs ~45 small kernels back to
-    // back without launch gaps and capturing costs the host less than launching (3090 chat +2.5 %, text identical). One
-    // sequence only (the multi-slot path interleaves per-sequence state); PCIe GPUs only until gated on a GB10.
+    // top-k) is captured into a CUDA graph each step, updated in place and launched. Unified-memory GPUs only: GB10
+    // decode +5-6 % (text identical); on PCIe cards the per-step re-capture of ~48 graphs costs more host time than the
+    // launch gaps it removes (3090 + Ryzen 5950X neutral, RTX 5090 + EPYC 7543 chat 128 -> 154, 64K 118 -> 134 tok/s with
+    // graphs off). One sequence only (the multi-slot path interleaves per-sequence state).
     static const bool graph_on = [] { int dev = 0, on = 0; cudaGetDevice(&dev);
-        return !(cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on); }();
+        return cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on; }();
     // Every step updates all kernel parameters (weights included), so layers of one kind share an exec, keyed by its
     // topology: the node count changes with the position in attention layers and with the draft in the MTP layer.
     // One exec per layer and variant (~11 x 49) held ~1.3 GB the expert banks had taken (out of memory on a 3090).
