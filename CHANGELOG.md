@@ -31,6 +31,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Expert cache on a full device: a bank that does not fit evicts the most recently used other bank, not the least
   recently used one. Layers run in a fixed cycle, so the old victim was always the next layer needed and every layer
   evicted the next (3090, 128K, larger expert banks: 0.5 % hits and 5 tok/s -> 77 % and 27.7 tok/s).
+- Expert cache over its own budget picks the victim the same way (most recent other bank), and `regrow` after a long
+  prompt rebuilds each bank at its target in place with the experts it held instead of releasing it (the refill took the
+  freed memory first and decode then built those banks by evicting others). RTX 3090, 128K, 109 GB cap: 69-71 -> 77-78
+  tok/s on a repeat request, zero bank rebuilds during decode.
+- Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
 - Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact
   device buffer instead of reading every old position over PCIe, and the expert banks grow back into the VRAM the

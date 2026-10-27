@@ -145,20 +145,20 @@ struct MixedExpertCache::State {
     }
     const void * upload(const void * host, size_t bytes, std::vector<Allocation> & owned, int protect) {
         if (!bytes || bytes > budget) throw std::invalid_argument("mixed cache: upload exceeds budget");
+        // over budget or out of device memory, the victim is the most recently used other bank: layers run in a fixed
+        // cycle, so the least recently used one is the next needed (every layer then evicted the next: all misses)
         while (live > budget - bytes) {
             auto victim = banks.end();
             for (auto it = banks.begin(); it != banks.end(); ++it)
-                if (it->first != protect && (victim == banks.end() || it->second->touched < victim->second->touched)) victim = it;
+                if (it->first != protect && (victim == banks.end() || it->second->touched > victim->second->touched)) victim = it;
             if (victim == banks.end()) throw std::invalid_argument("mixed cache: bank plus loader staging exceeds budget");
             for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
-            banks.erase(victim);
+            ++counters.bank_drops; ++counters.drops_budget; banks.erase(victim);
         }
         void * p = nullptr;
         // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so).
-        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts the most
-        // recently used other bank and tries again, so the bank count follows the free memory instead of failing the request.
-        // Layers run in a fixed cycle, so the least recently used bank is the next one needed: evicting it made every layer
-        // evict the next (all misses); the most recent one is needed last, and a step rebuilds at most one bank.
+        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts a bank
+        // the same way and tries again, so the bank count follows the free memory instead of failing the request
         cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10));
         while (e == cudaErrorMemoryAllocation) {
             cudaGetLastError();
@@ -168,7 +168,12 @@ struct MixedExpertCache::State {
             if (victim == banks.end()) break;
             for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
             if (active == victim->first) active = -1;
-            banks.erase(victim);
+            if (tqllm::debug_on("mem") && counters.drops_oom < 8) {
+                size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+                std::fprintf(stderr, "CACHE oom: %.1f MB for layer %d failed with %.0f MB free, dropping layer %d's bank\n",
+                             bytes / 1048576.0, protect, fr / 1048576.0, victim->first);
+            }
+            ++counters.bank_drops; ++counters.drops_oom; banks.erase(victim);
             e = cudaMalloc(&p, bytes + (size_t(64) << 10));
         }
         if (e != cudaSuccess) {
@@ -308,7 +313,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         for (const auto & [id, payload] : incoming) for (int p = 0; p < 3; ++p)
             if (payload[p].type != first[p].type) throw std::invalid_argument("mixed cache: types vary within a layer projection");
         s.active = -1;
-        auto created = s.create(layer, first); bank = created.get(); s.banks.emplace(layer, std::move(created));
+        auto created = s.create(layer, first); bank = created.get(); s.banks.emplace(layer, std::move(created)); ++s.counters.bank_builds;
         if (s.prepacked && s.registered) s.grow_pf(kPfBatch * State::expert_bytes(*bank));
     }
     s.active = -1;
@@ -676,15 +681,20 @@ int MixedExpertCache::plan_slots(int layer) {
 int MixedExpertCache::regrow(size_t keep_free) {
     auto & s = *state_; if (s.layer_target.empty()) return 0;
     int n = 0;
-    size_t reserved = 0;  // the full banks the released layers rebuild: their freed slots show as free memory but are spoken for
+    // a bank below its target is rebuilt at the target now, with the experts it held: releasing it for a later prepare
+    // let the bank refill take the freed memory first, and decode then built those layers' banks by evicting others
     for (int l = 0; l < s.layers; ++l) {
         const auto it = s.banks.find(l);
         if (it == s.banks.end() || it->second->cap >= s.layer_target[size_t(l)]) continue;
         size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
         const size_t grow = size_t(s.layer_target[size_t(l)] - it->second->cap) * s.slot_bytes(l);
-        if (fr < keep_free + reserved + grow) break;
-        reserved += size_t(s.layer_target[size_t(l)]) * s.slot_bytes(l);
-        release_bank(l); ++n;  // rebuilt at its target by the next prepare (choose_cap)
+        if (fr < keep_free + grow) break;
+        std::vector<int> held; for (int id : it->second->ids) if (id >= 0) held.push_back(id);
+        release_bank(l); ++n;
+        s.layer_cap[size_t(l)] = s.layer_target[size_t(l)];
+        if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
+        s.planned[size_t(l)] = 1;  // built at the target, not sized again by choose_cap
+        if (!held.empty()) { (void) prepare(l, held); wait_misses(); }
     }
     return n;
 }
@@ -753,7 +763,7 @@ std::vector<int> MixedExpertCache::evict_until_free(size_t want, int protect) {
         if (victim == s.banks.end()) break;
         for (int id : victim->second->ids) if (id >= 0) ++s.counters.evictions;
         if (s.active == victim->first) s.active = -1;
-        out.push_back(victim->first); s.banks.erase(victim);
+        out.push_back(victim->first); ++s.counters.bank_drops; s.banks.erase(victim);
     }
     return out;
 }
@@ -774,7 +784,7 @@ void MixedExpertCache::release_bank(int layer) {
     s.wait_misses_impl(); checked(cudaDeviceSynchronize());  // no kernel or copy may still use the bank
     for (int id : it->second->ids) if (id >= 0) ++s.counters.evictions;
     if (s.active == layer) s.active = -1;
-    s.banks.erase(it);
+    ++s.counters.bank_drops; s.banks.erase(it);
 }
 void MixedExpertCache::reset_usage() { auto & s = *state_; std::fill(s.frequency.begin(), s.frequency.end(), 0); }
 void MixedExpertCache::add_device_counters(uint64_t hits, uint64_t misses, uint64_t prefetched, uint64_t bytes) {

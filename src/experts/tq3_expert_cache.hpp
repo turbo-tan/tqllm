@@ -15,6 +15,8 @@ struct ExpertCacheStats {
     // prefetch overlap (split mode): prepares whose bank still had copies queued, of those the ones whose copies were
     // still running on the GPU (event not complete), and prepares that waited for copies of experts they do not read
     uint64_t pf_pending = 0, pf_running = 0, pf_waited_unread = 0, pf_skipped = 0;  // pf_skipped: no device room for the staging
+    uint64_t bank_builds = 0, bank_drops = 0;  // whole layer banks created / dropped (evicted or released)
+    uint64_t drops_budget = 0, drops_oom = 0;   // of the drops: over the cache budget / a failed device allocation
 };
 
 // One stream owns preparation and projections. Views are valid until the next prepare/clear.
@@ -103,7 +105,7 @@ public:
     // largest count that fits, not below floor[layer]
     void set_layer_tiers(const std::vector<int> & floor, size_t keep_bytes = size_t(256) << 20);  // keep: left free beside the banks
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
-    int regrow(size_t keep_free);  // releases banks built below their target while the free memory holds the target (+ keep_free)
+    int regrow(size_t keep_free);  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;
     bool has_layout(int layer) const;  // a bank existed once: bank_layout / bank_mat answer without one (no device pointers)

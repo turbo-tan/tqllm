@@ -79,8 +79,8 @@ public:
         std::vector<uint32_t> r(S().out_.begin(), S().out_.end());
         if (tqllm::debug_on("mem")) {  // the decode phase's expert cache traffic (the warm-prompt decode question of 10-17)
             const auto s = f_.cache->stats(), & b = S().stats_at_decode_, m = f_.mtp_cache->stats(), & mb = S().mtp_stats_at_decode_;
-            std::fprintf(stderr, "LEDGER decode of %zu tokens: expert hits %llu misses %llu evictions %llu (%.1f %% hit) transfer %.2f GB, banks %.0f MB | MTP hits %llu misses %llu transfer %.2f GB, bank %.0f MB\n", r.size(),
-                         (unsigned long long) (s.hits - b.hits), (unsigned long long) (s.misses - b.misses), (unsigned long long) (s.evictions - b.evictions),
+            std::fprintf(stderr, "LEDGER decode of %zu tokens: expert hits %llu misses %llu evictions %llu bank builds %llu drops %llu (budget %llu, oom %llu) (%.1f %% hit) transfer %.2f GB, banks %.0f MB | MTP hits %llu misses %llu transfer %.2f GB, bank %.0f MB\n", r.size(),
+                         (unsigned long long) (s.hits - b.hits), (unsigned long long) (s.misses - b.misses), (unsigned long long) (s.evictions - b.evictions), (unsigned long long) (s.bank_builds - b.bank_builds), (unsigned long long) (s.bank_drops - b.bank_drops), (unsigned long long) (s.drops_budget - b.drops_budget), (unsigned long long) (s.drops_oom - b.drops_oom),
                          100.0 * double(s.hits - b.hits) / std::max<double>(1, double(s.hits - b.hits + s.misses - b.misses)),
                          double(s.transfer_bytes - b.transfer_bytes) / 1e9, s.device_bytes / 1048576.0,
                          (unsigned long long) (m.hits - mb.hits), (unsigned long long) (m.misses - mb.misses), double(m.transfer_bytes - mb.transfer_bytes) / 1e9, m.device_bytes / 1048576.0);
