@@ -1,5 +1,6 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "fn_engine.hpp"
+#include <map>
 #include "decode_rules.hpp"
 #include "prefill_observer_cuda.hpp"
 
@@ -38,6 +39,7 @@ void FlashNextEngine::arena_resize(size_t bytes) {
 }
 
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
+    static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
     S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
@@ -161,10 +163,19 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         tqllm::BankLedger::Ops ops;
         ops.lru_layers = [this] { return f_.cache->banks_lru(); };
         ops.bank_bytes = [this](int l) { return f_.cache->bank_bytes(l); };
-        ops.release = [this](int l) { f_.cache->release_bank(l); };
-        ops.refill = [this](int l) {  // each layer's most-routed experts, as many as its rebuilt bank holds
-            auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it == m.pf_refill.end()) return;
-            auto top = it->second; top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
+        // A lent bank comes back with the experts it held before the prompt (the decode-warmed set): the answer routes
+        // like the earlier answers, not like the prompt. A bank that held nothing takes the prompt's most-routed experts.
+        bank_keep.clear();
+        ops.release = [this](int l) {
+            auto & keep = bank_keep[l];
+            for (int e = 0; e < f_.cache->experts(); ++e) if (f_.cache->resident(l, e)) keep.push_back(e);
+            f_.cache->release_bank(l); };
+        ops.refill = [this](int l) {
+            const auto k = bank_keep.find(l);
+            std::vector<int> top;
+            if (k != bank_keep.end() && !k->second.empty()) top = k->second;
+            else { auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it == m.pf_refill.end()) return; top = it->second; }
+            top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
