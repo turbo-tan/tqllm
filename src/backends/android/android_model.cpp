@@ -130,9 +130,22 @@ struct Model::Impl {
             }
         }
     }
-    Vec mat(const std::string & name, const Vec & x) { return matrices.at(name).multiply(x, executor); }
+    // One int8 copy of a projection input, shared by every matrix that reads it.
+    struct Input {
+        const Vec & x;
+        HostQ8 q;
+        bool quantized = false;
+    };
+    Vec mat(const std::string & name, Input & in) {
+        const auto & m = matrices.at(name);
+        if (options.exact || !m.int8_ready()) return m.multiply(in.x, executor);
+        if (!in.quantized) { host_quantize_q8(in.x.data(), int(in.x.size()), in.q); in.quantized = true; }
+        return m.multiply(in.q, executor);
+    }
+    Vec mat(const std::string & name, const Vec & x) { Input in{x}; return mat(name, in); }
     Vec attention(const std::string & p, const Vec & x, Layer & layer) {
-        auto qg = mat(p + "attn_q.weight", x), k = mat(p + "attn_k.weight", x), v = mat(p + "attn_v.weight", x);
+        Input in{x};
+        auto qg = mat(p + "attn_q.weight", in), k = mat(p + "attn_k.weight", in), v = mat(p + "attn_v.weight", in);
         for (int h = 0; h < heads; ++h) {
             rms(qg.data() + size_t(h) * 2 * hd, scalars.at(p + "attn_q_norm.weight"), eps);
             rope(qg.data() + size_t(h) * 2 * hd, rot, pos, theta);
@@ -167,8 +180,9 @@ struct Model::Impl {
         return mat(p + "attn_output.weight", out);
     }
     Vec gdn(const std::string & p, const Vec & x, Layer & layer) {
-        auto qkv = mat(p + "attn_qkv.weight", x), z = mat(p + "attn_gate.weight", x);
-        auto alpha = mat(p + "ssm_alpha.weight", x), beta = mat(p + "ssm_beta.weight", x);
+        Input in{x};
+        auto qkv = mat(p + "attn_qkv.weight", in), z = mat(p + "attn_gate.weight", in);
+        auto alpha = mat(p + "ssm_alpha.weight", in), beta = mat(p + "ssm_beta.weight", in);
         const int width = int(qkv.size());
         Vec filtered(width), out(vh * dv);
         const auto & cw = scalars.at(p + "ssm_conv1d.weight");
@@ -212,7 +226,8 @@ struct Model::Impl {
             auto y = cache[l].kv ? attention(p, n, cache[l]) : gdn(p, n, cache[l]);
             for (int j = 0; j < hidden; ++j) x[j] += y[j];
             n = x; rms(n.data(), scalars.at(p + "post_attention_norm.weight"), eps);
-            auto gate = mat(p + "ffn_gate.weight", n), up = mat(p + "ffn_up.weight", n);
+            Input in{n};
+            auto gate = mat(p + "ffn_gate.weight", in), up = mat(p + "ffn_up.weight", in);
             for (int j = 0; j < ffn; ++j) gate[j] *= sigmoid(gate[j]) * up[j];
             y = mat(p + "ffn_down.weight", gate);
             for (int j = 0; j < hidden; ++j) x[j] += y[j];

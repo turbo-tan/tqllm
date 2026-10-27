@@ -10,11 +10,14 @@ compiler=${CXX:-clang++}
 command -v "$compiler" >/dev/null
 mkdir -p "$build"
 build=$(cd -- "$build" && pwd)
-flags=(-O3 -DNDEBUG -std=c++20 -pthread -Wall -Wextra -Wpedantic
-       -I"$root/include" -I"$root/src/core" -I"$root/src/kv"
-       -I"$root/src/formats/weight" -I"$root/src/backends/android")
+flags=(-O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16 -std=c++20 -pthread -Wall -Wextra -Wpedantic
+       -I"$root/include" -I"$root/src/core" -I"$root/src/core/hf" -I"$root/src/kv"
+       -I"$root/src/formats/weight" -I"$root/src/backends/android"
+       -I"$root/third_party/nlohmann" -I"$root/third_party")
 sources=(src/backends/android/android_model.cpp src/core/mapped_file.cpp
-         src/core/gguf.cpp src/core/tokenizer.cpp src/formats/weight/dequant.cpp)
+         src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp
+         src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/safetensors.cpp
+         src/core/tokenizer.cpp src/formats/weight/dequant.cpp)
 objects=()
 "$compiler" --version > "$build/compiler.txt"
 for source in "${sources[@]}"; do

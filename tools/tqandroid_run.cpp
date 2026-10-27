@@ -22,19 +22,77 @@ int number(const std::string & text, int minimum, int maximum) {
 }
 void usage() {
     std::cout << "tqandroid-run --model FILE --prompt TEXT [--raw] [--thinking]\n"
-                 "  [--context 4096] [--threads 4] [--max-tokens 128]\n"
+                 "  [--context 4096] [--threads 4] [--max-tokens 128] [--exact]\n"
                  "  [--token-ids-file FILE] [--output-ids FILE] [--logits FILE] [--metrics FILE]\n"
+                 "tqandroid-run --model FILE --chat [--context 4096] [--threads 4] [--max-tokens 512] [--exact]\n"
                  "Native tqLLM CPU backend: dense qwen35 GGUF; no CUDA, MLX or llama runtime.\n";
 }
 using Clock = std::chrono::steady_clock;
 double ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
+std::string unescape(const std::string & line) {
+    std::string out;
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] != '\\' || i + 1 == line.size()) { out += line[i]; continue; }
+        const char c = line[++i];
+        out += c == 'n' ? '\n' : c;
+    }
+    return out;
+}
+// Line protocol on stdin, one conversation kept in the model state between turns:
+//   SYSTEM <text>  set the system prompt and reset;  USER <text>  answer;  RESET
+// Text escapes newline as \n and backslash as \\. Each answer streams to stdout and ends with
+// 0x1E plus a metrics JSON line. Recurrent state only appends, so overflow restarts from the system prompt.
+int chat(tqllm::android_backend::Model & model, tqllm::Tokenizer & tokenizer, int maximum) {
+    std::string system, line;
+    const std::vector<float> * logits = nullptr;
+    auto feed = [&](const std::string & text) {
+        for (auto token : tokenizer.encode(text)) logits = &model.forward(token);
+    };
+    auto restart = [&] {
+        model.reset(); logits = nullptr;
+        if (!system.empty()) feed("<|im_start|>system\n" + system + "<|im_end|>\n");
+    };
+    while (!interrupted && std::getline(std::cin, line)) {
+        if (line == "RESET") { restart(); std::cout << "\x1e{}\n" << std::flush; continue; }
+        if (line.rfind("SYSTEM ", 0) == 0) { system = unescape(line.substr(7)); restart(); std::cout << "\x1e{}\n" << std::flush; continue; }
+        if (line.rfind("USER ", 0)) { std::cout << "\x1e{\"error\":\"unknown command\"}\n" << std::flush; continue; }
+        const auto prompt = tokenizer.encode("<|im_start|>user\n" + unescape(line.substr(5)) +
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        bool restarted = false;
+        if (model.position() + int(prompt.size()) + maximum + 2 > model.context()) { restart(); restarted = true; }
+        if (model.position() + int(prompt.size()) + maximum + 2 > model.context()) {
+            std::cout << "\x1e{\"error\":\"message exceeds context\"}\n" << std::flush; continue;
+        }
+        const auto start = Clock::now();
+        for (auto token : prompt) logits = &model.forward(token);
+        const auto prefilled = Clock::now();
+        int generated = 0;
+        const char * finish = "length";
+        for (; generated < maximum; ++generated) {
+            if (interrupted) { finish = "cancelled"; break; }
+            const auto token = uint32_t(std::max_element(logits->begin(), logits->end()) - logits->begin());
+            if (token == model.eos()) { finish = "eos"; break; }
+            std::cout << tokenizer.decode({token}) << std::flush;
+            logits = &model.forward(token);
+        }
+        feed("<|im_end|>\n");
+        const auto end = Clock::now();
+        const double p = ms(start, prefilled), d = ms(prefilled, end);
+        std::cout << "\x1e{\"prompt_tokens\":" << prompt.size() << ",\"generated_tokens\":" << generated
+                  << ",\"prefill_tps\":" << (p > 0 ? 1000. * prompt.size() / p : 0.)
+                  << ",\"decode_tps\":" << (d > 0 ? 1000. * generated / d : 0.)
+                  << ",\"position\":" << model.position() << ",\"restarted\":" << (restarted ? "true" : "false")
+                  << ",\"finish_reason\":\"" << finish << "\"}\n" << std::flush;
+    }
+    return interrupted ? 130 : 0;
+}
 }
 int main(int argc, char ** argv) {
     try {
         std::string path, prompt, ids_path, output_path, logits_path, metrics_path;
         tqllm::android_backend::Options options;
         int maximum = 128;
-        bool raw = false, thinking = false;
+        bool raw = false, thinking = false, interactive = false;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             auto value = [&]() -> std::string {
@@ -53,7 +111,16 @@ int main(int argc, char ** argv) {
             else if (arg == "--max-tokens") maximum = number(value(), 0, 32768);
             else if (arg == "--raw") raw = true;
             else if (arg == "--thinking") thinking = true;
+            else if (arg == "--exact") options.exact = true;
+            else if (arg == "--chat") interactive = true;
             else throw std::invalid_argument("unknown option: " + arg);
+        }
+        if (interactive) {
+            if (path.empty() || !prompt.empty() || !ids_path.empty()) throw std::invalid_argument("--chat takes a model and no prompt");
+            std::signal(SIGINT, interrupt);
+            tqllm::Tokenizer tokenizer; tokenizer.load(path);
+            tqllm::android_backend::Model model(path, options);
+            return chat(model, tokenizer, maximum);
         }
         if (path.empty() || (prompt.empty() && ids_path.empty()) || (!prompt.empty() && !ids_path.empty()))
             throw std::invalid_argument("provide a model and exactly one of --prompt or --token-ids-file");

@@ -172,3 +172,25 @@ Stop if the SSH copy fails; do not execute an incomplete installer. Re-running
 the installer resumes a partial model transfer. The launcher uses 4K context,
 four CPU threads and a 256-token output limit; pass explicit CLI options to
 override these defaults. The first runner does not remember previous requests.
+
+## Int8 activations (default) and the chat front end
+
+Projections quantize their FP32 input to int8 per 256 elements (one scale, plus
+16-element sums) and use the Arm `sdot` instruction against the stored GGUF blocks.
+Weights are not changed or repacked. Pass `--exact` for the previous FP32-activation
+path. The build needs `dotprod` (`-march=armv8.2-a+dotprod+fp16`, every arm64 CPU
+since Cortex-A55); turn it off with `-DTQLLM_ANDROID_DOTPROD=OFF`.
+
+S25 Ultra, 4 threads, same 15-token hello prompt (2026-10-27): decode 1.20 -> 5.4-9.0
+tok/s and prefill 1.65 -> 6.4-9.7 tok/s; the range is thermal state. The 9 emitted IDs
+are identical to the FP32 path. On the 26-token coding prompt the answer diverged at
+token 10 (`(a: int, b: int) -> int` instead of `(a, b)`): int8 rounding can flip near
+ties, so it is not bit-exact. Per matrix: Q4_K 4.8x, Q5_K 4.9x, Q6_K 3.3x, relative L2
+error 0.37% against the FP32 path.
+
+`tqandroid-run --chat` keeps one conversation in the model state and reads a line
+protocol on stdin (`SYSTEM`, `USER`, `RESET`; see `tools/tqandroid_run.cpp`), so each
+turn only prefills the new message. `tools/android/chat/server.py` serves a phone
+browser chat at `http://127.0.0.1:8765` on top of it, with live phone facts (model,
+Android version, RAM, storage, battery) in the system prompt. Run it from a normal
+Termux shell; `getprop` and `dumpsys` are not reachable inside PRoot.

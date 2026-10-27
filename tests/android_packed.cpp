@@ -48,6 +48,19 @@ void fixtures() {
                 compare(matrix.multiply(input, executor), std::vector<float>(7, 0.f), error);
                 for (int i = 0; i < cols; ++i) input[i] = float(i % 31 - 15) * .03125f;
             }
+            if (matrix.int8_ready()) {
+                // int8 activations: bounded by the activation rounding step times sum |w|.
+                HostExecutor executor(4); HostQ8 q; host_quantize_q8(input.data(), cols, q);
+                const auto exact = matrix.multiply(input, executor, false), approx = matrix.multiply(q, executor);
+                std::vector<float> weights(cols);
+                for (int r = 0; r < 7; ++r) {
+                    dequantize_host(type, matrix.data + size_t(r) * matrix.row_bytes, weights.data(), cols);
+                    double bound = 0.;
+                    for (int i = 0; i < cols; ++i) bound += std::abs(weights[i]) * q.d[i / 256] * 0.5;
+                    check(std::abs(approx[r] - exact[r]) <= bound * 1.001 + 1e-4, "int8 dot exceeds rounding bound");
+                }
+                std::cout << "int8_oracle type=" << type << " cols=" << cols << " PASS\n";
+            }
             std::cout << "packed_oracle type=" << type << " cols=" << cols << " max_abs=" << error << '\n';
         }
     }
@@ -66,6 +79,23 @@ void real_shapes(const std::string & path) {
         for (int i = 0; i < matrix.cols; ++i) input[i] = float(i % 31 - 15) * .03125f;
         double error = 0.;
         compare(matrix.multiply(input, executor), matrix.multiply(input, executor, false), error);
+        if (matrix.int8_ready()) {
+            HostQ8 q; host_quantize_q8(input.data(), matrix.cols, q);
+            const auto exact = matrix.multiply(input, executor, false);
+            double rel = 0., norm = 0.;
+            auto y = matrix.multiply(q, executor);
+            for (size_t i = 0; i < y.size(); ++i) { rel += (y[i] - exact[i]) * (y[i] - exact[i]); norm += exact[i] * exact[i]; }
+            double int8_ms = 0., packed_ms = 0.;
+            for (int round = 0; round < 6; ++round) {
+                auto a = std::chrono::steady_clock::now(); y = matrix.multiply(q, executor);
+                auto b = std::chrono::steady_clock::now(); matrix.multiply(input, executor);
+                auto c = std::chrono::steady_clock::now();
+                if (round) { int8_ms += std::chrono::duration<double, std::milli>(b - a).count();
+                             packed_ms += std::chrono::duration<double, std::milli>(c - b).count(); }
+            }
+            std::cout << "int8_bench name=" << name << " packed_ms=" << packed_ms / 5. << " int8_ms=" << int8_ms / 5.
+                      << " speedup=" << packed_ms / int8_ms << " rel_l2=" << std::sqrt(rel / std::max(norm, 1e-30)) << '\n';
+        }
         double total[2] = {};
         float checksum = 0.f;
         for (int round = 0; round < 6; ++round) {

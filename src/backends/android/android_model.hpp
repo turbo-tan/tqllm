@@ -5,7 +5,8 @@
 #include <vector>
 
 namespace tqllm::android_backend {
-struct Options { int context = 4096; int threads = 4; };
+// exact keeps FP32 activations in every projection; the default quantizes them to int8 per 256.
+struct Options { int context = 4096; int threads = 4; bool exact = false; };
 // Native Arm CPU baseline. Standard GGUF weights stay packed and memory-mapped.
 class Model {
 public:
