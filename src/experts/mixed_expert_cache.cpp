@@ -155,14 +155,16 @@ struct MixedExpertCache::State {
         }
         void * p = nullptr;
         // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so).
-        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts the least
-        // recently used bank and tries again, so the bank count follows the free memory instead of failing the request
+        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts the most
+        // recently used other bank and tries again, so the bank count follows the free memory instead of failing the request.
+        // Layers run in a fixed cycle, so the least recently used bank is the next one needed: evicting it made every layer
+        // evict the next (all misses); the most recent one is needed last, and a step rebuilds at most one bank.
         cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10));
         while (e == cudaErrorMemoryAllocation) {
             cudaGetLastError();
             auto victim = banks.end();
             for (auto it = banks.begin(); it != banks.end(); ++it)
-                if (it->first != protect && (victim == banks.end() || it->second->touched < victim->second->touched)) victim = it;
+                if (it->first != protect && (victim == banks.end() || it->second->touched > victim->second->touched)) victim = it;
             if (victim == banks.end()) break;
             for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
             if (active == victim->first) active = -1;

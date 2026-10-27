@@ -183,7 +183,7 @@ static void run() {
                 current.set_miss_stream(nullptr);
             }
             std::puts("prefetch on a full device: skipped, staging stays valid, later prefetches byte-exact PASS");
-            {   // a bank needed on a full device evicts the least recently used bank instead of failing (a long context's
+            {   // a bank needed on a full device evicts another bank instead of failing (a long context's
                 // attention state takes the room the banks had at start-up)
                 MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
                 current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
@@ -202,7 +202,47 @@ static void run() {
                 compare(0, {0, 3}, true);  // an evicted layer comes back byte-exact
                 current.set_miss_stream(nullptr);
             }
-            std::puts("bank on a full device: least recently used bank evicted, new bank and reloaded bank byte-exact PASS");
+            std::puts("bank on a full device: a bank evicted, new bank and reloaded bank byte-exact PASS");
+            {   // decode reads the layers in a fixed cycle. With room for c = N - 1 of N banks, even the best choice rebuilds N / (N - 1)
+                // banks per step on average (here 4 / 3; 48 layers: 1.02). Expectation: over K warm steps at most ceil(K N / (N - 1))
+                // rebuilt layers, never more than two in one step. Old: the least recently used victim is the next layer of the cycle,
+                // so every layer evicted the next and all N rebuilt every step (0.5 % expert hits at 128K on a 3090). All layers here
+                // hold layer 1's experts: one format and one bank size, like a real model's layers.
+                auto same = [&](int, int id) { return source(1, id); };
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, same, nullptr);
+                current.set_prepacked([&](int, int id) { return blocks[experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                for (int l = 0; l < layers; ++l) { current.prepare(l, {0, 1}); current.wait_misses(); }
+                current.release_bank(0);
+                std::vector<void *> hog;
+                for (size_t chunk = size_t(64) << 20; chunk >= (size_t(1) << 20); chunk /= 2)
+                    for (void * p = nullptr; cudaMalloc(&p, chunk) == cudaSuccess; p = nullptr) hog.push_back(p);
+                cudaGetLastError();
+                const int steps = 8, active = 2;
+                std::string failed; std::vector<uint64_t> rebuilt; int resident = 0;
+                try {
+                    for (int step = 0; step < steps; ++step) {
+                        const auto before = current.stats();
+                        for (int l = 0; l < layers; ++l) { current.prepare(l, {0, 1}); current.wait_misses(); }
+                        check(cudaStreamSynchronize(misses));
+                        rebuilt.push_back((current.stats().misses - before.misses) / active);
+                    }
+                    for (int l = 0; l < layers; ++l) resident += current.bank_bytes(l) > 0;
+                } catch (const std::exception & e) { failed = e.what(); }
+                for (void * p : hog) check(cudaFree(p));
+                if (!failed.empty()) throw std::runtime_error("cyclic decode on a full device: " + failed);
+                std::string trace; uint64_t total = 0;
+                for (int k = 1; k < steps; ++k) { total += rebuilt[size_t(k)]; trace += " " + std::to_string(rebuilt[size_t(k)]); }
+                const uint64_t bound = ((steps - 1) * layers + layers - 2) / (layers - 1);
+                const std::string what = "cyclic decode on a full device: " + std::to_string(resident) + " of " + std::to_string(layers) +
+                                         " banks fit, rebuilt layers per step" + trace + " (total " + std::to_string(total) + ", bound " + std::to_string(bound) + ")";
+                require(resident == layers - 1, (what + ": setup must leave room for N - 1 banks").c_str());
+                require(total <= bound, what.c_str());
+                for (int k = 1; k < steps; ++k) require(rebuilt[size_t(k)] <= 2, what.c_str());
+                compare(1, {1, 0}, true);  // a rebuilt bank stays byte-exact
+                current.set_miss_stream(nullptr);
+                std::printf("%s PASS\n", what.c_str());
+            }
         }
         check(cudaStreamSynchronize(misses)); check(cudaStreamSynchronize(copies));
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",

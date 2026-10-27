@@ -28,6 +28,10 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - System memory is the machine's RAM capped by the container limit (cgroup `memory.max`): in a Docker / cloud container
   with less memory than the host, Flash-Next no longer pins an expert pack sized for the host (a 5090 pod reported 944 GB
   of host RAM with a 117 GB limit and kept hitting the limit while loading).
+- Expert cache on a full device: a bank that does not fit evicts the most recently used other bank, not the least
+  recently used one. Layers run in a fixed cycle, so the old victim was always the next layer needed and every layer
+  evicted the next (3090, 128K, larger expert banks: 0.5 % hits and 5 tok/s -> 77 % and 27.7 tok/s).
+- Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact
   device buffer instead of reading every old position over PCIe, and the expert banks grow back into the VRAM the
   host KV frees. RTX 3090 at 128K with a 109 GB RAM limit: 70.7 tok/s against 68 with all K/V on the device, output identical
