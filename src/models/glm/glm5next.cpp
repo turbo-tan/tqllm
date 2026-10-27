@@ -4,6 +4,7 @@
 //   hc_pre -> RMSNorm -> dense SwiGLU (first layers) or sigmoid MoE + shared expert -> hc_post; mean -> head.
 // Matrices go through the weight-format registry (Q8_0, Q6_K, Q2_K, IQ2_S, ...); tensors without a format
 // (F32 / BF16 / F16) run as FP32. TQLLM_GLM_DUMP=1 prints the per-stage sums glm-ref prints (`dump name-layer sum`).
+#include "device_free.hpp"
 #include "dequant.hpp"
 #include "dev_alloc.cuh"
 #include "engine.hpp"
@@ -485,7 +486,7 @@ private:
         // page-lock the mapping: a demand miss is then a DMA (or a kernel read) of the packed block, and the next token's
         // experts can be prefetched on a copy stream while this layer runs its attention. Only while the file is small
         // enough to pin beside the model: a 100 GB packed file on a 128 GB box would take the host down instead.
-        const size_t ram = size_t(sysconf(_SC_PHYS_PAGES)) * size_t(sysconf(_SC_PAGESIZE));
+        const size_t ram = tqllm::host_ram_bytes();  // physical RAM capped by the container limit
         const bool pinnable = packed_->bytes <= ram / 2;
         if (pinnable &&
             cudaHostRegister(const_cast<char *>(packed_->map), packed_->bytes, cudaHostRegisterDefault) == cudaSuccess)

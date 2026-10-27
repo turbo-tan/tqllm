@@ -1,6 +1,7 @@
 #include <cmath>
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
+#include "device_free.hpp"
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
 #include <chrono>
@@ -115,7 +116,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
     for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
-    const double host_ram = double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGESIZE));
+    const double host_ram = double(tqllm::host_ram_bytes());  // physical RAM capped by the container limit
     const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
     if (f.experts.empty() && !integrated && !pack_in_memory)
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
