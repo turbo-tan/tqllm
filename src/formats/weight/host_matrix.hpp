@@ -4,6 +4,7 @@
 #include "host_executor.hpp"
 #include "mapped_file.hpp"
 #include "host_packed_dot.hpp"
+#include "host_q8_dot.hpp"
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -70,6 +71,20 @@ struct HostMatrix {
                 out[r] = host_dot(scratch.data(), x.data(), cols);
             }
         });
+        return out;
+    }
+    bool int8_ready() const { return host_q8_supported(type, cols); }
+    // Approximate: the activation is int8 per 256 elements; weights are read exactly as stored.
+    std::vector<float> multiply(const HostQ8 & x, HostExecutor & executor) const {
+        if (x.n != cols || !int8_ready()) throw std::invalid_argument("native int8 matrix input");
+        std::vector<float> out(rows);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+        executor.rows(rows, [&](int begin, int end) {
+            for (int r = begin; r < end; ++r) out[r] = host_q8_dot(type, data + size_t(r) * row_bytes, x);
+        });
+#else
+        (void) executor;
+#endif
         return out;
     }
 };

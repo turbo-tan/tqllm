@@ -2,11 +2,18 @@
 find_package(Threads REQUIRED)
 add_library(tqandroid STATIC
   src/backends/android/android_model.cpp src/core/mapped_file.cpp
-  src/core/gguf.cpp src/core/tokenizer.cpp src/formats/weight/dequant.cpp)
+  src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp
+  src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/safetensors.cpp
+  src/core/tokenizer.cpp src/formats/weight/dequant.cpp)
 target_include_directories(tqandroid PUBLIC include src/backends/android PRIVATE
   src/core src/kv src/formats/weight)
 target_link_libraries(tqandroid PRIVATE Threads::Threads)
 target_compile_options(tqandroid PRIVATE -Wall -Wextra -Wpedantic)
+# Int8 activation dot products (host_q8_dot.hpp) need Armv8.2 dotprod; without it the FP32 path is used.
+option(TQLLM_ANDROID_DOTPROD "Build the Arm dotprod int8 projection path" ON)
+if(TQLLM_ANDROID_DOTPROD AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  target_compile_options(tqandroid PUBLIC -march=armv8.2-a+dotprod+fp16)
+endif()
 add_executable(tqandroid-run tools/tqandroid_run.cpp)
 target_link_libraries(tqandroid-run PRIVATE tqandroid)
 install(TARGETS tqandroid-run RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
