@@ -2,10 +2,12 @@
 #include "qwen4exp_kernels.cuh"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void ck(cudaError_t rc) {
@@ -283,6 +285,38 @@ static void check_dense_parity() {
             throw std::runtime_error("QSA all-selected attention differs from dense attention");
 }
 
+
+// Decode attention over a compact copy of the selected rows (QsaGather, used when K/V pages live in host memory) gives
+// the same output bits as reading the rows in place: same rows, same order, same causal cut.
+static void check_compact_attention() {
+    constexpr int cells = 5000, kvh = 2, heads = 24, dim = 256, tokens = 6, width = 2048, first = cells - tokens + 1, row = kvh * dim;
+    std::vector<__nv_bfloat16> keys(size_t(cells) * row), values(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys[i] = __float2bfloat16(float(int(i * 13 % 197) - 98) / 43.f);
+        values[i] = __float2bfloat16(float(int(i * 31 % 181) - 90) / 47.f);
+    }
+    std::vector<float> query(size_t(tokens) * heads * dim);
+    for (size_t i = 0; i < query.size(); ++i) query[i] = float(int(i * 7 % 113) - 56) / 29.f;
+    std::vector<int32_t> positions(size_t(tokens) * width); std::vector<uint8_t> valid(positions.size());
+    for (int t = 0; t < tokens; ++t) for (int w = 0; w < width; ++w) {  // overlapping selections, some invalid, some past the causal cut
+        const size_t i = size_t(t) * width + w;
+        valid[i] = (w + t) % 9 != 0;
+        positions[i] = w < width - 3 ? (w * 2 + t * 5) % (first + t) : first + t + w % 3;
+    }
+    Device<__nv_bfloat16> dk(keys.size()), dv(values.size()); Device<float> dq(query.size()), o1(query.size()), o2(query.size());
+    Device<int32_t> dp(positions.size()); Device<uint8_t> dm(valid.size());
+    dk.put(keys); dv.put(values); dq.put(query); dp.put(positions); dm.put(valid);
+    tqllm_cuda::qsa_attention_direct(dq.p, dk.p, dv.p, {dp.p, dm.p, width}, o1.p, tokens, first, heads, kvh, dim, nullptr);
+    tqllm_cuda::QsaGather gather(cells, size_t(row) * sizeof(__nv_bfloat16));
+    gather.run(dp.p, dm.p, tokens, width, first, dk.p, dv.p, nullptr);
+    tqllm_cuda::qsa_attention_direct(dq.p, static_cast<const __nv_bfloat16 *>(gather.keys()), static_cast<const __nv_bfloat16 *>(gather.values()),
+                                     {gather.positions(), dm.p, width}, o2.p, tokens, tokens * width + 1, heads, kvh, dim, nullptr);
+    ck(cudaDeviceSynchronize());
+    const auto a = o1.get(query.size()), b = o2.get(query.size());
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) throw std::runtime_error("QSA compact attention differs at " + std::to_string(i));
+}
+
 int main() {
     try {
         check_raw_cache(3, 4, 128);
@@ -292,6 +326,7 @@ int main() {
         check_gather(7);
         check_gather(2051);
         check_dense_parity();
+        check_compact_attention();
         check_scores(1, 4, 128);
         check_scores(2051, 4, 128);
         check_scores(65536, 4, 128);

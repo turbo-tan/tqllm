@@ -209,4 +209,27 @@ private:
     int32_t * positions_ = nullptr;
     uint8_t * valid_ = nullptr;
 };
+
+// Selected K/V rows copied into one compact device buffer before decode attention, when part of the K/V lives in host
+// memory (TQFN_KV_HOST): every selected row is read once, in wide loads, instead of once per query head by the attention
+// kernel over PCIe. Positions are renumbered in the same order with the same causal cut, so the attention result is
+// identical to reading the rows in place.
+class QsaGather {
+public:
+    QsaGather(int max_cells, size_t row_bytes);
+    ~QsaGather();
+    QsaGather(const QsaGather &) = delete;
+    QsaGather & operator=(const QsaGather &) = delete;
+    // positions / valid [tokens][width]; query t sees cells below first_cells + t; keys / values: row_bytes per cell
+    void run(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
+             const void * keys, const void * values, cudaStream_t stream);
+    const void * keys() const { return k_; }
+    const void * values() const { return v_; }
+    const int32_t * positions() const { return pos_; }  // [tokens][width], -1 for rows the attention skips
+
+private:
+    int max_cells_ = 0, max_rows_ = 0; size_t row_bytes_ = 0, temp_bytes_ = 0;
+    int * flags_ = nullptr; int * map_ = nullptr; void * temp_ = nullptr;
+    void * k_ = nullptr; void * v_ = nullptr; int32_t * pos_ = nullptr;
+};
 } // namespace tqllm_cuda

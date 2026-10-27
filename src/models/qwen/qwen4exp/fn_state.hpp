@@ -53,6 +53,7 @@ struct KvBuf {
         return ok;
     }
     size_t page_rows(size_t row) const { return page / row; }
+    bool any_host() const { for (auto h : on_host) if (h) return true; return false; }
 };
 // The K/V format of the attention layers (src/formats/kv): TQFN_KV=<name>, default bf16. Flash-Next attends sparsely, so
 // the format must implement attend_selected().

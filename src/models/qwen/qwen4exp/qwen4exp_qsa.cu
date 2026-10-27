@@ -4,6 +4,7 @@
 #include "qwen4exp_kernels.cuh"
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <algorithm>
 #include <cmath>
@@ -791,5 +792,63 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
         scratch.sorted, scratch.positions, scratch.valid, width, stride, first_position, ratio_);
     ck(cudaPeekAtLastError());
     return {scratch.positions, scratch.valid, width};
+}
+
+namespace {
+__global__ void gather_mark_k(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells, int * flags) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * width) return;
+    const int t = i / width, pos = positions[i];
+    if (valid[i] && pos >= 0 && pos < first_cells + t) flags[pos] = 1;
+}
+// one warp per cell: rows of the marked cells to their compact index (16-byte loads)
+__global__ void gather_rows_k(const int * flags, const int * map, int cells, const uint4 * keys, const uint4 * values,
+                              uint4 * k_out, uint4 * v_out, int row_vec) {
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    if (c >= cells || !flags[c]) return;
+    const int64_t src = int64_t(c) * row_vec, dst = int64_t(map[c]) * row_vec;
+    for (int j = lane; j < row_vec; j += 32) { k_out[dst + j] = keys[src + j]; v_out[dst + j] = values[src + j]; }
+}
+__global__ void gather_remap_k(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
+                               const int * map, int32_t * out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * width) return;
+    const int t = i / width, pos = positions[i];
+    out[i] = valid[i] && pos >= 0 && pos < first_cells + t ? map[pos] : -1;
+}
+}  // namespace
+
+QsaGather::QsaGather(int max_cells, size_t row_bytes) : max_cells_(max_cells), row_bytes_(row_bytes) {
+    if (max_cells <= 0 || row_bytes == 0 || row_bytes % 16) throw std::invalid_argument("QSA gather: invalid shape");
+    ck(cudaMalloc(&flags_, size_t(max_cells) * sizeof(int)));
+    ck(cudaMalloc(&map_, size_t(max_cells) * sizeof(int)));
+    ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells));
+    ck(cudaMalloc(&temp_, temp_bytes_));
+}
+QsaGather::~QsaGather() { cudaFree(flags_); cudaFree(map_); cudaFree(temp_); cudaFree(k_); cudaFree(v_); cudaFree(pos_); }
+void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
+                    const void * keys, const void * values, cudaStream_t stream) {
+    const int cells = first_cells + tokens - 1;
+    if (tokens <= 0 || width <= 0 || cells <= 0) throw std::invalid_argument("QSA gather: invalid call");
+    if (cells > max_cells_) {  // the attention state is sized per request: a longer one grows the cell maps
+        ck(cudaStreamSynchronize(stream)); cudaFree(flags_); cudaFree(map_); cudaFree(temp_);
+        max_cells_ = cells; temp_bytes_ = 0;
+        ck(cudaMalloc(&flags_, size_t(max_cells_) * sizeof(int))); ck(cudaMalloc(&map_, size_t(max_cells_) * sizeof(int)));
+        ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells_)); ck(cudaMalloc(&temp_, temp_bytes_));
+    }
+    if (tokens * width > max_rows_) {
+        cudaFree(k_); cudaFree(v_); cudaFree(pos_);
+        max_rows_ = tokens * width;
+        ck(cudaMalloc(&k_, size_t(max_rows_) * row_bytes_)); ck(cudaMalloc(&v_, size_t(max_rows_) * row_bytes_));
+        ck(cudaMalloc(&pos_, size_t(max_rows_) * sizeof(int32_t)));
+    }
+    const int items = tokens * width;
+    ck(cudaMemsetAsync(flags_, 0, size_t(cells) * sizeof(int), stream));
+    gather_mark_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, flags_);
+    size_t tb = temp_bytes_; ck(cub::DeviceScan::ExclusiveSum(temp_, tb, flags_, map_, cells, stream));
+    gather_rows_k<<<(int64_t(cells) * 32 + 255) / 256, 256, 0, stream>>>(flags_, map_, cells, static_cast<const uint4 *>(keys),
+        static_cast<const uint4 *>(values), static_cast<uint4 *>(k_), static_cast<uint4 *>(v_), int(row_bytes_ / 16));
+    gather_remap_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, map_, pos_);
+    ck(cudaPeekAtLastError());
 }
 } // namespace tqllm_cuda

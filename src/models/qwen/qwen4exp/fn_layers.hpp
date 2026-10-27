@@ -214,6 +214,16 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                     sc = std::make_unique<Device<float>>(size_t(nb) * heads * sel.width); inv = std::make_unique<Device<float>>(size_t(nb) * heads);
                     att.scores = sc->p; att.inv = inv->p;
                 }
+                // part of this layer's K/V in host memory (TQFN_KV_HOST): the selected rows go to one compact device copy
+                // first (read once, wide loads), then the attention reads that copy with the same rows in the same order
+                if (nb < 32 && carry->k->vmm && carry->k->any_host()) {
+                    static std::unique_ptr<tqllm_cuda::QsaGather> gather;
+                    const size_t row = size_t(kvheads) * dim * sizeof(__nv_bfloat16);
+                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(g_kv_capacity, row); }
+                    gather->run(sel.positions, sel.valid, nb, sel.width, pos + q0 + 1, carry->k->p, carry->v->p, nullptr);
+                    att.keys = gather->keys(); att.values = gather->values(); att.positions = gather->positions();
+                    att.first_cells = nb * sel.width + 1;  // renumbered cells all lie below this; the causal cut is already applied
+                }
                 kv_fmt().attend_selected(att);
             }
         } else {

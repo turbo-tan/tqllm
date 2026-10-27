@@ -45,7 +45,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
     // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
     // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
-    if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, prompt.size() + count + 16));
+    // with TQFN_KV_HOST the K/V older than the kept window lives in host memory after the prompt, so only the window's
+    // state keeps device room (a long prefill borrows banks for the rest and gives them back)
+    static const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0;
+    static const size_t kv_keep = std::getenv("TQFN_KV_HOST_KEEP") ? size_t(std::atoi(std::getenv("TQFN_KV_HOST_KEEP"))) : 32768;
+    const size_t state_rows = kv_host ? std::min(prompt.size() + count + 16, 2 * kv_keep) : prompt.size() + count + 16;
+    if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, state_rows));
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
         if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }
@@ -313,9 +318,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     arena_resize(f_.arena_decode);
     if (P >= 256) {  // long prompt: the old K/V rows to host memory, the refill below takes the freed device memory
         using kclk = std::chrono::steady_clock; const auto k0 = kclk::now();
-        if (const size_t freed = S().model_->kv_to_host())
+        if (const size_t freed = S().model_->kv_to_host()) {
             std::fprintf(stderr, "tqllm: attention KV: %.0f MB of old positions moved to host memory in %.0f ms\n", freed / 1048576.0,
                          std::chrono::duration<double, std::milli>(kclk::now() - k0).count());
+            // banks an earlier long prompt left below their slot target grow back into the freed memory with the refill
+            if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
+        }
     }
     stamp("before the bank refill"); refill_borrowed(); g_trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);
