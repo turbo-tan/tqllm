@@ -163,7 +163,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // arithmetic: test-gemv-seg, test-topk2; +2.7 % 3090 5-chat at --slots 168)
     auto is_bf16 = [&](const std::string & pre) { return cp.file(pre + "ffn_gate_inp.weight").file().tensors.at(pre + "ffn_gate_inp.weight").type == GGML_BF16; };
     static const bool f32_router = std::getenv("TQFN_F32_ROUTER") != nullptr;
-    const bool fused = !f32_router && n <= 4 && c.experts <= 1024 && h >= 1024 && is_bf16(prefix) && (!predict || is_bf16(np));
+    const bool fused = !f32_router && n <= 8 && c.experts <= 1024 && h >= 1024 && is_bf16(prefix) && (!predict || is_bf16(np));
     if (fused) {
         tqllm_cuda::GemvSegs g; int rows = 0;
         auto add = [&](const std::string & name, int r, float * y) {

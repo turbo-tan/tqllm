@@ -38,6 +38,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Flash-Next with `TQFN_KV_HOST=1`: each attention layer keeps the host K/V rows it read recently in a 16K-row device cache
   (consecutive steps select mostly the same positions); a new request starts with an empty cache. RTX 3090, 128K, 109 GB
   cap: 76-78 -> 82 tok/s on a repeat request, output identical.
+- Flash-Next verify blocks of 5-8 tokens (the default up to 5 drafts) read each BF16 weight matrix once: the BF16 GEMVs and
+  the fused router launch take up to 8 tokens (were 4, so a 6-token block read every BF16 matrix twice). Bit-identical
+  (tests: bf16_gemv token grouping, gemv_seg and topk2 to 8 tokens). RTX 3090 128K repeat request 82 -> 83-84 tok/s.
 - Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
 - Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact

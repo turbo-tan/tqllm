@@ -9,7 +9,7 @@
 int main() {
     std::mt19937 rng(11); std::normal_distribution<float> nd(0.f, 1.f); int bad = 0, cases = 0;
     const int cols = 2560, E = 512;
-    for (int n = 1; n <= 4; ++n) for (int trial = 0; trial < 5; ++trial) {
+    for (int n = 1; n <= 8; ++n) for (int trial = 0; trial < 5; ++trial) {  // up to a 6-token verify block and past it
         std::vector<__nv_bfloat16> w[4]; const int rows[4] = {E, 1, E, 1};
         __nv_bfloat16 * dw[4]; float * dx; float * ref[4]; float * seg[2];
         std::vector<float> x(size_t(n) * cols); for (auto & v : x) v = nd(rng);

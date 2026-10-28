@@ -1,3 +1,5 @@
+#include <cstring>
+#include <array>
 // BF16 GEMV (Flash-Next resident projections) vs a double oracle on the model's shapes; run with and without
 // The few-row and short-row layouts must stay within FP32 rounding of the oracle (same bf16-rounded activations).
 #include "qwen4exp_kernels.cuh"
@@ -31,7 +33,30 @@ static double run(int rows, int cols, int tokens) {
     cudaFree(dw); cudaFree(dx); cudaFree(dy);
     return worst;
 }
+// the token grouping inside fn_gemv_bf16_tokens (chunks per launch) does not change any output bit
+static bool grouping_invariant(int rows, int cols, int tokens) {
+    std::mt19937 rng(rows + cols * 3 + tokens); std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<__nv_bfloat16> w(size_t(rows) * cols); std::vector<float> x(size_t(cols) * tokens);
+    for (auto & v : w) v = __float2bfloat16(nd(rng)); for (auto & v : x) v = nd(rng);
+    __nv_bfloat16 * dw; float * dx, * dy, * d1;
+    check(cudaMalloc(&dw, w.size() * 2)); check(cudaMalloc(&dx, x.size() * 4)); check(cudaMalloc(&dy, size_t(rows) * tokens * 4)); check(cudaMalloc(&d1, size_t(rows) * 4));
+    check(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice)); check(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    tqllm_cuda::fn_gemv_bf16_tokens(dw, dx, dy, rows, cols, tokens, nullptr);
+    std::vector<float> all(size_t(rows) * tokens), one(static_cast<size_t>(rows)); check(cudaMemcpy(all.data(), dy, all.size() * 4, cudaMemcpyDeviceToHost));
+    bool same = true;
+    for (int t = 0; t < tokens && same; ++t) {
+        tqllm_cuda::fn_gemv_bf16_tokens(dw, dx + size_t(t) * cols, d1, rows, cols, 1, nullptr);
+        check(cudaMemcpy(one.data(), d1, one.size() * 4, cudaMemcpyDeviceToHost));
+        same = std::memcmp(one.data(), all.data() + size_t(t) * rows, one.size() * 4) == 0;
+    }
+    cudaFree(dw); cudaFree(dx); cudaFree(dy); cudaFree(d1);
+    return same;
+}
 int main() {
+    for (auto s : {std::array<int, 2>{16, 10240}, {512, 2560}, {10240, 320}, {2560, 640}})
+        for (int t : {5, 6, 8, 11})
+            if (!grouping_invariant(s[0], s[1], t)) { std::printf("FAIL rows %d cols %d tokens %d: grouped tokens differ from one at a time\n", s[0], s[1], t); return 1; }
+    std::puts("token grouping 5 / 6 / 8 / 11 tokens: bit-identical to one token at a time PASS");
     const int shapes[][2] = {{1, 2560}, {4, 10240}, {16, 10240}, {320, 10240}, {512, 2560}, {10240, 320}, {2560, 640}};
     const char * mode = "block-per-row"; double all = 0;
     for (auto & s : shapes) for (int t : {1, 3}) {
