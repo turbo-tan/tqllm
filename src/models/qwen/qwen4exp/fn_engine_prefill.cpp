@@ -397,14 +397,6 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         }
     }
     stamp("before the bank refill"); refill_borrowed(); f_.cp->rt.trim_below = SIZE_MAX; stamp("banks refilled");
-    // decode keeps only its own working memory free: the start-up keep is sized for a prefill, and every long prefill
-    // borrows the banks back anyway (10-28 128K: 3.6 GB idle in decode at 133 slots / layer vs Strata's ~172)
-    if (slots_.size() == 1 && f_.slots_auto && !f_.cp->run.small_card && kv_host_enabled()) {
-        { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
-        const int grown = f_.cache->grow_into(size_t(1024) << 20, f_.cp->config.experts);
-        if (grown) std::fprintf(stderr, "tqllm: expert banks grown for decode: %d layers, %d..%d slots\n", grown, f_.cache->slots(0), f_.cache->slots());
-        stamp("banks grown");
-    }
     S().model_->set_spec(true);
     ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();
     if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }

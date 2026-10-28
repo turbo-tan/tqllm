@@ -747,7 +747,6 @@ int MixedExpertCache::grow_into(size_t keep_free, int max_slots) {
         for (int e : order) { if (int(want.size()) >= cap) break; if (!in[size_t(e)] && fq[e] > 0) { want.push_back(e); in[size_t(e)] = 1; } }
         release_bank(l); ++n;
         s.layer_cap[size_t(l)] = cap;
-        if (!s.layer_target.empty()) s.layer_target[size_t(l)] = std::max(s.layer_target[size_t(l)], cap);
         if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
         s.planned[size_t(l)] = 1;  // built at this size, not sized again by choose_cap
         if (!want.empty()) { (void) prepare(l, want); wait_misses(); }
