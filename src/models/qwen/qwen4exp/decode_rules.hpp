@@ -53,6 +53,11 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
     return base + size_t(double(state_full) * double(std::min(tokens, size_t(state_tokens))) / double(state_tokens));
 }
 
+// Per-layer decode graphs (re-captured every step): they remove launch gaps on unified memory (GB10 +5-6 %) and on PCIe
+// cards before Blackwell (3090: chat 86.5 vs 83.9 tok/s without), but on a Blackwell PCIe card the re-capture costs more host
+// time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
+inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
+
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }
 

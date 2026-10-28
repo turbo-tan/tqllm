@@ -18,9 +18,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Guide: [RTX 5090](docs/guides/rtx-5090.md): Flash-Next and Qwen3.8-27B numbers and what the engine sizes by itself.
 
 ### Changed
-- Flash-Next decode launches its per-layer kernels directly on PCIe cards and keeps CUDA graphs for unified-memory GPUs
-  (GB10 / DGX Spark, +5-6 % decode). RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s; RTX 3090
-  unchanged. Output identical.
+- Flash-Next decode launches its per-layer kernels directly on Blackwell PCIe cards (RTX 5090, `sm_120`) and keeps CUDA
+  graphs on unified-memory GPUs (GB10 / DGX Spark, +5-6 % decode) and older PCIe cards (RTX 3090: -3 % chat without them).
+  RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s. Output identical.
 - Flash-Next: an expert bank lent to a long prompt's prefill comes back with the experts it held before the prompt
   (64K context on an RTX 5090: +3 % decode).
 
