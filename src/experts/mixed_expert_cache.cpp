@@ -424,13 +424,13 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
                 checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], packed_src + off, bank->stride[p], cudaMemcpyHostToDevice, up));
-                off += bank->stride[p];
+                off += bank->stride[p]; ++s.counters.miss_copies;
                 if (bank->aux_stride[p]) {
                     checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.aux)) + size_t(target) * bank->aux_stride[p], packed_src + off, bank->aux_stride[p], cudaMemcpyHostToDevice, up));
-                    off += bank->aux_stride[p];
+                    off += bank->aux_stride[p]; ++s.counters.miss_copies;
                 }
             }
-            s.counters.transfer_bytes += off; dma_issued = true;
+            s.counters.transfer_bytes += off; s.counters.miss_copy_bytes += off; dma_issued = true;
         } else if (packed_src && s.registered) {
             // Kernel reads straight from pinned host memory: demand misses skip the H2D DMA queue behind prefetches.
             size_t off = 0;
@@ -604,6 +604,7 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
             if (staged == kCap) flush();
             char * stage = s.pf_staging + size_t(staged) * total;
             checked(cudaMemcpyAsync(stage, src, total, cudaMemcpyHostToDevice, copy));  // the expert's packed block in one DMA
+            s.counters.pf_copy_bytes += total;
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
                 items.push_back({stage + off, static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], bank->stride[p]});

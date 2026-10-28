@@ -17,6 +17,7 @@ struct ExpertCacheStats {
     uint64_t pf_pending = 0, pf_running = 0, pf_waited_unread = 0, pf_skipped = 0;  // pf_skipped: no device room for the staging
     uint64_t bank_builds = 0, bank_drops = 0;  // whole layer banks created / dropped (evicted or released)
     uint64_t drops_budget = 0, drops_oom = 0;   // of the drops: over the cache budget / a failed device allocation
+    uint64_t miss_copies = 0, miss_copy_bytes = 0, pf_copy_bytes = 0;  // H2D DMAs of demand misses (pieces), prefetch bytes
 };
 
 // One stream owns preparation and projections. Views are valid until the next prepare/clear.
