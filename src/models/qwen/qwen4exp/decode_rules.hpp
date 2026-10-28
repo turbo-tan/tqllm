@@ -3,6 +3,7 @@
 // check them on any machine.
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstddef>
 #include <vector>
 #include <string>
@@ -60,9 +61,35 @@ inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_mem
 
 // The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
 // easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt
-// 0.72 s of time to first token (cudaMallocHost of 1.6 GB beside an 80 GB pinned expert pack), more at 128K.
-inline bool pin_residual_at_start(size_t bytes, size_t host_ram, size_t available) {
-    return bytes > 0 && bytes <= available / 4 && bytes <= host_ram / 10;
+// 0.72 s of time to first token (cudaMallocHost of 1.6 GB beside an 80 GB pinned expert pack), more at 128K. Never on
+// unified memory (GB10): pinned host memory is the GPU's memory there (6.6 GB left 759 MB after warm-up).
+inline bool pin_residual_at_start(size_t bytes, size_t host_ram, size_t available, bool unified_memory) {
+    return !unified_memory && bytes > 0 && bytes <= available / 4 && bytes <= host_ram / 10;
+}
+
+// Host K/V for positions older than TQFN_KV_HOST_KEEP (32768): on by default for discrete GPUs with VMM pages (RTX 3090,
+// 256K: 52-56 -> 65-71 tok/s; contexts up to 2 x 32K move nothing), off on unified memory (GB10: host and device memory are
+// the same). env (TQFN_KV_HOST) "0" / "1" forces it either way.
+inline bool kv_host_on(const char * env, bool vmm, bool unified) {
+    if (env) return std::atoi(env) != 0 && vmm;
+    return vmm && !unified;
+}
+
+// Approximate tail skip (opt-in; Strata's default route-tail-skip): per assignment of routed (tokens x topk ids), the
+// replacement expert or -1 to keep. An expert whose best rank over the block is R-th or lower and that is not resident goes
+// to its token's first choice (rank 0, always computed) with weight 0. Any block size (the first version stopped at 4 tokens,
+// so 5-draft verify blocks never skipped).
+template <class Resident>
+inline std::vector<int> tail_skip_targets(const std::vector<int> & routed, int topk, int r, Resident resident) {
+    std::vector<int> out(routed.size(), -1);
+    if (r <= 0 || topk <= 0) return out;
+    auto best = [&](int e) { int b = topk; for (size_t a = 0; a < routed.size(); ++a) if (routed[a] == e) b = std::min(b, int(a % size_t(topk))); return b; };
+    for (size_t a = 0; a < routed.size(); ++a) {
+        const int e = routed[a];
+        if (best(e) < r - 1 || resident(e)) continue;
+        out[a] = routed[a / size_t(topk) * size_t(topk)];
+    }
+    return out;
 }
 
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).

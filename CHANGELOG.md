@@ -44,6 +44,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Flash-Next pins the multi-chunk prefill's residual buffer once at start-up when the host easily holds it (a tenth of RAM,
   a quarter of what is available) instead of inside the first request of each new prompt length: RTX 3090 prefill
   32K / 64K / 128K 2,104 / 2,130 / 2,026 -> 2,197 / 2,251 / 2,133 tok/s (as 1.2.3), 128K time to first token 77 -> 73 s.
+- Flash-Next keeps K/V older than 32K positions in host memory by default on discrete GPUs (`TQFN_KV_HOST` auto; GB10
+  keeps it on the device; `TQFN_KV_HOST=0` turns it off). RTX 3090 decode at 256K 52-56 -> 65-71 tok/s, 128K first request
+  69 -> 75-77; contexts up to 64K move nothing (unchanged).
 - Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
 - Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact

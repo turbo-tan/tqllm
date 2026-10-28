@@ -1,3 +1,4 @@
+#include <algorithm>
 // Flash-Next decode rules (no CUDA): the F39 verify path choice, the F38 slots=auto keep, the adaptive draft stop.
 #include "models/qwen/qwen4exp/decode_rules.hpp"
 #include <cstdio>
@@ -115,10 +116,33 @@ int main() {
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");
     // the pinned residual buffer of a multi-chunk prefill: pinned at start-up when the host easily holds it (pinning it per
     // request cost a 32K prompt 0.72 s of time to first token), else per request as before
-    check(pin_residual_at_start(6 * GB, 125 * GB, 40 * GB), "3090 desktop, 125 GB RAM, 40 GB available: 6 GB pinned at start");
-    check(!pin_residual_at_start(6 * GB, 109 * GB, 18 * GB), "pod, 18 GB available: pinned per request");
-    check(!pin_residual_at_start(6 * GB, 48 * GB, 30 * GB), "48 GB machine: never more than a tenth of RAM pinned for it");
-    check(!pin_residual_at_start(0, 125 * GB, 40 * GB), "single-chunk contexts need no buffer");
+    check(pin_residual_at_start(6 * GB, 125 * GB, 40 * GB, false), "3090 desktop, 125 GB RAM, 40 GB available: 6 GB pinned at start");
+    check(!pin_residual_at_start(6 * GB, 109 * GB, 18 * GB, false), "pod, 18 GB available: pinned per request");
+    check(!pin_residual_at_start(6 * GB, 48 * GB, 30 * GB, false), "48 GB machine: never more than a tenth of RAM pinned for it");
+    check(!pin_residual_at_start(0, 125 * GB, 40 * GB, false), "single-chunk contexts need no buffer");
+    check(!pin_residual_at_start(6 * GB, 121 * GB, 116 * GB, true), "GB10 (unified memory): pinned memory is the GPU's memory (759 MB left after warm-up): per request");
+    // host K/V for old positions: default on for discrete GPUs with VMM (RTX 3090, 256K: 52-56 -> 65-71 tok/s; <= 64K moves
+    // nothing), off on unified memory (GB10: host and device are the same memory); TQFN_KV_HOST=0 / 1 forces it
+    check(kv_host_on(nullptr, true, false), "3090 / 5090 with VMM: on by default");
+    check(!kv_host_on(nullptr, true, true), "GB10 (unified memory): off by default");
+    check(!kv_host_on(nullptr, false, false), "no VMM granule: plain allocations");
+    check(!kv_host_on("0", true, false) && kv_host_on("1", true, true), "TQFN_KV_HOST=0 / 1 forces it");
+    // approximate tail skip (Strata's default route-tail-skip): a token's expert ranked R-th or lower that is not resident is
+    // replaced by the token's first choice with weight 0; never when the first choice itself would be skipped; any block size
+    {
+        const int topk = 4;  // two tokens x top-4: token 0 routes 1,2,3,4; token 1 routes 5,6,7,8
+        const std::vector<int> routed{1, 2, 3, 4, 5, 6, 7, 8};
+        auto resident = [](int e) { return e != 3 && e != 4 && e != 5 && e != 8; };  // 3, 4, 5, 8 would be misses
+        const auto skip = tail_skip_targets(routed, topk, 3, resident);  // R = 3: ranks 3 and 4 (0-based 2, 3) may be skipped
+        check(skip == std::vector<int>{-1, -1, 1, 1, -1, -1, -1, 5}, "missing ranks 3-4 go to the token's first choice (5 is loaded "
+              "anyway, missing or not)");
+        check(tail_skip_targets(std::vector<int>{1, 3, 9, 4, 6, 7, 3, 2}, topk, 3, resident)[6] == -1,
+              "expert 3 is rank 2 for token 1 but rank 1 for token 0 (its best rank): kept");
+        std::vector<int> big(8 * topk); for (int i = 0; i < int(big.size()); ++i) big[size_t(i)] = i;
+        const auto eight = tail_skip_targets(big, topk, 3, [](int e) { return e % topk == 0; });
+        check(std::count(eight.begin(), eight.end(), -1) == 8 * topk - 16, "an 8-token verify block skips too (the old rule stopped at 4 tokens)");
+        check(tail_skip_targets(routed, topk, 0, resident) == std::vector<int>(routed.size(), -1), "R = 0: off");
+    }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }
