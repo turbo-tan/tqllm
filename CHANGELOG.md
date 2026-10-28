@@ -41,6 +41,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Flash-Next verify blocks of 5-8 tokens (the default up to 5 drafts) read each BF16 weight matrix once: the BF16 GEMVs and
   the fused router launch take up to 8 tokens (were 4, so a 6-token block read every BF16 matrix twice). Bit-identical
   (tests: bf16_gemv token grouping, gemv_seg and topk2 to 8 tokens). RTX 3090 128K repeat request 82 -> 83-84 tok/s.
+- Flash-Next pins the multi-chunk prefill's residual buffer once at start-up when the host easily holds it (a tenth of RAM,
+  a quarter of what is available) instead of inside the first request of each new prompt length: RTX 3090 prefill
+  32K / 64K / 128K 2,104 / 2,130 / 2,026 -> 2,197 / 2,251 / 2,133 tok/s (as 1.2.3), 128K time to first token 77 -> 73 s.
 - Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
 - Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact

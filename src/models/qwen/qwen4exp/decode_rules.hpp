@@ -58,6 +58,13 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
 
+// The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
+// easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt
+// 0.72 s of time to first token (cudaMallocHost of 1.6 GB beside an 80 GB pinned expert pack), more at 128K.
+inline bool pin_residual_at_start(size_t bytes, size_t host_ram, size_t available) {
+    return bytes > 0 && bytes <= available / 4 && bytes <= host_ram / 10;
+}
+
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }
 

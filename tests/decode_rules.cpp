@@ -113,6 +113,12 @@ int main() {
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
     check(layer_graphs(false, 8) && layer_graphs(false, 9), "RTX 3090 / 4090 (sm_86 / sm_89) keep the decode graphs");
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");
+    // the pinned residual buffer of a multi-chunk prefill: pinned at start-up when the host easily holds it (pinning it per
+    // request cost a 32K prompt 0.72 s of time to first token), else per request as before
+    check(pin_residual_at_start(6 * GB, 125 * GB, 40 * GB), "3090 desktop, 125 GB RAM, 40 GB available: 6 GB pinned at start");
+    check(!pin_residual_at_start(6 * GB, 109 * GB, 18 * GB), "pod, 18 GB available: pinned per request");
+    check(!pin_residual_at_start(6 * GB, 48 * GB, 30 * GB), "48 GB machine: never more than a tenth of RAM pinned for it");
+    check(!pin_residual_at_start(0, 125 * GB, 40 * GB), "single-chunk contexts need no buffer");
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }
