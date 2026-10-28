@@ -465,7 +465,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         ck(cudaDeviceSynchronize());
         std::fprintf(stderr,"tqllm: uploaded checkpoint source page reclaim: %s\n",checkpoint.discard_source_pages() ? "ok" : "partial");
     }
-    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
     {   // the plan budget: what a prompt may plan with (device free + the expert banks), measured once with the pool trimmed and
         // rounded down to 256 MB, so the chunk / block a prompt length gets does not follow what earlier requests left in the
         // pool or in a partly refilled bank (a 100 MB difference flipped a 16K prompt between 3 x 6144 and 4 x 5120, F26)
