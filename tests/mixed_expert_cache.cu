@@ -142,6 +142,7 @@ static void run() {
                 compare(l, {0, 4});
             }
             require(current.prefetch_used() > 0, "registered prefetch was never consumed");
+            require(current.device_staging_bytes() == 0, "a registered prepacked pack held device staging it never reads");
             current.clear(); compare(0, {0, 1});
             current.set_miss_stream(nullptr);
         }

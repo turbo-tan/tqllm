@@ -1,3 +1,4 @@
+#include <cstring>
 #include "qwen4exp.hpp"
 #include "qwen4exp_kernels.cuh"
 #include <algorithm>
@@ -284,11 +285,44 @@ static void check_dense_parity() {
 }
 
 
+// The raw keys in a ring of the newest cells (64 to start, grown on a large append) pool and normalize exactly like a full
+// copy of the context, through verify-sized appends, a prefill-sized append that grows the ring, and rollbacks that re-append
+// different keys (10-28: the full FP32 copy held ~1 GB of a 128K decode's VRAM)
+static void check_raw_ring() {
+    const int cells = 5000, ratio = 4, dim = 128;
+    std::vector<float> a(size_t(cells) * dim), b(a.size());
+    for (size_t i = 0; i < a.size(); ++i) { a[i] = float(int(i * 17 % 43) - 21) / 43.f; b[i] = float(int(i * 29 % 47) - 23) / 47.f; }
+    Device<float> da(a.size()), db(b.size()); da.put(a); db.put(b);
+    std::vector<float> w(dim); for (int d = 0; d < dim; ++d) w[d] = 1.f + float(d % 7) / 10.f;
+    Device<float> dw(w.size()); dw.put(w);
+    tqllm_cuda::QsaRawKeyCache full(cells, ratio, dim, cells), ring(cells, ratio, dim, 64);
+    auto both = [&](auto f) { f(full); f(ring); };
+    int at = 0, step = 0;
+    while (at < cells - 800) {
+        const int n = step == 40 ? 700 : 1 + step % 8;  // verify blocks, one prefill-sized append
+        const float * src = (step % 3 ? da.p : db.p) + int64_t(at) * dim;
+        both([&](tqllm_cuda::QsaRawKeyCache & c) { c.append(src, n, nullptr); c.normalize_new(dw.p, dim, 10000.f, 1e-6f, nullptr); });
+        at += n;
+        if (step % 5 == 4 && at > 8) { const int back = 1 + step % 5; at -= back; both([&](tqllm_cuda::QsaRawKeyCache & c) { c.truncate(at); }); }
+        ++step;
+    }
+    if (ring.ring() >= full.ring() || ring.ring() < 700) throw std::runtime_error("QSA raw-key ring did not stay small or grow for the large append");
+    const int blocks = full.complete_blocks();
+    if (ring.complete_blocks() != blocks) throw std::runtime_error("QSA raw-key ring block count differs");
+    std::vector<float> p1(size_t(blocks) * dim), p2(p1.size()), n1(p1.size()), n2(p1.size());
+    ck(cudaMemcpy(p1.data(), full.pooled(), p1.size() * 4, cudaMemcpyDeviceToHost)); ck(cudaMemcpy(p2.data(), ring.pooled(), p2.size() * 4, cudaMemcpyDeviceToHost));
+    ck(cudaMemcpy(n1.data(), full.normalized(), n1.size() * 4, cudaMemcpyDeviceToHost)); ck(cudaMemcpy(n2.data(), ring.normalized(), n2.size() * 4, cudaMemcpyDeviceToHost));
+    if (std::memcmp(p1.data(), p2.data(), p1.size() * 4) || std::memcmp(n1.data(), n2.data(), n1.size() * 4))
+        throw std::runtime_error("QSA raw-key ring pooled / normalized keys differ from the full copy");
+    std::printf("PASS raw_key_ring (%d blocks, ring %d of %d cells)\n", blocks, ring.ring(), cells);
+}
+
 int main() {
     try {
         check_raw_cache(3, 4, 128);
         check_raw_cache(9, 4, 128);
         check_raw_cache(2051, 4, 128);
+        check_raw_ring();
         check_indexer();
         check_gather(7);
         check_gather(2051);

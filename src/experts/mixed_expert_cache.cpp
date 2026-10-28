@@ -333,7 +333,10 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         if (s.device_staging) { cudaFree(s.device_staging); s.device_staging = nullptr; }
         checked(cudaMallocHost(reinterpret_cast<void **>(&s.staging), need)); s.staging_bytes = need;
         if (tqllm::debug_on("mem")) std::fprintf(stderr, "STAGING grow layer %d: %zu experts, %.1f MB pinned%s\n", layer, incoming.size(), need / 1048576.0, s.prepacked ? " + device" : "");
-        if (s.prepacked) checked(cudaMalloc(reinterpret_cast<void **>(&s.device_staging), need));
+        // device staging serves only an unregistered prepacked pack (one upload + scatter); a registered pack's misses go
+        // straight into the slots (split: copy engine; else: kernel reads of pinned memory). 10-28: 0.65-1.4 GB of a 128K
+        // decode's VRAM held unused
+        if (s.prepacked && !s.registered) checked(cudaMalloc(reinterpret_cast<void **>(&s.device_staging), need));
     }
     struct Scatter { char * dst; size_t src, bytes; };
     std::vector<Scatter> scatter; std::vector<tqllm_cuda::ScatterItem> direct;
@@ -753,6 +756,7 @@ int MixedExpertCache::grow_into(size_t keep_free, int max_slots) {
     }
     return n;
 }
+size_t MixedExpertCache::device_staging_bytes() const { return state_->device_staging ? state_->staging_bytes : 0; }
 int MixedExpertCache::experts() const { return state_->experts; }
 int MixedExpertCache::layers() const { return state_->layers; }
 bool MixedExpertCache::bank_ready(int layer) const { return state_->banks.count(layer) != 0; }
@@ -805,7 +809,7 @@ void MixedExpertCache::reserve_staging(int min_cap) {
     if (s.staging) cudaFreeHost(s.staging);
     if (s.device_staging) { cudaFree(s.device_staging); s.device_staging = nullptr; }
     checked(cudaMallocHost(reinterpret_cast<void **>(&s.staging), need)); s.staging_bytes = need;
-    if (s.prepacked) checked(cudaMalloc(reinterpret_cast<void **>(&s.device_staging), need));
+    if (s.prepacked && !s.registered) checked(cudaMalloc(reinterpret_cast<void **>(&s.device_staging), need));  // see prepare
 }
 std::vector<int> MixedExpertCache::evict_until_free(size_t want, int protect) {
     auto & s = *state_; std::vector<int> out;

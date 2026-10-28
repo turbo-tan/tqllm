@@ -40,7 +40,8 @@ bool FlashNextEngine::spec_advance() {
     // after the request's first step (decode's lazy buffers, e.g. the host-K/V gather, exist now): the banks grow into what
     // is free beyond 1 GB; the start-up keep is sized for a prefill, which borrows the banks back anyway (10-28 128K: 3.6 GB
     // idle in decode at 133 slots / layer vs Strata's ~172). Growing before the first step left that gather no room (OOM)
-    if (S().steps_ == 1 && slots_.size() == 1 && f_.slots_auto && !f_.cp->run.small_card && kv_host_enabled()) {
+    // only after a prompt that borrowed the banks: grown after a short request, the next long prefill had no room (OOM)
+    if (S().steps_ == 1 && S().refilled_ && slots_.size() == 1 && f_.slots_auto && !f_.cp->run.small_card && kv_host_enabled()) {
         { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
         if (const int grown = f_.cache->grow_into(size_t(1024) << 20, f_.cp->config.experts))
             std::fprintf(stderr, "tqllm: expert banks grown for decode: %d layers, up to %d slots\n", grown, f_.cache->slots());

@@ -101,9 +101,13 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
 
 // Raw indexer keys stay on device. Completed blocks are updated only when new
 // keys make them complete; truncate invalidates later blocks for speculative rollback.
+// Raw keys are read only while their block is being pooled, so they live in a ring of the newest cells (one append + two
+// blocks + a rollback margin, grown on a larger append): 10-28 the full-context FP32 copy took ~1 GB of a 128K decode's VRAM.
+// A pinned host mirror of every appended key serves a truncate further back than the ring (same values, any rollback).
 class QsaRawKeyCache {
 public:
-    QsaRawKeyCache(int max_cells, int ratio, int dim);
+    // ring: initial raw-key cells (0: min(max_cells, 4096 + 2 x ratio + kRollback))
+    QsaRawKeyCache(int max_cells, int ratio, int dim, int ring = 0);
     ~QsaRawKeyCache();
     QsaRawKeyCache(const QsaRawKeyCache &) = delete;
     QsaRawKeyCache & operator=(const QsaRawKeyCache &) = delete;
@@ -116,9 +120,14 @@ public:
     const float * pooled() const { return pooled_; }
     const float * normalized() const { return normalized_; }
 
+    int ring() const { return ring_; }
+    static constexpr int kRollback = 64;  // cells a truncate may go back (a verify block is <= 8)
+
 private:
-    int max_cells_, ratio_, dim_, size_ = 0;
+    void reserve_ring(int cells, cudaStream_t stream);
+    int max_cells_, ratio_, dim_, size_ = 0, ring_ = 0;
     float * raw_ = nullptr;
+    float * host_raw_ = nullptr;  // pinned, max_cells x dim
     float * pooled_ = nullptr;
     float * normalized_ = nullptr;
     int normalized_blocks_ = 0;

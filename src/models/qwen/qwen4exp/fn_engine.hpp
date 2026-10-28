@@ -49,6 +49,7 @@ class FlashNextEngine final : public tqllm::Engine {
         ColdExpertStore::Stats cold_store_at_decode_{};
         ColdFetchQueue::Stats cold_fetch_at_decode_{};
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free
+        bool refilled_ = false;                     // this request's prefill borrowed banks and the refill brought them back
         std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
         std::chrono::steady_clock::time_point t_begin_, t_decode_;
         float temp_ = 0.f, top_p_ = 1.f; int top_k_ = 0; std::mt19937_64 rng_{1};

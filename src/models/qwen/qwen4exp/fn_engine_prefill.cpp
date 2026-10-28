@@ -31,6 +31,7 @@ void FlashNextEngine::refill_borrowed() {
     const int done = led->refill(f_.cp->run.small_card ? size_t(512) << 20 : 0); cudaGetLastError();
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
+    if (all) S().refilled_ = true;
     S().model_->pf_refill.clear(); led.reset();
 }
 
@@ -145,7 +146,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     S().t_begin_ = std::chrono::steady_clock::now(); S().prefill_us_ = S().decode_us_ = 0;
     static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;  // TQLLM_DEBUG=profile_req: host timeline of the request
     const auto stamp = [&](const char * what) { if (req_log) std::fprintf(stderr, "tqllm: req +%.3f s %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - S().t_begin_).count(), what); };
-    S().out_.clear(); S().out_view_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0;
+    S().out_.clear(); S().out_view_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0; S().refilled_ = false;
     // Trunk prefill first, then the MTP catch-up, so their working sets do not add up: a prompt longer than one chunk
     // keeps its residuals in pinned host memory, drops the MTP bank before the trunk and the layer-major buffers
     // after it. The catch-up runs the same batches in the same order as when it followed each chunk.

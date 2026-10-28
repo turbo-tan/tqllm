@@ -110,6 +110,7 @@ public:
     // routed experts (this prompt's prefill counts included); the targets stay (a refill after the next prompt rebuilds to
     // them, so decode's own buffers have room before the banks grow again). Returns the banks grown.
     int grow_into(size_t keep_free, int max_slots);
+    size_t device_staging_bytes() const;  // device staging held (only an unregistered prepacked pack needs it)
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
     int regrow(size_t keep_free);  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
     int experts() const; int layers() const;
