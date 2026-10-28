@@ -79,11 +79,13 @@ public:
         std::vector<uint32_t> r(S().out_.begin(), S().out_.end());
         if (tqllm::debug_on("mem")) {  // the decode phase's expert cache traffic (the warm-prompt decode question of 10-17)
             const auto s = f_.cache->stats(), & b = S().stats_at_decode_, m = f_.mtp_cache->stats(), & mb = S().mtp_stats_at_decode_;
-            std::fprintf(stderr, "LEDGER decode of %zu tokens: expert hits %llu misses %llu (%.1f %% hit) transfer %.2f GB, banks %.0f MB | MTP hits %llu misses %llu transfer %.2f GB, bank %.0f MB\n", r.size(),
-                         (unsigned long long) (s.hits - b.hits), (unsigned long long) (s.misses - b.misses),
+            std::fprintf(stderr, "LEDGER decode of %zu tokens: expert hits %llu misses %llu evictions %llu bank builds %llu drops %llu (budget %llu, oom %llu) (%.1f %% hit) transfer %.2f GB, banks %.0f MB | MTP hits %llu misses %llu transfer %.2f GB, bank %.0f MB\n", r.size(),
+                         (unsigned long long) (s.hits - b.hits), (unsigned long long) (s.misses - b.misses), (unsigned long long) (s.evictions - b.evictions), (unsigned long long) (s.bank_builds - b.bank_builds), (unsigned long long) (s.bank_drops - b.bank_drops), (unsigned long long) (s.drops_budget - b.drops_budget), (unsigned long long) (s.drops_oom - b.drops_oom),
                          100.0 * double(s.hits - b.hits) / std::max<double>(1, double(s.hits - b.hits + s.misses - b.misses)),
                          double(s.transfer_bytes - b.transfer_bytes) / 1e9, s.device_bytes / 1048576.0,
                          (unsigned long long) (m.hits - mb.hits), (unsigned long long) (m.misses - mb.misses), double(m.transfer_bytes - mb.transfer_bytes) / 1e9, m.device_bytes / 1048576.0);
+            std::fprintf(stderr, "LEDGER decode copies: demand %llu DMAs %.2f GB, prefetch %.2f GB\n", (unsigned long long) (s.miss_copies - b.miss_copies),
+                         double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e9, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e9);
             std::fprintf(stderr, "LEDGER decode rounds %llu | since start: prefetched %llu used %llu, pf pending %llu running %llu waited-unread %llu skipped %llu\n",
                          (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
                          (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);

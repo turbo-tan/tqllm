@@ -1,5 +1,6 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "fn_engine.hpp"
+#include <map>
 #include "decode_rules.hpp"
 #include "prefill_observer_cuda.hpp"
 
@@ -38,12 +39,18 @@ void FlashNextEngine::arena_resize(size_t bytes) {
 }
 
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
+    static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
-    S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
+    S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX; ++g_kv_epoch;
     // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
     // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
-    if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, prompt.size() + count + 16));
+    // with TQFN_KV_HOST the K/V older than the kept window lives in host memory after the prompt, so only the window's
+    // state keeps device room (a long prefill borrows banks for the rest and gives them back)
+    static const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0;
+    static const size_t kv_keep = std::getenv("TQFN_KV_HOST_KEEP") ? size_t(std::atoi(std::getenv("TQFN_KV_HOST_KEEP"))) : 32768;
+    const size_t state_rows = kv_host ? std::min(prompt.size() + count + 16, 2 * kv_keep) : prompt.size() + count + 16;
+    if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, state_rows));
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
         if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }
@@ -161,10 +168,19 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         tqllm::BankLedger::Ops ops;
         ops.lru_layers = [this] { return f_.cache->banks_lru(); };
         ops.bank_bytes = [this](int l) { return f_.cache->bank_bytes(l); };
-        ops.release = [this](int l) { f_.cache->release_bank(l); };
-        ops.refill = [this](int l) {  // each layer's most-routed experts, as many as its rebuilt bank holds
-            auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it == m.pf_refill.end()) return;
-            auto top = it->second; top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
+        // A lent bank comes back with the experts it held before the prompt (the decode-warmed set): the answer routes
+        // like the earlier answers, not like the prompt. A bank that held nothing takes the prompt's most-routed experts.
+        bank_keep.clear();
+        ops.release = [this](int l) {
+            auto & keep = bank_keep[l];
+            for (int e = 0; e < f_.cache->experts(); ++e) if (f_.cache->resident(l, e)) keep.push_back(e);
+            f_.cache->release_bank(l); };
+        ops.refill = [this](int l) {
+            const auto k = bank_keep.find(l);
+            std::vector<int> top;
+            if (k != bank_keep.end() && !k->second.empty()) top = k->second;
+            else { auto & m = *S().model_; const auto it = m.pf_refill.find(l); if (it == m.pf_refill.end()) return; top = it->second; }
+            top.resize(std::min(top.size(), size_t(f_.cache->plan_slots(l)))); f_.cache->prepare(l, top); };
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
@@ -196,7 +212,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             ck(cudaMallocHost(reinterpret_cast<void **>(&f_.res_host), size_t(P) * W * sizeof(float))); f_.res_host_cap = size_t(P) * W;
         }
     }
-    mem_note("residual host buffer ready");
+    mem_note("residual host buffer ready"); stamp("KV + residual host buffer ready");
     if (P >= 256 && chunk >= 256) arena_resize(arena_req);  // layer-major prefill; decode shrinks it again
     stamp("KV + arena ready");
     mem_note("prefill arena ready");
@@ -302,9 +318,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     arena_resize(f_.arena_decode);
     if (P >= 256) {  // long prompt: the old K/V rows to host memory, the refill below takes the freed device memory
         using kclk = std::chrono::steady_clock; const auto k0 = kclk::now();
-        if (const size_t freed = S().model_->kv_to_host())
+        if (const size_t freed = S().model_->kv_to_host()) {
             std::fprintf(stderr, "tqllm: attention KV: %.0f MB of old positions moved to host memory in %.0f ms\n", freed / 1048576.0,
                          std::chrono::duration<double, std::milli>(kclk::now() - k0).count());
+            // banks an earlier long prompt left below their slot target grow back into the freed memory with the refill
+            if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
+        }
     }
     stamp("before the bank refill"); refill_borrowed(); g_trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);

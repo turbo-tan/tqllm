@@ -283,6 +283,7 @@ static void check_dense_parity() {
             throw std::runtime_error("QSA all-selected attention differs from dense attention");
 }
 
+
 int main() {
     try {
         check_raw_cache(3, 4, 128);

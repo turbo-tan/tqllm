@@ -41,6 +41,30 @@ option; `--list-kv` and `--list-flags` list the KV formats and environment flags
 Bug fixes come with a test that fails on the old code and passes on the new one. Put it next to the closest existing
 test in `tests/` and register it in `CMakeLists.txt` with `add_test`.
 
+### GPU tests run locally, not in CI
+
+Every test carries a ctest label. `cpu` tests run in CI on every pull request (`.github/workflows/checks.yml`, GitHub
+runners have no GPU). `gpu` tests (kernels, expert caches, attention, engines) only run on a machine with a CUDA card,
+so run them yourself before opening a pull request that touches GPU code, and paste the result line in the pull request:
+
+```sh
+ctest --test-dir build -L gpu --output-on-failure   # this card's GPU tests
+ctest --test-dir build -L cpu --output-on-failure   # what CI runs
+```
+
+Some GPU tests fill the device on purpose (`RUN_SERIAL`); others share it, so keep `-j` low (2) on a 24 GB card.
+
+### How a test is laid out
+
+One program per area: `tests/<area>.cu` (GPU) or `.cpp` (CPU). State the expected behaviour in the comment at the top
+of the case, then check it against a reference (a CPU model, a dequantise-then-multiply product, or the path the change
+replaces). New files list their cases in a table and report each one (`tests/qsa_gather.cu`):
+
+```cpp
+const struct { const char * name; void (*run)(); } cases[] = {{"matches_reference", matches_reference}, ...};
+// prints PASS <name> / FAIL <name>: <why> per case, runs all cases, exits 1 if any failed
+```
+
 ## Where things plug in
 
 The source layout and its layering rules are in [AGENTS.md](AGENTS.md); read it first.
@@ -140,7 +164,7 @@ the PR. For changes that should not move speed, show that they do not.
 
 Before you open one:
 
-- [ ] Builds, and `ctest` passes (CPU build at least; the GPU build for kernel or engine changes).
+- [ ] Builds, and `ctest` passes (CPU build at least; `ctest -L gpu` on a CUDA card for kernel or engine changes).
 - [ ] New behaviour has a test; a bug fix has a test that failed before.
 - [ ] Exactness stated: identical tokens, or the measured quality cost.
 - [ ] Speed claims include base and branch numbers from the same session, with GPU, files and settings.

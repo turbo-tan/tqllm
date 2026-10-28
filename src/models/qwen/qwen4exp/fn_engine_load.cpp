@@ -1,6 +1,8 @@
 #include <cmath>
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
+#include <iterator>
+#include "device_free.hpp"
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
 #include <chrono>
@@ -115,7 +117,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
     for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
-    const double host_ram = double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGESIZE));
+    const double host_ram = double(tqllm::host_ram_bytes());  // physical RAM capped by the container limit
     const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
     if (f.experts.empty() && !integrated && !pack_in_memory)
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
@@ -444,6 +446,14 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // spec_begin grows pinned residuals to the actual prompt, not the configured slot capacity.
       f.cache->set_miss_stream(nullptr);
       if (tqllm::debug_on("mem")) checkpoint.resident_report();
+      {   // a multi-chunk prefill's pinned residual rows, pinned here once instead of inside a request (decode_rules.hpp)
+          const size_t rows = int(context) > 4096 ? size_t(context) * size_t(warm.width) : 0;
+          std::ifstream mi("/proc/meminfo"); const std::string text((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
+          if (pin_residual_at_start(rows * sizeof(float), tqllm::host_ram_bytes(), tqllm::meminfo_available(text))) {
+              ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), rows * sizeof(float))); f.res_host_cap = rows;
+              std::fprintf(stderr, "tqllm: prompt residual buffer pinned at start: %.1f GB for %u tokens\n", double(rows * sizeof(float)) / 1e9, context);
+          }
+      }
       if (f.arena.size != f.arena_decode) {  // start the first request as every later one: decode-sized arena, more room to borrow
           ck(cudaFree(f.arena.base)); ck(cudaMalloc(&f.arena.base, f.arena_decode)); f.arena.size = f.arena_decode; f.arena.used = 0; }
       size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));

@@ -1095,7 +1095,7 @@ flags:
   - name: TQFN_KV_HOST
     kind: user
     default: "off"
-    doc: "1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM, slower decode at long context)"
+    doc: "1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM for expert banks; decode copies only the selected rows)"
   - name: TQFN_KV_HOST_KEEP
     kind: user
     default: "32768"

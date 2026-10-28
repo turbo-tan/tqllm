@@ -30,6 +30,16 @@ int main() {
     expect(usable_free_bytes(cuda_free, total, true, "MemTotal: 1 kB\n"), cuda_free, "no MemAvailable");
     // cudaMemGetInfo above MemAvailable (never lower the figure)
     expect(usable_free_bytes(60 * GiB, total, true, gb10), 60 * GiB, "cudaMemGetInfo larger");
+    // host RAM: the cgroup limit caps physical memory (RunPod 5090 pod: 944 GB physical, memory.max 116999999488)
+    using tqllm::host_ram_limit;
+    expect(host_ram_limit(944 * GiB, "116999999488\n"), size_t(116999999488), "cgroup v2 limit below physical");
+    expect(host_ram_limit(125 * GiB, "max\n"), 125 * GiB, "no cgroup limit");
+    expect(host_ram_limit(125 * GiB, ""), 125 * GiB, "no cgroup file");
+    expect(host_ram_limit(31 * GiB, "9223372036854771712\n"), 31 * GiB, "cgroup v1 unlimited");
+    expect(host_ram_limit(125 * GiB, "x"), 125 * GiB, "unreadable limit");
+    if (tqllm::cgroup_v2_path("0::/user.slice/run-x.scope\n") != "/user.slice/run-x.scope") { std::fprintf(stderr, "FAIL cgroup path\n"); ++failures; }
+    if (tqllm::cgroup_v2_path("0::/\n") != "/") { std::fprintf(stderr, "FAIL cgroup root path\n"); ++failures; }
+    if (!tqllm::cgroup_v2_path("12:memory:/x\n").empty()) { std::fprintf(stderr, "FAIL v1-only text\n"); ++failures; }
     if (failures) return 1;
     std::puts("device_free: ok");
     return 0;

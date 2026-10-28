@@ -214,6 +214,23 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                     sc = std::make_unique<Device<float>>(size_t(nb) * heads * sel.width); inv = std::make_unique<Device<float>>(size_t(nb) * heads);
                     att.scores = sc->p; att.inv = inv->p;
                 }
+                // part of this layer's K/V in host memory (TQFN_KV_HOST): the selected rows go to one compact device copy
+                // first (read once, wide loads), then the attention reads that copy with the same rows in the same order
+                if (nb < 32 && carry->k->vmm && carry->k->any_host()) {
+                    // one gather per layer, each with a 16K-row device cache of host rows: consecutive steps select mostly the
+                    // same positions (128K: 81.6 % of the host rows a step reads were read recently)
+                    static std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> gathers; static std::vector<uint64_t> epochs;
+                    const size_t row = size_t(kvheads) * dim * sizeof(__nv_bfloat16);
+                    if (size_t(layer) >= gathers.size()) { gathers.resize(size_t(layer) + 1); epochs.resize(size_t(layer) + 1, 0); }
+                    auto & gather = gathers[size_t(layer)];
+                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(g_kv_capacity, row, 16384); }
+                    const int written_from = epochs[size_t(layer)] == g_kv_epoch ? pos : 0;  // a new request: the cache starts empty
+                    epochs[size_t(layer)] = g_kv_epoch;
+                    gather->run(sel.positions, sel.valid, nb, sel.width, pos + q0 + 1, carry->k->p, carry->v->p, nullptr,
+                                carry->k->host_rows(row), written_from);
+                    att.keys = gather->keys(); att.values = gather->values(); att.positions = gather->positions();
+                    att.first_cells = nb * sel.width + 1;  // renumbered cells all lie below this; the causal cut is already applied
+                }
                 kv_fmt().attend_selected(att);
             }
         } else {

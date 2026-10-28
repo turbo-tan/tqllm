@@ -1,7 +1,8 @@
 name: checks
 
 # Required on every pull request to main: CPU build (no CUDA), ctest, Python tests.
-# GPU tests and the decode-speed guard run on self-hosted GPU runners (separate workflow).
+# GPU tests (ctest label gpu) do not run here: GitHub runners have no GPU. Run `ctest -L gpu` on a CUDA card before a PR
+# (CONTRIBUTING.md, "GPU tests run locally, not in CI").
 
 on:
   pull_request:
