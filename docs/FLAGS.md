@@ -23,7 +23,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off) |  |
 | `TQFN_DRAFT_VOCAB` | - | FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab) |  |
 | `TQFN_KV` | - | KV format for Flash-Next attention (name from the KV format registry; default bf16) |  |
-| `TQFN_KV_HOST` | off | 1: decode keeps K/V older than TQFN_KV_HOST_KEEP positions in host memory (frees VRAM for expert banks; decode copies only the selected rows) |  |
+| `TQFN_KV_HOST` | auto | auto (default): on for discrete GPUs, off on unified memory; 1 / 0 force it. On: K/V older than TQFN_KV_HOST_KEEP positions lives in host memory after a long prompt (frees VRAM for expert banks; decode copies only the selected rows) |  |
 | `TQFN_KV_HOST_KEEP` | 32768 | positions of K/V kept on the device with TQFN_KV_HOST=1 |  |
 | `TQFN_LAYER_SLOTS` | - | comma list of expert slots per layer (overrides the packed file's .slots profile) |  |
 | `TQFN_MTP_SLOTS` | 256 | MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards) |  |

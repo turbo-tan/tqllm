@@ -1,6 +1,7 @@
 #pragma once
 // Flash-Next per-sequence state: GDN recurrent state, attention K/V buffers and QSA indexer keys.
 #include "fn_checkpoint.hpp"
+#include "decode_rules.hpp"
 struct RecurrentState {
     std::unique_ptr<Device<float>> history, state;
     // speculative mode: state after every token, the block's conv inputs and the history before it (rollback)
@@ -12,6 +13,9 @@ struct RecurrentState {
 // Attention K or V rows in one reserved address range, mapped page by page to device or pinned host memory (CUDA VMM,
 // the 27B engine's KvMemory): after a long prompt the oldest pages move to the host at the same addresses, so the kernels
 // keep one pointer and decode reads the selected host rows over PCIe; the freed device memory goes back to expert banks.
+struct KvBuf;
+// Host K/V on (decode_rules.hpp kv_host_on): TQFN_KV_HOST or the default for this GPU, decided once
+inline bool kv_host_enabled();
 struct KvBuf {
     __nv_bfloat16 * p = nullptr; size_t bytes = 0, page = 0, span = 0; std::vector<uint8_t> on_host; bool vmm = false;
     static tqllm::KvMemory & mem() { static auto m = tqllm::make_cuda_kv_memory(nullptr); return *m; }
@@ -23,10 +27,9 @@ struct KvBuf {
     char * at(size_t i) const { return reinterpret_cast<char *>(p) + i * page; }
     explicit KvBuf(size_t n) : bytes(n) {
         auto & m = mem(); const size_t g = m.granule();
-        // TQFN_KV_HOST=1 (opt-in): decode then reads the old rows over PCIe, measured 33-35 tok/s at 245K vs 52 with all
-        // K/V on the device (10-17); off, the buffers are plain allocations (no VMM pages to fragment the pool)
-        static const bool on = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0;
-        if (g && on) {
+        // host K/V (kv_host_enabled: discrete GPUs by default): VMM pages, so old ones can move to host memory; else
+        // plain allocations
+        if (g && kv_host_enabled()) {
             page = std::max(g, (size_t(32) << 20) / g * g); span = (n + page - 1) / page * page;
             if (void * va = m.reserve(span)) {
                 p = static_cast<__nv_bfloat16 *>(va); vmm = true; on_host.assign(span / page, 0);
@@ -60,6 +63,14 @@ struct KvBuf {
         return int(n * page / row_bytes);
     }
 };
+inline bool kv_host_enabled() {
+    static const bool on = [] {
+        int dev = 0, unified = 0; cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&unified, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) unified = 0;
+        return tqllm::flashnext::kv_host_on(std::getenv("TQFN_KV_HOST"), KvBuf::mem().granule() != 0, unified != 0);
+    }();
+    return on;
+}
 // The K/V format of the attention layers (src/formats/kv): TQFN_KV=<name>, default bf16. Flash-Next attends sparsely, so
 // the format must implement attend_selected().
 inline const tqllm::KvFormat & kv_fmt() {

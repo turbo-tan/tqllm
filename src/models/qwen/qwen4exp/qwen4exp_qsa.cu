@@ -843,9 +843,14 @@ __global__ void gather_remap_k(const int32_t * positions, const uint8_t * valid,
 }
 }  // namespace
 
-QsaGather::QsaGather(int max_cells, size_t row_bytes, int cache_rows) : max_cells_(max_cells), row_bytes_(row_bytes), cache_rows_(std::max(0, cache_rows)) {
+QsaGather::QsaGather(int max_cells, size_t row_bytes, int cache_rows, int max_rows) : max_cells_(max_cells), row_bytes_(row_bytes), cache_rows_(std::max(0, cache_rows)) {
     if (max_cells <= 0 || row_bytes == 0 || row_bytes % 16) throw std::invalid_argument("QSA gather: invalid shape");
     ck(cudaMalloc(&counters_, 2 * sizeof(unsigned long long))); ck(cudaMemset(counters_, 0, 2 * sizeof(unsigned long long)));
+    if (max_rows > 0) {
+        max_rows_ = max_rows;
+        ck(cudaMalloc(&k_, size_t(max_rows_) * row_bytes_)); ck(cudaMalloc(&v_, size_t(max_rows_) * row_bytes_));
+        ck(cudaMalloc(&pos_, size_t(max_rows_) * sizeof(int32_t)));
+    }
     if (cache_rows_) {
         ck(cudaMalloc(&tag_, size_t(cache_rows_) * sizeof(int))); ck(cudaMemset(tag_, 0xff, size_t(cache_rows_) * sizeof(int)));  // -1: empty
         ck(cudaMalloc(&claim_, size_t(cache_rows_) * sizeof(int))); ck(cudaMemset(claim_, 0x7f, size_t(cache_rows_) * sizeof(int)));  // ~INT_MAX

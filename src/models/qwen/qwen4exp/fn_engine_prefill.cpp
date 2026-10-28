@@ -47,7 +47,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
     // with TQFN_KV_HOST the K/V older than the kept window lives in host memory after the prompt, so only the window's
     // state keeps device room (a long prefill borrows banks for the rest and gives them back)
-    static const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0;
+    static const bool kv_host = kv_host_enabled();
     static const size_t kv_keep = std::getenv("TQFN_KV_HOST_KEEP") ? size_t(std::atoi(std::getenv("TQFN_KV_HOST_KEEP"))) : 32768;
     const size_t state_rows = kv_host ? std::min(prompt.size() + count + 16, 2 * kv_keep) : prompt.size() + count + 16;
     if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, state_rows));

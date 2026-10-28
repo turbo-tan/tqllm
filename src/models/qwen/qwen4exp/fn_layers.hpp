@@ -223,7 +223,8 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                     const size_t row = size_t(kvheads) * dim * sizeof(__nv_bfloat16);
                     if (size_t(layer) >= gathers.size()) { gathers.resize(size_t(layer) + 1); epochs.resize(size_t(layer) + 1, 0); }
                     auto & gather = gathers[size_t(layer)];
-                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(g_kv_capacity, row, 16384); }
+                    // sized for the slot context and an 8-token verify block: no allocation inside graph capture
+                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(g_kv_capacity, g_kv_capacity_full), row, 16384, 8 * sel.width); }
                     const int written_from = epochs[size_t(layer)] == g_kv_epoch ? pos : 0;  // a new request: the cache starts empty
                     epochs[size_t(layer)] = g_kv_epoch;
                     gather->run(sel.positions, sel.valid, nb, sel.width, pos + q0 + 1, carry->k->p, carry->v->p, nullptr,

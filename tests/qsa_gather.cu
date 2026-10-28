@@ -254,6 +254,30 @@ static void rewrite_invalidates_cache() {
     require(!std::memcmp(k.data(), &r.keys[size_t(120) * r.row], r.row_bytes()), "a rewritten row came from the cache (stale)");
 }
 
+
+// R6: the gather runs inside CUDA graph capture (decode layers are captured): a call with more cells and tokens than an
+// earlier one must not allocate or sync during capture when the gather was built for that size (max_rows)
+static void runs_inside_graph_capture() {
+    const Rows r(4200, 512);
+    Device<__nv_bfloat16> k(r.keys.size()), v(r.values.size()); k.put(r.keys); v.put(r.values);
+    tqllm_cuda::QsaGather g(4200, r.row_bytes(), 0, 6 * 2048);
+    expect_gather(g, mixed(1, 256, 1000), r, k.p, v.p);  // small first call
+    const Selection s = mixed(6, 2048, 4100);
+    Device<int32_t> dp(s.positions.size()); Device<uint8_t> dm(s.valid.size()); dp.put(s.positions); dm.put(s.valid);
+    cudaStream_t st; ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    std::string failed;
+    try { g.run(dp.p, dm.p, s.tokens, s.width, s.first, k.p, v.p, st); } catch (const std::exception & e) { failed = e.what(); }
+    const cudaError_t end = cudaStreamEndCapture(st, &graph); cudaGetLastError();
+    require(failed.empty() && end == cudaSuccess && graph, "capture of a larger call failed: " + (failed.empty() ? std::string(cudaGetErrorString(end)) : failed));
+    ck(cudaGraphInstantiate(&exec, graph, 0)); ck(cudaGraphLaunch(exec, st)); ck(cudaStreamSynchronize(st));
+    const Model m = reference(s);
+    std::vector<int32_t> got(s.positions.size()); ck(cudaMemcpy(got.data(), g.positions(), got.size() * 4, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < got.size(); ++i) require(got[i] == m.positions[i], "captured gather position " + std::to_string(i));
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(st);
+}
+
 static void rejects_bad_shapes() {
     auto throws = [](const std::function<void()> & f) { try { f(); } catch (const std::invalid_argument &) { return true; } return false; };
     require(throws([] { tqllm_cuda::QsaGather g(0, 512); }), "zero cells");
@@ -299,6 +323,7 @@ int main() {
         {"same_slot_conflict_is_safe", same_slot_conflict_is_safe},
         {"device_cells_not_cached", device_cells_not_cached},
         {"rewrite_invalidates_cache", rewrite_invalidates_cache},
+        {"runs_inside_graph_capture", runs_inside_graph_capture},
     };
     int failed = 0;
     for (const auto & c : cases) {

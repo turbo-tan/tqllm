@@ -367,20 +367,14 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         std::vector<int> routed_ids(ids_host.p, ids_host.p + A);
         // TQFN_TAIL_SKIP=R (APPROXIMATE, changes the output; idea: Strata v0.1.42 route-tail-skip): an expert that is
         // not resident and that every token of this call ranks R-th or lower is neither copied nor computed. Its
-        // assignments get weight 0 (other weights unchanged) and point at the token's resident first choice.
+        // assignments get weight 0 (other weights unchanged) and point at the token's first choice (computed anyway).
         static const int tail_skip = std::getenv("TQFN_TAIL_SKIP") ? std::atoi(std::getenv("TQFN_TAIL_SKIP")) : 0;
-        if (tail_skip > 0 && trunk && n <= 4) {
-            std::vector<int> best_rank(c.experts, c.topk);
-            for (int a = 0; a < A; ++a) best_rank[routed_ids[a]] = std::min(best_rank[routed_ids[a]], a % c.topk);
-            for (int a = 0; a < A; ++a) {
-                const int e = routed_ids[a];
-                if (best_rank[e] < tail_skip - 1 || cache.resident(layer, e)) continue;
-                const int first = routed_ids[(a / c.topk) * c.topk];
-                if (best_rank[first] >= tail_skip - 1 && !cache.resident(layer, first)) continue;  // first choice itself skipped: keep
-                routed_ids[a] = first;
-                ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr));
-                static uint64_t skipped = 0; ++skipped;
-                static struct Report { ~Report() { std::printf("TAIL_SKIP assignments skipped %llu\n", (unsigned long long) skipped); } } report;
+        if (tail_skip > 0 && trunk) {  // decode_rules.hpp tail_skip_targets: any verify block size
+            const auto to = tqllm::flashnext::tail_skip_targets(routed_ids, c.topk, tail_skip, [&](int e) { return cache.resident(layer, e); });
+            static uint64_t skipped = 0;
+            static struct Report { ~Report() { std::printf("TAIL_SKIP assignments skipped %llu\n", (unsigned long long) skipped); } } report;
+            for (size_t a = 0; a < to.size(); ++a) if (to[a] >= 0) {
+                routed_ids[a] = to[a]; ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr)); ++skipped;
             }
         }
         if (static FILE * dump = std::getenv("TQFN_ROUTE_DUMP") ? std::fopen(std::getenv("TQFN_ROUTE_DUMP"), "ab") : nullptr; dump && trunk) {

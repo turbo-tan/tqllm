@@ -354,7 +354,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     auto context_keep = [&] {
         int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
         // in decode the K/V of positions older than TQFN_KV_HOST_KEEP live in host memory (kv_to_host); the indexer keys stay
-        const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0 && KvBuf::mem().granule();
+        const bool kv_host = kv_host_enabled();
         const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
         const size_t kv_row = size_t(2) * checkpoint.attention_kvheads * checkpoint.attention_dim * 2;  // K + V bf16 per position
         const size_t moved = kv_host && int(context) > 2 * keep ? size_t(attn) * (size_t(context) - size_t(2 * keep)) * kv_row : 0;
@@ -449,7 +449,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       {   // a multi-chunk prefill's pinned residual rows, pinned here once instead of inside a request (decode_rules.hpp)
           const size_t rows = int(context) > 4096 ? size_t(context) * size_t(warm.width) : 0;
           std::ifstream mi("/proc/meminfo"); const std::string text((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
-          if (pin_residual_at_start(rows * sizeof(float), tqllm::host_ram_bytes(), tqllm::meminfo_available(text))) {
+          int dev = 0, unified = 0; cudaGetDevice(&dev);
+          if (cudaDeviceGetAttribute(&unified, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) unified = 0;
+          if (pin_residual_at_start(rows * sizeof(float), tqllm::host_ram_bytes(), tqllm::meminfo_available(text), unified != 0)) {
               ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), rows * sizeof(float))); f.res_host_cap = rows;
               std::fprintf(stderr, "tqllm: prompt residual buffer pinned at start: %.1f GB for %u tokens\n", double(rows * sizeof(float)) / 1e9, context);
           }
@@ -463,7 +465,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         ck(cudaDeviceSynchronize());
         std::fprintf(stderr,"tqllm: uploaded checkpoint source page reclaim: %s\n",checkpoint.discard_source_pages() ? "ok" : "partial");
     }
-    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
     {   // the plan budget: what a prompt may plan with (device free + the expert banks), measured once with the pool trimmed and
         // rounded down to 256 MB, so the chunk / block a prompt length gets does not follow what earlier requests left in the
         // pool or in a partly refilled bank (a 100 MB difference flipped a 16K prompt between 3 x 6144 and 4 x 5120, F26)

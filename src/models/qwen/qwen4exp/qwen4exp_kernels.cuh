@@ -218,7 +218,9 @@ private:
 class QsaGather {
 public:
     // cache_rows > 0: rows of cells below run()'s host_cells stay in a direct-mapped device cache between calls
-    QsaGather(int max_cells, size_t row_bytes, int cache_rows = 0);
+    // max_rows > 0: the compact buffers are allocated now for calls up to that many selections (tokens x width), so a call
+    // inside CUDA graph capture never allocates; max_cells likewise sizes the cell maps for the longest context
+    QsaGather(int max_cells, size_t row_bytes, int cache_rows = 0, int max_rows = 0);
     ~QsaGather();
     QsaGather(const QsaGather &) = delete;
     QsaGather & operator=(const QsaGather &) = delete;

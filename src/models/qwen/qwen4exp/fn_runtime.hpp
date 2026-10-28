@@ -74,6 +74,7 @@ inline bool g_tile_experts = false;
 // attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
 // it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
 inline int g_kv_capacity = 2048;
+inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_capacity follows each request)
 // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
 // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
 inline bool g_small_card = false;
