@@ -19,7 +19,12 @@ public:
     }
     const float * key(int pos, int offset) const { return keys_.data() + size_t(pos) * width_ + offset; }
     const float * value(int pos, int offset) const { return values_.data() + size_t(pos) * width_ + offset; }
+    // Rows [0, count) of keys then values, as stored (prompt-state files).
+    float * keys(int count) { check(count); return keys_.data(); }
+    float * values(int count) { check(count); return values_.data(); }
+    size_t row_floats() const { return size_t(width_); }
 private:
+    void check(int count) const { if (count < 0 || count > context_) throw std::out_of_range("host KV rows"); }
     int width_, context_;
     std::vector<float> keys_, values_;
 };

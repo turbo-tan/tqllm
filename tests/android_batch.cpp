@@ -1,7 +1,9 @@
 // Batched forward and speculative rollback against one-token-at-a-time forward, on a real qwen35 GGUF:
 //   test-android-batch MODEL.gguf
 #include "android_model.hpp"
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <iostream>
 #include <stdexcept>
 
@@ -38,7 +40,25 @@ int main(int argc, char ** argv) {
         c.checkpoint(); c.forward(5); c.rollback(1);
         c.checkpoint(); c.forward(6); c.forward(7); c.rollback(0);
         check(c.position() == int(prompt.size() + more.size()) + 1, "rollback bookkeeping");
-        std::cout << "android_batch: PASS (batched == single bitwise, prefill batch, rollback keep 2/all/none)\n";
+        // Snapshot / restore and save / load: continuing from either equals the clean history.
+        Model d(argv[1], {256, 4});
+        d.forward_batch(prompt, false);
+        d.snapshot();
+        d.forward_batch({1, 2, 3, 4});
+        check(d.restore() == int(prompt.size()), "restore position");
+        const auto restored = d.forward_batch(more);
+        for (size_t i = 0; i < more.size(); ++i) check(same(restored[i], single[i]), "restored state differs from clean history");
+        const std::string state = std::string(argv[1]) + ".test-state";
+        d.reset(); d.forward_batch(prompt, false); d.save(state);
+        Model e(argv[1], {256, 4});
+        check(e.load(state) && e.position() == int(prompt.size()), "load state");
+        std::remove(state.c_str());
+        const auto loaded = e.forward_batch(more);
+        for (size_t i = 0; i < more.size(); ++i) check(same(loaded[i], single[i]), "loaded state differs from clean history");
+        Model f(argv[1], {512, 4});
+        check(f.position() == 0, "fresh model");
+        std::cout << "android_batch: PASS (batched == single bitwise, prefill batch, rollback keep 2/all/none, "
+                     "snapshot/restore, save/load)\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -1,4 +1,7 @@
 #include "android_model.hpp"
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include "gguf.hpp"
 #include "host_matrix.hpp"
 #include "host_attention_cache.hpp"
@@ -35,6 +38,7 @@ Options validate(Options o) {
 }
 }
 struct Model::Impl {
+    uint64_t model_bytes = 0;
     Options options;
     GgufFile file;
     MappedFile mapping;
@@ -352,7 +356,9 @@ struct Model::Impl {
         pos = saved_pos + keep;
     }
 };
-Model::Model(const std::string & path, Options options) : impl_(std::make_unique<Impl>(path, options)) {}
+Model::Model(const std::string & path, Options options) : impl_(std::make_unique<Impl>(path, options)) {
+    impl_->model_bytes = std::filesystem::file_size(path);
+}
 Model::~Model() = default;
 void Model::reset() {
     impl_->pos = 0; impl_->logits.clear(); impl_->recording = false; impl_->snapshot_pos = -1;
@@ -385,6 +391,59 @@ int Model::restore() {
     }
     i.pos = i.snapshot_pos; i.logits.clear(); i.recording = false;
     return i.pos;
+}
+namespace {
+// Prompt-state file: header, then per layer either conv history + recurrent state or K rows + V rows [0, pos).
+struct StateHeader {
+    char magic[8] = {'T', 'Q', 'A', 'S', 'T', 'A', 'T', '1'};
+    uint64_t model_bytes = 0;
+    int32_t layers = 0, hidden = 0, vocab = 0, conv = 0, pos = 0, reserved = 0;
+};
+}
+void Model::save(const std::string & path) const {
+    const auto & i = *impl_;
+    StateHeader h;
+    h.model_bytes = i.model_bytes; h.layers = i.layers; h.hidden = i.hidden; h.vocab = i.vocab; h.conv = i.conv; h.pos = i.pos;
+    const std::string temp = path + ".part";
+    std::unique_ptr<FILE, int (*)(FILE *)> f(std::fopen(temp.c_str(), "wb"), std::fclose);
+    if (!f) throw std::runtime_error("cannot write " + temp);
+    auto put = [&](const void * data, size_t bytes) {
+        if (bytes && std::fwrite(data, 1, bytes, f.get()) != bytes) throw std::runtime_error("write failed: " + temp);
+    };
+    put(&h, sizeof(h));
+    for (const auto & layer : i.cache) {
+        if (layer.kv) {
+            const size_t n = size_t(i.pos) * layer.kv->row_floats() * sizeof(float);
+            put(layer.kv->keys(i.pos), n); put(layer.kv->values(i.pos), n);
+        } else {
+            put(layer.history.data(), layer.history.size() * sizeof(float));
+            put(layer.state.data(), layer.state.size() * sizeof(float));
+        }
+    }
+    if (std::fflush(f.get()) != 0) throw std::runtime_error("write failed: " + temp);
+    f.reset();
+    std::filesystem::rename(temp, path);
+}
+bool Model::load(const std::string & path) {
+    auto & i = *impl_;
+    std::unique_ptr<FILE, int (*)(FILE *)> f(std::fopen(path.c_str(), "rb"), std::fclose);
+    if (!f) return false;
+    StateHeader h, want;
+    want.model_bytes = i.model_bytes; want.layers = i.layers; want.hidden = i.hidden; want.vocab = i.vocab; want.conv = i.conv;
+    if (std::fread(&h, sizeof(h), 1, f.get()) != 1 || std::memcmp(h.magic, want.magic, sizeof(h.magic)) ||
+        h.model_bytes != want.model_bytes || h.layers != want.layers || h.hidden != want.hidden || h.vocab != want.vocab ||
+        h.conv != want.conv || h.pos <= 0 || h.pos >= i.options.context)
+        return false;
+    auto get = [&](void * data, size_t bytes) { return !bytes || std::fread(data, 1, bytes, f.get()) == bytes; };
+    for (auto & layer : i.cache) {
+        const bool ok = layer.kv ? get(layer.kv->keys(h.pos), size_t(h.pos) * layer.kv->row_floats() * sizeof(float)) &&
+                                   get(layer.kv->values(h.pos), size_t(h.pos) * layer.kv->row_floats() * sizeof(float))
+                                 : get(layer.history.data(), layer.history.size() * sizeof(float)) &&
+                                   get(layer.state.data(), layer.state.size() * sizeof(float));
+        if (!ok) { reset(); return false; }
+    }
+    i.pos = h.pos; i.logits.clear(); i.recording = false; i.snapshot_pos = -1;
+    return true;
 }
 int Model::position() const { return impl_->pos; }
 int Model::context() const { return impl_->options.context; }

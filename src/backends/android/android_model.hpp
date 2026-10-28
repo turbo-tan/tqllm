@@ -30,6 +30,10 @@ public:
     // gives its position (-1: none taken). Attention KV past it is overwritten later, as after rollback.
     void snapshot();
     int restore();
+    // The whole sequence state at the current position (recurrent state, conv history, attention KV rows) to a file,
+    // and back. load() checks the file belongs to this model file and these dimensions; false when it does not.
+    void save(const std::string & path) const;
+    bool load(const std::string & path);
     int position() const;
     int context() const;
     int vocabulary() const;

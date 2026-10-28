@@ -8,8 +8,14 @@
 // was generated (Qwen drops the empty think block), so each prompt also leaves a state snapshot just before its last
 // turn marker (<|im_start|>); a follow-up that shares the prompt up to there restores it and reads only the rest.
 //
+// A new conversation usually repeats the previous one's system prompt and tool definitions, often a thousand tokens
+// that take a minute to read on a phone. The state at the end of that system message is saved to a file (prompt
+// cache); a later request that starts with the same tokens loads it instead of reading them again.
+//
 // Environment: TQLLM_ANDROID_THREADS (default 8, capped by the CPU affinity mask), TQLLM_ANDROID_DRAFT_DEPTH (6, 0
-// disables speculation), TQLLM_ANDROID_DRAFT_HEAD (151936: the draft head's rows, plus EOS).
+// disables speculation), TQLLM_ANDROID_DRAFT_HEAD (151936: the draft head's rows, plus EOS),
+// TQLLM_ANDROID_PROMPT_CACHE (directory, default $HOME/.cache/tqserve-android; "off" disables),
+// TQLLM_ANDROID_PROMPT_CACHE_MIN (shortest saved prefix, 256 tokens), TQLLM_ANDROID_PROMPT_CACHE_FILES (kept, 8).
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "android_model.hpp"
@@ -19,6 +25,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -31,6 +39,89 @@ int env_int(const char * name, int fallback) {
     const char * v = std::getenv(name);
     return v && *v ? std::atoi(v) : fallback;
 }
+namespace fs = std::filesystem;
+// Saved prompt states: NAME.state (android_backend::Model::save) beside NAME.tokens, the prefix as raw uint32 ids.
+class PromptCache {
+public:
+    PromptCache() {
+        const char * dir = std::getenv("TQLLM_ANDROID_PROMPT_CACHE");
+        const char * home = std::getenv("HOME");
+        if (dir && std::string(dir) == "off") return;
+        dir_ = dir && *dir ? fs::path(dir) : fs::path(home ? home : ".") / ".cache" / "tqserve-android";
+        std::error_code e;
+        fs::create_directories(dir_, e);
+        if (e) dir_.clear();
+        minimum_ = std::max(16, env_int("TQLLM_ANDROID_PROMPT_CACHE_MIN", 256));
+        files_ = std::max(1, env_int("TQLLM_ANDROID_PROMPT_CACHE_FILES", 8));
+    }
+    bool enabled() const { return !dir_.empty(); }
+    size_t minimum() const { return size_t(minimum_); }
+    // The longest saved prefix of `prompt` that loads into `model`; 0 when none.
+    size_t load(const std::vector<uint32_t> & prompt, android_backend::Model & model) const {
+        if (!enabled()) return 0;
+        std::vector<std::pair<size_t, fs::path>> found;
+        std::error_code e;
+        for (const auto & entry : fs::directory_iterator(dir_, e)) {
+            if (entry.path().extension() != ".tokens") continue;
+            const auto tokens = read(entry.path());
+            if (!tokens.empty() && tokens.size() < prompt.size() && std::equal(tokens.begin(), tokens.end(), prompt.begin()))
+                found.emplace_back(tokens.size(), entry.path());
+        }
+        std::sort(found.rbegin(), found.rend());
+        for (const auto & [length, tokens] : found) {
+            auto state = tokens; state.replace_extension(".state");
+            if (model.load(state.string()) && size_t(model.position()) == length) {
+                fs::last_write_time(tokens, fs::file_time_type::clock::now(), e);  // most recently used
+                return length;
+            }
+            model.reset();
+        }
+        return 0;
+    }
+    bool has(const std::vector<uint32_t> & prefix) const { return enabled() && fs::exists(name(prefix).replace_extension(".tokens")); }
+    void save(const std::vector<uint32_t> & prefix, const android_backend::Model & model) const {
+        if (!enabled()) return;
+        try {
+            auto path = name(prefix);
+            model.save(fs::path(path).replace_extension(".state").string());
+            std::ofstream out(fs::path(path).replace_extension(".tokens"), std::ios::binary);
+            out.write(reinterpret_cast<const char *>(prefix.data()), std::streamsize(prefix.size() * sizeof(uint32_t)));
+            if (!out) throw std::runtime_error("token list write failed");
+            trim();
+        } catch (const std::exception & ex) {
+            std::fprintf(stderr, "tqserve: prompt cache not saved: %s\n", ex.what());
+        }
+    }
+private:
+    fs::path name(const std::vector<uint32_t> & prefix) const {
+        uint64_t h = 1469598103934665603ull;  // FNV-1a over the ids
+        for (uint32_t t : prefix) for (int b = 0; b < 4; ++b) { h ^= (t >> (8 * b)) & 0xff; h *= 1099511628211ull; }
+        char text[40];
+        std::snprintf(text, sizeof(text), "%016llx-%zu", static_cast<unsigned long long>(h), prefix.size());
+        return dir_ / text;
+    }
+    static std::vector<uint32_t> read(const fs::path & path) {
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        const auto bytes = in ? size_t(in.tellg()) : 0;
+        std::vector<uint32_t> ids(bytes / sizeof(uint32_t));
+        in.seekg(0);
+        if (ids.empty() || !in.read(reinterpret_cast<char *>(ids.data()), std::streamsize(ids.size() * sizeof(uint32_t)))) return {};
+        return ids;
+    }
+    void trim() const {  // keep the most recently used files_
+        std::vector<std::pair<fs::file_time_type, fs::path>> all;
+        std::error_code e;
+        for (const auto & entry : fs::directory_iterator(dir_, e))
+            if (entry.path().extension() == ".tokens") all.emplace_back(fs::last_write_time(entry.path(), e), entry.path());
+        std::sort(all.rbegin(), all.rend());
+        for (size_t k = size_t(files_); k < all.size(); ++k) {
+            auto state = all[k].second; state.replace_extension(".state");
+            fs::remove(all[k].second, e); fs::remove(state, e);
+        }
+    }
+    fs::path dir_;
+    int minimum_ = 256, files_ = 8;
+};
 }  // namespace
 
 struct Model::Impl {
@@ -39,6 +130,7 @@ struct Model::Impl {
     std::vector<uint32_t> snapshot;  // the tokens before the target's snapshot (empty: none)
     uint32_t turn = ~0u;  // <|im_start|>
     std::unique_ptr<android_backend::Speculator> speculator;
+    PromptCache cache;
     android_backend::SpeculativeStats stats;
     float temperature = 0.f, top_p = 1.f; int top_k = 0; std::mt19937_64 rng{0};
     bool ignore_eos = false;
@@ -155,14 +247,31 @@ void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int
         } else {
             i.restart();
             how = "started fresh";
+            if (const size_t loaded = i.cache.load(prompt, *i.target)) {
+                i.history.assign(prompt.begin(), prompt.begin() + loaded);
+                i.speculator->resync_draft();
+                how = "loaded the prompt cache";
+            }
         }
     }
     const size_t from = i.history.size();
+    // Save the state at the end of the system message (before the second turn marker) for later conversations.
+    if (i.cache.enabled()) {
+        const auto second = std::find(prompt.begin() + 1, prompt.end(), i.turn);
+        const size_t end = size_t(second - prompt.begin());
+        if (second != prompt.end() && end >= i.cache.minimum() && end > i.history.size()) {
+            const std::vector<uint32_t> prefix(prompt.begin(), second);
+            if (!i.cache.has(prefix)) {
+                i.prefill(std::vector<uint32_t>(prompt.begin() + i.history.size(), second));
+                i.cache.save(prefix, *i.target);
+            }
+        }
+    }
     size_t mark = prompt.size();
-    while (mark > from && prompt[mark - 1] != i.turn) --mark;
-    if (mark > from) {  // snapshot before the last turn marker
+    while (mark > i.history.size() && prompt[mark - 1] != i.turn) --mark;
+    if (mark > i.history.size()) {  // snapshot before the last turn marker
         --mark;
-        if (mark > from) i.prefill(std::vector<uint32_t>(prompt.begin() + from, prompt.begin() + mark));
+        if (mark > i.history.size()) i.prefill(std::vector<uint32_t>(prompt.begin() + i.history.size(), prompt.begin() + mark));
         i.target->snapshot();
         i.snapshot = i.history;
     }
