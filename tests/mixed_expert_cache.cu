@@ -342,6 +342,29 @@ static void run() {
         selected = &cache;
         std::puts("regrow: every floor bank grown to its target in place, experts kept, byte-exact PASS");
     }
+    {   // decode-time growth after a long prompt (10-28: 3.6 GB of VRAM stayed idle in a 128K decode at 133 slots / layer
+        // while Strata held ~172): every bank grows into the free memory, keeps its experts, and takes the layer's most routed
+        // missing experts into the new slots
+        auto same = [&](int, int id) { return source(1, id); };
+        MixedExpertCache g(layers, experts, hidden, ff, 2, budget, same, nullptr);
+        for (int l = 0; l < layers; ++l) { g.prepare(l, {0, 1}); g.wait_misses(); }
+        for (int l = 0; l < layers; ++l) for (int r = 0; r < 3; ++r) { g.prepare(l, {4}); g.wait_misses(); }  // 4 is this prompt's hot expert
+        std::vector<std::vector<int>> held(layers);
+        for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) if (g.resident(l, e)) held[size_t(l)].push_back(e);
+        const int n = g.grow_into(0, 4);
+        std::string bad;
+        for (int l = 0; l < layers; ++l) {
+            if (g.slots(l) != 4) bad += " layer " + std::to_string(l) + " at " + std::to_string(g.slots(l)) + " slots;";
+            for (int e : held[size_t(l)]) if (!g.resident(l, e)) bad += " layer " + std::to_string(l) + " lost " + std::to_string(e) + ";";
+            if (!g.resident(l, 4)) bad += " layer " + std::to_string(l) + " hot expert 4 not resident;";
+        }
+        require(n == layers && bad.empty(), ("grow_into: " + std::to_string(n) + " of " + std::to_string(layers) + " grown;" + bad).c_str());
+        require(g.grow_into(0, 4) == 0, "grow_into at the cap grew again");
+        selected = &g; compare(1, {4, 0}, true); selected = &cache;
+        for (int l = 0; l < layers; ++l) g.release_bank(l);  // the next long prompt borrows them back
+        require(g.stats().device_bytes == 0, "grown banks did not release");
+        std::puts("grow_into: banks grow into free memory with their experts and the hot ones, byte-exact, released by the next prompt PASS");
+    }
     std::puts("mixed IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS + IQ4_NL/Q2_0 banks: cold/warm/grouped/duplicates/per-expert/eviction/budget/clear PASS");
 }
 int main() { try { run(); return 0; } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; } }

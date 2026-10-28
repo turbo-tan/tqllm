@@ -105,6 +105,10 @@ public:
     // the slots set so far become each layer's target; a bank built while the free memory cannot hold the target gets the
     // largest count that fits, not below floor[layer]
     void set_layer_tiers(const std::vector<int> & floor, size_t keep_bytes = size_t(256) << 20);  // keep: left free beside the banks
+    // after a long prompt's prefill: every bank grows by the same number of slots into the device memory beyond keep_free
+    // (at most max_slots, at most every expert), keeps the experts it held and fills its new slots with the layer's most
+    // routed experts (this prompt's prefill counts included); the new size becomes its target. Returns the banks grown.
+    int grow_into(size_t keep_free, int max_slots);
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
     int regrow(size_t keep_free);  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
     int experts() const; int layers() const;

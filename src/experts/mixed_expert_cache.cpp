@@ -727,6 +727,33 @@ int MixedExpertCache::regrow(size_t keep_free) {
     }
     return n;
 }
+int MixedExpertCache::grow_into(size_t keep_free, int max_slots) {
+    auto & s = *state_;
+    if (s.layer_cap.empty()) s.layer_cap.assign(size_t(s.layers), s.capacity);  // uniform slots: the per-layer caps start equal
+    size_t per = 0; for (const auto & [l, b] : s.banks) per += s.slot_bytes(l);  // one more slot in every banked layer
+    size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+    if (!per || fr <= keep_free) return 0;
+    const int add = int((fr - keep_free) / per);
+    int n = 0;
+    for (int l = 0; l < s.layers && add > 0; ++l) {
+        const auto it = s.banks.find(l); if (it == s.banks.end()) continue;
+        const int cur = it->second->cap, cap = std::min({cur + add, max_slots, s.experts});
+        if (cap <= cur) continue;
+        std::vector<int> want; std::vector<char> in(size_t(s.experts), 0);
+        for (int id : it->second->ids) if (id >= 0) { want.push_back(id); in[size_t(id)] = 1; }
+        std::vector<int> order(size_t(s.experts)); for (int e = 0; e < s.experts; ++e) order[size_t(e)] = e;
+        const uint64_t * fq = s.frequency.data() + size_t(l) * s.experts;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return fq[a] > fq[b]; });
+        for (int e : order) { if (int(want.size()) >= cap) break; if (!in[size_t(e)] && fq[e] > 0) { want.push_back(e); in[size_t(e)] = 1; } }
+        release_bank(l); ++n;
+        s.layer_cap[size_t(l)] = cap;
+        if (!s.layer_target.empty()) s.layer_target[size_t(l)] = std::max(s.layer_target[size_t(l)], cap);
+        if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
+        s.planned[size_t(l)] = 1;  // built at this size, not sized again by choose_cap
+        if (!want.empty()) { (void) prepare(l, want); wait_misses(); }
+    }
+    return n;
+}
 int MixedExpertCache::experts() const { return state_->experts; }
 int MixedExpertCache::layers() const { return state_->layers; }
 bool MixedExpertCache::bank_ready(int layer) const { return state_->banks.count(layer) != 0; }
