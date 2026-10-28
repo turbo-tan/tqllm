@@ -358,6 +358,7 @@ if(TQLLM_CUDA)
   target_include_directories(test-tune-oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-tune-oom PRIVATE tqllm CUDA::cudart)
   add_test(NAME tune_oom COMMAND test-tune-oom)
+  set_tests_properties(tune_oom PROPERTIES RUN_SERIAL TRUE)  # fills the device: a test beside it (gdn_chunk) failed its own allocations
   add_executable(test-gsq-activation tests/gsq_activation.cu)
   target_include_directories(test-gsq-activation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-gsq-activation PRIVATE tqllm CUDA::cudart)
