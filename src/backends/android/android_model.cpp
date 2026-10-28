@@ -160,6 +160,8 @@ struct Model::Impl {
     int saved_pos = 0;
     std::vector<Saved> saved;
     std::vector<std::vector<Step>> steps;  // [layer][token since checkpoint]
+    int snapshot_pos = -1;
+    std::vector<Saved> snapshot;
     Batch attention(const std::string & p, const Batch & x, Layer & layer) {
         Input in{x};
         auto qg = mat(p + "attn_q.weight", in), k = mat(p + "attn_k.weight", in), v = mat(p + "attn_v.weight", in);
@@ -353,7 +355,7 @@ struct Model::Impl {
 Model::Model(const std::string & path, Options options) : impl_(std::make_unique<Impl>(path, options)) {}
 Model::~Model() = default;
 void Model::reset() {
-    impl_->pos = 0; impl_->logits.clear(); impl_->recording = false;
+    impl_->pos = 0; impl_->logits.clear(); impl_->recording = false; impl_->snapshot_pos = -1;
     for (auto & layer : impl_->cache) {
         std::fill(layer.history.begin(), layer.history.end(), 0.f);
         std::fill(layer.state.begin(), layer.state.end(), 0.f);
@@ -365,6 +367,25 @@ const std::vector<std::vector<float>> & Model::forward_batch(const std::vector<u
 }
 void Model::checkpoint() { impl_->checkpoint(); }
 void Model::rollback(int keep) { impl_->rollback(keep); }
+void Model::snapshot() {
+    auto & i = *impl_;
+    i.snapshot.resize(i.layers);
+    for (int l = 0; l < i.layers; ++l) {
+        if (i.cache[l].kv) continue;
+        i.snapshot[l].history = i.cache[l].history; i.snapshot[l].state = i.cache[l].state;
+    }
+    i.snapshot_pos = i.pos;
+}
+int Model::restore() {
+    auto & i = *impl_;
+    if (i.snapshot_pos < 0) return -1;
+    for (int l = 0; l < i.layers; ++l) {
+        if (i.cache[l].kv) continue;
+        i.cache[l].history = i.snapshot[l].history; i.cache[l].state = i.snapshot[l].state;
+    }
+    i.pos = i.snapshot_pos; i.logits.clear(); i.recording = false;
+    return i.pos;
+}
 int Model::position() const { return impl_->pos; }
 int Model::context() const { return impl_->options.context; }
 int Model::vocabulary() const { return impl_->vocab; }

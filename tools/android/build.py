@@ -23,9 +23,9 @@ def main():
                     '-DANDROID_PLATFORM=android-28', '-DANDROID_STL=c++_static',
                     '-DCMAKE_BUILD_TYPE=Release', '-DTQLLM_CUDA=OFF', '-DTQLLM_MLX=OFF',
                     '-DTQLLM_ANDROID=ON', '-DBUILD_TESTING=ON'], check=True)
-    subprocess.run(['cmake', '--build', str(build), '--target', 'tqandroid-run', 'test-android-native', 'test-android-packed',
+    subprocess.run(['cmake', '--build', str(build), '--target', 'tqandroid-run', 'tqserve', 'test-android-native', 'test-android-packed', 'test-android-batch',
                     '--parallel', str(args.jobs)], check=True)
-    print('Built:', build / 'tqandroid-run')
+    print('Built:', build / 'tqandroid-run', build / 'tqserve')
     print('This is an Android/arm64 binary. Execute it on the phone with adb or Termux.')
 
 

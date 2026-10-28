@@ -34,77 +34,87 @@ public:
     // Returns "eos", "length" or "stopped".
     const char * run(uint32_t next, int budget, const std::function<bool(uint32_t)> & emit, SpeculativeStats & stats) {
         int produced = 0;
+        std::vector<uint32_t> accepted;
         for (;;) {
             if (next == target_.eos()) return "eos";
             if (produced >= budget) return "length";
             if (!emit(next)) return "stopped";
             if (++produced >= budget) return "length";
-            const int room = std::min(target_.context() - target_.position() - 1, budget - produced);
-            if (room < 1) return "length";
-            const int limit = std::min(depth_, room - 1);
-            // Candidate proposals and their expected rate; plain decoding is the baseline.
-            std::vector<uint32_t> text = limit > 0 ? lookup(next, limit) : std::vector<uint32_t>{};
-            int text_k = 0, draft_k = 0;
-            double best = rate(0, 0.0, 0.0);
-            for (int k = 1; k <= int(text.size()); ++k)
-                if (rate(k, text_p(), 0.0) > best) { best = rate(k, text_p(), 0.0); text_k = k; }
-            if (draft_ && limit > 0) {
-                for (int k = 1; k <= limit; ++k)
-                    if (rate(k, draft_p(), draft_cost()) > best) { best = rate(k, draft_p(), draft_cost()); draft_k = k; text_k = 0; }
-                // Keep the draft estimate fresh: probe one token after a long plain or text-only stretch.
-                if (!draft_k && ++idle_ > 24) draft_k = 1, text_k = 0;
-            }
-            std::vector<uint32_t> proposal;
-            const bool from_draft = draft_k > 0;
-            if (from_draft) {
-                idle_ = 0;
-                sync_draft();
-                draft_->checkpoint();
-                const auto before = Clock::now();
-                uint32_t token = next;
-                for (int i = 0; i < draft_k; ++i) {
-                    token = greedy(draft_->forward(token));
-                    proposal.push_back(token);
-                    if (token == target_.eos()) break;
-                }
-                draft_ms_ = blend(draft_ms_, ms(before) / double(proposal.size()));
-            } else {
-                proposal.assign(text.begin(), text.begin() + text_k);
-            }
-            std::vector<uint32_t> batch{next};
-            batch.insert(batch.end(), proposal.begin(), proposal.end());
-            if (!proposal.empty()) target_.checkpoint();
-            const auto before = Clock::now();
-            const auto & logits = target_.forward_batch(batch);
-            int accepted = 0;
-            while (accepted < int(proposal.size()) && greedy(logits[accepted]) == proposal[accepted]) ++accepted;
-            const uint32_t bonus = greedy(logits[accepted]);
-            measure(int(batch.size()), ms(before));
-            ++stats.verifies;
-            if (!proposal.empty()) {
-                target_.rollback(accepted + 1);
-                const int tested = accepted + (accepted < int(proposal.size()) ? 1 : 0);
-                if (from_draft) {
-                    stats.drafted += int(proposal.size()); stats.accepted += accepted;
-                    draft_hits_ = 0.9 * draft_hits_ + accepted; draft_tries_ = 0.9 * draft_tries_ + tested;
-                    // The draft consumed next and proposal[0 .. size-2]; keep next and the accepted prefix.
-                    const int consumed = int(proposal.size());
-                    draft_->rollback(std::min(accepted + 1, consumed));
-                    synced_ = history_.size() + std::min(accepted + 1, consumed);
-                } else {
-                    stats.text_drafted += int(proposal.size()); stats.text_accepted += accepted;
-                    text_hits_ = 0.9 * text_hits_ + accepted; text_tries_ = 0.9 * text_tries_ + tested;
-                }
-            }
-            history_.push_back(next);
-            history_.insert(history_.end(), proposal.begin(), proposal.begin() + accepted);
-            for (int i = 0; i < accepted; ++i) {
-                if (proposal[i] == target_.eos()) return "eos";
-                if (!emit(proposal[i])) return "stopped";
+            if (!step(next, budget - produced, accepted, stats)) return "length";
+            for (uint32_t token : accepted) {
+                if (token == target_.eos()) return "eos";
+                if (!emit(token)) return "stopped";
                 if (++produced >= budget) return "length";
             }
-            next = bonus;
         }
+    }
+    // One decoding step after `next` (already emitted, not yet consumed): forwards it with a proposal, sets `accepted`
+    // to the agreeing proposal prefix (up to an EOS) and `next` to the target's token after them. At most `want` tokens
+    // follow `next` (accepted + the new next). False when nothing was forwarded: want < 1 or the context is full.
+    bool step(uint32_t & next, int want, std::vector<uint32_t> & accepted_out, SpeculativeStats & stats) {
+        accepted_out.clear();
+        const int room = std::min(target_.context() - target_.position() - 1, want);
+        if (room < 1) return false;
+        const int limit = std::min(depth_, room - 1);
+        // Candidate proposals and their expected rate; plain decoding is the baseline.
+        std::vector<uint32_t> text = limit > 0 ? lookup(next, limit) : std::vector<uint32_t>{};
+        int text_k = 0, draft_k = 0;
+        double best = rate(0, 0.0, 0.0);
+        for (int k = 1; k <= int(text.size()); ++k)
+            if (rate(k, text_p(), 0.0) > best) { best = rate(k, text_p(), 0.0); text_k = k; }
+        if (draft_ && limit > 0) {
+            for (int k = 1; k <= limit; ++k)
+                if (rate(k, draft_p(), draft_cost()) > best) { best = rate(k, draft_p(), draft_cost()); draft_k = k; text_k = 0; }
+            // Keep the draft estimate fresh: probe one token after a long plain or text-only stretch.
+            if (!draft_k && ++idle_ > 24) draft_k = 1, text_k = 0;
+        }
+        std::vector<uint32_t> proposal;
+        const bool from_draft = draft_k > 0;
+        if (from_draft) {
+            idle_ = 0;
+            sync_draft();
+            draft_->checkpoint();
+            const auto before = Clock::now();
+            uint32_t token = next;
+            for (int i = 0; i < draft_k; ++i) {
+                token = greedy(draft_->forward(token));
+                proposal.push_back(token);
+                if (token == target_.eos()) break;
+            }
+            draft_ms_ = blend(draft_ms_, ms(before) / double(proposal.size()));
+        } else {
+            proposal.assign(text.begin(), text.begin() + text_k);
+        }
+        std::vector<uint32_t> batch{next};
+        batch.insert(batch.end(), proposal.begin(), proposal.end());
+        if (!proposal.empty()) target_.checkpoint();
+        const auto before = Clock::now();
+        const auto & logits = target_.forward_batch(batch);
+        int accepted = 0;
+        while (accepted < int(proposal.size()) && greedy(logits[accepted]) == proposal[accepted]) ++accepted;
+        const uint32_t bonus = greedy(logits[accepted]);
+        measure(int(batch.size()), ms(before));
+        ++stats.verifies;
+        if (!proposal.empty()) {
+            target_.rollback(accepted + 1);
+            const int tested = accepted + (accepted < int(proposal.size()) ? 1 : 0);
+            if (from_draft) {
+                stats.drafted += int(proposal.size()); stats.accepted += accepted;
+                draft_hits_ = 0.9 * draft_hits_ + accepted; draft_tries_ = 0.9 * draft_tries_ + tested;
+                // The draft consumed next and proposal[0 .. size-2]; keep next and the accepted prefix.
+                const int consumed = int(proposal.size());
+                draft_->rollback(std::min(accepted + 1, consumed));
+                synced_ = history_.size() + std::min(accepted + 1, consumed);
+            } else {
+                stats.text_drafted += int(proposal.size()); stats.text_accepted += accepted;
+                text_hits_ = 0.9 * text_hits_ + accepted; text_tries_ = 0.9 * text_tries_ + tested;
+            }
+        }
+        history_.push_back(next);
+        history_.insert(history_.end(), proposal.begin(), proposal.begin() + accepted);
+        accepted_out.assign(proposal.begin(), proposal.begin() + accepted);
+        next = bonus;
+        return true;
     }
     // Feed the draft every history token it has not seen (it is fed lazily, only when it is about to draft).
     void sync_draft() {
@@ -118,6 +128,11 @@ public:
     }
     // The caller reset both models.
     void restart() { synced_ = history_.size(); }
+    // The caller moved the target back (history shortened): the draft starts over and catches up when next needed.
+    void resync_draft() {
+        if (draft_) draft_->reset();
+        synced_ = 0;
+    }
 
 private:
     using Clock = std::chrono::steady_clock;

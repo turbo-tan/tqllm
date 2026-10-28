@@ -37,3 +37,29 @@ done
 "$build/test-android-native"
 "$build/test-android-packed"
 printf 'Built %s\n' "$build/tqandroid-run"
+
+# tqserve (OpenAI-compatible HTTP server, the same tools/tqserve.cpp as the CUDA and MLX builds) over this backend
+mkdir -p "$build/generated"
+python3 - "$root" "$build/generated/monitor_page.hpp" <<'PY'
+import sys
+root, out = sys.argv[1], sys.argv[2]
+html = open(f"{root}/tools/serve/monitor.html").read().replace("@TQLLM_MONITOR_PANELS@", open(f"{root}/tools/serve/monitor_panels.js").read())
+page = open(f"{root}/tools/serve/monitor_page.hpp.in").read().replace("@TQLLM_MONITOR_HTML@", html)
+open(out, "w").write(page)
+PY
+commit=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)
+serve_flags=("${flags[@]}" -Wno-unused-parameter -DTQLLM_COMMIT="\"$commit\"" -I"$root" -I"$root/src" -I"$root/tools"
+             -I"$root/tools/serve" -I"$root/third_party/jinja" -I"$root/src/engine" -I"$root/src/formats/kv"
+             -I"$root/src/experts" -I"$root/src/spec" -I"$root/src/vision" -I"$build/generated")
+serve_sources=(tools/tqserve.cpp src/backends/android/model_android.cpp src/core/options.cpp src/kv/kv_store.cpp
+               tools/serve/jinja_template.cpp third_party/jinja/jinja/lexer.cpp third_party/jinja/jinja/parser.cpp
+               third_party/jinja/jinja/runtime.cpp third_party/jinja/jinja/string.cpp third_party/jinja/jinja/value.cpp)
+serve_objects=() pids=()
+for source in "${serve_sources[@]}"; do
+    object="$build/${source//\//_}.o"
+    "$compiler" "${serve_flags[@]}" -c "$root/$source" -o "$object" & pids+=($!)
+    serve_objects+=("$object")
+done
+for pid in "${pids[@]}"; do wait "$pid"; done
+"$compiler" "${flags[@]}" "${serve_objects[@]}" "${objects[@]}" -o "$build/tqserve"
+printf 'Built %s\n' "$build/tqserve"

@@ -26,6 +26,10 @@ public:
     // first `keep` of them had been forwarded. Attention KV past the position is simply overwritten later.
     void checkpoint();
     void rollback(int keep);
+    // One saved position besides checkpoint(): snapshot() copies the recurrent state, restore() returns to it and
+    // gives its position (-1: none taken). Attention KV past it is overwritten later, as after rollback.
+    void snapshot();
+    int restore();
     int position() const;
     int context() const;
     int vocabulary() const;

@@ -86,6 +86,18 @@ add_library(tqjinja STATIC third_party/jinja/jinja/lexer.cpp third_party/jinja/j
             third_party/jinja/jinja/string.cpp third_party/jinja/jinja/value.cpp tools/serve/jinja_template.cpp)
 target_include_directories(tqjinja PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/jinja ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
 set_target_properties(tqjinja PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+if(TQLLM_ANDROID)  # tqserve over the native Android/Arm CPU backend (src/backends/android/model_android.cpp)
+  execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+                  OUTPUT_VARIABLE TQLLM_ANDROID_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT TQLLM_ANDROID_COMMIT)
+    set(TQLLM_ANDROID_COMMIT "unknown")
+  endif()
+  add_executable(tqserve tools/tqserve.cpp src/backends/android/model_android.cpp)
+  target_include_directories(tqserve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  target_link_libraries(tqserve PRIVATE tqandroid tqllm tqjinja Threads::Threads)
+  target_compile_definitions(tqserve PRIVATE TQLLM_COMMIT="${TQLLM_ANDROID_COMMIT}")
+  install(TARGETS tqserve RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 get_property(tqllm_tests_before_cuda DIRECTORY PROPERTY TESTS)
 if(TQLLM_CUDA)
   if(CMAKE_VERSION VERSION_LESS 3.25)  # CUDA C++20 dialect
