@@ -63,9 +63,9 @@ struct Rows {
 
 // gather on the device and compare positions and every copied row with the CPU model
 static void expect_gather(tqllm_cuda::QsaGather & g, const Selection & s, const Rows & r, const void * keys, const void * values,
-                          cudaStream_t stream = nullptr) {
+                          cudaStream_t stream = nullptr, int host_cells = 0) {
     Device<int32_t> dp(s.positions.size()); Device<uint8_t> dm(s.valid.size()); dp.put(s.positions); dm.put(s.valid);
-    g.run(dp.p, dm.p, s.tokens, s.width, s.first, keys, values, stream);
+    g.run(dp.p, dm.p, s.tokens, s.width, s.first, keys, values, stream, host_cells);
     ck(cudaStreamSynchronize(stream)); ck(cudaDeviceSynchronize());
     const Model m = reference(s);
     std::vector<int32_t> got(s.positions.size());
@@ -163,6 +163,97 @@ static void ordered_on_its_stream() {
     ck(cudaStreamDestroy(stream));
 }
 
+
+// Row cache (cache_rows > 0): rows of cells below host_cells (K/V in host memory) are kept in a direct-mapped device cache
+// between calls. Expectations: R1 every call's compact rows equal the uncached gather's (checked against the CPU model);
+// R2 a repeated selection reads every host row from the cache; R3 two cells of one call on the same slot stay correct in
+// later calls (one claims the slot, no torn row / tag); R4 rows of device cells (>= host_cells) are never cached.
+struct HostRows {
+    void * hk = nullptr, * hv = nullptr, * dk = nullptr, * dv = nullptr;
+    explicit HostRows(const Rows & r) {
+        ck(cudaHostAlloc(&hk, r.keys.size() * sizeof(__nv_bfloat16), cudaHostAllocMapped));
+        ck(cudaHostAlloc(&hv, r.values.size() * sizeof(__nv_bfloat16), cudaHostAllocMapped));
+        std::memcpy(hk, r.keys.data(), r.keys.size() * sizeof(__nv_bfloat16)); std::memcpy(hv, r.values.data(), r.values.size() * sizeof(__nv_bfloat16));
+        ck(cudaHostGetDevicePointer(&dk, hk, 0)); ck(cudaHostGetDevicePointer(&dv, hv, 0));
+    }
+    ~HostRows() { cudaFreeHost(hk); cudaFreeHost(hv); }
+};
+
+static Selection shifted(int tokens, int width, int first, int shift) {  // the next step's selection: mostly the same cells
+    Selection s(tokens, width, first);
+    for (int t = 0; t < tokens; ++t) for (int w = 0; w < width; ++w) {
+        const size_t i = size_t(t) * width + w;
+        s.valid[i] = (w + t) % 11 != 0;
+        s.positions[i] = (w * 7 + t * 3 + (w % 5 == 0 ? shift * 13 : 0)) % (first + t);
+    }
+    return s;
+}
+
+static void cache_matches_uncached_over_steps() {
+    const Rows r(20100, 512); HostRows h(r);
+    tqllm_cuda::QsaGather g(20100, r.row_bytes(), 4096);
+    for (int step = 0; step < 6; ++step) expect_gather(g, shifted(4, 2048, 20000 + step * 3, step), r, h.dk, h.dv, nullptr, 15000);
+}
+
+static void repeat_selection_hits_cache() {
+    const Rows r(20100, 512); HostRows h(r);
+    tqllm_cuda::QsaGather g(20100, r.row_bytes(), 32768);  // more slots than cells: no conflicts
+    const Selection s = shifted(4, 2048, 20000, 0);
+    expect_gather(g, s, r, h.dk, h.dv, nullptr, 15000);
+    const auto first = g.stats();
+    expect_gather(g, s, r, h.dk, h.dv, nullptr, 15000);
+    const auto second = g.stats();
+    const uint64_t host_rows = second.host_rows - first.host_rows, hits = second.cache_hits - first.cache_hits;
+    require(host_rows > 0 && hits == host_rows, "repeat: " + std::to_string(hits) + " of " + std::to_string(host_rows) + " host rows from the cache");
+}
+
+static void same_slot_conflict_is_safe() {
+    const Rows r(5000, 512); HostRows h(r);
+    tqllm_cuda::QsaGather g(5000, r.row_bytes(), 64);
+    Selection both(1, 8, 4000);  // cells 10 and 74 (and 138, 202) share slot 10 of 64
+    const int cells[8] = {10, 74, 138, 202, 11, 75, 300, 364};
+    for (int w = 0; w < 8; ++w) { both.positions[size_t(w)] = cells[w]; both.valid[size_t(w)] = 1; }
+    expect_gather(g, both, r, h.dk, h.dv, nullptr, 4000);
+    for (int w = 0; w < 8; ++w) {
+        Selection one(1, 1, 4000); one.positions[0] = cells[w]; one.valid[0] = 1;
+        expect_gather(g, one, r, h.dk, h.dv, nullptr, 4000);
+    }
+}
+
+static void device_cells_not_cached() {
+    const Rows r(5000, 512); HostRows h(r);
+    tqllm_cuda::QsaGather g(5000, r.row_bytes(), 8192);
+    Selection s(2, 256, 4000);
+    for (size_t i = 0; i < s.positions.size(); ++i) { s.positions[i] = 1000 + int(i % 2900); s.valid[i] = 1; }
+    expect_gather(g, s, r, h.dk, h.dv, nullptr, 1000);
+    const auto a = g.stats();
+    expect_gather(g, s, r, h.dk, h.dv, nullptr, 1000);
+    const auto b = g.stats();
+    require(b.host_rows == a.host_rows && b.cache_hits == a.cache_hits, "device cells read or cached as host rows");
+}
+
+
+// R5: K/V rows rewritten at or below the cached cells (a new prompt that shares only part of the old one) are never
+// served stale: run() with written_from at or below a cached cell, or with other K/V buffers, empties the cache
+static void rewrite_invalidates_cache() {
+    Rows r(5000, 512); HostRows h(r);
+    tqllm_cuda::QsaGather g(5000, r.row_bytes(), 8192);
+    Selection s(1, 64, 4000);
+    for (int w = 0; w < 64; ++w) { s.positions[size_t(w)] = 100 + w; s.valid[size_t(w)] = 1; }
+    expect_gather(g, s, r, h.dk, h.dv, nullptr, 4000);  // cells 100..163 cached
+    for (size_t i = size_t(120) * r.row; i < size_t(121) * r.row; ++i) {  // the new prompt's row 120 differs
+        r.keys[i] = __float2bfloat16(7.f); r.values[i] = __float2bfloat16(-7.f);
+    }
+    std::memcpy(h.hk, r.keys.data(), r.keys.size() * sizeof(__nv_bfloat16)); std::memcpy(h.hv, r.values.data(), r.values.size() * sizeof(__nv_bfloat16));
+    Device<int32_t> dp(s.positions.size()); Device<uint8_t> dm(s.valid.size()); dp.put(s.positions); dm.put(s.valid);
+    g.run(dp.p, dm.p, s.tokens, s.width, s.first, h.dk, h.dv, nullptr, 4000, 120);  // this call wrote from position 120 on
+    ck(cudaDeviceSynchronize());
+    const Model m = reference(s); const int j = m.map[120];
+    std::vector<__nv_bfloat16> k(r.row);
+    ck(cudaMemcpy(k.data(), static_cast<const char *>(g.keys()) + size_t(j) * r.row_bytes(), r.row_bytes(), cudaMemcpyDeviceToHost));
+    require(!std::memcmp(k.data(), &r.keys[size_t(120) * r.row], r.row_bytes()), "a rewritten row came from the cache (stale)");
+}
+
 static void rejects_bad_shapes() {
     auto throws = [](const std::function<void()> & f) { try { f(); } catch (const std::invalid_argument &) { return true; } return false; };
     require(throws([] { tqllm_cuda::QsaGather g(0, 512); }), "zero cells");
@@ -203,6 +294,11 @@ int main() {
         {"ordered_on_its_stream", ordered_on_its_stream},
         {"rejects_bad_shapes", rejects_bad_shapes},
         {"attention_bits_unchanged", attention_bits_unchanged},
+        {"cache_matches_uncached_over_steps", cache_matches_uncached_over_steps},
+        {"repeat_selection_hits_cache", repeat_selection_hits_cache},
+        {"same_slot_conflict_is_safe", same_slot_conflict_is_safe},
+        {"device_cells_not_cached", device_cells_not_cached},
+        {"rewrite_invalidates_cache", rewrite_invalidates_cache},
     };
     int failed = 0;
     for (const auto & c : cases) {

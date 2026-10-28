@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstddef>
+#include <climits>
 #include <cstdint>
 
 namespace tqllm_cuda {
@@ -216,13 +217,16 @@ private:
 // identical to reading the rows in place.
 class QsaGather {
 public:
-    QsaGather(int max_cells, size_t row_bytes);
+    // cache_rows > 0: rows of cells below run()'s host_cells stay in a direct-mapped device cache between calls
+    QsaGather(int max_cells, size_t row_bytes, int cache_rows = 0);
     ~QsaGather();
     QsaGather(const QsaGather &) = delete;
     QsaGather & operator=(const QsaGather &) = delete;
     // positions / valid [tokens][width]; query t sees cells below first_cells + t; keys / values: row_bytes per cell
     void run(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
-             const void * keys, const void * values, cudaStream_t stream);
+             const void * keys, const void * values, cudaStream_t stream, int host_cells = 0, int written_from = INT_MAX);
+    struct Stats { uint64_t host_rows = 0, cache_hits = 0; };  // rows of host cells copied, of those served by the cache
+    Stats stats() const;
     const void * keys() const { return k_; }
     const void * values() const { return v_; }
     const int32_t * positions() const { return pos_; }  // [tokens][width], -1 for rows the attention skips
@@ -231,5 +235,8 @@ private:
     int max_cells_ = 0, max_rows_ = 0; size_t row_bytes_ = 0, temp_bytes_ = 0;
     int * flags_ = nullptr; int * map_ = nullptr; void * temp_ = nullptr;
     void * k_ = nullptr; void * v_ = nullptr; int32_t * pos_ = nullptr;
+    int cache_rows_ = 0; int * tag_ = nullptr; int * claim_ = nullptr; void * ck_ = nullptr; void * cv_ = nullptr;
+    unsigned long long * counters_ = nullptr;  // host rows, cache hits
+    const void * cached_keys_ = nullptr; int cached_below_ = 0;  // the K/V the cache holds rows of, cells it may hold
 };
 } // namespace tqllm_cuda

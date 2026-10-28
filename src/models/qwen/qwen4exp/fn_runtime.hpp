@@ -140,6 +140,7 @@ inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled 
 inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
 inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
+inline uint64_t g_kv_epoch = 0;   // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
 // TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
 inline const std::vector<int32_t> * g_hot_map = nullptr;

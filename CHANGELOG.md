@@ -35,6 +35,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   prompt rebuilds each bank at its target in place with the experts it held instead of releasing it (the refill took the
   freed memory first and decode then built those banks by evicting others). RTX 3090, 128K, 109 GB cap: 69-71 -> 77-78
   tok/s on a repeat request, zero bank rebuilds during decode.
+- Flash-Next with `TQFN_KV_HOST=1`: each attention layer keeps the host K/V rows it read recently in a 16K-row device cache
+  (consecutive steps select mostly the same positions); a new request starts with an empty cache. RTX 3090, 128K, 109 GB
+  cap: 76-78 -> 82 tok/s on a repeat request, output identical.
 - Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
 - Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
 - Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact

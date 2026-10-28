@@ -42,7 +42,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
-    S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX;
+    S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX; ++g_kv_epoch;
     // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
     // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
     // with TQFN_KV_HOST the K/V older than the kept window lives in host memory after the prompt, so only the window's

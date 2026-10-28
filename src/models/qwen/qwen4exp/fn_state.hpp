@@ -54,6 +54,11 @@ struct KvBuf {
     }
     size_t page_rows(size_t row) const { return page / row; }
     bool any_host() const { for (auto h : on_host) if (h) return true; return false; }
+    // rows (of row_bytes) of the leading pages in host memory: kv_to_host moves the oldest positions
+    int host_rows(size_t row_bytes) const {
+        size_t n = 0; while (n < on_host.size() && on_host[n]) ++n;
+        return int(n * page / row_bytes);
+    }
 };
 // The K/V format of the attention layers (src/formats/kv): TQFN_KV=<name>, default bf16. Flash-Next attends sparsely, so
 // the format must implement attend_selected().
