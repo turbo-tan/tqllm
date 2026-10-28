@@ -10,7 +10,7 @@ compiler=${CXX:-clang++}
 command -v "$compiler" >/dev/null
 mkdir -p "$build"
 build=$(cd -- "$build" && pwd)
-flags=(-O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16 -std=c++20 -pthread -Wall -Wextra -Wpedantic
+flags=(-O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16+i8mm -std=c++20 -pthread -Wall -Wextra -Wpedantic
        -I"$root/include" -I"$root/src/core" -I"$root/src/core/hf" -I"$root/src/kv"
        -I"$root/src/formats/weight" -I"$root/src/backends/android"
        -I"$root/third_party/nlohmann" -I"$root/third_party")
@@ -25,10 +25,11 @@ for source in "${sources[@]}"; do
     "$compiler" "${flags[@]}" -c "$root/$source" -o "$object"
     objects+=("$object")
 done
-for entry in tools/tqandroid_run.cpp tests/android_native.cpp tests/android_packed.cpp; do
+for entry in tools/tqandroid_run.cpp tests/android_native.cpp tests/android_packed.cpp tests/android_batch.cpp; do
     case "$entry" in
         tools/*) output=tqandroid-run ;;
         tests/android_native.cpp) output=test-android-native ;;
+        tests/android_batch.cpp) output=test-android-batch ;;
         *) output=test-android-packed ;;
     esac
     "$compiler" "${flags[@]}" "$root/$entry" "${objects[@]}" -o "$build/$output"

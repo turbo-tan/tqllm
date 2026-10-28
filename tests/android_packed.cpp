@@ -23,14 +23,14 @@ void fixtures() {
     std::vector<char> filename(pattern.begin(), pattern.end()); filename.push_back(0);
     int fd = mkstemp(filename.data()); check(fd >= 0, "packed test temporary file"); close(fd);
     struct Cleanup { const char * path; ~Cleanup() { unlink(path); } } cleanup{filename.data()};
-    for (uint32_t type : {GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0}) {
+    for (uint32_t type : {GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS}) {
         for (int cols : {256, 768, 3072}) {
             uint64_t block, bytes; check(gguf_block_layout(type, block, bytes), "block layout");
             std::vector<unsigned char> data(size_t(cols) / block * bytes * 7);
             uint32_t rng = 1234567;
             for (auto & v : data) { rng = rng * 1664525u + 1013904223u; v = uint8_t(rng >> 24); }
             for (size_t k = 0; k < data.size(); k += bytes) {
-                const size_t scale = k + (type == GGML_Q6_K ? 208 : 0);
+                const size_t scale = k + (type == GGML_Q6_K ? 208 : type == GGML_Q3_K ? 108 : 0);
                 data[scale] = uint8_t(k); data[scale + 1] = 0x24;
                 if (type == GGML_Q4_K || type == GGML_Q5_K) { data[k + 2] = uint8_t(k >> 3); data[k + 3] = 0x20; }
             }
@@ -58,6 +58,22 @@ void fixtures() {
                     double bound = 0.;
                     for (int i = 0; i < cols; ++i) bound += std::abs(weights[i]) * q.d[i / 256] * 0.5;
                     check(std::abs(approx[r] - exact[r]) <= bound * 1.001 + 1e-4, "int8 dot exceeds rounding bound");
+                }
+                // Any batch reproduces each activation's single result bit for bit.
+                std::vector<HostQ8> qs(5);
+                for (int b = 0; b < 5; ++b) {
+                    std::vector<float> xb(cols);
+                    for (int i = 0; i < cols; ++i) xb[i] = float((i * (b + 3)) % 29 - 14) * .04f;
+                    host_quantize_q8(xb.data(), cols, qs[b]);
+                }
+                for (int count = 1; count <= 5; ++count) {
+                    std::vector<const HostQ8 *> xs;
+                    for (int b = 0; b < count; ++b) xs.push_back(&qs[b]);
+                    const auto batch = matrix.multiply(xs, executor);
+                    for (int b = 0; b < count; ++b) {
+                        const auto one = matrix.multiply(qs[b], executor);
+                        check(std::memcmp(one.data(), batch[b].data(), one.size() * sizeof(float)) == 0, "batched int8 differs");
+                    }
                 }
                 std::cout << "int8_oracle type=" << type << " cols=" << cols << " PASS\n";
             }

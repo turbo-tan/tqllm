@@ -75,14 +75,33 @@ def cpu():
     return ", ".join(f"{n}x {f:.2f} GHz" for f, n in sorted(groups.items(), reverse=True))
 
 
+# Samsung leaves the marketing-name properties empty; map the model-number prefix instead.
+SAMSUNG_NAMES = {"SM-S938": "Galaxy S25 Ultra", "SM-S936": "Galaxy S25+", "SM-S931": "Galaxy S25",
+                 "SM-S937": "Galaxy S25 Edge", "SM-S928": "Galaxy S24 Ultra", "SM-S926": "Galaxy S24+",
+                 "SM-S921": "Galaxy S24", "SM-F966": "Galaxy Z Fold7", "SM-F766": "Galaxy Z Flip7"}
+
+
+def marketing_name(number):
+    for key in ("ro.product.marketname", "ro.product.vendor.marketname", "ro.config.marketing_name"):
+        if prop(key):
+            return prop(key)
+    return next((name for prefix, name in SAMSUNG_NAMES.items() if number.startswith(prefix)), "")
+
+
+def one_ui(value):
+    # ro.build.version.oneui encodes 8.0 as 80000 (major * 10000 + minor * 100).
+    return f"{int(value) // 10000}.{int(value) // 100 % 100}" if value.isdigit() else value or "?"
+
+
 def phone_facts():
     facts = []
-    model = " ".join(x for x in (prop("ro.product.manufacturer").title(), prop("ro.product.marketname") or prop("ro.product.model")) if x)
-    if model:
-        facts.append(f"Phone: {model} (model number {prop('ro.product.model')})")
+    number = prop("ro.product.model")
+    if number:
+        maker = prop("ro.product.manufacturer").title()
+        facts.append(f"Phone: {' '.join(x for x in (maker, marketing_name(number) or number) if x)} (model number {number})")
     android = prop("ro.build.version.release")
     if android:
-        facts.append(f"Android {android}, One UI {prop('ro.build.version.oneui') or '?'}, security patch {prop('ro.build.version.security_patch') or '?'}, build {prop('ro.build.display.id') or '?'}")
+        facts.append(f"Android {android}, One UI {one_ui(prop('ro.build.version.oneui'))}, security patch {prop('ro.build.version.security_patch') or '?'}, build {prop('ro.build.display.id') or '?'}")
     soc = prop("ro.soc.model") or prop("ro.board.platform")
     facts.append(f"Chip: {soc + ', ' if soc else ''}CPU {cpu()}")
     mem = meminfo()
@@ -94,8 +113,7 @@ def phone_facts():
             facts.append(f"{label}: {s[0]:.1f} GB free of {s[1]:.0f} GB")
             break
     b = battery()
-    if b:
-        facts.append(f"Battery: {b}")
+    facts.append(f"Battery: {b}" if b else "Battery: not readable (needs the Termux:API app and package)")
     facts.append(f"Checked at {time.strftime('%Y-%m-%d %H:%M')}")
     return facts
 
@@ -246,7 +264,7 @@ def main():
     p.add_argument("--model", default=installed.get("model") or str(Path.home() / "tqllm-android/models/Qwen3.5-4B-Q4_K_M.gguf"))
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--threads", type=int, default=6)
     p.add_argument("--context", type=int, default=4096)
     p.add_argument("--max-tokens", type=int, default=512)
     a = p.parse_args()

@@ -130,48 +130,69 @@ struct Model::Impl {
             }
         }
     }
-    // One int8 copy of a projection input, shared by every matrix that reads it.
+    using Batch = std::vector<Vec>;
+    // One int8 copy of each projection input, shared by every matrix that reads it.
     struct Input {
-        const Vec & x;
-        HostQ8 q;
-        bool quantized = false;
+        const Batch & x;
+        std::vector<HostQ8> q;
     };
-    Vec mat(const std::string & name, Input & in) {
+    Batch mat(const std::string & name, Input & in) {
         const auto & m = matrices.at(name);
-        if (options.exact || !m.int8_ready()) return m.multiply(in.x, executor);
-        if (!in.quantized) { host_quantize_q8(in.x.data(), int(in.x.size()), in.q); in.quantized = true; }
-        return m.multiply(in.q, executor);
+        Batch out;
+        if (options.exact || !m.int8_ready()) {
+            for (const auto & x : in.x) out.push_back(m.multiply(x, executor));
+            return out;
+        }
+        if (in.q.empty()) {
+            in.q.resize(in.x.size());
+            for (size_t i = 0; i < in.x.size(); ++i) host_quantize_q8(in.x[i].data(), int(in.x[i].size()), in.q[i]);
+        }
+        std::vector<const HostQ8 *> xs;
+        for (const auto & q : in.q) xs.push_back(&q);
+        return m.multiply(xs, executor);
     }
-    Vec mat(const std::string & name, const Vec & x) { Input in{x}; return mat(name, in); }
-    Vec attention(const std::string & p, const Vec & x, Layer & layer) {
+    Batch mat(const std::string & name, const Batch & x) { Input in{x}; return mat(name, in); }
+    // Speculative decoding: states saved at checkpoint() and the recurrent inputs of every token since then, so
+    // rollback(keep) restores and replays only the GDN recurrence of the kept tokens (no projection runs again).
+    struct Step { Vec qkv, filtered, decay, b; };
+    struct Saved { Vec history, state; };
+    bool recording = false;
+    int saved_pos = 0;
+    std::vector<Saved> saved;
+    std::vector<std::vector<Step>> steps;  // [layer][token since checkpoint]
+    Batch attention(const std::string & p, const Batch & x, Layer & layer) {
         Input in{x};
         auto qg = mat(p + "attn_q.weight", in), k = mat(p + "attn_k.weight", in), v = mat(p + "attn_v.weight", in);
-        for (int h = 0; h < heads; ++h) {
-            rms(qg.data() + size_t(h) * 2 * hd, scalars.at(p + "attn_q_norm.weight"), eps);
-            rope(qg.data() + size_t(h) * 2 * hd, rot, pos, theta);
+        const int count = int(x.size());
+        for (int t = 0; t < count; ++t) {
+            for (int h = 0; h < heads; ++h) {
+                rms(qg[t].data() + size_t(h) * 2 * hd, scalars.at(p + "attn_q_norm.weight"), eps);
+                rope(qg[t].data() + size_t(h) * 2 * hd, rot, pos + t, theta);
+            }
+            for (int h = 0; h < kvheads; ++h) {
+                rms(k[t].data() + h * hd, scalars.at(p + "attn_k_norm.weight"), eps);
+                rope(k[t].data() + h * hd, rot, pos + t, theta);
+            }
+            layer.kv->write(pos + t, k[t], v[t]);
         }
-        for (int h = 0; h < kvheads; ++h) {
-            rms(k.data() + h * hd, scalars.at(p + "attn_k_norm.weight"), eps);
-            rope(k.data() + h * hd, rot, pos, theta);
-        }
-        layer.kv->write(pos, k, v);
-        Vec out(heads * hd);
-        executor.rows(heads, [&](int begin, int end) {
-            Vec score(pos + 1);
-            for (int h = begin; h < end; ++h) {
+        Batch out(count, Vec(heads * hd));
+        executor.rows(heads * count, [&](int begin, int end) {
+            Vec score(pos + count);
+            for (int item = begin; item < end; ++item) {
+                const int h = item % heads, t = item / heads, last = pos + t;
                 const int offset = (h / (heads / kvheads)) * hd;
-                const float * q = qg.data() + size_t(h) * 2 * hd;
+                const float * q = qg[t].data() + size_t(h) * 2 * hd;
                 float maximum = -std::numeric_limits<float>::infinity();
-                for (int t = 0; t <= pos; ++t) {
-                    score[t] = host_dot(q, layer.kv->key(t, offset), hd) / std::sqrt(float(hd));
-                    maximum = std::max(maximum, score[t]);
+                for (int i = 0; i <= last; ++i) {
+                    score[i] = host_dot(q, layer.kv->key(i, offset), hd) / std::sqrt(float(hd));
+                    maximum = std::max(maximum, score[i]);
                 }
                 float sum = 0.f;
-                for (float & s : score) { s = std::exp(s - maximum); sum += s; }
-                float * y = out.data() + h * hd;
-                for (int t = 0; t <= pos; ++t) {
-                    const float * value = layer.kv->value(t, offset);
-                    const float a = score[t] / sum;
+                for (int i = 0; i <= last; ++i) { score[i] = std::exp(score[i] - maximum); sum += score[i]; }
+                float * y = out[t].data() + h * hd;
+                for (int i = 0; i <= last; ++i) {
+                    const float * value = layer.kv->value(i, offset);
+                    const float a = score[i] / sum;
                     for (int j = 0; j < hd; ++j) y[j] += a * value[j];
                 }
                 for (int j = 0; j < hd; ++j) y[j] *= sigmoid(q[hd + j]);
@@ -179,12 +200,10 @@ struct Model::Impl {
         });
         return mat(p + "attn_output.weight", out);
     }
-    Vec gdn(const std::string & p, const Vec & x, Layer & layer) {
-        Input in{x};
-        auto qkv = mat(p + "attn_qkv.weight", in), z = mat(p + "attn_gate.weight", in);
-        auto alpha = mat(p + "ssm_alpha.weight", in), beta = mat(p + "ssm_beta.weight", in);
+    // Causal conv over the stored history, then the per-head L2 norms; updates the history.
+    Vec convolve(const std::string & p, const Vec & qkv, Layer & layer) {
         const int width = int(qkv.size());
-        Vec filtered(width), out(vh * dv);
+        Vec filtered(width);
         const auto & cw = scalars.at(p + "ssm_conv1d.weight");
         for (int j = 0; j < width; ++j) {
             float s = qkv[j] * cw[size_t(j) * conv + conv - 1];
@@ -197,61 +216,155 @@ struct Model::Impl {
             l2(filtered.data() + h * dk, dk, 1.f / std::sqrt(float(dk)));
             l2(filtered.data() + (kh + h) * dk, dk, 1.f);
         }
+        return filtered;
+    }
+    // One state row: decay, delta rule with key k and value v; returns the updated row.
+    void delta_row(float * state, const float * k, float v, float decay, float b) const {
+        for (int j = 0; j < dk; ++j) state[j] *= decay;
+        const float delta = (v - host_dot(state, k, dk)) * b;
+        for (int j = 0; j < dk; ++j) state[j] += delta * k[j];
+    }
+    Batch gdn(const std::string & p, const Batch & x, Layer & layer, int l) {
+        Input in{x};
+        auto qkv = mat(p + "attn_qkv.weight", in), z = mat(p + "attn_gate.weight", in);
+        auto alpha = mat(p + "ssm_alpha.weight", in), beta = mat(p + "ssm_beta.weight", in);
+        const int count = int(x.size());
+        Batch filtered(count), decay(count, Vec(vh)), gate(count, Vec(vh));
+        const auto & bias = scalars.at(p + "ssm_dt.bias");
+        const auto & a = scalars.at(p + "ssm_a");
+        for (int t = 0; t < count; ++t) {
+            filtered[t] = convolve(p, qkv[t], layer);
+            for (int h = 0; h < vh; ++h) {
+                const float dt = alpha[t][h] + bias[h];
+                const float softplus = std::max(dt, 0.f) + std::log1p(std::exp(-std::abs(dt)));
+                decay[t][h] = std::exp(softplus * a[h]); gate[t][h] = sigmoid(beta[t][h]);
+            }
+            if (recording) steps[l].push_back({qkv[t], filtered[t], decay[t], gate[t]});
+        }
+        Batch out(count, Vec(vh * dv));
+        // Each head's state rows stay in cache across the whole batch.
         executor.rows(vh, [&](int begin, int end) {
             for (int h = begin; h < end; ++h) {
-                const float dt = alpha[h] + scalars.at(p + "ssm_dt.bias")[h];
-                const float softplus = std::max(dt, 0.f) + std::log1p(std::exp(-std::abs(dt)));
-                const float decay = std::exp(softplus * scalars.at(p + "ssm_a")[h]), b = sigmoid(beta[h]);
-                const float * q = filtered.data() + (h % kh) * dk;
-                const float * k = filtered.data() + (kh + h % kh) * dk;
                 for (int r = 0; r < dv; ++r) {
                     float * state = layer.state.data() + (size_t(h) * dv + r) * dk;
-                    for (int j = 0; j < dk; ++j) state[j] *= decay;
-                    const float delta = (filtered[2 * kh * dk + h * dv + r] - host_dot(state, k, dk)) * b;
-                    for (int j = 0; j < dk; ++j) state[j] += delta * k[j];
-                    out[h * dv + r] = host_dot(state, q, dk);
+                    for (int t = 0; t < count; ++t) {
+                        const float * f = filtered[t].data();
+                        delta_row(state, f + (kh + h % kh) * dk, f[2 * kh * dk + h * dv + r], decay[t][h], gate[t][h]);
+                        out[t][h * dv + r] = host_dot(state, f + (h % kh) * dk, dk);
+                    }
                 }
-                rms(out.data() + h * dv, scalars.at(p + "ssm_norm.weight"), eps);
-                for (int j = 0; j < dv; ++j) out[h * dv + j] *= z[h * dv + j] * sigmoid(z[h * dv + j]);
+                for (int t = 0; t < count; ++t) {
+                    rms(out[t].data() + h * dv, scalars.at(p + "ssm_norm.weight"), eps);
+                    for (int j = 0; j < dv; ++j) out[t][h * dv + j] *= z[t][h * dv + j] * sigmoid(z[t][h * dv + j]);
+                }
             }
         });
         return mat(p + "ssm_out.weight", out);
     }
-    const Vec & forward(uint32_t token, bool head) {
-        if (token >= uint32_t(vocab) || pos >= options.context) throw std::out_of_range("native token or context limit");
-        auto x = matrices.at("token_embd.weight").row(int(token));
+    // heads: 0 none, 1 the last token, 2 every token.
+    const Batch & run(const std::vector<uint32_t> & tokens, int head_mode) {
+        if (tokens.empty()) throw std::invalid_argument("native forward needs a token");
+        if (pos + int(tokens.size()) > options.context) throw std::out_of_range("native token or context limit");
+        for (auto token : tokens) if (token >= uint32_t(vocab)) throw std::out_of_range("native token or context limit");
+        const int count = int(tokens.size());
+        Batch x;
+        for (auto token : tokens) x.push_back(matrices.at("token_embd.weight").row(int(token)));
         for (int l = 0; l < layers; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
-            auto n = x; rms(n.data(), scalars.at(p + "attn_norm.weight"), eps);
-            auto y = cache[l].kv ? attention(p, n, cache[l]) : gdn(p, n, cache[l]);
-            for (int j = 0; j < hidden; ++j) x[j] += y[j];
-            n = x; rms(n.data(), scalars.at(p + "post_attention_norm.weight"), eps);
+            Batch n = x;
+            for (auto & v : n) rms(v.data(), scalars.at(p + "attn_norm.weight"), eps);
+            auto y = cache[l].kv ? attention(p, n, cache[l]) : gdn(p, n, cache[l], l);
+            for (int t = 0; t < count; ++t) for (int j = 0; j < hidden; ++j) x[t][j] += y[t][j];
+            n = x;
+            for (auto & v : n) rms(v.data(), scalars.at(p + "post_attention_norm.weight"), eps);
             Input in{n};
             auto gate = mat(p + "ffn_gate.weight", in), up = mat(p + "ffn_up.weight", in);
-            for (int j = 0; j < ffn; ++j) gate[j] *= sigmoid(gate[j]) * up[j];
+            for (int t = 0; t < count; ++t) for (int j = 0; j < ffn; ++j) gate[t][j] *= sigmoid(gate[t][j]) * up[t][j];
             y = mat(p + "ffn_down.weight", gate);
-            for (int j = 0; j < hidden; ++j) x[j] += y[j];
+            for (int t = 0; t < count; ++t) for (int j = 0; j < hidden; ++j) x[t][j] += y[t][j];
         }
-        ++pos;
-        logits.clear();
-        if (head) {
-            rms(x.data(), scalars.at("output_norm.weight"), eps);
-            logits = mat(matrices.count("output.weight") ? "output.weight" : "token_embd.weight", x);
-            for (float v : logits) if (!std::isfinite(v)) throw std::runtime_error("nonfinite native logits");
+        pos += count;
+        batch_logits.clear();
+        if (head_mode) {
+            Batch h(head_mode == 2 ? x.begin() : x.end() - 1, x.end());
+            for (auto & v : h) rms(v.data(), scalars.at("output_norm.weight"), eps);
+            const std::string head_name = matrices.count("output.weight") ? "output.weight" : "token_embd.weight";
+            if (options.head_rows > 0 && options.head_rows < vocab && !options.exact && matrices.at(head_name).int8_ready()) {
+                const auto & m = matrices.at(head_name);
+                std::vector<HostQ8> q(h.size());
+                std::vector<const HostQ8 *> xs;
+                for (size_t t = 0; t < h.size(); ++t) { host_quantize_q8(h[t].data(), hidden, q[t]); xs.push_back(&q[t]); }
+                batch_logits = m.multiply(xs, executor, options.head_rows);
+                for (size_t t = 0; t < h.size(); ++t) {
+                    auto & row = batch_logits[t];
+                    std::fill(row.begin() + options.head_rows, row.end(), -std::numeric_limits<float>::infinity());
+                    if (int(eos) >= options.head_rows) row[eos] = host_q8_dot(m.type, m.data + size_t(eos) * m.row_bytes, q[t]);
+                }
+                return batch_logits;
+            }
+            batch_logits = mat(head_name, h);
+            for (const auto & row : batch_logits)
+                for (float v : row) if (!std::isfinite(v)) throw std::runtime_error("nonfinite native logits");
         }
-        return logits;
+        return batch_logits;
+    }
+    Batch batch_logits;
+    const Vec & forward(uint32_t token, bool head) {
+        run({token}, head ? 1 : 0);
+        static const Vec empty;
+        return head ? batch_logits[0] : (logits = empty);
+    }
+    void checkpoint() {
+        saved_pos = pos; recording = true;
+        saved.resize(layers); steps.assign(layers, {});
+        for (int l = 0; l < layers; ++l) {
+            if (cache[l].kv) continue;
+            saved[l].history = cache[l].history; saved[l].state = cache[l].state;
+        }
+    }
+    void rollback(int keep) {
+        if (!recording || keep < 0 || saved_pos + keep > pos) throw std::invalid_argument("native rollback");
+        recording = false;
+        if (saved_pos + keep == pos) return;
+        for (int l = 0; l < layers; ++l) {
+            if (cache[l].kv) continue;
+            auto & layer = cache[l];
+            layer.history = saved[l].history; layer.state = saved[l].state;
+            const int width = int(layer.history.size()) / (conv - 1);
+            for (int t = 0; t < keep; ++t) {
+                const auto & step = steps[l][t];
+                std::move(layer.history.begin() + width, layer.history.end(), layer.history.begin());
+                std::copy(step.qkv.begin(), step.qkv.end(), layer.history.end() - width);
+            }
+            executor.rows(vh, [&](int begin, int end) {
+                for (int h = begin; h < end; ++h)
+                    for (int r = 0; r < dv; ++r)
+                        for (int t = 0; t < keep; ++t) {
+                            const auto & step = steps[l][t];
+                            const float * f = step.filtered.data();
+                            delta_row(layer.state.data() + (size_t(h) * dv + r) * dk, f + (kh + h % kh) * dk,
+                                      f[2 * kh * dk + h * dv + r], step.decay[h], step.b[h]);
+                        }
+            });
+        }
+        pos = saved_pos + keep;
     }
 };
 Model::Model(const std::string & path, Options options) : impl_(std::make_unique<Impl>(path, options)) {}
 Model::~Model() = default;
 void Model::reset() {
-    impl_->pos = 0; impl_->logits.clear();
+    impl_->pos = 0; impl_->logits.clear(); impl_->recording = false;
     for (auto & layer : impl_->cache) {
         std::fill(layer.history.begin(), layer.history.end(), 0.f);
         std::fill(layer.state.begin(), layer.state.end(), 0.f);
     }
 }
 const std::vector<float> & Model::forward(uint32_t token, bool head) { return impl_->forward(token, head); }
+const std::vector<std::vector<float>> & Model::forward_batch(const std::vector<uint32_t> & tokens, bool every) {
+    return impl_->run(tokens, every ? 2 : 1);
+}
+void Model::checkpoint() { impl_->checkpoint(); }
+void Model::rollback(int keep) { impl_->rollback(keep); }
 int Model::position() const { return impl_->pos; }
 int Model::context() const { return impl_->options.context; }
 int Model::vocabulary() const { return impl_->vocab; }
