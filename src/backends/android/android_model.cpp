@@ -134,7 +134,7 @@ struct Model::Impl {
     // One int8 copy of each projection input, shared by every matrix that reads it.
     struct Input {
         const Batch & x;
-        std::vector<HostQ8> q;
+        std::vector<HostQ8> q = {};
     };
     Batch mat(const std::string & name, Input & in) {
         const auto & m = matrices.at(name);
