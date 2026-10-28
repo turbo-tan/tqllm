@@ -23,8 +23,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s. Output identical.
 - Flash-Next: an expert bank lent to a long prompt's prefill comes back with the experts it held before the prompt
   (64K context on an RTX 5090: +3 % decode).
+- Flash-Next keeps the K/V of a long context in host memory by default on discrete GPUs with virtual memory management
+  (RTX 30 / 40 / 50; the last 32K positions stay on the GPU): 256K context on an RTX 3090 decodes at 65-69 instead of
+  52-56 tok/s, up to 128K unchanged. Off on unified-memory GPUs (GB10 / DGX Spark). `TQFN_KV_HOST=0` / `1` forces it.
 
 ### Fixed
+- Flash-Next on GB10 / DGX Spark no longer pins host memory for long-prompt residuals at start-up (on unified memory it
+  took 6.6 GB of the memory the expert banks need and left 759 MB free).
+- The approximate tail skip (`TQFN_TAIL_SKIP=R`, opt-in) applies to verify blocks of any size (it stopped at 4 tokens).
 - System memory is the machine's RAM capped by the container limit (cgroup `memory.max`): in a Docker / cloud container
   with less memory than the host, Flash-Next no longer pins an expert pack sized for the host (a 5090 pod reported 944 GB
   of host RAM with a 117 GB limit and kept hitting the limit while loading).
