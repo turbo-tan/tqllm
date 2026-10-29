@@ -284,6 +284,24 @@ static void run() {
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",
                     "mapped scatter");
     }
+    {   // 10-29 review: a failing copy inside a batched call must not leave the slot reading as a permanent hit on stale
+        // bytes. Expert 0 goes through the registered+split batched path first (needed is sorted, so 0 is queued before 1);
+        // prepacked() itself throws for expert 1 (deterministic, no real CUDA failure needed) - the exception must roll
+        // back expert 0's optimistic residency mark, not leave it reading as resident with nothing ever copied.
+        MixedExpertCache rb(layers, experts, hidden, ff, slots, budget, source, nullptr);
+        rb.set_prepacked([&](int l, int id) -> const char * {
+            if (id == 1) throw std::runtime_error("injected test failure");
+            return blocks[size_t(l) * size_t(experts) + size_t(id)];
+        }, true);
+        rb.set_miss_stream(misses);
+        bool threw = false;
+        try { rb.prepare(2, {0, 1}); rb.wait_misses(); } catch (const std::exception &) { threw = true; }
+        require(threw, "rollback test: the injected failure did not propagate");
+        require(!rb.resident(2, 0), "rollback test: a miss queued into a batch stayed resident after a later miss in the same call failed");
+        rb.set_prepacked([&](int l, int id) { return blocks[size_t(l) * size_t(experts) + size_t(id)]; }, true);
+        selected = &rb; compare(2, {0, 0}, true); selected = &cache;
+        std::puts("mixed cache: a failed batch rolls back the residency it queued, byte-exact on retry PASS");
+    }
     check(cudaStreamDestroy(copies)); check(cudaStreamDestroy(misses)); check(cudaFreeHost(pinned));
     std::printf("cache owned-device peak=%zu tight-budget=%zu bytes (includes loader staging)\n", tight.peak_device_bytes(), tight_budget);
     {  // per-layer slots: each bank holds its own count, projections stay byte-exact, the per-layer limit is enforced

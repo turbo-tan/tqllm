@@ -349,11 +349,26 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     size_t offset = 0;
     size_t read_at = 0;
     std::vector<void *> batch_dst; std::vector<const void *> batch_src; std::vector<size_t> batch_bytes;
+    // (id, target) of every miss queued into the batch below: bank->ids / s.where are committed immediately, as for every
+    // other miss path (victim selection within this call relies on bank->ids[target] reading as occupied right away, and
+    // MixedExpertCache::resident() scans bank->ids directly - deferring the commit until the copy succeeds let two misses
+    // in the same call double-book a slot, caught by test-mixed-expert-cache). If the batch fails, every (id, target) here
+    // is rolled back to -1 in the catch block below (10-29 review: without the rollback, a failed copy left the slot
+    // reading as a permanent hit on stale bytes - the slot is never re-copied once it reads resident).
+    std::vector<std::pair<int, int>> batch_commit;
     auto flush_batch = [&] {
         if (batch_dst.empty()) return;
         cudaMemcpyAttributes attr = {}; attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream; attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
         size_t first = 0;
+#if CUDART_VERSION >= 13000
         checked(cudaMemcpyBatchAsync(batch_dst.data(), batch_src.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, up));
+#elif CUDART_VERSION >= 12080
+        // 12.8 / 12.9: 9 arguments, non-const void ** src/dst and an extra size_t * failIdx before the stream
+        std::vector<void *> src_mut(batch_src.begin(), batch_src.end()); size_t fail_idx = 0;
+        checked(cudaMemcpyBatchAsync(batch_dst.data(), src_mut.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, &fail_idx, up));
+#else
+        for (size_t i = 0; i < batch_dst.size(); ++i) checked(cudaMemcpyAsync(batch_dst[i], batch_src[i], batch_bytes[i], cudaMemcpyHostToDevice, up));
+#endif
         batch_dst.clear(); batch_src.clear(); batch_bytes.clear();
     };
     // Misses that need the loader (a format conversion) are converted on worker threads first, each into its own slice of
@@ -440,6 +455,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
                 }
             }
             s.counters.transfer_bytes += off; s.counters.miss_copy_bytes += off; dma_issued = true;
+            batch_commit.push_back({id, target});
         } else if (packed_src && s.registered) {
             // Kernel reads straight from pinned host memory: demand misses skip the H2D DMA queue behind prefetches.
             size_t off = 0;
@@ -518,6 +534,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     }
     flush_batch();
     } catch (...) {
+        for (auto [id, target] : batch_commit) { if (bank->ids[target] == id) bank->ids[target] = -1; if (s.where[id] == target) s.where[id] = -1; }
         // A later read may fail after earlier records started DMA. Drain before staging can be reused.
         try { flush_batch(); } catch (...) {}
         if (dma_issued) checked(cudaStreamSynchronize(up));
