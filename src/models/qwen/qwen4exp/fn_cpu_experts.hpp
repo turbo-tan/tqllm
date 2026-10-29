@@ -182,6 +182,31 @@ __attribute__((target("avx2,fma"))) static float cpu_dot_q2_0_q8p(const uint8_t 
     }
     return cpu_hsum(acc) + tail;
 }
+inline int64_t cpu_block_off(int r, int s, int nb, int bpb, bool tiled);
+// IQ4_NL row straight from the pinned device layout (byte i = e[2i] | e[2i+1] << 4, fp16 scales apart): the activation
+// comes permuted to [even, odd] per 32 block (cpu_permute_nl), so no GGUF row is rebuilt (the rebuild cost 3x the dot)
+__attribute__((target("avx2,fma"))) static void cpu_dot_iq4nl_dev_q8_mc(const char * dev, const uint16_t * dh, int r, int nb, bool tiled,
+                                                                       const int8_t * const * xqc, const float * const * xdc, int nc, float * out) {
+    const __m256i table = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(kCpuIq4nl)));
+    const __m256i low = _mm256_set1_epi8(0x0f), ones = _mm256_set1_epi16(1);
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int b = 0; b < nb; ++b) {
+        __half_raw hr; hr.x = dh[b]; const float d = __half2float(__half(hr));
+        const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dev + cpu_block_off(r, b, nb, 16, tiled)));
+        const __m256i wv = _mm256_shuffle_epi8(table, _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(q, 4), q), low));
+        const __m256i wa = _mm256_sign_epi8(wv, wv);
+        for (int c = 0; c < nc; ++c) {
+            const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xqc[c] + b * 32));
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(wa, _mm256_sign_epi8(xv, wv)), ones);
+            acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(d * xdc[c][b]), _mm256_cvtepi32_ps(p32), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) out[c] = cpu_hsum(acc[c]);
+}
+// int8 activation per 32 block in the device IQ4_NL order: even elements, then odd
+inline void cpu_permute_nl(const int8_t * xq, int n, int8_t * out) {
+    for (int b = 0; b < n / 32; ++b) for (int i = 0; i < 16; ++i) { out[b * 32 + i] = xq[b * 32 + 2 * i]; out[b * 32 + 16 + i] = xq[b * 32 + 2 * i + 1]; }
+}
 inline void cpu_permute_q2(const int8_t * xq, int n, int8_t * out, int * sums) {
     for (int b = 0; b < n / 32; ++b) {
         int sum = 0;
@@ -364,19 +389,32 @@ private:
         } else {
             const int r0 = part * hidden_ / chunks, r1 = (part + 1) * hidden_ / chunks;
             const bool nl = j.type[2] == 20 && ff_ % 32 == 0, q2 = j.type[2] == GGML_GSQ_Q2_0 && ff_ % 64 == 0;
+            const bool nl_dev = nl && j.dev[2] && j.fmt[2] == 14;
             thread_local std::vector<int8_t> aq, ap; thread_local std::vector<float> ad; thread_local std::vector<int> as;
             if (nl || q2) {
                 aq.resize(size_t(j.ncols) * ff_); ad.resize(size_t(j.ncols) * ff_ / 32);
                 for (int c = 0; c < j.ncols; ++c) cpu_quant_q8(act_.data() + size_t(j.slot + c) * ff_, ff_, aq.data() + size_t(c) * ff_, ad.data() + size_t(c) * ff_ / 32);
+            }
+            if (nl_dev) {
+                ap.resize(aq.size());
+                for (int c = 0; c < j.ncols; ++c) cpu_permute_nl(aq.data() + size_t(c) * ff_, ff_, ap.data() + size_t(c) * ff_);
             }
             if (q2) {
                 ap.resize(aq.size()); as.resize(ad.size());
                 for (int c = 0; c < j.ncols; ++c) cpu_permute_q2(aq.data() + size_t(c) * ff_, ff_, ap.data() + size_t(c) * ff_, as.data() + size_t(c) * ff_ / 32);
             }
             for (int r = r0; r < r1; ++r) {
+                float nlo[8];
+                if (nl_dev) {
+                    const int8_t * xqc[8]; const float * xdc[8];
+                    for (int c = 0; c < j.ncols; ++c) { xqc[c] = ap.data() + size_t(c) * ff_; xdc[c] = ad.data() + size_t(c) * ff_ / 32; }
+                    const auto * dh = reinterpret_cast<const uint16_t *>(j.aux[2]) + int64_t(r) * (ff_ / 32);
+                    for (int c0 = 0; c0 < j.ncols; c0 += 4) cpu_dot_iq4nl_dev_q8_mc(j.dev[2], dh, r, ff_ / 32, j.tiled, xqc + c0, xdc + c0, std::min(4, j.ncols - c0), nlo + c0);
+                    for (int c = 0; c < j.ncols; ++c) out_[size_t(j.slot + c) * hidden_ + r] = __float2bfloat16_rn(nlo[c]);
+                    continue;
+                }
                 const char * wr = row_src(j, 2, r, ff_);
                 if (!nl && !q2) dequantize_host(j.type[2], wr, row.data(), ff_);
-                float nlo[8];
                 if (nl) {
                     const int8_t * xqc[8]; const float * xdc[8];
                     for (int c = 0; c < j.ncols; ++c) { xqc[c] = aq.data() + size_t(c) * ff_; xdc[c] = ad.data() + size_t(c) * ff_ / 32; }
