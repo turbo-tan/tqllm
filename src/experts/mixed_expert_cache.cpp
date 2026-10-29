@@ -348,6 +348,14 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     bool dma_issued = false;
     size_t offset = 0;
     size_t read_at = 0;
+    std::vector<void *> batch_dst; std::vector<const void *> batch_src; std::vector<size_t> batch_bytes;
+    auto flush_batch = [&] {
+        if (batch_dst.empty()) return;
+        cudaMemcpyAttributes attr = {}; attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream; attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+        size_t first = 0;
+        checked(cudaMemcpyBatchAsync(batch_dst.data(), batch_src.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, up));
+        batch_dst.clear(); batch_src.clear(); batch_bytes.clear();
+    };
     // Misses that need the loader (a format conversion) are converted on worker threads first, each into its own slice of
     // the staging buffer, in the order the loop below uploads them: one thread faulting in and repacking one expert after
     // another was the whole miss cost (GLM-5.3 on a GB10: ~0.3 GB/s).
@@ -401,15 +409,12 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
             }
         }
         int target = -1;
+        double vt = 0;  // value of the current target (computed when it changes, not on every slot)
         for (int j = 0; j < bank->cap; ++j) {
             const int old = bank->ids[j]; if (is_needed(old)) continue;
-            if (target < 0 || old < 0) target = j;
-            else {
-                const double vj = slot_value(*bank, j, s.frequency[size_t(layer) * s.experts + old], s.clock);
-                const double vt = slot_value(*bank, target, s.frequency[size_t(layer) * s.experts + bank->ids[target]], s.clock);
-                if (vj < vt || (vj == vt && s.clock - bank->ages[j] < s.clock - bank->ages[target])) target = j;
-            }
-            if (old < 0) break;
+            if (old < 0) { target = j; break; }
+            const double vj = slot_value(*bank, j, s.frequency[size_t(layer) * s.experts + old], s.clock);
+            if (target < 0 || vj < vt || (vj == vt && s.clock - bank->ages[j] < s.clock - bank->ages[target])) { target = j; vt = vj; }
         }
         if (target < 0) throw std::logic_error("mixed cache: no unpinned slot");
         bank->inflight[target] = 0;
@@ -420,13 +425,17 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
             // F25: on a PCIe GPU split-mode misses go by the copy engine straight into the slot on the miss stream: zero-copy kernels
             // beside the compute stream faulted / hung the 3090's front end in long decodes, and in compute-stream order they cost ~10 %
             // decode. GB10 (C2C, coherent host memory) never faulted and reads host memory faster by kernel: it keeps zero-copy.
+            // queued here, submitted as one cudaMemcpyBatchAsync after the loop (same stream position: nothing else is
+            // enqueued on `up` in between); perf test 10-29 on the 3090: 1.6 -> 0.45 us of host per copy, 24.0 -> 26.1 GB/s
             size_t off = 0;
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
-                checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], packed_src + off, bank->stride[p], cudaMemcpyHostToDevice, up));
+                batch_dst.push_back(static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p]);
+                batch_src.push_back(packed_src + off); batch_bytes.push_back(bank->stride[p]);
                 off += bank->stride[p]; ++s.counters.miss_copies;
                 if (bank->aux_stride[p]) {
-                    checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.aux)) + size_t(target) * bank->aux_stride[p], packed_src + off, bank->aux_stride[p], cudaMemcpyHostToDevice, up));
+                    batch_dst.push_back(static_cast<char *>(const_cast<void *>(d.aux)) + size_t(target) * bank->aux_stride[p]);
+                    batch_src.push_back(packed_src + off); batch_bytes.push_back(bank->aux_stride[p]);
                     off += bank->aux_stride[p]; ++s.counters.miss_copies;
                 }
             }
@@ -507,8 +516,10 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         ++s.counters.misses;
         if (stream_payloads) payload = {}; // pinned staging owns the bytes until its completion event
     }
+    flush_batch();
     } catch (...) {
         // A later read may fail after earlier records started DMA. Drain before staging can be reused.
+        try { flush_batch(); } catch (...) {}
         if (dma_issued) checked(cudaStreamSynchronize(up));
         throw;
     }
