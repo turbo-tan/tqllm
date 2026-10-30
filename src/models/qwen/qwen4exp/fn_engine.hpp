@@ -27,6 +27,7 @@ struct FnServe {
     std::vector<int32_t> hot_map; int cold_slots = 16, hot_slots = 0;
     std::unique_ptr<MixedExpertCache> cold_cache;
     ColdExpertMemo cold_host{size_t(3) << 30};
+    size_t hot_victim_mb = 0;
     int slots = 176, drafts = 3, chunk = 8; double budget_gb = 18; bool gsq_rco = true, slots_auto = false;
     std::vector<std::string> arg_store; std::vector<char *> argv;
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
@@ -44,6 +45,7 @@ class FlashNextEngine final : public tqllm::Engine {
         std::unique_ptr<tqllm::BankLedger> ledger_;  // this request's borrowed expert banks
         tqllm::ExpertCacheStats stats_at_decode_{}, mtp_stats_at_decode_{};  // TQLLM_DEBUG=mem: cache counters when the decode of this request began
         ExpertCacheStats cold_at_decode_{};
+        MixedExpertCache::HostVictimStats host_victim_at_decode_{};
         ColdExpertStore::Stats cold_store_at_decode_{};
         ColdFetchQueue::Stats cold_fetch_at_decode_{};
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free

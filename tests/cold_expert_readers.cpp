@@ -9,6 +9,17 @@
 #include <iostream>
 using namespace tqllm;
 int main() {
+    std::promise<int> blocked,ready;
+    std::vector<std::shared_future<int>> pending{blocked.get_future().share(),ready.get_future().share()};
+    ready.set_value(17);
+    assert(next_ready_expert(pending)==1 && pending[1].get()==17);
+    pending[1]={};blocked.set_value(9);
+    assert(next_ready_expert(pending)==0 && pending[0].get()==9);pending[0]={};
+    bool empty_failed=false;try{next_ready_expert(pending);}catch(const std::logic_error &){empty_failed=true;}
+    assert(empty_failed);
+    pending={std::async(std::launch::deferred,[]{return 23;}).share()};
+    assert(next_ready_expert(pending)==0 && pending[0].get()==23);
+
     ExpertReadPool pool(2);ColdExpertMemo memo(6);
     std::atomic<int> active{0},peak{0},loads{0};
     auto load=[&](ColdExpertMemo::Key key) {

@@ -284,7 +284,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_PREDICT_N", Kind::Debug, "4 (6 with adaptive drafts)", "next-layer prediction (prefetch) for verify blocks of up to N tokens", ""},
     {"TQFN_TQ_AHEAD", Kind::Retired, "-", "removed", "TQueue prefetch queue lives on branch tqllm/tqueue (not in the release)"},
     {"TQFN_PF_MMQ_CHECK", Kind::Debug, "0", "N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel", ""},
-    {"TQFN_PRED_DUMP", Kind::Debug, "-", "FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation)", ""},
+    {"TQFN_PRED_DUMP", Kind::Debug, "-", "FILE: append top-10 routed/predicted ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only)", ""},
     {"TQFN_PREFILL_INT8", Kind::Debug, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
     {"TQFN_PREFILL_INT8_FMT", Kind::Debug, "-", "comma list of u4h format ids allowed on the int8 prefill path (default all)", ""},
     {"TQFN_PREFILL_LOG", Kind::Debug, "off", "per-layer and per-stage prefill timings (synchronises; slower)", ""},
@@ -296,9 +296,10 @@ inline constexpr Flag ALL[] = {
     {"TQFN_QSA_SPLIT", Kind::Debug, "16", "slices per decode QSA attention row; 0 or 1 = direct attention", ""},
     {"TQFN_ROUND32", Kind::Debug, "-", "diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none)", ""},
     {"TQFN_ROUTER_GEMM", Kind::Retired, "-", "removed", "fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing)"},
-    {"TQFN_ROUTE_DUMP", Kind::Debug, "-", "FILE: append routed expert ids per trunk layer call", ""},
+    {"TQFN_ROUTE_DUMP", Kind::Debug, "-", "FILE: append top-10 routed ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only)", ""},
     {"TQFN_TAIL_SKIP", Kind::Debug, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""},
-    {"TQFN_WAVE_GEMM_AVG", Kind::Debug, "-", "average tokens per expert from which prefill waves use the grouped GEMM", ""}
+    {"TQFN_WAVE_GEMM_AVG", Kind::Debug, "-", "average tokens per expert from which prefill waves use the grouped GEMM", ""},
+    {"TQFN_HOT_VICTIM_MB", Kind::Debug, "0", "MiB of exact native hot expert victim memory; owner Codex, expires 2026-11-06; full routing unchanged", ""}
 };
 inline const Flag * find(const char * name) {
     for (const auto & f : ALL)

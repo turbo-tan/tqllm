@@ -52,6 +52,12 @@ bool FlashNextEngine::spec_advance() {
             (unsigned long long)(d.loads-a.loads), (unsigned long long)(d.bytes-a.bytes),
             (d.read_ns-a.read_ns)/1e6, (d.checksum_ns-a.checksum_ns)/1e6, (d.mapped_ns-a.mapped_ns)/1e6);
     }
+    if (S().done_ && f_.hot_victim_mb && tqllm::debug_on("mem")) {
+        const auto v=f_.cache->host_victim_stats(), b=S().host_victim_at_decode_;
+        std::fprintf(stderr,"HOT_VICTIM bytes=%zu hits=%llu source_loads=%llu spills=%llu d2h_bytes=%llu\n",v.bytes,
+            (unsigned long long)(v.hits-b.hits),(unsigned long long)(v.source_loads-b.source_loads),
+            (unsigned long long)(v.spills-b.spills),(unsigned long long)(v.d2h_bytes-b.d2h_bytes));
+    }
     if (S().done_ && f_.cold_fetch_queue && tqllm::debug_on("mem")) {
         const auto q = f_.cold_fetch_queue->stats(), b = S().cold_fetch_at_decode_;
         std::fprintf(stderr, "COLD_QUEUE prefetched=%llu used=%llu promoted=%llu deduplicated=%llu expired=%llu rejected=%llu demand_reads=%llu completed=%llu\n",

@@ -1189,7 +1189,7 @@ flags:
   - name: TQFN_PRED_DUMP
     kind: debug
     default: "-"
-    doc: "FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation)"
+    doc: "FILE: append top-10 routed/predicted ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only)"
   - name: TQFN_PREFILL_INT8
     kind: debug
     default: "0"
@@ -1238,7 +1238,7 @@ flags:
   - name: TQFN_ROUTE_DUMP
     kind: debug
     default: "-"
-    doc: "FILE: append routed expert ids per trunk layer call"
+    doc: "FILE: append top-10 routed ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only)"
   - name: TQFN_TAIL_SKIP
     kind: debug
     default: "-"
@@ -1247,3 +1247,7 @@ flags:
     kind: debug
     default: "-"
     doc: "average tokens per expert from which prefill waves use the grouped GEMM"
+  - name: TQFN_HOT_VICTIM_MB
+    kind: debug
+    default: "0"
+    doc: "MiB of exact native hot expert victim memory; owner Codex, expires 2026-11-06; full routing unchanged"

@@ -76,6 +76,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     require(f.cold_store_path.empty() || !f.hot_map_path.empty(), "cold_store requires hot_map");
     require(!f.hot_slots || !f.hot_map_path.empty(), "hot_slots requires hot_map");
+    if (const char * v = std::getenv("TQFN_HOT_VICTIM_MB")) {
+        size_t at=0; const auto mb=std::stoull(v,&at);
+        require(at==std::strlen(v) && mb<=65536,"TQFN_HOT_VICTIM_MB requires0..65536");
+        f.hot_victim_mb=size_t(mb);
+        require(!f.hot_victim_mb || slots_.size()==1,"hot victims currently require one sequence");
+        require(!f.hot_victim_mb || (!f.hot_map_path.empty() && f.experts.empty()),"hot victims require hot_map without an expert pack");
+    }
     require(!f.cold_streaming || (f.cold_mmap && f.cold_readers>=2),"cold_streaming requires cold_mmap and at least2 cold_readers");
     require(!f.cold_prefetch_k || (f.cold_mmap && f.cold_readers>=2),"cold_prefetch_k requires cold_mmap and at least2 cold_readers");
     require(!f.cold_mmap || !f.cold_store_path.empty(),"cold_mmap requires a persistent cold store");
@@ -93,7 +100,6 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         require(f.experts.empty() && !std::getenv("TQFN_KEEP_MAP") && !std::getenv("TQFN_EXPERT_PROFILE"),
                 "hot/cold: use original GGUFs, not pruning or a single-format packed bank/profile");
         require(nslots == 1 && f.cold_slots >= 1 && f.cold_slots <= 512, "hot/cold pilot: one session and cold_slots 1..512 required");
-        f.chunk = std::min(f.chunk, 8); // pilot uses the same mixed-precision path for prefill and decode
     }
     f.arena.size = size_t(std::getenv("TQFN_ARENA_MB") ? std::atoi(std::getenv("TQFN_ARENA_MB")) : std::max({256,
                    // layer-major chunks (256+) run the dense part in 256-token sub-chunks: measured 690 MB at 4096, 1375 at 8192
@@ -160,7 +166,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
             std::fprintf(stderr,"tqllm: cold store enabled; no runtime Q2 conversion\n");
         }
         f.cold_cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.cold_slots,
-                size_t(2) << 30, [state = &f, cp = &checkpoint](int layer, int expert) {
+                cold_cache_budget(c.layers, f.cold_slots, size_t(c.hidden) * c.expert_ff / 64 * 18 * 3),
+                [state = &f, cp = &checkpoint](int layer, int expert) {
             auto & f = *state; auto & checkpoint = *cp; const auto & c = cp->config;
             require(!expert_is_hot(f.hot_map, layer, c.experts, expert), "cold cache requested a hot expert");
             const auto key = std::make_pair(layer, expert);
@@ -243,6 +250,33 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
+    if (f.hot_victim_mb) {
+        const int hot_count=validate_hot_map(f.hot_map,c.layers,c.experts);
+        const double cold_bytes=double(c.layers)*(c.experts-hot_count)*c.hidden*c.expert_ff/64*18*3;
+        require(cold_bytes+double(f.hot_victim_mb)*(1u<<20)+0.2*host_ram<=host_ram,"hot victim budget leaves too little host RAM for cold records and headroom");
+        g_tile_experts=false; // match the existing hot pack's native bank layout
+        f.cache->set_host_victim_budget(f.hot_victim_mb<<20);
+        f.cache->enable_host_victims(false);
+    }
+    if (!f.hot_map_path.empty() && !f.hot_victim_mb) {  // hot experts missing the GPU bank come from pinned memory, not the GGUF (decode_rules.hpp)
+        double per_slot = 0;
+        for (int l = 0; l < c.layers; ++l) for (const auto & p : repack_expert(checkpoint, l, 0)) per_slot += double(p.size());
+        const int hot_count = int(std::count_if(f.hot_map.begin(), f.hot_map.begin() + c.experts, [](int32_t v) { return v >= 0; }));
+        // Cold records share host RAM with the hot pack; keep their working set and OS/MTP headroom available.
+        const double cold_bytes = f.cold_store ? double(c.layers) * (c.experts - hot_count) * c.hidden * c.expert_ff / 64 * 18 * 3 : 0;
+        const double host_reserve = f.cold_store ? cold_bytes + 0.2 * host_ram : 0;
+        const int K = hot_pack_slots(hot_count, integrated != 0, per_slot, host_ram, host_reserve);
+        if (K > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            f.packed = build_packed(checkpoint, std::max(4, std::min(32, int(std::thread::hardware_concurrency()))), f.hot_map.data(), K);
+            if (K == hot_count) checkpoint.release_expert_pages();  // every hot expert pinned; cold ones come from the cold store
+            const PackedExperts * pk = &f.packed; const int32_t * hm = f.hot_map.data(); const int E = c.experts;
+            f.cache->set_prepacked([pk, hm, E, K](int layer, int id) -> const char * {
+                if (layer >= pk->layers) return nullptr; const int32_t q = hm[size_t(layer) * E + id]; return q < 0 || q >= K ? nullptr : pk->at(layer, q); }, true, MixedExpertCache::PrepackedLayout::Indexed);
+            std::fprintf(stderr, "tqllm: hot/cold: %d of %d hot experts per layer pinned in memory: %.1f GB in %.0f s\n", K, hot_count,
+                         f.packed.bytes / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+    }
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
@@ -487,7 +521,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
             throw std::runtime_error("Flash-Next: " + std::to_string(f.slots) + " expert slots per layer leave " + std::to_string(fr >> 20) +
                                      " MB free, a full " + std::to_string(context) + "-token context needs " + std::to_string((state + reserve) >> 20) +
                                      " MB (attention state + decode reserve): use at most " + std::to_string(std::max(0, f.slots - drop)) +
-                                     " slots (manifest slots=) or a smaller --context");
+                                     (f.hot_map.empty() ? " slots (manifest slots=)" : " slots (manifest hot_slots=: hot/cold sizes the bank from it)") +
+                                     " or a smaller --context");
         }
     }
     // the default stream is per thread: the engine thread's stream is not ordered after the loading thread's work

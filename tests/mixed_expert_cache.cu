@@ -124,6 +124,24 @@ static void run() {
     for (size_t i = 0; i < packed.size(); ++i) {
         blocks[i] = pinned + at; std::memcpy(pinned + at, packed[i].data(), packed[i].size()); at += packed[i].size();
     }
+    {
+        MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+        current.set_prepacked([&](int l, int id) { return id == 0 ? nullptr : blocks[l * experts + id]; }, true,
+                              MixedExpertCache::PrepackedLayout::Indexed);
+        selected = &current;
+        compare(0, {1, 2, 1, 2});
+        const auto live_layout = current.bank_layout(0);
+        require(!live_layout.src0 && live_layout.block > 0, "indexed prepacked source exposed a contiguous expert array");
+        current.release_bank(0);
+        const auto saved_layout = current.bank_layout(0);
+        require(!saved_layout.src0 && saved_layout.block == live_layout.block,
+                "indexed prepacked source lost its evicted bank layout");
+        compare(0, {2, 1, 2, 1}, true);
+        current.set_prepacked([&](int l, int id) { return id == 0 ? nullptr : blocks[l * experts + id]; }, true);
+        bool dense_rejected = false;
+        try { current.bank_layout(0); } catch (const std::logic_error &) { dense_rejected = true; }
+        require(dense_rejected, "contiguous prepacked layout accepted a sparse source");
+    }
     cudaStream_t misses, copies;
     check(cudaStreamCreateWithFlags(&misses, cudaStreamNonBlocking));
     check(cudaStreamCreateWithFlags(&copies, cudaStreamNonBlocking));

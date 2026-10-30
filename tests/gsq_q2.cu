@@ -154,6 +154,7 @@ int main() {
         for (int k : {64, 640, 2560}) for (int n : {1, 2, 4, 6, 8, 12, 200}) for (bool per : {false, true}) run(k, n, per);
         for(int n:{1,2,4,6}) {run(2560,n,false,640);run(640,n,true,2560);}
         for (int n : {1, 2, 8}) { run(6144, n, false, 96); run(3072, n, true, 64); }  // wide rows (MiniMax): dot_wide
+        for(int k:{640,2560})for(bool per:{false,true})run(k,512,per);
         std::puts("GSQ Q2_0: 42 generic +8 real-shape code/scale/oracle/grouped/F32/graph/bounds scenarios PASS"); return 0;
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

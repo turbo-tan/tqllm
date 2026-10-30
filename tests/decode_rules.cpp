@@ -91,6 +91,16 @@ int main() {
     check(!build_pack_in_memory(false, false, true, 51 * GB, 128 * GB), "hot/cold manages expert memory: no pack built");
     check(!build_pack_in_memory(false, false, false, 51 * GB, 64 * GB) && !build_pack_in_memory(false, false, false, 51 * GB, 24 * GB),
           "a 51 GB pack is not pinned on a 64 GB or 24 GB machine");
+    // hot/cold: 154 hot experts per layer, 48 layers x 1.975 MB each (the 69-slot bank ledger: 6543 MB)
+    check(hot_pack_slots(154, false, 48 * 1.975e6, 24.7 * GB) == 154, ".231 (23 GiB): every hot expert in the pinned pack");
+    check(hot_pack_slots(154, false, 48 * 1.975e6, 8 * GB) == 50, "8 GB host: the pack holds what fits");
+    check(hot_pack_slots(154, true, 48 * 1.975e6, 128 * GB) == 0, "GB10: hot experts stay resident, no pack");
+    check(hot_pack_slots(154, false, 100e6, 32e9, 24e9 + 0.2 * 32e9) == 16,
+          "cold store plus20percent reserve leaves only1.6GB for the hot pack");
+    check(hot_pack_slots(154, false, 100e6, 24e9, 24e9 + 0.2 * 24e9) == 0,
+          "no spare host RAM: use GGUF fallback, no pinned pack");
+    check(hot_pack_slots(154, false, 100e6, 128e9, 24e9 + 0.2 * 128e9) == 154,
+          "large discrete host retains the full hot pack");
 
     {   // the HF manifest's 3090 plan on a GB10 (512 slots = every expert): no layer below 512
         const std::vector<int> plan{314, 291, 269, 160, 189, 219, 248, 239, 208, 135, 212, 160, 128, 145};
@@ -142,6 +152,40 @@ int main() {
         const auto eight = tail_skip_targets(big, topk, 3, [](int e) { return e % topk == 0; });
         check(std::count(eight.begin(), eight.end(), -1) == 8 * topk - 16, "an 8-token verify block skips too (the old rule stopped at 4 tokens)");
         check(tail_skip_targets(routed, topk, 0, resident) == std::vector<int>(routed.size(), -1), "R = 0: off");
+    }
+    // The layer-major mixed path must use the same projection rule as ordinary waves.
+    check(wave_uses_grouped_gemm(8192 * 10, 512, 512, 8), "real 8K prefill amortises expert weights over rows");
+    check(!wave_uses_grouped_gemm(8 * 10, 512, 60, 8), "eight-row verify keeps its existing arithmetic");
+    check(!wave_uses_grouped_gemm(4095, 512, 512, 8) && wave_uses_grouped_gemm(4096, 512, 512, 8),
+          "grouped GEMM begins at the shared average threshold");
+    check(!wave_uses_grouped_gemm(512, 512, 1, 8), "one-token-per-expert boundary keeps the dedup kernel");
+    check(!wave_uses_grouped_gemm(81920, 512, 512, 0), "existing zero threshold disables grouped GEMM");
+    check(grouped_expert_format(14, 640) && !grouped_expert_format(13, 640), "IQ4_NL supports128-column blocks; IQ4_XS requires256");
+    check(grouped_expert_format(13, 2560) && !grouped_expert_format(-1, 2560), "unsupported formats keep their own grouped implementation");
+    check(!mixed_prefill_needs_all_banks(true, size_t(8) << 30, size_t(60) << 30),
+          "mixed prefill preserves resident banks when its full working set fits");
+    check(!mixed_prefill_needs_all_banks(true, 1024, 1024) && mixed_prefill_needs_all_banks(true, 1025, 1024),
+          "mixed borrow-all starts only below the planned free-memory boundary");
+    check(!mixed_prefill_needs_all_banks(false, 2048, 1024), "ordinary prefill retains its minimal borrow policy");
+    check(dense_prefill_sub(true, 2048, 1024) == 1024, "mixed prefill respects its planned tensor-core block");
+    check(dense_prefill_sub(true, 8, 1024) == 8, "explicit sub8 reproduces old dense projection dispatch");
+    check(dense_prefill_sub(true, 2048, 128) == 128, "request memory cap limits mixed dense batches");
+    check(dense_prefill_sub(false, 2048, 0) == 2048 && dense_prefill_sub(false, 8, 1024) == 16,
+          "ordinary prefill retains its existing rule");
+    {   // host K/V paging: 2 MB pages (2,048 rows of 1 KB), keep 32K rows, 151K-row prompt in a 160K-row buffer (80 pages)
+        check(kv_page_bytes(size_t(2) << 20) == (size_t(2) << 20) && kv_page_bytes(size_t(64) << 10) == (size_t(2) << 20) &&
+              kv_page_bytes(size_t(4) << 20) == (size_t(4) << 20) && kv_page_bytes(0) == 0, "K/V page: 2 MB, a granule multiple, never below the granule");
+        const auto p = kv_host_pages(151147, 32768, kKvDecodeHeadroom, 2048, 79);
+        check(p.front == (151147 - 32768) / 2048, "K/V paging: everything older than the newest 32K rows (whole pages) goes to host");
+        check(p.tail == (151147 + kKvDecodeHeadroom + 2047) / 2048 && p.tail < 79, "K/V paging: capacity past len + headroom goes to host");
+        check((p.tail - p.front) * 2048 >= 32768 + kKvDecodeHeadroom && (p.tail - p.front) * 2048 <= 32768 + kKvDecodeHeadroom + 2 * 2048,
+              "K/V paging: the device keeps keep + headroom rows, at most two pages more");
+        const auto old = kv_host_pages(151147, 32768, kKvDecodeHeadroom, 32768, 5);  // the former 32 MB pages
+        check(old.front == 3 && old.tail == 5, "K/V paging: 32K-row pages keep two of five on the device (the 1.54 GB of 10-29)");
+        const auto shortp = kv_host_pages(20000, 32768, kKvDecodeHeadroom, 2048, 79);
+        check(shortp.front == 0 && shortp.tail == (20000 + kKvDecodeHeadroom + 2047) / 2048, "K/V paging: a short context moves nothing it holds");
+        const auto full = kv_host_pages(160000, 32768, kKvDecodeHeadroom, 2048, 79);
+        check(full.tail == 79 && full.front < full.tail, "K/V paging: a full buffer keeps its last page");
     }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
