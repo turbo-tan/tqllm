@@ -2,7 +2,6 @@
 #include <mlx/mlx.h>
 #include <span>
 #include <cstdint>
-#include "affine8.hpp"
 
 namespace tqllm::mlx_backend {
 struct Tq4Weights {
@@ -12,7 +11,6 @@ struct Tq4Weights {
 };
 // GGUF type 300: one FP16 scale followed by 64 packed bytes per block.
 Tq4Weights load_tq4_blocks(std::span<const uint8_t> blocks, int rows, int columns);
-Affine8Weights tq4_affine8(const Tq4Weights& weights);
 mlx::core::array tq4_rotate(const mlx::core::array& input);
 // tq4_rotate fused into one kernel, FP16 result (input of the matrix-unit TQ4 path).
 mlx::core::array tq4_rotate_half(const mlx::core::array& input);

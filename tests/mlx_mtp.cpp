@@ -14,7 +14,7 @@ int main(int argc,char** argv) {
         mx::set_cache_limit(512*1024*1024);
         tqllm::Tokenizer tokenizer;tokenizer.load(argv[1]);
         auto prompt=tokenizer.encode("Explain why rainbows form, including refraction and reflection.");
-        Qwen35 engine(argv[1],256);engine.gdn_mode(Qwen35::GdnMode::scan);engine.enable_mtp();
+        Qwen35 engine(argv[1],256);engine.enable_mtp();
         auto prefill=engine.forward(prompt);auto hidden=engine.hidden_states();
         engine.draft_forward({prompt.data()+1,prompt.size()-1},rows(hidden,0,int(prompt.size())-1),1,false);
         const auto snapshot=engine.draft_checkpoint();

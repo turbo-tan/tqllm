@@ -2,8 +2,12 @@
 #include "cold_expert_memo.hpp"
 #include <cassert>
 #include <iostream>
-template<class F> void rejects(F f) { bool hit=false; try { f(); } catch(const std::exception &) { hit=true; } assert(hit); }
+template<class F> void rejects(F f, int line = __builtin_LINE()) { bool hit=false; try { f(); } catch(const std::exception &) { hit=true; }
+    if(!hit) std::cerr<<"not rejected: line "<<line<<"\n"; assert(hit); }
 int main() {
+    // the .xxh64 sidecars are libxxhash XXH64 values (reference vectors from libxxhash 0.8)
+    assert(tqllm::xxh64("",0,0)==0xef46db3751d8e999ull && tqllm::xxh64("abc",3,0)==0x44bc2cf5ad770999ull);
+    assert(tqllm::xxh64("0123456789abcdef0123456789abcdef0123456789",42,7)==0x9cdb6129259b938eull);
     const auto root=std::filesystem::temp_directory_path()/("cold-store-test-"+std::to_string(getpid()));
     std::filesystem::create_directories(root);
     struct Cleanup { std::filesystem::path p; ~Cleanup(){std::filesystem::remove_all(p);} } cleanup{root};

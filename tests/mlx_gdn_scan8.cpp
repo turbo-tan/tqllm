@@ -35,16 +35,21 @@ double ms(const std::function<void()>& f) {
 }  // namespace
 
 int main() {
-    setenv("TQLLM_MLX_GDN_SCAN8", "0", 1);  // gdn_scan = the 32-lane reference; gdn_scan8 called directly
     std::mt19937 rng(9);
     bool ok = true;
     for (int t : {64, 300, 2048}) {
         auto q = unit_rows(random_array(rng, {1, t, KH, D}, -1, 1)), k = unit_rows(random_array(rng, {1, t, KH, D}, -1, 1));
         auto v = random_array(rng, {1, t, VH, D}, -1, 1), decay = random_array(rng, {1, t, VH}, 0.85f, 1.0f);
         auto beta = random_array(rng, {1, t, VH}, 0.0f, 1.0f), state = random_array(rng, {1, VH, D, D}, -0.1f, 0.1f);
-        auto ref = gdn_scan(q, k, v, decay, beta, state), got = gdn_scan8(q, k, v, decay, beta, state);
+        auto ref = gdn_scan(q, k, v, decay, beta, state, true), got = gdn_scan8(q, k, v, decay, beta, state);
         const double ro = rel(got.output, ref.output), rs = rel(got.state, ref.state);
-        const bool pass = ro < 1e-5 && rs < 1e-5;
+        bool staged_exact = true;
+        for (int rows : {16, 32}) {
+            auto st = gdn_scan8_staged(q, k, v, decay, beta, state, rows);
+            staged_exact = staged_exact && mx::array_equal(st.output, got.output).item<bool>() && mx::array_equal(st.state, got.state).item<bool>();
+        }
+        std::printf("GDN_SCAN8_STAGED T=%d equal_to_scan8=%d\n", t, int(staged_exact));
+        const bool pass = ro < 1e-5 && rs < 1e-5 && staged_exact;
         std::printf("GDN_SCAN8 T=%d out rel %.2e state rel %.2e %s\n", t, ro, rs, pass ? "PASS" : "FAIL");
         ok = ok && pass;
         if (t == 2048) {
@@ -52,6 +57,10 @@ int main() {
             const double a = ms([&] {std::vector<mx::array> o; for (int l = 0; l < 48; ++l) {auto r = gdn_scan(q, k, v, decay, beta, state); o.push_back(r.output); o.push_back(r.state);} mx::eval(o);});
             const double b = ms([&] {std::vector<mx::array> o; for (int l = 0; l < 48; ++l) {auto r = gdn_scan8(q, k, v, decay, beta, state); o.push_back(r.output); o.push_back(r.state);} mx::eval(o);});
             std::printf("GDN_SCAN8_SPEED T=2048 48 layers: 32-lane %.1f ms, 8-lane %.1f ms -> %.2fx\n", a, b, a / b);
+            for (int rows : {16, 32}) {
+                const double c = ms([&] {std::vector<mx::array> o; for (int l = 0; l < 48; ++l) {auto r = gdn_scan8_staged(q, k, v, decay, beta, state, rows); o.push_back(r.output); o.push_back(r.state);} mx::eval(o);});
+                std::printf("GDN_SCAN8_SPEED T=2048 48 layers: staged %d rows %.1f ms vs 8-lane %.1f ms -> %.2fx\n", rows, c, b, b / c);
+            }
         }
     }
     std::puts(ok ? "GDN_SCAN8_PASS" : "GDN_SCAN8_FAIL");

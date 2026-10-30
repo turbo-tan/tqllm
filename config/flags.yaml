@@ -7,39 +7,15 @@ flags:
     kind: debug
     default: "-"
     doc: "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path"
-  - name: TQLLM_MLX_ABLATE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ABLATE_BLOCKS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ABLATE_SMALL
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ANE_CHECK
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_ANE_FFN
     kind: user
     default: "-"
     doc: "DIR: Neural Engine share of the prefill FFN from per-layer Core ML models (opt-in fast prefill; quality changes, see docs/MLX_BACKEND.md)"
-  - name: TQLLM_MLX_ANE_FULL_DEQUANT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ANE_NOISE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_ANE_SERIAL
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ANE_SKIP_PREDICT
+  - name: TQLLM_MLX_ANE_STUB
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
@@ -51,30 +27,11 @@ flags:
     kind: user
     default: "-"
     doc: "1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN)"
-  - name: TQLLM_MLX_ATTN_DECODE_ROWS
-    kind: debug
+  - name: TQLLM_MLX_ATTN_DECODE_V7
+    kind: retired
     default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ATTN_DECODE_V2
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ATTN_DECODE_V3
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ATTN_PREFILL_BF16
-    kind: debug
-    default: "3"
-    doc: "Apple MLX backend prefill attention: 3 (default) FP16 SDPA for every chunk, 1 BF16 after an FP32 first chunk, 2 BF16 every chunk, 0 FP32"
-  - name: TQLLM_MLX_ATTN_Q_CHUNK
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ATTN_V3_PB
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+    doc: "removed"
+    replaced_by: "fixed behaviour (v7 is the only engine path)"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"
@@ -87,27 +44,19 @@ flags:
     kind: user
     default: "-"
     doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
-  - name: TQLLM_MLX_ATTN_DECODE_SDPA
-    kind: user
-    default: "1"
-    doc: "default on; =0 returns to v1. Decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4)"
-  - name: TQLLM_MLX_DFLASH_CHAIN
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DFLASH_PIPELINE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_DFLASH_RANKSTATS
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DFLASH_SHARDED_TOP16
+  - name: TQLLM_MLX_DRAFT_AHEAD
+    kind: user
+    default: "1"
+    doc: "Apple MLX greedy decode: verify(k) and draft(k+1) chained on the GPU (gated j892); 0 turns it off"
+  - name: TQLLM_MLX_DFLASH_COMPILE
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DFLASH_RING
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
@@ -119,22 +68,42 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DRAFT_ABLATE
+  - name: TQLLM_MLX_PREFILL_GROUP
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DRAFT_BUILD_PROFILE
+  - name: TQLLM_MLX_GDN_SCAN_STAGED
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DROP_TILED_ORIGINALS
+  - name: TQLLM_MLX_PREFILL_FUSED
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DUMP_KV
+  - name: TQLLM_KL_ROWS
     kind: debug
     default: "-"
-    doc: "Apple MLX backend debug: directory for FP16 .npy dumps of K / V / q of attention layers 3, 23, 43, 63 during prefill (KV format study)"
+    doc: "K: with tqmlx-probe --kl-reference, print the K worst prompt positions of each chunk by KL (diagnoses which rows the ANE split gets wrong)"
+  - name: TQLLM_KL_SLICE
+    kind: debug
+    default: "-"
+    doc: "N: with tqmlx-probe --kl-reference, print the mean KL and the count of rows with KL > 1 for each N-position slice of the prompt (finds whether the ANE split's error sits in one slice or follows tokens)"
+  - name: TQLLM_MLX_ATTN_QK_FUSED
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_PREFILL_PACK
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DRAFT_STAGES
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+  - name: TQLLM_MLX_DRAFT_BENCH
+    kind: debug
+    default: "-"
+    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_DUMP_FFN
     kind: debug
     default: "-"
@@ -143,115 +112,11 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_EAGER_ACCEPT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_EAGER_COMMIT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_FFN_GEMM
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_FUSE_EW
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_FUSE_SWIGLU_ROTATION
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_GDN_CHUNKED
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_GDN_FUSE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_GDN_FUSE_PREFILL
-    kind: debug
-    default: "1"
-    doc: "Apple MLX backend: fused GDN prep/post kernels for prefill chunks (1, default since j726); 0 runs the separate ops"
   - name: TQLLM_MLX_GDN_STEP
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_HEAD_FRAG
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_KV_F32
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_LAZY_INJECT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_LAZY_VERIFY_COMMIT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_MMA8
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_MMA8_DRAFT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_MMA8_UNTILED_ONLY
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_DRAFT_HEAD4
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+    kind: user
+    default: "1"
+    doc: "Apple MLX decode: one GDN launch per verify step (gated j892); 0 turns it off"
   - name: TQLLM_MLX_NAX_DRAFT_SHORTLIST
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_FUSE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_MAX_SPLIT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_MR64
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_NO_INPUT_CACHE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_PREFILL_GEMM
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_Q6_HEAD
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_ROW_CHECK
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_SPLIT_TARGET
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_NAX_TQ4
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_PAIRED_SWIGLU_ROTATION
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
@@ -259,58 +124,6 @@ flags:
     kind: user
     default: "-"
     doc: "N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best)"
-  - name: TQLLM_MLX_PREFILL_GEMM
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_PREFILL_INT8
-    kind: user
-    default: "-"
-    doc: "1: int8 matrix-unit prefill for FFN gate/up (opt-in, quality changes; 2 = exact slow mode)"
-  - name: TQLLM_MLX_PREFILL_INT8_MASK
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_SPLIT_COMMIT_TIMING
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_STAGED_BKM
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_STAGED_KS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_STAGED_MT
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_STAGED_PERSG
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_STAGED_SIMDS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_TARGET_HEAD_HOST
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_TARGET_HEAD_IDS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_TARGET_HEAD_SHORTLIST
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_TQ4_ROTATE_UNFUSED
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MOE_FUSE_SHARED
     kind: debug
     default: "on"
@@ -785,202 +598,10 @@ flags:
     replaced_by: "-fitt MiB (-fit on|off)"
 
   # Private experimental Apple MLX backend; unset preserves the base path.
-  - name: TQLLM_MLX_AFFINE_FFN
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_GU
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine gu override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_HALF
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine half override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_MIXER
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine mixer override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_PAD
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine pad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_TQ4
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine tq4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_AFFINE_TQ4_FP32
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX affine tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_ATTENTION_KV_VIEWS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX attention kv views override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_BATCH_DECODE_DENSE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX batch decode dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_CAPTURE_VERIFY
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX capture verify override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_COMPACT_GDN_TAPE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX compact gdn tape override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_COMPILED_GDN
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX compiled gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_DECODED_FFN
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX decoded ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_DEVICE_SELECTOR
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX device selector override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
   - name: TQLLM_MLX_DRAFT_HEAD4
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX draft head4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_DRAFT_HEAD_UNPAD
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX draft head unpad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_FUSED_ATTENTION_ROWS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX fused attention rows override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_FUSE_EPILOGUE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_GDN_SCAN8
-    kind: debug
-    default: "1"
-    doc: "Apple MLX backend: prefill GDN scan (>= 64 rows, no snapshots) with 8 lanes per state row (1, default); 0 keeps the 32-lane scan"
-  - name: TQLLM_MLX_GDN_SCAN
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX gdn scan override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_INT8_N
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX int8 n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_INT8_SIMDS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX int8 simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_INT8_TILE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX int8 tile override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_MATMUL_COLS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX matmul cols override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_MATMUL_SIMDS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX matmul simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_NATIVE_GDN
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX native gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_NATIVE_GDN_PREP
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX native gdn prep override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_Q6_AFFINE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX q6 affine override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_REUSE_ROTATION
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX reuse rotation override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_SERIAL_VERIFY_ATTENTION
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX serial verify attention override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_SERIAL_VERIFY_DENSE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX serial verify dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_K
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor k override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_M
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor m override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_MEMORY
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor memory override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_N
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_SIMDS
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_SPLIT
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor split override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_TRANSPOSE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor transpose override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TENSOR_WIDE
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tensor wide override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_DFLASH_FP32
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled dflash fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_MIXER_FP32
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled mixer fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_TQ3_FP16
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled tq3 fp16 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_TQ3_FP32
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled tq3 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_TQ4_FP32
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TQ3_STREAM
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tq3 stream override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TQ3_SUBGROUP
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tq3 subgroup override; only used by MLX tools. Leave unset unless running the corresponding validation experiment."
-  - name: TQLLM_MLX_TILED_TQ4_FP16
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes."
-  - name: TQLLM_MLX_PAIRED_GATE_UP
-    kind: debug
-    default: "unset (separate projections)"
-    doc: "Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required."
-  - name: TQLLM_MLX_TILED_MIXER_FP16
-    kind: debug
-    default: "unset (backend default)"
-    doc: "Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates."
+    kind: user
+    default: "2"
+    doc: "Apple MLX draft proposal head: 2 = 4-bit head in the matrix-unit layout (gated j892, default), 1 = row layout, 0 = off"
   - name: TQLLM_MLX_WIRED_MIB
     kind: debug
     default: "unset (retain MLX default)"

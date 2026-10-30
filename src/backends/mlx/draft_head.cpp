@@ -46,7 +46,9 @@ void frag_pack(DraftHead4& head) {
 }
 mx::array frag_matmul(const DraftHead4& head,const mx::array& x) {
     const int N=head.codes.shape(0),K=head.codes.shape(1)*8,KB=K/64,m=x.shape(0);
-    static auto kernel=mx::fast::metal_kernel("tqllm_head_frag8",{"W","S","Bi","XS","X"},{"out"},R"METAL(
+    // RT 8-row input tiles per call (1: 8 rows, 2: 16 rows): each weight fragment is loaded once and applied to every
+    // tile, so a 16-row draft reads the head once (was two 8-row calls); a row's arithmetic is the same either way
+    static auto kernel=mx::fast::metal_kernel("tqllm_head_frag",{"W","S","Bi","XS","X"},{"out"},R"METAL(
 const uint sg=simdgroup_index_in_threadgroup;
 const uint lane=thread_index_in_simdgroup;
 const uint g=threadgroup_position_in_grid.x*4+sg;
@@ -54,69 +56,77 @@ const uint qid=lane>>2;
 const uint fm=(qid&4)+((lane>>1)&3);
 const uint fn=(qid&2)*2+(lane&1)*2;
 const uint KB=K/64;
-simdgroup_float8x8 C[2];
-for(uint t=0;t<2;++t)C[t]=simdgroup_float8x8(0);
+simdgroup_float8x8 C[RT][2];
+for(uint r=0;r<RT;++r)for(uint t=0;t<2;++t)C[r][t]=simdgroup_float8x8(0);
 for(uint kb=0;kb<KB;++kb) {
     uint2 w2[2];float2 s2[2],b2[2];
-    simdgroup_float8x8 Ct[2];
-    const float xs=XS[fm*KB+kb];
+    simdgroup_float8x8 Ct[RT][2];
+    float xs[RT];
+    for(uint r=0;r<RT;++r)xs[r]=XS[(r*8+fm)*KB+kb];
     for(uint t=0;t<2;++t) {
         ulong base=((ulong)g*KB+kb)*2+t;
         w2[t]=((const device uint2*)(W+base*64))[lane];
         s2[t]=float2(S[base*8+fn],S[base*8+fn+1]);
         b2[t]=float2(Bi[base*8+fn],Bi[base*8+fn+1]);
-        Ct[t]=simdgroup_float8x8(0);
+        for(uint r=0;r<RT;++r)Ct[r][t]=simdgroup_float8x8(0);
     }
     for(uint kk=0;kk<8;++kk) {
-        simdgroup_half8x8 A;
-        simdgroup_load(A,X+kb*64+kk*8,K);
+        simdgroup_half8x8 A[RT];
+        for(uint r=0;r<RT;++r)simdgroup_load(A[r],X+r*8*K+kb*64+kk*8,K);
         for(uint t=0;t<2;++t) {
             uint word=kk<4?w2[t].x:w2[t].y;
             uint byte=(word>>((kk&3)*8))&255u;
             simdgroup_half8x8 B;
             B.thread_elements()[0]=half(byte&15u);
             B.thread_elements()[1]=half(byte>>4);
-            simdgroup_multiply_accumulate(Ct[t],A,B,Ct[t]);
+            for(uint r=0;r<RT;++r)simdgroup_multiply_accumulate(Ct[r][t],A[r],B,Ct[r][t]);
         }
     }
-    for(uint t=0;t<2;++t) {
-        C[t].thread_elements()[0]+=Ct[t].thread_elements()[0]*s2[t].x+b2[t].x*xs;
-        C[t].thread_elements()[1]+=Ct[t].thread_elements()[1]*s2[t].y+b2[t].y*xs;
+    for(uint r=0;r<RT;++r)for(uint t=0;t<2;++t) {
+        C[r][t].thread_elements()[0]+=Ct[r][t].thread_elements()[0]*s2[t].x+b2[t].x*xs[r];
+        C[r][t].thread_elements()[1]+=Ct[r][t].thread_elements()[1]*s2[t].y+b2[t].y*xs[r];
     }
 }
-for(uint t=0;t<2;++t)simdgroup_store(C[t],out+(g*2+t)*8,N);
+for(uint r=0;r<RT;++r)for(uint t=0;t<2;++t)simdgroup_store(C[r][t],out+r*8*N+(g*2+t)*8,N);
 )METAL",kHeader);
+    if(m>16)throw std::invalid_argument("fragment head: at most 16 rows");
+    const int rt=m>8?2:1,rows=rt*8;
     auto xp=mx::astype(x,mx::float16);
-    if(m<8)xp=mx::concatenate({xp,mx::zeros({8-m,K},mx::float16)},0);
-    auto xs=mx::sum(mx::reshape(mx::astype(xp,mx::float32),{8,KB,64}),-1);
-    auto y=kernel({*head.frag_codes,*head.frag_scales,*head.frag_biases,xs,xp},{{8,N}},{mx::float32},
-                  {N/(8*NT)*32,1,1},{128,1,1},{{"K",K},{"N",N}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
-    return m<8?mx::slice(y,{0,0},{m,N}):y;
+    if(m<rows)xp=mx::concatenate({xp,mx::zeros({rows-m,K},mx::float16)},0);
+    auto xs=mx::sum(mx::reshape(mx::astype(xp,mx::float32),{rows,KB,64}),-1);
+    auto y=kernel({*head.frag_codes,*head.frag_scales,*head.frag_biases,xs,mx::contiguous(xp)},{{rows,N}},{mx::float32},
+                  {N/(8*NT)*32,1,1},{128,1,1},{{"K",K},{"N",N},{"RT",rt}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+    return m<rows?mx::slice(y,{0,0},{m,N}):y;
 }
 }
 DraftHead4 draft_head4(const Matrix& original) {
+    // matrix-unit layout by default (j785 tqserve mlxc geomean 67.7 vs 65.0 tok/s, draft 8.4 vs 11.6 ms); =1 the fragment head
+    static const bool nax_layout=!std::getenv("TQLLM_MLX_DRAFT_HEAD4") || std::string(std::getenv("TQLLM_MLX_DRAFT_HEAD4"))!="1";
+    if(nax_layout) {
+        auto weights=mx::quantize(mx::astype(stage_bf16(original),mx::bfloat16),64,4,"affine");
+        mx::eval(weights);
+        auto nax=nax_affine_from_quantized(weights[0],weights[1],weights[2],64);
+        const auto none=mx::zeros({1},mx::uint32);
+        return DraftHead4{none,none,none,std::nullopt,std::nullopt,std::nullopt,nax};
+    }
     auto staged=mx::astype(stage_bf16(original),mx::float32);
     auto weights=mx::quantize(staged,64,4,"affine");
     mx::eval(weights);
-    DraftHead4 head{weights[0],weights[1],weights[2],std::nullopt,std::nullopt,std::nullopt};
+    DraftHead4 head{weights[0],weights[1],weights[2],std::nullopt,std::nullopt,std::nullopt,std::nullopt};
     const int rows=head.codes.shape(0),columns=head.codes.shape(1)*8;
-    // default on (TQLLM_MLX_HEAD_FRAG=0 opts out): j578 draft 11.6 vs 16.2 ms/step without it
-    const char* frag=std::getenv("TQLLM_MLX_HEAD_FRAG");
-    if((!frag || std::string(frag)!="0") && rows%(16*4)==0 && columns%64==0)frag_pack(head);
+    if(rows%(16*4)==0 && columns%64==0)frag_pack(head);  // j578: draft 11.6 vs 16.2 ms/step without the fragment layout
     return head;
 }
 mx::array draft_head4_matmul(const DraftHead4& head,const mx::array& x) {
+    if(head.nax)return nax_affine_matmul(*head.nax,x,false);
     if(x.ndim()!=2 || x.dtype()!=mx::float32 || x.shape(0)<1 || x.shape(1)!=8*head.codes.shape(1))
         throw std::invalid_argument("invalid proposal head input");
     const int m=x.shape(0);auto input=x;
+    // block-16 drafts: two 8-row fragment passes (j780: one 16-row pass, RT=2, head stage 10.0 vs 6.5 ms; the generic
+    // quantized matmul doubled the draft, j692: 11.1 -> 21.8 ms)
     if(head.frag_codes && m<=8)return frag_matmul(head,x);
-    // block-16 drafts: the 8-row fragment kernel twice (rows are independent) instead of the generic quantized matmul,
-    // which doubled the draft (j692: 11.1 -> 21.8 ms)
     if(head.frag_codes && m<=16)
-        return mx::concatenate({frag_matmul(head,mx::slice(x,{0,0},{8,x.shape(1)})),
-                                frag_matmul(head,mx::slice(x,{8,0},{m,x.shape(1)}))},0);
-    if(m>1 && m<32 && !std::getenv("TQLLM_MLX_DRAFT_HEAD_UNPAD"))
-        input=mx::concatenate({input,mx::zeros({32-m,x.shape(1)},mx::float32)},0);
+        return mx::concatenate({frag_matmul(head,mx::slice(x,{0,0},{8,x.shape(1)})),frag_matmul(head,mx::slice(x,{8,0},{m,x.shape(1)}))},0);
     auto result=mx::quantized_matmul(input,head.codes,head.scales,head.biases,true,64,4,"affine");
     return mx::astype(mx::slice(result,{0,0},{m,head.codes.shape(0)}),mx::float32);
 }

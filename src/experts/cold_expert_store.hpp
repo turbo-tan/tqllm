@@ -2,7 +2,6 @@
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <dlfcn.h>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -16,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include "xxh64.hpp"
 
 namespace tqllm {
 // Immutable Q2 records; identity binds the encoder revision, source files and exact precision map.
@@ -35,16 +35,8 @@ public:
 private:
     bool profile_ = false, fast_ = false;
     template<class P> static uint64_t fast_hash(const std::array<P,3> & parts) {
-        using Hash = uint64_t (*)(const void *, size_t, uint64_t);
-        static Hash hash = [] {
-            void * lib = dlopen("libxxhash.so.0", RTLD_NOW | RTLD_LOCAL);
-            auto fn = lib ? reinterpret_cast<Hash>(dlsym(lib, "XXH64")) : nullptr;
-            if (!fn) throw std::runtime_error("cold store: XXH64 verification requires libxxhash.so.0");
-            if (fn("",0,0) != 0xef46db3751d8e999ull) throw std::runtime_error("cold store: XXH64 self-test failed");
-            return fn;
-        }();
         uint64_t h=0;
-        for (const auto & p : parts) h=hash(p.data(),p.size(),h);
+        for (const auto & p : parts) h=xxh64(p.data(),p.size(),h);
         return h;
     }
     uint64_t fast_expected(int layer,int expert,uint64_t original) const {
@@ -56,7 +48,15 @@ private:
         return h[5];
     }
 
-    struct MappedRecord {std::shared_ptr<const void> owner;dev_t dev;ino_t ino;};
+    struct MappedRecord {std::shared_ptr<const void> owner;dev_t dev;ino_t ino;int64_t mtime;};
+    // a record rewritten in place keeps its inode; a MAP_PRIVATE mapping need not show the new bytes (macOS does not)
+    static int64_t mtime_ns(const struct stat & s) {
+#ifdef __APPLE__
+        return int64_t(s.st_mtimespec.tv_sec)*1000000000+s.st_mtimespec.tv_nsec;
+#else
+        return int64_t(s.st_mtim.tv_sec)*1000000000+s.st_mtim.tv_nsec;
+#endif
+    }
     mutable std::map<std::pair<int,int>,MappedRecord> mapped_;
     mutable std::mutex mapped_mutex_;
     mutable Stats stats_;
@@ -97,7 +97,7 @@ public:
         for (const auto & p : sources) {
             const auto full = std::filesystem::canonical(p);
             s += full.string() + "\n" + std::to_string(std::filesystem::file_size(full)) + "\n" +
-                 std::to_string(std::filesystem::last_write_time(full).time_since_epoch().count()) + "\n";
+                 std::to_string(static_cast<long long>(std::filesystem::last_write_time(full).time_since_epoch().count())) + "\n";
         }
         s.append(reinterpret_cast<const char *>(map.data()), map.size()*sizeof(int32_t));
         return s;
@@ -152,7 +152,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mapped_mutex_);
             auto it=mapped_.find({layer,expert});
-            if(it!=mapped_.end() && it->second.dev==info.st_dev && it->second.ino==info.st_ino)owner=it->second.owner;
+            if(it!=mapped_.end() && it->second.dev==info.st_dev && it->second.ino==info.st_ino && it->second.mtime==mtime_ns(info))owner=it->second.owner;
             else {
                 const int fd=::open(p.c_str(),O_RDONLY|O_CLOEXEC);
                 if(fd<0)throw std::runtime_error("cold store: mapped record open failed");
@@ -161,7 +161,7 @@ public:
                 void * data=mmap(nullptr,bytes,PROT_READ,MAP_PRIVATE,fd,0);::close(fd);
                 if(data==MAP_FAILED)throw std::runtime_error("cold store: mmap failed");
                 owner=std::shared_ptr<const void>(data,[bytes](const void * v){munmap(const_cast<void *>(v),bytes);});
-                mapped_[{layer,expert}]={owner,actual.st_dev,actual.st_ino};
+                mapped_[{layer,expert}]={owner,actual.st_dev,actual.st_ino,mtime_ns(actual)};
             }
         }
         const auto * data=static_cast<const char *>(owner.get());std::array<uint64_t,4> h{};

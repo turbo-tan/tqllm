@@ -12,13 +12,14 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_ANE_WAVE` | - | 1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN) |  |
 | `TQLLM_MLX_CACHE_LIMIT_MIB` | - | MiB: MLX buffer-cache limit for the Mac tools (default 512) |  |
 | `TQLLM_MLX_DFLASH_BLOCK` | - | N: drafter block rows (8, or 16 for block-16 drafts and verify) |  |
-| `TQLLM_MLX_ATTN_DECODE_SDPA` | 1 | default on; =0 returns to v1. Decode / verify attention (1-16 rows, BF16 KV) through MLX's fused SDPA matrix kernel, queries padded to 16 rows (v4) |  |
+| `TQLLM_MLX_DRAFT_AHEAD` | 1 | Apple MLX greedy decode: verify(k) and draft(k+1) chained on the GPU (gated j892); 0 turns it off |  |
+| `TQLLM_MLX_GDN_STEP` | 1 | Apple MLX decode: one GDN launch per verify step (gated j892); 0 turns it off |  |
 | `TQLLM_MLX_PREFILL_CHUNK` | - | N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best) |  |
-| `TQLLM_MLX_PREFILL_INT8` | - | 1: int8 matrix-unit prefill for FFN gate/up (opt-in, quality changes; 2 = exact slow mode) |  |
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |
 | `TQLLM_GLM_EXPERT_SLOTS` | 0 | GLM-5.3-Flash: keep only this many routed experts of every MoE layer resident, in a MixedExpertCache bank (0: the whole expert stack on the device). The experts a token needs are streamed from the GGUF / the packed file, so the tokens do not change; it also turns off the decode CUDA graph |  |
 | `TQLLM_GLM_EXPERT_BUDGET_MB` | banks + 25 % | GLM-5.3-Flash: device bytes the expert banks plus loader staging may hold. With TQLLM_GLM_EXPERT_SLOTS it caps them; on its own it turns on the shared byte-budget plan (src/experts/expert_bank_plan.hpp), which gives every MoE layer top-k slots and the rest of the bytes to the layers whose routing spreads over more experts (measured over the prompt, re-planned when it ends) |  |
 | `TQLLM_GLM_EXPERTS` | - | GLM-5.3-Flash: packed expert file (glm-pack-experts MODEL.gguf OUT.tqfnexp) for the expert banks: a bank miss copies the expert instead of repacking it; the engine page-locks it when it is at most half the host RAM, which also lets it prefetch (TQLLM_GLM_EXPERT_PF); a bigger file copies misses through pinned staging |  |
+| `TQLLM_MLX_DRAFT_HEAD4` | 2 | Apple MLX draft proposal head: 2 = 4-bit head in the matrix-unit layout (gated j892, default), 1 = row layout, 0 = off |  |
 | `TQFN_ARENA_MB` | - | MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit) |  |
 | `TQFN_CPU_MISS` | 0 | N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off) |  |
 | `TQFN_DRAFT_VOCAB` | - | FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab) |  |
@@ -33,75 +34,27 @@ command-line options (`docs/CONFIG.md`).
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
 | `TQFN_KEEP_MAP` | - | FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path |  |
-| `TQLLM_MLX_ABLATE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ABLATE_BLOCKS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ABLATE_SMALL` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ANE_CHECK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ANE_FULL_DEQUANT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ANE_NOISE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ANE_SERIAL` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ANE_SKIP_PREDICT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_ANE_STUB` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ANE_TIMING` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_DECODE_ROWS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_DECODE_V2` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_DECODE_V3` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_PREFILL_BF16` | 3 | Apple MLX backend prefill attention: 3 (default) FP16 SDPA for every chunk, 1 BF16 after an FP32 first chunk, 2 BF16 every chunk, 0 FP32 |  |
-| `TQLLM_MLX_ATTN_Q_CHUNK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_ATTN_V3_PB` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_COUNT_NODES` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DFLASH_CHAIN` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DFLASH_PIPELINE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DFLASH_RANKSTATS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DFLASH_SHARDED_TOP16` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_DFLASH_COMPILE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_DFLASH_RING` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DFLASH_SPEC_ONLY` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DFLASH_WARM_TOKENS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DRAFT_ABLATE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DRAFT_BUILD_PROFILE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DROP_TILED_ORIGINALS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_DUMP_KV` | - | Apple MLX backend debug: directory for FP16 .npy dumps of K / V / q of attention layers 3, 23, 43, 63 during prefill (KV format study) |  |
+| `TQLLM_MLX_PREFILL_GROUP` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_GDN_SCAN_STAGED` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_PREFILL_FUSED` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_KL_ROWS` | - | K: with tqmlx-probe --kl-reference, print the K worst prompt positions of each chunk by KL (diagnoses which rows the ANE split gets wrong) |  |
+| `TQLLM_KL_SLICE` | - | N: with tqmlx-probe --kl-reference, print the mean KL and the count of rows with KL > 1 for each N-position slice of the prompt (finds whether the ANE split's error sits in one slice or follows tokens) |  |
+| `TQLLM_MLX_ATTN_QK_FUSED` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_PREFILL_PACK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_DRAFT_STAGES` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
+| `TQLLM_MLX_DRAFT_BENCH` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DUMP_FFN` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DUMP_FFN_SLICE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_EAGER_ACCEPT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_EAGER_COMMIT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_FFN_GEMM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_FUSE_EW` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_FUSE_SWIGLU_ROTATION` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_GDN_CHUNKED` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_GDN_FUSE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_GDN_FUSE_PREFILL` | 1 | Apple MLX backend: fused GDN prep/post kernels for prefill chunks (1, default since j726); 0 runs the separate ops |  |
-| `TQLLM_MLX_GDN_STEP` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_HEAD_FRAG` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_KV_F32` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_LAZY_INJECT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_LAZY_VERIFY_COMMIT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_MMA8` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_MMA8_DRAFT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_MMA8_UNTILED_ONLY` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_DRAFT_HEAD4` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_NAX_DRAFT_SHORTLIST` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_FUSE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_MAX_SPLIT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_MR64` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_NO_INPUT_CACHE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_PREFILL_GEMM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_Q6_HEAD` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_ROW_CHECK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_SPLIT_TARGET` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_NAX_TQ4` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_PAIRED_SWIGLU_ROTATION` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_PREFILL_GEMM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_PREFILL_INT8_MASK` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_SPLIT_COMMIT_TIMING` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_STAGED_BKM` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_STAGED_KS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_STAGED_MT` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_STAGED_PERSG` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_STAGED_SIMDS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_TARGET_HEAD_HOST` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_TARGET_HEAD_IDS` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_TARGET_HEAD_SHORTLIST` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MLX_TQ4_ROTATE_UNFUSED` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MOE_FUSE_SHARED` | on | 0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches |  |
 | `TQLLM_MOE_STAGE` | on | 0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics) |  |
 | `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
@@ -111,55 +64,6 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MINIMAX_DUMP` | off | FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py |  |
 | `TQLLM_MINIMAX_ROUTES` | off | FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map |  |
 | `TQLLM_GLM_EXPERT_PF` | on | 0: GLM-5.3-Flash does not prefetch the experts a MoE layer wanted at the previous token while that layer runs its attention (needs a pinned TQLLM_GLM_EXPERTS file; placement only, the tokens do not change) |  |
-| `TQLLM_MLX_AFFINE_FFN` | unset (backend default) | Experimental Apple MLX affine ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_GU` | unset (backend default) | Experimental Apple MLX affine gu override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_HALF` | unset (backend default) | Experimental Apple MLX affine half override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_MIXER` | unset (backend default) | Experimental Apple MLX affine mixer override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_PAD` | unset (backend default) | Experimental Apple MLX affine pad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_TQ4` | unset (backend default) | Experimental Apple MLX affine tq4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_AFFINE_TQ4_FP32` | unset (backend default) | Experimental Apple MLX affine tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_ATTENTION_KV_VIEWS` | unset (backend default) | Experimental Apple MLX attention kv views override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_BATCH_DECODE_DENSE` | unset (backend default) | Experimental Apple MLX batch decode dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_CAPTURE_VERIFY` | unset (backend default) | Experimental Apple MLX capture verify override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_COMPACT_GDN_TAPE` | unset (backend default) | Experimental Apple MLX compact gdn tape override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_COMPILED_GDN` | unset (backend default) | Experimental Apple MLX compiled gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_DECODED_FFN` | unset (backend default) | Experimental Apple MLX decoded ffn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_DEVICE_SELECTOR` | unset (backend default) | Experimental Apple MLX device selector override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_DRAFT_HEAD4` | unset (backend default) | Experimental Apple MLX draft head4 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_DRAFT_HEAD_UNPAD` | unset (backend default) | Experimental Apple MLX draft head unpad override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_FUSED_ATTENTION_ROWS` | unset (backend default) | Experimental Apple MLX fused attention rows override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_FUSE_EPILOGUE` | unset (backend default) | Experimental Apple MLX fuse epilogue override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_GDN_SCAN8` | 1 | Apple MLX backend: prefill GDN scan (>= 64 rows, no snapshots) with 8 lanes per state row (1, default); 0 keeps the 32-lane scan |  |
-| `TQLLM_MLX_GDN_SCAN` | unset (backend default) | Experimental Apple MLX gdn scan override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_INT8_N` | unset (backend default) | Experimental Apple MLX int8 n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_INT8_SIMDS` | unset (backend default) | Experimental Apple MLX int8 simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_INT8_TILE` | unset (backend default) | Experimental Apple MLX int8 tile override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_MATMUL_COLS` | unset (backend default) | Experimental Apple MLX matmul cols override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_MATMUL_SIMDS` | unset (backend default) | Experimental Apple MLX matmul simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_NATIVE_GDN` | unset (backend default) | Experimental Apple MLX native gdn override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_NATIVE_GDN_PREP` | unset (backend default) | Experimental Apple MLX native gdn prep override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_Q6_AFFINE` | unset (backend default) | Experimental Apple MLX q6 affine override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_REUSE_ROTATION` | unset (backend default) | Experimental Apple MLX reuse rotation override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_SERIAL_VERIFY_ATTENTION` | unset (backend default) | Experimental Apple MLX serial verify attention override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_SERIAL_VERIFY_DENSE` | unset (backend default) | Experimental Apple MLX serial verify dense override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_K` | unset (backend default) | Experimental Apple MLX tensor k override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_M` | unset (backend default) | Experimental Apple MLX tensor m override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_MEMORY` | unset (backend default) | Experimental Apple MLX tensor memory override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_N` | unset (backend default) | Experimental Apple MLX tensor n override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_SIMDS` | unset (backend default) | Experimental Apple MLX tensor simds override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_SPLIT` | unset (backend default) | Experimental Apple MLX tensor split override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_TRANSPOSE` | unset (backend default) | Experimental Apple MLX tensor transpose override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TENSOR_WIDE` | unset (backend default) | Experimental Apple MLX tensor wide override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_DFLASH_FP32` | unset (backend default) | Experimental Apple MLX tiled dflash fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_MIXER_FP32` | unset (backend default) | Experimental Apple MLX tiled mixer fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_TQ3_FP16` | unset (backend default) | Experimental Apple MLX tiled tq3 fp16 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_TQ3_FP32` | unset (backend default) | Experimental Apple MLX tiled tq3 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_TQ4_FP32` | unset (backend default) | Experimental Apple MLX tiled tq4 fp32 override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TQ3_STREAM` | unset (backend default) | Experimental Apple MLX tq3 stream override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TQ3_SUBGROUP` | unset (backend default) | Experimental Apple MLX tq3 subgroup override; only used by MLX tools. Leave unset unless running the corresponding validation experiment. |  |
-| `TQLLM_MLX_TILED_TQ4_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ4 FFN with FP16 operands, FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_TQ4_FP32. Quality gate required; does not requantize stored codes. |  |
-| `TQLLM_MLX_PAIRED_GATE_UP` | unset (separate projections) | Experimental Apple MLX shared-tile gate/up projections with fused activation; set to 1. Uses explicitly enabled tiled FFN precision; incompatible pairs retain the original path. Arithmetic and whole-model gates required. |  |
-| `TQLLM_MLX_TILED_MIXER_FP16` | unset (backend default) | Experimental Apple MLX tiled TQ3 GDN projections with FP16 operands and FP32 accumulation; set to 1, mutually exclusive with TQLLM_MLX_TILED_MIXER_FP32. Recurrent-state precision is unchanged. Requires quality and width-parity gates. |  |
 | `TQLLM_MLX_WIRED_MIB` | unset (retain MLX default) | Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings. |  |
 | `TQFN_ALLOW_NP_ABOVE_8` | off | allow Flash-Next servers with more than 8 slots (known to end some requests after one token above 8) |  |
 | `TQFN_ARENA_LOG` | off | print the scratch arena high-water mark after each prefill |  |
@@ -211,6 +115,7 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
+| `TQLLM_MLX_ATTN_DECODE_V7` | - | removed | fixed behaviour (v7 is the only engine path) |
 | `TQLLM_ATTN_NBUF` | - | removed | fixed behaviour (settled A/B switch removed) |
 | `TQLLM_BATCH_COLS` | - | removed | automatic (per GPU) |
 | `TQLLM_COMPOSITE` | - | removed | fixed behaviour (settled A/B switch removed) |

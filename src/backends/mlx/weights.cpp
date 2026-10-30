@@ -55,6 +55,8 @@ Matrix load_matrix(const GgufTensor& tensor, std::span<const uint8_t> payload) {
         case GGML_TQ4: return load_tq4_blocks(payload, shape[0], shape[1]);
         case GGML_Q6_K: return load_q6_blocks(payload, shape[0], shape[1]);
         case GGML_Q8_0: return load_q8_blocks(payload, shape[0], shape[1]);
+        case GGML_Q2_K: case GGML_Q3_K: case GGML_Q4_K: case GGML_Q5_K: case GGML_IQ3_S: case GGML_IQ4_XS: case GGML_IQ4_NL:
+            return load_kquant_blocks(payload, tensor.type, shape[0], shape[1]);
         default: throw std::invalid_argument("unsupported MLX linear weight type " + std::to_string(tensor.type));
     }
 }
@@ -79,9 +81,17 @@ mx::array linear(const Matrix& weights, const mx::array& input) {
             return tq4_matmul(w, tq4_rotate(input),1,cols,matmul_simds());
         } else if constexpr (std::is_same_v<T, Q6Weights>) {
             return q6_matmul(w, input);
+        } else if constexpr (std::is_same_v<T, KQuantWeights>) {
+            return kquant_matmul(w, input);
         } else {
             return q8_matmul(w, input);
         }
     }, weights);
+}
+mx::array basis_input(const Matrix& weights, const mx::array& input, bool tq4_basis) {
+    return tq4_basis && std::holds_alternative<mx::array>(weights) ? tq4_rotate(input) : input;
+}
+mx::array linear(const Matrix& weights, const mx::array& input, bool tq4_basis) {
+    return linear(weights, basis_input(weights, input, tq4_basis));
 }
 }

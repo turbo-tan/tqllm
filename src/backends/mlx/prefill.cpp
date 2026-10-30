@@ -60,26 +60,12 @@ y[i]=bfloat16_t(float(as_type<char>(p[2+col%32]))*d);
                   {{"R",r},{"K",k}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
 }
+mx::array dense(const KQuantWeights& w) {return mx::astype(kquant_dequant(w), mx::bfloat16);}
 mx::array stage_bf16(const Matrix& weights) {
     return std::visit([](const auto& w)->mx::array {
         using T=std::decay_t<decltype(w)>;
         if constexpr(std::is_same_v<T,mx::array>)return mx::astype(w,mx::bfloat16);
         else return dense(w);
-    },weights);
-}
-mx::array prefill_linear(const Matrix& weights,const mx::array& input) {
-    if(input.ndim()!=2||input.dtype()!=mx::float32||input.shape(0)<1)
-        throw std::invalid_argument("prefill requires a nonempty FP32 matrix");
-    return std::visit([&](const auto& w)->mx::array {
-        using T=std::decay_t<decltype(w)>;
-        mx::array x=input;
-        if constexpr(std::is_same_v<T,Tq3Weights>||std::is_same_v<T,Tq4Weights>)x=tq4_rotate(input);
-        mx::array expanded=stage_bf16(weights);
-        if(expanded.shape(1)!=input.shape(1))throw std::invalid_argument("incompatible prefill matrix dimensions");
-        auto y=mx::astype(mx::matmul(mx::astype(x,mx::bfloat16),mx::transpose(expanded)),mx::float32);
-        // Complete one projection before another can allocate its dense scratch.
-        mx::eval(y);
-        return y;
     },weights);
 }
 }

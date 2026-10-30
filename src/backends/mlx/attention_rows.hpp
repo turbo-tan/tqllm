@@ -1,140 +1,55 @@
 #pragma once
-#include <algorithm>
-#include <string>
-#include <cstdlib>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
-#include <mlx/transforms.h>
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 #include "attention_decode.hpp"
 
 namespace tqllm::mlx_backend {
-inline mlx::core::array fused_decode_attention(const mlx::core::array& q,
-        const mlx::core::array& k,const mlx::core::array& v,float scale) {
-    namespace mx=mlx::core;
-    if(q.ndim()!=4 || k.ndim()!=4 || v.shape()!=k.shape() || q.shape(0)!=1 || k.shape(0)!=1 ||
-       q.shape(2)<1 || q.shape(2)>8 || k.shape(2)<q.shape(2) || k.shape(2)>=1024 ||
-       q.shape(1)<1 || k.shape(1)<1 || q.shape(1)%k.shape(1) ||
-       (q.shape(3)!=128 && q.shape(3)!=256) || k.shape(3)!=q.shape(3) ||
-       q.dtype()!=mx::float32 || k.dtype()!=mx::float32 || v.dtype()!=mx::float32)
-        throw std::invalid_argument("unsupported fused decode attention shape");
-    const uint32_t layout[]={uint32_t(k.shape(2)),uint32_t(q.shape(2)),
-        uint32_t(q.shape(1)),uint32_t(k.shape(1))};
-    static auto kernel=mx::fast::metal_kernel("tqllm_decode_attention_rows",{"q","k","v","layout","scale"},
-        {"out"},R"METAL(
-uint tid=thread_position_in_threadgroup.x;
-uint lane=tid%32u,partition=tid/32u;
-uint group=threadgroup_position_in_grid.y;
-uint length=layout[0],rows=layout[1],heads=layout[2],kvheads=layout[3];
-uint head=group/rows,token=group%rows,kvhead=head/(heads/kvheads);
-uint visible=length-rows+token+1u;
-constexpr uint elements=DIM/32u;
-float query[elements],weighted[elements];
-for(uint j=0;j<elements;++j) {
-    query[j]=scale*q[group*DIM+lane*elements+j];
-    weighted[j]=0.0f;
-}
-float peak=-3.4028234663852886e38f,mass=0.0f;
-for(uint row=partition;row<visible;row+=32u) {
-    uint offset=(kvhead*length+row)*DIM+lane*elements;
-    float dot=0.0f;
-    for(uint j=0;j<elements;++j)dot+=query[j]*k[offset+j];
-    dot=simd_sum(dot);
-    float next=max(peak,dot);
-    float retain=fast::exp(peak-next),weight=fast::exp(dot-next);
-    mass=mass*retain+weight;
-    for(uint j=0;j<elements;++j)weighted[j]=weighted[j]*retain+weight*v[offset+j];
-    peak=next;
-}
-// Reuse the same storage for partition metadata and the full numerator tile.
-threadgroup float workspace[32u*DIM];
-if(lane==0u) {workspace[partition]=peak;workspace[32u+partition]=mass;}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-float common_peak=simd_max(workspace[lane]);
-float factor=fast::exp(workspace[lane]-common_peak);
-float total=simd_sum(workspace[32u+lane]*factor);
-threadgroup_barrier(mem_flags::mem_threadgroup);
-for(uint j=0;j<elements;++j)workspace[(lane*elements+j)*32u+partition]=weighted[j];
-threadgroup_barrier(mem_flags::mem_threadgroup);
-for(uint j=0;j<elements;++j) {
-    uint column=partition*elements+j;
-    float value=simd_sum(workspace[column*32u+lane]*factor);
-    if(lane==0u)out[group*DIM+column]=total==0.0f?value:value/total;
-}
-)METAL");
-    return kernel({mx::contiguous(q),mx::contiguous(k),mx::contiguous(v),
-        mx::array(layout,{4},mx::uint32),mx::array(scale)}, {q.shape()},{mx::float32},
-        {1024,q.shape(1)*q.shape(2),1},{1024,1,1},{{"DIM",q.shape(3)}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
-}
-inline mlx::core::array causal_attention_rows(const mlx::core::array& q,
-        const mlx::core::array& k, const mlx::core::array& v, float scale,
-        bool decode_order, bool kv_views = false,bool fused_rows = false, int kv_valid = -1) {
+// Causal attention of q's rows (the last n of `length` positions) over a BF16 KV buffer whose first `kv_valid`
+// positions are filled (kv_valid <= 0: all of it). Up to 16 rows (decode, verify) run the batch-invariant decode-rows
+// kernel; prefill chunks run MLX's fused SDPA in FP16 (K / V hold BF16 values, exact in FP16 within its range; j735:
+// prefill +0.6-4.1 %, KL below the chunk-64 floor on 8 of 8 windows).
+// Prefill attention of q's rows (the last of the keys' positions), FP16 operands. MLX takes its fused kernel at head dim
+// 256 only from 1024 query rows (NAX); a shorter prefill slice (the last slice of a prompt, an ANE plan's remainder)
+// takes the unfused path, which materialises heads x rows x keys scores: 951 rows x 250,551 keys = 11 GB, the 256K
+// request's 44 GB peak (k1179). Such calls run in row chunks under kPrefillScoreBudget bytes of scores, each with the
+// full key length and an explicit causal mask, so every row sees the same operations as in the single call (the test
+// checks the result bit for bit).
+constexpr size_t kPrefillScoreBudget = size_t(512) << 20;
+inline mlx::core::array prefill_attention_rows(const mlx::core::array& q16, const mlx::core::array& keys16,
+                                               const mlx::core::array& values16, float scale) {
     namespace mx = mlx::core;
-    // kv_valid > 0: k / v are KV buffers whose first kv_valid positions are filled
-    const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2), past = length - n;
-    if (past < 0 || v.shape(2) != k.shape(2) || length > k.shape(2))
-        throw std::invalid_argument("attention cache shorter than query block");
-    const bool decode_rows = std::getenv("TQLLM_MLX_ATTN_DECODE_ROWS") != nullptr;
-    if (decode_rows && n <= 16 && q.shape(0) == 1 && k.shape(0) == 1 && q.dtype() == mx::float32 &&
-        (k.dtype() == mx::float32 || k.dtype() == mx::bfloat16) && v.dtype() == k.dtype() &&
-        (q.shape(3) == 128 || q.shape(3) == 256) && q.shape(1) % k.shape(1) == 0)
-        return decode_rows_attention(q, k, v, scale, length);
-    // prefill chunks: q, K and V hold BF16-rounded values and the output is BF16-rounded next (gate_mul_bf), so the
-    // fused SDPA runs on the BF16 cache directly instead of FP32 copies of it. TQLLM_MLX_ATTN_PREFILL_BF16=0 keeps FP32.
-    static const bool prefill_bf16 = !std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ||
-                                     std::string(std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16")) != "0";
-    // only with past keys: a first chunk (no past) was faster on the FP32 path (j605 doc2k 369 vs 345 tok/s, before
-    // the shipped epilogue defaults); =2 also runs the first chunk on BF16 (re-measure)
-    // default: every prefill chunk (first included) on the FP16 SDPA: same speed as BF16 (j724) with 3 more mantissa
-    // bits for q and P; K / V hold BF16 values, exact in FP16 within its range (j735: prefill +0.6-4.1 %, KL below the
-    // chunk-64 floor on 8 of 8 windows). =1 the earlier BF16 path after an FP32 first chunk, =2 BF16 first chunk too
-    static const std::string attn_mode = std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") ? std::getenv("TQLLM_MLX_ATTN_PREFILL_BF16") : "3";
-    static const bool first_bf16 = prefill_bf16 && (attn_mode == "2" || attn_mode == "3");
-    static const bool fp16_sdpa = attn_mode == "3";
-    if (prefill_bf16 && (kv_valid > n || (first_bf16 && kv_valid == n)) && n > 8 && !decode_order &&
-        k.dtype() == mx::bfloat16 && q.shape(0) == 1) {
-        auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)});
-        auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)});
-        const auto t = fp16_sdpa ? mx::float16 : mx::bfloat16;
-        if (fp16_sdpa) {keys = mx::astype(keys, t); values = mx::astype(values, t);}
-        auto out = mx::fast::scaled_dot_product_attention(mx::astype(q, t), keys, values, scale, "causal");
-        return mx::astype(out, q.dtype());
+    const int heads = q16.shape(1), n = q16.shape(2), length = keys16.shape(2);
+    const size_t row_bytes = size_t(heads) * size_t(length) * 2;
+    if (n >= 1024 || size_t(n) * row_bytes <= kPrefillScoreBudget)
+        return mx::fast::scaled_dot_product_attention(q16, keys16, values16, scale, "causal");
+    const int chunk = std::max<int>(1, int(kPrefillScoreBudget / row_bytes));
+    std::vector<mx::array> parts;
+    auto key_pos = mx::reshape(mx::arange(length, mx::int32), {1, length});
+    for (int r0 = 0; r0 < n; r0 += chunk) {
+        const int r1 = std::min(n, r0 + chunk);
+        auto qc = mx::slice(q16, {0, 0, r0, 0}, {q16.shape(0), heads, r1, q16.shape(3)});
+        auto row_pos = mx::reshape(mx::arange(length - n + r0, length - n + r1, mx::int32), {r1 - r0, 1});
+        auto mask = mx::greater_equal(row_pos, key_pos);   // the same mask the causal fallback builds, for these rows
+        auto out = mx::fast::scaled_dot_product_attention(qc, keys16, values16, scale, "", mask);
+        mx::eval(out);   // one chunk's scores alive at a time
+        parts.push_back(out);
     }
-    if (kv_valid > 0 && (kv_valid < k.shape(2) || k.dtype() != q.dtype())) {
-        // other paths read float32 views of the filled positions (BF16 storage holds BF16-rounded values: exact)
-        auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)});
-        auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)});
-        if (keys.dtype() != q.dtype()) {keys = mx::astype(keys, q.dtype()); values = mx::astype(values, q.dtype());}
-        return causal_attention_rows(q, keys, values, scale, decode_order, kv_views, fused_rows);
-    }
-    if(fused_rows && (decode_order || n==1) && q.shape(0)==1 && k.shape(2)<1024 &&
-       n<=8 && (q.shape(3)==128 || q.shape(3)==256) && q.dtype()==mx::float32)
-        return fused_decode_attention(q,k,v,scale);
-    static const int q_chunk = std::getenv("TQLLM_MLX_ATTN_Q_CHUNK") ? std::stoi(std::getenv("TQLLM_MLX_ATTN_Q_CHUNK")) : 0;
-    if (!decode_order && q_chunk > 0 && n > q_chunk) {
-        std::vector<mx::array> blocks;
-        for (int a = 0; a < n; a += q_chunk) {
-            const int b = std::min(n, a + q_chunk);
-            auto query = mx::slice(q, {0, 0, a, 0}, {q.shape(0), q.shape(1), b, q.shape(3)});
-            auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), past + b, k.shape(3)});
-            auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), past + b, v.shape(3)});
-            blocks.push_back(mx::fast::scaled_dot_product_attention(query, keys, values, scale, "causal"));
-            mx::eval(blocks.back());
-        }
-        return mx::concatenate(blocks, 2);
-    }
-    if (!decode_order || n == 1)
-        return mx::fast::scaled_dot_product_attention(q, k, v, scale, n > 1 ? "causal" : "");
-    std::vector<mx::array> output;
-    output.reserve(n);
-    for (int t = 0; t < n; ++t) {
-        auto query = mx::contiguous(mx::slice(q, {0, 0, t, 0}, {q.shape(0), q.shape(1), t + 1, q.shape(3)}));
-        auto keys = mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), past + t + 1, k.shape(3)});
-        auto values = mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), past + t + 1, v.shape(3)});
-        if(!kv_views) {keys=mx::contiguous(keys);values=mx::contiguous(values);}
-        output.push_back(mx::fast::scaled_dot_product_attention(query, keys, values, scale, ""));
-    }
-    return mx::concatenate(output, 2);
+    return mx::concatenate(parts, 2);
 }
+
+inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const mlx::core::array& k,
+                                              const mlx::core::array& v, float scale, int kv_valid = -1) {
+    namespace mx = mlx::core;
+    const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2);
+    if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
+        throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
+    if (n <= 16) return decode_rows_attention(q, k, v, scale, length);
+    auto keys = mx::astype(mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}), mx::float16);
+    auto values = mx::astype(mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}), mx::float16);
+    auto out = prefill_attention_rows(mx::astype(q, mx::float16), keys, values, scale);
+    return mx::astype(out, q.dtype());
 }
+}  // namespace tqllm::mlx_backend

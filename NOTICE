@@ -31,5 +31,7 @@ Credits - work this project builds on or learned from (ideas and formats, no cod
 * TheTom (turboquant_plus): TurboQuant KV-cache ideas and the REFRACT distance-from-reference quality metric.
 * Avarok (TorQuant): learned rotations for quantisation.
 * Unsloth: the UD GGUF quantisations, which TQLLM runs natively and benchmarks against.
+* Splash (Apache-2.0): the staged prefill GEMM tile on Apple GPUs (weights dequantized once per threadgroup into a
+  double-buffered threadgroup stage, one matmul2d per simdgroup per step), reimplemented for the NAX 4-bit layout.
 
 The full credits table, including methods and comparison baselines, is in README.md (Credits).

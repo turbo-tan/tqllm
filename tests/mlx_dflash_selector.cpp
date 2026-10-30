@@ -8,7 +8,6 @@
 #include <vector>
 namespace mx=mlx::core;
 using tqllm::mlx_backend::dflash_select;
-using tqllm::mlx_backend::dflash_top16_sharded;
 namespace {
 float bf(float x) {
     auto b=std::bit_cast<uint32_t>(x);
@@ -31,32 +30,9 @@ std::vector<uint32_t> legacy(const mx::array& mapped,const mx::array& unary,
     return result;
 }
 
-void check_top16() {
-    constexpr int rows=8,vocab=257;
-    std::vector<float> logits(rows*vocab);
-    for(int r=0;r<rows;++r)for(int c=0;c<vocab;++c) {
-        float value=std::sin(float((r+3)*(c+11))*0.017f)+0.001f*float((c*13+r*7)%29);
-        logits[r*vocab+c]=value;
-    }
-    logits[2*vocab+17]=3.0f;logits[2*vocab+29]=3.0f;
-    auto ids=dflash_top16_sharded(mx::array(logits.data(),{rows,vocab}));mx::eval(ids);
-    const auto* got=ids.data<uint32_t>();
-    for(int r=0;r<rows;++r) {
-        std::vector<uint32_t> order(vocab);
-        for(int c=0;c<vocab;++c)order[c]=uint32_t(c);
-        std::stable_sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b) {
-            float va=logits[r*vocab+a],vb=logits[r*vocab+b];
-            return va>vb || (va==vb && a<b);
-        });
-        for(int k=0;k<16;++k)
-            if(got[r*16+k]!=order[k])throw std::runtime_error("sharded top16 differs from CPU order");
-    }
-    std::cout<<"DFLASH_TOP16_PASS rows="<<rows<<" vocab="<<vocab<<'\n';
-}
 }
 int main() {
     try {
-        check_top16();
         constexpr int vocab=37;
         std::vector<uint32_t> ids(8*16);
         std::vector<float> unary(8*16),gate(8*256),successors(8*16*256),pred(vocab*256);

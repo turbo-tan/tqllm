@@ -32,7 +32,6 @@ int main(int argc,char** argv) {
             std::vector<int> selected(layers);std::iota(selected.begin(),selected.end(),0);
             engine.feature_layers(selected);
         }
-        engine.gdn_mode(Qwen35::GdnMode::scan);engine.verify_tiles(true);
         engine.forward(prompt);
         const auto start=engine.checkpoint();const int position=engine.position(),vocab=engine.vocabulary();
         Qwen35::Verification ticket;
@@ -85,8 +84,6 @@ int main(int argc,char** argv) {
         rejects([&]{engine.accept_prefix(ticket,1);});
         engine.verify({tokens.data(),8},ticket);engine.reset();
         rejects([&]{engine.accept_prefix(ticket,1);});
-        engine.gdn_mode(Qwen35::GdnMode::baseline);
-        rejects([&]{engine.verify({tokens.data(),8},ticket);});
         std::cout<<"PREFIX_PASS accepted=0..8 stale_forward=1 stale_restore=1 stale_reset=1 duplicate=1 invalid_count=1"<<std::endl;
     } catch(const std::exception& e) {std::cerr<<"PREFIX_ERROR "<<e.what()<<'\n';return 1;}
 }
