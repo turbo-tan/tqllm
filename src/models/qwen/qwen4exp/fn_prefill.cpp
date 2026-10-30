@@ -1,6 +1,8 @@
 // Flash-Next layer-major prefill: dense sub-chunks, then the routed experts once per layer from the expert banks and the staged groups.
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
+#include "route_trace.hpp"
+#include "hot_cold_policy.hpp"
 
 std::vector<int> DecodeModel::stage_plan(const MixedExpertCache & cache, int layer) {
     std::vector<int> plan; const bool bank = cache.bank_ready(layer);
@@ -47,6 +49,7 @@ void DecodeModel::stage_upload(PrefillStage & st, const MixedExpertCache & cache
 }
 
 void DecodeModel::stage_begin(PrefillStage & st, const MixedExpertCache & cache, int layer) {
+    require(st.K > 0 && st.copy && st.half[0] && st.half[1], "prefill staging is uninitialized");
     if (st.layer == layer && st.cache == &cache) return;
     st.cache = &cache; st.layer = layer; st.issued = 0;
     // no prepacked file (a GB10 keeps every expert in its bank): nothing to stage, prefill_layer fills the bank instead
@@ -76,16 +79,21 @@ void DecodeModel::release_prefill() {
 }
 
 void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * ple_rows, MixedExpertCache & cache, AttentionState * att_override) {
-    const int sub = std::max(16, g_sub_req > 0 ? std::min(g_tune.sub, g_sub_req) : g_tune.sub), stage_k = std::max(1, g_tune.stage);
+    const bool mixed = g_hot_map && layer < c.layers;
+    const int sub = tqllm::flashnext::dense_prefill_sub(mixed, g_tune.sub, g_sub_req);
+    const int stage_k = std::max(1, g_tune.stage);
     const int K = c.topk, A = n * K, E = c.experts, ff = c.expert_ff;
     auto & st = stage();
-    if (!st.copy || st.K != stage_k) {  // staging banks sized for the largest expert block of any layer
-        size_t need = 0;
-        for (int l = 0; l < c.layers; ++l) {
-            if (!cache.bank_ready(l) && !cache.has_layout(l)) continue;
-            size_t off[6]; const auto lay = cache.bank_layout(l); stage_offsets(lay, stage_k, off); need = std::max(need, off[5] + align256(size_t(stage_k) * lay.piece[5]));
+    if (!mixed && (!st.copy || st.K != stage_k)) {  // staging banks sized for the largest expert block of any layer
+        const size_t need = stage_required(cache, stage_k);
+        if (need) {
+            if (g_hot_map && layer == c.layers) {
+                // Catch-up starts after the trunk; its borrowed banks return after staging is released.
+                const auto evicted = experts.evict_until_free(2 * (need + (size_t(64) << 10)) + (size_t(256) << 20));
+                if (!evicted.empty()) std::fprintf(stderr, "tqllm: MTP staging borrowed %zu trunk banks\n", evicted.size());
+            }
+            stage_alloc(st, need, stage_k);
         }
-        if (need) stage_alloc(st, need, stage_k);
     }
     grow(pf_inject, size_t(n) * c.hc); grow(pf_weights, size_t(A)); grow(pf_sw, size_t(n)); grow(pf_xr, size_t(n) * h);
     grow(pf_routed, size_t(A)); grow(pf_eg, size_t(A) * ff); grow(pf_eu, size_t(A) * ff); grow(pf_ax, size_t(A) * ff);
@@ -98,7 +106,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     auto stage_early = [&](int l) {
         return cache.bank_ready(l) || (size_t(l) < pf_borrowed.size() && pf_borrowed[size_t(l)] && cache.has_layout(l));
     };
-    if (st.copy && stage_early(layer)) stage_begin(st, cache, layer);  // usually queued by the previous layer already
+    if (!mixed && st.copy && stage_early(layer)) stage_begin(st, cache, layer);  // usually queued by the previous layer already
     if (tqllm::debug_on("mem")) {
         size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
         cudaMemPool_t pool; uint64_t res = 0, used = 0; ck(cudaDeviceGetDefaultMemPool(&pool, 0));
@@ -126,7 +134,78 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
       require(!bad, "layer-major prefill: layer " + std::to_string(layer) + " routed " + std::to_string(bad) + " of " + std::to_string(A) +
                     " assignments to an expert outside 0.." + std::to_string(E - 1) + " (first at " + std::to_string(first) + ": " +
                     std::to_string(bad ? ids[first] : 0) + ")"); }
+    if (layer < c.layers) tqllm::flashnext::dump_routing(layer, n, K, ids, size_t(A));
     std::vector<int> cnt(size_t(E), 0); for (int a = 0; a < A; ++a) ++cnt[size_t(ids[a])];
+    if (mixed) {
+        static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
+        const int unique = int(std::count_if(cnt.begin(), cnt.end(), [](int count) { return count > 0; }));
+        const bool wave_gemm = tqllm::flashnext::wave_uses_grouped_gemm(A, E, unique, gemm_avg);
+        auto use_gemm = [&](const Mat & m) {
+            return wave_gemm && tqllm::flashnext::grouped_expert_format(m.fmt->u4h_id(), m.cols);
+        };
+        // Every routed expert is loaded at most once per bank wave over this whole chunk.
+        std::vector<int> hot_counts(cnt);
+        for (int e = 0; e < E; ++e) if (!expert_is_hot(*g_hot_map, layer, E, e)) hot_counts[size_t(e)] = 0;
+        pf_refill[layer] = tqllm::flashnext::bank_experts(hot_counts, layer, size_t(cache.slots(layer)), false);
+        ck(cudaMemsetAsync(pf_eg->p,0,size_t(A)*ff*sizeof(__nv_bfloat16),nullptr));
+        ck(cudaMemsetAsync(pf_eu->p,0,size_t(A)*ff*sizeof(__nv_bfloat16),nullptr));
+        lmark(1);
+        for (int b = 0; b < 2; ++b) {
+            MixedExpertCache & bank = b ? *g_cold_cache : cache;
+            if (b) bank.set_miss_stream(miss_stream);
+            std::vector<int> wanted;
+            for (int e = 0; e < E; ++e)
+                if (cnt[size_t(e)] && expert_is_hot(*g_hot_map, layer, E, e) == (b == 0)) wanted.push_back(e);
+            const int cap = bank.plan_slots(layer);
+            for (size_t start = 0; start < wanted.size(); start += size_t(cap)) {
+                const std::vector<int> wave(wanted.begin() + start, wanted.begin() + std::min(wanted.size(), start + size_t(cap)));
+                const auto slots = bank.prepare(layer, wave);
+                if (bank.split()) bank.wait_misses();
+                int cols = 1;
+                std::vector<int> slot_of(size_t(E), -1), counts(size_t(cap), 0);
+                for (size_t e = 0; e < wave.size(); ++e) {
+                    slot_of[size_t(wave[e])] = slots[e];
+                    cols = std::max(cols, cnt[size_t(wave[e])]);
+                }
+                std::vector<int> assignments(size_t(cap) * cols, 0);
+                for (int a = 0; a < A; ++a) {
+                    const int slot = slot_of[size_t(ids[a])];
+                    if (slot >= 0) assignments[size_t(slot) * cols + size_t(counts[size_t(slot)]++)] = a;
+                }
+                Device<int> dc(counts.size()), di(assignments.size()); dc.put(counts); di.put(assignments);
+                const Mat gate = bank.gate(), up = bank.up(), down = bank.down();
+                auto needs_dedup = [&](const Mat & m) { return m.fmt->has_expert_dedup() && !use_gemm(m); };
+                const bool dedup = needs_dedup(gate) || needs_dedup(up) || needs_dedup(down);
+                constexpr int DS=tqllm_cuda::kDedupStride, DC=tqllm_cuda::kDedupCols;
+                std::vector<int> map(dedup ? size_t(2)*A*DS : 0); int groups[2]={0,0};
+                for(int part=0;dedup && part<2;++part) {
+                    int * out=map.data()+size_t(part)*A*DS;std::vector<int> open(size_t(cap),-1);
+                    for(int a=0;a<A;++a) {
+                        const int slot=slot_of[size_t(ids[a])];if(slot<0)continue;
+                        int & at=open[size_t(slot)];
+                        if(at<0 || out[at*DS+1]==DC){at=groups[part]++;out[at*DS]=slot;out[at*DS+1]=0;}
+                        int * row=out+at*DS;const int col=row[1]++;
+                        row[2+col]=part ? a : a/K;row[2+DC+col]=a;
+                    }
+                }
+                Device<int> dm(map.size()); if (dedup) dm.put(map);
+                auto project = [&](const Mat & m, const __half * x, __nv_bfloat16 * y, int rows, bool down) {
+                    if(m.fmt->has_expert_dedup() && !use_gemm(m))m.fmt->expert_matvec_dedup(m,x,y,rows,dm.p+(down ? size_t(A)*DS : 0),groups[down],nullptr);
+                    else require(m.fmt->expert_gemm(m, x, y, rows, dc.p, di.p, cols, cap, K, down, nullptr),
+                                 std::string("hot/cold prefill: no grouped kernel for ") + m.fmt->name());
+                };
+                if(gate.fmt==up.fmt && gate.fmt->has_expert_dedup() && !use_gemm(gate))
+                    gate.fmt->expert_matvec_dedup2(gate,up,pf_xr->p,pf_eg->p,pf_eu->p,ff,dm.p,groups[0],nullptr);
+                else {project(gate,pf_xr->p,pf_eg->p,ff,false);project(up,pf_xr->p,pf_eu->p,ff,false);}
+                tqllm_cuda::fn_swiglu_bf16_h_groups(pf_eg->p, pf_eu->p, pf_ax->p, dc.p, di.p, cap, cols, ff, nullptr);
+                project(down, pf_ax->p, pf_ed->p, h, true);
+                ck(cudaStreamSynchronize(nullptr)); // do not reuse a bank's wave slots before the last projection
+            }
+        }
+        // Borrowed banks are temporary workspace, not persistent decode residency.
+        release_borrowed_prefill_bank(cache, layer, pf_borrowed);
+        lmark(2);
+    } else {
     const bool borrowed = size_t(layer) < pf_borrowed.size() && pf_borrowed[size_t(layer)] && cache.has_layout(layer);
     if (!cache.bank_ready(layer) && borrowed) {  // every routed expert from staging; refilled right after the prompt
         pf_refill[layer] = tqllm::flashnext::bank_experts(cnt, layer, size_t(cache.slots(layer)), g_cpu_owned);  // most routed first: the refill keeps what its bank holds
@@ -269,11 +348,21 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     lmark(2);
     // queue the next layer's first groups now: they land while this layer finishes and the next one's dense part runs
     if (next >= 0 && stage_early(next)) stage_begin(st, cache, next); else st.layer = -1;
+    }
     // combine and the hyper-connection update per sub-chunk (rows of `wide` replaced)
+    Device<int> nonfinite(mixed ? 1 : 0);
     for (int d = 0; d < n; d += sub) {
         const int nd = std::min(sub, n - d); ArenaMark scratch;
         Device<float> fo(size_t(nd) * h), upd(size_t(nd) * width);
-        tqllm_cuda::fn_moe_combine(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K, pf_sd->p + size_t(d) * h, pf_sw->p + d, fo.p, h, K, nd, nullptr);
+        if (mixed) {
+            ck(cudaMemsetAsync(nonfinite.p, 0, sizeof(int), nullptr));
+            tqllm_cuda::fn_moe_combine_checked(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K,
+                pf_sd->p + size_t(d) * h, pf_sw->p + d, fo.p, h, K, nd, nonfinite.p, nullptr);
+            require(nonfinite.get()[0] == 0, "hot/cold prefill: nonfinite MoE output at layer " + std::to_string(layer));
+        } else {
+            tqllm_cuda::fn_moe_combine(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K,
+                pf_sd->p + size_t(d) * h, pf_sw->p + d, fo.p, h, K, nd, nullptr);
+        }
         float * w = wide + size_t(d) * width;
         tqllm_cuda::hc_combine(w, fo.p, pf_inject->p + size_t(d) * c.hc, upd.p, h, c.hc, nd, nullptr);
         ck(cudaMemcpyAsync(w, upd.p, size_t(nd) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));

@@ -36,7 +36,10 @@ int main() {
     expect(parse({"--prefill-borrow", "auto"}).prefill_borrow == "auto" && parse({"--prefill-borrow", "12"}).prefill_borrow == "12", "--prefill-borrow all|auto|N");
     expect(throws({"--prefill-borrow", "some"}), "bad borrow value rejected");
     expect(throws({"--prefill-chunk", "100"}), "--prefill-chunk below 256 rejected");
-    expect(throws({"--prefill-sub", "8"}), "--prefill-sub below 16 rejected");
+    bool sub8 = false;
+    try { sub8 = parse({"--prefill-sub", "8"}).prefill_sub == 8; } catch (const std::exception &) {}
+    expect(sub8, "--prefill-sub8 can reproduce the mixed prefill baseline");
+    expect(throws({"--prefill-sub", "7"}), "--prefill-sub below8 rejected");
     expect(throws({"--prefill-stage", "0"}), "--prefill-stage below 1 rejected");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");

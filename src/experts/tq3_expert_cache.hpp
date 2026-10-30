@@ -63,12 +63,18 @@ public:
     // Ordered read futures; known staged banks start copying each record before later reads finish.
     using AsyncBatchSource = std::function<std::vector<std::shared_future<std::array<ExpertPayload,3>>>(int,const std::vector<int> &)>;
     void set_async_batch_source(AsyncBatchSource);
+    struct HostVictimStats { size_t bytes = 0; uint64_t hits = 0, source_loads = 0, spills = 0, d2h_bytes = 0; };
+    void set_host_victim_budget(size_t bytes);
+    void enable_host_victims(bool enabled);
+    size_t prime_host_victims(int layer, const std::vector<int> & expert_ids);
+    HostVictimStats host_victim_stats() const;
     std::vector<int> prepare(int layer, const std::vector<int> & expert_ids);
     // Optional source of experts already in the bank row layout: one contiguous block per expert,
     // [gate data][gate aux][up data][up aux][down data][down aux]. Misses then skip the loader repack.
     using Prepacked = std::function<const char *(int layer, int expert)>;
     // registered: the blocks live in page-locked (cudaHostRegister) memory and are DMA-ed directly, no staging copy.
-    void set_prepacked(Prepacked, bool registered = false);
+    enum class PrepackedLayout { Contiguous, Indexed };
+    void set_prepacked(Prepacked, bool registered = false, PrepackedLayout = PrepackedLayout::Contiguous);
     // Speculative upload of a later layer's likely experts on a copy stream (registered prepacked source only).
     // Slots are claimed immediately; the next prepare() of that layer waits for the copies on its own stream.
     void prefetch(int layer, const std::vector<int> & expert_ids, cudaStream_t copy_stream);
@@ -119,7 +125,7 @@ public:
     void reset_usage();                  // forgets the expert frequencies (victim policy), keeps the banks
     void reserve_staging(int min_cap = 0);  // staging for a whole bank (at least min_cap experts), so no prepare grows it mid-request
     bool resident(int layer, int expert) const;  // in the layer's bank now (no side effects)
-    BankLayout bank_layout(int layer) const;                // piece sizes; src0 set when a prepacked source exists
+    BankLayout bank_layout(int layer) const;                // piece sizes; src0 only for a contiguous expert-major source
     BankState bank_state(int layer) const;                  // waits for pending host-side copies first
     void bank_import(int layer, const BankState &);
     uint64_t clock() const; void set_clock(uint64_t);

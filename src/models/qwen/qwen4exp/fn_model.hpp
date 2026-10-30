@@ -24,11 +24,14 @@ struct DecodeModel {
     size_t kv_to_host() {
         static const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
         size_t freed = 0;
-        for (auto & a : att) {
-            if (!a.k || !a.k->vmm || a.len <= 2 * keep) continue;
-            const size_t row = a.k->bytes / size_t(g_kv_capacity), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
-            for (size_t i = 0; i < cut; ++i) for (KvBuf * b : {a.k.get(), a.v.get()})
-                if (!b->on_host[i] && b->move(i, true)) freed += b->page;
+        std::vector<AttentionState *> all; for (auto & a : att) all.push_back(&a);
+        all.push_back(&mtp_att);  // the MTP layer's K/V (full capacity, 0.33 GB at 160K) pages the same way
+        for (AttentionState * a : all) {
+            if (!a->k || !a->k->vmm || a->len <= 2 * keep) continue;
+            const size_t row = a->k->bytes / size_t(g_kv_capacity), per = a->k->page_rows(row);
+            const auto mv = tqllm::flashnext::kv_host_pages(size_t(a->len), size_t(keep), tqllm::flashnext::kKvDecodeHeadroom, per, a->k->on_host.size());
+            for (KvBuf * b : {a->k.get(), a->v.get()}) for (size_t i = 0; i < b->on_host.size(); ++i)
+                if ((i < mv.front || i >= mv.tail) && !b->on_host[i] && b->move(i, true)) freed += b->page;
         }
         return freed;
     }
@@ -96,6 +99,19 @@ struct DecodeModel {
     }
     // the layer's copy plan (sorted): experts its bank does not hold (all of them before the bank exists)
     static std::vector<int> stage_plan(const MixedExpertCache & cache, int layer);
+    static void release_borrowed_prefill_bank(MixedExpertCache & cache, int layer, const std::vector<char> & borrowed) {
+        if (size_t(layer) < borrowed.size() && borrowed[size_t(layer)]) cache.release_bank(layer);
+    }
+    static size_t stage_required(const MixedExpertCache & cache, int K) {
+        require(K > 0, "prefill staging width must be positive");
+        size_t need = 0;
+        for (int l = 0; l < cache.layers(); ++l) {
+            if (!cache.bank_ready(l) && !cache.has_layout(l)) continue;
+            const auto lay = cache.bank_layout(l); size_t off[6]; stage_offsets(lay, K, off);
+            need = std::max(need, off[5] + align256(size_t(K) * lay.piece[5]));
+        }
+        return need;
+    }
     static void stage_alloc(PrefillStage & st, size_t need, int K);
     // copy group g of the plan into staging bank g & 1 once the compute stream is done with it (runs of consecutive ids:
     // one 2D copy per piece)
@@ -178,22 +194,26 @@ inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpo
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
                                 g_tile_experts);
 }
-// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
-inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
-    const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
+// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file.
+// With index (int32 [layers][experts], an expert's slot or -1, the hot map's format) only experts whose slot is below
+// per_layer are packed, at that slot: a compact pack of part of the model.
+inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads, const int32_t * index = nullptr, int per_layer = 0) {
+    const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = index ? per_layer : c.experts; pe.sizes.resize(size_t(c.layers));
     g_tile_experts = false;  // untiled, as in the file: the loader tiles both the same way
     uint64_t off = 0;
     for (int l = 0; l < c.layers; ++l) {
         const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
         for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
-        pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
+        pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(pe.experts);
     }
     pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
     std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
     for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
         for (int64_t i; (i = next++) < total;) {
             const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+            const int slot = index ? index[i] : e;
+            if (slot < 0 || slot >= pe.experts) continue;
+            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(slot) * pe.block[size_t(l)];
             for (int k = 0; k < 6; ++k) {
                 require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
                 std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();

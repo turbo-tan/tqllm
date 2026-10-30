@@ -192,7 +192,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_VERIFY_WAVES` | off | 1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1) |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
-| `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
+| `TQFN_PRED_DUMP` | - | FILE: append top-10 routed/predicted ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only) |  |
 | `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
 | `TQFN_PREFILL_INT8_FMT` | - | comma list of u4h format ids allowed on the int8 prefill path (default all) |  |
 | `TQFN_PREFILL_LOG` | off | per-layer and per-stage prefill timings (synchronises; slower) |  |
@@ -203,9 +203,10 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_QSA_CHECK` | off | QSA selection: compare the top-k select with a full sort (raises on any difference) |  |
 | `TQFN_QSA_SPLIT` | 16 | slices per decode QSA attention row; 0 or 1 = direct attention |  |
 | `TQFN_ROUND32` | - | diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none) |  |
-| `TQFN_ROUTE_DUMP` | - | FILE: append routed expert ids per trunk layer call |  |
+| `TQFN_ROUTE_DUMP` | - | FILE: append top-10 routed ids, including mixed and layer-major calls; disables layer graphs (diagnostic timings only) |  |
 | `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
 | `TQFN_WAVE_GEMM_AVG` | - | average tokens per expert from which prefill waves use the grouped GEMM |  |
+| `TQFN_HOT_VICTIM_MB` | 0 | MiB of exact native hot expert victim memory; owner Codex, expires 2026-11-06; full routing unchanged |  |
 
 ## Retired (the tool stops; use the replacement)
 

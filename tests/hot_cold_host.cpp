@@ -15,12 +15,28 @@ int main() {
     }
     const std::vector<int32_t> map{0,-1,1,-1, -1,0,-1,1};
     assert(tqllm::validate_hot_map(map,2,4)==2);
+    assert(tqllm::complete_hot_residency(map,0,4,{-1,2},2)==std::vector<int>({2,0}));
+    assert(tqllm::complete_hot_residency(map,1,4,{-1,-1},2)==std::vector<int>({1,3}));
+    assert(tqllm::complete_hot_residency(map,0,4,{2,0},2)==std::vector<int>({2,0}));
+    rejects([&]{tqllm::complete_hot_residency(map,0,4,{2,2},2);});
+    rejects([&]{tqllm::complete_hot_residency(map,0,4,{1},2);});
+    rejects([&]{tqllm::complete_hot_residency(map,0,4,{-1},3);});
+    rejects([&]{tqllm::complete_hot_residency(map,0,4,{0,2},1);});
+    rejects([&]{tqllm::complete_hot_residency(map,2,4,{},2);});
     assert(tqllm::hot_cache_slots(154,0)==154);
     for(int n:{64,80,96})assert(tqllm::hot_cache_slots(154,n)==n);
     assert(tqllm::hot_cache_slots(2,1)==1);
     rejects([]{tqllm::hot_cache_slots(154,155);});
     rejects([]{tqllm::hot_cache_slots(154,-1);});
     rejects([]{tqllm::hot_cache_slots(0,0);});
+    constexpr size_t q2_expert = 1382400;
+    assert(tqllm::cold_cache_budget(48,32,q2_expert)==(size_t(2)<<30));
+    assert(tqllm::cold_cache_budget(48,40,q2_expert)==48*40*q2_expert);
+    assert(tqllm::cold_cache_budget(48,40,q2_expert)>(size_t(2)<<30));
+    rejects([]{tqllm::cold_cache_budget(0,40,q2_expert);});
+    rejects([]{tqllm::cold_cache_budget(48,0,q2_expert);});
+    rejects([]{tqllm::cold_cache_budget(48,40,0);});
+    rejects([]{tqllm::cold_cache_budget(48,40,std::numeric_limits<size_t>::max());});
     const std::vector<int> ids{3,0,3,1,2}; std::vector<int> seen(ids.size(),0);
     for (bool hot : {false,true}) for(size_t a=0;a<ids.size();++a)
         if(tqllm::expert_is_hot(map,0,4,ids[a])==hot) ++seen[a];

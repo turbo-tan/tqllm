@@ -90,6 +90,9 @@ void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * u
 void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t);
 void fn_moe_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
                     float * out, int hidden, int topk, int tokens, cudaStream_t);
+// Caller clears nonfinite before launch; set to 1 if any combined output is not finite.
+void fn_moe_combine_checked(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
+                            float * out, int hidden, int topk, int tokens, int * nonfinite, cudaStream_t);
 
 // Keys and query are already normalized and rotated: [blocks][dim], [heads][dim].
 // Rectify each head's dot product before summing its contribution to a block.

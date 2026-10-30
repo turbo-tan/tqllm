@@ -2,6 +2,7 @@
 #include "fn_engine.hpp"
 #include <map>
 #include "decode_rules.hpp"
+#include "hot_cold_policy.hpp"
 #include "prefill_observer_cuda.hpp"
 
 namespace tqllm::flashnext {
@@ -41,6 +42,10 @@ void FlashNextEngine::arena_resize(size_t bytes) {
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
+    if (f_.hot_victim_mb) {
+        if(prompt.size()>=256) f_.cache->set_host_victim_budget(f_.hot_victim_mb<<20);
+        f_.cache->enable_host_victims(false);
+    }
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
     S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX; ++g_kv_epoch;
     // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
@@ -91,7 +96,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // it until it fits, with the LM heads parked. 24 GB keeps the engine chunk: there the streams already hide under the
     // kernels (nsys 10-19: 25K in 2 x 16K 90.7 % busy, in one chunk 86.3 % and 0.8 s slower).
     constexpr int kMaxChunk = 32768;
-    const int chunk0 = g_tune.chunk_set || !g_small_card ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
+    const int selected_chunk = g_tune.chunk_set || !g_small_card ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
+    const int chunk0 = request_prefill_chunk(selected_chunk, P, g_hot_map != nullptr);
     int chunk = chunk0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
@@ -135,7 +141,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             // small cards release every bank for a multi-chunk prompt: a kept bank grows by its misses during the prompt
             // (slots=auto banks start below their cap) and OOMed at "expert bank upload ... 54 MiB free"; the fit check
             // below still asks whether the plan fits with every bank gone
-            borrow_all = g_small_card && P > chunk && g_tune.borrow == tqllm::BorrowMode::Auto;
+            borrow_all = mixed_prefill_needs_all_banks(g_hot_map != nullptr, plan.need, free_now() + mtp_room)
+                || (g_small_card && P > chunk && g_tune.borrow == tqllm::BorrowMode::Auto);
             try { (void) tqllm::banks_to_borrow(plan, bank_bytes, g_tune.borrow, g_tune.borrow_count);
                 // small cards: a multi-chunk prompt parks the LM heads (needed only for the first token) in pinned host
                 // memory and plans again with their room (~635 MB: a bigger chunk streams the experts fewer times)
@@ -326,6 +333,27 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         }
     }
     stamp("before the bank refill"); refill_borrowed(); g_trim_below = SIZE_MAX; stamp("banks refilled");
+    if (f_.hot_victim_mb) {
+        const auto start=pclk::now(); size_t primed=0;
+        // A repeated prompt may have used fewer experts than the bank can hold.
+        for(int layer=0;layer<c.layers;++layer) {
+            if(!f_.cache->bank_ready(layer))continue;
+            const auto fill=complete_hot_residency(f_.hot_map,layer,c.experts,f_.cache->bank_state(layer).ids,f_.cache->slots(layer));
+            f_.cache->prepare(layer,fill);f_.cache->wait_misses();
+        }
+        f_.cache->enable_host_victims(true);
+        for(int layer=0;layer<c.layers;++layer) {
+            std::vector<int> ids;
+            const int hot_count=std::count_if(f_.hot_map.begin()+size_t(layer)*c.experts,f_.hot_map.begin()+size_t(layer+1)*c.experts,[](int32_t x){return x>=0;});
+            const int limit=std::max(0,hot_count-f_.cache->slots(layer));
+            for(int id=0;id<c.experts && int(ids.size())<limit;++id)
+                if(expert_is_hot(f_.hot_map,layer,c.experts,id) && !f_.cache->resident(layer,id)) ids.push_back(id);
+            primed+=f_.cache->prime_host_victims(layer,ids);
+        }
+        const auto v=f_.cache->host_victim_stats();
+        std::fprintf(stderr,"tqllm: native hot victims primed %zu experts, %.1f MB in %.0f ms\n",primed,v.bytes/1048576.0,std::chrono::duration<double,std::milli>(pclk::now()-start).count());
+        S().host_victim_at_decode_=v;
+    }
     S().model_->set_spec(true);
     ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();
     if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }

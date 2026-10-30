@@ -1,6 +1,7 @@
 #pragma once
 // Flash-Next decode decisions that change exactness or memory, as pure functions (no CUDA) so tests/decode_rules.cpp can
 // check them on any machine.
+#include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +10,20 @@
 #include <string>
 
 namespace tqllm::flashnext {
+
+inline bool wave_uses_grouped_gemm(int assignments, int experts, int unique, int average) {
+    return average > 0 && unique > 0 && assignments > experts && int64_t(assignments) >= int64_t(average) * unique;
+}
+inline bool grouped_expert_format(int id, int cols) {
+    return cols > 0 && (id == 1 || id == 4 || id == 5 || id == 6 || id == 7 || id == 10 || id == 13 || id == 14)
+        && cols % (id == 14 ? 128 : 256) == 0;
+}
+inline bool mixed_prefill_needs_all_banks(bool mixed, size_t need, size_t free) {
+    return mixed && need > free;
+}
+inline int dense_prefill_sub(bool mixed, int configured, int request_cap) {
+    return std::max(mixed ? 8 : 16, request_cap > 0 ? std::min(configured, request_cap) : configured);
+}
 
 // Expert path of one trunk layer call: true = waves (several prepares, grouped per wave), false = one split prepare.
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
@@ -58,6 +73,23 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // cards before Blackwell (3090: chat 86.5 vs 83.9 tok/s without), but on a Blackwell PCIe card the re-capture costs more host
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
+
+// Host K/V paging (fn_state.hpp KvBuf, fn_model.hpp kv_to_host). Pages of 32 MB (32K positions of one layer's K or V) kept
+// the newest 32-64K positions plus the unwritten capacity on the device: 1.54 GB at a 151K prompt (10-29 census), the bank
+// gap to Strata. Pages of the VMM granule (2 MB = 2K positions) keep the newest keep + one page.
+constexpr size_t kKvPageBytes = size_t(2) << 20;
+inline size_t kv_page_bytes(size_t granule) { return granule ? std::max(granule, kKvPageBytes / granule * granule) : 0; }
+// rows past the context a decode may still write without touching a host page (the server's max tokens + a verify block)
+constexpr size_t kKvDecodeHeadroom = 4096 + 64;
+// after a long prompt: pages [0, front) (older than the newest `keep` rows) and [tail, pages) (capacity beyond len +
+// headroom, not written yet) go to host memory; a later write there is still correct (host-mapped page), only slower
+struct KvHostPages { size_t front = 0, tail = 0; };
+inline KvHostPages kv_host_pages(size_t len, size_t keep, size_t headroom, size_t rows_per_page, size_t pages) {
+    KvHostPages r; if (!rows_per_page) { r.tail = pages; return r; }
+    r.front = std::min(pages, len > keep ? (len - keep) / rows_per_page : 0);
+    r.tail = std::max(r.front, std::min(pages, (len + headroom + rows_per_page - 1) / rows_per_page));
+    return r;
+}
 
 // The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
 // easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt
@@ -138,6 +170,14 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes) {
     return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= 0.6 * host_ram_bytes;
 }
+// Hot/cold on a discrete GPU: the hot experts that miss the GPU bank are copied from a compact pinned pack instead of being
+// re-read from GGUF pages that a small host cannot retain. Returns how many hot experts per layer the pack holds:
+// all that fit in 60 % of RAM (bytes_per_slot = one expert of every layer), none on a GPU sharing system memory.
+inline int hot_pack_slots(int hot_count, bool integrated_gpu, double bytes_per_slot, double host_ram_bytes, double reserve_bytes = 0) {
+    if (integrated_gpu || hot_count <= 0 || bytes_per_slot <= 0) return 0;
+    const double budget = std::max(0.0, std::min(0.6 * host_ram_bytes, host_ram_bytes - reserve_bytes));
+    return int(std::min<double>(hot_count, std::floor(budget / bytes_per_slot)));
+}
 // Pages that may be dropped once the experts sit in pinned memory: the trunk expert tensors only. The per-layer token
 // embedding (Flash-Next: 28.8 GB, one 90-byte row per token and layer) is read from the file at every token; with its
 // pages dropped each new token waited on the disk (3090: chats 79-88 instead of 94-103 tok/s, 32K first token +2.7 s).
@@ -153,6 +193,9 @@ inline bool warm_at_start(const std::string & tensor, double tensor_bytes, doubl
 // Prefill chunk: the engine's --prefill-chunk setting (default 16384), whether or not the manifest names one; the
 // manifest value counts only when that setting is off. A manifest without chunk= once prefilled in chunks of 8 (32K: 263 s).
 inline int prefill_chunk(int tune_chunk, int manifest_chunk) { return tune_chunk > 0 ? tune_chunk : manifest_chunk; }
+inline int request_prefill_chunk(int selected, int prompt_tokens, bool hot_cold) {
+    return hot_cold && prompt_tokens < 256 ? std::min(selected, 8) : selected;
+}
 // Byte cap of the expert banks. slots=auto sizes the banks from free device memory itself, so its cap is the device; a
 // fixed budget_gb (taken from one card) capped a GB10's 512 resident slots at 18 GB and evicted layers mid-prompt.
 inline size_t bank_budget_bytes(bool slots_auto, double budget_gb, size_t device_total) {

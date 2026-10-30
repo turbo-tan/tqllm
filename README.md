@@ -77,6 +77,8 @@ requirements, and [the architecture guide](docs/ARCHITECTURE.md) for the source 
 Built on work from Qwen, ggml/llama.cpp, Google Research, z-lab, Tom Turney,
 spiritbuun, turboderp ([ExLlamaV3](https://github.com/turboderp-org/exllamav3): the trellis format and kernels behind
 X3 and our EXL3 support) and the contributors listed in [Credits](docs/CREDITS.md).
+Prefill architecture comparisons also draw on [Strata](https://github.com/Niko1221/Strata) and
+[MiaAI-Lab's TensorFold recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold).
 Third-party notices remain in [NOTICE](NOTICE). Thank you to our community testers.
 
 tqLLM is Apache-2.0 licensed. Model weights and third-party components retain

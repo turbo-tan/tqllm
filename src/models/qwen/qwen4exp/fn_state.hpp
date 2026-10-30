@@ -30,7 +30,7 @@ struct KvBuf {
         // host K/V (kv_host_enabled: discrete GPUs by default): VMM pages, so old ones can move to host memory; else
         // plain allocations
         if (g && kv_host_enabled()) {
-            page = std::max(g, (size_t(32) << 20) / g * g); span = (n + page - 1) / page * page;
+            page = tqllm::flashnext::kv_page_bytes(g); span = (n + page - 1) / page * page;
             if (void * va = m.reserve(span)) {
                 p = static_cast<__nv_bfloat16 *>(va); vmm = true; on_host.assign(span / page, 0);
                 for (size_t i = 0; i < on_host.size(); ++i)

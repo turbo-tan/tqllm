@@ -58,7 +58,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         o.kv_compact_turn = v == "turn";
     }
     else if (a == "--prefill-chunk") o.prefill_chunk = count(256);
-    else if (a == "--prefill-sub") o.prefill_sub = count(16);
+    else if (a == "--prefill-sub") o.prefill_sub = count(8);
     else if (a == "--prefill-stage") o.prefill_stage = count(1);
     else if (a == "--prefill-reserve-mb") o.prefill_reserve_mb = count(0);
     else if (a == "--prefill-arena-mb") o.prefill_arena_mb = count(0);

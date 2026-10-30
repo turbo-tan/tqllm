@@ -45,7 +45,40 @@ static void bounded_hot_banks(bool legacy_capacity) {
     assert(stats.misses==L*2 && stats.evictions==0 && stats.hits==L*2*19);
     std::puts("bounded_hot_banks: PASS (all layers resident, no repeated source reads, exact projection bytes)");
 }
-int main(int argc,char **) {
+// Real cold-bank byte geometry, without loading a model or changing expert arithmetic.
+static void cold_budget_residency(bool legacy_budget) {
+    constexpr int L=48,E=64,H=256,F=6400,C=40;
+    constexpr size_t B=size_t(H)*F/64*18;
+    std::array<std::vector<char>,3> raw;
+    for(int p=0;p<3;++p) {
+        raw[p].resize(B);
+        for(size_t i=0;i<B;++i)raw[p][i]=char((i*7+p*23)&255);
+    }
+    size_t calls=0;
+    const size_t budget=legacy_budget ? size_t(2)<<30 : cold_cache_budget(L,C,3*B);
+    MixedExpertCache cache(L,E,H,F,C,budget,[&](int,int) {
+        ++calls;std::array<ExpertPayload,3> out;
+        for(int p=0;p<3;++p)out[p]={GGML_GSQ_Q2_0,{raw[p].data(),B},{},true};
+        return out;
+    },nullptr);
+    for(int pass=0;pass<3;++pass) {
+        for(int l=0;l<L;++l) {
+            const auto slots=cache.prepare(l,{0});
+            const std::array<Mat,3> matrices{cache.gate(),cache.up(),cache.down()};
+            for(int p=0;p<3;++p) {
+                std::vector<char> got(B);
+                ck(cudaMemcpy(got.data(),static_cast<const char *>(matrices[p].p)+size_t(slots[0])*B,B,cudaMemcpyDeviceToHost));
+                assert(got==raw[p]);
+            }
+        }
+        assert(calls==L);
+    }
+    assert(cache.stats().misses==L && cache.stats().hits==L*2 && cache.stats().evictions==0);
+    std::puts("cold_budget_residency: PASS (48 layers x40 slots stay resident, exact projection bytes)");
+}
+int main(int argc,char ** argv) {
+    if(argc>1 && std::strcmp(argv[1],"--legacy-cold-budget")==0) { cold_budget_residency(true);return 0; }
+    cold_budget_residency(false);
     bounded_hot_banks(argc>1);
 
     constexpr int H=64,F=4096,E=4,N=80;
@@ -97,7 +130,21 @@ int main(int argc,char **) {
         });
         auto run=std::async(std::launch::async,[&] {ck(cudaSetDevice(0));return cache.prepare(0,{2,3});});
         assert(first_consumed.wait_for(std::chrono::seconds(2))==std::future_status::ready);
-        last.set_value(owned_payload(3,false));verify(run.get());
+        last.set_value(owned_payload(3,false));const auto ordered_slots=run.get();verify(ordered_slots);
+        cache.set_async_batch_source({});cache.prepare(0,{0,1});cache.wait_misses();ck(cudaStreamSynchronize(compute));
+        // The later completed record must stage while the earlier read remains blocked.
+        std::promise<void> later_copied;auto notified=later_copied.get_future();
+        std::promise<Payload> slow,fast;pending.clear();
+        pending.emplace(2,slow.get_future().share());pending.emplace(3,fast.get_future().share());
+        auto data=std::shared_ptr<std::array<std::vector<char>,3>>(new std::array<std::vector<char>,3>(raw[3]),[&](auto * p){delete p;later_copied.set_value();});
+        Payload ready;for(int p=0;p<3;++p)ready[p]={GGML_GSQ_Q2_0,{(*data)[p].data(),B},data,true};
+        fast.set_value(std::move(ready));fast=std::promise<Payload>();data.reset();
+        cache.set_async_batch_source([&](int,const std::vector<int> & ids){std::vector<std::shared_future<Payload>> out;for(int id:ids)out.push_back(std::move(pending.at(id)));return out;});
+        auto completion=std::async(std::launch::async,[&]{ck(cudaSetDevice(0));return cache.prepare(0,{2,3});});
+        const bool bypassed=notified.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+        slow.set_value(owned_payload(2,false));const auto completed_slots=completion.get();verify(completed_slots);
+        assert(completed_slots==ordered_slots);
+        assert(bypassed);
         cache.set_async_batch_source({});cache.prepare(0,{0,1});cache.wait_misses();ck(cudaStreamSynchronize(compute));
         std::promise<Payload> ok,bad;pending.clear();pending.emplace(2,ok.get_future().share());pending.emplace(3,bad.get_future().share());
         ok.set_value(owned_payload(2,false));bad.set_exception(std::make_exception_ptr(std::runtime_error("injected checksum failure")));

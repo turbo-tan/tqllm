@@ -727,11 +727,13 @@ __global__ void fn_swiglu_f32_k(const float * g, const float * u, float * o, int
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= n) return;
     const float a = g[i]; o[i] = a / (1.f + expf(-a)) * u[i];
 }
-__global__ void fn_moe_combine_k(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, float * o, int h, int k, int n) {
+template<bool Check>
+__global__ void fn_moe_combine_k(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, float * o, int h, int k, int n, int * nonfinite) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= int64_t(n) * h) return;
     const int t = int(i / h), j = int(i % h); float v = 0.f;
     for (int e = 0; e < k; ++e) v += w[t * k + e] * __bfloat162float(r[(int64_t(t) * k + e) * h + j]);
     o[i] = v + sw[t] * sh[i];
+    if constexpr (Check) if (!isfinite(o[i])) atomicExch(nonfinite, 1);
 }
 // gridDim.y splits the columns: block (b, k) covers vectors [k*span, (k+1)*span) and writes part[k][row] (or y when
 // gridDim.y == 1); fn_gemv_sum_k then adds the partials in a fixed order (deterministic).
@@ -1271,7 +1273,13 @@ void fn_swiglu_f32(const float * g, const float * u, float * o, int64_t n, cudaS
 }
 void fn_moe_combine(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, float * o, int h, int k, int n, cudaStream_t s) {
     if (h <= 0 || k <= 0 || n <= 0 || !r || !w || !sh || !sw || !o) throw std::invalid_argument("Flash-Next moe combine: invalid shape or pointer");
-    fn_moe_combine_k<<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, o, h, k, n);
+    fn_moe_combine_k<false><<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, o, h, k, n, nullptr);
+}
+void fn_moe_combine_checked(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, float * o,
+                            int h, int k, int n, int * nonfinite, cudaStream_t s) {
+    if (h <= 0 || k <= 0 || n <= 0 || !r || !w || !sh || !sw || !o || !nonfinite)
+        throw std::invalid_argument("Flash-Next checked moe combine: invalid shape or pointer");
+    fn_moe_combine_k<true><<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, o, h, k, n, nonfinite);
 }
 void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, cudaStream_t s) {
     if (rows <= 0 || cols <= 0 || cols % 8 || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 gemv: invalid shape or pointer");

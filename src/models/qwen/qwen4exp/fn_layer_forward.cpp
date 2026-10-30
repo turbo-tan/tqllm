@@ -1,6 +1,7 @@
 // Flash-Next layer forward (decode, verify and short prefill chunks) and the router.
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
+#include "route_trace.hpp"
 #include <map>
 #include <tuple>
 #include "hot_cold_policy.hpp"
@@ -44,7 +45,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     static std::map<GraphKey, std::vector<GraphSlot>> graphs;
     const GraphKey gkey{this, layer, n, 0};
     bool capturing = false;
-    if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
+    // A failed capture reruns this host path; eager tracing records each logical call once.
+    if (graph_on && !tqllm::flashnext::routing_trace_enabled() && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
         static int epoch = -1; if (epoch != g_prefill_epoch) { epoch = g_prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
         if (plain) calls[gkey] = 0;
         if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
@@ -235,7 +237,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     }
     // TQFN_PREFILL_WAVES (default on): a prefill chunk that routes to more experts than the cache holds runs its MoE in
     // waves of at most `slots` experts; each expert is loaded once per layer per chunk (not once per small chunk).
-    std::vector<int> wave_ids;
+    std::vector<int> wave_ids, wave_predictions;
     // prefill (spec off) always takes waves, decode verify (spec on) the split path when it fits: the two paths sum the
     // down projection in a different order (1 ulp in a few values), so a slot-dependent choice changed greedy text
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
@@ -243,7 +245,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
     if (trunk && (g_hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();
-        if(predict && g_hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
+        if (predict && g_hot_map && cp.cold_prefetch) {
+            wave_predictions = next_ids->get(); cp.cold_prefetch(layer + 1, wave_predictions);
+        }
         if (g_hot_map) for (int id : wave_ids) if (id < 0 || id >= c.experts) {
             const auto ls = logits.get(); const auto xs = mixed.get(); size_t bad_l = 0, bad_x = 0;
             for (float v : ls) bad_l += !std::isfinite(v);
@@ -255,6 +259,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         if (!g_hot_map && !tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
     }
     if (!wave_ids.empty()) {
+        tqllm::flashnext::dump_routing(layer, n, c.topk, wave_ids.data(), wave_ids.size(),
+                                     wave_predictions.data(), wave_predictions.size());
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
         std::vector<int> u(wave_ids); std::sort(u.begin(), u.end()); u.erase(std::unique(u.begin(), u.end()), u.end());
         Device<__half> xr(mixed.count); tqllm_cuda::vis_f32_to_h(mixed.p, xr.p, int64_t(mixed.count), nullptr);
@@ -275,7 +281,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             // the GEMM rounds differently from the dedup kernel the split path uses, so a slot-dependent switch changed
             // greedy text with the slot count (a 23-token prompt: 230 rows, ~8 per expert).
             static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
-            const bool wave_gemm = gemm_avg > 0 && A > c.experts && A >= gemm_avg * int(u.size());
+            const bool wave_gemm = tqllm::flashnext::wave_uses_grouped_gemm(A, c.experts, int(u.size()), gemm_avg);
             for (size_t w0 = 0; w0 < bank_ids.size(); w0 += size_t(W)) {
                 const std::vector<int> wave(bank_ids.begin() + long(w0), bank_ids.begin() + long(std::min(bank_ids.size(), w0 + size_t(W))));
                 if (bank_index) selected.set_miss_stream(miss_stream);
@@ -304,8 +310,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 for (int a = 0; a < A; ++a) { const int sl = slot_of[size_t(wave_ids[size_t(a)])]; if (sl >= 0) grp[size_t(sl) * wcap + size_t(fill[size_t(sl)]++)] = a; }
                 Device<int> dcnt(cnt.size()), dgrp(grp.size()); dcnt.put(cnt); dgrp.put(grp);
                 auto gemm_fmt = [](const Mat & mm) {
-                    const int id = mm.fmt->u4h_id();
-                    return (id == 1 || id == 4 || id == 5 || id == 6 || id == 7 || id == 10 || id == 13 || id == 14) && mm.cols % (id == 14 ? 128 : 256) == 0;
+                    return tqllm::flashnext::grouped_expert_format(mm.fmt->u4h_id(), mm.cols);
                 };
                 auto proj = [&](const Mat & mm, const __half * x, __nv_bfloat16 * y, int rows, bool per_expert) {
                     if (mm.fmt->has_expert_dedup() && !(wave_gemm && gemm_fmt(mm))) mm.fmt->expert_matvec_dedup(mm, x, y, rows, dmap.p + (per_expert ? size_t(A) * DS : 0), groups[per_expert], nullptr);
@@ -377,15 +382,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 routed_ids[a] = to[a]; ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr)); ++skipped;
             }
         }
-        if (static FILE * dump = std::getenv("TQFN_ROUTE_DUMP") ? std::fopen(std::getenv("TQFN_ROUTE_DUMP"), "ab") : nullptr; dump && trunk) {
-            const int32_t hdr[2] = {layer, n}; std::fwrite(hdr, 4, 2, dump); std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
-        }
-        // Routed and predicted next-layer ids per trunk layer call, for offline cache simulation.
-        if (static FILE * dump = std::getenv("TQFN_PRED_DUMP") ? std::fopen(std::getenv("TQFN_PRED_DUMP"), "ab") : nullptr; dump && trunk) {
-            const int32_t hdr[3] = {layer, n, predict ? A : 0}; std::fwrite(hdr, 4, 3, dump);
-            std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
-            if (predict) std::fwrite(ids_host.p + A, 4, size_t(A), dump);
-        }
+        if (trunk) tqllm::flashnext::dump_routing(layer, n, c.topk, routed_ids.data(), routed_ids.size(),
+                                               predict ? ids_host.p + A : nullptr, predict ? size_t(A) : 0);
         // TQFN_CPU_MISS: a non-resident expert goes to the CPU pool; its GPU assignment points at a resident expert of the
         // same token (output row overwritten before the combine), so the cache neither copies nor inserts it.
         std::vector<std::pair<int, int>> cpu_rows;  // (assignment, row in cpu_out)

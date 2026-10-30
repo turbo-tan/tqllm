@@ -239,8 +239,42 @@ static void shape_overflow_test() {
     ck(cudaGetLastError());
     std::puts("Flash-Next shape overflow rejection: PASS");
 }
+static void combine_check_test(bool legacy = false) {
+    constexpr int h = 257, k = 3, n = 3;
+    std::vector<__nv_bfloat16> routed(size_t(n) * k * h, __float2bfloat16(0.5f));
+    std::vector<float> weights(n * k, 0.25f), shared(n * h, -0.5f), sw(n, 0.125f);
+    Device<__nv_bfloat16> dr(routed.size()); Device<float> dw(weights.size()), ds(shared.size()), dsw(sw.size());
+    Device<float> out(n * h), reference(n * h); Device<int> bad(1);
+    auto run = [&](bool expected_bad) {
+        dr.put(routed); dw.put(weights); ds.put(shared); dsw.put(sw); bad.put({0});
+        tqllm_cuda::fn_moe_combine(dr.p, dw.p, ds.p, dsw.p, reference.p, h, k, n, nullptr);
+        if (legacy) tqllm_cuda::fn_moe_combine(dr.p, dw.p, ds.p, dsw.p, out.p, h, k, n, nullptr);
+        else tqllm_cuda::fn_moe_combine_checked(dr.p, dw.p, ds.p, dsw.p, out.p, h, k, n, bad.p, nullptr);
+        const auto got = out.get(), want = reference.get();
+        const bool host_bad = !std::all_of(got.begin(), got.end(), [](float x) { return std::isfinite(x); });
+        require(host_bad == expected_bad, "combine test did not exercise the intended finite/nonfinite case");
+        require((bad.get()[0] != 0) == host_bad, "device finite check differs from full host scan");
+        require(std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0,
+                "checked combine changed output bits");
+    };
+    run(false);
+    routed.back() = __float2bfloat16(std::numeric_limits<float>::quiet_NaN()); run(true);
+    routed.back() = __float2bfloat16(0.5f);
+    shared.back() = std::numeric_limits<float>::infinity(); run(true);
+    shared.back() = -std::numeric_limits<float>::infinity(); run(true);
+    shared.back() = -0.5f;
+    weights[0] = std::numeric_limits<float>::quiet_NaN(); run(true);
+    weights[0] = std::numeric_limits<float>::max(); routed[0] = __float2bfloat16(2.f); run(true);
+    weights[0] = 0.25f; routed[0] = __float2bfloat16(0.5f);
+    shared.back() = -0.f; run(false);
+    ck(cudaGetLastError());
+    std::puts("Flash-Next checked combine: PASS (finite, NaN, +/-Inf, overflow, reset, odd tail; bits unchanged)");
+}
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--combine-check") { combine_check_test(); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--legacy-combine-check") { combine_check_test(true); return 0; }
+        combine_check_test();
         if (argc == 2 && std::string(argv[1]) == "--shape-overflow") { shape_overflow_test(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--legacy-normalization") { legacy_normalization_test(); return 0; }
         const bool legacy = argc == 2 && std::string(argv[1]) == "--legacy-gate";

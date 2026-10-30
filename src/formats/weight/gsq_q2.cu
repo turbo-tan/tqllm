@@ -132,7 +132,7 @@ template<int C> __global__ void __launch_bounds__(256) dot_grouped(const unsigne
 // w >> 2 (u4h_gemm_k's layout). Lane t of a warp owns one 32-weight half of a Q2_0 block per 256-k step; scale * (code - 1)
 // is exact in FP16, so only the FP32 summation order differs from dot_grouped.
 template<int NT>
-__global__ void __launch_bounds__(256) q2_gemm_grouped(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int k,
+__global__ void __launch_bounds__(256, NT == 4 ? 3 : 1) q2_gemm_grouped(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int k,
                                                        const int * counts, const int * groups, int capacity, int topk, bool per_expert) {
     using namespace tqllm_dev;
     const int expert = blockIdx.z, ncols = counts[expert];
@@ -159,33 +159,35 @@ __global__ void __launch_bounds__(256) q2_gemm_grouped(const unsigned char * wei
         }
         __syncthreads();
         const int s = base + ks * 4 + t;
-        uint32_t af[8][4];
-        if (s < nb) {
-            const unsigned char * ba = wa + (s >> 1) * 18, * bb = wb + (s >> 1) * 18;
-            const __half sa = __ushort_as_half(uint16_t(ba[0] | ba[1] << 8)), sb = __ushort_as_half(uint16_t(bb[0] | bb[1] << 8));
-            const int off = 2 + (s & 1) * 8;
+        // Decode two independent fragments before consuming them; each column keeps its MMA order.
 #pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                const unsigned qa = ba[off + u], qb = bb[off + u];
-                const auto v = [](__half sc, unsigned q, int j) { return __hmul(sc, __int2half_rn(int((q >> (2 * j)) & 3u) - 1)); };
-                const __half2 a01 = __halves2half2(v(sa, qa, 0), v(sa, qa, 1)), a23 = __halves2half2(v(sa, qa, 2), v(sa, qa, 3));
-                const __half2 b01 = __halves2half2(v(sb, qb, 0), v(sb, qb, 1)), b23 = __halves2half2(v(sb, qb, 2), v(sb, qb, 3));
-                af[u][0] = *reinterpret_cast<const uint32_t *>(&a01); af[u][1] = *reinterpret_cast<const uint32_t *>(&b01);
-                af[u][2] = *reinterpret_cast<const uint32_t *>(&a23); af[u][3] = *reinterpret_cast<const uint32_t *>(&b23);
+        for (int u0 = 0; u0 < 8; u0 += 2) {
+            uint32_t af[2][4] = {};
+#pragma unroll
+            for (int du = 0; du < 2; ++du) {
+                const int u = u0 + du;
+                if (s < nb) {
+                    const unsigned char * ba = wa + (s >> 1) * 18, * bb = wb + (s >> 1) * 18;
+                    const __half sa = __ushort_as_half(uint16_t(ba[0] | ba[1] << 8)), sb = __ushort_as_half(uint16_t(bb[0] | bb[1] << 8));
+                    const int off = 2 + (s & 1) * 8;
+                    const unsigned qa = ba[off + u], qb = bb[off + u];
+                    const auto v = [](__half sc, unsigned q, int j) { return __hmul(sc, __int2half_rn(int((q >> (2 * j)) & 3u) - 1)); };
+                    const __half2 a01 = __halves2half2(v(sa, qa, 0), v(sa, qa, 1)), a23 = __halves2half2(v(sa, qa, 2), v(sa, qa, 3));
+                    const __half2 b01 = __halves2half2(v(sb, qb, 0), v(sb, qb, 1)), b23 = __halves2half2(v(sb, qb, 2), v(sb, qb, 3));
+                    af[du][0] = *reinterpret_cast<const uint32_t *>(&a01); af[du][1] = *reinterpret_cast<const uint32_t *>(&b01);
+                    af[du][2] = *reinterpret_cast<const uint32_t *>(&a23); af[du][3] = *reinterpret_cast<const uint32_t *>(&b23);
+                }
             }
-        } else {
 #pragma unroll
-            for (int u = 0; u < 8; ++u) af[u][0] = af[u][1] = af[u][2] = af[u][3] = 0u;
-        }
+            for (int nt = 0; nt < NT; ++nt) {
+                const uint4 * xp = xt + (nt * 8 + g) * XS + (ks * 4 + t) * 4;
 #pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-            const uint4 * xp = xt + (nt * 8 + g) * XS + (ks * 4 + t) * 4;
-            uint4 x4[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) x4[i] = xp[i];
-            const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
-#pragma unroll
-            for (int u = 0; u < 8; ++u) mma_f16(c[nt], af[u][0], af[u][1], af[u][2], af[u][3], xw[2 * u], xw[2 * u + 1]);
+                for (int du = 0; du < 2; ++du) {
+                    const int u = u0 + du;
+                    const uint2 xv = *reinterpret_cast<const uint2 *>(reinterpret_cast<const uint32_t *>(xp) + 2 * u);
+                    mma_f16(c[nt], af[du][0], af[du][1], af[du][2], af[du][3], xv.x, xv.y);
+                }
+            }
         }
     }
     __syncthreads();
@@ -245,7 +247,7 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     if (!scalar && capacity <= 65535 * 64) {
         if(capacity<=8)q2_gemm_grouped<1><<<dim3(unsigned((r+63)/64),1,unsigned(experts)),256,0,s>>>(
             static_cast<const unsigned char *>(w),x,y,r,k,counts,groups,capacity,topk,per_expert);
-        else q2_gemm_grouped<8><<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts)), 256, 0, s>>>(
+        else q2_gemm_grouped<4><<<dim3(unsigned((r + 63) / 64), unsigned((capacity + 31) / 32), unsigned(experts)), 256, 0, s>>>(
             static_cast<const unsigned char *>(w), x, y, r, k, counts, groups, capacity, topk, per_expert);
         return;
     }
