@@ -23,11 +23,6 @@ flags:
     kind: user
     default: "-"
     doc: "1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN)"
-  - name: TQLLM_MLX_ATTN_DECODE_V7
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (v7 is the only engine path)"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"
@@ -132,86 +127,26 @@ flags:
     kind: user
     default: "-"
     doc: "GLM-5.3-Flash: packed expert file (glm-pack-experts MODEL.gguf OUT.tqfnexp) for the expert banks: a bank miss copies the expert instead of repacking it; the engine page-locks it when it is at most half the host RAM, which also lets it prefetch (TQLLM_GLM_EXPERT_PF); a bigger file copies misses through pinned staging"
-  - name: TQLLM_ATTN_NBUF
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_BATCH_COLS
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (per GPU)"
-  - name: TQLLM_COMPOSITE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_CONV_SERIAL
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
   - name: TQLLM_DEBUG_DRAFT
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=draft"
-  - name: TQLLM_DEFER
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (per GPU)"
   - name: TQLLM_DFLASH
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "-md / --model-draft FILE"
-  - name: TQLLM_DFLASH_BF16
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_DFLASH_I8H
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_DFLASH_NOGRAPH
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_DFLASH_TQ3
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
   - name: TQLLM_DRAFT_D
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "tqserve --draft-max N"
-  - name: TQLLM_DRAFT_HEAD8
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
   - name: TQLLM_DRAFT_VOCAB
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "--draft-vocab FILE"
-  - name: TQLLM_DSUB_COPY
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_EMBED_HOST
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (tqserve memory fit)"
   - name: TQLLM_FAKEQ_K
     kind: retired
     default: "-"
@@ -222,61 +157,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=fakeq_v:N"
-  - name: TQLLM_FORCE_BATCH
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_GEMM_F32
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_GEMM_F32ACC
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_GEMM_PAD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_GEMM_ROWS
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (tqserve memory fit)"
-  - name: TQLLM_GEN_ATTN_OLD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_HEAD8
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "tqkld requests full-vocabulary logits itself"
-  - name: TQLLM_HEAD_HOST
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (tqserve memory fit)"
-  - name: TQLLM_HEAD_PER_SEG
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_HOST_CHAIN
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_HW_MT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (fixed launch policy)"
   - name: TQLLM_IQ3_OLD
     kind: retired
     default: "-"
@@ -292,11 +172,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_MATVEC_RULE=14:split16:PF"
-  - name: TQLLM_IQ4_OLD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (IQ4_XS loads as IQ4N)"
   - name: TQLLM_KV
     kind: retired
     default: "-"
@@ -347,11 +222,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "--lookup-first K"
-  - name: TQLLM_LOOKUP_N
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (--lookup matches 6 tokens)"
   - name: TQLLM_MATVEC_LOG
     kind: retired
     default: "-"
@@ -362,66 +232,11 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=memlog"
-  - name: TQLLM_MIX_COPY
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_MQ_SPLIT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic"
-  - name: TQLLM_NO_BLKMERGE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_NO_BTREE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_NO_RMSROPE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_NO_SIDE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_PF_GU_BF16
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_PF_MIX_COPY
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_PREFILL_ATTN_GROUPED
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_PREFILL_ATTN_OLD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
   - name: TQLLM_PREFILL_BUF
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "-ub / --ubatch-size N"
-  - name: TQLLM_PREFILL_CHUNK
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "automatic (-ub sets the prefill buffer)"
   - name: TQLLM_PREFILL_PROGRESS
     kind: retired
     default: "-"
@@ -432,31 +247,11 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=profile"
-  - name: TQLLM_Q4K_U4H
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_REPEAT_EXIT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed"
   - name: TQLLM_REPEAT_LIMIT
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "tqserve --repeat-limit N"
-  - name: TQLLM_SERIAL_DRAFT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
-  - name: TQLLM_SERIAL_SEGS
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (settled A/B switch removed)"
   - name: TQLLM_STAGEPROF
     kind: retired
     default: "-"
@@ -472,36 +267,11 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=tf_dump:FILE"
-  - name: TQLLM_TQ3_HW
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (fixed launch policy)"
-  - name: TQLLM_TQ3_MT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (fixed launch policy)"
-  - name: TQLLM_TQ3_MT_KMIN
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (fixed launch policy: k >= 12288)"
   - name: TQLLM_TQ3_OLD
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_MATVEC_RULE=3:legacy"
-  - name: TQLLM_TQ3_P
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (fixed launch policy)"
-  - name: TQLLM_TQ3_TUNE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (the load-time tuner always runs)"
   - name: TQLLM_TQ3_TUNE_LOG
     kind: retired
     default: "-"
@@ -512,21 +282,11 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_MATVEC_RULE=4:legacy"
-  - name: TQLLM_TQ4_TUNE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (no in-model gain)"
   - name: TQLLM_TQ4_TUNE_LOG
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=tune"
-  - name: TQLLM_TQ4_VARIANT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (variant 0)"
   - name: TQLLM_TREE
     kind: retired
     default: "-"
@@ -537,16 +297,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "TQLLM_DEBUG=tree_chain"
-  - name: TQLLM_TREE_TEMP
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (1.0)"
-  - name: TQLLM_U4H
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed"
   - name: TQLLM_VRAM_MARGIN_MB
     kind: retired
     default: "-"
@@ -558,11 +308,6 @@ flags:
     kind: debug
     default: "unset (retain MLX default)"
     doc: "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings."
-  - name: TQLLM_MOE_DEV
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "nothing: qwen35moe (MoE) models load by default"
   - name: TQFN_ARENA_LOG
     kind: debug
     default: "off"
@@ -583,11 +328,6 @@ flags:
     kind: user
     default: "0"
     doc: "N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off)"
-  - name: TQFN_CPU_OWNED
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks"
   - name: TQFN_DENSE_INT8
     kind: debug
     default: "0"
@@ -600,11 +340,6 @@ flags:
     kind: debug
     default: "-"
     doc: "FILE: dump the GDN layer outputs (fixture comparison)"
-  - name: TQFN_GDN_VPW
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (8 value columns per warp, bit-identical)"
   - name: TQFN_KV
     kind: user
     default: "-"
@@ -629,44 +364,14 @@ flags:
     kind: user
     default: "256"
     doc: "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)"
-  - name: TQFN_OLD_Q2_DOT
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (warp-per-row GSQ Q2_0 dot)"
-  - name: TQFN_PF_EVENTS
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33)"
-  - name: TQFN_CPU_OWNED_COLD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed (profile-owned cold experts lost on the 3090)"
-  - name: TQFN_CPU_OWNED_PROFILE
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "removed with TQFN_CPU_OWNED_COLD"
   - name: TQFN_DRAFT_TAU
     kind: debug
     default: "0.9 (np 1)"
     doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off"
-  - name: TQFN_PF_CHUNK_KB
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"
   - name: TQFN_PREDICT_N
     kind: debug
     default: "4 (6 with adaptive drafts)"
     doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
-  - name: TQFN_TQ_AHEAD
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "TQueue prefetch queue lives on branch tqllm/tqueue (not in the release)"
   - name: TQFN_PF_MMQ_CHECK
     kind: debug
     default: "0"
@@ -711,11 +416,6 @@ flags:
     kind: debug
     default: "16"
     doc: "slices per decode QSA attention row; 0 or 1 = direct attention"
-  - name: TQFN_ROUTER_GEMM
-    kind: retired
-    default: "-"
-    doc: "removed"
-    replaced_by: "fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing)"
   - name: TQFN_ROUTE_DUMP
     kind: debug
     default: "-"
