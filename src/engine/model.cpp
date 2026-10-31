@@ -470,6 +470,10 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                                          " per slot, KV " + asked.kv + "): it would need " + lossy +
                                          ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
             g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
+            if (opt.mode == Mode::Exact) {
+                g_fit_note = "exact mode: " + g_fit_note;
+                std::fprintf(stderr, "tqserve: WARN exact mode: %s forced by memory\n", lossy.c_str());
+            }
             std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
                          g_fit_note.c_str());
         }
@@ -674,14 +678,18 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 namespace { FlashNextFactory g_flashnext = nullptr; }
 // --mode exact must hold on every engine: refuse the approximations a user asked for explicitly, and the engines that
 // have no exact path yet
+static bool env_on(const char * name) { const char * v = std::getenv(name); return v && std::atoi(v) != 0; }
 static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
     if (o.mode != Mode::Exact) return;
     if (o.prefill_int8 == 1 || o.prefill_fp8 == 1) throw std::invalid_argument("--mode exact cannot run --prefill-int8 / --prefill-fp8 on");
-    if (p.extension() == ".tqfn" && std::getenv("TQFN_PREFILL_INT8") && std::atoi(std::getenv("TQFN_PREFILL_INT8")) != 0)
-        throw std::invalid_argument("--mode exact cannot run with TQFN_PREFILL_INT8 set (int8 prefill)");
+    if (const std::string kv = o.kv_format(); kv != "bf16" && kv != "f16")
+        throw std::invalid_argument("--mode exact cannot run the lossy KV " + kv + " (-ctk / -ctv / --kv); drop them or run speed mode");
+    if (p.extension() == ".tqfn")
+        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
+            if (env_on(v)) throw std::invalid_argument(std::string("--mode exact cannot run with ") + v + " set (an approximation); unset it or run speed mode");
     const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
     if (gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())))
-        throw std::invalid_argument("--mode exact is not available for this engine yet (MiniMax / GLM run speed mode only)");
+        throw std::invalid_argument("--mode exact is not available for MiniMax / GLM yet: run them without --mode exact (speed mode)");
 }
 void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
 // `weights` is either DIR/weights.tqbin (converted Qwen2) or a checkpoint directory / any file inside it.

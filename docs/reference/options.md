@@ -25,6 +25,18 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
 
+### Exact and speed mode
+
+`--mode speed` (default) lets each engine use its measured approximations; `--mode exact` turns them off. If memory
+forces a smaller KV cache in exact mode, the server says so on stderr and in `/health` ("exact mode: ...").
+
+| Engine | What speed mode changes | Exact mode |
+|---|---|---|
+| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 (where those are the default) | FP16 prefill; refuses `--prefill-int8 on`, `--prefill-fp8 on` and a lossy `-ctk` / `-ctv` / `--kv` |
+| Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; refuses `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
+| Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs exact at 32K-128K) | BF16 KV at every length; FP32 query if memory forces int8 |
+| MiniMax, GLM | (their only path) | refused: run them without `--mode exact` |
+
 ### Reasoning and chat template
 
 | Option | Default | What it does |
