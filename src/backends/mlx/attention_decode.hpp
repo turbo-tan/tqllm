@@ -963,6 +963,7 @@ inline mlx::core::array decode_rows_attention_v17(const mlx::core::array& q, con
 // v18: S = int8 Q x int8 K on the matrix unit (int32 accumulate; Q quantized per row), softmax and PV as v16 at 32-key
 // rounds (FP16 P x V codes). Not bitwise v12: error vs FP64 ~2.7x v12's (j1438); 16-18 % faster than v16 at 16K-64K,
 // 8 and 16 rows (j1439: 64K n=8 1021 vs 1233 us). Used for every int8 call (1 row too), so spec == AR stays exact.
+// Q quantized by one kernel (j1440: the ~10 host ops per call cost ~2 ms per step).
 inline mlx::core::array decode_rows_attention_v18(const mlx::core::array& q, const mlx::core::array& k8t,
                                                     const mlx::core::array& v8, const mlx::core::array& kscale,
                                                     const mlx::core::array& vscale, float scale, int length) {
@@ -983,25 +984,34 @@ inline mlx::core::array decode_rows_attention_v18(const mlx::core::array& q, con
     const int groups = (tiles + tpg - 1) / tpg;
     const int qrows = groups * tpg * 16;
 
-    // Q to int8 with one FP32 scale per row (max |q| / 127, from the BF16-rounded query): the scale depends only on the
-    // row, so a row still equals its 1-row call bit for bit.
-    auto qbf = mx::astype(q, mx::bfloat16);
-    auto qf = mx::astype(qbf, mx::float32);
-    auto qmax = mx::max(mx::abs(qf), 3, true);
-    auto qscale = mx::maximum(mx::divide(qmax, mx::array(127.0f, mx::float32)),
-                              mx::array(1e-8f, mx::float32));
-    auto qq = mx::divide(qf, mx::reshape(qscale, {1, heads, n, 1}));
-    qq = mx::clip(qq, mx::array(-127.0f, mx::float32), mx::array(127.0f, mx::float32));
-    auto q8 = mx::astype(mx::round(qq), mx::int8);
-
-    q8 = mx::reshape(q8, {kvh, rows, dim});
-    auto qsc = mx::reshape(mx::astype(qscale, mx::float32), {kvh, rows});
-    if (qrows > rows) {
-        q8 = mx::concatenate({q8, mx::zeros({kvh, qrows - rows, dim}, mx::int8)}, 1);
-        qsc = mx::concatenate({qsc, mx::zeros({kvh, qrows - rows}, mx::float32)}, 1);
+    // Q to int8 in one launch: per row (BF16-rounded) scale max(max |q| / 127, 1e-8), codes rint(q / scale) clamped to
+    // +-127, rows past `rows` zero. The scale depends only on the row, so a row still equals its 1-row call bit for bit.
+    static auto qquant = mx::fast::metal_kernel("tqllm_attn_v18_qquant", {"Q", "R"}, {"Q8", "QS"}, R"METAL(
+    const uint lane = thread_index_in_simdgroup;
+    const uint r = threadgroup_position_in_grid.x, kh = threadgroup_position_in_grid.y;
+    const int ROWS = R[0], QROWS = R[1];
+    const size_t dst = (size_t(kh) * QROWS + r) * DIM;
+    if (int(r) >= ROWS) {
+        for (int e = 0; e < DIM / 32; ++e) Q8[dst + e * 32 + lane] = 0;
+        if (lane == 0) QS[size_t(kh) * QROWS + r] = 0.0f;
+        return;
     }
-    q8 = mx::contiguous(q8);
-    qsc = mx::contiguous(qsc);
+    const size_t src = (size_t(kh) * ROWS + r) * DIM;
+    float x[DIM / 32], mx = 0.0f;
+    for (int e = 0; e < DIM / 32; ++e) {
+        const uint u = as_type<uint>(Q[src + e * 32 + lane]);
+        x[e] = as_type<float>((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);   // BF16 round to nearest even
+        mx = max(mx, fabs(x[e]));
+    }
+    mx = simd_max(mx);
+    const float sc = max(mx / 127.0f, 1e-8f);
+    for (int e = 0; e < DIM / 32; ++e) Q8[dst + e * 32 + lane] = int8_t(clamp(rint(x[e] / sc), -127.0f, 127.0f));
+    if (lane == 0) QS[size_t(kh) * QROWS + r] = sc;
+)METAL");
+    const auto rq = mx::array({rows, qrows}, {2}, mx::int32);
+    auto qo = qquant({mx::reshape(q, {kvh, rows, dim}), rq}, {{kvh, qrows, dim}, {kvh, qrows}}, {mx::int8, mx::float32},
+                     {qrows * 32, kvh, 1}, {32, 1, 1}, {{"DIM", dim}}, std::nullopt, false, mx::Device(mx::Device::gpu));
+    auto q8 = qo[0], qsc = qo[1];
 
     static const char* header = R"METAL(
 #include <metal_simdgroup>
