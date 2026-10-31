@@ -312,6 +312,7 @@ struct Qwen35::Impl {
     // kv_values; int8: K^T blocks [kvh, cap / 1024, hd, 1024] / V [kvh, cap, hd] int8 + FP16 scales [kvh, cap] in
     // kv_kscale / kv_vscale; trellis: K codes [kvh, cap, 26] / V codes [kvh, cap, 18] uint32
     KvTier kv_tier=KvTier::Bf16;
+    bool exact=false;  // --mode exact: BF16 KV first at every length
     std::vector<std::optional<mx::array>> kv_kscale,kv_vscale;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
@@ -1401,8 +1402,9 @@ KvTier Qwen35::choose_kv_format(int rows,int prefill_chunk,size_t other_row_byte
 KvPlan Qwen35::plan_kv_format(int prompt_rows,int answer_rows,int prefill_chunk,size_t far_row_bytes) const {
     const int rows=prompt_rows+answer_rows+16;
     const size_t lean=(size_t(512)<<20)+size_t(prefill_chunk)*size_t(impl_->hidden)*40;  // the decode-time cache limit
-    return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes,lean,request_kv_first(prompt_rows,answer_rows,exact_));
+    return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes,lean,request_kv_first(prompt_rows,answer_rows,impl_->exact));
 }
+void Qwen35::set_exact(bool on) {impl_->exact=on;}
 int Qwen35::attention_layers() const {return impl_->layers/impl_->interval;}
 int Qwen35::kv_heads() const {return impl_->kvheads;}
 int Qwen35::q_heads() const {return impl_->heads;}

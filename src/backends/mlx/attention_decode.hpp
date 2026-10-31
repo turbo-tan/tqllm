@@ -352,11 +352,7 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
         kscale.shape() != mx::Shape{kvh, cap} || vscale.shape() != kscale.shape() || kscale.dtype() != mx::float16 || vscale.dtype() != mx::float16)
         throw std::invalid_argument("decode attention int8: int8 K^T blocks [kvh, blocks, 256, 1024], V [kvh, cap, 256], FP16 scales [kvh, cap]");
 
-    const int rows = group * n, tiles = (rows + 15) / 16;
-    const int chunk = 32;
-    const int tpg = 1;
-    const int groups = (tiles + tpg - 1) / tpg;
-    const int qrows = groups * tpg * 16;
+    const int rows = group * n, tiles = (rows + 15) / 16, qrows = tiles * 16;
 
     // Q to int8 in one launch: per row (BF16-rounded) scale max(max |q| / 127, 1e-8), codes rint(q / scale) clamped to
     // +-127, rows past `rows` zero. The scale depends only on the row, so a row still equals its 1-row call bit for bit.
@@ -371,14 +367,14 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
         return;
     }
     const size_t src = (size_t(kh) * ROWS + r) * DIM;
-    float x[DIM / 32], mx = 0.0f;
+    float x[DIM / 32], amax = 0.0f;
     for (int e = 0; e < DIM / 32; ++e) {
         const uint u = as_type<uint>(Q[src + e * 32 + lane]);
         x[e] = as_type<float>((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);   // BF16 round to nearest even
-        mx = max(mx, fabs(x[e]));
+        amax = max(amax, fabs(x[e]));
     }
-    mx = simd_max(mx);
-    const float sc = max(mx / 127.0f, 1e-8f);
+    amax = simd_max(amax);
+    const float sc = max(amax / 127.0f, 1e-8f);
     for (int e = 0; e < DIM / 32; ++e) Q8[dst + e * 32 + lane] = int8_t(clamp(rint(x[e] / sc), -127.0f, 127.0f));
     if (lane == 0) QS[size_t(kh) * QROWS + r] = sc;
 )METAL");
@@ -397,7 +393,7 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
         {"Q", "QS", "KT", "V", "KS", "VS", "P"},
         {"M", "S", "O"},
         R"METAL(
-    constexpr int C = CK, RP = TPG * 16, HD = DIM / 2, CQ = C / 4, NT = TPG * 64;
+    constexpr int C = 32, RP = 16, HD = DIM / 2, CQ = C / 4;   // one 16-row tile per threadgroup, 32-key rounds
     const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint tid = sg * 32 + lane;
     const uint grp = threadgroup_position_in_grid.x, blk = threadgroup_position_in_grid.y, kh = threadgroup_position_in_grid.z;
@@ -467,25 +463,20 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
         }
 
         {
-            for (int sub = 0; sub < C / 32; ++sub) {
-                auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), int32_t>();
-                for (ushort i = 0; i < 16; ++i) sacc[i] = 0;
-
-                for (int ks = 0; ks < 8; ++ks) {
-                    for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];
-
-                    for (short w = 0; w < 2; ++w) for (short h = 0; h < 2; ++h) {
-                        const int d = (half_d * 8 + ks) * 16 + fm + 8 * h;
-                        const char4 kv = *(const device char4*)(kt + size_t(d) * BLOCK + c0 + sub * 32 + w * 16 + fn);
-                        for (short i = 0; i < 4; ++i) cb[w * 8 + h * 4 + i] = int8_t(kv[i]);
-                    }
-                    op.run(ca, cb, sacc);
+            // partial S tile [16 rows x 32 keys] over this half of the head dim, int32
+            auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), int32_t>();
+            for (ushort i = 0; i < 16; ++i) sacc[i] = 0;
+            for (int ks = 0; ks < 8; ++ks) {
+                for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];
+                for (short w = 0; w < 2; ++w) for (short h = 0; h < 2; ++h) {
+                    const int d = (half_d * 8 + ks) * 16 + fm + 8 * h;
+                    // keys past the view stay inside the allocated 1024-key block and are masked in the softmax
+                    const char4 kv = *(const device char4*)(kt + size_t(d) * BLOCK + c0 + w * 16 + fn);
+                    for (short i = 0; i < 4; ++i) cb[w * 8 + h * 4 + i] = int8_t(kv[i]);
                 }
-
-                for (ushort i = 0; i < 16; ++i)
-                    if (dn[i] >= 0)
-                        st[half_d][(tile * 16 + dm[i]) * C + sub * 32 + dn[i]] = sacc[i];
+                op.run(ca, cb, sacc);
             }
+            for (ushort i = 0; i < 16; ++i) if (dn[i] >= 0) st[half_d][(tile * 16 + dm[i]) * C + dn[i]] = sacc[i];
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -602,15 +593,15 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
     auto P = mx::array(p.data(), {9}, mx::int32);
 
     const auto tpl = std::vector<std::pair<std::string, mx::fast::TemplateArg>>{
-        {"DIM", dim}, {"BLOCK", kBlock}, {"TPG", tpg}, {"CK", chunk}
+        {"DIM", dim}, {"BLOCK", kBlock}
     };
 
     auto part = pass1(
         {q8, qsc, k8t, v8, kscale, vscale, P},
         {{kvh * rows * blocks}, {kvh * rows * blocks}, {kvh * rows * blocks * dim}},
         {mx::float32, mx::float32, mx::float32},
-        {64 * tpg * groups, blocks, kvh},
-        {64 * tpg, 1, 1},
+        {64 * tiles, blocks, kvh},
+        {64, 1, 1},
         tpl, std::nullopt, false, mx::Device(mx::Device::gpu)
     );
 
