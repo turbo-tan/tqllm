@@ -1,4 +1,5 @@
 #pragma once
+#include "debug.hpp"
 #include "wired_budget.hpp"
 #include <mlx/device.h>
 #include <mlx/memory.h>
@@ -10,7 +11,7 @@ class ScopedWiredLimit {
     std::optional<size_t> previous;
 public:
     ScopedWiredLimit() {
-        if(const char* value=std::getenv("TQLLM_MLX_WIRED_MIB")) {
+        if(const char* value=tqllm::debug_cstr("wired_mib")) {
             auto recommended=std::get<size_t>(mlx::core::device_info(mlx::core::Device::gpu).at("max_recommended_working_set_size"));
             size_t requested=wired_bytes(value,recommended);
             previous=mlx::core::set_wired_limit(requested);

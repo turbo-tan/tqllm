@@ -1,3 +1,4 @@
+#include "debug.hpp"
 #include "wired_limit.hpp"
 #include "qwen35.hpp"
 #include "kl_rows.hpp"
@@ -227,9 +228,9 @@ int main(int argc,char** argv) {
                     for(size_t r=0;r<rows_here && p+r+1<input.size();++r)targets.push_back(input[p+r+1]);
                     kl.add(ref.data(),yf.data<float>(),targets.size(),vocab,targets.data());
                     if(targets.size()<rows_here)kl.add(ref.data()+targets.size()*vocab,yf.data<float>()+targets.size()*vocab,rows_here-targets.size(),vocab);
-                    // TQLLM_KL_SLICE=N: mean KL per N-position slice of the prompt (printed after the run), to see whether the
+                    // TQLLM_DEBUG=kl_slice:N: mean KL per N-position slice of the prompt (printed after the run), to see whether the
                     // error sits in one slice (a join / padded tail) or follows tokens
-                    if(const char* ks=std::getenv("TQLLM_KL_SLICE")) {
+                    if(const char* ks=tqllm::debug_cstr("kl_slice")) {
                         const size_t width=std::max<size_t>(1,size_t(std::atoi(ks)));
                         for(size_t r=0;r<rows_here;++r){
                             const float* a=ref.data()+r*vocab;const float* b=yf.data<float>()+r*vocab;
@@ -242,8 +243,8 @@ int main(int argc,char** argv) {
                         }
                         slice_width=width;
                     }
-                    // TQLLM_KL_ROWS=K: print the K worst rows of this chunk by KL (absolute position), to find bad rows
-                    if(const char* kr=std::getenv("TQLLM_KL_ROWS")) {
+                    // TQLLM_DEBUG=kl_rows:K: print the K worst rows of this chunk by KL (absolute position), to find bad rows
+                    if(const char* kr=tqllm::debug_cstr("kl_rows")) {
                         const int topk=std::max(1,std::atoi(kr));
                         std::vector<std::pair<double,size_t>> rowkl;
                         for(size_t r=0;r<rows_here;++r){

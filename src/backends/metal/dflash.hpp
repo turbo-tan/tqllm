@@ -51,7 +51,7 @@ public:
     // size the far caches once for the request's rows: the x1.5 growth step at the first decode inject would add half
     // the prefill's caches again (248K: +3 GB)
     void reserve_far(int rows);
-    // with TQLLM_MLX_DFLASH_RANKSTATS: the last draft's 16 candidates per proposed token, best unary score first
+    // with TQLLM_DEBUG=dflash_rankstats: the last draft's 16 candidates per proposed token, best unary score first
     const std::vector<std::vector<uint32_t>>& candidates() const;
 private:
     struct Impl;

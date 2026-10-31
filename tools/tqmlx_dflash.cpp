@@ -1,3 +1,4 @@
+#include "debug.hpp"
 #include "wired_limit.hpp"
 #include "dflash.hpp"
 #include "dflash_rank_stats.hpp"
@@ -42,9 +43,9 @@ int main(int argc,char** argv) {
         DFlash2 drafter(argv[2],engine);
         const bool head4=true;  // served 4-bit proposal head
         if(head4)engine.enable_draft_head4();
-        // TQLLM_MLX_DRAFT_BENCH=n: after the prefill, n synchronous draft_device calls of `width` rows at the same
+        // TQLLM_DEBUG=draft_bench:n: after the prefill, n synchronous draft_device calls of `width` rows at the same
         // position; prints the median ms (drafter GPU + host) and exits
-        if(const char* bench=std::getenv("TQLLM_MLX_DRAFT_BENCH")) {
+        if(const char* bench=tqllm::debug_cstr("draft_bench")) {
             mx::array logits=mx::array(0.0f);
             for(size_t off=0;off<prompt.size();off+=size_t(prefill_chunk)) {
                 const int n=std::min(prefill_chunk,int(prompt.size()-off));
@@ -54,8 +55,8 @@ int main(int argc,char** argv) {
             if(!head4)engine.draft_shortlist(logits,shortlist);
             const uint32_t pending=mx::argmax(logits).item<uint32_t>();
             std::vector<double> ms;
-            // TQLLM_MLX_DRAFT_STAGES (this bench only): time draft_device_at (the draft-ahead draft) per stage instead
-            const bool stage_mode=std::getenv("TQLLM_MLX_DRAFT_STAGES")!=nullptr;
+            // TQLLM_DEBUG=draft_stages (this bench only): time draft_device_at (the draft-ahead draft) per stage instead
+            const bool stage_mode=tqllm::debug_cstr("draft_stages")!=nullptr;
             drafter.time_stages(stage_mode);
             for(int r=-3;r<std::max(1,std::atoi(bench));++r) {
                 const auto t0=Clock::now();
@@ -73,14 +74,14 @@ int main(int argc,char** argv) {
             return 0;
         }
         std::vector<uint32_t> reference,first_spec;
-        const bool rank_stats=std::getenv("TQLLM_MLX_DFLASH_RANKSTATS")!=nullptr;
+        const bool rank_stats=tqllm::debug_cstr("dflash_rankstats")!=nullptr;
         tqllm::DraftRankStats rank_table(width);
-        // TQLLM_MLX_DFLASH_SPEC_ONLY=1: speculative runs only (ar_equal_prefix then compares with nothing);
-        // TQLLM_MLX_DFLASH_WARM_TOKENS=n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
-        const bool spec_only=std::getenv("TQLLM_MLX_DFLASH_SPEC_ONLY")!=nullptr;
+        // TQLLM_DEBUG=dflash_spec_only:1: speculative runs only (ar_equal_prefix then compares with nothing);
+        // TQLLM_DEBUG=dflash_warm_tokens:n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
+        const bool spec_only=tqllm::debug_cstr("dflash_spec_only")!=nullptr;
         // verify(k) and draft(k+1) chained on the GPU from device values (spec_pipeline.hpp), as served
         const bool draft_ahead=true;
-        const int warm_tokens=std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS")?std::max(2,std::atoi(std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS"))):count;
+        const int warm_tokens=tqllm::debug_cstr("dflash_warm_tokens")?std::max(2,std::atoi(tqllm::debug_cstr("dflash_warm_tokens"))):count;
         tqllm::mlx_backend::WidthPolicy policy;  // width 0: the per-step verify width, its time lines kept across runs
         for(int mode=spec_only?1:0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {
             const int limit=run<0?std::min(count,warm_tokens):count;

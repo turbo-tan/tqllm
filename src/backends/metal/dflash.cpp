@@ -1,4 +1,5 @@
 #include <sstream>
+#include "debug.hpp"
 #include "dflash.hpp"
 #include "dflash_retrieve.hpp"
 #include "nax_affine.hpp"
@@ -610,7 +611,7 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     auto logits=i.target.shared_draft_head(normalized);
     auto top=dflash_top16(logits);auto selected=top.first,unary=top.second;
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
-    if(std::getenv("TQLLM_MLX_DFLASH_RANKSTATS")) {
+    if(tqllm::debug_cstr("dflash_rankstats")) {
         auto ids=mx::contiguous(mx::astype(mapped,mx::uint32));auto score=mx::contiguous(mx::astype(unary,mx::float32));mx::eval(ids,score);
         i.candidates.assign(count,{});
         for(int n=1;n<=count;++n) {

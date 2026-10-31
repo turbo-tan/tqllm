@@ -43,14 +43,9 @@ mx::array tail_slice(const mx::array& a,int axis,int begin,int end) {
     starts[axis]=begin;stops[axis]=end;
     return mx::slice(a,starts,stops);
 }
-// matrix-unit defaults (j576): on unless the variable is set to 0
-bool env_default_on(const char* name) {
-    const char* v=std::getenv(name);
-    return !v || std::string(v)!="0";
-}
 mx::array bf_raw(const mx::array& a) {return mx::astype(mx::astype(a,mx::bfloat16),mx::float32);}
 mx::array silu(const mx::array& a) {return mx::multiply(a,mx::sigmoid(a));}
-// TQLLM_MLX_COUNT_NODES: Metal dispatches per layer stage. Each primitive is counted once at the stage that first reaches
+// TQLLM_DEBUG=count_nodes: Metal dispatches per layer stage. Each primitive is counted once at the stage that first reaches
 // it; after the eval a view primitive (reshape, slice, transpose, contiguous ...) whose output shares its input's buffer
 // launched nothing, every other primitive is one launch
 struct DispatchCount {
@@ -151,8 +146,6 @@ struct Qwen35::Impl {
     std::map<std::string,NaxAffine> packs;
     std::map<std::string,std::vector<int>> pack_rows;
     void pack(const std::string& key,const std::vector<std::string>& names) {
-        static const bool on=env_default_on("TQLLM_MLX_PREFILL_PACK");
-        if(!on)return;
         auto& map=nax_tq4.count(names[0])?nax_tq4:nax;
         std::vector<NaxAffine*> ms;
         for(const auto& n:names) {
@@ -223,14 +216,14 @@ struct Qwen35::Impl {
         if(!slot || slot->first.id()!=x.id())slot=std::pair{x,tq4?tq4_rotate_half(x):mx::astype(x,mx::float16)};
         return gemm4(*w,slot->second);
     }
-    // TQLLM_MLX_PREFILL_FUSED=0: MLX op chains for the prefill norms and SwiGLU. On, each fused kernel is compared with
+    // Each fused prefill-norm / SwiGLU kernel is compared with
     // its chain on the first prefill chunk and used only when bitwise equal (-1 unchecked, 0 fallback, 1 fused)
     int norm_fused=-1,swiglu_fused=-1;
-    // TQLLM_MLX_ATTN_QK_FUSED=0: the attention q/k norm + RoPE stage runs the MLX chain. On, one fused kernel is compared
+    // The fused attention q/k norm + RoPE kernel is compared
     // with the chain on the first prefill chunk and used only when bitwise equal (-1 unchecked, 0 fallback, 1 fused)
     int attn_qk_fused=-1;
-    static bool fused_on() {static const bool on=env_default_on("TQLLM_MLX_PREFILL_FUSED");return on;}
-    static bool attn_qk_fused_on() {static const bool on=env_default_on("TQLLM_MLX_ATTN_QK_FUSED");return on;}
+    static bool fused_on() {return true;}
+    static bool attn_qk_fused_on() {return true;}
     static bool same_bits(const mx::array& a,const mx::array& b) {
         return a.shape()==b.shape() && a.dtype()==b.dtype() && mx::array_equal(a,b).item<bool>();
     }
@@ -446,7 +439,7 @@ struct Qwen35::Impl {
                 for(const auto* name:{"attn_qkv.weight","attn_gate.weight","ssm_alpha.weight","ssm_beta.weight","ssm_out.weight"}) matrix(p+name);
                 for(const auto* name:{"ssm_conv1d.weight","ssm_a","ssm_dt.bias","ssm_norm.weight"}) scalar(p+name);
             }
-            // TQLLM_MLX_PREFILL_PACK=0: separate prefill GEMMs per matrix
+            // pack_on (served): one packed prefill GEMM per group (separate GEMMs per matrix otherwise)
             pack(p+"ffn_gu",{p+"ffn_gate.weight",p+"ffn_up.weight"});
             if((l+1)%interval==0)pack(p+"attn_in",{p+"attn_q.weight",p+"attn_k.weight",p+"attn_v.weight"});
             else pack(p+"gdn_in",{p+"attn_qkv.weight",p+"attn_gate.weight"});
@@ -590,7 +583,7 @@ struct Qwen35::Impl {
         struct Half {mx::array x;int offset;std::vector<mx::array> feats;std::optional<mx::array> y_gpu,y_ane,xc;};
         Half h[2]={{bf(embed(tokens.subspan(0,R))),pos,{},{},{},{}},{bf(embed(tokens.subspan(R,R))),pos+R,{},{},{},{}}};
         std::future<void> job;int job_half=-1;
-        static const bool timing=std::getenv("TQLLM_MLX_ANE_TIMING")!=nullptr;
+        static const bool timing=tqllm::debug_cstr("ane_timing")!=nullptr;
         // direct evidence: ANE calls made, time inside the predict call (worker thread), layers that fell back to the GPU
         std::atomic<double> ane_ms{0},ane_cpu_ms{0};int ane_calls=0,gpu_layers=0;long gpu_share_cols=0;
         double t_eval=0,t_join=0,t_build=0;auto tick=std::chrono::steady_clock::now();
@@ -668,9 +661,9 @@ struct Qwen35::Impl {
         const auto *g=find(p+"ffn_gate.weight"),*u=find(p+"ffn_up.weight"),*d=find(p+"ffn_down.weight");
         if(!g || !u || !d || g->q6 || u->q6 || d->q6)return std::nullopt;
         auto x16=g->tq4?tq4_rotate_half(n):(gemm_input && gemm_input->first.id()==n.id()?gemm_input->second:mx::astype(n,mx::float16));
-        // TQLLM_MLX_DUMP_FFN=dir:layer,layer,...: save this layer's FFN input (FP16, rotated for TQ4) per chunk and
+        // TQLLM_DEBUG=dump_ffn:dir:layer,layer,...: save this layer's FFN input (FP16, rotated for TQ4) per chunk and
         // its dequantized FP16 weights once, as .npy (Neural Engine split calibration and quality checks)
-        static const std::string dump=std::getenv("TQLLM_MLX_DUMP_FFN")?std::getenv("TQLLM_MLX_DUMP_FFN"):"";
+        static const std::string dump=tqllm::debug_cstr("dump_ffn")?tqllm::debug_cstr("dump_ffn"):"";
         if(!dump.empty()) {
             const auto colon=dump.find(':');const std::string dir=dump.substr(0,colon),layers=","+dump.substr(colon+1)+",";
             const std::string layer=p.substr(4,p.size()-5);
@@ -685,9 +678,9 @@ struct Qwen35::Impl {
                 }
             }
         }
-        // TQLLM_MLX_DUMP_FFN_SLICE=dir:C: per layer, the last C intermediate channels' FP16 weights (gate/up rows, down
+        // TQLLM_DEBUG=dump_ffn_slice:dir:C: per layer, the last C intermediate channels' FP16 weights (gate/up rows, down
         // columns, TQ4 basis) and the first chunk's FFN input, for the Neural Engine model builder (ane_build.py)
-        static const std::string slice_dump=std::getenv("TQLLM_MLX_DUMP_FFN_SLICE")?std::getenv("TQLLM_MLX_DUMP_FFN_SLICE"):"";
+        static const std::string slice_dump=tqllm::debug_cstr("dump_ffn_slice")?tqllm::debug_cstr("dump_ffn_slice"):"";
         if(!slice_dump.empty()) {
             const auto colon=slice_dump.find(':');const std::string dir=slice_dump.substr(0,colon);
             const int C=std::stoi(slice_dump.substr(colon+1)),F=g->rows;
@@ -703,13 +696,13 @@ struct Qwen35::Impl {
         }
         // TQLLM_MLX_ANE_FFN=dir: the last C intermediate channels of each layer with a model in dir run on the Neural
         // Engine (Core ML, ane_ffn.mm) while the GPU computes the rest; chunks of the model's row count only.
-        // Opt-in fast prefill: the ANE's arithmetic is not exact (j662/j664). TQLLM_MLX_ANE_SERIAL=1 runs it after the GPU.
+        // Opt-in fast prefill: the ANE's arithmetic is not exact (j662/j664). TQLLM_DEBUG=ane_serial:1 runs it after the GPU.
         ensure_ane();
         const int layer_index=std::stoi(p.substr(4,p.size()-5));
         if(ane && ane->has(layer_index) && n.shape(0)==ane->rows() && g->tq4 && u->tq4 && d->tq4) {
             const int C=ane->columns(),F=g->rows,G=F-C,hidden=g->columns;
-            // TQLLM_MLX_ANE_TIMING=1: per-chunk sums of the input sync, the ANE call and the join wait (ms)
-            static const bool timing=std::getenv("TQLLM_MLX_ANE_TIMING")!=nullptr;
+            // TQLLM_DEBUG=ane_timing:1: per-chunk sums of the input sync, the ANE call and the join wait (ms)
+            static const bool timing=tqllm::debug_cstr("ane_timing")!=nullptr;
             static double t_sync=0,t_pred=0,t_join=0;static int t_layers=0;
             auto tick=std::chrono::steady_clock::now();
             auto lap=[&]() {auto now=std::chrono::steady_clock::now();double d=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;return d;};
@@ -727,7 +720,7 @@ struct Qwen35::Impl {
             },true);
             auto hg=tq4_rotate_half(swiglu_a({gv,uv})[0]);
             auto y_gpu=mx::astype(mx::matmul(hg,mx::transpose(mx::slice(nax_affine_dequant(*d),{0,0},{d->rows,G}))),mx::float32);
-            static const bool serial=std::getenv("TQLLM_MLX_ANE_SERIAL")!=nullptr;
+            static const bool serial=tqllm::debug_cstr("ane_serial")!=nullptr;
             if(serial)mx::eval(y_gpu);else mx::async_eval(y_gpu);
             if(timing)lap();
             ane->predict(layer_index,xc.data<mx::float16_t>(),y_ane.data<mx::float16_t>(),hidden);
@@ -999,7 +992,7 @@ struct Qwen35::Impl {
         bool wave_features=use_wave;
         if(stage_profiling)record("embedding",{x});
         std::optional<DispatchCount> dispatches;
-        if(std::getenv("TQLLM_MLX_COUNT_NODES")) {dispatches.emplace();dispatches->take({x},"embed");}
+        if(tqllm::debug_cstr("count_nodes")) {dispatches.emplace();dispatches->take({x},"embed");}
         auto cache_roots=[&](int l,std::vector<mx::array> roots) {
             const auto& c=caches[l];
             for(const std::optional<mx::array>* a:std::initializer_list<const std::optional<mx::array>*>{&c.conv,&c.state,&kv_keys[l],&kv_values[l],&kv_kscale[l],&kv_vscale[l]})if(*a)roots.push_back(**a);
@@ -1010,13 +1003,13 @@ struct Qwen35::Impl {
         auto layer_step=[&](int l,mx::array& x,int offset,std::vector<mx::array>& features) {
             if(std::binary_search(feature_ids.begin(),feature_ids.end(),l))features.push_back(x);
             const std::string p="blk."+std::to_string(l)+".";
-            static const bool pack_on0=env_default_on("TQLLM_MLX_PREFILL_PACK");
+            constexpr bool pack_on0=true;
             const bool rows16=x.shape(0)<=16;
             auto n=(pack_on0 && !capture_prefix && x.shape(0)>=64)?norm_prefill(x,p+"attn_norm.weight"):rows16?norm_rows(x,p+"attn_norm.weight"):norm(x,p+"attn_norm.weight");
             stage("norm_in",{n});
             const bool is_attn=(l+1)%interval==0;
             // prefill chunks: the output projection adds the residual (mixer_added), the down product likewise
-            static const bool pack_on=env_default_on("TQLLM_MLX_PREFILL_PACK");
+            constexpr bool pack_on=true;
             const bool fuse=pack_on && !capture_prefix && x.shape(0)>=64;
             mixer_residual=fuse?&x:nullptr;mixer_added=false;
             auto attn=is_attn?full_attention(p,n,caches[l],offset,l):gdn(p,n,caches[l],tapes[l]);
@@ -1267,7 +1260,8 @@ void Qwen35::draft_shortlist(const mx::array& logits,int count) {
         throw std::invalid_argument("invalid MTP shortlist");
     if(auto head=impl_->nax.find("output.weight");head!=impl_->nax.end()) {
         // the drafter scores only the target's `count` most likely tokens for this prompt (proposals only; verify uses the full head)
-        if(!std::getenv("TQLLM_MLX_NAX_DRAFT_SHORTLIST") || count%128)return;
+        constexpr bool shortlist=false;  // the draft-vocabulary shortlist experiment (off)
+        if(!shortlist || count%128)return;
         auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
         impl_->mtp_ids=mx::contiguous(mx::astype(tail_slice(ordered,0,impl_->vocab-count,impl_->vocab),mx::uint32));mx::eval(*impl_->mtp_ids);
         const auto& h=head->second;
