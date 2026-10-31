@@ -16,4 +16,4 @@ src/formats/weight/tq4.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
 src/formats/weight/w4s.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
 src/formats/weight/w4s.cu	src/models/qwen/qwen35/qwen35_kernels.cuh
 src/models/qwen/qwen35/attention.cu	src/models/qwen/qwen2/qwen2_kernels.cuh
-src/models/qwen/qwen35/qwen35.cpp	src/models/qwen/qwen2/qwen2_kernels.cuh
+src/models/qwen/qwen35/qwen35_engine.hpp	src/models/qwen/qwen2/qwen2_kernels.cuh
