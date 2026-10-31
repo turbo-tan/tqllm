@@ -35,9 +35,9 @@ namespace {
 // graphs; ~0.4 GB measured on a 3090 at 32K). A shortfall or an out-of-memory load applies the next step and reloads:
 // embeddings, then the int8 LM head to host memory, smaller prefill buffers, the turbo3 V cache, prefill weight blocks,
 // then half the context (not below -fitc). Options the user set are left alone; -fit off loads once.
-std::string g_fit_note;  // settings this load's memory fit chose instead of the defaults (empty: none), -> Engine::note
+// note: settings this load's memory fit chose instead of the defaults (empty: none), -> Engine::note
 std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::string & tok, uint32_t ctx, int slots,
-                                    EngineOptions opt) {
+                                    EngineOptions opt, std::string & note) {
     // WSL / Windows (WDDM): cudaMemGetInfo reads ~0 near the budget, and 0.30 GB free at 262K ran at full speed with
     // no spill on a 5060 Ti (results/20261008_kv_host_tail), so the default margin and the floor are 256 MB there
     static const bool wsl = [] {
@@ -102,13 +102,13 @@ std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::st
                 throw std::runtime_error("does not fit as asked (" + std::to_string(slots) + " slot(s), context " + std::to_string(asked.ctx) +
                                          " per slot, KV " + asked.kv + "): it would need " + lossy +
                                          ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
-            g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
+            note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
             if (opt.exact) {
-                g_fit_note = "exact on: " + g_fit_note;
+                note = "exact on: " + note;
                 std::fprintf(stderr, "tqserve: WARN --exact on: %s forced by memory\n", lossy.c_str());
             }
             std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
-                         g_fit_note.c_str());
+                         note.c_str());
         }
         if (slots <= 1) return en;
         size_t fr = 0, tot = 0;
@@ -309,9 +309,9 @@ std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::st
 }  // namespace
 
 std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string & tok, uint32_t ctx, int slots, EngineOptions opt) {
-    g_fit_note.clear();
-    auto e = load_fitted_impl(path, tok, ctx, slots, std::move(opt));
-    if (e) e->note = g_fit_note;
+    std::string note;
+    auto e = load_fitted_impl(path, tok, ctx, slots, std::move(opt), note);
+    if (e) e->note = note;
     return e;
 }
 

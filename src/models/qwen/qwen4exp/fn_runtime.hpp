@@ -68,19 +68,10 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }
-// expert slots hold lane-contiguous tiles: only with a packed experts file (cold GGUF uploads stay untiled); --pack-experts
-// writes tiled blocks unless TQFN_TILED=0
-inline bool g_tile_experts = false;
 // attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
 // it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
 inline int g_kv_capacity = 2048;
 inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_capacity follows each request)
-// slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
-// banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
-inline bool g_small_card = false;
-inline float g_draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
-inline int g_predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
-inline bool g_exact_mode = false;  // --exact on: no CPU miss pool (CPU-served experts make greedy text vary run to run)
 inline bool g_cpu_owned = false;  // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
 
 using namespace tqllm;
@@ -152,8 +143,20 @@ inline DenseHalfCache g_dhc;
 struct FnTune { int chunk = 16384, sub = 2048, stage = 192, dense_min = 256, borrow_count = 0; long reserve_mb = 1000, arena_mb = 3800, dense_cache_mb = 600;
                 tqllm::BorrowMode borrow = tqllm::BorrowMode::Auto;
                 bool dense_cache_set = false, chunk_set = false, stage_set = false; };  // set: given on the command line
-inline FnTune g_tune;
-inline size_t dense_half_pool_bytes() { return size_t(std::max(0L, g_tune.dense_cache_mb)) << 20; }
+// one engine's run-time choices: tqserve options (tune, exact) and what the load decided (the rest); Checkpoint::run
+struct FnConfig {
+    FnTune tune;
+    bool exact = false;  // --exact on: no CPU miss pool (CPU-served experts make greedy text vary run to run)
+    // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
+    // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
+    bool small_card = false;
+    // expert slots hold lane-contiguous tiles: only with a packed experts file (cold GGUF uploads stay untiled); --pack-experts
+    // writes tiled blocks unless TQFN_TILED=0
+    bool tile_experts = false;
+    float draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
+    int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
+};
+inline size_t dense_half_pool_bytes(const FnTune & tune) { return size_t(std::max(0L, tune.dense_cache_mb)) << 20; }
 inline void dense_half_release() {
     if (g_dhc.base && tqllm::debug_cstr("fn_prefill_log")) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", g_dhc.high / 1048576.0, g_dhc.cap / 1048576.0);
     if (g_dhc.base) cudaFree(g_dhc.base); g_dhc = DenseHalfCache{};

@@ -18,7 +18,7 @@ struct DecodeModel {
     std::unique_ptr<Device<float>> pingpong[2];  // prefill residual between layers (layer scratch is reset)
     std::unique_ptr<Device<float>> res_keep;  // [n][width] of the last step, persistent (grows with the prefill chunk)
     AttentionState mtp_att; std::unique_ptr<Device<float>> mtp_h;  // MTP block KV and its last wide output
-    float draft_conf = 1.f;  // top probability of the last MTP draft (g_draft_tau)
+    float draft_conf = 1.f;  // top probability of the last MTP draft (FnConfig::draft_tau)
     // After a long prompt: the trunk's K/V pages wholly below len - keep move to pinned host memory (same addresses);
     // returns the device bytes freed. TQFN_KV_HOST_KEEP: positions kept on the device (32768); TQFN_KV_HOST=0: off.
     size_t kv_to_host() {
@@ -174,17 +174,16 @@ struct DecodeModel {
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
     return tqllm::expert_u4h_ids(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
 }
-inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id) {
+inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id, bool tiled) {
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
-                                g_tile_experts);
+                                tiled);
 }
 // The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
 inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
     const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
-    g_tile_experts = false;  // untiled, as in the file: the loader tiles both the same way
     uint64_t off = 0;
     for (int l = 0; l < c.layers; ++l) {
-        const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
+        const auto parts = repack_expert(checkpoint, l, 0, false); uint64_t b = 0;
         for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
         pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
     }
@@ -193,7 +192,7 @@ inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
     for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
         for (int64_t i; (i = next++) < total;) {
             const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+            const auto parts = repack_expert(checkpoint, l, e, false); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
             for (int k = 0; k < 6; ++k) {
                 require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
                 std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();

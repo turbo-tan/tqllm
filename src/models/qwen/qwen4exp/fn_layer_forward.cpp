@@ -153,9 +153,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                hc_rs ? comb : nullptr, hc_rs ? rs->p : nullptr, hc_rs ? cp.dense_device(prefix + "hc_ffn_norm.weight") : nullptr);
     Device<float> logits(size_t(n) * (c.experts + 1)), weights(size_t(n) * c.topk), shared_weights(n);
     Device<int> routed(weights.count);
-    // g_predict_n (4; 6 with adaptive drafts): next-layer prediction (prefetch) for verify blocks of up to N tokens; above 4 the routers
+    // cp.run.predict_n (4; 6 with adaptive drafts): next-layer prediction (prefetch) for verify blocks of up to N tokens; above 4 the routers
     // run unfused (placement only: the output does not change)
-    const int predict_n = g_predict_n;
+    const int predict_n = cp.run.predict_n;
     const bool predict = (!g_hot_map || bool(cp.cold_prefetch)) && prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
     const std::string np = "blk." + std::to_string(layer + 1) + ".";
     std::unique_ptr<Device<float>> nl;
@@ -351,7 +351,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         if (predict) ck(cudaMemcpyAsync(ids_host.p + A, next_ids->p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         static cudaEvent_t ids_ready = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
         static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))  // explicit wins over --exact on
-                                   : g_exact_mode ? 0 : g_small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
+                                   : cp.run.exact ? 0 : cp.run.small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
         g_cpu_owned = cpu_pool != nullptr;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
@@ -405,7 +405,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                                sub = r; }
                 if (sub < 0) sub = e;  // nothing resident in the whole layer: the expert loads as a miss (its CPU row still overwrites it)
                 // at most cpu_max distinct experts per layer call on the CPU, the rest are GPU misses
-                const int cpu_max = g_small_card ? 5 : 1 << 30;  // distinct experts per layer call on the CPU pool
+                const int cpu_max = cp.run.small_card ? 5 : 1 << 30;  // distinct experts per layer call on the CPU pool
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
                 auto [it, fresh] = job_of.try_emplace(e, int(jobs.size()));
                 if (fresh) {

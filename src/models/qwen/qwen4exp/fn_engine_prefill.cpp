@@ -27,7 +27,7 @@ void FlashNextEngine::refill_borrowed() {
     // decode step's bank upload 88 MiB (12 GB, 16K prompt in 2 x 10240): the rest come back as ordinary misses. With slot
     // tiers each refilled bank is sized to what is free (MixedExpertCache choose_cap keeps 256 MB).
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
-    const int done = led->refill(g_small_card ? size_t(512) << 20 : 0); cudaGetLastError();
+    const int done = led->refill(f_.cp->run.small_card ? size_t(512) << 20 : 0); cudaGetLastError();
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     S().model_->pf_refill.clear(); led.reset();
@@ -92,7 +92,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // it until it fits, with the LM heads parked. 24 GB keeps the engine chunk: there the streams already hide under the
     // kernels (nsys 10-19: 25K in 2 x 16K 90.7 % busy, in one chunk 86.3 % and 0.8 s slower).
     constexpr int kMaxChunk = 32768;
-    const int chunk0 = g_tune.chunk_set || !g_small_card ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
+    const int chunk0 = f_.cp->run.tune.chunk_set || !f_.cp->run.small_card ? f_.chunk : std::max(f_.chunk, std::min(kMaxChunk, (P + 1023) / 1024 * 1024));
     int chunk = chunk0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
@@ -104,11 +104,11 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         for (int l = 0; l < c.layers; ++l) if (f_.cache->has_layout(l)) {
             const auto lay = f_.cache->bank_layout(l); size_t blk = 0;
             for (int i = 0; i < 6; ++i) blk += lay.piece[i];
-            sh.expert_block_bytes = std::max(sh.expert_block_bytes, std::max(blk, size_t(lay.block)) + 6 * 256 / std::max(1, g_tune.stage));
+            sh.expert_block_bytes = std::max(sh.expert_block_bytes, std::max(blk, size_t(lay.block)) + 6 * 256 / std::max(1, f_.cp->run.tune.stage));
         }
-        tqllm::PrefillTuning tu; tu.sub = g_tune.sub; tu.stage = g_tune.stage;
-        tu.dense_cache_bytes = dense_half_pool_bytes(); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
-        tu.workspace_bytes = size_t(1024 + std::max(0L, g_tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
+        tqllm::PrefillTuning tu; tu.sub = f_.cp->run.tune.sub; tu.stage = f_.cp->run.tune.stage;
+        tu.dense_cache_bytes = dense_half_pool_bytes(f_.cp->run.tune); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
+        tu.workspace_bytes = size_t(1024 + std::max(0L, f_.cp->run.tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
         // above 128K keep a small margin beyond the plan's own terms (allocator granularity, kernel scratch)
         if (P > 131072) tu.workspace_bytes += size_t(448) << 20;
         int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
@@ -118,11 +118,11 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         auto free_now = [] { return tqllm::device_free_bytes(); };
         std::vector<size_t> bank_bytes; size_t banks_total = 0;
         for (int l : f_.cache->banks_lru()) { bank_bytes.push_back(f_.cache->bank_bytes(l)); banks_total += bank_bytes.back(); }
-        const int block0 = std::clamp(g_tune.sub, 512, 2048);
+        const int block0 = std::clamp(f_.cp->run.tune.sub, 512, 2048);
         int block = block0;
         tqllm::PrefillPlan plan; bool park_tried = false, borrow_all = false;
         for (;;) {
-            tu.chunk = chunk; tu.sub = std::min(g_tune.sub, block); tu.context_bytes = context_term(block);
+            tu.chunk = chunk; tu.sub = std::min(f_.cp->run.tune.sub, block); tu.context_bytes = context_term(block);
             const size_t mtp_room = P > chunk ? f_.mtp_cache->stats().device_bytes : 0;  // a multi-chunk prompt clears the MTP bank first
             arena_req = std::min<size_t>(f_.arena_prefill, tqllm::prefill_arena_bytes(chunk));  // the measured rule at every chunk size
             arena_req += size_t(block) * size_t(checkpoint.attention_heads) * 2052 * 8 + (size_t(64) << 20);  // one block's QSA score scratch + headroom
@@ -136,11 +136,11 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             // small cards release every bank for a multi-chunk prompt: a kept bank grows by its misses during the prompt
             // (slots=auto banks start below their cap) and OOMed at "expert bank upload ... 54 MiB free"; the fit check
             // below still asks whether the plan fits with every bank gone
-            borrow_all = g_small_card && P > chunk && g_tune.borrow == tqllm::BorrowMode::Auto;
-            try { (void) tqllm::banks_to_borrow(plan, bank_bytes, g_tune.borrow, g_tune.borrow_count);
+            borrow_all = f_.cp->run.small_card && P > chunk && f_.cp->run.tune.borrow == tqllm::BorrowMode::Auto;
+            try { (void) tqllm::banks_to_borrow(plan, bank_bytes, f_.cp->run.tune.borrow, f_.cp->run.tune.borrow_count);
                 // small cards: a multi-chunk prompt parks the LM heads (needed only for the first token) in pinned host
                 // memory and plans again with their room (~635 MB: a bigger chunk streams the experts fewer times)
-                if (g_small_card && P > chunk && !park_tried) {
+                if (f_.cp->run.small_card && P > chunk && !park_tried) {
                     park_tried = true; heads_parked = checkpoint.park_heads();
                     if (heads_parked) {  // the freed buffers sit in the async pool until trimmed; the plan reads the device's free memory
                         cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
@@ -185,7 +185,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         ops.free_bytes = free_now;
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
-        const auto ev = tqllm::borrow_banks(*S().ledger_, plan, borrow_all ? tqllm::BorrowMode::All : g_tune.borrow, g_tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
+        const auto ev = tqllm::borrow_banks(*S().ledger_, plan, borrow_all ? tqllm::BorrowMode::All : f_.cp->run.tune.borrow, f_.cp->run.tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
         g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
         S().model_->pf_borrowed.assign(size_t(c.layers), 0);
         for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;

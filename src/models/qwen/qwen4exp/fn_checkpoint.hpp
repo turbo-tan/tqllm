@@ -62,6 +62,7 @@ public:
         return n;
     }
     Qwen4ExpConfig config;
+    FnConfig run;  // this engine's run-time choices (options and load decisions)
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;
     int attention_heads = 0, attention_kvheads = 0, attention_dim = 0, rotary = 0;
@@ -356,7 +357,7 @@ public:
         }
         return ids.empty() ? nullptr : &ids;
     }
-    // conf (optional): the draft's top softmax probability over the draft vocabulary (g_draft_tau)
+    // conf (optional): the draft's top softmax probability over the draft vocabulary (FnConfig::draft_tau)
     int draft_head_argmax_device(const float * rows, int count, float * conf = nullptr) const {
         const auto * ids = draft_vocab();
         if (!ids) { if (conf) *conf = 1.f; return head_argmax_device(rows, count); }
@@ -499,10 +500,10 @@ public:
             }
             // dense FP16 cache (Strata's dense path, --dense-cache-mb): chunks of >= 256 tokens dequantise the weight to fp16 once and run one
             // cuBLAS fp16 tensor-core GEMM (fp32 accumulate); the weight decode is amortised over the whole chunk
-            const int dense_deq = g_tune.dense_cache_mb > 0 ? g_tune.dense_min : 0;
+            const int dense_deq = run.tune.dense_cache_mb > 0 ? run.tune.dense_min : 0;
             if (dense_deq > 0 && tokens >= dense_deq) {
                 __half * whp = nullptr; std::unique_ptr<Device<__half>> wh;
-                if (const size_t pool = dense_half_pool_bytes()) {
+                if (const size_t pool = dense_half_pool_bytes(run.tune)) {
                     int layer = -1; std::sscanf(name.c_str(), "blk.%d.", &layer);
                     if (layer != g_dhc.layer) { g_dhc.used = 0; g_dhc.map.clear(); g_dhc.layer = layer; }
                     if (auto it = g_dhc.map.find(matrix.p); it != g_dhc.map.end()) whp = it->second;

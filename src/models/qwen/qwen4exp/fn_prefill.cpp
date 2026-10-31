@@ -77,7 +77,7 @@ void DecodeModel::release_prefill() {
 }
 
 void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * ple_rows, MixedExpertCache & cache, AttentionState * att_override) {
-    const int sub = std::max(16, g_sub_req > 0 ? std::min(g_tune.sub, g_sub_req) : g_tune.sub), stage_k = std::max(1, g_tune.stage);
+    const int sub = std::max(16, g_sub_req > 0 ? std::min(cp.run.tune.sub, g_sub_req) : cp.run.tune.sub), stage_k = std::max(1, cp.run.tune.stage);
     const int K = c.topk, A = n * K, E = c.experts, ff = c.expert_ff;
     auto & st = stage();
     if (!st.copy || st.K != stage_k) {  // staging banks sized for the largest expert block of any layer
@@ -204,7 +204,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
                         const __nv_bfloat16 * gate = nullptr, __half * act = nullptr, int fmt_override = -1) {
         const int id = fmt_override >= 0 ? fmt_override : mm.fmt->u4h_id();
         if (!tqllm_cuda::mmq_supports(id, mm.cols)) return false;
-        const bool ok = tqllm_cuda::mmq_expert_gemm(id, static_cast<const uint8_t *>(mm.p), mm.aux, fmt_override < 0 && g_tile_experts && tqllm_cuda::tiled_block_bytes(id),
+        const bool ok = tqllm_cuda::mmq_expert_gemm(id, static_cast<const uint8_t *>(mm.p), mm.aux, fmt_override < 0 && cp.run.tile_experts && tqllm_cuda::tiled_block_bytes(id),
                                            rows, mm.cols, pf_idx->p + ps.at, st.idx_host + ps.at, pf_idx->p + ps.at + ps.W, ps.cap, ps.W,
                                            div, yq, ny, y, pf_tiles->p, int(pf_tiles->count), nullptr, gate, act);
         // TQLLM_DEBUG=pf_mmq_check:N: up to N MMQ GEMMs against the fp16 grouped kernel on the same pass, the first of each
@@ -225,7 +225,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
                 for (int r = 0; r < rows; ++r) { const double u = __bfloat162float(a[o + r]), v = __bfloat162float(b[o + r]); num += (u - v) * (u - v); den += v * v; }
             }
             std::fprintf(stderr, "MMQ_CHECK layer %d fmt %d rows %d k %d tiled %d slots %d cols %zu: rel L2 %.4g\n", layer, id, rows, mm.cols,
-                         int(g_tile_experts && tqllm_cuda::tiled_block_bytes(id)), ps.W, cols, std::sqrt(num / std::max(den, 1e-30)));
+                         int(cp.run.tile_experts && tqllm_cuda::tiled_block_bytes(id)), ps.W, cols, std::sqrt(num / std::max(den, 1e-30)));
         }
         return ok;
     };

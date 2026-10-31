@@ -61,7 +61,7 @@ class FlashNextEngine final : public tqllm::Engine {
     // sample, so the output follows the target exactly (greedy drafts just lower the acceptance)
     std::vector<int> pick(const float * rows, int n);
 public:
-    FlashNextEngine(const std::string & manifest, uint32_t context, int nslots);
+    FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options);
     // TQLLM_DEBUG=mem: where the device memory is (MiB); "other" = KV, QSA keys, recurrent state, CUDA context
     void ledger(const char * at) const;
     // borrowed banks back, filled with the prompt's most-routed experts (Strata does the same)
