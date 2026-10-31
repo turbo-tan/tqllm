@@ -324,7 +324,9 @@ bool MlxQwen35Engine::spec_advance() {
 bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
     auto& i = *impl_;
     constexpr int kPositions = 15;
+    const auto t0 = Clock::now();
     auto lattice = i.drafter->draft_lattice(i.pending, pos, kPositions);
+    const auto t1 = Clock::now();
     const tqllm::DraftLattice view{lattice.positions, lattice.topk, lattice.rank, lattice.tokens.data(), lattice.unary.data(),
         lattice.gate.data(), lattice.successor.data(),
         [](void* context, uint32_t token) {return static_cast<const DFlash2::HostLattice*>(context)->predecessor_row(token);},
@@ -337,9 +339,13 @@ bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
         parents.push_back(tree.parents[r] < 0 ? 0 : tree.parents[r] + 1);
     }
     const int n = int(ids.size());
+    const auto t2 = Clock::now();
     Qwen35::Verification ticket;
     auto choices = mx::argmax(i.engine->verify_tree_device(mx::array(ids.data(), {n}, mx::uint32), parents, ticket), -1);
     mx::eval(choices);
+    const auto t3 = Clock::now();
+    auto ms = [](Clock::time_point a, Clock::time_point b) {return std::chrono::duration<double, std::milli>(b - a).count();};
+    // the per-request host line's fields in tree steps: build = draft + lattice readback, submit = selector, wait = verify
     const uint32_t* target = choices.data<uint32_t>();
     std::vector<int32_t> path{0};
     for (int cur = 0;;) {
@@ -359,6 +365,7 @@ bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
     i.pending = bonus;
     i.engine->accept_path(ticket, path);
     i.drafter->inject(i.engine->feature_states(), pos);
+    i.h_build += ms(t0, t1); i.h_submit += ms(t1, t2); i.h_wait += ms(t2, t3); i.h_post += ms(t3, Clock::now());
     if (!i.done) i.done = i.output.size() >= limit || i.output.back() == i.eos;
     return !i.done;
 }

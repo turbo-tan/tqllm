@@ -1226,6 +1226,9 @@ void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& r
                 a=mx::slice_update(a,moved,{0,0,s->start,0},{1,a.shape(1),s->start+count,a.shape(3)});
             }
             c.kv_len=s->start+count;
+            // run the moves now on this thread's stream: the KV buffers outlive the request, and a later request may run
+            // on another thread (MLX streams are per thread)
+            mx::async_eval({*i.kv_keys[l],*i.kv_values[l]});
         } else {
             if(!tape.conv_rows || !tape.deltas)throw std::invalid_argument("tree path accept needs the fused GDN step tape");
             auto joined=mx::concatenate({*tape.conv_prev,mx::take(*tape.conv_rows,index,0)},0);
