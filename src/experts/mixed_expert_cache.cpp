@@ -1,4 +1,5 @@
 #include "tq3_expert_cache.hpp"
+#include "expert_bank_plan.hpp"
 #include "moe_kernels.cuh"
 #include "debug.hpp"
 #include "device_free_cuda.hpp"
@@ -12,6 +13,10 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <stdexcept>
+#include <atomic>
+#include <exception>
+#include <thread>
+#include <mutex>
 // TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
 static inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); return !v || (v[0] && v[0] != '0'); }
 
@@ -140,28 +145,35 @@ struct MixedExpertCache::State {
     }
     const void * upload(const void * host, size_t bytes, std::vector<Allocation> & owned, int protect) {
         if (!bytes || bytes > budget) throw std::invalid_argument("mixed cache: upload exceeds budget");
+        // over budget or out of device memory, the victim is the most recently used other bank: layers run in a fixed
+        // cycle, so the least recently used one is the next needed (every layer then evicted the next: all misses)
         while (live > budget - bytes) {
             auto victim = banks.end();
             for (auto it = banks.begin(); it != banks.end(); ++it)
-                if (it->first != protect && (victim == banks.end() || it->second->touched < victim->second->touched)) victim = it;
+                if (it->first != protect && (victim == banks.end() || it->second->touched > victim->second->touched)) victim = it;
             if (victim == banks.end()) throw std::invalid_argument("mixed cache: bank plus loader staging exceeds budget");
             for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
-            banks.erase(victim);
+            ++counters.bank_drops; ++counters.drops_budget; banks.erase(victim);
         }
         void * p = nullptr;
         // + a tail: the MMQ kernels read the last row up to a multiple of 512 columns (ggml pads quantized matrices so).
-        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts the least
-        // recently used bank and tries again, so the bank count follows the free memory instead of failing the request
+        // The device can be fuller than at start-up (a long context's attention state): a failed allocation evicts a bank
+        // the same way and tries again, so the bank count follows the free memory instead of failing the request
         cudaError_t e = cudaMalloc(&p, bytes + (size_t(64) << 10));
         while (e == cudaErrorMemoryAllocation) {
             cudaGetLastError();
             auto victim = banks.end();
             for (auto it = banks.begin(); it != banks.end(); ++it)
-                if (it->first != protect && (victim == banks.end() || it->second->touched < victim->second->touched)) victim = it;
+                if (it->first != protect && (victim == banks.end() || it->second->touched > victim->second->touched)) victim = it;
             if (victim == banks.end()) break;
             for (int id : victim->second->ids) if (id >= 0) ++counters.evictions;
             if (active == victim->first) active = -1;
-            banks.erase(victim);
+            if (tqllm::debug_on("mem") && counters.drops_oom < 8) {
+                size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+                std::fprintf(stderr, "CACHE oom: %.1f MB for layer %d failed with %.0f MB free, dropping layer %d's bank\n",
+                             bytes / 1048576.0, protect, fr / 1048576.0, victim->first);
+            }
+            ++counters.bank_drops; ++counters.drops_oom; banks.erase(victim);
             e = cudaMalloc(&p, bytes + (size_t(64) << 10));
         }
         if (e != cudaSuccess) {
@@ -301,7 +313,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         for (const auto & [id, payload] : incoming) for (int p = 0; p < 3; ++p)
             if (payload[p].type != first[p].type) throw std::invalid_argument("mixed cache: types vary within a layer projection");
         s.active = -1;
-        auto created = s.create(layer, first); bank = created.get(); s.banks.emplace(layer, std::move(created));
+        auto created = s.create(layer, first); bank = created.get(); s.banks.emplace(layer, std::move(created)); ++s.counters.bank_builds;
         if (s.prepacked && s.registered) s.grow_pf(kPfBatch * State::expert_bytes(*bank));
     }
     s.active = -1;
@@ -336,6 +348,48 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     bool dma_issued = false;
     size_t offset = 0;
     size_t read_at = 0;
+    // Misses that need the loader (a format conversion) are converted on worker threads first, each into its own slice of
+    // the staging buffer, in the order the loop below uploads them: one thread faulting in and repacking one expert after
+    // another was the whole miss cost (GLM-5.3 on a GB10: ~0.3 GB/s).
+    struct Repacked { std::array<const void *, 3> p{}, aux{}; };
+    std::vector<Repacked> repacked;
+    size_t per_expert = 0;
+    if (!incoming.empty()) for (int p = 0; p < 3; ++p) per_expert += bank->stride[p] + bank->aux_stride[p];
+    bool all_loader = !stream_payloads && !s.staged_misses && incoming.size() > 1;
+    if (all_loader && s.prepacked) for (const auto & item : incoming) if (s.prepacked(layer, item.first)) { all_loader = false; break; }
+    if (all_loader) {
+        idle_host();
+        repacked.resize(incoming.size());
+        std::atomic<size_t> next{0}; std::exception_ptr error; std::mutex error_mutex;
+        auto work = [&] {
+            for (size_t k; (k = next++) < incoming.size();) {
+                try {
+                    size_t at = k * per_expert;
+                    const size_t end = at + per_expert;
+                    for (int p = 0; p < 3; ++p) {
+                        const int cols = p == 2 ? s.ff : s.hidden, rows = p == 2 ? s.hidden : s.ff;
+                        Upload stage = [&](const void * data, size_t bytes) {
+                            if (at + bytes > end) throw std::invalid_argument("mixed cache: repacked expert larger than its slot");
+                            std::memcpy(s.staging + at, data, bytes); const void * where = s.staging + at; at += bytes; return where;
+                        };
+                        const auto & payload = incoming[k].second[p];
+                        const auto m = weight_format(payload.type)->load(
+                            std::vector<char>(payload.bytes.data, payload.bytes.data + payload.bytes.size), rows, cols, stage, nullptr);
+                        if (m.fmt != bank->matrices[p].fmt || m.type != bank->matrices[p].type)
+                            throw std::invalid_argument("mixed cache: per-expert runtime format changed");
+                        repacked[k].p[size_t(p)] = m.p; repacked[k].aux[size_t(p)] = m.aux;
+                    }
+                } catch (...) { std::lock_guard<std::mutex> lock(error_mutex); if (!error) error = std::current_exception(); }
+            }
+        };
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const size_t workers = std::min<size_t>(incoming.size(), std::min(16u, std::max(1u, hw / 2)));
+        std::vector<std::thread> pool;
+        for (size_t t = 1; t < workers; ++t) pool.emplace_back(work);
+        work();
+        for (auto & t : pool) t.join();
+        if (error) std::rethrow_exception(error);
+    }
     try {
     for (auto & [id, payload] : incoming) {
         if (stream_payloads) {
@@ -370,13 +424,13 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
                 checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], packed_src + off, bank->stride[p], cudaMemcpyHostToDevice, up));
-                off += bank->stride[p];
+                off += bank->stride[p]; ++s.counters.miss_copies;
                 if (bank->aux_stride[p]) {
                     checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(d.aux)) + size_t(target) * bank->aux_stride[p], packed_src + off, bank->aux_stride[p], cudaMemcpyHostToDevice, up));
-                    off += bank->aux_stride[p];
+                    off += bank->aux_stride[p]; ++s.counters.miss_copies;
                 }
             }
-            s.counters.transfer_bytes += off; dma_issued = true;
+            s.counters.transfer_bytes += off; s.counters.miss_copy_bytes += off; dma_issued = true;
         } else if (packed_src && s.registered) {
             // Kernel reads straight from pinned host memory: demand misses skip the H2D DMA queue behind prefetches.
             size_t off = 0;
@@ -414,6 +468,20 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
                 std::memcpy(s.staging + offset, data, bytes); const void * at = s.staging + offset;
                 offset += bytes; pieces.push_back({at, bytes}); return at;
             };
+            if (!repacked.empty()) {
+                const auto & r = repacked[size_t(reinterpret_cast<const char *>(&id) - reinterpret_cast<const char *>(&incoming.front().first)) / sizeof(incoming.front())];
+                const auto & destination = bank->matrices[p];
+                checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(destination.p)) + size_t(target) * bank->stride[p],
+                                        r.p[size_t(p)], bank->stride[p], cudaMemcpyHostToDevice, s.stream));
+                s.counters.transfer_bytes += bank->stride[p];
+                if (bank->aux_stride[p]) {
+                    checked(cudaMemcpyAsync(static_cast<char *>(const_cast<void *>(destination.aux)) + size_t(target) * bank->aux_stride[p],
+                                            r.aux[size_t(p)], bank->aux_stride[p], cudaMemcpyHostToDevice, s.stream));
+                    s.counters.transfer_bytes += bank->aux_stride[p];
+                }
+                offset += bank->stride[p] + bank->aux_stride[p];
+                continue;
+            }
             if (s.staged_misses) {
                 const auto & destination = bank->matrices[p];
                 std::memcpy(s.staging + offset, payload[p].bytes.data, bank->stride[p]);
@@ -473,7 +541,8 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
 bool MixedExpertCache::prefetch_released(int layer, const std::vector<int> & ids, cudaStream_t copy) {
     auto & s = *state_;
     if (!s.prepacked || !s.registered || layer < 0 || layer >= s.layers || layer == s.active) return false;
-    auto it = s.banks.find(layer); if (it == s.banks.end() || !it->second->used) return false;
+    auto it = s.banks.find(layer);
+    if (it == s.banks.end() || !it->second->used) return false;
     prefetch_impl(layer, ids, copy, true); return true;
 }
 void MixedExpertCache::prefetch(int layer, const std::vector<int> & ids, cudaStream_t copy) { prefetch_impl(layer, ids, copy, false); }
@@ -535,6 +604,7 @@ void MixedExpertCache::prefetch_impl(int layer, const std::vector<int> & ids, cu
             if (staged == kCap) flush();
             char * stage = s.pf_staging + size_t(staged) * total;
             checked(cudaMemcpyAsync(stage, src, total, cudaMemcpyHostToDevice, copy));  // the expert's packed block in one DMA
+            s.counters.pf_copy_bytes += total;
             for (int p = 0; p < 3; ++p) {
                 const auto & d = bank->matrices[p];
                 items.push_back({stage + off, static_cast<char *>(const_cast<void *>(d.p)) + size_t(target) * bank->stride[p], bank->stride[p]});
@@ -612,15 +682,20 @@ int MixedExpertCache::plan_slots(int layer) {
 int MixedExpertCache::regrow(size_t keep_free) {
     auto & s = *state_; if (s.layer_target.empty()) return 0;
     int n = 0;
-    size_t reserved = 0;  // the full banks the released layers rebuild: their freed slots show as free memory but are spoken for
+    // a bank below its target is rebuilt at the target now, with the experts it held: releasing it for a later prepare
+    // let the bank refill take the freed memory first, and decode then built those layers' banks by evicting others
     for (int l = 0; l < s.layers; ++l) {
         const auto it = s.banks.find(l);
         if (it == s.banks.end() || it->second->cap >= s.layer_target[size_t(l)]) continue;
         size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
         const size_t grow = size_t(s.layer_target[size_t(l)] - it->second->cap) * s.slot_bytes(l);
-        if (fr < keep_free + reserved + grow) break;
-        reserved += size_t(s.layer_target[size_t(l)]) * s.slot_bytes(l);
-        release_bank(l); ++n;  // rebuilt at its target by the next prepare (choose_cap)
+        if (fr < keep_free + grow) break;
+        std::vector<int> held; for (int id : it->second->ids) if (id >= 0) held.push_back(id);
+        release_bank(l); ++n;
+        s.layer_cap[size_t(l)] = s.layer_target[size_t(l)];
+        if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
+        s.planned[size_t(l)] = 1;  // built at the target, not sized again by choose_cap
+        if (!held.empty()) { (void) prepare(l, held); wait_misses(); }
     }
     return n;
 }
@@ -689,7 +764,7 @@ std::vector<int> MixedExpertCache::evict_until_free(size_t want, int protect) {
         if (victim == s.banks.end()) break;
         for (int id : victim->second->ids) if (id >= 0) ++s.counters.evictions;
         if (s.active == victim->first) s.active = -1;
-        out.push_back(victim->first); s.banks.erase(victim);
+        out.push_back(victim->first); ++s.counters.bank_drops; s.banks.erase(victim);
     }
     return out;
 }
@@ -710,11 +785,24 @@ void MixedExpertCache::release_bank(int layer) {
     s.wait_misses_impl(); checked(cudaDeviceSynchronize());  // no kernel or copy may still use the bank
     for (int id : it->second->ids) if (id >= 0) ++s.counters.evictions;
     if (s.active == layer) s.active = -1;
-    s.banks.erase(it);
+    ++s.counters.bank_drops; s.banks.erase(it);
 }
 void MixedExpertCache::reset_usage() { auto & s = *state_; std::fill(s.frequency.begin(), s.frequency.end(), 0); }
 void MixedExpertCache::add_device_counters(uint64_t hits, uint64_t misses, uint64_t prefetched, uint64_t bytes) {
     auto & s = *state_; s.counters.hits += hits; s.counters.misses += misses; s.counters.transfer_bytes += bytes; s.prefetch_count += prefetched;
+}
+// Per-layer slots fitted for this model (see expert_bank_plan.hpp): the environment wins over the file beside the packed
+// experts; counts fitted for another slot count are scaled to keep the same total.
+void apply_layer_slots(MixedExpertCache & cache, const std::string & experts_path, int slots, const char * env) {
+    const char * v = env ? std::getenv(env) : nullptr;
+    const bool from_env = v && *v;
+    const std::string line = layer_slots_text(env, experts_path);
+    if (line.empty()) return;
+    const auto caps = parse_layer_slots(line, slots, cache.experts());
+    if (caps.empty()) return;
+    cache.set_layer_slots(caps);
+    std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(),
+                (from_env ? env : experts_path + ".slots").c_str());
 }
 uint64_t MixedExpertCache::clock() const { return state_->clock; }
 void MixedExpertCache::set_clock(uint64_t c) { state_->clock = c; }

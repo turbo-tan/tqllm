@@ -69,6 +69,10 @@ struct WeightFormat {
                         int topk, cudaStream_t) const;
     // FP16 [rows][cols] in basis(), for the cuBLAS prefill GEMM.
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
+    // int8 prefill without an FP16 round trip: weights quantised straight to int8 [rows][cols] (row-major) plus the
+    // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
+    // dequant_h + per-chunk quantise path (the default for every format).
+    virtual bool dequant_i8(const Mat &, int8_t * w8, float * row_scale, cudaStream_t) const { return false; }
     // Device bytes per row of the data / aux arrays when rows are stored contiguously (a row range is then a Mat of its
     // own: p + r0 * row_bytes, aux + r0 * aux_row_bytes); 0 = not row-sliceable.
     virtual size_t row_bytes(int /*cols*/) const { return 0; }
@@ -78,6 +82,9 @@ struct WeightFormat {
     virtual bool has_gemm() const { return fused_gemm_cols() > 0; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
     // y [n][rows] F32 through the u4h-family GEMM (weights read once per 64 columns); false: no GEMM for this format
     bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;
+    // u4h kernel family id with an F32-output GEMM (u4h_family_gemm_f32), including the UD types that are not u4h_id()
+    // formats (gemm_f32 above keeps u4h_id(), so engines that call it are unchanged)
+    virtual int gemm_f32_id() const { return u4h_id(); }
     bool gemm_i8_f32(const Mat & m, const int8_t * xq, const float * xs, const int16_t * xsum, float * y, int n, cudaStream_t s, int mode) const;
     // gemm() also replaces the dequant + cuBLAS prefill up to this many columns (0: only below the cuBLAS threshold).
     virtual int fused_gemm_cols() const { return 0; }

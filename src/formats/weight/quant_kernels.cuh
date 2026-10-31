@@ -32,7 +32,7 @@ void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const _
 // input row (mmq_quantize_act: rows 0..rows-1; _rows: a pass's groups only); the GEMM reads slot z's columns
 // groups[z cap + j] (j < counts[z]), input row groups[] / div, writes y[groups[] * rows + r] (bf16).
 size_t mmq_act_bytes(int rows, int k);
-void mmq_quantize_act(const __half * x, int rows, int k, void * yq, cudaStream_t);
+void mmq_quantize_act(const __half * x, int rows, int k, void * yq, cudaStream_t, bool ds4 = false);  // ds4: IQ1_S's scale + sum layout
 void mmq_quantize_act_rows(const __half * x, int rows, int k, const int * rows_of, const int * counts, int cap, int slots, void * yq, cudaStream_t);
 int mmq_max_tiles(int cap, int slots);
 size_t mmq_warm();  // load the MMQ kernels now; returns the device bytes it cost
@@ -308,4 +308,7 @@ void bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t);
 void fp_matvec(bool bf16, const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t,
                int ldy = 0);  // ldy: output column stride (0 = rows)
 void fp_dequant_h(bool bf16, const void * w, __half * out, size_t n, cudaStream_t);
+// MXFP8: rows of k E4M3 bytes then the row's k / 32 E8M0 scales (k % 512 == 0); ldy 0 = rows
+void mxfp8_matvec(const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t, int ldy);
+void mxfp8_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t);
 } // namespace tqllm_cuda

@@ -61,6 +61,8 @@ updates. See [installation and requirements](docs/guides/quickstart.md).
 | You want to... | Read |
 |---|---|
 | Download a model and add a drafter | [DFlash2 and MTP](docs/guides/speculative-decoding.md) |
+| Run MiniMax-M3.1-Flash or GLM-5.3-Flash on a DGX Spark / GB10 | [Big MoE models on one GB10](docs/guides/gb10-big-moe.md) |
+| Run on an RTX 5090 (numbers, what is automatic) | [RTX 5090](docs/guides/rtx-5090.md) |
 | Use a local coding agent | [Agent setup](docs/guides/coding-agents.md) |
 | Serve several users or tune memory | [Server options](docs/reference/options.md) |
 | Run a longer context | [TqCache](docs/guides/long-context.md) |
@@ -73,7 +75,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and contribution
 requirements, and [the architecture guide](docs/ARCHITECTURE.md) for the source map.
 
 Built on work from Qwen, ggml/llama.cpp, Google Research, z-lab, Tom Turney,
-spiritbuun and the contributors listed in [Credits](docs/CREDITS.md).
+spiritbuun, turboderp ([ExLlamaV3](https://github.com/turboderp-org/exllamav3): the trellis format and kernels behind
+X3 and our EXL3 support) and the contributors listed in [Credits](docs/CREDITS.md).
 Third-party notices remain in [NOTICE](NOTICE). Thank you to our community testers.
 
 tqLLM is Apache-2.0 licensed. Model weights and third-party components retain

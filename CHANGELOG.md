@@ -3,6 +3,68 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- MiniMax-M3.1-Flash from the EXL3 2.15 bpw pack (Hugging Face folder, no conversion) on one GB10 / DGX Spark, with the
+  DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
+  when the context needs it, and a draft length that follows the measured acceptance. Prefill 537 tok/s on an 8K prompt
+  at 16K context, 492 tok/s at 32K.
+- GLM-5.3-Flash (GSQ GGUF): sparse attention with the DSA indexer, contexts up to 128K on a GB10, prompt chunks of
+  512 tokens (prefill ~100 tok/s), end-of-turn stop and reasoning split.
+- Hugging Face checkpoint folders served in place (`--model FOLDER`): safetensors shards, tokenizer and chat template read
+  as published, no conversion and no second copy on disk. Encodings: EXL3 trellis, MXFP8, BF16 / F16 / F32.
+- Guide: [MiniMax-M3.1-Flash and GLM-5.3-Flash on one GB10](docs/guides/gb10-big-moe.md).
+- Guide: [RTX 5090](docs/guides/rtx-5090.md): Flash-Next and Qwen3.8-27B numbers and what the engine sizes by itself.
+
+### Changed
+- Flash-Next decode launches its per-layer kernels directly on Blackwell PCIe cards (RTX 5090, `sm_120`) and keeps CUDA
+  graphs on unified-memory GPUs (GB10 / DGX Spark, +5-6 % decode) and older PCIe cards (RTX 3090: -3 % chat without them).
+  RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s. Output identical.
+- Flash-Next: an expert bank lent to a long prompt's prefill comes back with the experts it held before the prompt
+  (64K context on an RTX 5090: +3 % decode).
+- Flash-Next keeps the K/V of a long context in host memory by default on discrete GPUs with virtual memory management
+  (RTX 30 / 40 / 50; the last 32K positions stay on the GPU): 256K context on an RTX 3090 decodes at 65-69 instead of
+  52-56 tok/s, up to 128K unchanged. Off on unified-memory GPUs (GB10 / DGX Spark). `TQFN_KV_HOST=0` / `1` forces it.
+
+### Fixed
+- Flash-Next on GB10 / DGX Spark no longer pins host memory for long-prompt residuals at start-up (on unified memory it
+  took 6.6 GB of the memory the expert banks need and left 759 MB free).
+- The approximate tail skip (`TQFN_TAIL_SKIP=R`, opt-in) applies to verify blocks of any size (it stopped at 4 tokens).
+- System memory is the machine's RAM capped by the container limit (cgroup `memory.max`): in a Docker / cloud container
+  with less memory than the host, Flash-Next no longer pins an expert pack sized for the host (a 5090 pod reported 944 GB
+  of host RAM with a 117 GB limit and kept hitting the limit while loading).
+- Expert cache on a full device: a bank that does not fit evicts the most recently used other bank, not the least
+  recently used one. Layers run in a fixed cycle, so the old victim was always the next layer needed and every layer
+  evicted the next (3090, 128K, larger expert banks: 0.5 % hits and 5 tok/s -> 77 % and 27.7 tok/s).
+- Expert cache over its own budget picks the victim the same way (most recent other bank), and `regrow` after a long
+  prompt rebuilds each bank at its target in place with the experts it held instead of releasing it (the refill took the
+  freed memory first and decode then built those banks by evicting others). RTX 3090, 128K, 109 GB cap: 69-71 -> 77-78
+  tok/s on a repeat request, zero bank rebuilds during decode.
+- Flash-Next with `TQFN_KV_HOST=1`: each attention layer keeps the host K/V rows it read recently in a 16K-row device cache
+  (consecutive steps select mostly the same positions); a new request starts with an empty cache. RTX 3090, 128K, 109 GB
+  cap: 76-78 -> 82 tok/s on a repeat request, output identical.
+- Flash-Next verify blocks of 5-8 tokens (the default up to 5 drafts) read each BF16 weight matrix once: the BF16 GEMVs and
+  the fused router launch take up to 8 tokens (were 4, so a 6-token block read every BF16 matrix twice). Bit-identical
+  (tests: bf16_gemv token grouping, gemv_seg and topk2 to 8 tokens). RTX 3090 128K repeat request 82 -> 83-84 tok/s.
+- Flash-Next pins the multi-chunk prefill's residual buffer once at start-up when the host easily holds it (a tenth of RAM,
+  a quarter of what is available) instead of inside the first request of each new prompt length: RTX 3090 prefill
+  32K / 64K / 128K 2,104 / 2,130 / 2,026 -> 2,197 / 2,251 / 2,133 tok/s (as 1.2.3), 128K time to first token 77 -> 73 s.
+- Flash-Next keeps K/V older than 32K positions in host memory by default on discrete GPUs (`TQFN_KV_HOST` auto; GB10
+  keeps it on the device; `TQFN_KV_HOST=0` turns it off). RTX 3090 decode at 256K 52-56 -> 65-71 tok/s, 128K first request
+  69 -> 75-77; contexts up to 64K move nothing (unchanged).
+- Decode memory ledger (`TQLLM_DEBUG=mem`): bank builds and drops per request, by cause.
+- Tests carry a ctest label: `gpu` tests run locally (`ctest -L gpu`), `cpu` tests run in CI (CONTRIBUTING.md).
+- Flash-Next with `TQFN_KV_HOST=1`: decode copies only the attention-selected K/V rows from host memory into a compact
+  device buffer instead of reading every old position over PCIe, and the expert banks grow back into the VRAM the
+  host KV frees. RTX 3090 at 128K with a 109 GB RAM limit: 70.7 tok/s against 68 with all K/V on the device, output identical
+  (the old path read every position over PCIe: 14-19 tok/s on a 5090).
+- Qwen3.5 / 3.8 TQ4 files (e.g. Qwen3.8-27B TQ_L): the Gated DeltaNet [b|a] rows and the MoE router read the rotated
+  activation again. Builds after 1.2.3 fed them an un-rotated copy meant only for hub TQ3_4S files, and greedy decode
+  could loop (40-question MMLU-Pro subset 23/40 -> 36/40). Released 1.2.x builds were not affected.
+- MiniMax raw completions start with the model's beginning-of-document token (without it the first tokens degenerate).
+- Builds with GCC 12 (Ubuntu 22.04), test fixes for x86 builds and GPU stream ordering in the test suite.
+
 ## 1.2.3 (2026-10-22)
 
 ### Fixed

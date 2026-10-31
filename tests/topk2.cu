@@ -1,5 +1,5 @@
 // moe_topk2 (this layer's and the predicted next layer's routing in one launch) must equal two moe_topk calls bit for
-// bit: ids, weights and shared-expert gates, for 256 / 512 / 1024 experts, top-10, 1..4 tokens.
+// bit: ids, weights and shared-expert gates, for 256 / 512 / 1024 experts, top-10, 1..8 tokens.
 #include "moe_kernels.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -10,7 +10,7 @@
 static void check(cudaError_t x) { if (x != cudaSuccess) throw std::runtime_error(cudaGetErrorString(x)); }
 int main() {
     bool ok = true; const int k = 10;
-    for (int e : {256, 512, 1024}) for (int n = 1; n <= 4; ++n) {
+    for (int e : {256, 512, 1024}) for (int n = 1; n <= 8; ++n) {  // up to a 6-token verify block and past it
         std::mt19937 rng(e + n); std::normal_distribution<float> nd(0.f, 2.f);
         std::vector<float> l1(size_t(n) * (e + 1)), l2(l1.size());
         for (auto & v : l1) v = nd(rng);

@@ -45,7 +45,11 @@ struct MappedGguf::Mapping {
     }
 };
 MappedGguf::MappedGguf(const std::string & path, GgufDialect dialect)
-    : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open(path, dialect)) {}
+    : mapping_(std::make_unique<Mapping>(path)), file_(gguf_open_shard(path, dialect)) {}
+MappedGguf::MappedGguf(const std::string & path, Raw) : mapping_(std::make_unique<Mapping>(path)) { file_.path = path; }
+std::unique_ptr<MappedGguf> MappedGguf::raw(const std::string & path) {
+    return std::unique_ptr<MappedGguf>(new MappedGguf(path, Raw{}));
+}
 MappedGguf::~MappedGguf() = default;
 void MappedGguf::release_tensor(const std::string & name) const {
 #ifndef _WIN32

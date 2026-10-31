@@ -14,8 +14,14 @@ class MappedGguf {
     std::unique_ptr<Mapping> mapping_;
     GgufFile file_;
     GgufBytes checked(const GgufTensor &) const;
+    struct Raw {};
+    MappedGguf(const std::string & path, Raw);
 public:
     explicit MappedGguf(const std::string & path, GgufDialect dialect = GgufDialect::Native);
+    // A file mapped without a GGUF header (an EXL3 folder's safetensors shard): only view() is meaningful.
+    static std::unique_ptr<MappedGguf> raw(const std::string & path);
+    // The bytes of a tensor whose offset / size are given by the caller's GgufFile (any file layout).
+    GgufBytes view(const GgufTensor & t) const { return checked(t); }
     ~MappedGguf();
     MappedGguf(const MappedGguf &) = delete;
     MappedGguf & operator=(const MappedGguf &) = delete;

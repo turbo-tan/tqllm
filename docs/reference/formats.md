@@ -4,6 +4,8 @@
 
 ## TQ formats: TQ3_4S, TQ3 and TQ4
 
+Illustrated version with bit layouts and quality charts: [formats.html](formats.html).
+
 All three rotate the weights before quantising (the TurboQuant idea: a rotation spreads outliers so a small codebook fits
 every block), then store codes plus scales. They differ in block size, scales and where they run:
 

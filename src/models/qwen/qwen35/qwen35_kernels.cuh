@@ -146,10 +146,13 @@ void rms_rope_multi(const __nv_bfloat16 * x, int xts, int xrs, const float * w, 
 // DFlash retrieval window: scores 16-token far chunks (positions < pos - recent) against the anchor query, keeps the top
 // `chunks` per KV head, and builds a contiguous scratch K/V [R retrieved (re-rotated) | recent | nq]; returns R (or -1
 // when there is no far context). Attend the scratch with query position R + recent and window R + recent + nq.
-// score: kvheads x 4096 floats, sel: kvheads x min(chunks, 128) ints, sk / sv: (128 x 16 + recent + nq) x kd.
+// Only the newest kDflRetrMaxChunks chunks are scored, so kc / vc may be a ring (position p at row p % ring, ring a
+// multiple of kDflRetrChunk; 0 = full context) that holds kDflRetrMaxChunks x kDflRetrChunk + recent + nq positions.
+// score: kvheads x kDflRetrMaxChunks floats, sel: kvheads x min(chunks, 128) ints, sk / sv: (128 x 16 + recent + nq) x kd.
+constexpr int kDflRetrChunk = 16, kDflRetrMaxChunks = 4096;
 int dflash_retrieve_build(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, int kd, int heads,
                           int kvheads, int pos, int nq, int recent, int chunks, float theta, float * score, int * sel,
-                          __nv_bfloat16 * sk, __nv_bfloat16 * sv, cudaStream_t s);
+                          __nv_bfloat16 * sk, __nv_bfloat16 * sv, cudaStream_t s, int ring = 0);
 void rope_partial_multi(__nv_bfloat16 * x, int ts, int n, int heads, int dim, int rot, const int * dpos0, float theta,
                         cudaStream_t, const int * dep = nullptr, const int * mpos = nullptr, int3 sec = {0, 0, 0});
 // KV cache write for n tokens at positions pos0 + i; k/v of token i at k0/v0 + i * ts. ring > 0: slot = pos % ring.

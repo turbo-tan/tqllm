@@ -29,11 +29,12 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                    const PrefillSink * sink, bool plain) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
     // The part of a decode / verify step before the routing readback (PLE, norms, mixer, attention or GDN core, routers,
-    // top-k) is captured into a CUDA graph each step, updated in place and launched: the GPU runs ~45 small kernels back to
-    // back without launch gaps and capturing costs the host less than launching (3090 chat +2.5 %, text identical). One
-    // sequence only (the multi-slot path interleaves per-sequence state); PCIe GPUs only until gated on a GB10.
-    static const bool graph_on = [] { int dev = 0, on = 0; cudaGetDevice(&dev);
-        return !(cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on); }();
+    // top-k) is captured into a CUDA graph each step, updated in place and launched (layer_graphs: unified memory and PCIe
+    // cards before Blackwell; text identical either way). One sequence only (the multi-slot path interleaves per-sequence state).
+    static const bool graph_on = [] { int dev = 0, on = 0, major = 0; cudaGetDevice(&dev);
+        const bool unified = cudaDeviceGetAttribute(&on, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && on;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return tqllm::flashnext::layer_graphs(unified, major); }();  // decode_rules.hpp
     // Every step updates all kernel parameters (weights included), so layers of one kind share an exec, keyed by its
     // topology: the node count changes with the position in attention layers and with the draft in the MTP layer.
     // One exec per layer and variant (~11 x 49) held ~1.3 GB the expert banks had taken (out of memory on a 3090).
@@ -162,7 +163,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // arithmetic: test-gemv-seg, test-topk2; +2.7 % 3090 5-chat at --slots 168)
     auto is_bf16 = [&](const std::string & pre) { return cp.file(pre + "ffn_gate_inp.weight").file().tensors.at(pre + "ffn_gate_inp.weight").type == GGML_BF16; };
     static const bool f32_router = std::getenv("TQFN_F32_ROUTER") != nullptr;
-    const bool fused = !f32_router && n <= 4 && c.experts <= 1024 && h >= 1024 && is_bf16(prefix) && (!predict || is_bf16(np));
+    const bool fused = !f32_router && n <= 8 && c.experts <= 1024 && h >= 1024 && is_bf16(prefix) && (!predict || is_bf16(np));
     if (fused) {
         tqllm_cuda::GemvSegs g; int rows = 0;
         auto add = [&](const std::string & name, int r, float * y) {
@@ -366,20 +367,14 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         std::vector<int> routed_ids(ids_host.p, ids_host.p + A);
         // TQFN_TAIL_SKIP=R (APPROXIMATE, changes the output; idea: Strata v0.1.42 route-tail-skip): an expert that is
         // not resident and that every token of this call ranks R-th or lower is neither copied nor computed. Its
-        // assignments get weight 0 (other weights unchanged) and point at the token's resident first choice.
+        // assignments get weight 0 (other weights unchanged) and point at the token's first choice (computed anyway).
         static const int tail_skip = std::getenv("TQFN_TAIL_SKIP") ? std::atoi(std::getenv("TQFN_TAIL_SKIP")) : 0;
-        if (tail_skip > 0 && trunk && n <= 4) {
-            std::vector<int> best_rank(c.experts, c.topk);
-            for (int a = 0; a < A; ++a) best_rank[routed_ids[a]] = std::min(best_rank[routed_ids[a]], a % c.topk);
-            for (int a = 0; a < A; ++a) {
-                const int e = routed_ids[a];
-                if (best_rank[e] < tail_skip - 1 || cache.resident(layer, e)) continue;
-                const int first = routed_ids[(a / c.topk) * c.topk];
-                if (best_rank[first] >= tail_skip - 1 && !cache.resident(layer, first)) continue;  // first choice itself skipped: keep
-                routed_ids[a] = first;
-                ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr));
-                static uint64_t skipped = 0; ++skipped;
-                static struct Report { ~Report() { std::printf("TAIL_SKIP assignments skipped %llu\n", (unsigned long long) skipped); } } report;
+        if (tail_skip > 0 && trunk) {  // decode_rules.hpp tail_skip_targets: any verify block size
+            const auto to = tqllm::flashnext::tail_skip_targets(routed_ids, c.topk, tail_skip, [&](int e) { return cache.resident(layer, e); });
+            static uint64_t skipped = 0;
+            static struct Report { ~Report() { std::printf("TAIL_SKIP assignments skipped %llu\n", (unsigned long long) skipped); } } report;
+            for (size_t a = 0; a < to.size(); ++a) if (to[a] >= 0) {
+                routed_ids[a] = to[a]; ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr)); ++skipped;
             }
         }
         if (static FILE * dump = std::getenv("TQFN_ROUTE_DUMP") ? std::fopen(std::getenv("TQFN_ROUTE_DUMP"), "ab") : nullptr; dump && trunk) {

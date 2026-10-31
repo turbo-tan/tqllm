@@ -21,8 +21,12 @@ int main() {
         for (int i = 0; i < vh; ++i) { neg[i] = -.2f - .017f * i; bias[i] = .1f * std::cos(float(i)); }
         for (size_t i = 0; i < st.size(); ++i) st[i] = .05f * std::sin(float(i) * .021f);
         float *dx, *da, *db, *dn, *dw, *ds, *dnext, *dy;
-        cudaMalloc(&dx, x.size() * 4); cudaMalloc(&da, a.size() * 4); cudaMalloc(&db, b.size() * 4); cudaMalloc(&dn, vh * 4);
-        cudaMalloc(&dw, vh * 4); cudaMalloc(&ds, st.size() * 4); cudaMalloc(&dnext, st.size() * 4); cudaMalloc(&dy, size_t(n) * vh * dim * 4);
+        // a device another process filled (tune_oom before it ran serially) fails here with a message, not inside fn_gdn
+        const bool got = cudaMalloc(&dx, x.size() * 4) == cudaSuccess && cudaMalloc(&da, a.size() * 4) == cudaSuccess &&
+            cudaMalloc(&db, b.size() * 4) == cudaSuccess && cudaMalloc(&dn, vh * 4) == cudaSuccess && cudaMalloc(&dw, vh * 4) == cudaSuccess &&
+            cudaMalloc(&ds, st.size() * 4) == cudaSuccess && cudaMalloc(&dnext, st.size() * 4) == cudaSuccess &&
+            cudaMalloc(&dy, size_t(n) * vh * dim * 4) == cudaSuccess;
+        if (!got) { std::printf("GDN_CHUNK FAIL: device allocation failed (another process holds the memory?)\n"); return 1; }
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(da, a.data(), a.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(db, b.data(), b.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(dn, neg.data(), vh * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dw, bias.data(), vh * 4, cudaMemcpyHostToDevice); cudaMemcpy(ds, st.data(), st.size() * 4, cudaMemcpyHostToDevice);

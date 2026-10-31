@@ -35,8 +35,7 @@ inline std::vector<char> encode_gsq_q2(const float * x, size_t n) {
                 }
                 if (yy) s = float(xy / yy);
             }
-            const _Float16 h = (_Float16)s; uint16_t bits; std::memcpy(&bits, &h, 2);
-            s = half_to_float(bits);
+            s = half_to_float(float_to_half(s));
             if (!std::isfinite(s)) continue;
             double error = 0;
             for (int i = 0; i < 64; ++i) {
@@ -46,7 +45,7 @@ inline std::vector<char> encode_gsq_q2(const float * x, size_t n) {
             if (error < best_error) { best_error = error; best_scale = s; }
         }
         if (!std::isfinite(best_error)) throw std::invalid_argument("cold Q2: scale overflow");
-        char * dst = out.data() + b * 18; const _Float16 hs = (_Float16)best_scale; std::memcpy(dst, &hs, 2);
+        char * dst = out.data() + b * 18; const uint16_t hs = float_to_half(best_scale); std::memcpy(dst, &hs, 2);
         for (int i = 0; i < 64; ++i) {
             const int q = best_scale ? gsq_q2_code(v[i] / best_scale) : 0;
             dst[2 + i / 4] = char(uint8_t(dst[2 + i / 4]) | uint8_t((q + 1) << (2 * (i % 4))));

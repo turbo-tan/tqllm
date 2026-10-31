@@ -119,7 +119,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature T --top-p P --top-k K (defaults for requests that set none; default greedy)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
@@ -203,7 +203,7 @@ int main(int argc, char ** argv) {
             else if (arg == "--port") port = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--context") context = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--max-tokens") max_tokens = static_cast<uint32_t>(std::stoul(value()));
-            else if (arg == "--temperature") tqserve::sampling_defaults().temperature = std::stof(value());
+            else if (arg == "--temperature" || arg == "--temp") tqserve::sampling_defaults().temperature = std::stof(value());
             else if (arg == "--top-p") tqserve::sampling_defaults().top_p = std::stof(value());
             else if (arg == "--top-k") tqserve::sampling_defaults().top_k = std::stoi(value());
             else if (arg == "--reasoning") {
@@ -227,6 +227,7 @@ int main(int argc, char ** argv) {
             else if (tqllm::parse_engine_option(argc, argv, i, engine)) continue;
             else if (arg == "--draft-max" || arg == "--draft") tqserve::serve_options().draft_max = std::clamp(std::stoi(value()), 1, 15);
             else if (arg == "--repeat-limit") tqserve::serve_options().repeat_limit = static_cast<uint32_t>(std::stoul(value()));
+            else if (arg == "--presence-penalty") tqserve::sampling_defaults().presence_penalty = std::stof(value());
             else if (arg == "--np") np = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--mmproj") mmproj = value();
             else if (arg == "--image-min-tokens") image_min_tokens = std::stoi(value());
@@ -258,6 +259,10 @@ int main(int argc, char ** argv) {
         std::cerr << "tqserve: loading model from " << model_path << "\n";
         tqllm::Tokenizer tokenizer;
         tokenizer.load(tokenizer_path);
+        if (tokenizer.encode("</mm:think>").size() == 1) {  // MiniMax-M3: its own thinking tags; the answer follows the end tag
+            auto & so = tqserve::serve_options();
+            so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
+        }
         tqserve::Vision vis;
 #if !TQLLM_WITH_CUDA
         if (!mmproj.empty()) throw std::runtime_error("--mmproj (image input) needs a CUDA build");
@@ -314,6 +319,12 @@ int main(int argc, char ** argv) {
             const bool manifest = model_path.size() > 5 && model_path.compare(model_path.size() - 5, 5, ".tqfn") == 0;
             const auto g = tqllm::gguf_open(manifest ? tokenizer_path : model_path);
             if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
+            // a model GGUF without tokenizer metadata (MiniMax-M3 from tools/minimax_convert.cpp): the --tokenizer GGUF's
+            if (src.empty() && !manifest && tokenizer_path != model_path && tokenizer_path.size() > 5 &&
+                tokenizer_path.compare(tokenizer_path.size() - 5, 5, ".gguf") == 0) {
+                const auto tg = tqllm::gguf_open_shard(tokenizer_path);
+                if (const auto it = tg.kv.find("tokenizer.chat_template"); it != tg.kv.end()) src = it->second.str;
+            }
         } else if (!model_dir.empty()) {
             std::ifstream tf(model_dir + "/chat_template.jinja", std::ios::binary);
             if (tf) src.assign(std::istreambuf_iterator<char>(tf), std::istreambuf_iterator<char>());
@@ -433,7 +444,7 @@ int main(int argc, char ** argv) {
                         if (parsed.max_tokens < want) parsed.max_tokens = static_cast<uint32_t>(std::min<uint64_t>(want, 0xFFFFFFFFull));
                     }
                     if (parsed.thinking_budget == 0) {  // budget 0: end thinking immediately (llama.cpp): force message + end tag
-                        parsed.prompt_text += parsed.budget_message + "</think>";
+                        parsed.prompt_text += parsed.budget_message + tqserve::serve_options().think_close;
                         parsed.thinking = false;
                     }
                 }
@@ -482,8 +493,8 @@ int main(int argc, char ** argv) {
                             auto phase2 = parsed;
                             phase2.thinking = false;
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, first.completion_tokens);
-                            phase2.prompt_text += closed ? first.reasoning + "\n</think>\n\n" + first.text
-                                                         : first.reasoning + "</think>";  // llama.cpp: message + end tag forced
+                            phase2.prompt_text += closed ? first.reasoning + "\n" + tqserve::serve_options().think_close + "\n\n" + first.text
+                                                         : first.reasoning + tqserve::serve_options().think_close;  // llama.cpp: message + end tag forced
                             tqserve::StreamWriter w2(tokenizer, phase2, name, send);
                             w2.mark_role_sent();
                             auto more = phase2.max_tokens > 0 ? run_stream(phase2, w2) : tqserve::DecodeResult{};
@@ -527,7 +538,7 @@ int main(int argc, char ** argv) {
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
                             if (!closed) generated.reasoning = tqserve::trim_incomplete_utf8(generated.reasoning) + parsed.budget_message;
                             phase2.prompt_text += generated.reasoning;
-                            phase2.prompt_text += closed ? "\n</think>\n\n" + generated.text : std::string("</think>");
+                            phase2.prompt_text += closed ? "\n" + tqserve::serve_options().think_close + "\n\n" + generated.text : tqserve::serve_options().think_close;
                             auto more = phase2.max_tokens > 0 ? run(phase2) : tqserve::DecodeResult{};
                             if (!more.error.empty()) generated.error = more.error;
                             else {

@@ -23,6 +23,7 @@ TEXTS = [
     "int f() {\n    if (x) {\n        return 1;\n    }\n}\n",   # code indent: \s+(?!\S) keeps runs
     "a   \n\n   b\t\t\tc",   # spaces then newlines (\s*[\r\n]+), tab runs
     "trailing   ",
+    "1234567 and 2026-10-24, pi 3.14159, 0007",   # digit runs: \p{N} (Qwen) vs \p{N}{1,3} (GLM)
 ]
 
 

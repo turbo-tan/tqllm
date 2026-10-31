@@ -47,6 +47,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Stamp the engine commit (a git archive does this through export-subst; the image build has no .git)
+        run: git rev-parse --short=7 HEAD > src/COMMIT
       - name: Build (and push per-arch image)
         uses: docker/build-push-action@v6
         with:

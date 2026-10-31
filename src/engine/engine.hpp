@@ -27,14 +27,22 @@ struct Engine {
         throw std::runtime_error("speculative decoding not supported for this model");
     }
     // Sampling for generate_spec (temperature 0 = greedy): top-k <= 16 of the exact head logits, top-p, seed.
-    virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) {
+    // presence: subtracted from the logit of every candidate seen in the last kPresenceLastN output tokens
+    // (OpenAI presence_penalty; breaks the phrase-level loops of long sampled thinking)
+    // ignore_eos (OpenAI / vLLM / llama.cpp request field): decode to max_tokens through end-of-sequence tokens, for
+    // fixed-length benchmarks. Engines that have no stop of their own ignore it.
+    virtual void set_ignore_eos(bool) {}
+    virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) {
         if (temperature > 0.f) throw std::runtime_error("sampling not supported for this model");
-        (void) top_p, (void) top_k, (void) seed;
+        (void) top_p, (void) top_k, (void) seed, (void) presence;
     }
     // Multi-slot serving: each slot holds one sequence (KV, recurrent state, drafter K/V, sampling). select_slot makes
     // a slot active for the calls that follow; spec_begin prefills it, spec_advance runs one draft + verify step
     // (false once done) and spec_finish returns the generated ids. generate_spec = begin + advance* + finish.
     virtual int slots() const { return 1; }
+    // tensor-parallel followers (ranks > 0) mirror rank 0's forwards until stop_followers() on rank 0
+    virtual void follow() { throw std::runtime_error("this engine has no tensor-parallel follower"); }
+    virtual void stop_followers() {}
     virtual bool has_drafter() const { return false; }
     virtual bool native_mtp() const { return false; }  // --mtp drafts with the model's own nextn head
     virtual bool incremental() const { return false; }  // spec_begin / spec_advance work (chunked prefill), drafter or not
@@ -87,6 +95,15 @@ struct Engine {
 using FlashNextFactory = std::unique_ptr<Engine> (*)(const std::string & manifest, const std::string & tokenizer, uint32_t context,
                                                      int slots, const EngineOptions & options);
 void register_flashnext_engine(FlashNextFactory factory);
+// GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next.cpp; split GGUFs open from any shard
+bool is_glm5next_gguf(const std::string & path);
+std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
+bool is_minimax_gguf(const std::string & path);
+// tensor parallelism over linked boxes: world ranks, rank 0 at peer:port (rank 0 listens there for the others)
+struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
+std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",
+                                            const std::string & tokenizer = "", const TpConfig & tp = {},
+                                            const std::string & hot_map = "");  // routing counts: preload the hot experts
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

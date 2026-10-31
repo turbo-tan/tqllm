@@ -1313,13 +1313,15 @@ template<int T> __global__ void fn_gemv_bf16_seg_k(GemvSegs g, const float * x, 
     }
 }
 void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t s) {
-    if (g.n <= 0 || g.n > kGemvSegs || cols <= 0 || cols % 8 || tokens <= 0 || tokens > 4 || !x) throw std::invalid_argument("bf16 gemv segments: invalid shape");
+    if (g.n <= 0 || g.n > kGemvSegs || cols <= 0 || cols % 8 || tokens <= 0 || tokens > 8 || !x) throw std::invalid_argument("bf16 gemv segments: invalid shape");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
     const int total = g.start[g.n];
-    if (tokens == 1) fn_gemv_bf16_seg_k<1><<<total, thr, 0, s>>>(g, x, cols);
-    else if (tokens == 2) fn_gemv_bf16_seg_k<2><<<total, thr, 0, s>>>(g, x, cols);
-    else if (tokens == 3) fn_gemv_bf16_seg_k<3><<<total, thr, 0, s>>>(g, x, cols);
-    else fn_gemv_bf16_seg_k<4><<<total, thr, 0, s>>>(g, x, cols);
+    switch (tokens) {  // up to 8: a verify block (5 drafts + 1) routes in one launch; per-token sums keep their order
+    case 1: fn_gemv_bf16_seg_k<1><<<total, thr, 0, s>>>(g, x, cols); break; case 2: fn_gemv_bf16_seg_k<2><<<total, thr, 0, s>>>(g, x, cols); break;
+    case 3: fn_gemv_bf16_seg_k<3><<<total, thr, 0, s>>>(g, x, cols); break; case 4: fn_gemv_bf16_seg_k<4><<<total, thr, 0, s>>>(g, x, cols); break;
+    case 5: fn_gemv_bf16_seg_k<5><<<total, thr, 0, s>>>(g, x, cols); break; case 6: fn_gemv_bf16_seg_k<6><<<total, thr, 0, s>>>(g, x, cols); break;
+    case 7: fn_gemv_bf16_seg_k<7><<<total, thr, 0, s>>>(g, x, cols); break; default: fn_gemv_bf16_seg_k<8><<<total, thr, 0, s>>>(g, x, cols); break;
+    }
 }
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 chunk gemv: invalid shape or pointer");
@@ -1383,6 +1385,20 @@ void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, flo
     if (rows >= 8) fn_gemv_bf16x_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
     else fn_gemv_bf16x_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
 }
+// up to 8 tokens per launch: a verify block (5 drafts + 1) reads each weight row once (with chunks of 4 it read it twice);
+// each token's sum keeps its order, so the output does not depend on how the tokens are grouped
+template <template <int> class K, class... A> static void bf16_by_tokens(int k, A... a) {
+    switch (k) {
+    case 1: K<1>::go(a...); break; case 2: K<2>::go(a...); break; case 3: K<3>::go(a...); break; case 4: K<4>::go(a...); break;
+    case 5: K<5>::go(a...); break; case 6: K<6>::go(a...); break; case 7: K<7>::go(a...); break; default: K<8>::go(a...); break;
+    }
+}
+template <int T> struct FewL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t ldy) {
+    fn_gemv_bf16_few_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols, ldy); } };
+template <int T> struct ShortL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
+    fn_gemv_bf16_short_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
+template <int T> struct MultiL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
+    fn_gemv_bf16_multi_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
 void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 gemv: invalid shape or pointer");
     const int warps = 8, blocks = (rows + warps - 1) / warps;
@@ -1390,35 +1406,20 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
     const bool few = rows <= 16 || (rows <= 1024 && cols >= 1024);
     const bool shrt = !few && cols <= 512 && rows >= 2048;
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
-    for (int t0 = 0; t0 < tokens; t0 += 4) {
-        const int k = std::min(4, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * rows;
-        if (few) {
-            if (k == 1) fn_gemv_bf16_few_k<1><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
-            else if (k == 2) fn_gemv_bf16_few_k<2><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
-            else if (k == 3) fn_gemv_bf16_few_k<3><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
-            else fn_gemv_bf16_few_k<4><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, rows);
-        } else if (shrt) {
-            const int sb = (rows * 8 + 255) / 256;
-            if (k == 1) fn_gemv_bf16_short_k<1><<<sb, 256, 0, s>>>(w, xt, yt, rows, cols);
-            else if (k == 2) fn_gemv_bf16_short_k<2><<<sb, 256, 0, s>>>(w, xt, yt, rows, cols);
-            else if (k == 3) fn_gemv_bf16_short_k<3><<<sb, 256, 0, s>>>(w, xt, yt, rows, cols);
-            else fn_gemv_bf16_short_k<4><<<sb, 256, 0, s>>>(w, xt, yt, rows, cols);
-        } else if (k == 1) fn_gemv_bf16_multi_k<1><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
-        else if (k == 2) fn_gemv_bf16_multi_k<2><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
-        else if (k == 3) fn_gemv_bf16_multi_k<3><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
-        else fn_gemv_bf16_multi_k<4><<<blocks, warps * 32, 0, s>>>(w, xt, yt, rows, cols);
+    for (int t0 = 0; t0 < tokens; t0 += 8) {
+        const int k = std::min(8, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * rows;
+        if (few) bf16_by_tokens<FewL>(k, unsigned(rows), thr, s, w, xt, yt, rows, cols, int64_t(rows));
+        else if (shrt) bf16_by_tokens<ShortL>(k, unsigned((rows * 8 + 255) / 256), 256, s, w, xt, yt, rows, cols, int64_t(rows));
+        else bf16_by_tokens<MultiL>(k, unsigned(blocks), warps * 32, s, w, xt, yt, rows, cols, int64_t(rows));
     }
 }
 void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 strided gemv: invalid shape or pointer");
     if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 strided gemv: rows take the warp-per-row path");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
-    for (int t0 = 0; t0 < tokens; t0 += 4) {
-        const int k = std::min(4, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * ldy;
-        if (k == 1) fn_gemv_bf16_few_k<1><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
-        else if (k == 2) fn_gemv_bf16_few_k<2><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
-        else if (k == 3) fn_gemv_bf16_few_k<3><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
-        else fn_gemv_bf16_few_k<4><<<rows, thr, 0, s>>>(w, xt, yt, rows, cols, ldy);
+    for (int t0 = 0; t0 < tokens; t0 += 8) {
+        const int k = std::min(8, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * ldy;
+        bf16_by_tokens<FewL>(k, unsigned(rows), thr, s, w, xt, yt, rows, cols, ldy);
     }
 }
 } // namespace tqllm_cuda

@@ -18,6 +18,7 @@
 #include "dev_alloc.cuh"
 #include "fp8_gemm.cuh"
 #include "int8_gemm.cuh"
+#include "qwen35_guard.hpp"
 #include "qwen35_kernels.cuh"
 #include "quant_kernels.cuh"
 #include "moe_kernels.cuh"
@@ -57,6 +58,21 @@
 #endif
 
 namespace tqllm {
+
+// The grouped-expert guard used by load_moe: a loaded expert matrix must have a format with a
+// grouped-expert projection. The forward path calls the format's own expert_matvec / expert_gemm,
+// which handle any basis, so the basis is not checked here. (The old guard also required
+// Basis::Plain, which rejected our own TQ3_4S MoE files.)
+void check_grouped_expert_format(const Mat & m, const std::string & prefix) {
+    if (m.p && !m.fmt->has_expert_matvec())
+        throw std::runtime_error(prefix + "unsupported grouped expert format: " + m.fmt->name());
+}
+
+MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model) {
+    if (!quantized_model) return {};
+    return {basis != Basis::Tq3Rot32 || bf16_ba, bf16_ba && bf16_ba_unrotated(basis)};
+}
+
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -233,6 +249,7 @@ struct DFlash {
     int retr = 0, recent = 0;  // retrieval window: retr chunks of 16 far positions + `recent` latest positions
     uint32_t mask_id = 0;
     std::vector<int> target_ids;  // target layers whose *input* hidden states feed the drafter
+    static constexpr int injBatch = 32;  // tokens per inject matvec batch (the u4h NCOL cap); the inject scratch is sized to it
     Mat fc, sel_hidden, w_kv_all;  // w_kv_all: [layer][k | v] rows of every layer, one matvec for injection
     const float *enc_norm = nullptr, *out_norm = nullptr;
     const __nv_bfloat16 *sel_prev = nullptr, *sel_next = nullptr;  // [vocab][rank]
@@ -1134,8 +1151,7 @@ private:
             L.sh_down = g_mat(f, p + "ffn_down_shexp.weight", H, FS);
             L.sh_gate = g_f32(f, p + "ffn_gate_inp_shexp.weight", H);
             for (const Mat * m : {&L.ex_gate, &L.ex_up, &L.ex_down, &L.cx_gate, &L.cx_up, &L.cx_down})
-                if (m->p && (!m->fmt->has_expert_matvec() || m->fmt->basis() != Basis::Plain))
-                    throw std::runtime_error(p + "unsupported grouped expert format: " + m->fmt->name());
+                check_grouped_expert_format(*m, p);
         };
         const auto mp = "blk." + std::to_string(cfg.layers) + ".";
         // the MTP head loads only for --mtp (tqllm::drafters: one drafter per run, never beside DFlash2)
@@ -1469,11 +1485,14 @@ private:
         h_slg.resize(size_t(NB) * 16);
         v_amax = Buf(size_t(NB) * 128 * 8);
         v_mix_rows = mix_rows;
-        if (fmt_target && basis_ != Basis::Tq3Rot32) {  // BF16 Gated DeltaNet b/a next to 4-bit matrices
+        const bool bf16_ba = std::any_of(layer.begin(), layer.end(), [](const Layer & L) { return L.w_ba.p; });
+        const MixStaging stage = mix_staging(basis_, bf16_ba, fmt_target);
+        if (stage.quantized) {  // BF16 Gated DeltaNet b/a next to 4-bit matrices
             v_xb = Buf(NBUF * widest * 2);
             v_mixa = Buf(NBUF * (2 * lk + 2 * lv) * 2);
             v_mixb = Buf(NBUF * 2 * size_t(cfg.lin_vheads) * 2);
         }
+        if (stage.unrotated) v_xu = Buf(NBUF * H * 2);  // the BF16 b/a rows of a rotated-basis model
         v_q = Buf(NBUF * size_t(cfg.heads) * hd * 2);
         v_qkvc = Buf(NBUF * (2 * lk + lv) * 2);
         part_floats = std::max({!kvf->needs_context_scratch() ? size_t(0) : size_t(NVER) * tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd)),
@@ -1791,7 +1810,8 @@ private:
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
     // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; the host runs
     // speculative sampling (accept draft d with p(d), else resample from p without d; bonus token from p).
-    struct Sampling { float temperature = 0.f, top_p = 1.f; int top_k = 0; } samp;
+    struct Sampling { float temperature = 0.f, top_p = 1.f, presence = 0.f; int top_k = 0; } samp;
+    static constexpr int kPresenceLastN = 64;  // llama.cpp's default penalty window (repeat_last_n)
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
@@ -1872,7 +1892,8 @@ private:
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
     Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > NVER): run the LM head only on the final chunk
-    Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_topk;
+    Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_inj_g, d_inj_kv,
+        d_topk;
     Buf dfl_part, ds_t, ds_act, ds_q, ds_o;  // DSpark drafter attention partials and block scratch
     uint32_t * h_tok = nullptr;  // pinned staging for the graph inputs
     int * h_pos = nullptr;
@@ -1923,8 +1944,10 @@ private:
     }
     size_t v_mix_rows = 0;
     Buf v_xb, v_mixa, v_mixb;  // W4A16: BF16 copy of the activation for BF16 matrices; [qkv|z] and [b|a] partials
+    Buf v_xu;                  // rotated-basis models: the un-rotated FP16 normalised activation the BF16 [b|a] rows read
     int last_n = 0;
     double last_prefill_ms = 0;
+    std::chrono::steady_clock::time_point dec_log_tp;  // last TQLLM_DEBUG=decode progress print
 
     // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own)
     void mm_h(const Mat & m, bf16 * out, int n) { mm_h(m, out, n, basis_); }
@@ -2076,12 +2099,17 @@ private:
         // int8 only on chunks of >= 1024 tokens: per-chunk weight quantisation does not pay off on the 512-token chunks of
         // 24 GB cards at 256K (3090 192K prompt: int8 641 vs FP16 668 tok/s; 54K: 1760 vs 1445)
         if (i8 && np >= 1024 && m.cols % 4 == 0 && ldo % 4 == 0 && r_off % 4 == 0) {
-            m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
+            // Formats that can quantise their weights to int8 themselves (X3's straight-to-int8 reconstruct with
+            // load-time scales) skip the FP16 round trip and the per-chunk weight quantise pass entirely.
+            float* sw = fp8_sw.as<float>() + r_off;
+            const bool preq = m.fmt->dequant_i8(m, i8->w8(), sw, stream);
+            if (!preq) m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
             if (!fp8_x_ready) {
                 i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream);
                 fp8_x_ready = true;
             }
-            i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, fp8_sw.as<float>() + r_off, stream);
+            if (preq) i8->gemm_prequant(m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, stream);
+            else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream);
             i8_used = true;
             return;
         }
@@ -2153,6 +2181,17 @@ private:
         }
     }
     int mix_rows(const Layer & L) const { return L.w_mix.rows + (L.w_ba.p ? L.w_ba.rows : 0); }
+    // v_xb = the current layer's normalised activation in BF16, in the basis the BF16 [b|a] rows are stored in
+    // (bf16_ba_unrotated): the rotated copy the quantized [qkv|z] rows read, or a second, un-rotated FP16 copy
+    // (norm_h writes exactly the values norm_rotate_h rotates).
+    void ba_bf16(const Layer & L, int n, cudaStream_t s) {
+        if (!tqllm::bf16_ba_unrotated(basis_) || tqllm::debug_on("rot_ba")) {
+            tqllm_cuda::h_to_bf16(v_xh.as<__half>(), v_xb.as<bf16>(), int64_t(n) * L.w_ba.cols, s);
+            return;
+        }
+        tqllm_cuda::norm_h(v_x.as<bf16>(), L.in_norm, v_px.as<float>(), cfg.eps, v_xu.as<__half>(), int(cfg.hidden), n, s);
+        tqllm_cuda::h_to_bf16(v_xu.as<__half>(), v_xb.as<bf16>(), int64_t(n) * L.w_ba.cols, s);
+    }
     // [qkv|z] (u4h) and [b|a] (BF16) into the [qkv|z|b|a] mix rows of T
     void mix_mm(const Layer & L, bf16 * T, int n) {
         if (!L.w_ba.p) { mm_h(L.w_mix, T, n); return; }
@@ -2170,7 +2209,7 @@ private:
             ck(cudaEventRecord(ev_fork, stream));  // before the [qkv | z] matvec: the side branch overlaps it
             ck(cudaStreamWaitEvent(side, ev_fork, 0));
             if (L.w_mix.fmt->matvec_ld(L.w_mix, v_xh.as<__half>(), T, n, rows, stream)) {
-                tqllm_cuda::h_to_bf16(v_xh.as<__half>(), v_xb.as<bf16>(), int64_t(n) * L.w_ba.cols, side);
+                ba_bf16(L, n, side);
                 tqllm_cuda::bf16_matvec_cols(static_cast<const bf16 *>(L.w_ba.p), v_xb.as<bf16>(), T + ra, rb, L.w_ba.cols,
                                              n, side, rows);
                 ck(cudaEventRecord(ev_join, side));
@@ -2184,7 +2223,7 @@ private:
             L.w_mix.fmt->basis() == basis_ && L.w_ba.type == GGML_BF16 && n > L.w_mix.fmt->max_matvec_cols() &&
             size_t(n + 8) * rows * 4 <= gemm_c_bytes) {
             gemm_rows(L.w_mix, T, n, rows);
-            tqllm_cuda::h_to_bf16(v_xh.as<__half>(), v_xb.as<bf16>(), int64_t(n) * L.w_ba.cols, stream);
+            ba_bf16(L, n, stream);
             const float alpha = 1.f, beta = 0.f;
             cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rb, n, L.w_ba.cols, &alpha, L.w_ba.p, CUDA_R_16BF, L.w_ba.cols,
                             v_xb.p, CUDA_R_16BF, L.w_ba.cols, &beta, T + ra, CUDA_R_16BF, rows, CUBLAS_COMPUTE_32F,
@@ -2192,7 +2231,9 @@ private:
             return;
         }
         mm_h(L.w_mix, v_mixa.as<bf16>(), n);
-        mm_h(L.w_ba, v_mixb.as<bf16>(), n);
+        ba_bf16(L, n, stream);
+        tqllm_cuda::bf16_matvec_cols(static_cast<const bf16 *>(L.w_ba.p), v_xb.as<bf16>(), v_mixb.as<bf16>(), rb,
+                                     L.w_ba.cols, n, stream);
         ck(cudaMemcpy2DAsync(T, size_t(rows) * 2, v_mixa.p, size_t(ra) * 2, size_t(ra) * 2, n, cudaMemcpyDeviceToDevice, stream));
         ck(cudaMemcpy2DAsync(T + ra, size_t(rows) * 2, v_mixb.p, size_t(rb) * 2, size_t(rb) * 2, n, cudaMemcpyDeviceToDevice, stream));
     }
@@ -2221,8 +2262,9 @@ public:
     bool full_logits = tqllm::debug_value("full_head") != nullptr;  // TQLLM_DEBUG=full_head: full-vocabulary int8 head, the reference for the shortlist
     void set_full_logits(bool on) override { full_logits = on; }
     const float * verify_logits() const override { return v_logits.as<float>(); }
-    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed) override {
+    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) override {
         samp.temperature = temperature;
+        samp.presence = presence > 0.f ? presence : 0.f;
         samp.top_p = top_p > 0.f && top_p <= 1.f ? top_p : 1.f;
         samp.top_k = top_k;
         rng.seed(seed);
@@ -2427,9 +2469,14 @@ public:
         auto * XH = v_xh.as<__half>();
         tqllm_cuda::add_sumsq(M, resid ? resid : R, v_pm.as<float>(), n * H, stream);
         nrot_h(M, L.post_norm, v_pm.as<float>(), XH, H, n);
+        const __half * XIN = XH;  // DIAG: TQLLM_DEBUG=rot_router forces the rotated copy for the router
+        if (tqllm::bf16_ba_unrotated(basis_) && v_xu.p && !tqllm::debug_on("rot_router")) {
+            tqllm_cuda::norm_h(M, L.post_norm, v_pm.as<float>(), cfg.eps, v_xu.as<__half>(), H, n, stream);
+            XIN = v_xu.as<__half>();
+        }
         if (cfg.moe) {
             const int E = int(cfg.expert_count), K = int(cfg.expert_used), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
-            tqllm_cuda::moe_router(L.router, L.sh_gate, XH, moe_logits.as<float>(), H, E, n, stream);
+            tqllm_cuda::moe_router(L.router, L.sh_gate, XIN, moe_logits.as<float>(), H, E, n, stream);
             tqllm_cuda::moe_topk(moe_logits.as<float>(), moe_ids.as<int>(), moe_weights.as<float>(),
                                  moe_shared_weights.as<float>(), E, K, n, 1.f, stream);
             const long li = &L - layer.data();
@@ -2631,14 +2678,21 @@ public:
             tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, lg_out, id_out, s_scr.p, stream);
     }
 
-    // Column i's sampling distribution: top-16 by exact logit, temperature, top-k (<= 16), top-p.
+    // Column i's sampling distribution: top-16 by exact logit, presence penalty against `recent` (the last output
+    // tokens before this column), temperature, top-k (<= 16), top-p.
     struct Dist { uint32_t id[16]; double p[16]; int n = 0; };
-    Dist dist(int col) const {
+    Dist dist(int col, const std::vector<uint32_t> & recent = {}) const {
         Dist d;
         int ord[16];
         for (int i = 0; i < 16; ++i) ord[i] = i;
-        const float * lg = h_slg.data() + size_t(col) * 16;
+        float lg[16];
         const uint32_t * id = h_sid.data() + size_t(col) * 16;
+        std::copy_n(h_slg.data() + size_t(col) * 16, 16, lg);
+        if (samp.presence > 0.f) {
+            const size_t r0 = recent.size() > size_t(kPresenceLastN) ? recent.size() - kPresenceLastN : 0;
+            for (int i = 0; i < 16; ++i)
+                if (std::find(recent.begin() + long(r0), recent.end(), id[i]) != recent.end()) lg[i] -= samp.presence;
+        }
         std::sort(ord, ord + 16, [&](int a, int b) { return lg[a] > lg[b]; });
         const int k = samp.top_k > 0 ? std::min(samp.top_k, 16) : 16;
         double sum = 0;
@@ -2940,7 +2994,11 @@ public:
         return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
     }
 
-    // Drafter K/V of the active slot: the sliding-window ring, else the full context.
+    // Drafter kernel grids independent of the position (sliding-window ring, no retrieval): drafts and commits can be
+    // captured once as CUDA graphs. Retrieval sizes its launches by the position, so it runs eagerly.
+    bool dfl_fixed_grids() const { return dfl.ring > 0 && !dfl.retr; }
+
+    // Drafter K/V of the active slot: the sliding-window (or retrieval) ring, else the full context.
     void alloc_dfl_state() {
         const size_t kd = size_t(dfl.kvheads) * dfl.hd, rows = dfl.ring ? size_t(dfl.ring) : context_;
         for (size_t l = 0; l < dfl.L.size(); ++l) {
@@ -3026,8 +3084,10 @@ public:
         // sliding-window drafter: K/V ring of the window (+ one verify and one draft block, chunk-rounded)
         dfl.ring = dfl.window > 0 ? (dfl.window + NVER + dfl.block + 64 + 63) / 64 * 64 : 0;
         if (dfl.ring >= int(context_)) dfl.ring = 0;
-        if (dfl.retr) {  // retrieval reads far positions: full drafter K/V, scratch for [retrieved | recent | block]
-            dfl.ring = 0;
+        if (dfl.retr) {  // retrieval reads back at most the newest kDflRetrMaxChunks chunks: a ring that holds them, and
+                         // scratch for [retrieved | recent | block]
+            dfl.ring = (tqllm_cuda::kDflRetrMaxChunks * tqllm_cuda::kDflRetrChunk + dfl.recent + NVER + dfl.block + 64 + 63) / 64 * 64;
+            if (dfl.ring >= int(context_)) dfl.ring = 0;
             const size_t kdb = size_t(dfl.kvheads) * dfl.hd;
             dfl_rscore = Buf(size_t(dfl.kvheads) * 4096 * 4);
             dfl_rsel = Buf(size_t(dfl.kvheads) * 128 * 4);
@@ -3060,6 +3120,10 @@ public:
         d_pos = Buf(2 * size_t(nslots) * sizeof(int));
         d_tok = Buf(B * 4);
         d_kv = Buf(size_t(NVER) * nl * 2 * kd * 2);
+        // inject scratch for batches wider than the draft buffers (d_x / d_kv hold a draft block and NVER rows): prefill
+        // injects in batches of DFlash::injBatch tokens, so the projections read each weight once per batch
+        d_inj_g = Buf(size_t(DFlash::injBatch) * H * 2);
+        d_inj_kv = Buf(size_t(DFlash::injBatch) * nl * 2 * kd * 2);
         d_topk = Buf(B * 64 * 16 * 8);
         if (const char * dv = opt.draft_vocab.c_str(); *dv && has_head8()) {
             // draft vocabulary (llama.cpp map format): those head8 rows in 4 bits; ids mapped on the device
@@ -3211,6 +3275,18 @@ public:
         ck(cudaMemcpyAsync(d_pos.p, v, sizeof(v), cudaMemcpyHostToDevice, stream));
     }
 
+    // The inject projections as matvec batches of the format's max_batch_cols(): per-column results are identical to
+    // narrower calls (the batched-matvec contract), while each weight is read once per batch of tokens instead of once
+    // per 8-token group - the whole cost of the old prefill injection.
+    void inj_mm(const Mat & m, const bf16 * in, bf16 * out, int n) {
+        if (n > DFlash::injBatch) throw std::runtime_error("dflash inject: batch wider than the scratch");
+        const int mc = m.fmt->max_batch_cols();
+        for (int c0 = 0; c0 < n; c0 += mc) {
+            const int nc = std::min(mc, n - c0);
+            prep_input(m.fmt->basis(), in + size_t(c0) * m.cols, v_xh.as<__half>(), m.cols, nc);
+            m.fmt->matvec(m, v_xh.as<__half>(), out + size_t(c0) * m.rows, nc, stream);
+        }
+    }
     // Encodes n rows of target features (device [n][nf*H]) for positions pos.. and writes every drafter layer's K/V.
     void dflash_inject(const bf16 * feats, int n, uint32_t pos) {
         set_dpos(pos);
@@ -3218,10 +3294,10 @@ public:
     }
     void dflash_inject_body(const bf16 * feats, int n) {  // positions from d_pos
         const int H = int(cfg.hidden), kd = dfl.kvheads * dfl.hd, nl = int(dfl.L.size());
-        auto *G = d_x.as<bf16>(), *KV = d_kv.as<bf16>();
-        mmx(dfl.fc, feats, G, n);
+        auto *G = d_inj_g.as<bf16>(), *KV = d_inj_kv.as<bf16>();
+        inj_mm(dfl.fc, feats, G, n);
         tqllm_cuda::rms_f_multi(G, H, 0, dfl.enc_norm, G, H, 0, H, 1, n, cfg.eps, stream);
-        mmx(dfl.w_kv_all, G, KV, n);
+        inj_mm(dfl.w_kv_all, G, KV, n);
         const int ts = dfl.w_kv_all.rows;
         for (int l = 0; l < nl; ++l) {
             bf16 * K = KV + size_t(l) * 2 * kd;
@@ -3243,7 +3319,7 @@ public:
     bool dflash_draft_batch(const std::vector<DraftReq> & rq, std::vector<std::vector<uint32_t>> & out,
                             const std::vector<int> * tree_cols = nullptr, const std::vector<int> * chain_cols = nullptr) {
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        if (rq.size() < 2 || dfl.ring <= 0 || dfl.dspark || subset || !(dsub_rows || head4.p || lm_head.fmt))
+        if (rq.size() < 2 || !dfl_fixed_grids() || dfl.dspark || subset || !(dsub_rows || head4.p || lm_head.fmt))
             return false;
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         const int ns = int(rq.size()), DB = ns * B;
@@ -3446,7 +3522,7 @@ public:
         // Device-resident body (positions in d_pos, tokens / anchor in d_tok): with the K/V ring the kernel grids do not
         // depend on pos, so the whole draft is captured once as a CUDA graph and replayed.
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        const bool graph = dfl.ring > 0 && !subset;
+        const bool graph = dfl_fixed_grids() && !subset;
         auto body = [&] {
         if (dfl.dspark) {
             dspark_forward(pos);
@@ -3479,7 +3555,7 @@ public:
                                ? tqllm_cuda::dflash_retrieve_build(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), kd, dfl.heads,
                                                                    dfl.kvheads, int(pos), B, dfl.recent, dfl.retr, dfl.theta,
                                                                    dfl_rscore.as<float>(), dfl_rsel.as<int>(), dfl_rk.as<bf16>(),
-                                                                   dfl_rv.as<bf16>(), stream)
+                                                                   dfl_rv.as<bf16>(), stream, dfl.ring)
                                : -1;
             if (rr >= 0) {  // scratch [retrieved | recent | block]: the query block sits at scratch row rr + recent
                 if (l == 0) {
@@ -3708,8 +3784,8 @@ public:
                         if (final && count > 1 && next != eos_)
                             first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
                     }
-                    for (int off = 0; off < m && dfl_on; off += 8) {
-                        const int count = std::min(8, m - off);
+                    for (int off = 0; off < m && dfl_on; off += DFlash::injBatch) {
+                        const int count = std::min(DFlash::injBatch, m - off);
                         if (t + uint32_t(off + count) <= inj0) continue;
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                     }
@@ -3717,8 +3793,9 @@ public:
                     tqllm::prefill_completed(stream,t+uint32_t(m),P,P0);
                     if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
-                        std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f tok/s)\n", t + uint32_t(m), P,
-                                     (t + uint32_t(m)) / elapsed);
+                        const uint32_t done = t + uint32_t(m);  // rate counts this request's new tokens (not reused ones)
+                        std::fprintf(stderr, "prefill progress %u/%u tokens (%.0f%%, %.0f tok/s)\n", done, P,
+                                     100.0 * done / P, (done - P0) / elapsed);
                     }
                 }
                 sync_ck();
@@ -3764,6 +3841,7 @@ public:
         gen.done = false;
         gen.prefill_ms = last_prefill_ms;
         gen.decode_start = std::chrono::steady_clock::now();
+        dec_log_tp = gen.decode_start;
     }
 
     // Accepted draft count j for the active slot; res[j] becomes the token after them. Column col0 + i of the verify
@@ -3772,16 +3850,22 @@ public:
         int j = 0;
         if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
             std::uniform_real_distribution<double> uni(0.0, 1.0);
+            std::vector<uint32_t> recent;  // presence window: the output so far, then each draft token as it is accepted
+            if (samp.presence > 0.f) {
+                const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
+                recent.assign(gen.out.begin() + long(r0), gen.out.end());
+            }
             for (; j < int(draft.size()); ++j) {
-                const Dist d = dist(col0 + j);
+                const Dist d = dist(col0 + j, recent);
                 double q = 0;
                 for (int i = 0; i < d.n; ++i) if (d.id[i] == draft[j]) q = d.p[i];
                 if (uni(rng) >= q) {
                     res[j] = draw(d, draft[j]);
                     break;
                 }
+                if (samp.presence > 0.f) recent.push_back(draft[j]);
             }
-            if (j == int(draft.size())) res[j] = draw(dist(col0 + j));
+            if (j == int(draft.size())) res[j] = draw(dist(col0 + j, recent));
         } else {
             while (j < int(draft.size()) && draft[j] == res[j]) ++j;
         }
@@ -4061,6 +4145,20 @@ public:
         return 0;
     }
 
+    // TQLLM_DEBUG=decode: a progress line every ~2.5 s while decoding (tokens / wall time, same basis as reqlog).
+    void dec_progress() {
+        static const bool on = tqllm::debug_on("decode");
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - dec_log_tp).count() < 2.5) return;
+        dec_log_tp = now;
+        const double total = std::chrono::duration<double>(now - gen.decode_start).count();
+        const uint32_t n = uint32_t(gen.out.size());
+        std::fprintf(stderr, "decode progress %u tokens (%.0f tok/s), drafts accepted %llu of %llu (%.0f%%)\n", n,
+                     total > 0 ? n / total : 0.0, (unsigned long long) gen.accepted, (unsigned long long) gen.drafted,
+                     gen.drafted ? 100.0 * gen.accepted / gen.drafted : 0.0);
+    }
+
     // One draft + verify step on the active slot; false once the generation is complete.
     bool dflash_advance() {
         if (gen.done) return false;
@@ -4183,7 +4281,7 @@ public:
                 set_pending(j + 1);
                 last_n = 0;
                 dflash_inject(v_feat.as<bf16>(), j + 1, pos);
-            } else if (dfl.ring > 0) {
+            } else if (dfl_fixed_grids()) {
                 // commit + inject as one graph: ~110 small launches otherwise leave the GPU waiting on the host
                 const int k = j + 1;
                 if (k > last_n) throw std::runtime_error("commit: accepted count out of range");
@@ -4246,6 +4344,7 @@ public:
             if (hit_eos) gen.done = true;
         }
         if (out.size() >= count || pending == eos_) gen.done = true;
+        dec_progress();
         return !gen.done;
     }
 
@@ -4444,6 +4543,7 @@ public:
         gen.t_draft += ms(t0, t1);
         gen.t_verify += ms(t1, t2);
         gen.t_tail += ms(t2, t3);
+        dec_progress();
         return !gen.done;
     }
 

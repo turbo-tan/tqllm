@@ -31,6 +31,10 @@ public:
     // X quantised once per GEMM group; W [rows][k] FP16; Y int32 [tok][ldo] (unscaled), row scales to sw_out [rows]
     void quant_x(const __half * x, int ldx, int tok, int k, cudaStream_t s);
     void gemm(const __half * w, int rows, int k, int tok, int32_t * y, int ldo, float * sw_out, cudaStream_t s);
+    // Weights already quantised into w8_ (a format's straight-to-int8 reconstruct) with the row scales in place:
+    // multiply only, no quantise pass.
+    void gemm_prequant(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s);
+    int8_t * w8() const { return w8_; }
     const float * sx() const { return sx_; }
 
 private:
@@ -38,6 +42,7 @@ private:
     int8_t * w8_ = nullptr, * x8_ = nullptr;
     float * sw_ = nullptr, * sx_ = nullptr;
     void * ws_ = nullptr;
+    void matmul(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s);
     size_t ws_bytes_ = size_t(32) << 20;
     std::map<std::tuple<int, int, int, int>, cublasLtMatmulAlgo_t> algos_;
 };

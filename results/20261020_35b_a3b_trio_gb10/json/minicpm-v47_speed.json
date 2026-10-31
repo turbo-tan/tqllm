@@ -1,0 +1,82 @@
+{
+  "model": "minicpm-v47",
+  "gguf": "/mnt/data2t/gguf/minicpm-v47-35b-a3b/tq3_4s/MiniCPM-V-4_7-35B-A3B-TQ3_4S.gguf",
+  "port": 18131,
+  "reasoning": "off",
+  "context": 40960,
+  "server_log": "/tmp/tqs_minicpm-v47.log",
+  "engine": "turbo-tan/tqllm aa5ab0c",
+  "source_commit": "aa5ab0c",
+  "gguf_bytes": "17626983360",
+  "sha256": "a48cb39581ce01c99c28b21a2934bb640456d2517f5084bb92b322ffb664ee16",
+  "gguf_meta": {
+    "error": "Traceback (most recent call last):\n  File \"<stdin>\", line 70, in <module>\n  File \"<stdin>\", line 38, in main\n  File \"<stdin>\", line 18, in read_string\nMemoryError"
+  },
+  "host_free_gb_before": "26",
+  "measured_at": "2026-10-22 09:11:15",
+  "chats": [
+    {
+      "prompt": "What is the capital of France?",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 104.41,
+      "content_head": "1 slamp\u4e00        \n\n    \u4e00\n\n\n\n\u4f24\u4f24ate\u4e00\u4e00\u4e00\n\n\u4e00 **\u6709\u4e9b\u4f24\u4e00\u76f4\u4f24\u4f24\n\n\u4e00\n\n\u4e00-h image image\u4e00\u4e00\u4e00\u4e00\u4e00\u5173\u4e8e\u6709\u4e9b\u4e00\u6709\u4e9b"
+    },
+    {
+      "prompt": "Explain gravity in one sentence.",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 105.69,
+      "content_head": "\n\u4e00  \u4e00\u4e00arch\u4e00\u4e00\u4e00\n\n \u4e00\u4e00\u4e00\u4e00 \u0627\u0646 \u4e00\u4e00  \u8ddf\u5173\u4e8e\u5173\u4e8e\u062e\u5173\u4e8e\u4e00\u4e00\u4e00 (\u4e00red\u5173\u4e8e\u4e00\u4e00\u5173\u4e8e\u4e00 redredredredredredred about"
+    },
+    {
+      "prompt": "What is 2+2?",
+      "prompt_tokens": 19,
+      "completion_tokens": 128,
+      "decode_tok_s": 105.82,
+      "content_head": "2  **              ken  k\n\n k\n\n\n\n k\n\n\n\n k k k k k k k\n\n k k k  k k k k k k ** \n\n"
+    },
+    {
+      "prompt": "Name three primary colors.",
+      "prompt_tokens": 17,
+      "completion_tokens": 128,
+      "decode_tok_s": 106.14,
+      "content_head": "#\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\u4e00\n\n\u4e00\u4e00\u4e00\u4e00\n\n \u4e00\n\n\u4e00\n\n\u4e00\n\n\u4e00\n\n\n\n-c-ph\u4e00 \u4e00 \u4e00\n\n-h\n\n              \u4e00         \u4e00  (\n\n "
+    },
+    {
+      "prompt": "Write a haiku about the sea.",
+      "prompt_tokens": 20,
+      "completion_tokens": 128,
+      "decode_tok_s": 105.91,
+      "content_head": ">\u4e00\u4e00\u4e00**  \u4e00** **\n\n\u4e00****** \u4e00**\u0627\u0646\u4e00** k** k-h**v-h-h**headed-h****\u4e00\u4e00\u4e00 ** V **\u4e00\u4e00\u4e00 V\n\n-"
+    }
+  ],
+  "decode": {
+    "chats": 5,
+    "predicted_n_minus_1": 635,
+    "predicted_ms": 6013.8,
+    "tok_s": 105.59
+  },
+  "tokens_per_filler_unit": 18.188,
+  "prefill": {
+    "4096": {
+      "prompt_tokens": 4014,
+      "prefill_tok_s": 3327.9,
+      "prompt_ms": 1206.1,
+      "first_token_s": 1.223
+    },
+    "16384": {
+      "prompt_tokens": 16182,
+      "prefill_tok_s": 3136.3,
+      "prompt_ms": 5159.6,
+      "first_token_s": 5.187
+    },
+    "32768": {
+      "prompt_tokens": 32400,
+      "prefill_tok_s": 2919.8,
+      "prompt_ms": 11096.5,
+      "first_token_s": 11.139
+    }
+  },
+  "host_free_gb_after": "26"
+}

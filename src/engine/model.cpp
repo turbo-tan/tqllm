@@ -7,6 +7,7 @@
 #include "engine.hpp"
 #include "nlohmann/json.hpp"
 #include "gguf.hpp"
+#include "hf_folder.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -681,6 +682,19 @@ Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots
         if (!g_flashnext) throw std::invalid_argument("this binary has no Flash-Next engine (use tqserve)");
         impl_->e = g_flashnext(p.string(), t, c, slots, o); return;
     }
+    // a GGUF file or a Hugging Face checkpoint folder (src/core/hf) is dispatched by its architecture
+    const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
+    if (gguf_like && is_minimax_gguf(p.string())) {
+        if (slots != 1) throw std::invalid_argument("MiniMax-M3.1-Flash runs one slot (--np 1)");
+        TpConfig tp;
+        tp.rank = o.tp_rank; tp.world = o.tp_world; tp.peer = o.tp_peer; tp.port = o.tp_port;
+        if (tp.world > 1 && tp.rank != 0) throw std::invalid_argument("tqserve is rank 0; rank 1 runs glm-gpu --tp-rank 1");
+        impl_->e = make_minimax_engine(p.string(), c, o.draft_model, t, tp, o.hot_map); return;  // -md: the DSpark draft GGUF
+    }
+    if (gguf_like && is_glm5next_gguf(p.string())) {
+        if (slots != 1) throw std::invalid_argument("GLM-5.3-Flash runs one slot (--np 1)");
+        impl_->e = make_glm5next_engine(p.string(), c); return;
+    }
     if (slots != 1 && p.extension() != ".gguf") throw std::invalid_argument("multiple slots need a qwen35 GGUF model");
     if (p.extension() == ".gguf") impl_->e = load_fitted(p.string(), t, c, slots, o);  // qwen35 GGUF (llama.cpp-tq3)
     else if (model_type(dir) == "qwen3_5") impl_->e = make_qwen35_engine(dir.string(), t, c, 1, o);
@@ -724,8 +738,9 @@ void Model::verify(const std::vector<uint32_t> & tokens, uint32_t pos, std::vect
 void Model::commit(int accepted) { impl_->e->commit(accepted); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
-void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed) {
-    impl_->e->set_sampling(temperature, top_p, top_k, seed);
+void Model::set_ignore_eos(bool on) { impl_->e->set_ignore_eos(on); }
+void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
+    impl_->e->set_sampling(temperature, top_p, top_k, seed, presence);
 }
 
 std::vector<uint32_t> Model::generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int draft,

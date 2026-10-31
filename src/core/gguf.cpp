@@ -1,6 +1,10 @@
 #include "gguf.hpp"
+#include "paw_gguf.hpp"
+#include "hf_folder.hpp"
 
+#include <cstdio>
 #include <fstream>
+#include <regex>
 #include <limits>
 #include <stdexcept>
 
@@ -107,9 +111,11 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
     switch (type) {
         case GGML_F32:    elems = 1;   bytes = 4;   return true;
         case GGML_F16:
-        case GGML_BF16:   elems = 1;   bytes = 2;   return true;
+        case GGML_BF16:
+        case GGML_I16:    elems = 1;   bytes = 2;   return true;
         case GGML_Q4_0:   elems = 32;  bytes = 18;  return true;
         case GGML_Q8_0:   elems = 32;  bytes = 34;  return true;
+        case GGML_MXFP8:  elems = 32;  bytes = 33;  return true;  // per row: the E4M3 bytes, then the row's scales
         case GGML_GSQ_Q2_0: elems = 64; bytes = 18; return true;
         case GGML_TQ3_4S: elems = 32;  bytes = 16;  return true;
         case GGML_Q2_K:   elems = 256; bytes = 84;  return true;
@@ -217,7 +223,31 @@ std::string GgufFile::str(const std::string & key) const {
 bool GgufFile::has(const std::string & key) const { return kv.count(key) != 0; }
 
 std::vector<char> GgufFile::read(const GgufTensor & t) const {
-    std::ifstream in(path, std::ios::binary);
+    if (t.make) {
+        auto buf = t.make();
+        if (buf.size() != t.bytes) throw std::runtime_error("built GGUF tensor byte-count mismatch");
+        return buf;
+    }
+    if (!t.parts.empty() || !t.header.empty()) {  // virtual tensor: header, then each part (its header, its bytes)
+        std::vector<char> buf(t.header);
+        buf.reserve(size_t(t.bytes));
+        std::string open_file;
+        std::ifstream pin;
+        for (const GgufTensor & p : t.parts) {
+            buf.insert(buf.end(), p.header.begin(), p.header.end());
+            if (!p.bytes) continue;
+            const std::string & pf = p.file.empty() ? (t.file.empty() ? path : t.file) : p.file;
+            if (pf != open_file) { pin = std::ifstream(pf, std::ios::binary); open_file = pf; }
+            const size_t at = buf.size();
+            buf.resize(at + p.bytes);
+            pin.seekg(std::streamoff(p.offset));
+            pin.read(buf.data() + at, std::streamsize(p.bytes));
+            if (!pin) throw std::runtime_error("failed reading GGUF tensor part");
+        }
+        if (buf.size() != t.bytes) throw std::runtime_error("virtual GGUF tensor byte-count mismatch");
+        return buf;
+    }
+    std::ifstream in(t.file.empty() ? path : t.file, std::ios::binary);
     std::vector<char> buf(t.bytes);
     in.seekg(std::streamoff(t.offset));
     in.read(buf.data(), std::streamsize(t.bytes));
@@ -225,7 +255,7 @@ std::vector<char> GgufFile::read(const GgufTensor & t) const {
     return buf;
 }
 
-GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
+GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
     GgufFile f;
     f.path = path;
     Reader r{std::ifstream(path, std::ios::binary)};
@@ -261,7 +291,12 @@ GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
         t.type = r.get<uint32_t>();
         if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
         t.offset = r.get<uint64_t>();
-        t.bytes = tensor_bytes(t.type, n, name, t.ne);
+        if (t.type == GGML_X3) {  // self-describing X3Record groups (the K can differ per expert): size from x3.bytes.<name>
+            t.bytes = uint64_t(f.num("x3.bytes." + name, 0));
+            if (!t.bytes) throw std::runtime_error("GGUF X3 tensor " + name + " has no x3.bytes." + name);
+        } else {
+            t.bytes = tensor_bytes(t.type, n, name, t.ne);
+        }
         infos.emplace_back(std::move(name), std::move(t));
     }
     const uint64_t align = uint64_t(f.num("general.alignment", 32));
@@ -281,6 +316,49 @@ GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
         f.tensors.emplace(name, std::move(t));
     }
     return f;
+}
+
+std::string gguf_architecture(const std::string & path) {
+    if (const std::string a = hf_folder_arch(path); !a.empty()) return a;
+    const GgufFile f = gguf_open_shard(path);
+    return f.has("general.architecture") ? f.str("general.architecture") : std::string();
+}
+
+GgufFile gguf_open(const std::string & path, GgufDialect dialect) {
+    if (hf_folder(path)) return hf_open(path);  // a Hugging Face checkpoint folder, opened in place
+    GgufFile f = gguf_open_shard(path, dialect);
+    const uint64_t count = uint64_t(f.num("split.count", 1));
+    if (count <= 1) { paw_adapt(f); return f; }  // paw-dense -> qwen35 view (no-op for every other arch)
+    static const std::regex name(R"((.*)-(\d+)-of-(\d+)\.gguf$)");
+    std::smatch m;
+    if (!std::regex_match(path, m, name) || std::stoull(m[3].str()) != count)
+        throw std::runtime_error("split GGUF " + path + ": expected a name ending -NNNNN-of-" + std::to_string(count) + ".gguf");
+    const int width = int(m[2].length());
+    auto shard_path = [&](uint64_t i) {
+        char num[32];
+        std::snprintf(num, sizeof num, "%0*llu", width, static_cast<unsigned long long>(i + 1));
+        return m[1].str() + "-" + num + "-of-" + m[3].str() + ".gguf";
+    };
+    GgufFile all = uint64_t(f.num("split.no", 0)) == 0 ? std::move(f) : gguf_open_shard(shard_path(0), dialect);
+    if (uint64_t(all.num("split.no", 0)) != 0 || uint64_t(all.num("split.count", 1)) != count)
+        throw std::runtime_error("split GGUF " + shard_path(0) + ": not the first of " + std::to_string(count) + " shards");
+    all.path = shard_path(0);
+    for (auto & [n, t] : all.tensors) t.file = all.path;
+    for (uint64_t i = 1; i < count; ++i) {
+        const auto p = shard_path(i);
+        GgufFile s = gguf_open_shard(p, dialect);
+        if (uint64_t(s.num("split.no", -1)) != i || uint64_t(s.num("split.count", 0)) != count)
+            throw std::runtime_error("split GGUF " + p + ": split.no / split.count do not match its name");
+        for (auto & [n, t] : s.tensors) {
+            t.file = p;
+            if (!all.tensors.emplace(n, t).second) throw std::runtime_error("split GGUF: tensor " + n + " is in two shards");
+        }
+    }
+    if (all.has("split.tensors.count") && uint64_t(all.num("split.tensors.count")) != all.tensors.size())
+        throw std::runtime_error("split GGUF: " + std::to_string(all.tensors.size()) + " tensors found, split.tensors.count says " +
+                                 std::to_string(uint64_t(all.num("split.tensors.count"))));
+    paw_adapt(all);
+    return all;
 }
 
 } // namespace tqllm

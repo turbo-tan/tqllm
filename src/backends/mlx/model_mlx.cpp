@@ -98,7 +98,9 @@ void Model::select_slot(int slot) {if (slot != 0) throw std::invalid_argument("t
 void Model::set_prompt_images(const std::vector<PromptImage>& images) {
     if (!images.empty()) throw std::invalid_argument("image input is not supported by the MLX backend yet");
 }
-void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed) {
+void Model::set_ignore_eos(bool) {}  // the MLX decode loop stops at its own end tokens
+void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
+    (void) presence;  // the MLX sampler has no presence penalty yet
     auto& i = *impl_;
     i.temperature = temperature; i.top_p = top_p; i.top_k = top_k; i.rng.seed(seed);
 }

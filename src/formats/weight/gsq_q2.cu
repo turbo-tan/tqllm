@@ -42,6 +42,42 @@ template<class T> __global__ void dot_warp(const unsigned char * weights, const 
         else y[int64_t(assignment) * rows + row] = __float2bfloat16_rn(sum);
     }
 }
+// Wide rows (cols >= 3072, MiniMax): warp per (row, assignment), 4 blocks per step: 8 lanes per block, each lane 2 code
+// bytes (8 weights) and one 16-byte load of the 8 inputs. 4x the bytes per load of dot_warp, whose byte-wide reads ran a
+// 3072 x 6144 expert at ~85 GB/s on a GB10. Its own summation order: not bit-identical to dot_warp.
+template<class T> __global__ void dot_wide(const unsigned char * weights, const __half * x, T * y,
+                                          int rows, int cols, int experts, const int * ids, int topk, bool per_expert) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, assignment = blockIdx.y;
+    if (row >= rows) return;
+    const int expert = ids ? ids[assignment] : 0;
+    const int input = per_expert ? assignment : assignment / topk;
+    float sum = 0.f;
+    if (expert >= 0 && expert < experts) {
+        const int nb = cols / 64, sub = lane & 7, which = lane >> 3;
+        const unsigned char * r = weights + (int64_t(expert) * rows + row) * nb * 18;
+        const __half * xr = x + int64_t(input) * cols;
+        for (int b = which; b < nb; b += 4) {
+            const unsigned char * block = r + b * 18;
+            const float scale = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned q = *reinterpret_cast<const uint16_t *>(block + 2 + sub * 2);
+            const uint4 xv = *reinterpret_cast<const uint4 *>(xr + b * 64 + sub * 8);
+            const __half2 * xh = reinterpret_cast<const __half2 *>(&xv);
+            float part = 0.f;
+            for (int i = 0; i < 4; ++i) {
+                const float2 xx = __half22float2(xh[i]);
+                part += (int((q >> (4 * i)) & 3u) - 1) * xx.x;
+                part += (int((q >> (4 * i + 2)) & 3u) - 1) * xx.y;
+            }
+            sum += scale * part;
+        }
+    }
+    for (int d = 16; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
+    if (!lane) {
+        if (expert < 0 || expert >= experts) sum = nanf("");
+        if constexpr (std::is_same_v<T, float>) y[int64_t(assignment) * rows + row] = sum;
+        else y[int64_t(assignment) * rows + row] = __float2bfloat16_rn(sum);
+    }
+}
 // Grouped experts (moe_group lists): warp per (row, expert, up to C of its tokens); the row's blocks are read once for
 // all C tokens. Per token the products and their order are those of dot_warp (bit-identical).
 // Grouped experts (moe_group lists): block = 64 rows (8 warps x 8 rows) of one expert; the expert's tokens C at a time
@@ -194,7 +230,10 @@ void gsq_q2_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, i
     shape(w, x, y, r, k, n, topk);
     if (!ids || experts <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid expert dimensions");
-    dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    if (k >= 3072)
+        dot_wide<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    else
+        dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
 }
 void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, const int * counts, const int * groups,
                            int capacity, int experts, int topk, bool per_expert, cudaStream_t s) {

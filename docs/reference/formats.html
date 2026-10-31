@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tqLLM Weight Formats</title>
+<meta name="description" content="How TQ3_4S, TQ3 and TQ4 store weights: rotation, codebook, scales, bit budget and quality.">
+<style>
+/* One reading column; each format is drawn as its real 128-weight storage strip, one cell per bit, same scale */
+:root {
+  --bg: #f6f7fb; --paper: #ffffff; --ink: #161a2b; --muted: #5b6178; --line: #dfe2ee; --chip: #eef1fb;
+  --code3: #18a999; --code3b: #0f8577; --code4: #2f6cf6; --code4b: #1f50c4; --scale: #f2a71b;
+  --old: #8b5cf6; --oldb: #6d3fe0; --good: #0f9d58; --hot: #e2367d;
+  --display: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1220; --paper: #171b2d; --ink: #eef0fa; --muted: #a3a9c2; --line: #2a3048; --chip: #1f2440;
+  --code3: #2cc8b6; --code3b: #1aa393; --code4: #5b8cff; --code4b: #3f6fe6; --scale: #ffbd3d;
+  --old: #a78bfa; --oldb: #8b6cf0; --good: #34c77b; --hot: #ff5c9d; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f1220; --paper: #171b2d; --ink: #eef0fa; --muted: #a3a9c2; --line: #2a3048; --chip: #1f2440;
+  --code3: #2cc8b6; --code3b: #1aa393; --code4: #5b8cff; --code4b: #3f6fe6; --scale: #ffbd3d;
+  --old: #a78bfa; --oldb: #8b6cf0; --good: #34c77b; --hot: #ff5c9d; color-scheme: dark }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 400 16px/1.6 var(--body); margin: 0; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 40px 16px 64px; }
+a { color: var(--code4); }
+.eyebrow { font: 600 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+h1 { font: 800 clamp(32px, 5.4vw, 54px)/1.04 var(--display); letter-spacing: -.02em; margin: 14px 0 16px; text-wrap: balance; }
+h1 .t3 { color: var(--code3); } h1 .t4 { color: var(--code4); } h1 .o { color: var(--old); }
+h2 { font: 800 clamp(22px, 3vw, 29px)/1.15 var(--display); letter-spacing: -.01em; margin: 0 0 10px; text-wrap: balance; }
+p { max-width: 68ch; margin: 0 0 12px; }
+.lede { font-size: 18px; color: var(--muted); max-width: 64ch; }
+section { margin-top: 56px; }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+.key { display: flex; flex-wrap: wrap; gap: 10px 18px; font: 500 13px/1.2 var(--body); color: var(--muted); margin: 14px 0 4px; }
+.key i { display: inline-block; width: 14px; height: 14px; border-radius: 3px; vertical-align: -2px; margin-right: 6px; }
+code { font: 500 .9em var(--mono); background: var(--chip); padding: 1px 6px; border-radius: 5px; }
+.strip-row { display: grid; grid-template-columns: 150px 1fr; gap: 6px 16px; align-items: center; margin: 16px 0; }
+.strip-row .name { font: 600 15px/1.2 var(--mono); }
+.strip-row .name small { display: block; font: 400 12px/1.4 var(--body); color: var(--muted); margin-top: 3px; }
+.strip { display: block; width: 100%; height: auto; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-top: 22px; }
+.fact { border-left: 4px solid var(--line); padding: 4px 0 4px 14px; }
+.fact b { font: 800 26px/1.1 var(--display); display: block; }
+.fact span { font-size: 14px; color: var(--muted); }
+.fact.t3 { border-color: var(--code3); } .fact.t4 { border-color: var(--code4); } .fact.o { border-color: var(--old); }
+canvas { display: block; width: 100%; height: auto; border-radius: 10px; }
+.how { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.how figure { margin: 0; } .how figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-top: 18px; }
+.step { background: var(--paper); border: 1px solid var(--line); border-top: 4px solid var(--c, var(--line)); border-radius: 10px; padding: 14px 16px; }
+.step b { display: block; font: 600 12px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.step p { font-size: 14.5px; margin: 0; }
+.chart { width: 100%; height: auto; display: block; }
+.chart text { font: 500 12px var(--body); fill: var(--ink); }
+.chart .num { font: 600 12px var(--mono); } .chart .dim { fill: var(--muted); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 620px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; vertical-align: top; }
+th { font: 600 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+td.n { font-family: var(--mono); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; vertical-align: 0; }
+.note { font-size: 13px; color: var(--muted); }
+.warn { border-left: 4px solid var(--hot); background: var(--paper); border-radius: 0 10px 10px 0; padding: 14px 18px; margin-top: 18px; }
+.warn p { margin: 0; font-size: 15px; }
+@media (max-width: 640px) { .strip-row { grid-template-columns: 1fr; } .how { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">tqLLM weight formats &middot; GGUF types 46 / 300 / 301</div>
+  <h1>Inside <span class="o">TQ3_4S</span>, <span class="t3">TQ3</span> and <span class="t4">TQ4</span>: rotate first, then a small codebook</h1>
+  <p class="lede">The TQ formats store a model's weights in blocks. Each block is rotated so no single weight sticks out,
+    every weight becomes a 3-bit or 4-bit code, and a few scales set the size of the block. TQ3_4S uses blocks of 32 with
+    four scales; TQ3 and TQ4 use blocks of 128 with one scale, so almost every bit goes into the codes.</p>
+
+  <div class="facts">
+    <div class="fact o"><b>4.0</b><span>bits per weight, TQ3_4S (32-weight blocks, 8 levels)</span></div>
+    <div class="fact t3"><b>3.125</b><span>bits per weight, TQ3 (128-weight blocks, 8 levels)</span></div>
+    <div class="fact t4"><b>4.125</b><span>bits per weight, TQ4 (128-weight blocks, 16 levels)</span></div>
+  </div>
+
+  <section>
+    <h2>What happens to one block of weights</h2>
+    <p>A raw block has a few large weights and many small ones. Quantising it directly wastes most of the code levels on
+      the rare outliers. A fixed rotation (a Hadamard-style transform with fixed signs over the whole block) spreads the
+      outliers out, so the rotated values look alike and a small codebook fits them all. This is the TurboQuant idea
+      applied to weights.</p>
+    <div class="how card">
+      <figure><canvas id="raw" width="880" height="320" aria-label="Raw weights with outliers"></canvas>
+        <figcaption>Before: 128 weights; a few outliers (pink) set the range.</figcaption></figure>
+      <figure><canvas id="rot" width="880" height="320" aria-label="Rotated weights snapped to 16 levels"></canvas>
+        <figcaption>After rotation: an even spread, snapped to 16 levels (TQ4). TQ3 and TQ3_4S use 8.</figcaption></figure>
+    </div>
+    <div class="steps">
+      <div class="step" style="--c:var(--old)"><b>1 &middot; rotate</b><p>Multiply the block by a fixed signed Hadamard
+        rotation: 32 points in TQ3_4S, 128 in TQ3 / TQ4. No data is stored for it.</p></div>
+      <div class="step" style="--c:var(--scale)"><b>2 &middot; scale</b><p>Pick the block scale (FP16 in TQ3 / TQ4, four
+        8-bit scales in TQ3_4S) so the codebook covers the rotated values.</p></div>
+      <div class="step" style="--c:var(--code3)"><b>3 &middot; code</b><p>Store each weight as the index of its nearest
+        level: 3 bits (8 levels) or 4 bits (16 levels).</p></div>
+      <div class="step" style="--c:var(--code4)"><b>4 &middot; read</b><p>At run time the input is rotated once with the
+        same transform, and the product runs directly on the codes and scales.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>The bit budget, drawn to scale</h2>
+    <p>Each strip is the storage for 128 weights, one cell per bit, all at the same scale. Codes are the bulk; the scales
+      are what is left. TQ3_4S spends a quarter of its bits on scales, TQ3 and TQ4 about 3 %.</p>
+    <div class="key">
+      <span><i style="background:var(--old)"></i>TQ3_4S 3-bit codes</span>
+      <span><i style="background:var(--code3)"></i>TQ3 3-bit codes</span>
+      <span><i style="background:var(--code4)"></i>TQ4 4-bit codes</span>
+      <span><i style="background:var(--scale)"></i>scales</span>
+    </div>
+    <div id="strips"></div>
+    <p class="note">TQ3_4S is four 32-weight blocks, each with 96 bits of codes and four 8-bit scales (one per 8 weights).
+      Shades inside the code area mark sub-blocks.</p>
+  </section>
+
+  <section>
+    <h2>Quality: KL divergence against the original model</h2>
+    <p>Qwen3.8-27B, mean KL divergence to the BF16 model over 100 chunks of text (the llama.cpp reference method; lower
+      is closer to the original). The first group changes only the format: plain rounding, same file, only the quantised
+      matrices differ. The second group is the release files with calibrated rounding.</p>
+    <div class="facts" style="margin:0 0 18px">
+      <div class="fact t4"><b>3.7x</b><span>lower KL: TQ4 (TQ4_L, 14.72 GB) 0.0220 against TQ3_4S 0.0824 (14.50 GB)</span></div>
+      <div class="fact t3"><b>18 %</b><span>smaller and still closer: TQ3 (TQ_XS, 11.85 GB) 0.0793 against TQ3_4S 0.0824</span></div>
+    </div>
+    <div class="card"><svg id="kl" class="chart" viewBox="0 0 900 300" role="img" aria-label="KL divergence by format"></svg></div>
+    <div class="tablewrap" style="margin-top:18px"><table>
+      <thead><tr><th>File</th><th>Format of the big matrices</th><th>Size</th><th>Mean KL</th><th>Same top token</th></tr></thead>
+      <tbody id="kltable"></tbody>
+    </table></div>
+    <p class="note" style="margin-top:12px">Release files also keep the output head and embeddings at higher precision,
+      which is why TQ4_L is far below plain TQ4. Files: <a href="https://huggingface.co/YTan2000/Qwen3.8-27B-TQ">YTan2000/Qwen3.8-27B-TQ</a>.</p>
+  </section>
+
+  <section>
+    <h2>Which TQ format, when</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Format</th><th>Block</th><th>Codes</th><th>Scales</th><th>Bits / weight</th><th>Runs in</th></tr></thead>
+      <tbody>
+        <tr><td><span class="sw" style="background:var(--old)"></span><b>TQ3_4S</b> (type 46)</td><td class="n">32</td><td>3-bit, 8 levels, 32-point rotation</td><td>four 8-bit, one per 8 weights</td><td class="n">4.0</td><td>tqLLM, <a href="https://github.com/turbo-tan/llama.cpp-tq3">llama.cpp-tq3</a></td></tr>
+        <tr><td><span class="sw" style="background:var(--code3)"></span><b>TQ3</b> (type 301)</td><td class="n">128</td><td>3-bit, 8 levels, 128-point rotation</td><td>one FP16</td><td class="n">3.125</td><td>tqLLM</td></tr>
+        <tr><td><span class="sw" style="background:var(--code4)"></span><b>TQ4</b> (type 300)</td><td class="n">128</td><td>4-bit, 16 levels, 128-point rotation</td><td>one FP16</td><td class="n">4.125</td><td>tqLLM</td></tr>
+      </tbody>
+    </table></div>
+    <p style="margin-top:14px">TQ3_4S was first: it works in a llama.cpp fork and in tqLLM, and it is what the Flash-Next
+      expert files use. TQ3 and TQ4 rotate over a 4x longer block, so one scale per 128 weights is enough and the bits go
+      into the codes instead. That is how Qwen3.8-27B fits in 11.85 GB as TQ3 (TQ_XS) against 14.5 GB as TQ3_4S, and why
+      TQ4 at about the same size as TQ3_4S is much closer to the original. Type ids 300 and 301 are tqLLM's own, above
+      the ggml range, so these files need tqLLM.</p>
+    <div class="warn"><p><b>Readers and ports:</b> a TQ3 / TQ4 matrix lives in the rotated basis, so rotate the input
+      of every matrix that shares an input with a TQ matrix, whatever its storage type. Details in
+      <a href="formats.md">formats.md</a>.</p></div>
+  </section>
+
+  <section>
+    <h2>Other formats tqLLM reads</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Family</th><th>Types</th><th>Where it comes from</th></tr></thead>
+      <tbody>
+        <tr><td><b>GGUF K-quants and IQ</b></td><td>Q4_K ... Q8_0, IQ1_S ... IQ4_XS</td><td>Standard llama.cpp GGUF files (IQ grids from llama.cpp, MIT)</td></tr>
+        <tr><td><b>GSQ-RCO</b></td><td>IQ3_S experts, Q2 dialect (type 302)</td><td>ISTA-DASLab GSQ GGUFs, e.g. Qwen3.8-Flash-Next</td></tr>
+        <tr><td><b>EXL3 trellis</b></td><td>X3 (type 320)</td><td>Hugging Face EXL3 folders served in place, e.g. MiniMax-M3.1-Flash</td></tr>
+        <tr><td><b>Float</b></td><td>MXFP8, BF16, F16, F32</td><td>Safetensors folders and GGUF</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="margin-top:12px">Engine: <a href="https://github.com/turbo-tan/tqllm">github.com/turbo-tan/tqllm</a>.
+      Text reference: <a href="formats.md">formats.md</a>.</p>
+  </section>
+</div>
+
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const NS = "http://www.w3.org/2000/svg";
+const el = (t, a, txt) => { const e = document.createElementNS(NS, t); for (const k in a) e.setAttribute(k, a[k]); if (txt !== undefined) e.textContent = txt; return e; };
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const gauss = () => { let u = 0, v = 0; while (!u) u = rnd(); while (!v) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+const W0 = Array.from({ length: 128 }, (_, i) => 0.18 * gauss() + ([9, 41, 77, 103].includes(i) ? (i % 2 ? -1 : 1) * (1.6 + rnd()) : 0));
+function hadamard(x) { const a = x.slice(); for (let h = 1; h < a.length; h *= 2) for (let i = 0; i < a.length; i += 2 * h) for (let j = i; j < i + h; j++) { const p = a[j], q = a[j + h]; a[j] = p + q; a[j + h] = p - q; } return a.map(v => v / Math.sqrt(a.length)); }
+const R = hadamard(W0.map((v, i) => v * (((i * 2654435761) >>> 0) % 2 ? 1 : -1)));
+function bars(id, vals, levels, color) {
+  const c = document.getElementById(id), g = c.getContext("2d"), w = c.width, h = c.height, mid = h / 2;
+  g.clearRect(0, 0, w, h); g.fillStyle = css("--paper"); g.fillRect(0, 0, w, h);
+  const m = Math.max(...vals.map(Math.abs)) * 1.05, bw = w / vals.length;
+  if (levels) { g.strokeStyle = css("--line"); g.lineWidth = 1; for (let k = 0; k < levels; k++) { const y = mid - ((k + 0.5) / levels * 2 - 1) * (h * 0.44); g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); } }
+  vals.forEach((v, i) => {
+    let q = v; if (levels) { const s = m / (levels / 2); q = (Math.round(v / s - 0.5) + 0.5) * s; q = Math.max(-m * 0.999, Math.min(m * 0.999, q)); }
+    const y = mid - q / m * h * 0.44; g.fillStyle = Math.abs(v) > m * 0.55 && !levels ? css("--hot") : color;
+    g.fillRect(i * bw + 1, Math.min(y, mid), Math.max(1, bw - 2), Math.abs(y - mid));
+  });
+  g.strokeStyle = css("--muted"); g.globalAlpha = .5; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke(); g.globalAlpha = 1;
+}
+
+const FMTS = [
+  { name: "TQ3_4S", sub: "4.0 bits / weight", parts: [0, 1, 2, 3].flatMap(() => [{ n: 96, c: "--old", c2: "--oldb", grp: 4 }, { n: 32, c: "--scale" }]) },
+  { name: "TQ3", sub: "3.125 bits / weight", parts: [{ n: 384, c: "--code3", c2: "--code3b", grp: 4 }, { n: 16, c: "--scale" }] },
+  { name: "TQ4", sub: "4.125 bits / weight", parts: [{ n: 512, c: "--code4", c2: "--code4b", grp: 4 }, { n: 16, c: "--scale" }] },
+];
+function strips() {
+  const host = document.getElementById("strips"); host.innerHTML = "";
+  const cols = 68, cell = 13, gap = 1.5;
+  for (const f of FMTS) {
+    const total = f.parts.reduce((s, p) => s + p.n, 0), rows = Math.ceil(total / cols);
+    const row = document.createElement("div"); row.className = "strip-row";
+    row.innerHTML = `<div class="name">${f.name}<small>${f.sub} &middot; ${total} bits</small></div>`;
+    const svg = el("svg", { class: "strip", viewBox: `0 0 ${cols * cell} ${rows * cell + 4}`, role: "img", "aria-label": `${f.name}: ${total} bits for 128 weights` });
+    let b = 0;
+    for (const p of f.parts) for (let i = 0; i < p.n; i++, b++) {
+      const r = Math.floor(b / cols), c = b % cols;
+      const col = p.grp ? (Math.floor(i / (p.n / p.grp)) % 2 ? p.c2 : p.c) : p.c;
+      svg.appendChild(el("rect", { x: c * cell + gap / 2, y: r * cell + gap / 2, width: cell - gap, height: cell - gap, rx: 2, fill: css(col) }));
+    }
+    const box = document.createElement("div"); box.style.minWidth = "0"; box.appendChild(svg); row.appendChild(box); host.appendChild(row);
+  }
+}
+
+const KL = [
+  { group: "Same rounding, only the format changes", rows: [
+    { f: "TQ3", fmt: "TQ3", gb: 11.85, kl: 0.1186, top: 85.38, c: "--code3" },
+    { f: "TQ4", fmt: "TQ4", gb: 14.72, kl: 0.0345, top: 91.84, c: "--code4" } ] },
+  { group: "Release files (calibrated rounding)", rows: [
+    { f: "TQ3_4S-v2", fmt: "TQ3_4S", gb: 14.50, kl: 0.0824, top: 87.97, c: "--old" },
+    { f: "TQ_XS", fmt: "TQ3", gb: 11.85, kl: 0.0793, top: 88.58, c: "--code3" },
+    { f: "TQ4_L", fmt: "TQ4", gb: 14.72, kl: 0.0220, top: 93.66, c: "--code4" } ] },
+];
+function klchart() {
+  const s = document.getElementById("kl"); s.innerHTML = "";
+  const L = 190, Rx = 860, max = 0.13, x = v => L + (Rx - L) * v / max; let y = 18;
+  const rowsN = KL.reduce((n, g) => n + g.rows.length, 0), H = 18 + KL.length * 32 + rowsN * 28 + 30;
+  s.setAttribute("viewBox", `0 0 900 ${H}`);
+  for (let t = 0; t <= 0.12001; t += 0.02) { s.appendChild(el("line", { x1: x(t), x2: x(t), y1: 10, y2: H - 24, stroke: css("--line") })); s.appendChild(el("text", { x: x(t), y: H - 8, "text-anchor": "middle", class: "num dim" }, t.toFixed(2))); }
+  for (const g of KL) {
+    s.appendChild(el("text", { x: 0, y: y + 12, class: "dim", style: "font-weight:600" }, g.group)); y += 22;
+    for (const r of g.rows) {
+      s.appendChild(el("text", { x: 0, y: y + 15, class: "num" }, r.f));
+      s.appendChild(el("text", { x: 110, y: y + 15, class: "num dim" }, r.gb.toFixed(2) + " GB"));
+      s.appendChild(el("rect", { x: L, y, width: Math.max(2, x(r.kl) - L), height: 20, rx: 4, fill: css(r.c) }));
+      s.appendChild(el("text", { x: x(r.kl) + 6, y: y + 15, class: "num" }, r.kl.toFixed(4)));
+      y += 28;
+    }
+    y += 10;
+  }
+  const tb = document.getElementById("kltable"); tb.innerHTML = "";
+  for (const g of KL) for (const r of g.rows)
+    tb.insertAdjacentHTML("beforeend", `<tr><td>${r.f}</td><td>${r.fmt}</td><td class="n">${r.gb.toFixed(2)} GB</td><td class="n">${r.kl.toFixed(4)}</td><td class="n">${r.top.toFixed(2)} %</td></tr>`);
+}
+function drawAll() { bars("raw", W0, 0, css("--old")); bars("rot", R, 16, css("--code4")); strips(); klchart(); }
+drawAll();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+</script>
+</body>
+</html>

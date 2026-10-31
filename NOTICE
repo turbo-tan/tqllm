@@ -12,6 +12,12 @@ This product includes third-party code under its own licence:
   IQ4_NL codebook from ggml (llama.cpp), used only to read GGUF files stored in those formats.
   MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
 
+* src/formats/weight/x3/{codec_mul1.cuh, dispatch.cu, gemv_sq.cuh, gemv_x3v.cuh, had128.cuh, ptx.cuh, reconstruct.cuh} -
+  the X3 / X3.1 (EXL3 mul1 trellis) decode, GEMV and dequant kernels, ported from llama-paw-k25
+  ggml/src/ggml-cuda/paw-x3.cu, itself a port of exllamav3 (exllamav3_ext/quant, commit 63b32f0).
+  MIT License, Copyright (c) 2023-2026 The ggml authors (licenses/ggml-MIT.txt) and Copyright (c) 2025 Turboderp
+  (licenses/exllamav3-MIT.txt).
+
 * third_party/stb/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):

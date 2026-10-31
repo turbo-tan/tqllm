@@ -6,6 +6,7 @@
 #include "../src/cuda_recover.hpp"
 #include "dev_alloc.cuh"
 #include "tq3_expert_cache.hpp"
+#include "packed_experts.hpp"
 #include "prefill_plan.hpp"
 #include "kv_store.hpp"
 #include "kv_format.hpp"
@@ -73,6 +74,7 @@ inline bool g_tile_experts = false;
 // attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
 // it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
 inline int g_kv_capacity = 2048;
+inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_capacity follows each request)
 // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
 // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
 inline bool g_small_card = false;
@@ -139,6 +141,7 @@ inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled 
 inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
 inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
+inline uint64_t g_kv_epoch = 0;   // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
 // TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
 inline const std::vector<int32_t> * g_hot_map = nullptr;

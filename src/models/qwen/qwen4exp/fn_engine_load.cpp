@@ -1,6 +1,8 @@
 #include <cmath>
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
+#include <iterator>
+#include "device_free.hpp"
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
 #include <chrono>
@@ -115,7 +117,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
     for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
-    const double host_ram = double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGESIZE));
+    const double host_ram = double(tqllm::host_ram_bytes());  // physical RAM capped by the container limit
     const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
     if (f.experts.empty() && !integrated && !pack_in_memory)
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
@@ -240,7 +242,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     size_t device_total = 0; (void) tqllm::device_free_bytes(&device_total);
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
-    apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
+    ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
@@ -352,7 +354,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     auto context_keep = [&] {
         int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
         // in decode the K/V of positions older than TQFN_KV_HOST_KEEP live in host memory (kv_to_host); the indexer keys stay
-        const bool kv_host = std::getenv("TQFN_KV_HOST") && std::atoi(std::getenv("TQFN_KV_HOST")) != 0 && KvBuf::mem().granule();
+        const bool kv_host = kv_host_enabled();
         const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
         const size_t kv_row = size_t(2) * checkpoint.attention_kvheads * checkpoint.attention_dim * 2;  // K + V bf16 per position
         const size_t moved = kv_host && int(context) > 2 * keep ? size_t(attn) * (size_t(context) - size_t(2 * keep)) * kv_row : 0;
@@ -403,7 +405,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
               const size_t fr = tqllm::device_free_bytes();
               f.slots = tqllm::auto_expert_slots(fr, need + extra, per, c.experts);
-              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
+              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
               { auto again = warm.step(ids); ck(cudaDeviceSynchronize()); }  // the banks again, at the new size
               const size_t after = tqllm::device_free_bytes();
               std::fprintf(stderr, "tqllm: expert slots auto: %.0f MB free without banks, %.0f MB kept, %.1f MB per slot -> %d slots/layer, %.0f MB free after\n",
@@ -444,6 +446,16 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // spec_begin grows pinned residuals to the actual prompt, not the configured slot capacity.
       f.cache->set_miss_stream(nullptr);
       if (tqllm::debug_on("mem")) checkpoint.resident_report();
+      {   // a multi-chunk prefill's pinned residual rows, pinned here once instead of inside a request (decode_rules.hpp)
+          const size_t rows = int(context) > 4096 ? size_t(context) * size_t(warm.width) : 0;
+          std::ifstream mi("/proc/meminfo"); const std::string text((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
+          int dev = 0, unified = 0; cudaGetDevice(&dev);
+          if (cudaDeviceGetAttribute(&unified, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) unified = 0;
+          if (pin_residual_at_start(rows * sizeof(float), tqllm::host_ram_bytes(), tqllm::meminfo_available(text), unified != 0)) {
+              ck(cudaMallocHost(reinterpret_cast<void **>(&f.res_host), rows * sizeof(float))); f.res_host_cap = rows;
+              std::fprintf(stderr, "tqllm: prompt residual buffer pinned at start: %.1f GB for %u tokens\n", double(rows * sizeof(float)) / 1e9, context);
+          }
+      }
       if (f.arena.size != f.arena_decode) {  // start the first request as every later one: decode-sized arena, more room to borrow
           ck(cudaFree(f.arena.base)); ck(cudaMalloc(&f.arena.base, f.arena_decode)); f.arena.size = f.arena_decode; f.arena.used = 0; }
       size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
@@ -453,7 +465,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         ck(cudaDeviceSynchronize());
         std::fprintf(stderr,"tqllm: uploaded checkpoint source page reclaim: %s\n",checkpoint.discard_source_pages() ? "ok" : "partial");
     }
-    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
+    g_kv_capacity = kv_capacity_full; f.kv_capacity_full = kv_capacity_full; g_kv_capacity_full = kv_capacity_full; g_qsa_batch.reset();  // the selection scratch was sized for the warm-up's capacity
     {   // the plan budget: what a prompt may plan with (device free + the expert banks), measured once with the pool trimmed and
         // rounded down to 256 MB, so the chunk / block a prompt length gets does not follow what earlier requests left in the
         // pool or in a partly refilled bank (a 100 MB difference flipped a 16K prompt between 3 x 6144 and 4 x 5120, F26)

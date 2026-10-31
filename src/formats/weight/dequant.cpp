@@ -1,11 +1,32 @@
 #include "dequant.hpp"
 #include "gguf.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace tqllm {
+uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000, a = x & 0x7FFFFFFF;
+    if (a >= 0x7F800000) return uint16_t(sign | 0x7C00 | (a > 0x7F800000 ? 0x200 : 0));  // inf, NaN
+    if (a >= 0x477FF000) return uint16_t(sign | 0x7C00);                               // rounds past 65504
+    if (a < 0x38800000) {                                                             // subnormal or zero
+        if (a < 0x33000000) return uint16_t(sign);
+        const uint32_t e = a >> 23, m = (a & 0x7FFFFF) | 0x800000, shift = 126 - e;
+        uint32_t h = m >> shift;
+        const uint32_t rest = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rest > half || (rest == half && (h & 1))) ++h;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = ((a >> 13) - (112u << 10));
+    const uint32_t rest = a & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) ++h;
+    return uint16_t(sign | h);
+}
+
 float half_to_float(uint16_t h) {
     const uint32_t sign = uint32_t(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
     uint32_t bits;
@@ -341,6 +362,7 @@ void iq4nl(const uint8_t * b, float * y) {
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
     const auto * s = static_cast<const uint8_t *>(src);
     switch (type) {
+        case GGML_MXFP8: throw std::runtime_error("dequantize_host: MXFP8 rows carry their scales; use dequantize_host_rows");
         case GGML_GSQ_Q2_0:
             if (n < 0 || n % 64) break;
             for (int64_t b = 0; b < n / 64; ++b) {
@@ -434,3 +456,20 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
 }
 
 } // namespace tqllm
+
+namespace tqllm {
+void dequantize_host_rows(uint32_t type, const void * src, float * dst, int64_t rows, int64_t cols) {
+    if (type != GGML_MXFP8) { dequantize_host(type, src, dst, rows * cols); return; }
+    if (cols % 32) throw std::runtime_error("dequantize_host_rows: MXFP8 cols must be a multiple of 32");
+    const auto * s = static_cast<const uint8_t *>(src);
+    for (int64_t r = 0; r < rows; ++r) {
+        const uint8_t * row = s + r * (cols + cols / 32);
+        for (int64_t c = 0; c < cols; ++c) {
+            const uint8_t b = row[c];
+            const int sg = b >> 7, e = (b >> 3) & 15, m = b & 7;
+            const float v = e == 15 && m == 7 ? NAN : e == 0 ? m / 8.0f * std::ldexp(1.0f, -6) : (1 + m / 8.0f) * std::ldexp(1.0f, e - 7);
+            dst[r * cols + c] = (sg ? -v : v) * std::ldexp(1.0f, int(row[cols + c / 32]) - 127);
+        }
+    }
+}
+}  // namespace tqllm

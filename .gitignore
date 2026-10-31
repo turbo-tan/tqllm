@@ -5,3 +5,4 @@ build*/
 *.log
 __pycache__/
 .venv-monitor/
+build-scratch/

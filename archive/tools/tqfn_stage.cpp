@@ -324,20 +324,9 @@ static void run_pack_experts(int argc, char ** argv) {
     const std::string out = argv[1];
     std::vector<char *> args{argv[0], argv[0]}; for (int i = 2; i < argc; ++i) args.push_back(argv[i]);
     Checkpoint checkpoint(int(args.size()), args.data()); const auto & c = checkpoint.config;
-    auto repack = [&](int layer, int id) { return repack_expert(checkpoint, layer, id); };
-    FILE * f = std::fopen(out.c_str(), "wb"); require(f, "cannot create " + out);
     g_tile_experts = true;
-    std::fwrite(g_tile_experts ? "TQFNEXPT" : "TQFNEXP1", 1, 8, f); int32_t dims[2] = {c.layers, c.experts}; std::fwrite(dims, 4, 2, f);
-    std::vector<std::array<uint64_t, 6>> sizes(c.layers);
-    for (int l = 0; l < c.layers; ++l) { const auto parts = repack(l, 0); for (int k = 0; k < 6; ++k) sizes[l][k] = parts[k].size(); std::fwrite(sizes[l].data(), 8, 6, f); }
-    for (int l = 0; l < c.layers; ++l) {
-        for (int e = 0; e < c.experts; ++e) {
-            const auto parts = repack(l, e);
-            for (int k = 0; k < 6; ++k) { require(parts[k].size() == sizes[l][k], "expert layout varies within a layer"); std::fwrite(parts[k].data(), 1, parts[k].size(), f); }
-        }
-        std::printf("packed layer %d\n", l); std::fflush(stdout);
-    }
-    require(std::fclose(f) == 0, "write failed: " + out);
+    tqllm::write_packed_experts(out, c.layers, c.experts, g_tile_experts,
+                                [&](int l, int e) { return repack_expert(checkpoint, l, e); });
     std::printf("PACK_DONE %s\n", out.c_str());
 }
 

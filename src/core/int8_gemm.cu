@@ -92,9 +92,9 @@ Int8Gemm::~Int8Gemm() {
 
 void Int8Gemm::quant_x(const __half * x, int ldx, int tok, int k, cudaStream_t s) { int8_quant_rows(x, tok, k, ldx, x8_, sx_, s); }
 
-void Int8Gemm::gemm(const __half * w, int rows, int k, int tok, int32_t * y, int ldo, float * sw_out, cudaStream_t s) {
-    if (k % 4 || ldo % 4) throw std::invalid_argument("int8 gemm: k and ldo must be multiples of 4");
-    int8_quant_rows(w, rows, k, k, w8_, sw_, s);
+// cuBLASLt int8 x int8 -> int32 from the resident w8_/x8_ buffers; y [tok][ldo] unscaled (scales applied by the
+// int8_i32_to_* pass). Algorithm picked once per shape and cached.
+void Int8Gemm::matmul(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s) {
     cublasLtMatmulDesc_t op;
     cl(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32I, CUDA_R_32I), "desc");
     const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
@@ -143,7 +143,20 @@ void Int8Gemm::gemm(const __half * w, int rows, int k, int tok, int32_t * y, int
     cublasLtMatrixLayoutDestroy(lb);
     cublasLtMatrixLayoutDestroy(lc);
     cublasLtMatmulDescDestroy(op);
+}
+
+void Int8Gemm::gemm(const __half * w, int rows, int k, int tok, int32_t * y, int ldo, float * sw_out, cudaStream_t s) {
+    if (k % 4 || ldo % 4) throw std::invalid_argument("int8 gemm: k and ldo must be multiples of 4");
+    int8_quant_rows(w, rows, k, k, w8_, sw_, s);
+    matmul(rows, k, tok, y, ldo, s);
     if (sw_out) ck(cudaMemcpyAsync(sw_out, sw_, size_t(rows) * 4, cudaMemcpyDeviceToDevice, s), "row scales");
+}
+
+// Weights already quantised into w8_ (a format's straight-to-int8 reconstruct with load-time row scales): multiply
+// only; the caller has placed the row scales where the output conversion reads them.
+void Int8Gemm::gemm_prequant(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s) {
+    if (k % 4 || ldo % 4) throw std::invalid_argument("int8 gemm: k and ldo must be multiples of 4");
+    matmul(rows, k, tok, y, ldo, s);
 }
 
 }  // namespace tqllm_cuda
