@@ -68,7 +68,7 @@ int main() {
             const auto a = tqllm::top_dist(&lg[size_t(c) * 16], &id[size_t(c) * 16], s, recent0);
             const auto b = old_dist(&lg[size_t(c) * 16], &id[size_t(c) * 16], s, recent0);
             ++cases;
-            if (a.n != b.n || std::memcmp(a.id, b.id, sizeof a.id) || std::memcmp(a.p, b.p, sizeof(double) * size_t(a.n))) ++fails;
+            if (a.n != b.n || std::memcmp(a.id, b.id, sizeof(uint32_t) * size_t(a.n)) || std::memcmp(a.p, b.p, sizeof(double) * size_t(a.n))) ++fails;  // entries past n are unset
         }
         // acceptance: new helper vs the old loop, same seed
         const uint64_t seed = gen();
