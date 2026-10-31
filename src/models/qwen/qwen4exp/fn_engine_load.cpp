@@ -2,6 +2,7 @@
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
 #include <iterator>
+#include "debug.hpp"
 #include "device_free.hpp"
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
@@ -90,7 +91,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       ck(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep)); }
     // per-step temporaries grow with the prefill chunk (one layer at a time in prefill: measured 117 MB at chunk 16-64, 245 MB at 256; decode verify steps keep one span); TQFN_ARENA_MB overrides
     if (!f.hot_map_path.empty()) {
-        require(f.experts.empty() && !std::getenv("TQFN_KEEP_MAP") && !std::getenv("TQFN_EXPERT_PROFILE"),
+        require(f.experts.empty() && !tqllm::debug_cstr("keep_map") && !tqllm::debug_cstr("expert_profile"),
                 "hot/cold: use original GGUFs, not pruning or a single-format packed bank/profile");
         require(nslots == 1 && f.cold_slots >= 1 && f.cold_slots <= 512, "hot/cold pilot: one session and cold_slots 1..512 required");
         f.chunk = std::min(f.chunk, 8); // pilot uses the same mixed-precision path for prefill and decode
@@ -246,7 +247,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
-    static std::vector<int32_t> keep_map; int keep_k = 0;  // TQFN_KEEP_MAP (pack-file path only)
+    static std::vector<int32_t> keep_map; int keep_k = 0;  // TQLLM_DEBUG=keep_map (pack-file path only)
     if (pack_in_memory) {  // no experts file: the same bytes, built from the GGUF (decode_rules.hpp build_pack_in_memory)
         const auto t0 = std::chrono::steady_clock::now();
         f.packed = build_packed(checkpoint, std::max(4, std::min(32, int(std::thread::hardware_concurrency()))));
@@ -255,11 +256,11 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     } else {
     f.packed = open_packed(f.experts);
-    // TQFN_KEEP_MAP=FILE (expert pruning): int32 [layers][experts], each expert's index in a compact pack or -1 (pruned); the router
+    // TQLLM_DEBUG=keep_map:FILE (expert pruning): int32 [layers][experts], each expert's index in a compact pack or -1 (pruned); the router
     // masks pruned experts out (g_keep_mask) and the pack holds only the kept ones (K per layer)
-    if (const char * km = std::getenv("TQFN_KEEP_MAP")) {
+    if (const char * km = tqllm::debug_cstr("keep_map")) {
         keep_map.assign(size_t(c.layers) * c.experts, -1);
-        FILE * mf = std::fopen(km, "rb"); require(mf && std::fread(keep_map.data(), 4, keep_map.size(), mf) == keep_map.size(), std::string("TQFN_KEEP_MAP: cannot read ") + km);
+        FILE * mf = std::fopen(km, "rb"); require(mf && std::fread(keep_map.data(), 4, keep_map.size(), mf) == keep_map.size(), std::string("TQLLM_DEBUG=keep_map: cannot read ") + km);
         std::fclose(mf);
         std::vector<float> mask(keep_map.size());
         for (size_t i = 0; i < keep_map.size(); ++i) { mask[i] = keep_map[i] < 0 ? -INFINITY : 0.f; keep_k = std::max(keep_k, keep_map[i] + 1); }
@@ -421,13 +422,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               std::fprintf(stderr, "tqllm: expert slots: %d per layer (%d with a full context's state kept; a long prompt's layers share what is free)\n", f.slots, tier_a);
           }
       }
-      // TQFN_EXPERT_PROFILE=FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
+      // TQLLM_DEBUG=expert_profile:FILE (int32 counts [layers][experts], tools/fn_expert_profile.py): the banks start with each
       // layer's most-routed experts instead of what the synthetic warm-up prompt happened to route (the first request
       // otherwise runs on a cold cache)
-      if (const char * prof = std::getenv("TQFN_EXPERT_PROFILE")) {
+      if (const char * prof = tqllm::debug_cstr("expert_profile")) {
           std::ifstream in(prof, std::ios::binary); std::vector<int32_t> cnt(size_t(c.layers) * c.experts);
           in.read(reinterpret_cast<char *>(cnt.data()), std::streamsize(cnt.size() * 4));
-          if (!in) throw std::runtime_error(std::string("TQFN_EXPERT_PROFILE: cannot read ") + prof + " as int32 [layers][experts]");
+          if (!in) throw std::runtime_error(std::string("TQLLM_DEBUG=expert_profile: cannot read ") + prof + " as int32 [layers][experts]");
           int seeded = 0;
           for (int l = 0; l < c.layers; ++l) {
               if (!f.cache->has_layout(l)) continue;

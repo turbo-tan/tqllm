@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next CPU expert-miss pool (x86 AVX2): missed experts computed on the CPU from the pinned packed copy.
+#include "debug.hpp"
 #include "fn_checkpoint.hpp"
 #if defined(__x86_64__)
 inline const int8_t kCpuIq4nl[16] = {
@@ -273,7 +274,7 @@ public:
                                 double(jobs_sum_) / calls_, double(cols_sum_) / calls_, gu_wall_ms_ / calls_, cpu_ns_gu_.load() / 1e6 / calls_,
                                 dn_wall_ms_ / calls_, cpu_ns_dn_.load() / 1e6 / calls_);
         for (auto & [t, e] : check_gu_) std::printf("CPU_CHECK gate/up type %u int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", t, e.first, e.second);
-        if (std::getenv("TQFN_CPU_CHECK")) std::printf("CPU_CHECK packed-row rebuild mismatches vs GGUF: %llu\n", (unsigned long long) row_mismatch_);
+        if (tqllm::debug_cstr("cpu_check")) std::printf("CPU_CHECK packed-row rebuild mismatches vs GGUF: %llu\n", (unsigned long long) row_mismatch_);
         if (check_mag_ > 0) std::printf("CPU_CHECK down int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", check_err_, check_mag_);
     }
     // x: n tokens x hidden (fp32, rounded to fp16 like the GPU input); out: one bf16 row of `hidden` per job column.
@@ -321,7 +322,7 @@ private:
                 std::printf("CPU_MISS first GGUF-mapping row: matrix %d fmt %d gguf type %u\n", m, j.fmt[m], j.type[m]);
             return gguf;
         }
-        static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+        static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
         if (check && std::memcmp(q, gguf, j.row_bytes[m]) != 0) { std::lock_guard<std::mutex> l(m_); ++row_mismatch_; }
         return q;
     }
@@ -346,7 +347,7 @@ private:
                     for (int c = 0; c < j.ncols; ++c) {
                         const int t = j.cols_t[c];
                         const float acc = fast ? fo[c] : cpu_dot_f32(row.data(), x_.data() + size_t(t) * hidden_, hidden_);
-                        static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+                        static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
                         if (check && fast) {
                             std::vector<float> ref(hidden_); dequantize_host(j.type[m], wr, ref.data(), hidden_);
                             const float want = cpu_dot_f32(ref.data(), x_.data() + size_t(t) * hidden_, hidden_);
@@ -387,7 +388,7 @@ private:
                                     : q2 ? cpu_dot_q2_0_q8p(wu, ap.data() + size_t(c) * ff_, ad.data() + size_t(c) * ff_ / 32, as.data() + size_t(c) * ff_ / 32, ff_ / 64)
                                          : cpu_dot_f32(row.data(), act_.data() + size_t(j.slot + c) * ff_, ff_);
                     out_[size_t(j.slot + c) * hidden_ + r] = __float2bfloat16_rn(acc);
-                    static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+                    static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
                     if (check && (nl || q2)) {  // int8 kernel vs dequantize_host + fp32 dot
                         std::vector<float> ref(ff_); dequantize_host(j.type[2], wr, ref.data(), ff_);
                         const float want = cpu_dot_f32(ref.data(), act_.data() + size_t(j.slot + c) * ff_, ff_);

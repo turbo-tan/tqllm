@@ -29,7 +29,6 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
-| `TQFN_KEEP_MAP` | - | FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path |  |
 | `TQLLM_MLX_ANE_SERIAL` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_ANE_TIMING` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_COUNT_NODES` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
@@ -46,33 +45,12 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_DUMP_FFN` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DUMP_FFN_SLICE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_NAX_DRAFT_SHORTLIST` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
-| `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
-| `TQLLM_GLM_NO_GRAPH` | off | set (any value): the GLM-5.3-Flash engine decodes eagerly instead of replaying one captured single-token CUDA graph (same tokens, slower). The bring-up scripts' GLM_NO_GRAPH is read as well |  |
-| `TQLLM_GLM_DUMP` | off | set (any value): GLM-5.3-Flash prints the per-stage sums of the forward (same names as glm-ref and llama-eval-callback); implies TQLLM_GLM_NO_GRAPH. The bring-up scripts' GLM_DUMP is read as well |  |
-| `TQLLM_MINIMAX_DUMP` | off | FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py |  |
-| `TQLLM_MINIMAX_ROUTES` | off | FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map |  |
+| `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, glm_dump, glm_no_graph |  |
 | `TQLLM_MLX_WIRED_MIB` | unset (retain MLX default) | Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings. |  |
-| `TQFN_ARENA_LOG` | off | print the scratch arena high-water mark after each prefill |  |
-| `TQFN_CPU_CHECK` | off | check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF |  |
-| `TQFN_EXPERT_PROFILE` | - | seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune) |  |
 | `TQFN_DENSE_INT8` | 0 | 1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path) |  |
-| `TQFN_DUMP_GDN` | - | FILE: dump the GDN layer outputs (fixture comparison) |  |
-| `TQFN_LAYER_MAJOR` | on | 0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer) |  |
 | `TQFN_DRAFT_TAU` | 0.9 (np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
-| `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
-| `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
 | `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
-| `TQFN_PREFILL_INT8_FMT` | - | comma list of u4h format ids allowed on the int8 prefill path (default all) |  |
-| `TQFN_PREFILL_LOG` | off | per-layer and per-stage prefill timings (synchronises; slower) |  |
-| `TQFN_PROFILE_DECODE` | off | 1: the TQFN_PROFILE_REQ capture covers decode instead of prefill |  |
-| `TQFN_PROFILE_REQ` | - | N: profile the N-th request; also logs where a slow first token goes |  |
-| `TQFN_Q2_DOT_GROUPED` | off | GSQ Q2_0 grouped experts: 1 = the scalar kernel instead of tensor cores (A/B) |  |
-| `TQFN_QSA` | on | 0: dense attention at every length instead of QSA sparse attention past the indexer budget (changes output) |  |
-| `TQFN_QSA_CHECK` | off | QSA selection: compare the top-k select with a full sort (raises on any difference) |  |
-| `TQFN_QSA_SPLIT` | 16 | slices per decode QSA attention row; 0 or 1 = direct attention |  |
-| `TQFN_ROUTE_DUMP` | - | FILE: append routed expert ids per trunk layer call |  |
 | `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
 
 ## Retired (the tool stops; use the replacement)

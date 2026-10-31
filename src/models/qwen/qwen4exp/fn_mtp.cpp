@@ -35,7 +35,7 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
     if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
     require(a.len + n <= g_kv_capacity, "MTP KV exceeds the attention KV capacity");
     const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
-    const bool qsa_keys = tqfn_default_on("TQFN_QSA") && cp.has_tensor(prefix + "indexer.k_proj.weight");
+    const bool qsa_keys = cp.has_tensor(prefix + "indexer.k_proj.weight");
     for (int d = 0; d < n; d += 2048) {
         const int m = std::min(2048, n - d); ArenaMark scratch;
         Device<float> de(size_t(m) * h), en(size_t(m) * h), hn(size_t(m) * width), cat(size_t(m) * c.hc * 2 * h), res(size_t(m) * width);

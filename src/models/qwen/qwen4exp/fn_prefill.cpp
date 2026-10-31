@@ -1,4 +1,5 @@
 // Flash-Next layer-major prefill: dense sub-chunks, then the routed experts once per layer from the expert banks and the staged groups.
+#include "debug.hpp"
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
 
@@ -198,7 +199,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
         pf_mq = std::make_unique<Device<uint8_t>>(tqllm_cuda::mmq_act_bytes(n, h)); pf_tiles = std::make_unique<Device<int2>>(nt);
         tqllm_cuda::mmq_quantize_act(pf_xr->p, n, h, pf_mq->p, nullptr);
     }
-    static int mmq_checks = std::getenv("TQFN_PF_MMQ_CHECK") ? std::atoi(std::getenv("TQFN_PF_MMQ_CHECK")) : 0;
+    static int mmq_checks = tqllm::debug_cstr("pf_mmq_check") ? std::atoi(tqllm::debug_cstr("pf_mmq_check")) : 0;
     auto gemm_mmq = [&](const Mat & mm, const void * yq, int ny, int div, __nv_bfloat16 * y, int rows, const Pass & ps,
                         const __nv_bfloat16 * gate = nullptr, __half * act = nullptr, int fmt_override = -1) {
         const int id = fmt_override >= 0 ? fmt_override : mm.fmt->u4h_id();
@@ -206,7 +207,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
         const bool ok = tqllm_cuda::mmq_expert_gemm(id, static_cast<const uint8_t *>(mm.p), mm.aux, fmt_override < 0 && g_tile_experts && tqllm_cuda::tiled_block_bytes(id),
                                            rows, mm.cols, pf_idx->p + ps.at, st.idx_host + ps.at, pf_idx->p + ps.at + ps.W, ps.cap, ps.W,
                                            div, yq, ny, y, pf_tiles->p, int(pf_tiles->count), nullptr, gate, act);
-        // TQFN_PF_MMQ_CHECK=N: up to N MMQ GEMMs against the fp16 grouped kernel on the same pass, the first of each
+        // TQLLM_DEBUG=pf_mmq_check:N: up to N MMQ GEMMs against the fp16 grouped kernel on the same pass, the first of each
         // (format, projection shape) anywhere in the model
         static std::set<std::pair<int, int>> mmq_checked;
         if (ok && mmq_checks > 0 && mmq_checked.insert({id, rows}).second) {

@@ -638,7 +638,7 @@ private:
                      avail / 1e9, budget_ / 1e9);
         preload_hot(caps);
     }
-    // Hot / cold: with a routing profile (TQLLM_MINIMAX_ROUTES output: int64 [layers][experts]) each layer's bank starts
+    // Hot / cold: with a routing profile (TQLLM_DEBUG=minimax_routes output: int64 [layers][experts]) each layer's bank starts
     // with its most-routed experts; every other expert stays in the GGUF on disk until a token routes to it.
     std::string hot_map_;
     void preload_hot(const std::vector<int> & caps) {
@@ -1094,11 +1094,11 @@ private:
         return std::vector<uint32_t>(ids.begin() + 1, ids.end());
     }
 
-    // TQLLM_MINIMAX_ROUTES=FILE: per-layer routed-expert counts (int64 [layers][experts]) written at exit, for hot / cold
+    // TQLLM_DEBUG=minimax_routes:FILE: per-layer routed-expert counts (int64 [layers][experts]) written at exit, for hot / cold
     // expert maps (the counts also include verify rows that are rejected later)
     std::vector<int64_t> route_counts_;
     void count_routes(int layer, int n) {
-        static const char * path = std::getenv("TQLLM_MINIMAX_ROUTES");
+        static const char * path = tqllm::debug_cstr("minimax_routes");
         if (!path) return;
         if (route_counts_.empty()) route_counts_.assign(L_.size() * size_t(experts_), 0);
         std::vector<int> ids(static_cast<size_t>(n) * topk_);
@@ -1107,15 +1107,15 @@ private:
         for (int id : ids) if (id >= 0 && id < experts_) ++route_counts_[size_t(layer) * experts_ + size_t(id)];
     }
     void write_routes() const {
-        const char * path = std::getenv("TQLLM_MINIMAX_ROUTES");
+        const char * path = tqllm::debug_cstr("minimax_routes");
         if (!path || route_counts_.empty()) return;
         if (std::FILE * f = std::fopen(path, "wb")) { std::fwrite(route_counts_.data(), 8, route_counts_.size(), f); std::fclose(f); }
     }
 
-    // TQLLM_MINIMAX_DUMP=FILE: the residual stream after every layer, as records {int32 layer, pos, n; float [n][H]}
+    // TQLLM_DEBUG=minimax_dump:FILE: the residual stream after every layer, as records {int32 layer, pos, n; float [n][H]}
     // (tools/minimax_ref.py writes the same states as h1..hN)
     void dump(int layer, uint32_t pos, int n) {
-        static const char * path = std::getenv("TQLLM_MINIMAX_DUMP");
+        static const char * path = tqllm::debug_cstr("minimax_dump");
         if (!path) return;
         static std::FILE * f = std::fopen(path, "wb");
         if (!f) throw std::runtime_error(std::string("minimax: cannot write ") + path);

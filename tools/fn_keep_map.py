@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expert pruning map for TQFN_KEEP_MAP: from a routing profile (fn_expert_profile.py: int32 counts [layers][experts], the MTP row
+"""Expert pruning map for TQLLM_DEBUG=keep_map: from a routing profile (fn_expert_profile.py: int32 counts [layers][experts], the MTP row
 ignored), keep the K most-routed experts of every trunk layer. Writes int32 [layers][experts]: compact index (ascending expert id)
 or -1. usage: fn_keep_map.py PROFILE.bin LAYERS EXPERTS K OUT.map"""
 import sys, numpy as np

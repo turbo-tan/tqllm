@@ -1010,7 +1010,7 @@ private:
         std::vector<std::tuple<unsigned long long, int, int>> order;
         unsigned long long total = 0, placed = 0;
         if (!have)  // no profile: the same share of every layer (rank e of each layer before rank e + 1 of any)
-            std::fprintf(stderr, "tqllm: no MoE routing profile (%s): host experts spread evenly over the layers (TQLLM_MOE_PROFILE=FILE "
+            std::fprintf(stderr, "tqllm: no MoE routing profile (%s): host experts spread evenly over the layers (TQLLM_DEBUG=moe_profile:FILE "
                          "writes one, then --moe-profile FILE)\n", path.c_str());
         for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
             unsigned long long c = 0;
@@ -1458,7 +1458,7 @@ private:
                 alloc_moe_stage();
                 alloc_moe_cache();
             }
-            if (const char * pf = std::getenv("TQLLM_MOE_PROFILE")) {
+            if (const char * pf = tqllm::debug_cstr("moe_profile")) {
                 moe_prof_path = pf; moe_prof = Buf(size_t(cfg.layers) * cfg.expert_count * 8);
                 ck(cudaMemset(moe_prof.p, 0, size_t(cfg.layers) * cfg.expert_count * 8));
             }
@@ -1764,7 +1764,7 @@ private:
         std::fprintf(stderr, "tqllm: MoE host experts staged through %.0f MiB of VRAM (%d assignments)\n", total / 1048576.0,
                      moe_stage_slots);
     }
-    Buf moe_prof; std::string moe_prof_path;  // TQLLM_MOE_PROFILE: routing counts [L][E]
+    Buf moe_prof; std::string moe_prof_path;  // TQLLM_DEBUG=moe_profile: routing counts [L][E]
     void moe_profile_write() {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         ck(cudaStreamIsCapturing(stream, &cs));

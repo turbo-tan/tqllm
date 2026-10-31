@@ -1,4 +1,5 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
+#include "debug.hpp"
 #include "fn_engine.hpp"
 #include <map>
 #include "decode_rules.hpp"
@@ -68,15 +69,15 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     S().model_->mtp_experts = f_.mtp_cache.get();
     bind();
     const std::vector<int> ids(prompt.begin(), prompt.end());
-    // TQFN_PROFILE_REQ=N: cudaProfilerStart at the N-th request's prefill, stop after it (nsys --capture-range=cudaProfilerApi)
-    static const int prof_req = std::getenv("TQFN_PROFILE_REQ") ? std::atoi(std::getenv("TQFN_PROFILE_REQ")) : 0; static int req_no = 0;
-    // TQFN_PROFILE_DECODE=1: the capture covers that request's decode instead of its prefill
-    static const bool prof_decode = std::getenv("TQFN_PROFILE_DECODE") && std::atoi(std::getenv("TQFN_PROFILE_DECODE")) != 0;
+    // TQLLM_DEBUG=profile_req:N: cudaProfilerStart at the N-th request's prefill, stop after it (nsys --capture-range=cudaProfilerApi)
+    static const int prof_req = tqllm::debug_cstr("profile_req") ? std::atoi(tqllm::debug_cstr("profile_req")) : 0; static int req_no = 0;
+    // TQLLM_DEBUG=profile_decode:1: the capture covers that request's decode instead of its prefill
+    static const bool prof_decode = tqllm::debug_cstr("profile_decode") && std::atoi(tqllm::debug_cstr("profile_decode")) != 0;
     const bool profiling = prof_req > 0 && ++req_no == prof_req && !prof_decode;
     g_profile_decode_req = prof_req > 0 && req_no == prof_req && prof_decode;
     if (profiling) ck(cudaProfilerStart());
     S().t_begin_ = std::chrono::steady_clock::now(); S().prefill_us_ = S().decode_us_ = 0;
-    static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;  // TQFN_PROFILE_REQ: host timeline of the request
+    static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;  // TQLLM_DEBUG=profile_req: host timeline of the request
     const auto stamp = [&](const char * what) { if (req_log) std::fprintf(stderr, "tqllm: req +%.3f s %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - S().t_begin_).count(), what); };
     S().out_.clear(); S().out_view_.clear(); S().generate_ = int(count); S().steps_ = S().toks_ = 0;
     // Trunk prefill first, then the MTP catch-up, so their working sets do not add up: a prompt longer than one chunk
@@ -266,7 +267,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         S().model_->release_prefill(); S().model_->pf_borrowed.clear();
         if (heads_parked) { checkpoint.unpark_heads(); heads_parked = 0; S().out_.push_back(pick(last_row->p, 1)[0]); last_row.reset(); }
         mem_note("prefill buffers released");
-        if (std::getenv("TQFN_PROFILE_REQ")) std::fprintf(stderr, "tqllm: req +%.3f s buffers released\n", std::chrono::duration<double>(pclk::now() - p0).count());
+        if (tqllm::debug_cstr("profile_req")) std::fprintf(stderr, "tqllm: req +%.3f s buffers released\n", std::chrono::duration<double>(pclk::now() - p0).count());
         auto tl = pclk::now();
         // residual rows staged through a small device buffer, a whole number of catch-up batches, starting at each
         // chunk boundary so the batches are the ones the interleaved order ran
@@ -310,7 +311,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             }
         lap(mtp_ms, tl);
         mem_note("after MTP catch-up");
-        if (std::getenv("TQFN_PROFILE_REQ")) std::fprintf(stderr, "tqllm: req +%.3f s after MTP catch-up\n", std::chrono::duration<double>(pclk::now() - p0).count());
+        if (tqllm::debug_cstr("profile_req")) std::fprintf(stderr, "tqllm: req +%.3f s after MTP catch-up\n", std::chrono::duration<double>(pclk::now() - p0).count());
     }
     if (g_prefill_log) std::fprintf(stderr, "tqllm: prefill %d tokens %.1f s: trunk %.1f s (QSA %.1f s), MTP catch-up %.1f s\n", P,
         std::chrono::duration<double>(pclk::now() - p0).count(), trunk_ms / 1000, g_qsa_ms / 1000, mtp_ms / 1000);
@@ -335,7 +336,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (f_.cold_store) S().cold_store_at_decode_ = f_.cold_store->stats();
     if (f_.cold_fetch_queue) S().cold_fetch_at_decode_ = f_.cold_fetch_queue->stats();
     if (g_profile_decode_req) ck(cudaProfilerStart());
-    if (g_arena && std::getenv("TQFN_ARENA_LOG")) std::fprintf(stderr, "tqllm: prefill %d tokens, arena high %.0f MB of %.0f\n", P, g_arena->high / 1048576.0, g_arena->size / 1048576.0);
+    if (g_arena && tqllm::debug_cstr("arena")) std::fprintf(stderr, "tqllm: prefill %d tokens, arena high %.0f MB of %.0f\n", P, g_arena->high / 1048576.0, g_arena->size / 1048576.0);
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());
     (void) c;
 }

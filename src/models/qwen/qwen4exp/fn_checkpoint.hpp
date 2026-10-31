@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next weights: the GGUF checkpoint, resident tensors and the dense projection dispatch; stage fixtures.
+#include "debug.hpp"
 #include "decode_rules.hpp"
 #include "fn_runtime.hpp"
 #include <functional>
@@ -296,7 +297,7 @@ public:
     // Greedy head for the last row of a device [count][hidden] F32 block; the matrix stays resident.
     // Greedy head for every row of a device [count][hidden] F32 block in one weight read (speculative verify).
     std::vector<int> head_argmax_rows(const float * rows, int count) const {
-        static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;  // diagnostic: where a slow first token goes
+        static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;  // diagnostic: where a slow first token goes
         const auto t0 = std::chrono::steady_clock::now();
         const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
         const auto * r = &head_resident();
@@ -383,7 +384,7 @@ public:
         return (*ids)[size_t(argmax_rows(output.p, int(ids->size()), 1)[0])];
     }
     const Resident & head_resident() const {
-        static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;
+        static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         const auto & f = file("output.weight"); const auto & t = f.file().tensors.at("output.weight");
         auto & r = resident_["output.weight"]; if (!r) r = std::make_unique<Resident>();

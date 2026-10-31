@@ -1,6 +1,7 @@
 #include <string>
 #include <cstdlib>
 #include <vector>
+#include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
@@ -738,8 +739,8 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
     const int width = std::min(cells, scratch.width_cap);
     // blocks a selection can reach: rank < width - tail, so block index <= (width - 1) / ratio
     const int need_cap = (width - 1) / ratio_ + 1;
-    constexpr bool topk_on = true;  // top-k select instead of a full sort (TQFN_QSA_CHECK compares them)
-    static const bool check = std::getenv("TQFN_QSA_CHECK") != nullptr;
+    constexpr bool topk_on = true;  // top-k select instead of a full sort (TQLLM_DEBUG=qsa_check compares them)
+    static const bool check = tqllm::debug_cstr("qsa_check") != nullptr;
     const bool topk = topk_on && need_cap <= kTopkCap && int64_t(tokens) * kTopkCap <= int64_t(scratch.max_queries) * scratch.max_blocks;
     int stride = blocks;
     if (blocks > 0 && topk) {

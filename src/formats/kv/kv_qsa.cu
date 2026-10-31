@@ -400,8 +400,7 @@ constexpr int64_t kQsaSplitPart = int64_t(16) * 32 * 16 * (256 + 2);  // rows x 
 void qsa_set_split(int splits) { g_qsa_split = splits; }
 // TQFN_QSA_SPLIT (default 16; 0 or 1 = attention_direct): slices per decode attention row
 static int qsa_split_count() {
-    static const int env = std::getenv("TQFN_QSA_SPLIT") ? std::atoi(std::getenv("TQFN_QSA_SPLIT")) : 16;
-    return g_qsa_split >= 0 ? g_qsa_split : env;
+    return g_qsa_split >= 0 ? g_qsa_split : 16;  // slices per decode QSA attention row (tests set g_qsa_split)
 }
 static float * g_qsa_split_part = nullptr;
 static float * qsa_split_scratch(cudaStream_t stream) {

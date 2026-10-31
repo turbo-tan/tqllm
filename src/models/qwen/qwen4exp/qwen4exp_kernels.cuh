@@ -170,7 +170,7 @@ public:
     int32_t * positions = nullptr;  // [max_queries][width_cap]
     uint8_t * valid = nullptr;
     // lean: only the top-k path can run (every query needs <= 1024 blocks and the context has >= 1024): keys holds 32-bit
-    // score bits and sorted 1024 keys per query, no sort temp; full() switches to the full-sort buffers (TQFN_QSA_CHECK)
+    // score bits and sorted 1024 keys per query, no sort temp; full() switches to the full-sort buffers (TQLLM_DEBUG=qsa_check)
     bool lean = false;
     void full();
 };

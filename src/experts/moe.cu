@@ -437,7 +437,7 @@ void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream
         else param_launch<kParamCopyMax>(src, len, d, stream);
     }
 }
-// Expert pruning (TQFN_KEEP_MAP): logits[t][e] += mask[e] for e < experts (0 kept, -inf pruned); the shared-expert column stays.
+// Expert pruning (TQLLM_DEBUG=keep_map): logits[t][e] += mask[e] for e < experts (0 kept, -inf pruned); the shared-expert column stays.
 __global__ void logits_mask_k(float * logits, const float * mask, int n, int ld, int experts) {
     const int t = blockIdx.x;
     for (int e = threadIdx.x; e < experts; e += blockDim.x) logits[size_t(t) * ld + e] += mask[e];

@@ -1,4 +1,5 @@
 // Flash-Next layer forward (decode, verify and short prefill chunks) and the router.
+#include "debug.hpp"
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
 #include <map>
@@ -176,7 +177,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         router(prefix, mixed.p, logits.p, n);
         if (predict) router(np, mixed.p, nl->p, n);
     }
-    if (g_keep_mask && trunk) {  // TQFN_KEEP_MAP: pruned experts never win the top-k
+    if (g_keep_mask && trunk) {  // TQLLM_DEBUG=keep_map: pruned experts never win the top-k
         tqllm_cuda::logits_mask(logits.p, g_keep_mask + size_t(layer) * c.experts, n, c.experts + 1, c.experts, nullptr);
         if (predict) tqllm_cuda::logits_mask(nl->p, g_keep_mask + size_t(layer + 1) * c.experts, n, c.experts + 1, c.experts, nullptr);
     }
@@ -377,11 +378,11 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 routed_ids[a] = to[a]; ck(cudaMemsetAsync(weights.p + a, 0, sizeof(float), nullptr)); ++skipped;
             }
         }
-        if (static FILE * dump = std::getenv("TQFN_ROUTE_DUMP") ? std::fopen(std::getenv("TQFN_ROUTE_DUMP"), "ab") : nullptr; dump && trunk) {
+        if (static FILE * dump = tqllm::debug_cstr("route_dump") ? std::fopen(tqllm::debug_cstr("route_dump"), "ab") : nullptr; dump && trunk) {
             const int32_t hdr[2] = {layer, n}; std::fwrite(hdr, 4, 2, dump); std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
         }
         // Routed and predicted next-layer ids per trunk layer call, for offline cache simulation.
-        if (static FILE * dump = std::getenv("TQFN_PRED_DUMP") ? std::fopen(std::getenv("TQFN_PRED_DUMP"), "ab") : nullptr; dump && trunk) {
+        if (static FILE * dump = tqllm::debug_cstr("pred_dump") ? std::fopen(tqllm::debug_cstr("pred_dump"), "ab") : nullptr; dump && trunk) {
             const int32_t hdr[3] = {layer, n, predict ? A : 0}; std::fwrite(hdr, 4, 3, dump);
             std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
             if (predict) std::fwrite(ids_host.p + A, 4, size_t(A), dump);
@@ -543,7 +544,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         }
     } else {
         const auto routed_ids = routed.get(); auto h1 = clk::now();
-        if (static FILE * dump = std::getenv("TQFN_ROUTE_DUMP") ? std::fopen(std::getenv("TQFN_ROUTE_DUMP"), "ab") : nullptr; dump && trunk) {
+        if (static FILE * dump = tqllm::debug_cstr("route_dump") ? std::fopen(tqllm::debug_cstr("route_dump"), "ab") : nullptr; dump && trunk) {
             const int32_t hdr[2] = {layer, n}; std::fwrite(hdr, 4, 2, dump); std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
         }
         const auto slots = cache.prepare(layer, routed_ids); routed.put(slots); auto h2 = clk::now();

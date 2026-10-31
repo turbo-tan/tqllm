@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flash-Next routing profile for TQFN_EXPERT_PROFILE: counts every routed (layer, expert) in TQFN_ROUTE_DUMP files
+"""Flash-Next routing profile for TQLLM_DEBUG=expert_profile: counts every routed (layer, expert) in TQLLM_DEBUG=route_dump files
 (records: int32 layer, int32 n, n * topk int32 ids) and writes int32 counts [layers][experts].
 usage: fn_expert_profile.py OUT.bin LAYERS EXPERTS TOPK DUMP [DUMP ...]"""
 import struct, sys

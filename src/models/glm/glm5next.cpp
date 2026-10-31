@@ -3,7 +3,8 @@
 //   4 mHC streams; per layer hc_pre -> RMSNorm -> KDA (3 of 4 layers) or nope MLA -> hc_post, then
 //   hc_pre -> RMSNorm -> dense SwiGLU (first layers) or sigmoid MoE + shared expert -> hc_post; mean -> head.
 // Matrices go through the weight-format registry (Q8_0, Q6_K, Q2_K, IQ2_S, ...); tensors without a format
-// (F32 / BF16 / F16) run as FP32. TQLLM_GLM_DUMP=1 prints the per-stage sums glm-ref prints (`dump name-layer sum`).
+// (F32 / BF16 / F16) run as FP32. TQLLM_DEBUG=glm_dump prints the per-stage sums glm-ref prints (`dump name-layer sum`).
+#include "debug.hpp"
 #include "device_free.hpp"
 #include "dequant.hpp"
 #include "dev_alloc.cuh"
@@ -45,8 +46,6 @@ using bf16 = __nv_bfloat16;
 void ck(cudaError_t e) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("glm5next: ") + cudaGetErrorString(e));
 }
-// config/flags.yaml name, plus the short GLM_* name the bring-up scripts in ref/ use
-bool env_on(const char * registered, const char * legacy) { return std::getenv(registered) || std::getenv(legacy); }
 
 struct Buf {
     void * p = nullptr;
@@ -116,9 +115,9 @@ public:
         open_maps();
         load();
         alloc();
-        dump_ = env_on("TQLLM_GLM_DUMP", "GLM_DUMP");
+        dump_ = tqllm::debug_on("glm_dump");
         // the bank path decides on the host which experts a layer needs, so it cannot be one captured graph
-        use_graph_ = !dump_ && !bank_mode_ && !env_on("TQLLM_GLM_NO_GRAPH", "GLM_NO_GRAPH");
+        use_graph_ = !dump_ && !bank_mode_ && !tqllm::debug_on("glm_no_graph");
     }
     ~Glm5NextEngine() override {
         // the bank frees its device banks through the engine's stream, so it goes before that stream is destroyed

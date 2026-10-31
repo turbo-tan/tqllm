@@ -26,6 +26,11 @@ inline const std::string * debug_value(const char * key) {
     return it == items.end() ? nullptr : &it->second;
 }
 inline bool debug_on(const char * key) { return debug_value(key) != nullptr; }
+// the value as a C string ("" when given without one); nullptr when the key is absent
+inline const char * debug_cstr(const char * key) {
+    const auto * v = debug_value(key);
+    return v ? v->c_str() : nullptr;
+}
 inline int debug_int(const char * key) {
     const auto * v = debug_value(key);
     return v ? std::atoi(v->c_str()) : 0;

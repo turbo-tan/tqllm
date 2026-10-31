@@ -129,15 +129,15 @@ inline void cpu_q8k_round(std::vector<float> & values) {
 // one buffer that is reset per decode step, so a token makes no allocation calls. State that outlives a step must be
 // allocated under PersistentAlloc.
 struct ScratchArena { char * base = nullptr; size_t size = 0, used = 0, high = 0; };
-inline bool g_prefill_log = std::getenv("TQFN_PREFILL_LOG") != nullptr; inline double g_qsa_ms = 0;  // prefill profile (syncs)
+inline bool g_prefill_log = tqllm::debug_cstr("fn_prefill_log") != nullptr; inline double g_qsa_ms = 0;  // prefill profile (syncs)
 inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
-inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled request is in its decode
+inline bool g_profile_decode_req = false;  // TQLLM_DEBUG=profile_decode: the profiled request is in its decode
 inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
 inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
 inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
 inline uint64_t g_kv_epoch = 0;   // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
 inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
-// TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
+// TQLLM_DEBUG=keep_map (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
 inline const std::vector<int32_t> * g_hot_map = nullptr;
 inline MixedExpertCache * g_cold_cache = nullptr;
 inline const float * g_keep_mask = nullptr;
@@ -153,7 +153,7 @@ struct FnTune { int chunk = 16384, sub = 2048, stage = 192, dense_min = 256, bor
 inline FnTune g_tune;
 inline size_t dense_half_pool_bytes() { return size_t(std::max(0L, g_tune.dense_cache_mb)) << 20; }
 inline void dense_half_release() {
-    if (g_dhc.base && std::getenv("TQFN_PREFILL_LOG")) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", g_dhc.high / 1048576.0, g_dhc.cap / 1048576.0);
+    if (g_dhc.base && tqllm::debug_cstr("fn_prefill_log")) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", g_dhc.high / 1048576.0, g_dhc.cap / 1048576.0);
     if (g_dhc.base) cudaFree(g_dhc.base); g_dhc = DenseHalfCache{};
 }
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)

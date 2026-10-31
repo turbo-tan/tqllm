@@ -240,8 +240,8 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     shape(w, x, y, r, k, 1, 1);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid grouped expert dimensions");
-    // TQFN_Q2_DOT_GROUPED=1: the scalar kernel (A/B); default: tensor cores when k is a multiple of 64
-    static const bool scalar = std::getenv("TQFN_Q2_DOT_GROUPED") && std::atoi(std::getenv("TQFN_Q2_DOT_GROUPED")) != 0;
+    // tensor cores when k is a multiple of 64 (dfd89eb: 32K prefill 1029.7 -> 1105.1, identical tokens)
+    constexpr bool scalar = false;
     if (!scalar && capacity <= 65535 * 64) {
         if(capacity<=8)q2_gemm_grouped<1><<<dim3(unsigned((r+63)/64),1,unsigned(experts)),256,0,s>>>(
             static_cast<const unsigned char *>(w),x,y,r,k,counts,groups,capacity,topk,per_expert);

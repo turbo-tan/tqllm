@@ -3,10 +3,6 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
-  - name: TQFN_KEEP_MAP
-    kind: debug
-    default: "-"
-    doc: "FILE: private compact-expert diagnostic map; incompatible with the full-routing hot/cold path"
   - name: TQLLM_MLX_ANE_FFN
     kind: user
     default: "-"
@@ -87,34 +83,14 @@ flags:
     kind: user
     default: "-"
     doc: "N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best)"
-  - name: TQLLM_MOE_PROFILE
-    kind: debug
-    default: "-"
-    doc: "FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill"
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"
-    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits)"
+    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, glm_dump, glm_no_graph"
   - name: TQLLM_MATVEC_RULE
     kind: user
     default: "-"
     doc: "override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: \"BITS:KERNEL[:PF],... (KERNEL legacy or split16)\", e.g. \"3:split16:2,21:legacy\" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3)"
-  - name: TQLLM_GLM_NO_GRAPH
-    kind: debug
-    default: "off"
-    doc: "set (any value): the GLM-5.3-Flash engine decodes eagerly instead of replaying one captured single-token CUDA graph (same tokens, slower). The bring-up scripts' GLM_NO_GRAPH is read as well"
-  - name: TQLLM_GLM_DUMP
-    kind: debug
-    default: "off"
-    doc: "set (any value): GLM-5.3-Flash prints the per-stage sums of the forward (same names as glm-ref and llama-eval-callback); implies TQLLM_GLM_NO_GRAPH. The bring-up scripts' GLM_DUMP is read as well"
-  - name: TQLLM_MINIMAX_DUMP
-    kind: debug
-    default: "off"
-    doc: "FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py"
-  - name: TQLLM_MINIMAX_ROUTES
-    kind: debug
-    default: "off"
-    doc: "FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map"
   - name: TQLLM_GLM_EXPERT_SLOTS
     kind: user
     default: "0"
@@ -308,22 +284,10 @@ flags:
     kind: debug
     default: "unset (retain MLX default)"
     doc: "Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings."
-  - name: TQFN_ARENA_LOG
-    kind: debug
-    default: "off"
-    doc: "print the scratch arena high-water mark after each prefill"
   - name: TQFN_ARENA_MB
     kind: user
     default: "-"
     doc: "MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit)"
-  - name: TQFN_CPU_CHECK
-    kind: debug
-    default: "off"
-    doc: "check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF"
-  - name: TQFN_EXPERT_PROFILE
-    kind: debug
-    default: "-"
-    doc: "seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune)"
   - name: TQFN_CPU_MISS
     kind: user
     default: "0"
@@ -336,10 +300,6 @@ flags:
     kind: user
     default: "-"
     doc: "FILE: the MTP draft vocabulary (overrides the manifest's draft_vocab)"
-  - name: TQFN_DUMP_GDN
-    kind: debug
-    default: "-"
-    doc: "FILE: dump the GDN layer outputs (fixture comparison)"
   - name: TQFN_KV
     kind: user
     default: "-"
@@ -352,10 +312,6 @@ flags:
     kind: user
     default: "32768"
     doc: "positions of K/V kept on the device with TQFN_KV_HOST=1"
-  - name: TQFN_LAYER_MAJOR
-    kind: debug
-    default: "on"
-    doc: "0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer)"
   - name: TQFN_LAYER_SLOTS
     kind: user
     default: "-"
@@ -372,54 +328,10 @@ flags:
     kind: debug
     default: "4 (6 with adaptive drafts)"
     doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
-  - name: TQFN_PF_MMQ_CHECK
-    kind: debug
-    default: "0"
-    doc: "N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel"
-  - name: TQFN_PRED_DUMP
-    kind: debug
-    default: "-"
-    doc: "FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation)"
   - name: TQFN_PREFILL_INT8
     kind: debug
     default: "0"
     doc: "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)"
-  - name: TQFN_PREFILL_INT8_FMT
-    kind: debug
-    default: "-"
-    doc: "comma list of u4h format ids allowed on the int8 prefill path (default all)"
-  - name: TQFN_PREFILL_LOG
-    kind: debug
-    default: "off"
-    doc: "per-layer and per-stage prefill timings (synchronises; slower)"
-  - name: TQFN_PROFILE_DECODE
-    kind: debug
-    default: "off"
-    doc: "1: the TQFN_PROFILE_REQ capture covers decode instead of prefill"
-  - name: TQFN_PROFILE_REQ
-    kind: debug
-    default: "-"
-    doc: "N: profile the N-th request; also logs where a slow first token goes"
-  - name: TQFN_Q2_DOT_GROUPED
-    kind: debug
-    default: "off"
-    doc: "GSQ Q2_0 grouped experts: 1 = the scalar kernel instead of tensor cores (A/B)"
-  - name: TQFN_QSA
-    kind: debug
-    default: "on"
-    doc: "0: dense attention at every length instead of QSA sparse attention past the indexer budget (changes output)"
-  - name: TQFN_QSA_CHECK
-    kind: debug
-    default: "off"
-    doc: "QSA selection: compare the top-k select with a full sort (raises on any difference)"
-  - name: TQFN_QSA_SPLIT
-    kind: debug
-    default: "16"
-    doc: "slices per decode QSA attention row; 0 or 1 = direct attention"
-  - name: TQFN_ROUTE_DUMP
-    kind: debug
-    default: "-"
-    doc: "FILE: append routed expert ids per trunk layer call"
   - name: TQFN_TAIL_SKIP
     kind: debug
     default: "-"

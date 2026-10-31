@@ -1043,9 +1043,6 @@ bool WeightFormat::expert_gemm_i8(const Mat & m, const int8_t * xq, const float 
                                    cudaStream_t stream, int mode) const {
     const int id = u4h_id();
     if (id != 1 && id != 4 && id != 5 && id != 6 && id != 7 && id != 10 && id != 13 && id != 14) return false;
-    // TQFN_PREFILL_INT8_FMT: comma list of u4h ids allowed on the int8 path (default all); e.g. 13,14 = IQ4 formats only
-    static const std::string allow = std::getenv("TQFN_PREFILL_INT8_FMT") ? std::getenv("TQFN_PREFILL_INT8_FMT") : "";
-    if (!allow.empty() && ("," + allow + ",").find("," + std::to_string(id) + ",") == std::string::npos) return false;
     tqllm_cuda::k_expert_gemm_i8(id, static_cast<const uint8_t *>(m.p), m.aux, xq, xs, xsum, y, rows, m.cols, counts, groups,
                                  capacity, experts, topk, per_expert_input, stream, mode);
     return true;

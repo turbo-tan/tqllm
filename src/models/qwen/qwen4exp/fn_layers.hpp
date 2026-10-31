@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next layer cores: GDN recurrence, attention (dense and QSA) and the hyper-connection mixer.
+#include "debug.hpp"
 #include "fn_state.hpp"
 struct GdnPre { const float * qkv, * z, * a, * b; };
 inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p, float * result, int n,
@@ -107,7 +108,7 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
     if (fixtures && fixtures->has("final_output" + suffix))
         compare("gdn_sigmoid_norm" + suffix, gated.get(), fixtures->values("final_output" + suffix), .02);
     checkpoint.project(prefix + "ssm_out.weight", gated.p, projected.p, vh * dim, c.hidden, n);
-    if (const char * dump = std::getenv("TQFN_DUMP_GDN")) {
+    if (const char * dump = tqllm::debug_cstr("dump_gdn")) {
         std::vector<float> pv(size_t(n) * c.hidden); ck(cudaMemcpy(pv.data(), result, pv.size() * 4, cudaMemcpyDeviceToHost));
         for (const auto & [tag, values] : {std::pair<std::string, std::vector<float>>{"gated", gated.get()}, {"projected", pv}}) {
             std::ofstream file(std::filesystem::path(dump) / ("gdn-" + tag + suffix + ".f32"), std::ios::binary);
@@ -170,7 +171,7 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
         ck(cudaMemcpyAsync(carry->v->p + size_t(pos) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         // QSA (the model's own long-context attention): every token's indexer key is kept; once the context passes the
         // indexer budget each query attends to its top-k selected positions (dense attention is the same below it)
-        static const bool qsa_on = tqfn_default_on("TQFN_QSA");
+        constexpr bool qsa_on = true;  // the model's sparse attention (dense is the same below the top-k budget)
         const bool has_indexer = qsa_on && checkpoint.has_tensor(prefix + "indexer.k_proj.weight");
         const int top_k = 2048, ratio = 4, iheads = 4, idim = 128;
         if (has_indexer) {
