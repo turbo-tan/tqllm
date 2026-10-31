@@ -23,7 +23,7 @@ int DecodeModel::mtp_batch(const std::vector<int> & tokens, const float * h_rows
     Device<float> norm{size_t(width)}, out{size_t(h)};
     tqllm_cuda::hc_norm(residual->p + size_t(n - 1) * width, cp.dense_device(nx + "hc_head_norm.weight"), norm.p, h, c.hc, 1, float(cp.epsilon), nullptr);
     mix_device(cp, nx + "hc_head_", norm.p, 1, out.p, nullptr);
-    static const bool conf_on = std::getenv("TQFN_DRAFT_TAU") != nullptr;
+    const bool conf_on = g_draft_tau > 0.f;
     return cp.draft_head_argmax_device(out.p, 1, conf_on ? &draft_conf : nullptr);
 }
 
@@ -184,9 +184,9 @@ std::vector<int> DecodeModel::mtp_drafts(int d1, int count) {
     if (count <= 0) return {};  // drafts=0: plain decode (the length fix-up below assumes at least one draft)
     std::vector<int> d{d1};
     Device<float> hcopy{size_t(width)};
-    // TQFN_DRAFT_TAU=t: stop drafting once the last draft's top probability is below t (at least one draft). The verify
+    // g_draft_tau = t: stop drafting once the last draft's top probability is below t (at least one draft). The verify
     // output does not depend on the block length (greedy text identical for drafts 2-5), so the text is unchanged.
-    static const float tau = std::getenv("TQFN_DRAFT_TAU") ? std::strtof(std::getenv("TQFN_DRAFT_TAU"), nullptr) : 0.f;
+    const float tau = g_draft_tau;
     for (int i = 1; i < count && tqllm::flashnext::keep_drafting(tau, draft_conf); ++i) {
         ck(cudaMemcpyAsync(hcopy.p, mtp_h->p, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         d.push_back(mtp_batch({d.back()}, hcopy.p));

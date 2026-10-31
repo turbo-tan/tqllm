@@ -82,8 +82,6 @@ inline constexpr Flag ALL[] = {
     {"TQFN_KV_HOST_KEEP", Kind::User, "32768", "positions of K/V kept on the device with TQFN_KV_HOST=1", ""},
     {"TQFN_LAYER_SLOTS", Kind::User, "-", "comma list of expert slots per layer (overrides the packed file's .slots profile)", ""},
     {"TQFN_MTP_SLOTS", Kind::User, "256", "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)", ""},
-    {"TQFN_DRAFT_TAU", Kind::Debug, "0.9 (np 1)", "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off", ""},
-    {"TQFN_PREDICT_N", Kind::Debug, "4 (6 with adaptive drafts)", "next-layer prediction (prefetch) for verify blocks of up to N tokens", ""},
     {"TQFN_PREFILL_INT8", Kind::Debug, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
     {"TQFN_TAIL_SKIP", Kind::Debug, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""}
 };

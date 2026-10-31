@@ -78,6 +78,8 @@ inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_cap
 // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
 // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
 inline bool g_small_card = false;
+inline float g_draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
+inline int g_predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
 inline bool g_exact_mode = false;  // --exact on: no CPU miss pool (CPU-served experts make greedy text vary run to run)
 inline bool g_cpu_owned = false;  // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
 

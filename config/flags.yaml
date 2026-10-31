@@ -320,14 +320,6 @@ flags:
     kind: user
     default: "256"
     doc: "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)"
-  - name: TQFN_DRAFT_TAU
-    kind: debug
-    default: "0.9 (np 1)"
-    doc: "t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off"
-  - name: TQFN_PREDICT_N
-    kind: debug
-    default: "4 (6 with adaptive drafts)"
-    doc: "next-layer prediction (prefetch) for verify blocks of up to N tokens"
   - name: TQFN_PREFILL_INT8
     kind: debug
     default: "0"

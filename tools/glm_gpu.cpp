@@ -1,7 +1,7 @@
 // glm-gpu: the GPU GLM-5.3-Flash engine with glm-ref's command line and output, for a line-by-line comparison.
 //   glm-gpu MODEL.gguf --tokens 1,2,3 [--gen N | --force a,b,c] [--context N] [--step] [--spec D [--draft ids]]
 // --spec D decodes through verify() blocks of D+1 tokens and commits only the accepted prefix (the KDA state and conv
-// history roll back), so its tokens must be identical to the plain decode's. GLM_DUMP=1 adds the per-stage sums.
+// history roll back), so its tokens must be identical to the plain decode's. TQLLM_DEBUG=glm_dump adds the per-stage sums.
 #include "engine.hpp"
 
 #include <fstream>

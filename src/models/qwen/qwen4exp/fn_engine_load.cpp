@@ -127,13 +127,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
     // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
     // cards: their CPU expert pool takes blocks of at most kCpuPoolRows rows (decode_rules.hpp one_sequence_drafts).
-    // TQFN_DRAFT_TAU=0 turns it off; --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
-    if (const char * t = std::getenv("TQFN_DRAFT_TAU"); slots_.size() == 1 && (!t || std::strtof(t, nullptr) > 0.f)) {
+    // --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
+    if (slots_.size() == 1) {
         const DraftPlan plan = one_sequence_drafts(f.drafts, g_small_card);
         f.drafts = plan.drafts;
         if (plan.adaptive) {
-            if (!t) setenv("TQFN_DRAFT_TAU", "0.9", 1);
-            if (!std::getenv("TQFN_PREDICT_N")) setenv("TQFN_PREDICT_N", "6", 1);
+            g_draft_tau = 0.9f;
+            g_predict_n = 6;
         }
     }
     if (g_small_card) {

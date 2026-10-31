@@ -356,7 +356,7 @@ public:
         }
         return ids.empty() ? nullptr : &ids;
     }
-    // conf (optional): the draft's top softmax probability over the draft vocabulary (TQFN_DRAFT_TAU)
+    // conf (optional): the draft's top softmax probability over the draft vocabulary (g_draft_tau)
     int draft_head_argmax_device(const float * rows, int count, float * conf = nullptr) const {
         const auto * ids = draft_vocab();
         if (!ids) { if (conf) *conf = 1.f; return head_argmax_device(rows, count); }
