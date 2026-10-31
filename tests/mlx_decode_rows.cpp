@@ -302,6 +302,40 @@ bool safe_run_omega(int length, int n, std::mt19937& rng) {
     catch (const std::exception& e) {std::printf("OMEGA_GATE length=%d n=%d EXCEPTION %s FAIL\n", length, n, e.what()); return false;}
 }
 
+// v18 (int8 Q x int8 K): every row = its 1-row call bit for bit; error vs the FP32 reference at most 4x v12's
+bool run_v18(int length, int n, std::mt19937& rng) {
+    const int heads = 24, kvheads = 4, dim = 256, cap = (length + 1023) / 1024 * 1024 + 1024;
+    auto q = random_array(rng, {1, heads, n, dim}, 1.0f);
+    auto kv = quantize_kv_int8(mx::astype(random_array(rng, {1, kvheads, cap, dim}, 1.0f), mx::bfloat16),
+                               mx::astype(random_array(rng, {1, kvheads, cap, dim}, 1.0f), mx::bfloat16));
+    mx::eval(q, kv.k8t, kv.v8, kv.kscale, kv.vscale);
+    const float scale = 1.0f / std::sqrt(float(dim));
+    auto a = mx::contiguous(decode_rows_attention_v12(q, kv.k8t, kv.v8, kv.kscale, kv.vscale, scale, length));
+    auto b = mx::contiguous(decode_rows_attention_v18(q, kv.k8t, kv.v8, kv.kscale, kv.vscale, scale, length));
+    auto vd = mx::multiply(mx::astype(kv.v8, mx::float32), mx::expand_dims(mx::astype(kv.vscale, mx::float32), -1));
+    auto kq = mx::reshape(mx::astype(mx::transpose(mx::reshape(kv.k8t, {kvheads, -1, dim, 1024}), {0, 1, 3, 2}), mx::float32), {kvheads, -1, dim});
+    kq = mx::multiply(mx::slice(kq, {0, 0, 0}, {kvheads, cap, dim}), mx::expand_dims(mx::astype(kv.kscale, mx::float32), -1));
+    auto kref = mx::expand_dims(mx::slice(kq, {0, 0, 0}, {kvheads, length, dim}), 0), vref = mx::expand_dims(mx::slice(vd, {0, 0, 0}, {kvheads, length, dim}), 0);
+    auto ref = mx::contiguous(mx::fast::scaled_dot_product_attention(q, kref, vref, scale, n > 1 ? "causal" : ""));
+    mx::eval(a, b, ref);
+    const float peak = mx::max(mx::abs(ref)).item<float>();
+    const float ea = mx::max(mx::abs(mx::subtract(a, ref))).item<float>() / peak, eb = mx::max(mx::abs(mx::subtract(b, ref))).item<float>() / peak;
+    const bool bitwise = mx::array_equal(a, b).item<bool>();
+    bool rows = true;
+    for (int t = 0; t < n && rows; ++t) {
+        auto qt = mx::contiguous(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}));
+        auto one = mx::contiguous(decode_rows_attention_v18(qt, kv.k8t, kv.v8, kv.kscale, kv.vscale, scale, length - n + t + 1));
+        rows = mx::array_equal(one, mx::slice(b, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+    }
+    const bool gate_b = eb <= 4.0f * ea + 1e-6f;   // int8 Q: ~2.7x v12's error (j1438)
+    std::printf("DECODE_ROWS v18 length=%d n=%d rows_exact %d bitwise_v12 %d err %.3e v12_err %.3e %s\n", length, n, int(rows), int(bitwise), eb, ea, rows && gate_b ? "PASS" : "FAIL");
+    return rows && gate_b;
+}
+bool safe_run_v18(int length, int n, std::mt19937& rng) {
+    try { return run_v18(length, n, rng); }
+    catch (const std::exception& e) {std::printf("DECODE_ROWS v18 length=%d n=%d EXCEPTION %s FAIL\n", length, n, e.what()); return false;}
+}
+
 void bench(int heads, int kvheads, int dim, int length, int n, std::mt19937& rng) {
     const int cap = (length + 512 + 4095) / 4096 * 4096, calls = 16;  // a multiple of every segment size below (no padding copy)
     std::vector<mx::array> qs, ks, vs;
@@ -563,8 +597,10 @@ int main() {
         ok &= safe_run(8, 2, 128, 3000, 1, rng);
         ok &= safe_run(24, 4, 256, 16384, 8, rng);
     }
-    for (int length : {64, 1023, 1024, 1025, 4096, 8193, 16384, 32768, 65543})
+    for (int length : {64, 1023, 1024, 1025, 4096, 8193, 16384, 32768, 65543}) {
         for (int n : {1, 8, 16}) if (length >= n) ok &= safe_run_v12(24, 4, 256, length, n, rng);
+        for (int n : {1, 8, 16}) if (length >= n) ok &= safe_run_v18(length, n, rng);
+    }
     bool shapes = true;
     for (int ver : {7, 11}) {
         if (ver == 11 && !attention_v11_available()) continue;

@@ -960,6 +960,288 @@ inline mlx::core::array decode_rows_attention_v17(const mlx::core::array& q, con
     return mx::astype(mx::astype(y, mx::bfloat16), mx::float32);
 }
 
+// v18: S = int8 Q x int8 K on the matrix unit (int32 accumulate; Q quantized per row), softmax and PV as v16 at 32-key
+// rounds (FP16 P x V codes). Not bitwise v12: error vs FP64 ~2.7x v12's (j1438); 16-18 % faster than v16 at 16K-64K,
+// 8 and 16 rows (j1439: 64K n=8 1021 vs 1233 us). Used for every int8 call (1 row too), so spec == AR stays exact.
+inline mlx::core::array decode_rows_attention_v18(const mlx::core::array& q, const mlx::core::array& k8t,
+                                                    const mlx::core::array& v8, const mlx::core::array& kscale,
+                                                    const mlx::core::array& vscale, float scale, int length) {
+    namespace mx = mlx::core;
+    constexpr int kBlock = 1024, kDim = 256;
+    if (q.ndim() != 4 || q.shape(0) != 1 || q.shape(3) != kDim || q.dtype() != mx::float32 || q.shape(2) < 1 || q.shape(2) > 16)
+        throw std::invalid_argument("decode rows attention v18: q [1, heads, n <= 16, 256] FP32");
+    const int heads = q.shape(1), kvh = v8.shape(0), group = heads / kvh, n = q.shape(2), dim = kDim;
+    const int blocks = (length + kBlock - 1) / kBlock, cap = v8.shape(1);
+    if (kvh < 1 || heads % kvh || k8t.ndim() != 4 || k8t.shape(0) != kvh || k8t.shape(1) < blocks || k8t.shape(2) != dim || k8t.shape(3) != kBlock ||
+        k8t.dtype() != mx::int8 || v8.ndim() != 3 || v8.shape(2) != dim || v8.dtype() != mx::int8 || cap < length || length < 1 ||
+        kscale.shape() != mx::Shape{kvh, cap} || vscale.shape() != kscale.shape() || kscale.dtype() != mx::float16 || vscale.dtype() != mx::float16)
+        throw std::invalid_argument("decode rows attention v18: int8 K^T blocks [kvh, blocks, 256, 1024], V [kvh, cap, 256], FP16 scales [kvh, cap]");
+
+    const int rows = group * n, tiles = (rows + 15) / 16;
+    const int chunk = 32;
+    const int tpg = 1;
+    const int groups = (tiles + tpg - 1) / tpg;
+    const int qrows = groups * tpg * 16;
+
+    // Q to int8 with one FP32 scale per row (max |q| / 127, from the BF16-rounded query): the scale depends only on the
+    // row, so a row still equals its 1-row call bit for bit.
+    auto qbf = mx::astype(q, mx::bfloat16);
+    auto qf = mx::astype(qbf, mx::float32);
+    auto qmax = mx::max(mx::abs(qf), 3, true);
+    auto qscale = mx::maximum(mx::divide(qmax, mx::array(127.0f, mx::float32)),
+                              mx::array(1e-8f, mx::float32));
+    auto qq = mx::divide(qf, mx::reshape(qscale, {1, heads, n, 1}));
+    qq = mx::clip(qq, mx::array(-127.0f, mx::float32), mx::array(127.0f, mx::float32));
+    auto q8 = mx::astype(mx::round(qq), mx::int8);
+
+    q8 = mx::reshape(q8, {kvh, rows, dim});
+    auto qsc = mx::reshape(mx::astype(qscale, mx::float32), {kvh, rows});
+    if (qrows > rows) {
+        q8 = mx::concatenate({q8, mx::zeros({kvh, qrows - rows, dim}, mx::int8)}, 1);
+        qsc = mx::concatenate({qsc, mx::zeros({kvh, qrows - rows}, mx::float32)}, 1);
+    }
+    q8 = mx::contiguous(q8);
+    qsc = mx::contiguous(qsc);
+
+    static const char* header = R"METAL(
+#include <metal_simdgroup>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+)METAL";
+
+    static auto pass1 = mx::fast::metal_kernel(
+        "tqllm_attn_v18_pass1",
+        {"Q", "QS", "KT", "V", "KS", "VS", "P"},
+        {"M", "S", "O"},
+        R"METAL(
+    constexpr int C = CK, RP = TPG * 16, HD = DIM / 2, CQ = C / 4, NT = TPG * 64;
+    const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint tid = sg * 32 + lane;
+    const uint grp = threadgroup_position_in_grid.x, blk = threadgroup_position_in_grid.y, kh = threadgroup_position_in_grid.z;
+    const int r0 = int(grp) * RP;
+    const int L = P[0], NR = P[1], ROWS = P[3], NB = P[5], CAP = P[7], QROWS = P[8];
+    const float sc = as_type<float>(P[6]);
+    const int k0 = int(blk) * BLOCK, kn = min(BLOCK, L - k0);
+    const int tile = int(sg) / 2, half_d = int(sg) % 2;
+    const int row = int(tid) / 4, quarter = int(tid) % 4;
+    const int grow = r0 + row;
+    const int last = grow < ROWS ? L - NR + grow % NR : -1;
+
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+
+    threadgroup int32_t st[2][RP * C];
+    threadgroup half pt[RP * C];
+    threadgroup float arow[RP];
+    threadgroup float kscl[C], vscl[C];
+
+    const device int8_t* qrow = Q + (size_t(kh) * QROWS + r0 + tile * 16) * DIM;
+    const float qsc = QS[size_t(kh) * QROWS + grow];
+    const device int8_t* kt = KT + (size_t(kh) * P[4] + blk) * DIM * BLOCK;
+    const device int8_t* vv = V + size_t(kh) * CAP * DIM;
+
+    // S = int8 Q x int8 K on the matrix unit (int32); PV stays FP16 P x half(V) with FP32 accumulators.
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+
+    auto ca = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    auto cb = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+
+    auto pa = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto pb = op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto acc0 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
+    auto acc1 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
+    auto acc2 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
+    auto acc3 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
+    for (ushort i = 0; i < 16; ++i) {acc0[i] = 0.0f; acc1[i] = 0.0f; acc2[i] = 0.0f; acc3[i] = 0.0f;}
+
+    short dn[16], dm[16];
+    for (ushort i = 0; i < 16; ++i) {
+        if (acc0.is_valid_element(i)) {
+            const auto idx = acc0.get_multidimensional_index(i);
+            dn[i] = short(idx[0]); dm[i] = short(idx[1]);
+        } else {
+            dn[i] = -1; dm[i] = -1;
+        }
+    }
+
+    // This simdgroup's int8 Q fragments: 8 k-steps over its half of the head dim.
+    int8_t qa[8][8];
+    for (int ks = 0; ks < 8; ++ks) for (short i = 0; i < 4; ++i) {
+        const int d = (half_d * 8 + ks) * 16 + fn + i;
+        qa[ks][i] = qrow[size_t(fm) * DIM + d];
+        qa[ks][4 + i] = qrow[size_t(fm + 8) * DIM + d];
+    }
+
+    float m = -INFINITY, s = 0.0f;
+    for (int c0 = 0; c0 < kn; c0 += C) {
+        if (tid < uint(C)) {
+            const int key = k0 + c0 + int(tid);
+            kscl[tid] = key < L ? float(KS[size_t(kh) * CAP + key]) : 0.0f;
+            vscl[tid] = key < L ? float(VS[size_t(kh) * CAP + key]) : 0.0f;
+        }
+
+        {
+            for (int sub = 0; sub < C / 32; ++sub) {
+                auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), int32_t>();
+                for (ushort i = 0; i < 16; ++i) sacc[i] = 0;
+
+                for (int ks = 0; ks < 8; ++ks) {
+                    for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];
+
+                    for (short w = 0; w < 2; ++w) for (short h = 0; h < 2; ++h) {
+                        const int d = (half_d * 8 + ks) * 16 + fm + 8 * h;
+                        const char4 kv = *(const device char4*)(kt + size_t(d) * BLOCK + c0 + sub * 32 + w * 16 + fn);
+                        for (short i = 0; i < 4; ++i) cb[w * 8 + h * 4 + i] = int8_t(kv[i]);
+                    }
+                    op.run(ca, cb, sacc);
+                }
+
+                for (ushort i = 0; i < 16; ++i)
+                    if (dn[i] >= 0)
+                        st[half_d][(tile * 16 + dm[i]) * C + sub * 32 + dn[i]] = sacc[i];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            float x[CQ];
+            float lm = -INFINITY;
+            for (int j = 0; j < CQ; ++j) {
+                const int key = k0 + c0 + quarter * CQ + j;
+                const int e = row * C + quarter * CQ + j;
+                const float sdot = float(st[0][e]) + float(st[1][e]);
+                x[j] = key <= last ? sdot * qsc * kscl[quarter * CQ + j] * sc : -INFINITY;
+                lm = max(lm, x[j]);
+            }
+            lm = max(lm, simd_shuffle_xor(lm, 1));
+            lm = max(lm, simd_shuffle_xor(lm, 2));
+
+            const float mn = max(m, lm);
+            const float alpha = mn == m ? 1.0f : exp2(m - mn);
+
+            float ls = 0.0f;
+            for (int j = 0; j < CQ; ++j) {
+                const float pr = x[j] == -INFINITY ? 0.0f : exp2(x[j] - mn);
+                ls += pr;
+                pt[row * C + quarter * CQ + j] = half(pr * vscl[quarter * CQ + j]);
+            }
+            ls += simd_shuffle_xor(ls, 1);
+            ls += simd_shuffle_xor(ls, 2);
+
+            s = s * alpha + ls;
+            m = mn;
+            if (quarter == 0) arow[row] = alpha;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (ushort i = 0; i < 16; ++i) if (dm[i] >= 0) {
+            const float a = arow[tile * 16 + dm[i]];
+            if (a != 1.0f) {acc0[i] *= a; acc1[i] *= a; acc2[i] *= a; acc3[i] *= a;}
+        }
+
+        const threadgroup half* prow = pt + (tile * 16) * C;
+        for (int ks = 0; ks < C / 16; ++ks) {
+            for (short i = 0; i < 4; ++i) {
+                pa[i] = prow[fm * C + ks * 16 + fn + i];
+                pa[4 + i] = prow[(fm + 8) * C + ks * 16 + fn + i];
+            }
+
+            for (short nb = 0; nb < 4; ++nb) {
+                for (short w = 0; w < 2; ++w) for (short h = 0; h < 2; ++h) {
+                    const int kc = ks * 16 + fm + 8 * h;
+                    const int d0 = half_d * HD + nb * 32 + w * 16 + fn;
+                    const int key = k0 + c0 + kc;
+                    const char4 vv4 = key < CAP ? *(const device char4*)(vv + size_t(key) * DIM + d0) : char4(0);
+                    for (short i = 0; i < 4; ++i) pb[w * 8 + h * 4 + i] = half(vv4[i]);
+                }
+
+                if (nb == 0) op.run(pa, pb, acc0);
+                else if (nb == 1) op.run(pa, pb, acc1);
+                else if (nb == 2) op.run(pa, pb, acc2);
+                else op.run(pa, pb, acc3);
+            }
+        }
+    }
+
+    for (ushort i = 0; i < 16; ++i) if (dm[i] >= 0) {
+        const int r = r0 + tile * 16 + dm[i];
+        if (r >= ROWS) continue;
+        const size_t base = ((size_t(kh) * ROWS + r) * NB + blk) * DIM + half_d * HD;
+        O[base + dn[i]] = acc0[i];
+        O[base + 32 + dn[i]] = acc1[i];
+        O[base + 64 + dn[i]] = acc2[i];
+        O[base + 96 + dn[i]] = acc3[i];
+    }
+
+    if (grow < ROWS && quarter == 0) {
+        const size_t base = (size_t(kh) * ROWS + grow) * NB + blk;
+        M[base] = m;
+        S[base] = s;
+    }
+)METAL", header);
+
+    static auto pass2 = mx::fast::metal_kernel(
+        "tqllm_attn_v18_pass2",
+        {"M", "S", "O", "P"},
+        {"Y"},
+        R"METAL(
+    const uint lane = thread_index_in_simdgroup;
+    const uint r = threadgroup_position_in_grid.x, kh = threadgroup_position_in_grid.y;
+    const int ROWS = P[3], NB = P[5];
+
+    float m = -INFINITY, s = 0.0f, o[DIM / 32];
+    for (int e = 0; e < DIM / 32; ++e) o[e] = 0.0f;
+
+    for (int b = 0; b < NB; ++b) {
+        const size_t base = (size_t(kh) * ROWS + r) * NB + b;
+        const float mb = M[base], sb = S[base];
+        if (sb == 0.0f) continue;
+        const float mn = max(m, mb);
+        const float a = m == mn ? 1.0f : exp2(m - mn);
+        const float c = mb == mn ? 1.0f : exp2(mb - mn);
+        s = s * a + sb * c;
+        for (int e = 0; e < DIM / 32; ++e) o[e] = o[e] * a + O[base * DIM + e * 32 + lane] * c;
+        m = mn;
+    }
+
+    const size_t out = (size_t(kh) * ROWS + r) * DIM;
+    for (int e = 0; e < DIM / 32; ++e) Y[out + e * 32 + lane] = o[e] / s;
+)METAL");
+
+    std::vector<int32_t> p = {length, n, group, rows, k8t.shape(1), blocks, 0, cap, qrows};
+    float scf = scale * 1.4426950408889634f;
+    std::memcpy(&p[6], &scf, 4);
+    auto P = mx::array(p.data(), {9}, mx::int32);
+
+    const auto tpl = std::vector<std::pair<std::string, mx::fast::TemplateArg>>{
+        {"DIM", dim}, {"BLOCK", kBlock}, {"TPG", tpg}, {"CK", chunk}
+    };
+
+    auto part = pass1(
+        {q8, qsc, k8t, v8, kscale, vscale, P},
+        {{kvh * rows * blocks}, {kvh * rows * blocks}, {kvh * rows * blocks * dim}},
+        {mx::float32, mx::float32, mx::float32},
+        {64 * tpg * groups, blocks, kvh},
+        {64 * tpg, 1, 1},
+        tpl, std::nullopt, false, mx::Device(mx::Device::gpu)
+    );
+
+    auto y = pass2(
+        {part[0], part[1], part[2], P},
+        {{1, heads, n, dim}},
+        {mx::float32},
+        {rows * 32, kvh, 1},
+        {32, 1, 1},
+        tpl, std::nullopt, false, mx::Device(mx::Device::gpu)
+    )[0];
+
+    return mx::astype(mx::astype(y, mx::bfloat16), mx::float32);
+}
+
 // Omega candidate slot (rung 6, docs/steering/tqllm/mac/bundle/omega_attn_iter.sh): a candidate patch replaces this
 // body (and may add helpers above it); the pin forwards to v16 at 32-key rounds (the best kernel, bitwise = v12).
 // Contract: q [1, heads, n <= 16, 256] FP32, the v12 int8 cache layout, returns [1, heads, n, 256] FP32 (BF16-rounded);

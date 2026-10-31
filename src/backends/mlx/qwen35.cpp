@@ -840,10 +840,8 @@ struct Qwen35::Impl {
         const float scale=1.0f/std::sqrt(float(hd));
         mx::array out=mx::array(0.0f);
         if(m<=16) {
-            // int8 verify: v16 at 32-key rounds (= v12 bit for bit, test-mlx-decode-rows; j1188 64K 1237 vs 1361 us at 8 rows,
-            // 2418 vs 2910 at 16), v12 for a single row
-            out=int8?(m>1?decode_rows_attention_v16(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need,32):
-                          decode_rows_attention_v12(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need)):
+            // int8: v18 (int8 Q x K) for every row count, so a verify row equals the AR step's call bit for bit
+            out=int8?decode_rows_attention_v18(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
                      decode_rows_attention_tcq(q,*kb,*vb,scale,need);
         } else {
             mx::array keys=mx::array(0.0f),values=mx::array(0.0f);
