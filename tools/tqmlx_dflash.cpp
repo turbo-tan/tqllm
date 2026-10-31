@@ -29,7 +29,7 @@ int main(int argc,char** argv) {
         const int width_arg=argc>4?std::stoi(argv[4]):7,width=width_arg==0?15:width_arg,count=argc>5?std::stoi(argv[5]):128,reps=argc>6?std::stoi(argv[6]):5;
         const int shortlist=argc>7?std::stoi(argv[7]):32768,warmup=argc>8?std::stoi(argv[8]):1;
         if(width<1 || width>15 || count<2 || reps<1 || shortlist<16 || warmup<0)throw std::invalid_argument("invalid DFlash benchmark parameters");
-        int prefill_chunk=8192;  // the server's chunk (model_mlx.cpp): layer-major in 2048-row slices; a whole-prompt prefill at 24K needs a 53 GB score buffer (j729)
+        int prefill_chunk=8192;  // the server's chunk (engine_mlx.cpp): layer-major in 2048-row slices; a whole-prompt prefill at 24K needs a 53 GB score buffer (j729)
         if(const char* mode=std::getenv("TQLLM_MLX_PREFILL_CHUNK")) {
             prefill_chunk=std::stoi(mode);
             if(prefill_chunk<128)throw std::invalid_argument("TQLLM_MLX_PREFILL_CHUNK must be >=128");

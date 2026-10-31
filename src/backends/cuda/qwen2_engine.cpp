@@ -2,7 +2,7 @@
 #include "dev_alloc.cuh"
 #include "tqllm/model.hpp"
 #include "debug.hpp"
-#include "../fit_context.hpp"
+#include "../../engine/fit_context.hpp"
 #include "dev_alloc.cuh"
 #include "qwen2_kernels.cuh"
 #include "cuda_engines.hpp"

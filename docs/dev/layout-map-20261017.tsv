@@ -120,6 +120,6 @@ branch:kernels/expert_q8.cu	src/experts/expert_q8.cu
 branch:kernels/mmq_experts.cu	src/experts/mmq_experts.cu
 branch:tools/deepseek/*	tools/convert/deepseek/*
 branch:tools/nemotron/*	tools/convert/nemotron/*
-branch:src/mlx/*	src/backends/mlx/*
+branch:src/mlx/*	src/backends/metal/*
 branch:kernels/gdn_seq_fast.cuh	src/models/qwen/qwen4exp/gdn_seq_fast.cuh
 branch:kernels/third_party/ggml_mmq/*	third_party/ggml_mmq/*

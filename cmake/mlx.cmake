@@ -3,14 +3,14 @@ if(NOT APPLE)
 endif()
 find_package(MLX 0.32 CONFIG REQUIRED)
 enable_language(OBJCXX)
-add_library(tqmlx STATIC src/backends/mlx/tq4.cpp src/backends/mlx/tq3.cpp src/backends/mlx/q6.cpp src/backends/mlx/q8.cpp
-            src/backends/mlx/q4_embedding.cpp src/backends/mlx/weights.cpp src/backends/mlx/kquant.cpp)
-target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mlx)
+add_library(tqmlx STATIC src/backends/metal/tq4.cpp src/backends/metal/tq3.cpp src/backends/metal/q6.cpp src/backends/metal/q8.cpp
+            src/backends/metal/q4_embedding.cpp src/backends/metal/weights.cpp src/backends/metal/kquant.cpp)
+target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/metal)
 target_link_libraries(tqmlx PUBLIC mlx tqllm)
-target_sources(tqmlx PRIVATE src/backends/mlx/qwen35.cpp src/backends/mlx/gdn.cpp src/backends/mlx/dflash.cpp
-               src/formats/weight/dequant.cpp src/backends/mlx/draft_head.cpp src/backends/mlx/prefill.cpp
-               src/backends/mlx/nax_affine.cpp src/backends/mlx/prefill_fused.cpp src/backends/mlx/ane_ffn.mm)
-set_source_files_properties(src/backends/mlx/ane_ffn.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp
+               src/formats/weight/dequant.cpp src/backends/metal/draft_head.cpp src/backends/metal/prefill.cpp
+               src/backends/metal/nax_affine.cpp src/backends/metal/prefill_fused.cpp src/backends/metal/ane_ffn.mm)
+set_source_files_properties(src/backends/metal/ane_ffn.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(tqmlx PUBLIC "-framework CoreML" "-framework Foundation")
 foreach(tool tqmlx-probe:tqmlx_probe tqmlx-dflash:tqmlx_dflash tqmlx-spec:tqmlx_spec bench-mlx-sdpa:bench_mlx_sdpa
              bench-mlx-verify:bench_mlx_verify bench-mlx-prefill-gemm:bench_mlx_prefill_gemm bench-mlx-gdn-step:bench_mlx_gdn_step)
@@ -49,7 +49,7 @@ if(BUILD_TESTING)
   foreach(test release_defaults sampling wired_budget width_policy kv_capacity tcq_codec kv_tier)
     string(REPLACE "_" "-" name ${test})
     add_executable(test-mlx-${name} tests/mlx_${test}.cpp)
-    target_include_directories(test-mlx-${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mlx)
+    target_include_directories(test-mlx-${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/metal)
     add_test(NAME mlx_${test} COMMAND test-mlx-${name})
   endforeach()
   add_executable(test-mlx-env-flags tests/mlx_env_flags.cpp)
@@ -57,7 +57,8 @@ if(BUILD_TESTING)
   add_test(NAME mlx_env_flags COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/mlx_env_flags.py $<TARGET_FILE:test-mlx-env-flags>)
 endif()
 
-# tqserve on the MLX backend (Apple Silicon): the shared HTTP server over tqllm::Model from src/backends/mlx/model_mlx.cpp
+# tqserve on the MLX backend (Apple Silicon): the shared HTTP server over the shared tqllm::Model (src/engine/model.cpp),
+# which picks the Metal engine (src/backends/metal/engine_mlx.cpp) through the registry (builtin_mlx.cpp)
 if(NOT TQLLM_COMMIT)
   file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/src/COMMIT TQLLM_COMMIT LIMIT_COUNT 1)
   if(NOT TQLLM_COMMIT OR TQLLM_COMMIT MATCHES "Format")
@@ -68,7 +69,8 @@ if(NOT TQLLM_COMMIT)
     set(TQLLM_COMMIT "unknown")
   endif()
 endif()
-add_executable(tqserve tools/tqserve.cpp src/backends/mlx/model_mlx.cpp src/core/gguf_mapped.cpp)
+add_executable(tqserve tools/tqserve.cpp src/engine/model.cpp src/engine/registry.cpp src/backends/metal/engine_mlx.cpp
+               src/backends/metal/builtin_mlx.cpp src/core/gguf_mapped.cpp)
 target_include_directories(tqserve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tqserve PRIVATE tqmlx tqllm tqjinja Threads::Threads)
 target_compile_definitions(tqserve PRIVATE TQLLM_COMMIT="${TQLLM_COMMIT}")

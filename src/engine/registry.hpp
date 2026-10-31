@@ -1,6 +1,6 @@
 #pragma once
 // Engine registry: the engines a build serves, matched in registration order (first match wins). Each backend's build
-// lists its engines in register_builtin_engines() (src/engine/builtin_cuda.cpp, src/backends/mlx/builtin_mlx.cpp): an
+// lists its engines in register_builtin_engines() (src/backends/cuda/builtin_cuda.cpp, src/backends/metal/builtin_mlx.cpp): an
 // explicit list, not static initializers, which a static library would drop with an unreferenced object file.
 #include "engine.hpp"
 #include <filesystem>

@@ -1,6 +1,6 @@
 #pragma once
 // CUDA builds: the loaders src/engine/builtin_cuda.cpp registers.
-#include "../engine.hpp"
+#include "../../engine/engine.hpp"
 #include <memory>
 #include <string>
 

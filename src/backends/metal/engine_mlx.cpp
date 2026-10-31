@@ -1,10 +1,11 @@
-// tqllm::Model on the MLX backend (Apple Silicon): the server's single-slot speculative path (spec_begin / spec_advance /
+// The Metal engine (Apple Silicon, MLX), registered in builtin_mlx.cpp behind the shared tqllm::Model: the single-slot
+// speculative path (spec_begin / spec_advance /
 // spec_tokens / spec_finish) over Qwen35 + the DFlash2 drafter, with the settings of the measured exact configuration as
 // defaults (an environment variable that is already set wins). Greedy is exact (output == the target's own greedy
 // decode); a request with temperature > 0 uses speculative sampling with the same drafter (exact distribution).
 #include "debug.hpp"
 #include "release_defaults.hpp"
-#include "tqllm/model.hpp"
+#include "engine_mlx.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "dflash.hpp"
 #include "sampling.hpp"
@@ -41,7 +42,36 @@ mx::array rows(const mx::array& x, int a, int b) {return mx::slice(x, {a, 0}, {b
 }  // namespace
 
 struct ScopedWiredLimitHolder { tqllm::mlx_backend::ScopedWiredLimit limit; };
-struct Model::Impl {
+class MlxQwen35Engine final : public Engine {
+public:
+    MlxQwen35Engine(const std::string& weights, const std::string& tokenizer, uint32_t context, int slots, const EngineOptions& options);
+    int slots() const override;
+    uint32_t context() const override;
+    bool kv_idle_pending() const override;
+    bool kv_idle_step() override;
+    bool has_drafter() const override;
+    bool native_mtp() const override;
+    bool incremental() const override;
+    bool prefill_state(const std::vector<uint32_t>&, uint32_t) override;
+    void select_slot(int slot) override;
+    void set_prompt_images(const std::vector<PromptImage>& images) override;
+    void set_ignore_eos(bool) override;
+    void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) override;
+    void synchronize() override;
+    uint32_t layers() const override;
+    uint32_t hidden() const override;
+    uint32_t vocab() const override;
+    uint32_t eos() const override;
+    void spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) override;
+    bool spec_advance() override;
+    const std::vector<uint32_t>& spec_tokens(int) const override;
+    std::vector<uint32_t> spec_finish(uint64_t* stats) override;
+    void spec_step(const int*, int, bool*) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+struct MlxQwen35Engine::Impl {
     std::unique_ptr<ScopedWiredLimitHolder> residency;
     std::unique_ptr<Qwen35> engine;
     std::unique_ptr<DFlash2> drafter;
@@ -70,7 +100,7 @@ struct Model::Impl {
 
 namespace tqllm {
 
-Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t context, int slots, const EngineOptions& options)
+MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& tokenizer, uint32_t context, int slots, const EngineOptions& options)
     : impl_(std::make_unique<Impl>()) {
     if (slots != 1) throw std::invalid_argument("the MLX backend serves one request at a time (--np 1)");
     if (options.draft_model.empty()) throw std::invalid_argument("the MLX backend needs the DFlash2 drafter (-md DRAFTER.gguf)");
@@ -91,31 +121,30 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, exact %s\n", options.draft_model.c_str(),
                  options.exact ? "on" : "off");
 }
-Model::~Model() = default;
-Model::Model(Model&&) noexcept = default;
-Model& Model::operator=(Model&&) noexcept = default;
 
-int Model::slots() const {return 1;}
-uint32_t Model::context() const {return impl_->context_;}
-bool Model::kv_idle_pending() const {return false;}
-bool Model::kv_idle_step() {return false;}
-bool Model::has_drafter() const {return true;}
-bool Model::native_mtp() const {return false;}
-std::string Model::fit_note() const {return {};}
-bool Model::incremental() const {return true;}
-bool Model::prefill_state(const std::vector<uint32_t>&, uint32_t) {return false;}  // no chunked plain-decode prompt path: token by token
-void Model::select_slot(int slot) {if (slot != 0) throw std::invalid_argument("the MLX backend has one slot");}
-void Model::set_prompt_images(const std::vector<PromptImage>& images) {
+int MlxQwen35Engine::slots() const {return 1;}
+uint32_t MlxQwen35Engine::context() const {return impl_->context_;}
+bool MlxQwen35Engine::kv_idle_pending() const {return false;}
+bool MlxQwen35Engine::kv_idle_step() {return false;}
+bool MlxQwen35Engine::has_drafter() const {return true;}
+bool MlxQwen35Engine::native_mtp() const {return false;}
+bool MlxQwen35Engine::incremental() const {return true;}
+bool MlxQwen35Engine::prefill_state(const std::vector<uint32_t>&, uint32_t) {return false;}  // no chunked plain-decode prompt path: token by token
+void MlxQwen35Engine::select_slot(int slot) {if (slot != 0) throw std::invalid_argument("the MLX backend has one slot");}
+void MlxQwen35Engine::set_prompt_images(const std::vector<PromptImage>& images) {
     if (!images.empty()) throw std::invalid_argument("image input is not supported by the MLX backend yet");
 }
-void Model::set_ignore_eos(bool) {}  // the MLX decode loop stops at its own end tokens
-void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
+void MlxQwen35Engine::set_ignore_eos(bool) {}  // the MLX decode loop stops at its own end tokens
+void MlxQwen35Engine::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
     (void) presence;  // the MLX sampler has no presence penalty yet
     auto& i = *impl_;
     i.temperature = temperature; i.top_p = top_p; i.top_k = top_k; i.rng.seed(seed);
 }
-uint32_t Model::vocab_size() const {return impl_->vocab;}
-void Model::synchronize() {mx::synchronize();}
+uint32_t MlxQwen35Engine::vocab() const {return impl_->vocab;}
+uint32_t MlxQwen35Engine::eos() const {return impl_->eos;}
+uint32_t MlxQwen35Engine::layers() const {return impl_->layers_;}
+uint32_t MlxQwen35Engine::hidden() const {return impl_->hidden_;}
+void MlxQwen35Engine::synchronize() {mx::synchronize();}
 
 // TQLLM_DEBUG=memlog: MLX memory in use / peak since the request began / buffer cache at each stage of a request
 static void memlog_point(const char* stage, long a = -1) {
@@ -125,7 +154,7 @@ static void memlog_point(const char* stage, long a = -1) {
     else std::fprintf(stderr, "MEMLOG %-22s active %6.2f GB peak %6.2f GB cache %5.2f GB\n", stage, mx::get_active_memory() / 1e9, mx::get_peak_memory() / 1e9, mx::get_cache_memory() / 1e9);
 }
 
-void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) {
+void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) {
     auto& i = *impl_;
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     if (prompt.size() + count + 16 > i.context_) throw std::invalid_argument("prompt and answer exceed the context");
@@ -188,7 +217,7 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
     i.active = true; i.done = i.output.size() >= i.count || i.pending == i.eos;
 }
 
-bool Model::spec_advance() {
+bool MlxQwen35Engine::spec_advance() {
     auto& i = *impl_;
     if (!i.active || i.done) return false;
     const uint32_t limit = i.count;
@@ -280,9 +309,9 @@ bool Model::spec_advance() {
     return !i.done;
 }
 
-const std::vector<uint32_t>& Model::spec_tokens(int) const {return impl_->output;}
+const std::vector<uint32_t>& MlxQwen35Engine::spec_tokens(int) const {return impl_->output;}
 
-std::vector<uint32_t> Model::spec_finish(uint64_t* stats) {
+std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
     auto& i = *impl_;
     i.decode_us = us_since(i.decode_start);
     if (stats) {
@@ -308,10 +337,11 @@ std::vector<uint32_t> Model::spec_finish(uint64_t* stats) {
     return i.output;  // EOS stays: finish() turns it into finish_reason "stop"
 }
 
-void Model::spec_step(const std::vector<int>&, std::vector<char>&) {
+void MlxQwen35Engine::spec_step(const int*, int, bool*) {
     throw std::invalid_argument("the MLX backend has no batched multi-slot step (--np 1)");
 }
-uint32_t Model::forward(uint32_t, uint32_t, bool) {
-    throw std::invalid_argument("the MLX backend decodes through spec_begin / spec_advance");
+std::unique_ptr<Engine> make_mlx_qwen35_engine(const std::string& weights, const std::string& tokenizer, uint32_t context, int slots,
+                                               const EngineOptions& options) {
+    return std::make_unique<MlxQwen35Engine>(weights, tokenizer, context, slots, options);
 }
 }  // namespace tqllm
