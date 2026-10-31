@@ -43,7 +43,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
-    S().model_.reset(); S().prompt_res_.reset(); g_trim_below = SIZE_MAX; ++g_kv_epoch;
+    S().model_.reset(); S().prompt_res_.reset(); f_.cp->rt.trim_below = SIZE_MAX; ++f_.cp->rt.kv_epoch;
     // banks a long prompt left below their slot target grow back once its state is gone, unless this request's own state
     // needs the room (regrowing then would throw the banks' experts away and rebuild them at the same smaller size)
     // with TQFN_KV_HOST the K/V older than the kept window lives in host memory after the prompt, so only the window's
@@ -54,7 +54,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, state_rows));
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
-        if (need != g_kv_capacity) { if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); } g_kv_capacity = need; }
+        if (need != f_.cp->rt.kv_capacity) { if (f_.cp->rt.qsa_batch) { ck(cudaDeviceSynchronize()); f_.cp->rt.qsa_batch.reset(); } f_.cp->rt.kv_capacity = need; }
     }
     if (g_arena) g_arena->used = 0;
     // the pool keeps what the last request freed (release threshold max); hand it back so plain cudaMalloc users (expert
@@ -74,7 +74,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // TQLLM_DEBUG=profile_decode:1: the capture covers that request's decode instead of its prefill
     static const bool prof_decode = tqllm::debug_cstr("profile_decode") && std::atoi(tqllm::debug_cstr("profile_decode")) != 0;
     const bool profiling = prof_req > 0 && ++req_no == prof_req && !prof_decode;
-    g_profile_decode_req = prof_req > 0 && req_no == prof_req && prof_decode;
+    f_.cp->rt.profile_decode_req = prof_req > 0 && req_no == prof_req && prof_decode;
     if (profiling) ck(cudaProfilerStart());
     S().t_begin_ = std::chrono::steady_clock::now(); S().prefill_us_ = S().decode_us_ = 0;
     static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;  // TQLLM_DEBUG=profile_req: host timeline of the request
@@ -112,9 +112,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         // above 128K keep a small margin beyond the plan's own terms (allocator granularity, kernel scratch)
         if (P > 131072) tu.workspace_bytes += size_t(448) << 20;
         int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
-        auto context_term = [&](int block) { return tqllm::prefill_context_bytes(g_kv_capacity, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
+        auto context_term = [&](int block) { return tqllm::prefill_context_bytes(f_.cp->rt.kv_capacity, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
         // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
-        if (g_qsa_batch) { ck(cudaDeviceSynchronize()); g_qsa_batch.reset(); cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
+        if (f_.cp->rt.qsa_batch) { ck(cudaDeviceSynchronize()); f_.cp->rt.qsa_batch.reset(); cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
         auto free_now = [] { return tqllm::device_free_bytes(); };
         std::vector<size_t> bank_bytes; size_t banks_total = 0;
         for (int l : f_.cache->banks_lru()) { bank_bytes.push_back(f_.cache->bank_bytes(l)); banks_total += bank_bytes.back(); }
@@ -161,7 +161,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
                 chunk = std::max(2048, chunk * 7 / 8 / 1024 * 1024); block = block0;  // 16K -> 14K -> 12K -> 10.5K ...: every chunk streams all experts, so take the largest that fits
             }
         }
-        g_qsa_block = block; g_sub_req = block;
+        f_.cp->rt.qsa_block = block; f_.cp->rt.sub_req = block;
         // the first chunk's host prep (embedding + PLE gathers, ~0.4 s at 16K) runs while the banks, KV and arena are set up
         { DecodeModel * m = S().model_.get(); std::vector<int> first(ids.begin(), ids.begin() + std::min(P, chunk));
           m->prep_next_ = std::async(std::launch::async, [m, first] { return m->prepare_host(first); }); }
@@ -186,7 +186,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         S().ledger_ = std::make_unique<tqllm::BankLedger>(std::move(ops));
         std::vector<int> bankless; for (int l = 0; l < c.layers; ++l) if (!f_.cache->bank_ready(l) && f_.cache->has_layout(l)) bankless.push_back(l);
         const auto ev = tqllm::borrow_banks(*S().ledger_, plan, borrow_all ? tqllm::BorrowMode::All : f_.cp->run.tune.borrow, f_.cp->run.tune.borrow_count, bankless); S().plan_catchup_bytes_ = plan.catchup_peak;
-        g_trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
+        f_.cp->rt.trim_below = S().ledger_->borrowed_bytes() + f_.mtp_cache->peak_device_bytes() + (size_t(512) << 20);
         S().model_->pf_borrowed.assign(size_t(c.layers), 0);
         for (int l : ev) S().model_->pf_borrowed[size_t(l)] = 1;
         if (!ev.empty() || tqllm::debug_on("mem"))
@@ -195,12 +195,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
                          S().ledger_->borrowed_bytes() / 1048576.0, free_now() / 1048576.0, plan.host_copies / 1e9);
     }
     const bool host_res = P > chunk;
-    using pclk = std::chrono::steady_clock; double trunk_ms = 0, mtp_ms = 0; g_qsa_ms = 0; const auto p0 = pclk::now();
-    auto lap = [&](double & acc, pclk::time_point & t) { if (!g_prefill_log) return; ck(cudaDeviceSynchronize()); const auto u = pclk::now();
+    using pclk = std::chrono::steady_clock; double trunk_ms = 0, mtp_ms = 0; f_.cp->rt.qsa_ms = 0; const auto p0 = pclk::now();
+    auto lap = [&](double & acc, pclk::time_point & t) { if (!kPrefillLog) return; ck(cudaDeviceSynchronize()); const auto u = pclk::now();
                                                          acc += std::chrono::duration<double, std::milli>(u - t).count(); t = u; };
     auto mem_note = [&](const char * at) {
         if (tqllm::debug_on("mem")) ledger(at);
-        if (g_prefill_log) { ck(cudaDeviceSynchronize());
+        if (kPrefillLog) { ck(cudaDeviceSynchronize());
             std::fprintf(stderr, "tqllm: prefill +%.2f s %s\n", std::chrono::duration<double>(pclk::now() - p0).count(), at); }
     };
     mem_note("banks borrowed"); stamp("plan + banks borrowed");
@@ -313,8 +313,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         mem_note("after MTP catch-up");
         if (tqllm::debug_cstr("profile_req")) std::fprintf(stderr, "tqllm: req +%.3f s after MTP catch-up\n", std::chrono::duration<double>(pclk::now() - p0).count());
     }
-    if (g_prefill_log) std::fprintf(stderr, "tqllm: prefill %d tokens %.1f s: trunk %.1f s (QSA %.1f s), MTP catch-up %.1f s\n", P,
-        std::chrono::duration<double>(pclk::now() - p0).count(), trunk_ms / 1000, g_qsa_ms / 1000, mtp_ms / 1000);
+    if (kPrefillLog) std::fprintf(stderr, "tqllm: prefill %d tokens %.1f s: trunk %.1f s (QSA %.1f s), MTP catch-up %.1f s\n", P,
+        std::chrono::duration<double>(pclk::now() - p0).count(), trunk_ms / 1000, f_.cp->rt.qsa_ms / 1000, mtp_ms / 1000);
     if (!host_res && P >= 256 && chunk >= 256) S().model_->release_prefill();  // single-chunk layer-major prompt
     arena_resize(f_.arena_decode);
     if (P >= 256) {  // long prompt: the old K/V rows to host memory, the refill below takes the freed device memory
@@ -326,7 +326,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
         }
     }
-    stamp("before the bank refill"); refill_borrowed(); g_trim_below = SIZE_MAX; stamp("banks refilled");
+    stamp("before the bank refill"); refill_borrowed(); f_.cp->rt.trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);
     ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();
     if (tqllm::debug_on("mem")) { S().stats_at_decode_ = f_.cache->stats(); S().mtp_stats_at_decode_ = f_.mtp_cache->stats(); }
@@ -335,7 +335,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (f_.cold_cache) S().cold_at_decode_ = f_.cold_cache->stats();
     if (f_.cold_store) S().cold_store_at_decode_ = f_.cold_store->stats();
     if (f_.cold_fetch_queue) S().cold_fetch_at_decode_ = f_.cold_fetch_queue->stats();
-    if (g_profile_decode_req) ck(cudaProfilerStart());
+    if (f_.cp->rt.profile_decode_req) ck(cudaProfilerStart());
     if (g_arena && tqllm::debug_cstr("arena")) std::fprintf(stderr, "tqllm: prefill %d tokens, arena high %.0f MB of %.0f\n", P, g_arena->high / 1048576.0, g_arena->size / 1048576.0);
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());
     (void) c;

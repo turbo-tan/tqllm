@@ -165,8 +165,8 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
     auto & out = *out_d; struct Out { float * p; } projected{result};
     if (carry) {
         const size_t row = size_t(kvheads) * dim;
-        if (!carry->k) { PersistentAlloc keep; carry->k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); carry->v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
-        require(pos + n <= g_kv_capacity, "decode context exceeds the attention KV capacity (pos " + std::to_string(pos) + " + " + std::to_string(n) + " > " + std::to_string(g_kv_capacity) + ")");
+        if (!carry->k) { PersistentAlloc keep; carry->k = std::make_unique<KvBuf>(size_t(checkpoint.rt.kv_capacity) * row * sizeof(__nv_bfloat16)); carry->v = std::make_unique<KvBuf>(size_t(checkpoint.rt.kv_capacity) * row * sizeof(__nv_bfloat16)); }
+        require(pos + n <= checkpoint.rt.kv_capacity, "decode context exceeds the attention KV capacity (pos " + std::to_string(pos) + " + " + std::to_string(n) + " > " + std::to_string(checkpoint.rt.kv_capacity) + ")");
         ck(cudaMemcpyAsync(carry->k->p + size_t(pos) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         ck(cudaMemcpyAsync(carry->v->p + size_t(pos) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         // QSA (the model's own long-context attention): every token's indexer key is kept; once the context passes the
@@ -181,7 +181,7 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                 // (a trim per attention layer cost 0.3 s of idle GPU at 128K; the indexer state is tens of MB)
                 { size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
                   if (fr < (size_t(1) << 30)) { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); } }
-                PersistentAlloc keep; carry->qsa = std::make_unique<tqllm_cuda::QsaIndexer>(g_kv_capacity, ratio, top_k, iheads, idim,
+                PersistentAlloc keep; carry->qsa = std::make_unique<tqllm_cuda::QsaIndexer>(checkpoint.rt.kv_capacity, ratio, top_k, iheads, idim,
                                    std::min(checkpoint.rotary, idim), checkpoint.theta, float(checkpoint.epsilon)); }
             if (carry->qsa->size() > pos) carry->qsa->truncate(pos);  // speculative rollback
             Device<float> ik(size_t(n) * idim);
@@ -190,19 +190,19 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
         }
         if (has_indexer && pos + n > top_k) {
             ArenaMark scratch;
-            struct QsaTimer { std::chrono::steady_clock::time_point t0;
-                QsaTimer() { if (g_prefill_log) { cudaDeviceSynchronize(); t0 = std::chrono::steady_clock::now(); } }
-                ~QsaTimer() { if (g_prefill_log) { cudaDeviceSynchronize(); g_qsa_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } } qsa_timer;
+            struct QsaTimer { double & ms; std::chrono::steady_clock::time_point t0;
+                explicit QsaTimer(double & m) : ms(m) { if (kPrefillLog) { cudaDeviceSynchronize(); t0 = std::chrono::steady_clock::now(); } }
+                ~QsaTimer() { if (kPrefillLog) { cudaDeviceSynchronize(); ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } } qsa_timer(checkpoint.rt.qsa_ms);
             Device<float> iq(size_t(n) * iheads * idim);
             checkpoint.project(prefix + "indexer.q_proj.weight", input.p, iq.p, c.hidden, iheads * idim, n);
             const float * qnorm = checkpoint.dense_device(prefix + "indexer.q_norm.weight");
-            auto & batch = g_qsa_batch;  // shared by every layer (one stream)
-            // the selection runs in blocks of g_qsa_block queries: its scratch scales with queries x context (4 GB at 245K for a
+            auto & batch = checkpoint.rt.qsa_batch;  // shared by every layer (one stream)
+            // the selection runs in blocks of checkpoint.rt.qsa_block queries: its scratch scales with queries x context (4 GB at 245K for a
             // 2048-token sub-chunk), and every query's top-k is independent of the block it is scored in
-            const int qb = std::min(n, g_qsa_block);
+            const int qb = std::min(n, checkpoint.rt.qsa_block);
             if (!batch || batch->max_queries < qb) {
                 batch.reset(); cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
-                batch = std::make_unique<tqllm_cuda::QsaBatchScratch>(std::max(qb, 16), g_kv_capacity, ratio, top_k);
+                batch = std::make_unique<tqllm_cuda::QsaBatchScratch>(std::max(qb, 16), checkpoint.rt.kv_capacity, ratio, top_k);
             }
             for (int q0 = 0; q0 < n; q0 += qb) {
                 const int nb = std::min(qb, n - q0);
@@ -225,9 +225,9 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                     if (size_t(layer) >= gathers.size()) { gathers.resize(size_t(layer) + 1); epochs.resize(size_t(layer) + 1, 0); }
                     auto & gather = gathers[size_t(layer)];
                     // sized for the slot context and an 8-token verify block: no allocation inside graph capture
-                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(g_kv_capacity, g_kv_capacity_full), row, 16384, 8 * sel.width); }
-                    const int written_from = epochs[size_t(layer)] == g_kv_epoch ? pos : 0;  // a new request: the cache starts empty
-                    epochs[size_t(layer)] = g_kv_epoch;
+                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(checkpoint.rt.kv_capacity, checkpoint.rt.kv_capacity_full), row, 16384, 8 * sel.width); }
+                    const int written_from = epochs[size_t(layer)] == checkpoint.rt.kv_epoch ? pos : 0;  // a new request: the cache starts empty
+                    epochs[size_t(layer)] = checkpoint.rt.kv_epoch;
                     gather->run(sel.positions, sel.valid, nb, sel.width, pos + q0 + 1, carry->k->p, carry->v->p, nullptr,
                                 carry->k->host_rows(row), written_from);
                     att.keys = gather->keys(); att.values = gather->values(); att.positions = gather->positions();

@@ -46,7 +46,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     const GraphKey gkey{this, layer, n, 0};
     bool capturing = false;
     if (graph_on && spec && !segs && !sink && n <= 8 && g_arena && !g_persistent) {
-        static int epoch = -1; if (epoch != g_prefill_epoch) { epoch = g_prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
+        static int epoch = -1; if (epoch != cp.rt.prefill_epoch) { epoch = cp.rt.prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
         if (plain) calls[gkey] = 0;
         if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
@@ -156,7 +156,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // cp.run.predict_n (4; 6 with adaptive drafts): next-layer prediction (prefetch) for verify blocks of up to N tokens; above 4 the routers
     // run unfused (placement only: the output does not change)
     const int predict_n = cp.run.predict_n;
-    const bool predict = (!g_hot_map || bool(cp.cold_prefetch)) && prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
+    const bool predict = (!cp.rt.hot_map || bool(cp.cold_prefetch)) && prefetch_on && n <= predict_n && trunk && layer + 1 < c.layers;
     const std::string np = "blk." + std::to_string(layer + 1) + ".";
     std::unique_ptr<Device<float>> nl;
     if (predict) nl = std::make_unique<Device<float>>(size_t(n) * (c.experts + 1));
@@ -177,9 +177,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         router(prefix, mixed.p, logits.p, n);
         if (predict) router(np, mixed.p, nl->p, n);
     }
-    if (g_keep_mask && trunk) {  // TQLLM_DEBUG=keep_map: pruned experts never win the top-k
-        tqllm_cuda::logits_mask(logits.p, g_keep_mask + size_t(layer) * c.experts, n, c.experts + 1, c.experts, nullptr);
-        if (predict) tqllm_cuda::logits_mask(nl->p, g_keep_mask + size_t(layer + 1) * c.experts, n, c.experts + 1, c.experts, nullptr);
+    if (cp.rt.keep_mask && trunk) {  // TQLLM_DEBUG=keep_map: pruned experts never win the top-k
+        tqllm_cuda::logits_mask(logits.p, cp.rt.keep_mask + size_t(layer) * c.experts, n, c.experts + 1, c.experts, nullptr);
+        if (predict) tqllm_cuda::logits_mask(nl->p, cp.rt.keep_mask + size_t(layer + 1) * c.experts, n, c.experts + 1, c.experts, nullptr);
     }
     std::unique_ptr<Device<int>> next_ids;
     if (predict) {
@@ -242,10 +242,10 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
     // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit
     constexpr bool old_rule = false;  // F39 rule: np > 1 text equals np 1
-    if (trunk && (g_hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
+    if (trunk && (cp.rt.hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();
-        if(predict && g_hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
-        if (g_hot_map) for (int id : wave_ids) if (id < 0 || id >= c.experts) {
+        if(predict && cp.rt.hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
+        if (cp.rt.hot_map) for (int id : wave_ids) if (id < 0 || id >= c.experts) {
             const auto ls = logits.get(); const auto xs = mixed.get(); size_t bad_l = 0, bad_x = 0;
             for (float v : ls) bad_l += !std::isfinite(v);
             for (float v : xs) bad_x += !std::isfinite(v);
@@ -253,7 +253,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                     " nonfinite_logits=" + std::to_string(bad_l) + " nonfinite_input=" + std::to_string(bad_x));
         }
         // one wave when the unique experts fit: the split path's miss accounting assumes small steps
-        if (!g_hot_map && !tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
+        if (!cp.rt.hot_map && !tqllm::flashnext::layer_takes_waves(wave_ids, n, c.topk, cache.slots(layer), spec, old_rule)) wave_ids.clear();
     }
     if (!wave_ids.empty()) {
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
@@ -263,12 +263,12 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         Device<__half> ax(eg.count);
         bool shared_queued = false;
         // Each assignment is written by exactly one bank; weights and original router ids are untouched.
-        for (int bank_index = 0; bank_index < (g_hot_map && trunk ? 2 : 1); ++bank_index) {
+        for (int bank_index = 0; bank_index < (cp.rt.hot_map && trunk ? 2 : 1); ++bank_index) {
             // Keep independent shared-expert work on the GPU while the CPU prepares cold demand reads.
             if (cp.cold_overlap >= 2 && bank_index == 1) { shared_expert(xr.p); shared_queued = true; }
-            MixedExpertCache & selected = bank_index ? *g_cold_cache : cache;
+            MixedExpertCache & selected = bank_index ? *cp.rt.cold_cache : cache;
             std::vector<int> bank_ids;
-            for (int id : u) if (!g_hot_map || !trunk || expert_is_hot(*g_hot_map, layer, c.experts, id) == (bank_index == 0)) bank_ids.push_back(id);
+            for (int id : u) if (!cp.rt.hot_map || !trunk || expert_is_hot(*cp.rt.hot_map, layer, c.experts, id) == (bank_index == 0)) bank_ids.push_back(id);
             const int W = selected.plan_slots(layer);
             // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
             // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel; gemm_avg is the switch-over average.
@@ -320,13 +320,13 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 proj(selected.down(), ax.p, ed.p, h, true);
                 // Same-bank waves still wait before reusing slots. The separate cold bank may prepare
                 // its demand reads and DMA while the final hot wave remains in flight.
-                if (!cp.cold_overlap || !g_hot_map || !trunk || bank_index != 0 || w0 + size_t(W) < bank_ids.size())
+                if (!cp.cold_overlap || !cp.rt.hot_map || !trunk || bank_index != 0 || w0 + size_t(W) < bank_ids.size())
                     ck(cudaStreamSynchronize(nullptr));
         }
         }
         if (!shared_queued) shared_expert();
         tqllm_cuda::fn_moe_combine(ed.p, weights.p, sd.p, shared_weights.p, fo.p, h, c.topk, n, nullptr);
-        if (g_hot_map && trunk) {
+        if (cp.rt.hot_map && trunk) {
             const auto out = fo.get();
             if (std::any_of(out.begin(), out.end(), [](float v) { return !std::isfinite(v); })) {
                 const auto a = ed.get(), b = eg.get(), d = eu.get(); size_t ea = 0, eb = 0, eu_bad = 0;
@@ -353,7 +353,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))  // explicit wins over --exact on
                                    : cp.run.exact ? 0 : cp.run.small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
-        g_cpu_owned = cpu_pool != nullptr;
+        cp.rt.cpu_owned = cpu_pool != nullptr;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
         const bool use_cpu = cpu_pool && trunk && n <= tqllm::flashnext::kCpuPoolRows;
         if (use_cpu) {

@@ -39,7 +39,7 @@ bool FlashNextEngine::spec_advance() {
     S().model_->accept(m); ++S().steps_; S().toks_ += m;
     S().d1_ = S().model_->mtp_batch(std::vector<int>(v.begin(), v.begin() + m), S().model_->res_keep->p);
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());
-    if (S().done_ && g_profile_decode_req) { ck(cudaDeviceSynchronize()); ck(cudaProfilerStop()); g_profile_decode_req = false; }
+    if (S().done_ && f_.cp->rt.profile_decode_req) { ck(cudaDeviceSynchronize()); ck(cudaProfilerStop()); f_.cp->rt.profile_decode_req = false; }
     if (S().done_) { S().model_->set_spec(false); ck(cudaDeviceSynchronize());
                  S().decode_us_ = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - S().t_decode_).count()); }
     if (S().done_ && f_.cold_cache && tqllm::debug_on("mem")) {

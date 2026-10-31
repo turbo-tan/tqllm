@@ -32,8 +32,8 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
     const std::string nx = "blk." + std::to_string(L) + ".nextn.", prefix = "blk." + std::to_string(L) + ".";
     const int kvh = cp.attention_kvheads, ad = cp.attention_dim; const size_t row = size_t(kvh) * ad;
     AttentionState & a = mtp_att;
-    if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
-    require(a.len + n <= g_kv_capacity, "MTP KV exceeds the attention KV capacity");
+    if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(cp.rt.kv_capacity) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(cp.rt.kv_capacity) * row * sizeof(__nv_bfloat16)); }
+    require(a.len + n <= cp.rt.kv_capacity, "MTP KV exceeds the attention KV capacity");
     const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
     const bool qsa_keys = cp.has_tensor(prefix + "indexer.k_proj.weight");
     for (int d = 0; d < n; d += 2048) {
@@ -71,7 +71,7 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
         ck(cudaMemcpyAsync(a.k->p + size_t(a.len) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         ck(cudaMemcpyAsync(a.v->p + size_t(a.len) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         if (qsa_keys) {  // the indexer keys as attention_core appends them
-            if (!a.qsa) { PersistentAlloc keep; a.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(g_kv_capacity, 4, 2048, 4, 128,
+            if (!a.qsa) { PersistentAlloc keep; a.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(cp.rt.kv_capacity, 4, 2048, 4, 128,
                               std::min(cp.rotary, 128), cp.theta, float(cp.epsilon)); }
             if (a.qsa->size() > a.len) a.qsa->truncate(a.len);
             Device<float> ik(size_t(m) * 128);

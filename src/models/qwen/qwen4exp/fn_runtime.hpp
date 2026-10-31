@@ -68,11 +68,6 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }
-// attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
-// it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
-inline int g_kv_capacity = 2048;
-inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_capacity follows each request)
-inline bool g_cpu_owned = false;  // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
 
 using namespace tqllm;
 inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = __builtin_LINE()) {
@@ -122,23 +117,18 @@ inline void cpu_q8k_round(std::vector<float> & values) {
 // one buffer that is reset per decode step, so a token makes no allocation calls. State that outlives a step must be
 // allocated under PersistentAlloc.
 struct ScratchArena { char * base = nullptr; size_t size = 0, used = 0, high = 0; };
-inline bool g_prefill_log = tqllm::debug_cstr("fn_prefill_log") != nullptr; inline double g_qsa_ms = 0;  // prefill profile (syncs)
+inline const bool kPrefillLog = tqllm::debug_cstr("fn_prefill_log") != nullptr;  // prefill profile (syncs)
 inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
-inline bool g_profile_decode_req = false;  // TQLLM_DEBUG=profile_decode: the profiled request is in its decode
-inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
-inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
-inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
-inline uint64_t g_kv_epoch = 0;   // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
-inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
-// TQLLM_DEBUG=keep_map (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
-inline const std::vector<int32_t> * g_hot_map = nullptr;
-inline MixedExpertCache * g_cold_cache = nullptr;
-inline const float * g_keep_mask = nullptr;
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
 // 256-token sub-chunk of that layer (the pool is a prefill borrow: counted in the bank eviction, freed with the prefill buffers)
-struct DenseHalfCache { char * base = nullptr; size_t cap = 0, used = 0, high = 0; int layer = -2; std::unordered_map<const void *, __half *> map; };
-inline DenseHalfCache g_dhc;
+struct DenseHalfCache {
+    char * base = nullptr; size_t cap = 0, used = 0, high = 0; int layer = -2; std::unordered_map<const void *, __half *> map;
+    void release() {
+        if (base && kPrefillLog) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", high / 1048576.0, cap / 1048576.0);
+        if (base) cudaFree(base); *this = DenseHalfCache{};
+    }
+};
 // layer-major prefill tuning (tqserve parameters --prefill-*, --dense-cache-mb; set before the engine starts)
 struct FnTune { int chunk = 16384, sub = 2048, stage = 192, dense_min = 256, borrow_count = 0; long reserve_mb = 1000, arena_mb = 3800, dense_cache_mb = 600;
                 tqllm::BorrowMode borrow = tqllm::BorrowMode::Auto;
@@ -156,15 +146,32 @@ struct FnConfig {
     float draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
     int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
 };
+// one engine's mutable state shared by its sequences (one stream): Checkpoint::rt
+struct FnRuntime {
+    // attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
+    // it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
+    int kv_capacity = 2048;
+    int kv_capacity_full = 0;  // the slot context's K/V capacity (kv_capacity follows each request)
+    bool cpu_owned = false;    // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
+    bool profile_decode_req = false;  // TQLLM_DEBUG=profile_decode: the profiled request is in its decode
+    double qsa_ms = 0;         // prefill profile (kPrefillLog)
+    int qsa_block = 2048;      // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
+    int sub_req = 0;           // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
+    int prefill_epoch = 0;     // bumped when a prefill releases decode scratch: graph capture warms up again
+    uint64_t kv_epoch = 0;     // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
+    std::unique_ptr<tqllm_cuda::QsaBatchScratch> qsa_batch;  // QSA selection scratch, sized by qsa_block
+    // release_prefill trims the memory pool only when free device memory is below this (the refill and the MTP bank need
+    // it); the trim costs 60-100 ms of idle GPU, so a request whose refill fits without it skips it
+    size_t trim_below = SIZE_MAX;
+    DenseHalfCache dhc;
+    // pilot hot / cold split (hot_map=) and TQLLM_DEBUG=keep_map (expert pruning: per trunk layer [experts] device mask,
+    // 0 kept, -inf pruned); null when off
+    const std::vector<int32_t> * hot_map = nullptr;
+    MixedExpertCache * cold_cache = nullptr;
+    const float * keep_mask = nullptr;
+};
 inline size_t dense_half_pool_bytes(const FnTune & tune) { return size_t(std::max(0L, tune.dense_cache_mb)) << 20; }
-inline void dense_half_release() {
-    if (g_dhc.base && tqllm::debug_cstr("fn_prefill_log")) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", g_dhc.high / 1048576.0, g_dhc.cap / 1048576.0);
-    if (g_dhc.base) cudaFree(g_dhc.base); g_dhc = DenseHalfCache{};
-}
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)
-// release_prefill trims the memory pool only when free device memory is below this (the refill and the MTP bank need
-// it); the trim costs 60-100 ms of idle GPU, so a request whose refill fits without it skips it
-inline size_t g_trim_below = SIZE_MAX;
 struct ArenaMark { size_t at = g_arena ? g_arena->used : 0; ~ArenaMark() { if (g_arena) g_arena->used = at; } };
 template<class T> struct Device {
     T * p = nullptr; size_t count; bool owned = true, plain = false;

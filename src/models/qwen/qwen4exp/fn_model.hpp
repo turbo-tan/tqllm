@@ -26,7 +26,7 @@ struct DecodeModel {
         size_t freed = 0;
         for (auto & a : att) {
             if (!a.k || !a.k->vmm || a.len <= 2 * keep) continue;
-            const size_t row = a.k->bytes / size_t(g_kv_capacity), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
+            const size_t row = a.k->bytes / size_t(cp.rt.kv_capacity), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
             for (size_t i = 0; i < cut; ++i) for (KvBuf * b : {a.k.get(), a.v.get()})
                 if (!b->on_host[i] && b->move(i, true)) freed += b->page;
         }

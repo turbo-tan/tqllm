@@ -63,6 +63,7 @@ public:
     }
     Qwen4ExpConfig config;
     FnConfig run;  // this engine's run-time choices (options and load decisions)
+    mutable FnRuntime rt;  // this engine's mutable shared state (KV capacity, epochs, QSA / dense scratch)
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;
     int attention_heads = 0, attention_kvheads = 0, attention_dim = 0, rotary = 0;
@@ -505,15 +506,15 @@ public:
                 __half * whp = nullptr; std::unique_ptr<Device<__half>> wh;
                 if (const size_t pool = dense_half_pool_bytes(run.tune)) {
                     int layer = -1; std::sscanf(name.c_str(), "blk.%d.", &layer);
-                    if (layer != g_dhc.layer) { g_dhc.used = 0; g_dhc.map.clear(); g_dhc.layer = layer; }
-                    if (auto it = g_dhc.map.find(matrix.p); it != g_dhc.map.end()) whp = it->second;
+                    if (layer != rt.dhc.layer) { rt.dhc.used = 0; rt.dhc.map.clear(); rt.dhc.layer = layer; }
+                    if (auto it = rt.dhc.map.find(matrix.p); it != rt.dhc.map.end()) whp = it->second;
                     else {
                         const size_t b = (size_t(rows) * cols * sizeof(__half) + 255) / 256 * 256;
-                        if (!g_dhc.base && cudaMalloc(reinterpret_cast<void **>(&g_dhc.base), pool) == cudaSuccess) g_dhc.cap = pool;
+                        if (!rt.dhc.base && cudaMalloc(reinterpret_cast<void **>(&rt.dhc.base), pool) == cudaSuccess) rt.dhc.cap = pool;
                         cudaGetLastError();
-                        if (g_dhc.base && g_dhc.used + b <= g_dhc.cap) {
-                            whp = reinterpret_cast<__half *>(g_dhc.base + g_dhc.used); g_dhc.used += b; g_dhc.high = std::max(g_dhc.high, g_dhc.used);
-                            matrix.fmt->dequant_h(matrix, whp, nullptr); g_dhc.map[matrix.p] = whp;
+                        if (rt.dhc.base && rt.dhc.used + b <= rt.dhc.cap) {
+                            whp = reinterpret_cast<__half *>(rt.dhc.base + rt.dhc.used); rt.dhc.used += b; rt.dhc.high = std::max(rt.dhc.high, rt.dhc.used);
+                            matrix.fmt->dequant_h(matrix, whp, nullptr); rt.dhc.map[matrix.p] = whp;
                         }
                     }
                 }

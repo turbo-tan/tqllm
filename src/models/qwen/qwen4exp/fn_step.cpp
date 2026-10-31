@@ -27,7 +27,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     auto residual = std::make_unique<Device<float>>(size_t(width) * n);
     tqllm_cuda::hc_init(de.p, residual->p, h, c.hc, n, nullptr);
     Device<float> dp(prep.ple.size()); dp.put(prep.ple);
-    if (g_prefill_log && n >= 256) std::fprintf(stderr, "tqllm: prefill chunk host prep (embedding + PLE) %.0f ms\n",
+    if (kPrefillLog && n >= 256) std::fprintf(stderr, "tqllm: prefill chunk host prep (embedding + PLE) %.0f ms\n",
                                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count());
     // prefill: hand back each layer's scratch; the residual moves through two persistent buffers (speculative steps keep
     // their per-layer rollback state in the arena, so they keep one arena span per step)
@@ -35,7 +35,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     // chunk (routed experts copied once per layer, prefill_layer); the residual stays in res_keep, updated in place
     constexpr bool layer_major = true;
     constexpr int lm_min = 256;  // tokens from which a prefill chunk runs layer-major
-    if (!g_hot_map && layer_major && !spec && n >= lm_min && g_arena) {
+    if (!cp.rt.hot_map && layer_major && !spec && n >= lm_min && g_arena) {
         if (res_keep->count < size_t(n) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(n) * width); }
         ck(cudaMemcpyAsync(res_keep->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         residual.reset(); const size_t base = g_arena->used;
