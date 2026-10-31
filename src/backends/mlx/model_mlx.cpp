@@ -169,7 +169,9 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
     if (!i.head4) i.engine->draft_shortlist(logits, i.shortlist);
     i.pending = mx::argmax(logits).item<uint32_t>();
     mx::set_cache_limit(size_t(512) << 20);
-    if (lean_prefill) mx::clear_cache();   // the prefill's cached buffers go back to the system before the decode
+    // the prefill's cached buffers go back to the system before the decode, lean or not: up to 4 GiB left cached pushed a
+    // 256K decode into swap whenever the plan judged it fit (j1446: 21.8 vs 27.3 tok/s on a fresh server)
+    mx::clear_cache();
     memlog_point("prefill done");
 
     if (i.sampling) {
