@@ -45,6 +45,7 @@ struct ScopedWiredLimitHolder { tqllm::mlx_backend::ScopedWiredLimit limit; };
 class MlxQwen35Engine final : public Engine {
 public:
     MlxQwen35Engine(const std::string& weights, const std::string& tokenizer, uint32_t context, int slots, const EngineOptions& options);
+    ~MlxQwen35Engine() override;
     int slots() const override;
     uint32_t context() const override;
     bool kv_idle_pending() const override;
@@ -122,6 +123,7 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
                  options.exact ? "on" : "off");
 }
 
+MlxQwen35Engine::~MlxQwen35Engine() = default;  // Impl is complete here
 int MlxQwen35Engine::slots() const {return 1;}
 uint32_t MlxQwen35Engine::context() const {return impl_->context_;}
 bool MlxQwen35Engine::kv_idle_pending() const {return false;}
