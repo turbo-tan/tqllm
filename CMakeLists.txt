@@ -605,6 +605,9 @@ if(BUILD_TESTING)
   # Host-only gates for the MoE work. Both are plain C++ (no CUDA, no GPU, no model), so they
   # build and run regardless of TQLLM_CUDA. Sources are compiled directly into the test so they
   # do not depend on which translation units the tqllm library carries in a CUDA build.
+  add_executable(test-sampling tests/sampling.cpp)
+  target_include_directories(test-sampling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME sampling COMMAND test-sampling)
   add_executable(test-moe tests/moe.cpp src/experts/moe.cpp)
   target_include_directories(test-moe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME moe COMMAND test-moe)

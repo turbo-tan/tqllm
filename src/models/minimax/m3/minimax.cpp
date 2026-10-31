@@ -17,6 +17,7 @@
 #include "minimax_kernels.cuh"
 #include "minimax_memory.hpp"
 #include "minimax_spec.hpp"
+#include "sampling.hpp"
 #include "moe_kernels.cuh"
 #include "tp_comm.hpp"
 #include "quant_kernels.cuh"
@@ -216,14 +217,8 @@ public:
         run(blk.data(), dk + 1, gen_.pos, v.data());
         int k = 0;
         if (sampling()) {  // v holds no greedy ids here: accept / resample against each column's distribution
-            std::uniform_real_distribution<double> uni(0.0, 1.0);
-            for (; k < dk; ++k) {
-                const Dist d = dist(k);
-                double q = 0;
-                for (int i = 0; i < d.n; ++i) if (d.id[i] == blk[size_t(k) + 1]) q = d.p[i];
-                if (uni(rng_) >= q) { v[size_t(k)] = draw(d, blk[size_t(k) + 1]); break; }
-            }
-            if (k == dk) v[size_t(k)] = draw(dist(k));
+            std::vector<uint32_t> none;
+            k = accept_drafts(blk.data() + 1, dk, [&](int i, const std::vector<uint32_t> &) { return dist(i); }, rng_, v.data(), none, false);
         } else {
             while (k < dk && blk[size_t(k) + 1] == v[size_t(k)]) ++k;
         }
@@ -1168,7 +1163,7 @@ private:
             if (!next || rows == 0) continue;
             if (sampling()) {  // top-16 per row to the host; a prompt's last row is drawn here, a verify block's in spec_advance
                 top16(rows);
-                if (prompt) next[n - 1] = draw(dist(0));
+                if (prompt) next[n - 1] = draw(dist(0), rng_);
                 continue;
             }
             tqllm_cuda::glm_argmax_rows(logits_.as<float>(), vocab_, rows, d_arg_.as<int>(), stream_);
@@ -1178,7 +1173,7 @@ private:
             for (int j = 0; j < rows; ++j) next[i + c - rows + j] = uint32_t(ids[size_t(j)]);
         }
     }
-    struct Sampling { float temperature = 0.f, top_p = 1.f; int top_k = 0; } samp_;
+    SamplingParams samp_;
     bool ignore_eos_ = false;
     std::mt19937_64 rng_{0};
     Buf s_val_, s_idx_, s_scr_;
@@ -1201,43 +1196,7 @@ private:
         ck(cudaMemcpyAsync(h_sid_.data(), s_idx_.p, size_t(rows) * 16 * 4, cudaMemcpyDeviceToHost, stream_));
         ck(cudaStreamSynchronize(stream_));
     }
-    struct Dist { uint32_t id[16]; double p[16]; int n = 0; };
-    Dist dist(int row) const {
-        Dist d;
-        int ord[16];
-        for (int i = 0; i < 16; ++i) ord[i] = i;
-        const float * lg = h_slg_.data() + size_t(row) * 16;
-        const uint32_t * id = h_sid_.data() + size_t(row) * 16;
-        std::sort(ord, ord + 16, [&](int a, int b) { return lg[a] > lg[b]; });
-        const int k = samp_.top_k > 0 ? std::min(samp_.top_k, 16) : 16;
-        double sum = 0;
-        for (int i = 0; i < k; ++i) {
-            d.id[i] = id[ord[i]];
-            d.p[i] = std::exp(double(lg[ord[i]] - lg[ord[0]]) / samp_.temperature);
-            sum += d.p[i];
-        }
-        double cum = 0;
-        d.n = k;
-        for (int i = 0; i < k; ++i) {
-            cum += d.p[i] / sum;
-            if (cum >= samp_.top_p) { d.n = i + 1; break; }
-        }
-        double s2 = 0;
-        for (int i = 0; i < d.n; ++i) s2 += d.p[i];
-        for (int i = 0; i < d.n; ++i) d.p[i] /= s2;
-        return d;
-    }
-    uint32_t draw(const Dist & d, uint32_t exclude = UINT32_MAX) {
-        double total = 0;
-        for (int i = 0; i < d.n; ++i) total += d.id[i] == exclude ? 0 : d.p[i];
-        double u = std::uniform_real_distribution<double>(0, total)(rng_);
-        for (int i = 0; i < d.n; ++i) {
-            if (d.id[i] == exclude) continue;
-            if ((u -= d.p[i]) <= 0) return d.id[i];
-        }
-        for (int i = d.n - 1; i >= 0; --i) if (d.id[i] != exclude) return d.id[i];
-        return d.id[0];
-    }
+    TopDist dist(int row) const { return top_dist(h_slg_.data() + size_t(row) * 16, h_sid_.data() + size_t(row) * 16, samp_); }
     // rows: how many of the last tokens get logits (0 inside a prompt; at most chunk_)
     void forward(const uint32_t * tokens, int n, uint32_t pos, int rows) {
         if (rows > chunk_ || rows > n) throw std::runtime_error("minimax: head rows beyond the verify chunk");

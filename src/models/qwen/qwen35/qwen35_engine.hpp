@@ -65,6 +65,7 @@ void check_grouped_expert_format(const Mat & m, const std::string & prefix);
 MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
+#include "sampling.hpp"
 namespace tqllm {
 namespace qwen35_detail {
 
@@ -446,10 +447,8 @@ private:
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
     Buf head4, head4s;  // draft-only 4-bit copy of head8 (DFlash2 full-vocabulary draft head)
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
-    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; the host runs
-    // speculative sampling (accept draft d with p(d), else resample from p without d; bonus token from p).
-    struct Sampling { float temperature = 0.f, top_p = 1.f, presence = 0.f; int top_k = 0; } samp;
-    static constexpr int kPresenceLastN = 64;  // llama.cpp's default penalty window (repeat_last_n)
+    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (sampling.hpp)
+    SamplingParams samp;
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
@@ -471,7 +470,7 @@ private:
         std::vector<Buf> conv_state, rec_state, dfl_kc, dfl_vc;
         cudaGraphExec_t dfl_graph = nullptr;
         int cur = 0;
-        Sampling samp;
+        SamplingParams samp;
         std::mt19937_64 rng{0};
         Gen gen;
     };
@@ -763,11 +762,10 @@ public:
     // Head on columns [col0, col0 + n) of v_x; writes v_tok (and the sampling top-16) at the same columns.
     void head_argmax(const float * norm_w, int n, int col0 = 0);
 
-    // Column i's sampling distribution: top-16 by exact logit, presence penalty against `recent` (the last output
-    // tokens before this column), temperature, top-k (<= 16), top-p.
-    struct Dist { uint32_t id[16]; double p[16]; int n = 0; };
-    Dist dist(int col, const std::vector<uint32_t> & recent = {}) const;
-    uint32_t draw(const Dist & d, uint32_t exclude = UINT32_MAX);
+    // Column col's sampling distribution (sampling.hpp top_dist); recent: the last output tokens before this column
+    TopDist dist(int col, const std::vector<uint32_t> & recent = {}) const {
+        return top_dist(h_slg.data() + size_t(col) * 16, h_sid.data() + size_t(col) * 16, samp, recent);
+    }
 
     // token embeddings of n device-resident ids -> Y [n][hidden] (BF16)
     void embed_multi(const uint32_t * dtok, int n, bf16 * Y);

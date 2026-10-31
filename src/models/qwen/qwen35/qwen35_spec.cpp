@@ -288,7 +288,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         if (sampling()) {  // the final chunk's head wrote column 0's top-16
             ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
             ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
-            next = draw(dist(0));
+            next = draw(dist(0), rng);
         }
         if (kv_cmp && opt.kv_compact_turn) {  // refit the old blocks on this request's queries before decoding
             const auto tc = std::chrono::steady_clock::now();
@@ -319,23 +319,13 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
 int Qwen35Engine::accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0) {
     int j = 0;
     if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
         std::vector<uint32_t> recent;  // presence window: the output so far, then each draft token as it is accepted
         if (samp.presence > 0.f) {
             const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
             recent.assign(gen.out.begin() + long(r0), gen.out.end());
         }
-        for (; j < int(draft.size()); ++j) {
-            const Dist d = dist(col0 + j, recent);
-            double q = 0;
-            for (int i = 0; i < d.n; ++i) if (d.id[i] == draft[j]) q = d.p[i];
-            if (uni(rng) >= q) {
-                res[j] = draw(d, draft[j]);
-                break;
-            }
-            if (samp.presence > 0.f) recent.push_back(draft[j]);
-        }
-        if (j == int(draft.size())) res[j] = draw(dist(col0 + j, recent));
+        j = accept_drafts(draft.data(), int(draft.size()), [&](int i, const std::vector<uint32_t> & r) { return dist(col0 + i, r); },
+                          rng, res, recent, samp.presence > 0.f);
     } else {
         while (j < int(draft.size()) && draft[j] == res[j]) ++j;
     }

@@ -1054,50 +1054,6 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
         tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, lg_out, id_out, s_scr.p, stream);
 }
 
-Qwen35Engine::Dist Qwen35Engine::dist(int col, const std::vector<uint32_t> & recent) const {
-    Dist d;
-    int ord[16];
-    for (int i = 0; i < 16; ++i) ord[i] = i;
-    float lg[16];
-    const uint32_t * id = h_sid.data() + size_t(col) * 16;
-    std::copy_n(h_slg.data() + size_t(col) * 16, 16, lg);
-    if (samp.presence > 0.f) {
-        const size_t r0 = recent.size() > size_t(kPresenceLastN) ? recent.size() - kPresenceLastN : 0;
-        for (int i = 0; i < 16; ++i)
-            if (std::find(recent.begin() + long(r0), recent.end(), id[i]) != recent.end()) lg[i] -= samp.presence;
-    }
-    std::sort(ord, ord + 16, [&](int a, int b) { return lg[a] > lg[b]; });
-    const int k = samp.top_k > 0 ? std::min(samp.top_k, 16) : 16;
-    double sum = 0;
-    for (int i = 0; i < k; ++i) {
-        d.id[i] = id[ord[i]];
-        d.p[i] = std::exp(double(lg[ord[i]] - lg[ord[0]]) / samp.temperature);
-        sum += d.p[i];
-    }
-    double cum = 0;
-    d.n = k;
-    for (int i = 0; i < k; ++i) {
-        cum += d.p[i] / sum;
-        if (cum >= samp.top_p) { d.n = i + 1; break; }
-    }
-    double s2 = 0;
-    for (int i = 0; i < d.n; ++i) s2 += d.p[i];
-    for (int i = 0; i < d.n; ++i) d.p[i] /= s2;
-    return d;
-}
-
-uint32_t Qwen35Engine::draw(const Dist & d, uint32_t exclude) {
-    double total = 0;
-    for (int i = 0; i < d.n; ++i) total += d.id[i] == exclude ? 0 : d.p[i];
-    double u = std::uniform_real_distribution<double>(0, total)(rng);
-    for (int i = 0; i < d.n; ++i) {
-        if (d.id[i] == exclude) continue;
-        if ((u -= d.p[i]) <= 0) return d.id[i];
-    }
-    for (int i = d.n - 1; i >= 0; --i) if (d.id[i] != exclude) return d.id[i];
-    return d.id[0];
-}
-
 void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     const int H = int(cfg.hidden);
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::embed_multi_tq3(embed.p, dtok, n, Y, H, stream);
