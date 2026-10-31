@@ -11,7 +11,8 @@
 
 --model takes a file, a catalog name (`--list`: qwen3.8-27b, -s, -xs, -l) or nothing (the catalog default for this GPU). Catalog
 files are looked up in ./models, ~/models and $TQLLM_MODELS; missing ones are offered for download from Hugging Face
-(size and sha256 checked), --yes downloads without asking.
+(size and sha256 checked), --yes downloads without asking. --yes also goes to tqserve, where it accepts --mode exact
+conflicts (options that are not exact, e.g. --prefill-int8 on) without asking; images older than that option reject it.
 
 The server comes from the Docker image (default) or a native build (--native PATH/tqserve). A server already answering
 on --port with the same model name is reused and left running; one this command started is stopped when the agent exits.
@@ -136,10 +137,11 @@ def start_server(a):
         sampling = []
     args = ["--context", str(a.context), "--np", "1", "--reasoning", a.reasoning, "--max-tokens", str(a.max_tokens),
             "--name", NAME, "--prompt-cache", "on"] + sampling + a.server_arg
+    yes = ["--yes"] if a.yes else []  # the server's log is a file: it cannot ask, so a --mode conflict stops it unless --yes
     if a.native:
-        cmd = [a.native, "--model", a.model, "--port", str(a.port), "--host", "127.0.0.1"] + args
+        cmd = [a.native, "--model", a.model, "--port", str(a.port), "--host", "127.0.0.1"] + args + yes
         if a.drafter: cmd += ["-md", a.drafter, "--draft-vocab", a.draft_vocab]
-        proc, cname = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(a.log, "w")), None
+        proc, cname = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(a.log, "w")), None
     else:
         mdir, mfile = os.path.split(os.path.abspath(a.model))
         cname = f"tqllm-launch-{os.getpid()}"
@@ -151,8 +153,8 @@ def start_server(a):
             vols += ["-v", f"{ddir}:/drafter:ro", "-v", f"{vdir}:/vocab:ro"]
             env += ["-e", f"DRAFT_MODEL_FILE=/drafter/{dfile}", "-e", f"DRAFT_VOCAB_FILE=/vocab/{vfile}"]
         cmd = ["docker", "run", "--rm", "--name", cname, "--gpus", "all", "-p", f"127.0.0.1:{a.port}:8086"] + vols + env + \
-              [a.image, "--name", NAME, "--prompt-cache", "on"] + sampling + a.server_arg
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(a.log, "w"))
+              [a.image, "--name", NAME, "--prompt-cache", "on"] + sampling + a.server_arg + yes
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(a.log, "w"))
     t0 = time.time()
     while time.time() - t0 < a.start_timeout:
         if proc.poll() is not None:
@@ -269,7 +271,8 @@ def main():
     p.add_argument("agent", nargs="?", choices=["opencode", "codex", "claude", "pi", "dsh"])
     p.add_argument("--model", help="GGUF file or catalog name (models.json); default: the catalog default for this GPU")
     p.add_argument("--models-dir", help="where downloads go (default ./models, or $TQLLM_MODELS)")
-    p.add_argument("--yes", action="store_true", help="download missing catalog files without asking")
+    p.add_argument("--yes", action="store_true", help="download missing catalog files without asking, and pass --yes to tqserve "
+                                                      "(accept --mode exact conflicts without asking)")
     p.add_argument("--list", action="store_true", help="print the model catalog and exit")
     p.add_argument("--drafter"); p.add_argument("--draft-vocab")
     p.add_argument("--no-drafter", action="store_true", help="run without the catalog model's drafter")
