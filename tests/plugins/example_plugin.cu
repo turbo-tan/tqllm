@@ -3,7 +3,7 @@
 //   EX_PATCH   an exact patch of the I8H dequant (same arithmetic as the built-in kernel)
 //   EX_BROKEN  P8 whose CPU reference is wrong on one value of every block: the contract must refuse it
 //   EX_INEXACT an I8H dequant patch that claims exact but rounds toward zero (within the contract's 1 ulp, not
-//              byte-identical): the exactness check must refuse it
+//              byte-identical): the exactness check must refuse it; with EX_NOT_EXACT_CLAIM it claims exact = 0 and loads
 #include "tqllm/plugin.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -87,7 +87,12 @@ extern "C" int32_t tq_plugin_init_v2(const tq_host_v2 * host, tq_error * error) 
     static const tq_format_v2 f{sizeof(tq_format_v2), TQ_ABI_VERSION_2, "P8", 2001, uint32_t(kP8Values), uint32_t(kP8Bytes), 0, 0, 0,
                                 p8_cpu, p8_gpu_dequant, p8_gpu_matvec};
 #else
-    static const tq_format_v2 f{sizeof(tq_format_v2), TQ_ABI_VERSION_2, "I8H dequant patch", TQ_PATCH_I8H, 0, 0, 0, 0, 1,
+#ifdef EX_NOT_EXACT_CLAIM  // the rounding variant declared honestly: loads, and --exact on warns
+    const uint32_t exact = 0;
+#else
+    const uint32_t exact = 1;
+#endif
+    static const tq_format_v2 f{sizeof(tq_format_v2), TQ_ABI_VERSION_2, "I8H dequant patch", TQ_PATCH_I8H, 0, 0, 0, 0, exact,
                                 nullptr, i8h_gpu_dequant, nullptr};
 #endif
     return host->register_format(host->context, &f, error);
