@@ -25,7 +25,7 @@ int main(int argc,char** argv) {
         int count=32,repeat=1,warmup=0,chunk=64,context=32768;
         int verify_repeats=5,verify_width=0;
         bool ignore_eos=false,all_logits=false,profiling=false,clear_prefill_cache=false,verify_probe=false,stage_profiling=false,verify_prefix_probe=false,draft_head4=false;
-        size_t cache_limit=0;int kl_ctx=0;double kl_cutoff=-INFINITY;
+        size_t cache_limit=0;int kl_ctx=0;double kl_cutoff=-INFINITY;int kl_tail=0;std::string kv_name;
         for(int i=1;i<argc;++i) {
             const std::string arg=argv[i];
             auto value=[&]() {if(++i==argc)throw std::invalid_argument("missing argument value");return std::string(argv[i]);};
@@ -56,6 +56,8 @@ int main(int argc,char** argv) {
             else if(arg=="--draft-head4") draft_head4=true;
             else if(arg=="--clear-cache-after-prefill") clear_prefill_cache=true;
             else if(arg=="--cache-limit-mib") cache_limit=std::stoull(value())*1024*1024;
+            else if(arg=="--kl-tail") kl_tail=std::stoi(value());  // score the last N prompt tokens in --verify-width rows
+            else if(arg=="--kv-format") kv_name=value();          // bf16 | int8 | trellis (default: the engine's BF16)
             else throw std::invalid_argument("unknown argument: "+arg);
         }
         if(model.empty()||count<1||repeat<1||warmup<0||chunk<1||context<1||verify_repeats<1||
@@ -73,6 +75,44 @@ int main(int argc,char** argv) {
         engine.profile(profiling);
         engine.profile_stages(stage_profiling);
         if(draft_head4)engine.enable_draft_head4();
+        if(!kv_name.empty()) {
+            using tqllm::mlx_backend::KvTier;
+            if(kv_name!="bf16" && kv_name!="int8" && kv_name!="trellis")throw std::invalid_argument("--kv-format must be bf16, int8 or trellis");
+            engine.reserve_kv(int(input.size())+count+16);
+            engine.kv_format(kv_name=="bf16"?KvTier::Bf16:kv_name=="int8"?KvTier::Int8:KvTier::Trellis);
+        }
+        // --kl-tail N: prefill all but the last N prompt tokens, then run those N through the decode / verify path in
+        // --verify-width rows (default 8) with every row's logits: written to --logits, or scored against --kl-reference
+        // (a run of the same tail, e.g. --kv-format bf16). Measures the KV format and verify attention, not the prefill.
+        if(kl_tail>0) {
+            const int width=verify_width>0?verify_width:8;
+            if(size_t(kl_tail)>=input.size())throw std::invalid_argument("--kl-tail must be shorter than the prompt");
+            if(logits_path.empty()==kl_reference.empty())throw std::invalid_argument("--kl-tail needs one of --logits or --kl-reference");
+            const size_t head=input.size()-size_t(kl_tail);
+            const auto t0=Clock::now();
+            for(size_t p=0;p<head;p+=size_t(chunk))engine.forward({input.data()+p,std::min(size_t(chunk),head-p)});
+            std::ofstream out;std::ifstream ref;
+            if(!logits_path.empty())out.open(logits_path,std::ios::binary|std::ios::trunc);else ref.open(kl_reference,std::ios::binary);
+            if((!logits_path.empty() && !out) || (!kl_reference.empty() && !ref))throw std::runtime_error("cannot open the tail logits file");
+            tqllm::KlRows kl;kl.min_log_p=kl_cutoff;
+            for(size_t p=head;p<input.size();p+=size_t(width)) {
+                const size_t n=std::min(size_t(width),input.size()-p);
+                auto y=mx::astype(engine.forward({input.data()+p,n},true),mx::float32);mx::eval(y);
+                const size_t vocab=size_t(y.shape(1));
+                if(!logits_path.empty()) {out.write(reinterpret_cast<const char*>(y.data<float>()),std::streamsize(y.size()*sizeof(float)));continue;}
+                std::vector<float> r(n*vocab);
+                ref.read(reinterpret_cast<char*>(r.data()),std::streamsize(r.size()*sizeof(float)));
+                if(!ref)throw std::runtime_error("tail reference shorter than this run");
+                std::vector<uint32_t> targets;
+                for(size_t k=0;k<n && p+k+1<input.size();++k)targets.push_back(input[p+k+1]);
+                kl.add(r.data(),y.data<float>(),targets.size(),vocab,targets.data());
+            }
+            std::cout<<"{\"kind\":\"kl_tail\",\"kv\":\""<<(kv_name.empty()?"default":kv_name)<<"\",\"prompt\":"<<input.size()
+                     <<",\"tail\":"<<kl_tail<<",\"width\":"<<width<<",\"rows\":"<<kl.rows<<",\"mean_kl\":"<<kl.mean()<<",\"max_kl\":"<<kl.kl_max
+                     <<",\"top1_same\":"<<double(kl.top1_same)/double(std::max<size_t>(kl.rows,1))
+                     <<",\"ln_ppl_ratio\":"<<(kl.targets?kl.nll_gap_sum/double(kl.targets):0.0)<<",\"seconds\":"<<elapsed(t0)<<"}"<<std::endl;
+            return 0;
+        }
         std::cerr<<"MLX_MODEL_LOADED seconds="<<elapsed(started)<<" vocabulary="<<engine.vocabulary()<<'\n';
         memory("loaded");
         if(verify_probe) {
