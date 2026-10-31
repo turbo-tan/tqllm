@@ -6,6 +6,18 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Added
+- `--exact on|off`, on by default: every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8
+  GEMMs, no CPU-served experts), so greedy output is the same from build to build. `--exact off` turns on each engine's
+  measured approximations; an approximation asked for explicitly with `--exact on` runs with one `WARN` line and a
+  `/health` note. Per-engine table in [options](docs/reference/options.md#exact-and-speed---exact-onoff).
+- One server front for every backend: CUDA and Apple Silicon (Metal) builds of `tqserve` share the same model front and
+  pick the engine from a registry (`src/backends/<platform>/`); a new architecture registers there
+  ([Adding a model](docs/guides/adding-a-model.md)).
+- Weight-format plugins (experimental, CUDA): `--plugin PATH` loads a shared library that adds a GGUF tensor type or a
+  faster kernel for a built-in format. Each is checked against the format contract at load, and a patch that claims to
+  be exact is compared bit for bit with the built-in kernel; `/health` lists what was loaded ([Plugins](docs/guides/plugins.md)).
+- Format contract test: every GGUF weight format's GPU dequantisation against a CPU reference and its matrix-vector
+  product against a double-precision dot (14 of 19 formats pass; IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_S are known gaps).
 - Metal (Apple Silicon): Qwen3.8-27B decode with the DFlash2 drafter on the same mlx-community 4-bit weights as
   Splash 1.4.0 is faster on 13 of 18 measured prompts on an M5 Pro 48 GB (2 ties, 3 losses). Short prompts run 2-20 % faster. Contexts
   from 32K to 128K run 2-15 % faster. Changes: the drafter's native 8-row blocks on prompts of 8,000 tokens or more,
@@ -23,6 +35,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Guide: [RTX 5090](docs/guides/rtx-5090.md): Flash-Next and Qwen3.8-27B numbers and what the engine sizes by itself.
 
 ### Changed
+- **Default precision:** with `--exact on` (the new default) the Qwen3.8-27B prefill runs FP16 GEMMs on CUDA where
+  1.3.0 used int8 (RTX 30 / 40 / 50) or FP8 (GB10). `--exact off` restores the 1.3.0 prefill.
+- **Environment variables:** 55 remain (20 settings, `TQLLM_DEBUG`, 35 retired names that stop the tool and name their
+  replacement). Diagnostics are `TQLLM_DEBUG` keys; settled A/B switches are gone, fixed at their measured defaults.
+  [docs/FLAGS.md](docs/FLAGS.md) lists every removed name with what replaces it.
 - Flash-Next decode launches its per-layer kernels directly on Blackwell PCIe cards (RTX 5090, `sm_120`) and keeps CUDA
   graphs on unified-memory GPUs (GB10 / DGX Spark, +5-6 % decode) and older PCIe cards (RTX 3090: -3 % chat without them).
   RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s. Output identical.
