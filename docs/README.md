@@ -14,6 +14,7 @@
 | Configure serving, sampling and memory | [Options](reference/options.md) |
 | Reproduce performance measurements | [Benchmarks](BENCHMARKS.md) |
 | Understand source layout | [Architecture](ARCHITECTURE.md) |
+| Add a model architecture | [Adding a model](guides/adding-a-model.md) |
 | Extend the monitor | [Monitor contributor guide](MONITOR_CONTRIBUTING.md) |
 | Acknowledgements and third-party licences | [Credits](CREDITS.md), [NOTICE](../NOTICE) |
 

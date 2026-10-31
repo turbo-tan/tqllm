@@ -120,8 +120,10 @@ component live in the same folder. Dependencies point down only, and `tests/test
 
 ## Adding a model architecture
 
+Checklist (what you write, what you get from the components): [docs/guides/adding-a-model.md](docs/guides/adding-a-model.md).
+
 - `src/models/<family>/<arch>/`: config + tensor schema check, a CPU reference forward for one token, the CUDA
-  forward, and the dispatch entry in `src/engine/`.
+  forward; the registry entry goes in `src/backends/<platform>/builtin_<platform>.cpp`.
 - Use `src/kv`, `src/formats`, `src/experts` and `src/spec`. Extend them when something is missing; do not copy them
   into the model folder.
 - Tests: the schema check on a mock file; CUDA greedy tokens identical to the CPU reference; a serve smoke test.
