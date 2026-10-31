@@ -16,5 +16,7 @@ void q3k_scales(const uint8_t * p, int8_t * sc);
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n);
 // The same for a [rows][cols] matrix; layouts whose rows carry their own scales (MXFP8) need the row length.
 void dequantize_host_rows(uint32_t type, const void * src, float * dst, int64_t rows, int64_t cols);
+// TQ3 rotation of one 32-value block (model basis -> the rotated basis TQ3 formats store and decode in)
+void tq3_rotate_block(float * v);
 
 } // namespace tqllm
