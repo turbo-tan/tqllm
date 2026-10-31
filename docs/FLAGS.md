@@ -73,3 +73,240 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_TREE` | - | removed | tree verify is on with -md; --no-tree turns it off |
 | `TQLLM_TREE_CHAIN` | - | removed | TQLLM_DEBUG=tree_chain |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
+
+## Removed in 1.4.0 (no effect; use the replacement)
+
+| Flag | Use instead |
+|---|---|
+| `TQFN_ALLOW_NP_ABOVE_8` | none: fixed at its measured default |
+| `TQFN_ARENA_LOG` | TQLLM_DEBUG=arena |
+| `TQFN_AUTO_KEEP_MB` | none: fixed at its measured default |
+| `TQFN_BF16_ACT` | none: fixed at its measured default |
+| `TQFN_CPU_CHECK` | TQLLM_DEBUG=cpu_check |
+| `TQFN_CPU_GGUF_ROWS` | none: fixed at its measured default |
+| `TQFN_CPU_MISS_MAX` | none: fixed at its measured default |
+| `TQFN_CPU_OWNED` | removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks |
+| `TQFN_CPU_OWNED_COLD` | removed (profile-owned cold experts lost on the 3090) |
+| `TQFN_CPU_OWNED_PROFILE` | removed with TQFN_CPU_OWNED_COLD |
+| `TQFN_CPU_REFILL` | none: fixed at its measured default |
+| `TQFN_CPU_SPIN_MS` | none: fixed at its measured default |
+| `TQFN_DRAFT_TAU` | none: the engine sets the draft stop at load |
+| `TQFN_DUMP_GDN` | TQLLM_DEBUG=dump_gdn:FILE |
+| `TQFN_EXACT_F32` | none: fixed at its measured default |
+| `TQFN_EXPERT_GEMM_MIN` | none: fixed at its measured default |
+| `TQFN_EXPERT_PROFILE` | TQLLM_DEBUG=expert_profile:FILE |
+| `TQFN_F32_ROUTER` | none: fixed at its measured default |
+| `TQFN_GDN_CHUNK_MIN` | none: fixed at its measured default |
+| `TQFN_GDN_SEQ_FAST` | none: fixed at its measured default |
+| `TQFN_GDN_VPW` | fixed behaviour (8 value columns per warp, bit-identical) |
+| `TQFN_GDN_WY` | none: fixed at its measured default |
+| `TQFN_GEMV_TILE` | none: fixed at its measured default |
+| `TQFN_KEEP_MAP` | TQLLM_DEBUG=keep_map:FILE |
+| `TQFN_LAYER_MAJOR` | none: fixed at its default |
+| `TQFN_LAYER_MAJOR_MIN` | none: fixed at its measured default |
+| `TQFN_MTP_CATCHUP` | none: fixed at its measured default |
+| `TQFN_MTP_LAYER_MAJOR` | none: fixed at its measured default |
+| `TQFN_NO_LAYER_RESET` | none: fixed at its measured default |
+| `TQFN_NO_PREFETCH` | none: fixed at its measured default |
+| `TQFN_OLD_Q2_DOT` | fixed behaviour (warp-per-row GSQ Q2_0 dot) |
+| `TQFN_PF_CHUNK_KB` | fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090) |
+| `TQFN_PF_EVENTS` | fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33) |
+| `TQFN_PF_K` | none: fixed at its measured default |
+| `TQFN_PF_KEEP` | none: fixed at its measured default |
+| `TQFN_PF_MMQ_CHECK` | TQLLM_DEBUG=pf_mmq_check:N |
+| `TQFN_PREDICT_N` | none: the engine sets the prediction depth at load |
+| `TQFN_PRED_DUMP` | TQLLM_DEBUG=pred_dump:FILE |
+| `TQFN_PREFILL_INT8_FMT` | none: fixed at its default |
+| `TQFN_PREFILL_LOG` | TQLLM_DEBUG=fn_prefill_log |
+| `TQFN_PROFILE_DECODE` | TQLLM_DEBUG=profile_decode |
+| `TQFN_PROFILE_REQ` | TQLLM_DEBUG=profile_req:N |
+| `TQFN_Q2_DOT_GROUPED` | none: fixed at its default |
+| `TQFN_QSA` | none: fixed at its default |
+| `TQFN_QSA_CHECK` | TQLLM_DEBUG=qsa_check |
+| `TQFN_QSA_SPLIT` | none: fixed at its default |
+| `TQFN_ROUND32` | none: fixed at its measured default |
+| `TQFN_ROUTER_GEMM` | fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing) |
+| `TQFN_ROUTE_DUMP` | TQLLM_DEBUG=route_dump:FILE |
+| `TQFN_TQ_AHEAD` | TQueue prefetch queue lives on branch tqllm/tqueue (not in the release) |
+| `TQFN_VERIFY_WAVES` | none: fixed at its measured default |
+| `TQFN_WAVE_GEMM_AVG` | none: fixed at its measured default |
+| `TQLLM_ATTN_NBUF` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_BATCH_COLS` | automatic (per GPU) |
+| `TQLLM_COMPOSITE` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_CONV_SERIAL` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DEFER` | automatic (per GPU) |
+| `TQLLM_DFLASH_BF16` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DFLASH_I8H` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DFLASH_NOGRAPH` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DFLASH_TQ3` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DRAFT_HEAD8` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_DSUB_COPY` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_EMBED_HOST` | automatic (tqserve memory fit) |
+| `TQLLM_FORCE_BATCH` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_GEMM_F32` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_GEMM_F32ACC` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_GEMM_PAD` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_GEMM_ROWS` | automatic (tqserve memory fit) |
+| `TQLLM_GEN_ATTN_OLD` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_GLM_DUMP` | TQLLM_DEBUG=glm_dump |
+| `TQLLM_GLM_EXPERT_PF` | none: fixed at its measured default |
+| `TQLLM_GLM_NO_GRAPH` | TQLLM_DEBUG=glm_no_graph |
+| `TQLLM_HEAD8` | tqkld requests full-vocabulary logits itself |
+| `TQLLM_HEAD_HOST` | automatic (tqserve memory fit) |
+| `TQLLM_HEAD_PER_SEG` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_HOST_CHAIN` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_HW_MT` | removed (fixed launch policy) |
+| `TQLLM_IQ4_OLD` | removed (IQ4_XS loads as IQ4N) |
+| `TQLLM_LOOKUP_N` | removed (--lookup matches 6 tokens) |
+| `TQLLM_MINIMAX_DUMP` | TQLLM_DEBUG=minimax_dump:FILE |
+| `TQLLM_MINIMAX_ROUTES` | TQLLM_DEBUG=minimax_routes:FILE |
+| `TQLLM_MIX_COPY` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_MLX_ABLATE` | none: Metal release default built in |
+| `TQLLM_MLX_ABLATE_BLOCKS` | none: Metal release default built in |
+| `TQLLM_MLX_ABLATE_SMALL` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_FFN` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_GU` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_HALF` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_MIXER` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_PAD` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_TQ4` | none: Metal release default built in |
+| `TQLLM_MLX_AFFINE_TQ4_FP32` | none: Metal release default built in |
+| `TQLLM_MLX_ANE_CHECK` | none: Metal release default built in |
+| `TQLLM_MLX_ANE_FULL_DEQUANT` | none: Metal release default built in |
+| `TQLLM_MLX_ANE_NOISE` | none: Metal release default built in |
+| `TQLLM_MLX_ANE_SERIAL` | TQLLM_DEBUG=ane_serial |
+| `TQLLM_MLX_ANE_SKIP_PREDICT` | none: Metal release default built in |
+| `TQLLM_MLX_ANE_TIMING` | TQLLM_DEBUG=ane_timing |
+| `TQLLM_MLX_ATTENTION_KV_VIEWS` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_DECODE_ROWS` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_DECODE_SDPA` | none: always on (fused SDPA decode attention) |
+| `TQLLM_MLX_ATTN_DECODE_V2` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_DECODE_V3` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_PREFILL_BF16` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_Q_CHUNK` | none: Metal release default built in |
+| `TQLLM_MLX_ATTN_V3_PB` | none: Metal release default built in |
+| `TQLLM_MLX_BATCH_DECODE_DENSE` | none: Metal release default built in |
+| `TQLLM_MLX_CAPTURE_VERIFY` | none: Metal release default built in |
+| `TQLLM_MLX_COMPACT_GDN_TAPE` | none: Metal release default built in |
+| `TQLLM_MLX_COMPILED_GDN` | none: Metal release default built in |
+| `TQLLM_MLX_COUNT_NODES` | TQLLM_DEBUG=count_nodes |
+| `TQLLM_MLX_DECODED_FFN` | none: Metal release default built in |
+| `TQLLM_MLX_DEVICE_SELECTOR` | none: Metal release default built in |
+| `TQLLM_MLX_DFLASH_BLOCK` | none: the drafter GGUF's block size (DFlash2 block_rows) |
+| `TQLLM_MLX_DFLASH_CHAIN` | none: Metal release default built in |
+| `TQLLM_MLX_DFLASH_PIPELINE` | none: Metal release default built in |
+| `TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD` | none: Metal release default built in |
+| `TQLLM_MLX_DFLASH_RANKSTATS` | TQLLM_DEBUG=dflash_rankstats |
+| `TQLLM_MLX_DFLASH_SHARDED_TOP16` | none: Metal release default built in |
+| `TQLLM_MLX_DFLASH_SPEC_ONLY` | TQLLM_DEBUG=dflash_spec_only |
+| `TQLLM_MLX_DFLASH_WARM_TOKENS` | TQLLM_DEBUG=dflash_warm_tokens:N |
+| `TQLLM_MLX_DRAFT_ABLATE` | none: Metal release default built in |
+| `TQLLM_MLX_DRAFT_BUILD_PROFILE` | none: Metal release default built in |
+| `TQLLM_MLX_DRAFT_HEAD4` | none: Metal release default built in |
+| `TQLLM_MLX_DRAFT_HEAD_UNPAD` | none: Metal release default built in |
+| `TQLLM_MLX_DROP_TILED_ORIGINALS` | none: Metal release default built in |
+| `TQLLM_MLX_DUMP_FFN` | TQLLM_DEBUG=dump_ffn:DIR |
+| `TQLLM_MLX_DUMP_FFN_SLICE` | TQLLM_DEBUG=dump_ffn_slice:N |
+| `TQLLM_MLX_DUMP_KV` | none: Metal release default built in |
+| `TQLLM_MLX_EAGER_ACCEPT` | none: Metal release default built in |
+| `TQLLM_MLX_EAGER_COMMIT` | none: Metal release default built in |
+| `TQLLM_MLX_FFN_GEMM` | none: Metal release default built in |
+| `TQLLM_MLX_FUSED_ATTENTION_ROWS` | none: Metal release default built in |
+| `TQLLM_MLX_FUSE_EPILOGUE` | none: Metal release default built in |
+| `TQLLM_MLX_FUSE_EW` | none: Metal release default built in |
+| `TQLLM_MLX_FUSE_SWIGLU_ROTATION` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_CHUNKED` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_FUSE` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_FUSE_PREFILL` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_SCAN` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_SCAN8` | none: Metal release default built in |
+| `TQLLM_MLX_GDN_STEP` | none: Metal release default built in |
+| `TQLLM_MLX_HEAD_FRAG` | none: Metal release default built in |
+| `TQLLM_MLX_INT8_N` | none: Metal release default built in |
+| `TQLLM_MLX_INT8_SIMDS` | none: Metal release default built in |
+| `TQLLM_MLX_INT8_TILE` | none: Metal release default built in |
+| `TQLLM_MLX_KV_F32` | none: Metal release default built in |
+| `TQLLM_MLX_LAZY_INJECT` | none: Metal release default built in |
+| `TQLLM_MLX_LAZY_VERIFY_COMMIT` | none: Metal release default built in |
+| `TQLLM_MLX_MATMUL_COLS` | none: Metal release default built in |
+| `TQLLM_MLX_MATMUL_SIMDS` | none: Metal release default built in |
+| `TQLLM_MLX_MMA8` | none: Metal release default built in |
+| `TQLLM_MLX_MMA8_DRAFT` | none: Metal release default built in |
+| `TQLLM_MLX_MMA8_UNTILED_ONLY` | none: Metal release default built in |
+| `TQLLM_MLX_NATIVE_GDN` | none: Metal release default built in |
+| `TQLLM_MLX_NATIVE_GDN_PREP` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_DRAFT_HEAD4` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_DRAFT_SHORTLIST` | none: removed (experiment, off) |
+| `TQLLM_MLX_NAX_FUSE` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_MAX_SPLIT` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_MR64` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_NO_INPUT_CACHE` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_PREFILL_GEMM` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_Q6_HEAD` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_ROW_CHECK` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_SPLIT_TARGET` | none: Metal release default built in |
+| `TQLLM_MLX_NAX_TQ4` | none: Metal release default built in |
+| `TQLLM_MLX_PAIRED_GATE_UP` | none: Metal release default built in |
+| `TQLLM_MLX_PAIRED_SWIGLU_ROTATION` | none: Metal release default built in |
+| `TQLLM_MLX_PREFILL_GEMM` | none: Metal release default built in |
+| `TQLLM_MLX_PREFILL_INT8` | none: removed (opt-in experiment; its quality loss closed it) |
+| `TQLLM_MLX_PREFILL_INT8_MASK` | none: Metal release default built in |
+| `TQLLM_MLX_Q6_AFFINE` | none: Metal release default built in |
+| `TQLLM_MLX_REUSE_ROTATION` | none: Metal release default built in |
+| `TQLLM_MLX_SERIAL_VERIFY_ATTENTION` | none: Metal release default built in |
+| `TQLLM_MLX_SERIAL_VERIFY_DENSE` | none: Metal release default built in |
+| `TQLLM_MLX_SPLIT_COMMIT_TIMING` | none: Metal release default built in |
+| `TQLLM_MLX_STAGED_BKM` | none: Metal release default built in |
+| `TQLLM_MLX_STAGED_KS` | none: Metal release default built in |
+| `TQLLM_MLX_STAGED_MT` | none: Metal release default built in |
+| `TQLLM_MLX_STAGED_PERSG` | none: Metal release default built in |
+| `TQLLM_MLX_STAGED_SIMDS` | none: Metal release default built in |
+| `TQLLM_MLX_TARGET_HEAD_HOST` | none: Metal release default built in |
+| `TQLLM_MLX_TARGET_HEAD_IDS` | none: Metal release default built in |
+| `TQLLM_MLX_TARGET_HEAD_SHORTLIST` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_K` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_M` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_MEMORY` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_N` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_SIMDS` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_SPLIT` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_TRANSPOSE` | none: Metal release default built in |
+| `TQLLM_MLX_TENSOR_WIDE` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_DFLASH_FP32` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_MIXER_FP16` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_MIXER_FP32` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_TQ3_FP16` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_TQ3_FP32` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_TQ4_FP16` | none: Metal release default built in |
+| `TQLLM_MLX_TILED_TQ4_FP32` | none: Metal release default built in |
+| `TQLLM_MLX_TQ3_STREAM` | none: Metal release default built in |
+| `TQLLM_MLX_TQ3_SUBGROUP` | none: Metal release default built in |
+| `TQLLM_MLX_TQ4_ROTATE_UNFUSED` | none: Metal release default built in |
+| `TQLLM_MLX_WIRED_MIB` | TQLLM_DEBUG=wired_mib:N |
+| `TQLLM_MOE_DEV` | nothing: qwen35moe (MoE) models load by default |
+| `TQLLM_MOE_FUSE_SHARED` | none: fixed at its measured default |
+| `TQLLM_MOE_PROFILE` | TQLLM_DEBUG=moe_profile:FILE |
+| `TQLLM_MOE_STAGE` | none: fixed at its measured default |
+| `TQLLM_MQ_SPLIT` | automatic |
+| `TQLLM_NO_BLKMERGE` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_NO_BTREE` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_NO_RMSROPE` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_NO_SIDE` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_PF_GU_BF16` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_PF_MIX_COPY` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_PREFILL_ATTN_GROUPED` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_PREFILL_ATTN_OLD` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_PREFILL_CHUNK` | automatic (-ub sets the prefill buffer) |
+| `TQLLM_Q4K_U4H` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_REPEAT_EXIT` | removed |
+| `TQLLM_SERIAL_DRAFT` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_SERIAL_SEGS` | fixed behaviour (settled A/B switch removed) |
+| `TQLLM_TQ3_HW` | removed (fixed launch policy) |
+| `TQLLM_TQ3_MT` | removed (fixed launch policy) |
+| `TQLLM_TQ3_MT_KMIN` | removed (fixed launch policy: k >= 12288) |
+| `TQLLM_TQ3_P` | removed (fixed launch policy) |
+| `TQLLM_TQ3_TUNE` | removed (the load-time tuner always runs) |
+| `TQLLM_TQ4_TUNE` | removed (no in-model gain) |
+| `TQLLM_TQ4_VARIANT` | removed (variant 0) |
+| `TQLLM_TREE_TEMP` | removed (1.0) |
+| `TQLLM_U4H` | removed |

@@ -18,6 +18,10 @@ This product includes third-party code under its own licence:
   MIT License, Copyright (c) 2023-2026 The ggml authors (licenses/ggml-MIT.txt) and Copyright (c) 2025 Turboderp
   (licenses/exllamav3-MIT.txt).
 
+* third_party/ggml_mmq - the CUDA MMQ (quantised matrix-multiply) kernels from llama.cpp ggml/src/ggml-cuda (commit fb4b273);
+  the tile loaders of the codebook expert formats changed to read tqLLM's bank layout (third_party/ggml_mmq/NOTICE).
+  MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
+
 * third_party/stb/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
@@ -31,6 +35,8 @@ Credits - work this project builds on or learned from (ideas and formats, no cod
 * TheTom (turboquant_plus): TurboQuant KV-cache ideas and the REFRACT distance-from-reference quality metric.
 * Avarok (TorQuant): learned rotations for quantisation.
 * Unsloth: the UD GGUF quantisations, which TQLLM runs natively and benchmarks against.
+* Strata (MIT, Niko1221 and the Strata contributors): the idea of launching MMQ directly per expert group from the
+  prefill path.
 * Splash (Apache-2.0): the staged prefill GEMM tile on Apple GPUs (weights dequantized once per threadgroup into a
   double-buffered threadgroup stage, one matmul2d per simdgroup per step), reimplemented for the NAX 4-bit layout.
 

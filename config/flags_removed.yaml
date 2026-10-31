@@ -1,0 +1,699 @@
+# Environment variables removed in a release: tools/gen_flags.py lists them in docs/FLAGS.md ("Removed") and checks that
+# none is registered or read again. A removed name has no effect; `use` says what replaces it.
+removed:
+  - name: TQFN_ALLOW_NP_ABOVE_8
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_ARENA_LOG
+    since: 1.4.0
+    use: "TQLLM_DEBUG=arena"
+  - name: TQFN_AUTO_KEEP_MB
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_BF16_ACT
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_CPU_CHECK
+    since: 1.4.0
+    use: "TQLLM_DEBUG=cpu_check"
+  - name: TQFN_CPU_GGUF_ROWS
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_CPU_MISS_MAX
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_CPU_OWNED
+    since: 1.4.0
+    use: "removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks"
+  - name: TQFN_CPU_OWNED_COLD
+    since: 1.4.0
+    use: "removed (profile-owned cold experts lost on the 3090)"
+  - name: TQFN_CPU_OWNED_PROFILE
+    since: 1.4.0
+    use: "removed with TQFN_CPU_OWNED_COLD"
+  - name: TQFN_CPU_REFILL
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_CPU_SPIN_MS
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_DRAFT_TAU
+    since: 1.4.0
+    use: "none: the engine sets the draft stop at load"
+  - name: TQFN_DUMP_GDN
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dump_gdn:FILE"
+  - name: TQFN_EXACT_F32
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_EXPERT_GEMM_MIN
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_EXPERT_PROFILE
+    since: 1.4.0
+    use: "TQLLM_DEBUG=expert_profile:FILE"
+  - name: TQFN_F32_ROUTER
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_GDN_CHUNK_MIN
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_GDN_SEQ_FAST
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_GDN_VPW
+    since: 1.4.0
+    use: "fixed behaviour (8 value columns per warp, bit-identical)"
+  - name: TQFN_GDN_WY
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_GEMV_TILE
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_KEEP_MAP
+    since: 1.4.0
+    use: "TQLLM_DEBUG=keep_map:FILE"
+  - name: TQFN_LAYER_MAJOR
+    since: 1.4.0
+    use: "none: fixed at its default"
+  - name: TQFN_LAYER_MAJOR_MIN
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_MTP_CATCHUP
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_MTP_LAYER_MAJOR
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_NO_LAYER_RESET
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_NO_PREFETCH
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_OLD_Q2_DOT
+    since: 1.4.0
+    use: "fixed behaviour (warp-per-row GSQ Q2_0 dot)"
+  - name: TQFN_PF_CHUNK_KB
+    since: 1.4.0
+    use: "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"
+  - name: TQFN_PF_EVENTS
+    since: 1.4.0
+    use: "fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33)"
+  - name: TQFN_PF_K
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_PF_KEEP
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_PF_MMQ_CHECK
+    since: 1.4.0
+    use: "TQLLM_DEBUG=pf_mmq_check:N"
+  - name: TQFN_PREDICT_N
+    since: 1.4.0
+    use: "none: the engine sets the prediction depth at load"
+  - name: TQFN_PRED_DUMP
+    since: 1.4.0
+    use: "TQLLM_DEBUG=pred_dump:FILE"
+  - name: TQFN_PREFILL_INT8_FMT
+    since: 1.4.0
+    use: "none: fixed at its default"
+  - name: TQFN_PREFILL_LOG
+    since: 1.4.0
+    use: "TQLLM_DEBUG=fn_prefill_log"
+  - name: TQFN_PROFILE_DECODE
+    since: 1.4.0
+    use: "TQLLM_DEBUG=profile_decode"
+  - name: TQFN_PROFILE_REQ
+    since: 1.4.0
+    use: "TQLLM_DEBUG=profile_req:N"
+  - name: TQFN_Q2_DOT_GROUPED
+    since: 1.4.0
+    use: "none: fixed at its default"
+  - name: TQFN_QSA
+    since: 1.4.0
+    use: "none: fixed at its default"
+  - name: TQFN_QSA_CHECK
+    since: 1.4.0
+    use: "TQLLM_DEBUG=qsa_check"
+  - name: TQFN_QSA_SPLIT
+    since: 1.4.0
+    use: "none: fixed at its default"
+  - name: TQFN_ROUND32
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_ROUTER_GEMM
+    since: 1.4.0
+    use: "fixed behaviour (tiled router GEMV; the GEMM flipped near-tie routing)"
+  - name: TQFN_ROUTE_DUMP
+    since: 1.4.0
+    use: "TQLLM_DEBUG=route_dump:FILE"
+  - name: TQFN_TQ_AHEAD
+    since: 1.4.0
+    use: "TQueue prefetch queue lives on branch tqllm/tqueue (not in the release)"
+  - name: TQFN_VERIFY_WAVES
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQFN_WAVE_GEMM_AVG
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQLLM_ATTN_NBUF
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_BATCH_COLS
+    since: 1.4.0
+    use: "automatic (per GPU)"
+  - name: TQLLM_COMPOSITE
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_CONV_SERIAL
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DEFER
+    since: 1.4.0
+    use: "automatic (per GPU)"
+  - name: TQLLM_DFLASH_BF16
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DFLASH_I8H
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DFLASH_NOGRAPH
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DFLASH_TQ3
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DRAFT_HEAD8
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DSUB_COPY
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_EMBED_HOST
+    since: 1.4.0
+    use: "automatic (tqserve memory fit)"
+  - name: TQLLM_FORCE_BATCH
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_GEMM_F32
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_GEMM_F32ACC
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_GEMM_PAD
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_GEMM_ROWS
+    since: 1.4.0
+    use: "automatic (tqserve memory fit)"
+  - name: TQLLM_GEN_ATTN_OLD
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_GLM_DUMP
+    since: 1.4.0
+    use: "TQLLM_DEBUG=glm_dump"
+  - name: TQLLM_GLM_EXPERT_PF
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQLLM_GLM_NO_GRAPH
+    since: 1.4.0
+    use: "TQLLM_DEBUG=glm_no_graph"
+  - name: TQLLM_HEAD8
+    since: 1.4.0
+    use: "tqkld requests full-vocabulary logits itself"
+  - name: TQLLM_HEAD_HOST
+    since: 1.4.0
+    use: "automatic (tqserve memory fit)"
+  - name: TQLLM_HEAD_PER_SEG
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_HOST_CHAIN
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_HW_MT
+    since: 1.4.0
+    use: "removed (fixed launch policy)"
+  - name: TQLLM_IQ4_OLD
+    since: 1.4.0
+    use: "removed (IQ4_XS loads as IQ4N)"
+  - name: TQLLM_LOOKUP_N
+    since: 1.4.0
+    use: "removed (--lookup matches 6 tokens)"
+  - name: TQLLM_MINIMAX_DUMP
+    since: 1.4.0
+    use: "TQLLM_DEBUG=minimax_dump:FILE"
+  - name: TQLLM_MINIMAX_ROUTES
+    since: 1.4.0
+    use: "TQLLM_DEBUG=minimax_routes:FILE"
+  - name: TQLLM_MIX_COPY
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_MLX_ABLATE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ABLATE_BLOCKS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ABLATE_SMALL
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_FFN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_GU
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_HALF
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_MIXER
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_PAD
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_TQ4
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_AFFINE_TQ4_FP32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ANE_CHECK
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ANE_FULL_DEQUANT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ANE_NOISE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ANE_SERIAL
+    since: 1.4.0
+    use: "TQLLM_DEBUG=ane_serial"
+  - name: TQLLM_MLX_ANE_SKIP_PREDICT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ANE_TIMING
+    since: 1.4.0
+    use: "TQLLM_DEBUG=ane_timing"
+  - name: TQLLM_MLX_ATTENTION_KV_VIEWS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_DECODE_ROWS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_DECODE_SDPA
+    since: 1.4.0
+    use: "none: always on (fused SDPA decode attention)"
+  - name: TQLLM_MLX_ATTN_DECODE_V2
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_DECODE_V3
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_PREFILL_BF16
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_Q_CHUNK
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_ATTN_V3_PB
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_BATCH_DECODE_DENSE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_CAPTURE_VERIFY
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_COMPACT_GDN_TAPE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_COMPILED_GDN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_COUNT_NODES
+    since: 1.4.0
+    use: "TQLLM_DEBUG=count_nodes"
+  - name: TQLLM_MLX_DECODED_FFN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DEVICE_SELECTOR
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DFLASH_BLOCK
+    since: 1.4.0
+    use: "none: the drafter GGUF's block size (DFlash2 block_rows)"
+  - name: TQLLM_MLX_DFLASH_CHAIN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DFLASH_PIPELINE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DFLASH_PIPELINE_SYNC_BUILD
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DFLASH_RANKSTATS
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dflash_rankstats"
+  - name: TQLLM_MLX_DFLASH_SHARDED_TOP16
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DFLASH_SPEC_ONLY
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dflash_spec_only"
+  - name: TQLLM_MLX_DFLASH_WARM_TOKENS
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dflash_warm_tokens:N"
+  - name: TQLLM_MLX_DRAFT_ABLATE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DRAFT_BUILD_PROFILE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DRAFT_HEAD4
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DRAFT_HEAD_UNPAD
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DROP_TILED_ORIGINALS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_DUMP_FFN
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dump_ffn:DIR"
+  - name: TQLLM_MLX_DUMP_FFN_SLICE
+    since: 1.4.0
+    use: "TQLLM_DEBUG=dump_ffn_slice:N"
+  - name: TQLLM_MLX_DUMP_KV
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_EAGER_ACCEPT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_EAGER_COMMIT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_FFN_GEMM
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_FUSED_ATTENTION_ROWS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_FUSE_EPILOGUE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_FUSE_EW
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_FUSE_SWIGLU_ROTATION
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_CHUNKED
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_FUSE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_FUSE_PREFILL
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_SCAN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_SCAN8
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_GDN_STEP
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_HEAD_FRAG
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_INT8_N
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_INT8_SIMDS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_INT8_TILE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_KV_F32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_LAZY_INJECT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_LAZY_VERIFY_COMMIT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_MATMUL_COLS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_MATMUL_SIMDS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_MMA8
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_MMA8_DRAFT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_MMA8_UNTILED_ONLY
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NATIVE_GDN
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NATIVE_GDN_PREP
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_DRAFT_HEAD4
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_DRAFT_SHORTLIST
+    since: 1.4.0
+    use: "none: removed (experiment, off)"
+  - name: TQLLM_MLX_NAX_FUSE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_MAX_SPLIT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_MR64
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_NO_INPUT_CACHE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_PREFILL_GEMM
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_Q6_HEAD
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_ROW_CHECK
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_SPLIT_TARGET
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_NAX_TQ4
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_PAIRED_GATE_UP
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_PAIRED_SWIGLU_ROTATION
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_PREFILL_GEMM
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_PREFILL_INT8
+    since: 1.4.0
+    use: "none: removed (opt-in experiment; its quality loss closed it)"
+  - name: TQLLM_MLX_PREFILL_INT8_MASK
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_Q6_AFFINE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_REUSE_ROTATION
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_SERIAL_VERIFY_ATTENTION
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_SERIAL_VERIFY_DENSE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_SPLIT_COMMIT_TIMING
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_STAGED_BKM
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_STAGED_KS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_STAGED_MT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_STAGED_PERSG
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_STAGED_SIMDS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TARGET_HEAD_HOST
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TARGET_HEAD_IDS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TARGET_HEAD_SHORTLIST
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_K
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_M
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_MEMORY
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_N
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_SIMDS
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_SPLIT
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_TRANSPOSE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TENSOR_WIDE
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_DFLASH_FP32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_MIXER_FP16
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_MIXER_FP32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_TQ3_FP16
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_TQ3_FP32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_TQ4_FP16
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TILED_TQ4_FP32
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TQ3_STREAM
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TQ3_SUBGROUP
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_TQ4_ROTATE_UNFUSED
+    since: 1.4.0
+    use: "none: Metal release default built in"
+  - name: TQLLM_MLX_WIRED_MIB
+    since: 1.4.0
+    use: "TQLLM_DEBUG=wired_mib:N"
+  - name: TQLLM_MOE_DEV
+    since: 1.4.0
+    use: "nothing: qwen35moe (MoE) models load by default"
+  - name: TQLLM_MOE_FUSE_SHARED
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQLLM_MOE_PROFILE
+    since: 1.4.0
+    use: "TQLLM_DEBUG=moe_profile:FILE"
+  - name: TQLLM_MOE_STAGE
+    since: 1.4.0
+    use: "none: fixed at its measured default"
+  - name: TQLLM_MQ_SPLIT
+    since: 1.4.0
+    use: "automatic"
+  - name: TQLLM_NO_BLKMERGE
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_NO_BTREE
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_NO_RMSROPE
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_NO_SIDE
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_PF_GU_BF16
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_PF_MIX_COPY
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_PREFILL_ATTN_GROUPED
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_PREFILL_ATTN_OLD
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_PREFILL_CHUNK
+    since: 1.4.0
+    use: "automatic (-ub sets the prefill buffer)"
+  - name: TQLLM_Q4K_U4H
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_REPEAT_EXIT
+    since: 1.4.0
+    use: "removed"
+  - name: TQLLM_SERIAL_DRAFT
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_SERIAL_SEGS
+    since: 1.4.0
+    use: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_TQ3_HW
+    since: 1.4.0
+    use: "removed (fixed launch policy)"
+  - name: TQLLM_TQ3_MT
+    since: 1.4.0
+    use: "removed (fixed launch policy)"
+  - name: TQLLM_TQ3_MT_KMIN
+    since: 1.4.0
+    use: "removed (fixed launch policy: k >= 12288)"
+  - name: TQLLM_TQ3_P
+    since: 1.4.0
+    use: "removed (fixed launch policy)"
+  - name: TQLLM_TQ3_TUNE
+    since: 1.4.0
+    use: "removed (the load-time tuner always runs)"
+  - name: TQLLM_TQ4_TUNE
+    since: 1.4.0
+    use: "removed (no in-model gain)"
+  - name: TQLLM_TQ4_VARIANT
+    since: 1.4.0
+    use: "removed (variant 0)"
+  - name: TQLLM_TREE_TEMP
+    since: 1.4.0
+    use: "removed (1.0)"
+  - name: TQLLM_U4H
+    since: 1.4.0
+    use: "removed"
