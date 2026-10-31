@@ -10,16 +10,14 @@
 #include "tqllm/rope_scaling.hpp"
 
 namespace tqllm {
-// --mode: exact runs every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs) unless
-// memory forces a smaller KV, which is logged; speed (default) lets each engine take its measured approximations
-enum class Mode {Speed, Exact};
-inline const char * mode_name(Mode m) { return m == Mode::Exact ? "exact" : "speed"; }
+// --exact on (default): every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs, no
+// CPU-served experts) unless memory forces a smaller KV, which is logged. --exact off lets each engine take its measured
+// approximations (docs/reference/options.md, "Exact and speed")
 struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
-    Mode mode = Mode::Speed;  // --mode exact|speed (enum Mode above)
-    bool allow_inexact = false;  // --allow-inexact: accept --mode exact conflicts without asking (the asked options win)
+    bool exact = true;  // --exact on|off (see above)
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -85,13 +83,12 @@ struct EngineOptions {
 struct Drafters { bool dflash = false, mtp = false; };
 Drafters drafters(const EngineOptions & o);
 
-// --mode exact conflicts: the approximations a run asked for explicitly in exact mode (empty: none). flashnext: a .tqfn
-// model (its TQFN_* approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM)
-std::vector<std::string> exact_mode_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
-                                              const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
-// Prints a warning per conflict to err; true when the run goes ahead: --allow-inexact, or an answer starting with y / Y read from
-// in (a terminal; nullptr: none, so the run stops)
-bool confirm_mode_conflicts(const std::vector<std::string> & conflicts, bool allow_inexact, std::istream * in, std::ostream & err);
+// --exact on conflicts: the approximations a run asked for explicitly (empty: none). flashnext: a .tqfn model (its TQFN_*
+// approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM). The asked options win.
+std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                         const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
+// one "tqserve: WARN --exact on with ..." line per conflict
+void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

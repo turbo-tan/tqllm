@@ -312,7 +312,7 @@ struct Qwen35::Impl {
     // kv_values; int8: K^T blocks [kvh, cap / 1024, hd, 1024] / V [kvh, cap, hd] int8 + FP16 scales [kvh, cap] in
     // kv_kscale / kv_vscale; trellis: K codes [kvh, cap, 26] / V codes [kvh, cap, 18] uint32
     KvTier kv_tier=KvTier::Bf16;
-    bool exact=false;  // --mode exact: BF16 KV first at every length
+    bool exact=true;  // --exact on: BF16 KV first at every length
     std::vector<std::optional<mx::array>> kv_kscale,kv_vscale;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
@@ -839,7 +839,7 @@ struct Qwen35::Impl {
         mx::array out=mx::array(0.0f);
         if(m<=16) {
             // int8 KV: decode_attention_int8 (int8 Q x K) for every row count, so a verify row equals the AR step's
-            // call bit for bit; exact mode (int8 forced by memory) keeps the query FP32 (decode_attention_int8_reference)
+            // call bit for bit; --exact on (int8 forced by memory) keeps the query FP32 (decode_attention_int8_reference)
             out=int8?(exact?decode_attention_int8_reference(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
                             decode_attention_int8(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need)):
                      decode_attention_trellis(q,*kb,*vb,scale,need);

@@ -55,7 +55,7 @@ inline KvTier choose_kv_tier(int64_t rows, int attn_layers, int kvheads, int hea
 inline KvTier speed_kv_tier(int64_t rows) {return rows >= 32768 ? KvTier::Int8 : KvTier::Bf16;}
 // a request's first format follows its prompt plus at most 1K answer rows: max_tokens is a cap (server default 16384),
 // counting all of it would send every 16K+ chat that omits it to int8
-// exact mode (--mode exact): BF16 first at every length; memory still decides below it
+// --exact on: BF16 first at every length; memory still decides below it
 inline KvTier request_kv_first(int64_t prompt_rows, int64_t answer_rows, bool exact = false) {
     return exact ? KvTier::Bf16 : speed_kv_tier(prompt_rows + std::min<int64_t>(answer_rows, 1024));
 }

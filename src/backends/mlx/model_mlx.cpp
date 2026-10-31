@@ -50,7 +50,7 @@ struct Model::Impl {
     tqllm::mlx_backend::WidthPolicy widths;  // verify 7 or 15 drafted tokens per step (time lines kept across requests)
     uint32_t context_ = 0, eos = 0, vocab = 0, layers_ = 0, hidden_ = 0;
     int width = 15, chunk = 8192;  // block-16 drafts; prefill batches of 8192 run layer-major in 2048-row slices
-    bool exact = false;  // --mode exact
+    bool exact = true;  // --exact on|off
     float temperature = 0.f, top_p = 1.f; int top_k = 0; std::mt19937_64 rng{0};
     // the active request
     std::vector<uint32_t> output;
@@ -82,14 +82,15 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     i.engine = std::make_unique<Qwen35>(weights, int(context));
     i.drafter = std::make_unique<DFlash2>(options.draft_model, *i.engine);
     i.engine->enable_draft_head4();  // 4-bit proposal head, matrix-unit layout (gated j892)
-    i.exact = options.mode == Mode::Exact;
+    i.exact = options.exact;
     i.engine->set_exact(i.exact);
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
-    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, mode %s\n", options.draft_model.c_str(),
-                 mode_name(options.mode));
+    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, exact %s
+", options.draft_model.c_str(),
+                 options.exact ? "on" : "off");
 }
 Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
@@ -141,7 +142,7 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
         const auto tier = plan.tier;
         i.engine->kv_format(tier); i.drafter->far_context(plan.far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
         if (i.exact && tier != mlx_backend::KvTier::Bf16)
-            std::fprintf(stderr, "tqserve: WARN exact mode: KV forced to %s by memory for this request\n", mlx_backend::kv_tier_name(tier));
+            std::fprintf(stderr, "tqserve: WARN --exact on: KV forced to %s by memory for this request\n", mlx_backend::kv_tier_name(tier));
         if (tier != mlx_backend::KvTier::Bf16 || prompt.size() > 32768)
             std::fprintf(stderr, "tqserve: KV format %s%s for %zu prompt + %u new tokens (in use %.1f GB, usable working set %.1f GB)\n",
                          mlx_backend::kv_tier_name(tier), plan.far ? (plan.lean ? " (lean prefill)" : "") : (plan.lean ? " (drafter window only, lean prefill)" : " (drafter window only)"), prompt.size(), count, mx::get_active_memory() / 1e9,

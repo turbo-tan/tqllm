@@ -23,6 +23,7 @@ int main() {
     for (auto& t : tail) {x = x * 1103515245u + 12345u; t = 1000 + (x >> 8) % 40000;}
     int failures = 0;
     std::vector<int> ref_top;
+    engine.set_exact(false);  // the --exact off kernels (int8 query) for the int8 tier, as served with --exact off
     for (KvTier tier : {KvTier::Bf16, KvTier::Int8, KvTier::Trellis}) {
         auto start = [&] {engine.reset(); engine.reserve_kv(int(prompt.size() + tail.size()) + 16); engine.kv_format(tier); mx::eval(engine.forward(prompt));};
         start();

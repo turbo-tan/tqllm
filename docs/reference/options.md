@@ -25,22 +25,24 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
 
-### Exact and speed mode
+### Exact and speed (`--exact on|off`)
 
-`--mode speed` (default) lets each engine use its measured approximations; `--mode exact` turns them off. If memory
-forces a smaller KV cache in exact mode, the server says so on stderr and in `/health` ("exact mode: ...").
+`--exact on` (default) runs every step at the reference precision: FP16 / BF16 activations and KV, no int8 / FP8 GEMMs,
+no CPU-served experts. Greedy output is then the same from build to build. `--exact off` lets each engine use its
+measured approximations (the middle column below): faster, with a small, measured change in the output. Published speed
+numbers say which one they ran.
 
-An approximation asked for explicitly in exact mode (the "Exact mode" column below) is a conflict: the server warns,
-names each one and asks `continue with those options (not exact)? [y/N]` on the terminal. `y` keeps the asked options
-(they win over exact mode, and `/health` shows "exact mode with: ..."); anything else stops. `--allow-inexact` accepts
-them without asking (services, containers); without a terminal and without `--allow-inexact` the server stops.
+If memory forces a smaller KV cache with `--exact on`, the server says so on stderr and in `/health`
+("exact on: ..."). An approximation asked for explicitly with `--exact on` (the last column) is a conflict: the server
+prints one `WARN --exact on with ...` line per option, runs the asked option, and `/health` shows
+"exact on, overridden by: ...".
 
-| Engine | What speed mode changes | Exact mode |
+| Engine | What `--exact off` changes | `--exact on`, and its conflicts |
 |---|---|---|
-| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 (where those are the default) | FP16 prefill; conflicts: `--prefill-int8 on`, `--prefill-fp8 on`, a lossy `-ctk` / `-ctv` / `--kv` |
+| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 | FP16 prefill; conflicts: `--prefill-int8 on`, `--prefill-fp8 on`, a lossy `-ctk` / `-ctv` / `--kv` |
 | Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; conflicts: `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
-| Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs exact at 32K-128K) | BF16 KV at every length; FP32 query if memory forces int8 |
-| MiniMax, GLM | (their only path) | a conflict (no exact path yet): `y` / `--allow-inexact` runs speed mode |
+| Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs `--exact on` at 32K-128K) | BF16 KV at every length; FP32 query if memory forces int8 |
+| MiniMax, GLM | (their only path) | no exact path yet: they run their approximate path with a WARN |
 
 ### Reasoning and chat template
 

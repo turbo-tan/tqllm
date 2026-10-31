@@ -31,7 +31,7 @@ int main() {
     check(speed_kv_tier(32768) == KvTier::Int8 && speed_kv_tier(249391 + 272) == KvTier::Int8, "32K and up: int8 first");
     check(request_kv_first(300, 16384) == KvTier::Bf16, "short chat, max_tokens omitted (server default 16384): BF16");
     check(request_kv_first(20000, 16384) == KvTier::Bf16 && request_kv_first(32766, 256) == KvTier::Int8, "the prompt decides: 20K + default answer BF16, 32K int8");
-    check(request_kv_first(32766, 256, true) == KvTier::Bf16 && request_kv_first(253054, 256, true) == KvTier::Bf16, "exact mode: BF16 first at 32K and 256K");
+    check(request_kv_first(32766, 256, true) == KvTier::Bf16 && request_kv_first(253054, 256, true) == KvTier::Bf16, "--exact on: BF16 first at 32K and 256K");
     const auto p64s = plan_kv(65536 + 272, 16, 4, 256, mac48run, far, 0, speed_kv_tier(65536 + 272));
     check(p64s.tier == KvTier::Int8 && p64s.far, "64K: int8 with far caches (j1224 44.4 vs BF16 42.1 tok/s)");
     const auto p8s = plan_kv(8192 + 272, 16, 4, 256, mac48run, far, 0, speed_kv_tier(8192 + 272));

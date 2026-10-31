@@ -63,7 +63,7 @@ public:
     KvTier choose_kv_format(int rows,int prefill_chunk,size_t other_row_bytes=0) const;
     // the format plus whether the drafter keeps its far-context caches (far_row_bytes per row), kv_tier.hpp plan_kv
     KvPlan plan_kv_format(int prompt_rows,int answer_rows,int prefill_chunk,size_t far_row_bytes) const;
-    void set_exact(bool on);  // --mode exact: BF16 KV first at every length (memory still decides)
+    void set_exact(bool on);  // --exact on: BF16 KV first at every length (memory still decides)
     // memory for a new request's plan: in use now without this engine's KV buffers, the working set, the prefill transient
     KvBudget kv_budget(int prefill_chunk) const;
     int attention_layers() const;

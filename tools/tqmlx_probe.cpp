@@ -80,6 +80,7 @@ int main(int argc,char** argv) {
             if(kv_name!="bf16" && kv_name!="int8" && kv_name!="trellis")throw std::invalid_argument("--kv-format must be bf16, int8 or trellis");
             engine.reserve_kv(int(input.size())+count+16);
             engine.kv_format(kv_name=="bf16"?KvTier::Bf16:kv_name=="int8"?KvTier::Int8:KvTier::Trellis);
+            engine.set_exact(kv_name=="bf16");  // int8 / trellis: the --exact off kernels, as served
         }
         // --kl-tail N: prefill all but the last N prompt tokens, then run those N through the decode / verify path in
         // --verify-width rows (default 8) with every row's logits: written to --logits, or scored against --kl-reference

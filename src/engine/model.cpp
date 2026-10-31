@@ -472,9 +472,9 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                                          " per slot, KV " + asked.kv + "): it would need " + lossy +
                                          ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
             g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
-            if (opt.mode == Mode::Exact) {
-                g_fit_note = "exact mode: " + g_fit_note;
-                std::fprintf(stderr, "tqserve: WARN exact mode: %s forced by memory\n", lossy.c_str());
+            if (opt.exact) {
+                g_fit_note = "exact on: " + g_fit_note;
+                std::fprintf(stderr, "tqserve: WARN --exact on: %s forced by memory\n", lossy.c_str());
             }
             std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
                          g_fit_note.c_str());
@@ -678,19 +678,15 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 }  // namespace
 
 namespace { FlashNextFactory g_flashnext = nullptr; }
-// --mode exact must hold on every engine: refuse the approximations a user asked for explicitly, and the engines that
-// have no exact path yet
-std::string g_mode_note;  // --mode exact options the user accepted over exact (/health)
-// --mode exact conflicts (approximations asked for explicitly) warn and ask; --allow-inexact or a "y" on the terminal keeps the
-// asked options, otherwise the load stops
+std::string g_mode_note;  // --exact on, with the options the user asked for over it (/health)
+// --exact on conflicts (approximations asked for explicitly): one WARN each, the asked options win
 static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
     const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
-    const auto conflicts = exact_mode_conflicts(o, p.extension() == ".tqfn",
-                                                gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())));
+    const auto conflicts = exact_conflicts(o, p.extension() == ".tqfn",
+                                           gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())));
     if (conflicts.empty()) return;
-    if (!confirm_mode_conflicts(conflicts, o.allow_inexact, isatty(0) ? &std::cin : nullptr, std::cerr))
-        throw std::invalid_argument("--mode exact: conflicting options not accepted (answer y, or pass --allow-inexact)");
-    g_mode_note = "exact mode with:";
+    warn_exact_conflicts(conflicts, std::cerr);
+    g_mode_note = "exact on, overridden by:";
     for (const auto & c : conflicts) g_mode_note += " " + c.substr(0, c.find(':')) + ";";
 }
 void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
