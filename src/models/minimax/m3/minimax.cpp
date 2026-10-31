@@ -17,7 +17,7 @@
 #include "minimax_kernels.cuh"
 #include "minimax_memory.hpp"
 #include "minimax_spec.hpp"
-#include "sampling.hpp"
+#include "token_sampling.hpp"
 #include "moe_kernels.cuh"
 #include "tp_comm.hpp"
 #include "quant_kernels.cuh"

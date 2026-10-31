@@ -65,7 +65,7 @@ void check_grouped_expert_format(const Mat & m, const std::string & prefix);
 MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
-#include "sampling.hpp"
+#include "token_sampling.hpp"
 namespace tqllm {
 namespace qwen35_detail {
 
@@ -447,7 +447,7 @@ private:
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
     Buf head4, head4s;  // draft-only 4-bit copy of head8 (DFlash2 full-vocabulary draft head)
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
-    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (sampling.hpp)
+    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (token_sampling.hpp)
     SamplingParams samp;
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
@@ -762,7 +762,7 @@ public:
     // Head on columns [col0, col0 + n) of v_x; writes v_tok (and the sampling top-16) at the same columns.
     void head_argmax(const float * norm_w, int n, int col0 = 0);
 
-    // Column col's sampling distribution (sampling.hpp top_dist); recent: the last output tokens before this column
+    // Column col's sampling distribution (token_sampling.hpp top_dist); recent: the last output tokens before this column
     TopDist dist(int col, const std::vector<uint32_t> & recent = {}) const {
         return top_dist(h_slg.data() + size_t(col) * 16, h_sid.data() + size_t(col) * 16, samp, recent);
     }

@@ -95,6 +95,17 @@ class Layering(unittest.TestCase):
                          "\n".join("  %s -> %s" % p for p in stale))
 
 
+class UniqueHeaders(unittest.TestCase):
+    def test_header_names_unique(self):
+        """Includes name the file only (AGENTS.md rule 8), so two headers with one name make an include resolve to
+        whichever folder the compiler searches first (src/spec/sampling.hpp shadowed the Metal one on a clean Mac build)."""
+        by = {}
+        for f in repo_files(REPO):
+            if f.startswith("src/") and f.endswith((".hpp", ".h", ".cuh", ".inc")):
+                by.setdefault(Path(f).name, []).append(f)
+        self.assertEqual({k: v for k, v in by.items() if len(v) > 1}, {}, "header file names must be unique across src/")
+
+
 if __name__ == "__main__":
     if len(__import__("sys").argv) > 1 and __import__("sys").argv[1] == "--list":
         for a, b in sorted(violations()):

@@ -29,7 +29,7 @@ serving across slots adds `slots`, `select_slot` and `spec_step`. Images add `se
 | Weight formats (K-quants, IQ, TQ3 / TQ4, FP8, ...) | `src/formats/weight/` | `weight_format(type)->load(...)` gives a `Mat` with `matvec`, the expert GEMMs and `dequant_h`; every format passes `tests/format_contract.cu` |
 | K/V cache formats, host tail (TqCache), paged pool | `src/formats/kv/`, `src/kv/` | `KvStore` / `KvMemory` (rule 4: models do not allocate K/V themselves) |
 | MoE routing, grouped expert GEMM, expert caches (VRAM / host / mixed) | `src/experts/` | shared by every MoE model; there is no MoE model folder |
-| Sampling (temperature, top-k / top-p, presence, speculative accept) | `src/spec/sampling.hpp` | `top_dist`, `draw`, `accept_drafts` over the head's top-16 |
+| Sampling (temperature, top-k / top-p, presence, speculative accept) | `src/spec/token_sampling.hpp` | `top_dist`, `draw`, `accept_drafts` over the head's top-16 |
 | Drafting (DFlash, token trees) | `src/spec/` | |
 | Vision encoders | `src/vision/` | `--mmproj` |
 | GGUF / safetensors readers, tokenizer, options, CUDA helpers | `src/core/` | |

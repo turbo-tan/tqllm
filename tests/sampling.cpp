@@ -1,6 +1,6 @@
-// src/spec/sampling.hpp against the engines' previous private copies (Qwen35Engine::dist / draw / accept, 10-31): the same
+// src/spec/token_sampling.hpp against the engines' previous private copies (Qwen35Engine::dist / draw / accept, 10-31): the same
 // distributions, the same tokens and the same RNG draws for random top-16 logits, every parameter combination.
-#include "spec/sampling.hpp"
+#include "spec/token_sampling.hpp"
 #include <cstdio>
 #include <cstring>
 
