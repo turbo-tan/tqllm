@@ -28,15 +28,6 @@ Tq3Weights load_tq3_blocks(std::span<const uint8_t> blocks, int rows, int column
             mx::view(mx::array(scales.data(), {rows, columns / 128}, mx::uint16), mx::float16)};
 }
 
-Tq3Weights tq3_interleave(const Tq3Weights& w) {
-    if(w.interleaved)return w;
-    if(w.planes.ndim()!=3 || w.planes.shape(1)!=3 || w.planes.dtype()!=mx::uint32)
-        throw std::invalid_argument("invalid TQ3 planar layout");
-    auto packed=mx::contiguous(mx::concatenate({mx::transpose(w.planes,{0,2,1}),mx::zeros({w.planes.shape(0),w.planes.shape(2),1},mx::uint32)},2));
-    mx::eval(packed);
-    return {packed,w.scales,true};
-}
-
 mx::array tq3_matmul(const Tq3Weights& w, const mx::array& x) {
     if (w.planes.ndim() != 3 || (w.interleaved?w.planes.shape(2)!=4:w.planes.shape(1)!=3) || w.planes.dtype() != mx::uint32 ||
         w.scales.ndim() != 2 || w.scales.dtype() != mx::float16 || x.ndim() != 2 || x.dtype() != mx::float32)
@@ -121,16 +112,11 @@ for (uint m = 0; m < MCOLS; ++m) {
 )METAL", "inline float tq3_level(uint rank,uint sign) { int value=int((0x7f4f2d0eu>>(rank*8u))&255u); return float(sign?-value:value); }");
     const int cols=matmul_columns(m);
     const int simds=matmul_simds();
-    int klanes=32;
-    if (const char* option=std::getenv("TQLLM_MLX_TQ3_SUBGROUP")) {
-        if (std::string_view(option)!="8")
-            throw std::invalid_argument("TQLLM_MLX_TQ3_SUBGROUP must be 8");
-        klanes=8;
-    }
+    constexpr int klanes=32;
     const int rows_per_group=simds*32/klanes;
     return kernel({w.planes, w.scales, x}, {{m, rows}}, {mx::float32},
                   {32, (rows + rows_per_group - 1) / rows_per_group * simds, (m + cols - 1) / cols}, {32, simds, 1},
                   {{"R", rows}, {"K", k}, {"M", m}, {"MCOLS", cols}, {"KLANES", klanes}, {"INTERLEAVED",w.interleaved},
-                   {"STREAMING",std::getenv("TQLLM_MLX_TQ3_STREAM")!=nullptr}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+                   {"STREAMING",false}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 }

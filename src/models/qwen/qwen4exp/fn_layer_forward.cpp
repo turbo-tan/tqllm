@@ -349,8 +349,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         ck(cudaMemcpyAsync(ids_host.p, routed.p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         if (predict) ck(cudaMemcpyAsync(ids_host.p + A, next_ids->p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         static cudaEvent_t ids_ready = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
-        static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))
-                                   : g_small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
+        static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))  // explicit wins over --exact on
+                                   : g_exact_mode ? 0 : g_small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
         g_cpu_owned = cpu_pool != nullptr;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;

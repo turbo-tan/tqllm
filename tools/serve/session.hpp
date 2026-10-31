@@ -1166,7 +1166,14 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
-    while (model.spec_advance()) {
+    // the prefill already chose the first token (engines that keep it in spec_tokens): stream it now, not after the
+    // first speculative step, so the time to first token is the prefill's
+    bool live = true;
+    if (const auto & first = model.spec_tokens(0); !first.empty()) {
+        if (req.observation) req.observation->tokens(static_cast<uint32_t>(first.size()));
+        if (!on_tokens(first)) { if (req.observation) req.observation->finish("cancelled"); live = false; }
+    }
+    while (live && model.spec_advance()) {
         const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;

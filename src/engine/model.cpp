@@ -19,6 +19,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
+#include <unistd.h>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -470,6 +472,10 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
                                          " per slot, KV " + asked.kv + "): it would need " + lossy +
                                          ". Ask for that explicitly (--kv, -ub, --gemm-rows), use fewer slots (--np) or a smaller --context, or drop -fitl off");
             g_fit_note = "to fit " + std::to_string(slots) + " slot(s) x " + std::to_string(asked.ctx) + " in GPU memory: " + lossy;
+            if (opt.exact) {
+                g_fit_note = "exact on: " + g_fit_note;
+                std::fprintf(stderr, "tqserve: WARN --exact on: %s forced by memory\n", lossy.c_str());
+            }
             std::fprintf(stderr, "tqserve: fit: %s (choose yourself with --kv, -ub, --gemm-rows or a smaller --context)\n",
                          g_fit_note.c_str());
         }
@@ -672,12 +678,24 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 }  // namespace
 
 namespace { FlashNextFactory g_flashnext = nullptr; }
+std::string g_mode_note;  // --exact on, with the options the user asked for over it (/health)
+// --exact on conflicts (approximations asked for explicitly): one WARN each, the asked options win
+static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
+    const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
+    const auto conflicts = exact_conflicts(o, p.extension() == ".tqfn",
+                                           gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())));
+    if (conflicts.empty()) return;
+    warn_exact_conflicts(conflicts, std::cerr);
+    g_mode_note = "exact on, overridden by:";
+    for (const auto & c : conflicts) g_mode_note += " " + c.substr(0, c.find(':')) + ";";
+}
 void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
 // `weights` is either DIR/weights.tqbin (converted Qwen2) or a checkpoint directory / any file inside it.
 Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots, const EngineOptions & o)
     : impl_(std::make_unique<Impl>()) {
     const std::filesystem::path p(w);
     const auto dir = std::filesystem::is_directory(p) ? p : p.parent_path();
+    check_mode(p, o);
     if (p.extension() == ".tqfn") {
         if (!g_flashnext) throw std::invalid_argument("this binary has no Flash-Next engine (use tqserve)");
         impl_->e = g_flashnext(p.string(), t, c, slots, o); return;
@@ -714,7 +732,7 @@ bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
 bool Model::native_mtp() const { return impl_->e->native_mtp(); }
-std::string Model::fit_note() const { return g_fit_note; }
+std::string Model::fit_note() const { return g_mode_note.empty() ? g_fit_note : g_fit_note.empty() ? g_mode_note : g_mode_note + " " + g_fit_note; }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
 void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft) {

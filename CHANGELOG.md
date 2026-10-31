@@ -6,6 +6,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Added
+- Metal (Apple Silicon): Qwen3.8-27B decode with the DFlash2 drafter on the same mlx-community 4-bit weights as
+  Splash 1.4.0 is faster on 13 of 18 measured prompts on an M5 Pro 48 GB (2 ties, 3 losses). Short prompts run 2-20 % faster. Contexts
+  from 32K to 128K run 2-15 % faster. Changes: the drafter's native 8-row blocks on prompts of 8,000 tokens or more,
+  draft-ahead and a per-request width policy, int8 KV from 32K keys, and far-context retrieval for the drafter.
+  Verify attention reads the int8 KV in place. Greedy speculative output equals plain decoding.
 - MiniMax-M3.1-Flash from the EXL3 2.15 bpw pack (Hugging Face folder, no conversion) on one GB10 / DGX Spark, with the
   DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
   when the context needs it, and a draft length that follows the measured acceptance. Prefill 537 tok/s on an 8K prompt

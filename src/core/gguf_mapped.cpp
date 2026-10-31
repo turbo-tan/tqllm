@@ -57,7 +57,11 @@ void MappedGguf::release_tensor(const std::string & name) const {
     const uintptr_t a = (reinterpret_cast<uintptr_t>(v.data) + page - 1) / page * page, b = (reinterpret_cast<uintptr_t>(v.data) + v.size) / page * page;
     if (b > a) madvise(reinterpret_cast<void *>(a), b - a, MADV_DONTNEED);
     const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
+#ifdef POSIX_FADV_DONTNEED  // macOS has no posix_fadvise; madvise above already drops the mapped pages
     if (fd >= 0) { posix_fadvise(fd, off_t(v.data - mapping_->data), off_t(v.size), POSIX_FADV_DONTNEED); close(fd); }
+#else
+    if (fd >= 0) close(fd);
+#endif
 #endif
 }
 size_t MappedGguf::warm_tensor(const std::string & name, int threads) const {
@@ -84,7 +88,11 @@ void MappedGguf::release_pages() const {
 #ifndef _WIN32
     madvise(const_cast<char *>(mapping_->data), mapping_->size, MADV_DONTNEED);
     const int fd = open(mapping_->path.c_str(), O_RDONLY | O_CLOEXEC);
+#ifdef POSIX_FADV_DONTNEED
     if (fd >= 0) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+#else
+    if (fd >= 0) close(fd);
+#endif
 #endif
 }
 bool MappedGguf::discard_pages() const noexcept { return discard_pages({mapping_->data,mapping_->size}); }

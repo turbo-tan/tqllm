@@ -3,6 +3,7 @@
 #include "tq4.hpp"
 #include "q6.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -26,7 +27,7 @@ float bf16_value(uint16_t b) {
     return v;
 }
 std::vector<float> rows_of(const mx::array& y) {
-    auto c = mx::contiguous(y);
+    auto c = mx::contiguous(mx::astype(y, mx::float32));
     mx::eval(c);
     return std::vector<float>(c.data<float>(), c.data<float>() + c.size());
 }
@@ -238,6 +239,119 @@ bool run_q6(int rows, int k, std::mt19937& rng) {
     std::printf("NAX Q6 head rows=%d k=%d rel_err_vs_q6_matmul=%.3e row_mismatches=%zu\n", rows, k, worst / peak, mismatches);
     return worst / peak < 2e-3 && mismatches == 0;
 }
+// MLX quantize output repacked on the GPU (nax_affine_from_quantized) equals the host pack of the same codes word for
+// word, and its 16-row product matches quantized_matmul
+bool run_from_quantized(int rows, int k, std::mt19937& rng) {
+    std::uniform_real_distribution<float> wd(-0.1f, 0.1f);
+    std::vector<float> w(size_t(rows) * k);
+    for (auto& v : w) v = wd(rng);
+    auto q = mx::quantize(mx::astype(mx::array(w.data(), {rows, k}, mx::float32), mx::bfloat16), 64, 4, "affine");
+    mx::eval(q);
+    auto got = nax_affine_from_quantized(q[0], q[1], q[2], 64);
+    auto cq = mx::contiguous(q[0]), sq = mx::contiguous(mx::view(q[1], mx::uint16)), bq = mx::contiguous(mx::view(q[2], mx::uint16));
+    mx::eval(cq, sq, bq);
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t((cq.data<uint32_t>()[i / 8] >> (4 * (i % 8))) & 15u);
+    std::vector<uint16_t> sc(sq.data<uint16_t>(), sq.data<uint16_t>() + sq.size()), bi(bq.data<uint16_t>(), bq.data<uint16_t>() + bq.size());
+    auto want = nax_affine_load(nax_affine_pack(codes, sc, bi, rows, k, 4, 64), rows, k, 4, 64);
+    auto bytes_equal = [](const mx::array& a, const mx::array& b) {
+        auto ca = mx::contiguous(a), cb = mx::contiguous(b);
+        mx::eval(ca, cb);
+        return ca.nbytes() == cb.nbytes() && std::memcmp(ca.data<void>(), cb.data<void>(), ca.nbytes()) == 0;
+    };
+    const bool same = bytes_equal(got.words, want.words) && bytes_equal(got.scales, want.scales) && bytes_equal(got.biases, want.biases);
+    std::vector<float> x(size_t(16) * k);
+    for (auto& v : x) v = float(mx::float16_t(wd(rng) * 10.0f));
+    auto X = mx::array(x.data(), {16, k}, mx::float32);
+    auto y = rows_of(nax_affine_matmul(got, X, false));
+    auto ref = rows_of(mx::quantized_matmul(X, q[0], q[1], q[2], true, 64, 4, "affine"));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < y.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - y[i])));}
+    std::printf("NAX from quantized rows=%d k=%d words_equal_host_pack=%d rel_err_vs_quantized_matmul=%.3e\n", rows, k, int(same), worst / peak);
+    return same && worst / peak < 2e-3;
+}
+// stored codes repacked into MLX's layout (nax_affine_to_mlx) equal the host MLX packing of the same codes word for word,
+// FP16 scales / biases are the BF16 values, and the prefill product on quantized_matmul matches the dequant + GEMM path
+bool run_to_mlx(int rows, int k, int group, std::mt19937& rng) {
+    const int gpr = k / group;
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() & 15u);
+    std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f), xd(-2.0f, 2.0f);
+    std::vector<uint16_t> s(size_t(rows) * gpr), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+    auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, group), rows, k, 4, group);
+    auto q = nax_affine_to_mlx(w);
+    auto cq = mx::contiguous(q.codes), sq = mx::contiguous(q.scales), bq = mx::contiguous(q.biases);
+    mx::eval(cq, sq, bq);
+    size_t bad_words = 0, bad_scales = 0;
+    for (size_t i = 0; i < size_t(rows) * k / 8; ++i) {
+        uint32_t want = 0;
+        for (int e = 0; e < 8; ++e) want |= uint32_t(codes[i * 8 + e]) << (4 * e);
+        bad_words += cq.data<uint32_t>()[i] != want;
+    }
+    // exact in FP16's normal range; below it (|v| < 6.1e-5) FP16 subnormals round by at most half their step, 3e-8
+    for (size_t i = 0; i < s.size(); ++i)
+        bad_scales += std::abs(float(sq.data<mx::float16_t>()[i]) - bf16_value(s[i])) > 3e-8f ||
+                      std::abs(float(bq.data<mx::float16_t>()[i]) - bf16_value(b[i])) > 3e-8f;
+    const int m = 64;
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto ref = rows_of(nax_affine_gemm(w, X, false));
+    auto y = rows_of(mx::astype(nax_affine_qmm(q, X), mx::float32));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < y.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - y[i])));}
+    std::printf("NAX to MLX rows=%d k=%d group=%d bad_words=%zu bad_scales=%zu qmm_rel_err_vs_gemm=%.3e\n", rows, k, group,
+                bad_words, bad_scales, worst / peak);
+    return bad_words == 0 && bad_scales == 0 && worst / peak < 2e-3;
+}
+// the prefill kernel on the stored codes matches the dequant + GEMM path (affine and TQ4), every tile shape, an uneven
+// row count (partial row tiles) and partial column threadgroups
+bool run_prefill(int rows, int k, int group, bool tq4, int m, std::mt19937& rng) {
+    NaxAffine w = [&] {
+        if (tq4) {
+            std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+            for (auto& c : codes) c = uint8_t(rng());
+            std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+            for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+            return nax_from_tq4(Tq4Weights{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true});
+        }
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+        std::vector<uint16_t> s(size_t(rows) * (k / group)), b(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+        return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, group), rows, k, 4, group);
+    }();
+    std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto ref = rows_of(nax_affine_gemm(w, X, false));
+    std::vector<float> g(size_t(m) * rows);
+    for (auto& v : g) v = float(mx::float16_t(xd(rng)));
+    auto G = mx::array(g.data(), {m, rows}, mx::float32);
+    double worst_all = 0;
+    for (auto [rs, tn, sgs, tb, pf] : {std::array{32, 64, 4, 1, 1}, std::array{16, 64, 8, 1, 0}, std::array{16, 32, 2, 1, 1},
+                                       std::array{32, 64, 4, 0, 1}, std::array{16, 32, 2, 0, 0}, std::array{32, 64, 8, 0, 0}})
+        for (int ep = 0; ep < 3; ++ep) {
+            auto y = rows_of(mx::astype(nax_affine_prefill(w, X, ep, ep ? std::optional<mx::array>(G) : std::nullopt, rs, tn, sgs, tb, pf), mx::float32));
+            double worst = 0, peak = 0;
+            for (size_t i = 0; i < y.size(); ++i) {
+                const float want = ep == 1 ? ref[i] * g[i] / (1.0f + std::exp(-g[i])) : ep == 2 ? ref[i] + g[i] : ref[i];
+                peak = std::max(peak, double(std::abs(want)));
+                worst = std::max(worst, double(std::abs(want - y[i])));
+            }
+            std::printf("NAX prefill rows=%d k=%d group=%d tq4=%d m=%d tile %dx%d sg %d tb %d pf %d epilogue %d rel_err_vs_gemm=%.3e\n", rows, k,
+                        group, int(tq4), m, rs, tn, sgs, tb, pf, ep, worst / peak);
+            worst_all = std::max(worst_all, worst / peak);
+        }
+    // rows are independent (the wrapper pads a partial row tile): the m rows equal the first m rows of a longer input
+    auto more = mx::concatenate({X, mx::random::uniform(-2.0f, 2.0f, {131, k})}, 0);
+    const bool same = mx::array_equal(nax_affine_prefill(w, X), mx::slice(nax_affine_prefill(w, more), {0, 0}, {m, rows})).item<bool>();
+    std::printf("NAX prefill rows=%d k=%d m=%d rows independent of the row tile: %s\n", rows, k, m, same ? "yes" : "NO");
+    return worst_all < 2e-3 && same;
+}
 bool run_embedding(std::mt19937& rng) {
     const int rows = 300, k = 256;
     std::vector<uint8_t> payload(affine8_embedding_bytes(rows, k));
@@ -260,9 +374,53 @@ bool run_embedding(std::mt19937& rng) {
 }
 }
 
+// gate + up + SwiGLU in one launch (nax_affine_swiglu) equals the two row-kernel matmuls followed by
+// bf16(bf16(silu(bf16 gate)) * bf16 up) within one BF16 rounding of the activation, and every row is bitwise equal to its
+// own 1-row call (affine 4-bit and TQ4; the 27B FFN shape among them)
+bool run_swiglu(int rows, int k, bool tq4, std::mt19937& rng) {
+    auto make = [&]() -> NaxAffine {
+        if (tq4) {
+            std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+            for (auto& c : codes) c = uint8_t(rng());
+            std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+            for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+            return nax_from_tq4(Tq4Weights{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true});
+        }
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+        std::vector<uint16_t> s(size_t(rows) * (k / 64)), b(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+        return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 64), rows, k, 4, 64);
+    };
+    auto g = make(), u = make();
+    std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
+    const int m = 16;
+    std::vector<float> x(size_t(m) * k);
+    for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+    auto X = mx::array(x.data(), {m, k}, mx::float32);
+    auto got = rows_of(nax_affine_swiglu(g, u, X));
+    auto gv = rows_of(nax_affine_matmul(g, X, true)), uv = rows_of(nax_affine_matmul(u, X, true));
+    double worst = 0, peak = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const float act = bf16_value(bf16_bits(gv[i] / (1.0f + std::exp(-gv[i]))));
+        // the kernel hands the BF16 value on as FP16 (ffn_down's matmul input): the reference takes the same rounding,
+        // so values past the FP16 range compare as the same inf the old FP32 -> FP16 cast produced
+        const float ref = float(mx::float16_t(bf16_value(bf16_bits(act * uv[i]))));
+        if (std::isinf(ref) && std::isinf(got[i]) && (ref > 0) == (got[i] > 0)) continue;
+        worst = std::max(worst, double(std::fabs(got[i] - ref))); peak = std::max(peak, double(std::fabs(ref)));
+    }
+    int mismatches = 0;
+    for (int r = 0; r < m; ++r) {
+        auto one = rows_of(nax_affine_swiglu(g, u, mx::array(x.data() + size_t(r) * k, {1, k}, mx::float32)));
+        if (std::memcmp(one.data(), got.data() + size_t(r) * rows, size_t(rows) * sizeof(float))) ++mismatches;
+    }
+    std::printf("NAX_SWIGLU rows=%d k=%d tq4=%d rel=%.2e row_mismatches=%d\n", rows, k, int(tq4), worst / std::max(peak, 1e-30), mismatches);
+    return mismatches == 0 && worst / std::max(peak, 1e-30) < 1e-2;
+}
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng) && run_from_quantized(256, 512, rng) && run_from_quantized(16384 + 512, 1024, rng) && run_to_mlx(256, 512, 64, rng) && run_to_mlx(256, 512, 128, rng) && run_to_mlx(5120, 2048, 64, rng) && run_prefill(256, 512, 64, false, 1910, rng) && run_prefill(5120, 2048, 64, false, 300, rng) && run_prefill(256, 512, 128, true, 77, rng) && run_prefill(256, 512, 64, false, 2048, rng) && run_prefill(256, 512, 128, true, 256, rng) && run_swiglu(256, 512, false, rng) && run_swiglu(256, 512, true, rng) && run_swiglu(17408, 5120, false, rng) && run_swiglu(17408, 5120, true, rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");

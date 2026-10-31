@@ -2,15 +2,22 @@
 // Engine options, fixed when a Model is built. Every tool parses them with parse_engine_option (llama.cpp names
 // where llama.cpp has the option); tqserve's memory fit fills the placement fields itself.
 #include <cstdint>
+#include <cstdlib>
+#include <iosfwd>
 #include <string>
+#include <vector>
 
 #include "tqllm/rope_scaling.hpp"
 
 namespace tqllm {
+// --exact on (default): every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs, no
+// CPU-served experts) unless memory forces a smaller KV, which is logged. --exact off lets each engine take its measured
+// approximations (docs/reference/options.md, "Exact and speed")
 struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
+    bool exact = true;  // --exact on|off (see above)
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -75,6 +82,13 @@ struct EngineOptions {
 // with --mtp: the unused drafter is never loaded or run.
 struct Drafters { bool dflash = false, mtp = false; };
 Drafters drafters(const EngineOptions & o);
+
+// --exact on conflicts: the approximations a run asked for explicitly (empty: none). flashnext: a .tqfn model (its TQFN_*
+// approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM). The asked options win.
+std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                         const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
+// one "tqserve: WARN --exact on with ..." line per conflict
+void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

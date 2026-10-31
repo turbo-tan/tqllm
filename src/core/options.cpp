@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -30,6 +31,23 @@ std::string EngineOptions::kv_format() const {
     return k == "bf16" && v == "bf16" ? "bf16" : k + "/" + v;
 }
 
+std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                         const char * (*env)(const char *)) {
+    std::vector<std::string> out;
+    if (!o.exact) return out;
+    if (o.prefill_int8 == 1) out.push_back("--prefill-int8 on: int8 prefill GEMMs (KLD 0.003-0.007 vs FP16 prefill)");
+    if (o.prefill_fp8 == 1) out.push_back("--prefill-fp8 on: FP8 prefill GEMMs (KLD 0.003-0.005 vs FP16 prefill)");
+    if (const std::string kv = o.kv_format(); kv != "bf16") out.push_back("KV " + kv + " (-ctk / -ctv / --kv): a lossy KV cache");
+    if (flashnext)
+        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
+            if (const char * s = env(v); s && std::atoi(s) != 0) out.push_back(std::string(v) + " set: an approximation");
+    if (no_exact_path) out.push_back("MiniMax / GLM have no exact path yet: they run their approximate path");
+    return out;
+}
+void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err) {
+    for (const auto & c : conflicts) err << "tqserve: WARN --exact on with " << c << " (the asked option wins)\n";
+}
+
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
@@ -44,6 +62,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     if (a == "-ctk" || a == "--cache-type-k") o.cache_k = value();
     else if (a == "-ctv" || a == "--cache-type-v") o.cache_v = value();
     else if (a == "--kv") o.kv = value();
+    else if (a == "--exact") {
+        const std::string v = value();
+        if (v != "on" && v != "off") throw std::invalid_argument("--exact must be on or off");
+        o.exact = v == "on";
+    }
     else if (a == "--kv-store") o.kv_store = value();
     else if (a == "--kv-host") o.kv_host = count(0);
     else if (a == "--kv-compact") o.kv_compact = count(0);
@@ -127,7 +150,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"

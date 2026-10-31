@@ -76,7 +76,7 @@ def gen_md(flags):
 
 def used_names():
     names = set()
-    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")):
+    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")) + list(ROOT.glob("src/**/*.mm")):
         if p.name == "flags_gen.hpp":
             continue
         names |= set(re.findall(r'"((?:TQLLM|TQFN)_[A-Z0-9_]+)"', p.read_text(errors="ignore")))
