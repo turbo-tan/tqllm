@@ -25,6 +25,33 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
 
+### More engine options
+
+Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v`, `-md` / `--model-draft`,
+`-ub` / `--ubatch-size`, `-ncmoe` / `--n-cpu-moe`, `-fit` / `--fit`, `-fitt` / `--fit-target`, `-fitc` / `--fit-ctx`,
+`-fitl` / `--fit-lossy`, `--temperature` / `--temp`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--temperature T` `--top-p P` `--top-k K` `--presence-penalty X` | greedy, no penalty | sampling defaults for requests that set none |
+| `--monitor-port N` | the API port | serve the read-only dashboard on its own port |
+| `-fit on\|off` | on | fit the model, KV and buffers into GPU memory at load |
+| `-fitt MiB` | 768 (256 under WSL) | GPU memory to leave free after loading |
+| `-fitc N` | 4096 | smallest context per slot the fit may choose |
+| `-fitl on\|off` | on | on: the fit may pick KV codec / context / prefill buffers and announces them; off: refuse to start instead |
+| `-ub N` | engine default | prefill micro-batch rows |
+| `-ncmoe N` | 0 | keep the MoE experts of the first N layers in host memory |
+| `--moe-host-mb M\|auto` `--moe-profile FILE` | off | keep the least-routed MoE experts (by FILE's routing counts) in host memory, M MiB of them |
+| `--moe-cache-mb C\|auto` | auto | VRAM cache of recently used host experts |
+| `--hot-map FILE` | none | MiniMax: routing counts; the busiest experts are preloaded, the rest stay on disk |
+| `--tp-rank R --tp-peer IP [--tp-port P]` | single box, port 29600 | MiniMax over two linked boxes (rank 0 serves; rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
+| `--yarn-orig-ctx N` `--yarn-ext-factor F` `--yarn-attn-factor F` `--yarn-beta-fast F` `--yarn-beta-slow F` | model metadata | YaRN context extension, llama.cpp meanings (with `--rope-scaling yarn`) |
+| Flash-Next prefill: `--prefill-chunk N` `--prefill-sub N` `--prefill-stage N` | 16384, 2048, 192 | rows per prefill chunk, per sub-batch, and per expert stage |
+| Flash-Next: `--prefill-reserve-mb N` `--prefill-arena-mb N` `--dense-cache-mb N` | 1000, 3800, 600 | GPU memory kept free during prefill, the prefill arena, the dense-weight cache |
+| Flash-Next: `--prefill-borrow auto\|all\|N` | auto | expert banks the prefill may borrow (all, or N of them) for its arena |
+
+Environment variables (`TQLLM_*`, `TQFN_*`) are listed with their defaults and status in [FLAGS.md](../FLAGS.md).
+
 ### Exact and speed (`--exact on|off`)
 
 `--exact on` (default) runs every step at the reference precision: FP16 / BF16 activations and KV, no int8 / FP8 GEMMs,
