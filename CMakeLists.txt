@@ -48,6 +48,8 @@ target_include_directories(test-dflash-rank-stats PRIVATE ${CMAKE_CURRENT_SOURCE
 add_test(NAME dflash-rank-stats COMMAND test-dflash-rank-stats)
 add_executable(test-tree-columns tests/tree_columns.cpp)
 add_test(NAME tree-columns COMMAND test-tree-columns)
+add_executable(test-draft-tree tests/draft_tree.cpp src/spec/draft_tree.cpp)  # tree selectors (chain / best-first), no CUDA
+add_test(NAME draft-tree COMMAND test-draft-tree)
 add_executable(test-prefill-plan tests/prefill_plan.cpp)  # Flash-Next prefill memory plan + bank ledger (no CUDA)
 target_include_directories(test-prefill-plan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME prefill-plan COMMAND test-prefill-plan)
