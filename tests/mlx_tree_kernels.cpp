@@ -34,6 +34,10 @@ int main() {
         auto bias = randn(rng, {vh}, 0.5f), rate = mx::negative(mx::abs(randn(rng, {vh}, 0.5f)));
         auto z = randn(rng, {n, vh * 128}, 1.0f), w = randn(rng, {128}, 1.0f), state = randn(rng, {1, vh, 128, 128}, 0.1f);
         mx::eval({prev, rows, weights, alpha, beta, bias, rate, z, w, state});
+        // small evaluated inputs reach a custom kernel as `constant` buffers; the model passes fresh device results, so
+        // the test does too (one multiply each, not evaluated here)
+        auto fresh = [](const mx::array& x) {return mx::multiply(x, mx::array(1.0f));};
+        alpha = fresh(alpha); beta = fresh(beta); bias = fresh(bias); rate = fresh(rate); w = fresh(w);
         const auto par = mx::array(parents.data(), {n}, mx::int32);
         auto tree = gdn_step_fused(prev, rows, weights, alpha, beta, bias, rate, z, w, 1e-6f, 0.0883883f, state, kh, vh, 0, 0, 0, &par);
         mx::eval(tree.out, tree.deltas, tree.decay);
