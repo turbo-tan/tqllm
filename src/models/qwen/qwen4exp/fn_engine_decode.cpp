@@ -69,9 +69,11 @@ void FlashNextEngine::spec_step(const int * ids, int n, bool * done) {
     for (int i = 0; i < n; ++i) { done[i] = slots_[size_t(ids[i])].done_; if (!done[i]) act.push_back(i); }
     const int rows = int(act.size()) * (drafts + 1);
     if (act.size() < 2 || rows > 64 || (f_.cache->slots() < f_.cp->config.experts && rows * topk > f_.cache->slots())) {
+        serial_steps_ += act.size() > 1;
         for (int i : act) { select_slot(ids[i]); done[i] = !spec_advance(); }
         return;
     }
+    ++batched_steps_;
     // every slot drafts and catches up in shared MTP passes
     std::vector<DecodeModel *> ms; std::vector<std::vector<int>> blocks, drs; std::vector<int> d1s;
     for (int i : act) { select_slot(ids[i]); refill_borrowed(); ms.push_back(S().model_.get()); d1s.push_back(S().d1_); }

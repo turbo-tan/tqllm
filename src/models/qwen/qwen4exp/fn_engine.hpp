@@ -52,6 +52,7 @@ class FlashNextEngine final : public tqllm::Engine {
         float temp_ = 0.f, top_p_ = 1.f; int top_k_ = 0; std::mt19937_64 rng_{1};
     };
     std::vector<SlotState> slots_; int cur_ = 0;
+    uint64_t batched_steps_ = 0, serial_steps_ = 0;  // spec_step: one verify pass for all slots / one slot at a time (TQLLM_DEBUG=mem)
     SlotState & S() { return slots_[size_t(cur_)]; }
     uint32_t slot_context() const { return context_; }  // Model passes the per-slot context (tqserve: --context / --np)
     // the shared caches copy misses on the active slot's stream
@@ -86,6 +87,7 @@ public:
                          (unsigned long long) (m.hits - mb.hits), (unsigned long long) (m.misses - mb.misses), double(m.transfer_bytes - mb.transfer_bytes) / 1e9, m.device_bytes / 1048576.0);
             std::fprintf(stderr, "LEDGER decode copies: demand %llu DMAs %.2f GB, prefetch %.2f GB\n", (unsigned long long) (s.miss_copies - b.miss_copies),
                          double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e9, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e9);
+            std::fprintf(stderr, "LEDGER slot steps since start: batched %llu, one slot at a time %llu\n", (unsigned long long) batched_steps_, (unsigned long long) serial_steps_);
             std::fprintf(stderr, "LEDGER decode rounds %llu | since start: prefetched %llu used %llu, pf pending %llu running %llu waited-unread %llu skipped %llu\n",
                          (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
                          (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);
