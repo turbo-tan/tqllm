@@ -88,8 +88,7 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
-    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, exact %s
-", options.draft_model.c_str(),
+    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, exact %s\n", options.draft_model.c_str(),
                  options.exact ? "on" : "off");
 }
 Model::~Model() = default;
