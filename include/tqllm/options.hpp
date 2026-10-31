@@ -19,7 +19,7 @@ struct EngineOptions {
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
     Mode mode = Mode::Speed;  // --mode exact|speed (enum Mode above)
-    bool assume_yes = false;  // -y / --yes: accept --mode exact conflicts without asking
+    bool allow_inexact = false;  // --allow-inexact: accept --mode exact conflicts without asking (the asked options win)
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -89,9 +89,9 @@ Drafters drafters(const EngineOptions & o);
 // model (its TQFN_* approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM)
 std::vector<std::string> exact_mode_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
                                               const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
-// Prints a warning per conflict to err; true when the run goes ahead: --yes, or an answer starting with y / Y read from
+// Prints a warning per conflict to err; true when the run goes ahead: --allow-inexact, or an answer starting with y / Y read from
 // in (a terminal; nullptr: none, so the run stops)
-bool confirm_mode_conflicts(const std::vector<std::string> & conflicts, bool assume_yes, std::istream * in, std::ostream & err);
+bool confirm_mode_conflicts(const std::vector<std::string> & conflicts, bool allow_inexact, std::istream * in, std::ostream & err);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

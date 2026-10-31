@@ -681,15 +681,15 @@ namespace { FlashNextFactory g_flashnext = nullptr; }
 // --mode exact must hold on every engine: refuse the approximations a user asked for explicitly, and the engines that
 // have no exact path yet
 std::string g_mode_note;  // --mode exact options the user accepted over exact (/health)
-// --mode exact conflicts (approximations asked for explicitly) warn and ask; --yes or a "y" on the terminal keeps the
+// --mode exact conflicts (approximations asked for explicitly) warn and ask; --allow-inexact or a "y" on the terminal keeps the
 // asked options, otherwise the load stops
 static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
     const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
     const auto conflicts = exact_mode_conflicts(o, p.extension() == ".tqfn",
                                                 gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())));
     if (conflicts.empty()) return;
-    if (!confirm_mode_conflicts(conflicts, o.assume_yes, isatty(0) ? &std::cin : nullptr, std::cerr))
-        throw std::invalid_argument("--mode exact: conflicting options not accepted (answer y, or pass --yes)");
+    if (!confirm_mode_conflicts(conflicts, o.allow_inexact, isatty(0) ? &std::cin : nullptr, std::cerr))
+        throw std::invalid_argument("--mode exact: conflicting options not accepted (answer y, or pass --allow-inexact)");
     g_mode_note = "exact mode with:";
     for (const auto & c : conflicts) g_mode_note += " " + c.substr(0, c.find(':')) + ";";
 }
