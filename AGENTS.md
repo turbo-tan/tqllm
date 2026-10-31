@@ -65,7 +65,11 @@ component live in the same folder. Dependencies point down only, and `tests/test
   tools/convert/<arch>/      checkpoint converters
         |
         v
-  src/engine/                Model (opens a file, fits memory, picks the engine), engine interface (engine.hpp)
+  src/engine/                Model (opens a file, asks the registry for the engine, forwards every call): backend
+                             neutral, no CUDA / Metal include; engine interface (engine.hpp) and registry (registry.hpp)
+  src/backends/<platform>/   one folder per platform: cuda/, metal/, android/. builtin_<platform>.cpp lists the engines
+                             that platform serves (register_builtin_engines), beside its loaders and its engine code.
+                             Engine level: may use models, components and core; no model includes a backend.
         |
         v
   src/models/<family>/<arch>/      one folder per architecture
@@ -73,8 +77,6 @@ component live in the same folder. Dependencies point down only, and `tests/test
         qwen/qwen4exp        Flash-Next
         qwen/qwen2           the draft-model forward
         deepseek/ nemotron/ glm/ ...   next architectures, same shape
-  src/backends/<name>/       another runtime for the same models (e.g. mlx/: Apple MLX / Metal); model level,
-                             may use components and core, never a model folder or another backend
         |   a model may use any component below; it never includes another model
         v
   src/formats/weight/        weight formats: host codec + kernels + registry (WeightFormat)
@@ -97,8 +99,9 @@ component live in the same folder. Dependencies point down only, and `tests/test
 1. Include downward only. `src/core` includes nothing above it. Components include core and other components.
    Models include components and core. Nothing includes `tools/`.
 2. A model never includes another model. Code two models need moves down into a component or core.
-3. No engine code in `tools/`. Tools call the `Model` / `Engine` interface. A model registers its GGUF
-   `general.architecture` string with the model dispatch in `src/engine/`.
+3. No engine code in `tools/`. Tools call the `Model` / `Engine` interface. An engine is added to its platform's
+   `register_builtin_engines()` (`src/backends/<platform>/builtin_<platform>.cpp`) with a matcher for its model files;
+   `src/engine/model.cpp` never names an engine.
 4. K/V memory goes through `src/kv` (KvStore / KvMemory). A model does not allocate its own K/V buffers, so KV
    formats and TqCache work for every architecture.
 5. Weights go through the WeightFormat registry. A new format is its files in `src/formats/weight/` (a folder of its

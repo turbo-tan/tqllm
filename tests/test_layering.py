@@ -1,6 +1,6 @@
 """Source layering (AGENTS.md): includes point down the layers only, and a model never includes another model.
 
-Layers, top to bottom: tools/ > src/engine/ > src/models/<family>/<arch>/ > components (src/formats, src/kv, src/vision,
+Layers, top to bottom: tools/ > src/engine/ and src/backends/<platform>/ > src/models/<family>/<arch>/ > components (src/formats, src/kv, src/vision,
 src/experts, src/spec) > src/core/ and include/tqllm/ > third_party/. Includes name the file only (the folders are the
 search path), so each include is resolved through the unique basenames of the tree. Known violations are listed in
 tests/layering_allowlist.txt; the list may only shrink: a new violation fails, and so does an entry that no longer applies.
@@ -16,7 +16,7 @@ from repo_files import repo_files  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 ALLOW = REPO / "tests" / "layering_allowlist.txt"
 SRC_EXT = (".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc")
-INTERFACE = {"src/engine/engine.hpp"}  # the interface every model implements: it sits with core
+INTERFACE = {"src/engine/engine.hpp", "src/engine/registry.hpp"}  # the interface every engine implements and registers through: it sits with core
 
 
 def layer(path):
@@ -30,10 +30,9 @@ def layer(path):
     if path.startswith("src/models/"):
         parts = path.split("/")
         return 3, "/".join(parts[2:4]) if len(parts) > 4 else parts[2]
-    if path.startswith("src/backends/"):  # an alternative implementation (e.g. Apple MLX / Metal): model level, its own group
-        return 3, "backends/" + path.split("/")[2]
-    if path.startswith("src/engine/"):
-        return 4, None
+    if path.startswith(("src/engine/", "src/backends/")):  # src/backends/<platform>/ (cuda, metal, android) assembles that
+        return 4, None                                       # platform's engines: engine level, never included by a model
+
     if path.startswith("tools/"):
         return 5, None
     return None, None
