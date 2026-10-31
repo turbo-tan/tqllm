@@ -93,7 +93,7 @@ struct Engine {
 
 // Qwen3.5 dense hybrid (Gated DeltaNet + gated attention), BF16 weights read from safetensors in `dir`.
 // `slots` sequences share the weights; each gets `context` positions.
-// GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next.cpp; split GGUFs open from any shard
+// GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next/glm5next.cpp; split GGUFs open from any shard
 bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);

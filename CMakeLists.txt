@@ -11,7 +11,7 @@ include(GNUInstallDirs)
 include(CTest)
 # Source layout (AGENTS.md): one folder per component and per model architecture, host and device code together.
 # Includes name the file only; these folders are the search path.
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/engine ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/experts ${CMAKE_CURRENT_SOURCE_DIR}/src/spec ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen2 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp ${CMAKE_CURRENT_SOURCE_DIR}/src/models/glm ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax ${CMAKE_CURRENT_SOURCE_DIR}/src/vision ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/engine ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/experts ${CMAKE_CURRENT_SOURCE_DIR}/src/spec ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen2 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp ${CMAKE_CURRENT_SOURCE_DIR}/src/models/glm/glm5next ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax/m3 ${CMAKE_CURRENT_SOURCE_DIR}/src/vision ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 find_package(Threads REQUIRED)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tools/serve/monitor.html tools/serve/monitor_panels.js)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tools/serve/monitor_panels.js" TQLLM_MONITOR_PANELS)
@@ -112,11 +112,11 @@ if(TQLLM_CUDA)
     src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu src/experts/moe.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/models/qwen/qwen35/attention.cu
     src/spec/dflash.cu src/vision/vision.cpp src/vision/vision.cu
     src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu)
-  # GLM-5.3-Flash (src/models/glm): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
+  # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
   # weights through MappedGguf, which moves here from the per-tool source lists (tqserve, tqfn-stage).
-  target_sources(tqllm PRIVATE src/models/glm/glm5next.cpp src/models/glm/glm5next.cu src/models/glm/glm5next_dsa.cu src/core/gguf_mapped.cpp)
-  # MiniMax-M3.1-Flash (src/models/minimax, GGUF arch minimax-m3 from tools/minimax_convert.cpp); reuses the GLM kernels
-  target_sources(tqllm PRIVATE src/models/minimax/minimax.cpp src/models/minimax/minimax.cu)
+  target_sources(tqllm PRIVATE src/models/glm/glm5next/glm5next.cpp src/models/glm/glm5next/glm5next.cu src/models/glm/glm5next/glm5next_dsa.cu src/core/gguf_mapped.cpp)
+  # MiniMax-M3.1-Flash (src/models/minimax/m3, GGUF arch minimax-m3 from tools/minimax_convert.cpp); reuses the GLM kernels
+  target_sources(tqllm PRIVATE src/models/minimax/m3/minimax.cpp src/models/minimax/m3/minimax.cu)
   # two linked boxes (tensor parallel): NCCL over RoCE, e.g. -DTQLLM_NCCL_DIR=<venv>/site-packages/nvidia/nccl
   set(TQLLM_NCCL_DIR "" CACHE PATH "NCCL root (include/nccl.h, lib/libnccl.so.2) for multi-box tensor parallelism")
   if(TQLLM_NCCL_DIR)
@@ -194,12 +194,12 @@ if(TQLLM_CUDA)
   add_executable(glm-pack-experts tools/glm_pack.cpp)
   target_include_directories(glm-pack-experts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(glm-pack-experts PRIVATE tqllm CUDA::cudart)
-  add_executable(test-minimax tests/minimax.cu src/models/minimax/minimax.cu)
-  target_include_directories(test-minimax PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax)
+  add_executable(test-minimax tests/minimax.cu src/models/minimax/m3/minimax.cu)
+  target_include_directories(test-minimax PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax/m3)
   target_link_libraries(test-minimax PRIVATE CUDA::cudart)
   add_test(NAME minimax COMMAND test-minimax)
-  add_executable(test-glm5next tests/glm5next.cu src/models/glm/glm5next.cu src/experts/moe.cpp)
-  add_executable(test-glm-dsa tests/glm_dsa.cu src/models/glm/glm5next.cu src/models/glm/glm5next_dsa.cu)
+  add_executable(test-glm5next tests/glm5next.cu src/models/glm/glm5next/glm5next.cu src/experts/moe.cpp)
+  add_executable(test-glm-dsa tests/glm_dsa.cu src/models/glm/glm5next/glm5next.cu src/models/glm/glm5next/glm5next_dsa.cu)
   set_target_properties(test-glm-dsa PROPERTIES CUDA_STANDARD 17)
   target_include_directories(test-glm-dsa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/experts)
   add_test(NAME glm_dsa COMMAND test-glm-dsa)
@@ -601,6 +601,7 @@ if(BUILD_TESTING)
   add_test(NAME launch_catalog COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_catalog.py)
   add_test(NAME launch_codex COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_codex.py)
   add_test(NAME flags_registry COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_flags.py --check)
+  add_test(NAME docs_map COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_docs_map.py)
   # Host-only gates for the MoE work. Both are plain C++ (no CUDA, no GPU, no model), so they
   # build and run regardless of TQLLM_CUDA. Sources are compiled directly into the test so they
   # do not depend on which translation units the tqllm library carries in a CUDA build.

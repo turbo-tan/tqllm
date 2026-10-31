@@ -1,4 +1,4 @@
-// GLM-5.3-Flash routed experts from the shared expert bank (src/models/glm/glm_experts.hpp): a layer's experts in a
+// GLM-5.3-Flash routed experts from the shared expert bank (src/experts/glm_experts.hpp): a layer's experts in a
 // MixedExpertCache of `slots` slots, the grouped expert kernels on the bank's slot ids, waves when a chunk routes past
 // the slots. It must give the whole-expert-stack output bit for bit (same rows, same bytes, another row index) and both
 // must match a CPU reference of the same layer (dequantise + multiply, the math of tools/glm_ref.cpp). Mock routing

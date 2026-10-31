@@ -1,4 +1,4 @@
-// GLM-5.3-Flash kernels (src/models/glm/glm5next.cu) against CPU code that is the math of tools/glm_ref.cpp, which
+// GLM-5.3-Flash kernels (src/models/glm/glm5next/glm5next.cu) against CPU code that is the math of tools/glm_ref.cpp, which
 // matches llama.cpp. Stateful kernels (KDA conv history and recurrence, MLA cache) run several steps.
 #include "glm5next_kernels.cuh"
 #include "moe.hpp"

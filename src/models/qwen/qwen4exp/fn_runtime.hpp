@@ -3,7 +3,7 @@
 #include <unordered_map>
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
-#include "../src/cuda_recover.hpp"
+#include "cuda_recover.hpp"
 #include "dev_alloc.cuh"
 #include "tq3_expert_cache.hpp"
 #include "packed_experts.hpp"

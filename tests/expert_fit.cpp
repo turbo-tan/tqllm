@@ -1,4 +1,4 @@
-#include "../src/expert_fit.hpp"
+#include "../src/experts/expert_fit.hpp"
 #include <cstdio>
 
 int main() {

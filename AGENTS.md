@@ -76,7 +76,9 @@ component live in the same folder. Dependencies point down only, and `tests/test
         qwen/qwen35          Qwen3.5 / Qwen3.8 dense and qwen35moe: one engine, MoE is a block type
         qwen/qwen4exp        Flash-Next
         qwen/qwen2           the draft-model forward
-        deepseek/ nemotron/ glm/ ...   next architectures, same shape
+        glm/glm5next         GLM-5.3-Flash (DSA attention, MoE)
+        minimax/m3           MiniMax-M3.1-Flash (GLM kernels through src/experts)
+        deepseek/ gemma/ ...   next architectures, same shape
         |   a model may use any component below; it never includes another model
         v
   src/formats/weight/        weight formats: host codec + kernels + registry (WeightFormat)
