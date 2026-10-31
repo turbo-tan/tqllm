@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -30,6 +31,29 @@ std::string EngineOptions::kv_format() const {
     return k == "bf16" && v == "bf16" ? "bf16" : k + "/" + v;
 }
 
+std::vector<std::string> exact_mode_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                              const char * (*env)(const char *)) {
+    std::vector<std::string> out;
+    if (o.mode != Mode::Exact) return out;
+    if (o.prefill_int8 == 1) out.push_back("--prefill-int8 on: int8 prefill GEMMs (KLD 0.003-0.007 vs FP16 prefill)");
+    if (o.prefill_fp8 == 1) out.push_back("--prefill-fp8 on: FP8 prefill GEMMs (KLD 0.003-0.005 vs FP16 prefill)");
+    if (const std::string kv = o.kv_format(); kv != "bf16") out.push_back("KV " + kv + " (-ctk / -ctv / --kv): a lossy KV cache");
+    if (flashnext)
+        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
+            if (const char * s = env(v); s && std::atoi(s) != 0) out.push_back(std::string(v) + " set: an approximation");
+    if (no_exact_path) out.push_back("MiniMax / GLM have no exact path yet: they run speed mode");
+    return out;
+}
+bool confirm_mode_conflicts(const std::vector<std::string> & conflicts, bool assume_yes, std::istream * in, std::ostream & err) {
+    if (conflicts.empty()) return true;
+    for (const auto & c : conflicts) err << "tqserve: WARN --mode exact with " << c << "\n";
+    if (assume_yes) {err << "tqserve: --yes: going ahead; those options win over exact mode\n"; return true;}
+    if (!in) {err << "tqserve: no terminal to confirm: rerun with --yes to accept, or drop the options / use --mode speed\n"; return false;}
+    err << "tqserve: continue with those options (not exact)? [y/N] " << std::flush;
+    std::string answer;
+    return std::getline(*in, answer) && !answer.empty() && (answer[0] == 'y' || answer[0] == 'Y');
+}
+
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
@@ -49,6 +73,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "exact" && v != "speed") throw std::invalid_argument("--mode must be exact or speed");
         o.mode = v == "exact" ? Mode::Exact : Mode::Speed;
     }
+    else if (a == "-y" || a == "--yes") o.assume_yes = true;
     else if (a == "--kv-store") o.kv_store = value();
     else if (a == "--kv-host") o.kv_host = count(0);
     else if (a == "--kv-compact") o.kv_compact = count(0);
@@ -132,7 +157,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--mode exact|speed] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+    return "  engine: [--mode exact|speed [-y]] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"

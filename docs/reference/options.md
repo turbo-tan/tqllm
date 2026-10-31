@@ -30,12 +30,17 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 `--mode speed` (default) lets each engine use its measured approximations; `--mode exact` turns them off. If memory
 forces a smaller KV cache in exact mode, the server says so on stderr and in `/health` ("exact mode: ...").
 
+An approximation asked for explicitly in exact mode (the "Exact mode" column below) is a conflict: the server warns,
+names each one and asks `continue with those options (not exact)? [y/N]` on the terminal. `y` keeps the asked options
+(they win over exact mode, and `/health` shows "exact mode with: ..."); anything else stops. `-y` / `--yes` answers yes
+without asking (services, containers); without a terminal and without `--yes` the server stops.
+
 | Engine | What speed mode changes | Exact mode |
 |---|---|---|
-| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 (where those are the default) | FP16 prefill; refuses `--prefill-int8 on`, `--prefill-fp8 on` and a lossy `-ctk` / `-ctv` / `--kv` |
-| Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; refuses `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
+| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 (where those are the default) | FP16 prefill; conflicts: `--prefill-int8 on`, `--prefill-fp8 on`, a lossy `-ctk` / `-ctv` / `--kv` |
+| Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; conflicts: `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
 | Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs exact at 32K-128K) | BF16 KV at every length; FP32 query if memory forces int8 |
-| MiniMax, GLM | (their only path) | refused: run them without `--mode exact` |
+| MiniMax, GLM | (their only path) | a conflict (no exact path yet): `y` / `--yes` runs speed mode |
 
 ### Reasoning and chat template
 

@@ -2,7 +2,10 @@
 // Engine options, fixed when a Model is built. Every tool parses them with parse_engine_option (llama.cpp names
 // where llama.cpp has the option); tqserve's memory fit fills the placement fields itself.
 #include <cstdint>
+#include <cstdlib>
+#include <iosfwd>
 #include <string>
+#include <vector>
 
 #include "tqllm/rope_scaling.hpp"
 
@@ -16,6 +19,7 @@ struct EngineOptions {
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
     Mode mode = Mode::Speed;  // --mode exact|speed (enum Mode above)
+    bool assume_yes = false;  // -y / --yes: accept --mode exact conflicts without asking
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -80,6 +84,14 @@ struct EngineOptions {
 // with --mtp: the unused drafter is never loaded or run.
 struct Drafters { bool dflash = false, mtp = false; };
 Drafters drafters(const EngineOptions & o);
+
+// --mode exact conflicts: the approximations a run asked for explicitly in exact mode (empty: none). flashnext: a .tqfn
+// model (its TQFN_* approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM)
+std::vector<std::string> exact_mode_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                              const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
+// Prints a warning per conflict to err; true when the run goes ahead: --yes, or an answer starting with y / Y read from
+// in (a terminal; nullptr: none, so the run stops)
+bool confirm_mode_conflicts(const std::vector<std::string> & conflicts, bool assume_yes, std::istream * in, std::ostream & err);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

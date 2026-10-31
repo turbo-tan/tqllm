@@ -19,6 +19,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
+#include <unistd.h>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -678,18 +680,18 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 namespace { FlashNextFactory g_flashnext = nullptr; }
 // --mode exact must hold on every engine: refuse the approximations a user asked for explicitly, and the engines that
 // have no exact path yet
-static bool env_on(const char * name) { const char * v = std::getenv(name); return v && std::atoi(v) != 0; }
+std::string g_mode_note;  // --mode exact options the user accepted over exact (/health)
+// --mode exact conflicts (approximations asked for explicitly) warn and ask; --yes or a "y" on the terminal keeps the
+// asked options, otherwise the load stops
 static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
-    if (o.mode != Mode::Exact) return;
-    if (o.prefill_int8 == 1 || o.prefill_fp8 == 1) throw std::invalid_argument("--mode exact cannot run --prefill-int8 / --prefill-fp8 on");
-    if (const std::string kv = o.kv_format(); kv != "bf16" && kv != "f16")
-        throw std::invalid_argument("--mode exact cannot run the lossy KV " + kv + " (-ctk / -ctv / --kv); drop them or run speed mode");
-    if (p.extension() == ".tqfn")
-        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
-            if (env_on(v)) throw std::invalid_argument(std::string("--mode exact cannot run with ") + v + " set (an approximation); unset it or run speed mode");
     const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
-    if (gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())))
-        throw std::invalid_argument("--mode exact is not available for MiniMax / GLM yet: run them without --mode exact (speed mode)");
+    const auto conflicts = exact_mode_conflicts(o, p.extension() == ".tqfn",
+                                                gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())));
+    if (conflicts.empty()) return;
+    if (!confirm_mode_conflicts(conflicts, o.assume_yes, isatty(0) ? &std::cin : nullptr, std::cerr))
+        throw std::invalid_argument("--mode exact: conflicting options not accepted (answer y, or pass --yes)");
+    g_mode_note = "exact mode with:";
+    for (const auto & c : conflicts) g_mode_note += " " + c.substr(0, c.find(':')) + ";";
 }
 void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
 // `weights` is either DIR/weights.tqbin (converted Qwen2) or a checkpoint directory / any file inside it.
@@ -734,7 +736,7 @@ bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
 bool Model::native_mtp() const { return impl_->e->native_mtp(); }
-std::string Model::fit_note() const { return g_fit_note; }
+std::string Model::fit_note() const { return g_mode_note.empty() ? g_fit_note : g_fit_note.empty() ? g_mode_note : g_mode_note + " " + g_fit_note; }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
 void Model::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft) {

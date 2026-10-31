@@ -2,6 +2,9 @@
 // and reject out-of-range values.
 #include "tqllm/options.hpp"
 #include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,6 +44,29 @@ int main() {
     expect(d.mode == tqllm::Mode::Speed, "--mode defaults to speed");
     expect(parse({"--mode", "exact"}).mode == tqllm::Mode::Exact && parse({"--mode", "speed"}).mode == tqllm::Mode::Speed, "--mode exact|speed");
     expect(throws({"--mode", "fast"}), "unknown --mode rejected");
+    // --mode exact conflicts: listed, warned, and only accepted by --yes or a "y" on the terminal
+    static const char * (*no_env)(const char *) = [](const char *) -> const char * { return nullptr; };
+    static const char * (*cpu_miss)(const char *) = [](const char * n) -> const char * { return std::strcmp(n, "TQFN_CPU_MISS") ? nullptr : "4"; };
+    expect(tqllm::exact_mode_conflicts(parse({"--mode", "exact"}), false, false, no_env).empty(), "exact alone: no conflict");
+    expect(tqllm::exact_mode_conflicts(parse({"--prefill-int8", "on"}), false, false, no_env).empty(), "speed mode: never a conflict");
+    expect(tqllm::exact_mode_conflicts(parse({"--mode", "exact", "--prefill-int8", "on"}), false, false, no_env).size() == 1, "exact + --prefill-int8 on");
+    expect(tqllm::exact_mode_conflicts(parse({"--mode", "exact", "-ctk", "q8"}), false, false, no_env).size() == 1, "exact + lossy KV");
+    expect(tqllm::exact_mode_conflicts(parse({"--mode", "exact"}), true, false, cpu_miss).size() == 1 &&
+           tqllm::exact_mode_conflicts(parse({"--mode", "exact"}), false, false, cpu_miss).empty(), "TQFN_* only for Flash-Next");
+    expect(tqllm::exact_mode_conflicts(parse({"--mode", "exact"}), false, true, no_env).size() == 1, "engine without an exact path");
+    expect(parse({"-y"}).assume_yes && parse({"--yes"}).assume_yes && !parse({}).assume_yes, "-y / --yes");
+    const std::vector<std::string> one = {"--prefill-int8 on: int8 prefill"};
+    auto confirm = [&](bool yes, const char * typed, bool terminal) {
+        std::istringstream in(typed); std::ostringstream err;
+        const bool go = tqllm::confirm_mode_conflicts(one, yes, terminal ? &in : nullptr, err);
+        return std::make_pair(go, err.str());
+    };
+    expect(confirm(true, "", false).first, "--yes goes ahead without a terminal");
+    expect(confirm(false, "y\n", true).first && confirm(false, "Yes\n", true).first, "y / Yes on the terminal goes ahead");
+    expect(!confirm(false, "n\n", true).first && !confirm(false, "\n", true).first && !confirm(false, "", true).first, "n / empty / EOF stops");
+    expect(!confirm(false, "y\n", false).first, "no terminal and no --yes stops");
+    expect(confirm(false, "n\n", true).second.find("WARN --mode exact with --prefill-int8 on") != std::string::npos, "the warning names the option");
+    expect(tqllm::confirm_mode_conflicts({}, false, nullptr, std::cerr), "no conflict: no question");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");
     std::printf(fail ? "ENGINE_OPTIONS FAIL\n" : "ENGINE_OPTIONS PASS\n");
