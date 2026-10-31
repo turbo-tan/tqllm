@@ -1154,8 +1154,8 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             fn_gdn_kh_k<3><<<unsigned(kh * (128 / gdnkh::CB)), dim3(gdnkh::CB, gdnkh::RG), 0, s>>>(qkv, qk, gates, state, next, out, kh, vh, n);
             return;
         }
-        // TQFN_GDN_CHUNK_MIN (default 64; 0 = off): prefills of that many tokens use the chunked kernel (C 32, 32 value columns)
-        if (g_gdn_chunk_min < 0) g_gdn_chunk_min = std::getenv("TQFN_GDN_CHUNK_MIN") ? std::atoi(std::getenv("TQFN_GDN_CHUNK_MIN")) : 64;  // WY chunked path beats the per-token kernel from 64 tokens
+        // from 64 tokens (tests may set another value; 0 = off) prefills use the chunked kernel (C 32, 32 value columns)
+        if (g_gdn_chunk_min < 0) g_gdn_chunk_min = 64;  // WY chunked path beats the per-token kernel from 64 tokens
         const int chunk_min = g_gdn_chunk_min;
         if (chunk_min > 0 && n >= chunk_min && dim <= 128 && dim % 32 == 0) {
             constexpr int C = 32, VS = 32;
@@ -1166,7 +1166,7 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             float *& gram = g_gdn_ws.gram; size_t & gcap = g_gdn_ws.gcap;
             const size_t gneed = size_t(kh) * chunks * 2 * C * C;
             if (gneed > gcap && !gdn_ws_grow(gram, gcap, gneed, s)) throw std::runtime_error("GDN chunk: gram allocation failed");
-            static const bool wy = !std::getenv("TQFN_GDN_WY") || std::atoi(std::getenv("TQFN_GDN_WY")) != 0;
+            constexpr bool wy = true;  // the WY form (739a8fb: 4K prefill 894.5 -> 958.6 tok/s, identical tokens)
             if (wy) {  // parallel per-chunk WY terms, then the sequential state pass
                 float *& wbuf = g_gdn_ws.wbuf; size_t & wcap = g_gdn_ws.wcap;
                 const size_t per = size_t(vh) * chunks;
@@ -1182,8 +1182,8 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
                     wattr = true;
                 }
                 fn_gdn_wy_k<C><<<dim3(vh, chunks), 256, wsm, s>>>(qkv, qk, gates, U, W, Mg, lg, kh, vh, dim, n);
-                // TQFN_GDN_SEQ_FAST (default on): Omega's sequential pass (gdn_seq_fast.cuh) at dim 128; 0 = fn_gdn_seq_k
-                static const bool seq_fast = !(std::getenv("TQFN_GDN_SEQ_FAST") && std::atoi(std::getenv("TQFN_GDN_SEQ_FAST")) == 0);
+                // Omega's sequential pass (gdn_seq_fast.cuh) at dim 128; else fn_gdn_seq_k
+                constexpr bool seq_fast = true;  // the fast sequential pass at dim 128
                 if (seq_fast && dim == 128) fn_gdn_seq_fast(qk, U, W, Mg, lg, state, next, out, kh, vh, dim, n, chunks, s);
                 else fn_gdn_seq_k<C, VS><<<dim3(vh, dim / VS), 256, ssm, s>>>(qk, U, W, Mg, lg, state, next, out, kh, vh, dim, n, chunks);
                 return;
@@ -1328,9 +1328,9 @@ void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int
     if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 chunk gemv: rows take the warp-per-row path");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
     // Each (row, token) sum depends only on the thread count and the columns per thread, not on the R x T tile, so the
-    // tile is free to choose (same bits); TQFN_GEMV_TILE picks it: 8 (8 x 8), 16 (16 x 8, default: 0.47 vs 0.56 ms per 2K-token call, same output hash), 164 (16 x 4), 32 (32 x 2:
+    // tile is free to choose (same bits): 8 (8 x 8), 16 (16 x 8, default: 0.47 vs 0.56 ms per 2K-token call, same output hash), 164 (16 x 4), 32 (32 x 2:
     // measured slower, the weight rows are re-read per 2-token tile).
-    static const int tile = std::getenv("TQFN_GEMV_TILE") ? std::atoi(std::getenv("TQFN_GEMV_TILE")) : 16;
+    constexpr int tile = 16;  // router GEMV tile (8 / 16 / 32 give the same output bits; 16 fastest)
     if (rows >= 32 && tile == 32) {
         constexpr int R = 32, T = 2;
         fn_gemv_bf16_tiles_k<R, T><<<dim3(unsigned((rows + R - 1) / R), unsigned((tokens + T - 1) / T)), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);

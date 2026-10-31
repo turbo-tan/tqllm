@@ -14,7 +14,7 @@ namespace tqllm::flashnext {
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
 // distinct experts fit the layer's slots: the waves path sums the down projection in another order, so choosing it by
 // the assignment count made a multi-sequence block (np 4: 4 x 4 rows = 160 assignments) differ from np 1 (F39).
-// old_rule = the pre-F39 choice (assignments vs slots), kept behind TQFN_VERIFY_WAVES for A/B.
+// old_rule = the pre-F39 choice (assignments vs slots), kept for its unit test.
 inline bool layer_takes_waves(const std::vector<int> & routed, int n, int topk, int slots, bool spec, bool old_rule = false) {
     if (!(n * topk > slots || (!spec && n > 1))) return false;
     if (!spec || n <= 1 || old_rule) return true;

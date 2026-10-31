@@ -22,8 +22,8 @@ std::array<ExpertPayload,3> mapped_cold_payload(FnServe & f,int layer,int expert
 
 FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context, int nslots) : context_(context), slots_(size_t(std::max(1, nslots))) {
     // above 8 concurrent slots some requests end after one token and np 16 fails (10-13, P8 build too): refuse until fixed
-    require(nslots <= 8 || std::getenv("TQFN_ALLOW_NP_ABOVE_8") != nullptr,
-            "Flash-Next serves up to --np 8 for now (a bug above 8 slots is being fixed); TQFN_ALLOW_NP_ABOVE_8=1 for diagnostics");
+    require(nslots <= 8,
+            "Flash-Next serves up to --np 8 for now (a bug above 8 slots is being fixed)");
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
@@ -391,13 +391,10 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep
           size_t per = 0; for (int l = 0; l < c.layers; ++l) if (f.cache->has_layout(l)) per += f.cache->bank_layout(l).block;
           const auto [state, reserve] = context_keep();
-          // TQFN_AUTO_KEEP_MB (debug A/B): what slots=auto keeps free beside the banks, instead of the full-context attention
-          // state + decode reserve (a long prompt then borrows banks for its state)
-          static const char * keep_env = std::getenv("TQFN_AUTO_KEEP_MB");
           // every slot (--np) keeps its own full-context attention / recurrent / MTP state beside the banks: sized for one,
           // np 4 at 32K ran out of memory in the second request's state (F38)
           const size_t nseq = slots_.size();
-          const size_t need = keep_env ? size_t(std::atoll(keep_env)) << 20 : g_small_card ? size_t(512) << 20 : auto_keep_bytes(nseq, state, reserve);
+          const size_t need = g_small_card ? size_t(512) << 20 : auto_keep_bytes(nseq, state, reserve);
           if (g_small_card) std::fprintf(stderr, "tqllm: small card: CPU expert pool, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n");
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
@@ -479,7 +476,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         f.state_full = state; f.state_tokens = int(context);
         const size_t fr = tqllm::device_free_bytes();
         // slots=auto with one sequence keeps only the reserve on purpose (decode_rules.hpp auto_keep_bytes): long prompts borrow
-        if (fr < state + reserve && (std::getenv("TQFN_AUTO_KEEP_MB") || g_small_card || (f.slots_auto && slots_.size() == 1))) {
+        if (fr < state + reserve && (g_small_card || (f.slots_auto && slots_.size() == 1))) {
             std::fprintf(stderr, "tqllm: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
         } else if (fr < state + reserve) {
             const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));

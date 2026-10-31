@@ -162,7 +162,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // Both routers + shared gates in one segmented launch and both top-k in one launch (same per-row and per-token
     // arithmetic: test-gemv-seg, test-topk2; +2.7 % 3090 5-chat at --slots 168)
     auto is_bf16 = [&](const std::string & pre) { return cp.file(pre + "ffn_gate_inp.weight").file().tensors.at(pre + "ffn_gate_inp.weight").type == GGML_BF16; };
-    static const bool f32_router = std::getenv("TQFN_F32_ROUTER") != nullptr;
+    constexpr bool f32_router = false;
     const bool fused = !f32_router && n <= 8 && c.experts <= 1024 && h >= 1024 && is_bf16(prefix) && (!predict || is_bf16(np));
     if (fused) {
         tqllm_cuda::GemvSegs g; int rows = 0;
@@ -239,8 +239,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // prefill (spec off) always takes waves, decode verify (spec on) the split path when it fits: the two paths sum the
     // down projection in a different order (1 ulp in a few values), so a slot-dependent choice changed greedy text
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
-    // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit (TQFN_VERIFY_WAVES=1: old rule)
-    static const bool old_rule = std::getenv("TQFN_VERIFY_WAVES") != nullptr;
+    // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit
+    constexpr bool old_rule = false;  // F39 rule: np > 1 text equals np 1
     if (trunk && (g_hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();
         if(predict && g_hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
@@ -270,11 +270,11 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             for (int id : u) if (!g_hot_map || !trunk || expert_is_hot(*g_hot_map, layer, c.experts, id) == (bank_index == 0)) bank_ids.push_back(id);
             const int W = selected.plan_slots(layer);
             // many tokens per expert (GB10 chunk 1024: ~20): grouped GEMM, weights read once per 64 tokens instead of
-            // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel. TQFN_WAVE_GEMM_AVG: the switch-over average.
+            // once per 4; few (3090 chunk 128: ~3) keep the dedup kernel; gemm_avg is the switch-over average.
             // Decided per layer from slot-independent counts, and only when every slot count runs waves (A > experts):
             // the GEMM rounds differently from the dedup kernel the split path uses, so a slot-dependent switch changed
             // greedy text with the slot count (a 23-token prompt: 230 rows, ~8 per expert).
-            static const int gemm_avg = std::getenv("TQFN_WAVE_GEMM_AVG") ? std::atoi(std::getenv("TQFN_WAVE_GEMM_AVG")) : 8;
+            constexpr int gemm_avg = 8;  // waves use the grouped GEMM from 8 tokens per expert on average
             const bool wave_gemm = gemm_avg > 0 && A > c.experts && A >= gemm_avg * int(u.size());
             for (size_t w0 = 0; w0 < bank_ids.size(); w0 += size_t(W)) {
                 const std::vector<int> wave(bank_ids.begin() + long(w0), bank_ids.begin() + long(std::min(bank_ids.size(), w0 + size_t(W))));
@@ -389,7 +389,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         // TQFN_CPU_MISS: a non-resident expert goes to the CPU pool; its GPU assignment points at a resident expert of the
         // same token (output row overwritten before the combine), so the cache neither copies nor inserts it.
         std::vector<std::pair<int, int>> cpu_rows;  // (assignment, row in cpu_out)
-        std::vector<int> cpu_experts;  // TQFN_CPU_REFILL: copied into the cache after this layer, off the critical path
+        std::vector<int> cpu_experts;  // cpu_refill (off): would copy them into the cache after this layer
         if (use_cpu) {
             std::vector<CpuMissPool::Job> jobs; std::map<int, int> job_of;
             for (int a = 0; a < A; ++a) {
@@ -403,15 +403,15 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                                if (r < 0 || !cache.resident(layer, r)) { r = -1; for (int x = 0; x < c.experts && r < 0; ++x) if (cache.resident(layer, x)) r = x; }
                                sub = r; }
                 if (sub < 0) sub = e;  // nothing resident in the whole layer: the expert loads as a miss (its CPU row still overwrites it)
-                // TQFN_CPU_MISS_MAX=K: at most K distinct experts per layer call on the CPU, the rest are GPU misses
-                static const int cpu_max = std::getenv("TQFN_CPU_MISS_MAX") ? std::atoi(std::getenv("TQFN_CPU_MISS_MAX")) : g_small_card ? 5 : 1 << 30;
+                // at most cpu_max distinct experts per layer call on the CPU, the rest are GPU misses
+                const int cpu_max = g_small_card ? 5 : 1 << 30;  // distinct experts per layer call on the CPU pool
                 if (!job_of.count(e) && int(jobs.size()) >= cpu_max) continue;
                 auto [it, fresh] = job_of.try_emplace(e, int(jobs.size()));
                 if (fresh) {
                     CpuMissPool::Job j; const auto pl = cp.expert_payload(layer, e);
                     const int rows[3] = {c.expert_ff, c.expert_ff, h};
                     for (int m = 0; m < 3; ++m) { j.w[m] = pl[m].bytes.data; j.type[m] = pl[m].type; j.row_bytes[m] = pl[m].bytes.size / size_t(rows[m]); }
-                    static const bool gguf_rows = std::getenv("TQFN_CPU_GGUF_ROWS") != nullptr;  // debug A/B: GGUF rows, no rebuild from the packed copy
+                    constexpr bool gguf_rows = false;  // rows are rebuilt from the packed copy
                     if (const auto * pv = g_cpu_packed; pv && layer < pv->layers && !gguf_rows) {
                         const char * blk = pv->map + pv->base[layer] + uint64_t(e) * pv->block[layer]; uint64_t off = 0;
                         for (int m = 0; m < 3; ++m) {
@@ -447,8 +447,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         auto h2 = clk::now();
         auto issue_prefetch = [&] {
             if (!predict) return;
-            // TQFN_PF_K: prefetch only each token's k best predicted experts (ids are in descending score order)
-            static const int pf_k = std::getenv("TQFN_PF_K") ? std::atoi(std::getenv("TQFN_PF_K")) : 6;  // 6 of 10: +3.3 % vs all (10-11)
+            // prefetch only each token's pf_k best predicted experts (ids are in descending score order)
+            constexpr int pf_k = 6;  // prefetch each token's 6 best predicted experts of 10: +3.3 % vs all (10-11)
             std::vector<int> want; want.reserve(A);
             constexpr int high = 3;  // ranks 1-3 are admitted first, ranks 4..pf_k only over stale or rarely used victims
             for (int t = 0; t < n; ++t) for (int j = 0; j < std::min(high, c.topk); ++j) if (const int id = ids_host.p[A + t * c.topk + j]; !(cpu_pool && tqllm::flashnext::cpu_owned(layer + 1, id))) want.push_back(id);
@@ -537,7 +537,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             tqllm_cuda::scatter_copy(items.data(), int(items.size()), nullptr, 1);
         }
         tqllm_cuda::fn_moe_combine(ed.p, weights.p, sd.p, shared_weights.p, fo.p, h, c.topk, n, nullptr);
-        static const bool cpu_refill = std::getenv("TQFN_CPU_REFILL") != nullptr;
+        constexpr bool cpu_refill = false;
         if (cpu_refill && !cpu_experts.empty()) {  // the cache still learns the experts the CPU served (copies after this layer)
             cache.set_prefetch_strict(1 << 30); cache.prefetch(layer, cpu_experts, copy_stream);
         }
@@ -566,10 +566,10 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         auto m = cache.gate();
         // TQFN_NS_DEDUP=0: one block per assignment. Default: one block per unique expert (weights read once per step)
         const bool dd = n > 1 && m.fmt->has_expert_dedup() && cache.up().fmt->has_expert_dedup() && cache.down().fmt->has_expert_dedup();
-        // TQFN_EXPERT_GEMM (default on, chunks of TQFN_EXPERT_GEMM_MIN+ tokens): grouped GEMM per cache slot, each expert's
+        // chunks of egemm_min+ tokens: grouped GEMM per cache slot, each expert's
         // weights read once per 64 of its tokens (the dedup kernel reads them once per 4). Prefill only: decode and the batched
         // verify (<= 64 rows) keep the exact dedup path.
-        static const int egemm_min = std::getenv("TQFN_EXPERT_GEMM_MIN") ? std::atoi(std::getenv("TQFN_EXPERT_GEMM_MIN")) : 65;  // above the 64-row batched verify
+        constexpr int egemm_min = 65;  // grouped expert GEMM from 65 rows: above the 64-row batched verify
         auto gemm_ok = [](const Mat & mm) {
             const int id = mm.fmt->u4h_id();
             if (std::string(mm.fmt->name()) == "GSQ_Q2_0") return mm.cols % 64 == 0;
@@ -640,11 +640,11 @@ void DecodeModel::router(const std::string & prefix, const float * x, float * lo
         tqllm_cuda::fn_round_bf16(x, xb.p, int64_t(n) * h, nullptr);
         tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp.weight"), xb.p, logits, c.experts, h, n, c.experts + 1, nullptr);
         tqllm_cuda::fn_gemv_bf16_chunk_bx(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), xb.p, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
-    } else if (bf16 && std::getenv("TQFN_F32_ROUTER") == nullptr) {
+    } else if (bf16) {
         // straight into the [n][experts + 1] logits (no staging copies)
         tqllm_cuda::fn_gemv_bf16_tokens_ld(cp.bf16_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);
         tqllm_cuda::fn_gemv_bf16_tokens_ld(cp.bf16_device(prefix + "ffn_gate_inp_shexp.weight"), x, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
-    } else if (n > 64 && std::getenv("TQFN_F32_ROUTER") == nullptr) {
+    } else if (n > 64) {
         // f32 router (the MTP layer): one cuBLAS fp32 GEMM for a prefill chunk instead of the per-token kernel (127 ms per 32K
         // tokens in the catch-up); fp32 sums in another order, and the MTP's routing only shapes the drafts, never the output
         const float one = 1.f, zero = 0.f; const int ld = c.experts + 1;

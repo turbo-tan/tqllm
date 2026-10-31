@@ -1123,8 +1123,7 @@ private:
                 const auto & b = gt(f, p + ex);
                 return a.type == b.type && a.ne.size() == 2 && a.ne[0] == uint64_t(cols) && a.ne[1] == uint64_t(rows) && FS == FE;
             };
-            const char * fz = std::getenv("TQLLM_MOE_FUSE_SHARED");
-            const bool fuse = !host && !(fz && fz[0] == '0') && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
+            const bool fuse = !host && same("ffn_gate_shexp.weight", "ffn_gate_exps.weight", FE, H) &&
                               same("ffn_up_shexp.weight", "ffn_up_exps.weight", FE, H) &&
                               same("ffn_down_shexp.weight", "ffn_down_exps.weight", H, FE);
             auto x = [&](const char * sh) { return fuse ? p + sh : std::string(); };
@@ -1744,7 +1743,6 @@ private:
                      moe_cache.size(), used / 1048576.0);
     }
     void alloc_moe_stage() {
-        if (std::getenv("TQLLM_MOE_STAGE") && std::string(std::getenv("TQLLM_MOE_STAGE")) == "0") return;
         long long most[tqllm_cuda::kMoeStageSpans] = {};
         for (const auto & L : layer) {
             if (L.n_cold <= 0) continue;

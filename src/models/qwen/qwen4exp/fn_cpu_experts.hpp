@@ -406,7 +406,7 @@ private:
             for (int spin = 0; (g = gen_.load(std::memory_order_acquire)) == seen; ++spin) {
                 _mm_pause();
                 // decode calls arrive every ~0.5 ms; after 2 ms idle (prefill, between prompts) sleep instead of spinning
-                static const int spin_ms = std::getenv("TQFN_CPU_SPIN_MS") ? std::atoi(std::getenv("TQFN_CPU_SPIN_MS")) : 2;
+                constexpr int spin_ms = 2;  // CPU miss workers spin this long before sleeping
                 if ((spin & 1023) == 1023 && std::chrono::steady_clock::now() - idle0 > std::chrono::milliseconds(spin_ms)) {
                     std::unique_lock<std::mutex> l(m_); ++sleepers_;
                     cv_.wait(l, [&] { return gen_.load() != seen; }); --sleepers_;

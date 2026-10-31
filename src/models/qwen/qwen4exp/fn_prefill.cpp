@@ -59,8 +59,8 @@ void DecodeModel::stage_begin(PrefillStage & st, const MixedExpertCache & cache,
 void DecodeModel::release_prefill() {
     dense_half_release();
     ck(cudaDeviceSynchronize());
-    // TQFN_PF_KEEP: keep the layer-major buffers and staging halves across requests (no free / re-allocate per prompt)
-    static const bool keep = std::getenv("TQFN_PF_KEEP") && std::atoi(std::getenv("TQFN_PF_KEEP")) != 0;
+    // keep (off): would keep the layer-major buffers and staging halves across requests (no free / re-allocate per prompt)
+    constexpr bool keep = false;  // layer-major buffers and staging halves are freed between requests
     if (!keep) {
         pf_inject.reset(); pf_weights.reset(); pf_sw.reset(); pf_sd.reset(); pf_xr.reset(); pf_ax.reset();
         pf_routed.reset(); pf_idx.reset(); pf_eg.reset(); pf_eu.reset(); pf_ed.reset();

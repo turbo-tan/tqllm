@@ -216,14 +216,14 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (P >= 256 && chunk >= 256) arena_resize(arena_req);  // layer-major prefill; decode shrinks it again
     stamp("KV + arena ready");
     mem_note("prefill arena ready");
-    // TQFN_MTP_CATCHUP: tokens per MTP catch-up batch (each needs topk unique MTP slots)
+    // tokens per MTP catch-up batch (each needs topk unique MTP slots)
     // a cache holding every expert takes any width (the whole chunk: grouped GEMM path); else unique experts <= slots
     static const int cw = f_.mtp_cache->slots() >= checkpoint.config.experts
-        ? (std::getenv("TQFN_MTP_CATCHUP") ? std::atoi(std::getenv("TQFN_MTP_CATCHUP")) : chunk)
-        : std::max(1, std::min(std::getenv("TQFN_MTP_CATCHUP") ? std::atoi(std::getenv("TQFN_MTP_CATCHUP")) : 16,
+        ? chunk
+        : std::max(1, std::min(16,
                                f_.mtp_cache->slots() / checkpoint.config.topk));
-    // TQFN_MTP_LAYER_MAJOR (default on): the catch-up runs the MTP layer layer-major in 1024-position pieces
-    static const bool mtp_lm = !(std::getenv("TQFN_MTP_LAYER_MAJOR") && std::atoi(std::getenv("TQFN_MTP_LAYER_MAJOR")) == 0);
+    // the catch-up runs the MTP layer layer-major in 1024-position pieces
+    constexpr bool mtp_lm = true;  // MTP catch-up layer-major
     auto catch_up = [&](int b, int e, const float * res) {  // res: residual rows b..e-1 on the device
         if (mtp_lm && chunk >= 256 && e - b >= 256) {  // layer-major MTP straight from the chunk's rows
             for (int q = b; q < e; q += 1024) {

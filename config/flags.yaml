@@ -92,14 +92,6 @@ flags:
     kind: user
     default: "-"
     doc: "N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best)"
-  - name: TQLLM_MOE_FUSE_SHARED
-    kind: debug
-    default: "on"
-    doc: "0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches"
-  - name: TQLLM_MOE_STAGE
-    kind: debug
-    default: "on"
-    doc: "0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics)"
   - name: TQLLM_MOE_PROFILE
     kind: debug
     default: "-"
@@ -136,10 +128,6 @@ flags:
     kind: user
     default: "banks + 25 %"
     doc: "GLM-5.3-Flash: device bytes the expert banks plus loader staging may hold. With TQLLM_GLM_EXPERT_SLOTS it caps them; on its own it turns on the shared byte-budget plan (src/experts/expert_bank_plan.hpp), which gives every MoE layer top-k slots and the rest of the bytes to the layers whose routing spreads over more experts (measured over the prompt, re-planned when it ends)"
-  - name: TQLLM_GLM_EXPERT_PF
-    kind: debug
-    default: "on"
-    doc: "0: GLM-5.3-Flash does not prefetch the experts a MoE layer wanted at the previous token while that layer runs its attention (needs a pinned TQLLM_GLM_EXPERTS file; placement only, the tokens do not change)"
   - name: TQLLM_GLM_EXPERTS
     kind: user
     default: "-"
@@ -575,10 +563,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "nothing: qwen35moe (MoE) models load by default"
-  - name: TQFN_ALLOW_NP_ABOVE_8
-    kind: debug
-    default: "off"
-    doc: "allow Flash-Next servers with more than 8 slots (known to end some requests after one token above 8)"
   - name: TQFN_ARENA_LOG
     kind: debug
     default: "off"
@@ -587,22 +571,10 @@ flags:
     kind: user
     default: "-"
     doc: "MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit)"
-  - name: TQFN_BF16_ACT
-    kind: debug
-    default: "off"
-    doc: "BF16 instead of FP16 activations for the Flash-Next native projections (A/B)"
   - name: TQFN_CPU_CHECK
     kind: debug
     default: "off"
     doc: "check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF"
-  - name: TQFN_CPU_GGUF_ROWS
-    kind: debug
-    default: "off"
-    doc: "debug A/B: the CPU miss pool reads GGUF rows instead of rebuilding them from the pinned packed copy"
-  - name: TQFN_AUTO_KEEP_MB
-    kind: debug
-    default: "-"
-    doc: "MB slots=auto keeps free beside the expert banks instead of the full-context attention room (small cards: 512); long prompts borrow banks"
   - name: TQFN_EXPERT_PROFILE
     kind: debug
     default: "-"
@@ -611,23 +583,11 @@ flags:
     kind: user
     default: "0"
     doc: "N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off)"
-  - name: TQFN_CPU_MISS_MAX
-    kind: debug
-    default: "-"
-    doc: "K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses (small cards: 5)"
   - name: TQFN_CPU_OWNED
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "removed: the CPU-owned eighth is a fixed rule (decode_rules.hpp cpu_owned), kept out of the GPU banks"
-  - name: TQFN_CPU_REFILL
-    kind: debug
-    default: "off"
-    doc: "refill the expert banks from the CPU pool's copies (A/B)"
-  - name: TQFN_CPU_SPIN_MS
-    kind: debug
-    default: "2"
-    doc: "ms the CPU miss workers spin before sleeping"
   - name: TQFN_DENSE_INT8
     kind: debug
     default: "0"
@@ -640,39 +600,11 @@ flags:
     kind: debug
     default: "-"
     doc: "FILE: dump the GDN layer outputs (fixture comparison)"
-  - name: TQFN_EXACT_F32
-    kind: debug
-    default: "off"
-    doc: "every Flash-Next projection on the fp32 reference path (slow; numerics gate)"
-  - name: TQFN_EXPERT_GEMM_MIN
-    kind: debug
-    default: "65"
-    doc: "rows from which prefill experts use the grouped GEMM instead of the dedup kernel"
-  - name: TQFN_F32_ROUTER
-    kind: debug
-    default: "off"
-    doc: "the fp32 per-token router kernel instead of the BF16 GEMV / segmented launch"
-  - name: TQFN_GDN_CHUNK_MIN
-    kind: debug
-    default: "64"
-    doc: "tokens from which GDN prefill uses the chunked (WY) kernel; 0 = off"
-  - name: TQFN_GDN_SEQ_FAST
-    kind: debug
-    default: "on"
-    doc: "0: the plain sequential GDN kernel instead of the fast pass at dim 128"
   - name: TQFN_GDN_VPW
     kind: retired
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (8 value columns per warp, bit-identical)"
-  - name: TQFN_GDN_WY
-    kind: debug
-    default: "on"
-    doc: "0: GDN chunked prefill without the WY form (A/B)"
-  - name: TQFN_GEMV_TILE
-    kind: debug
-    default: "16"
-    doc: "router GEMV tile: 8, 16, 164 (16 x 4) or 32 (same output bits)"
   - name: TQFN_KV
     kind: user
     default: "-"
@@ -689,34 +621,14 @@ flags:
     kind: debug
     default: "on"
     doc: "0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer)"
-  - name: TQFN_LAYER_MAJOR_MIN
-    kind: debug
-    default: "256"
-    doc: "tokens from which a prefill chunk runs layer-major"
   - name: TQFN_LAYER_SLOTS
     kind: user
     default: "-"
     doc: "comma list of expert slots per layer (overrides the packed file's .slots profile)"
-  - name: TQFN_MTP_CATCHUP
-    kind: debug
-    default: "-"
-    doc: "positions per MTP catch-up batch when the MTP cache holds every expert"
-  - name: TQFN_MTP_LAYER_MAJOR
-    kind: debug
-    default: "on"
-    doc: "0: the MTP catch-up runs token-major instead of layer-major"
   - name: TQFN_MTP_SLOTS
     kind: user
     default: "256"
     doc: "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)"
-  - name: TQFN_NO_LAYER_RESET
-    kind: debug
-    default: "off"
-    doc: "keep the scratch arena across layers (A/B)"
-  - name: TQFN_NO_PREFETCH
-    kind: debug
-    default: "off"
-    doc: "no predicted-expert prefetch in decode"
   - name: TQFN_OLD_Q2_DOT
     kind: retired
     default: "-"
@@ -727,14 +639,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (bank-wide prefetch wait; per-slot events were neutral and could find no slot, F33)"
-  - name: TQFN_PF_K
-    kind: debug
-    default: "6"
-    doc: "prefetch each token's K best predicted experts"
-  - name: TQFN_PF_KEEP
-    kind: debug
-    default: "off"
-    doc: "1: keep the layer-major buffers and staging halves across requests"
   - name: TQFN_CPU_OWNED_COLD
     kind: retired
     default: "-"
@@ -754,10 +658,6 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (one DMA per prefetched expert; chunking lost on the 3090)"
-  - name: TQFN_VERIFY_WAVES
-    kind: debug
-    default: "off"
-    doc: "1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1)"
   - name: TQFN_PREDICT_N
     kind: debug
     default: "4 (6 with adaptive drafts)"
@@ -811,10 +711,6 @@ flags:
     kind: debug
     default: "16"
     doc: "slices per decode QSA attention row; 0 or 1 = direct attention"
-  - name: TQFN_ROUND32
-    kind: debug
-    default: "-"
-    doc: "diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none)"
   - name: TQFN_ROUTER_GEMM
     kind: retired
     default: "-"
@@ -828,7 +724,3 @@ flags:
     kind: debug
     default: "-"
     doc: "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)"
-  - name: TQFN_WAVE_GEMM_AVG
-    kind: debug
-    default: "-"
-    doc: "average tokens per expert from which prefill waves use the grouped GEMM"

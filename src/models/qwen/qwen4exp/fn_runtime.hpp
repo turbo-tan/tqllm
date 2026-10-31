@@ -88,27 +88,20 @@ inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = 
     throw std::runtime_error(std::string(cudaGetErrorString(rc)) + " (" + (base ? base + 1 : file) + ":" + std::to_string(line) + ")");
 }
 inline void require(bool ok, const std::string & why) { if (!ok) throw std::runtime_error(why); }
-inline bool exact_f32() { static const bool on = std::getenv("TQFN_EXACT_F32") != nullptr; return on; }
+inline bool exact_f32() { return false; }  // the fp32 reference path is for tests only
 inline void f32_to_half_host(const float * src, __half * dst, size_t count) {
     std::vector<float> v(count); ck(cudaMemcpy(v.data(), src, count * sizeof(float), cudaMemcpyDeviceToHost));
     std::vector<__half> h(count); for (size_t i = 0; i < count; ++i) h[i] = __float2half_rn(v[i]);
     ck(cudaMemcpy(dst, h.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
 }
-inline bool bf16_act() { static const bool on = std::getenv("TQFN_BF16_ACT") != nullptr; return on; }
+inline bool bf16_act() { return false; }  // FP16 activations
 inline void round_bf16_device(float * p, size_t count) {
     std::vector<float> v(count); ck(cudaMemcpy(v.data(), p, count * sizeof(float), cudaMemcpyDeviceToHost));
     for (auto & x : v) { uint32_t u; std::memcpy(&u, &x, 4); u = (u + 0x7fff + ((u >> 16) & 1)) & 0xffff0000u; std::memcpy(&x, &u, 4); }
     ck(cudaMemcpy(p, v.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-inline bool round32_gpu_side(const std::string & name) {
-    static const char * mode = std::getenv("TQFN_ROUND32");
-    if (!mode) return false;
-    if (std::string(mode) == "all") return true;
-    for (const char * cpu : {"ssm_alpha", "ssm_beta", "attn_qkv", "attn_gate", "shexp", "ffn_gate_inp", "hc_", "ple", "per_layer"})
-        if (name.find(cpu) != std::string::npos) return false;
-    return true;
-}
+inline bool round32_gpu_side(const std::string &) { return false; }  // the Q8-rounding diagnostic (KLD hunt 10-08) is closed
 
 inline void cpu_q8_round(std::vector<float> & values) {
     require(values.size() % 32 == 0, "Q8 diagnostic needs complete blocks");

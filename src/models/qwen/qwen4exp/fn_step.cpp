@@ -31,10 +31,10 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
                                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count());
     // prefill: hand back each layer's scratch; the residual moves through two persistent buffers (speculative steps keep
     // their per-layer rollback state in the arena, so they keep one arena span per step)
-    // TQFN_LAYER_MAJOR (default on): prefill chunks of TQFN_LAYER_MAJOR_MIN+ tokens run layer by layer over the whole
+    // prefill chunks of lm_min+ tokens run layer by layer over the whole
     // chunk (routed experts copied once per layer, prefill_layer); the residual stays in res_keep, updated in place
     static const bool layer_major = tqfn_default_on("TQFN_LAYER_MAJOR");
-    static const int lm_min = std::getenv("TQFN_LAYER_MAJOR_MIN") ? std::atoi(std::getenv("TQFN_LAYER_MAJOR_MIN")) : 256;
+    constexpr int lm_min = 256;  // tokens from which a prefill chunk runs layer-major
     if (!g_hot_map && layer_major && !spec && n >= lm_min && g_arena) {
         if (res_keep->count < size_t(n) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(n) * width); }
         ck(cudaMemcpyAsync(res_keep->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
@@ -47,7 +47,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
         mix_device(cp, "output_hc_", norm.p, n, out->p, nullptr);
         return out;
     }
-    const bool layer_reset = g_arena && !spec && !std::getenv("TQFN_NO_LAYER_RESET");
+    const bool layer_reset = g_arena && !spec;
     const size_t base = g_arena ? g_arena->used : 0;
     for (int layer = 0; layer < c.layers; ++layer) {
         layer_forward(layer, residual, n, dp.p, nullptr, experts);

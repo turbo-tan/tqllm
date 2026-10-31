@@ -48,7 +48,7 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             const float * dt_bias, const float * state, float * next_state, float * out,
             int kheads, int vheads, int dim, int tokens, float epsilon, cudaStream_t);
 // Same as fn_gdn, also writing the state after every token to states[t][vheads][value][key] (speculative rollback).
-// Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default TQFN_GDN_CHUNK_MIN or 64). Tests.
+// Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default 64). Tests.
 void fn_gdn_set_chunk_min(int n);
 void fn_gdn_set_kh(int on);
 void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);

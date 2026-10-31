@@ -496,8 +496,7 @@ private:
         bank_->set_prepacked([this](int l, int e) -> const char * {
             return packed_->block[size_t(l)] ? packed_->at(l, e) : nullptr;  // a dense layer packs nothing
         }, packed_pinned_);
-        const char * pf_env = std::getenv("TQLLM_GLM_EXPERT_PF");
-        pf_ = packed_pinned_ && !dump_ && !(pf_env && pf_env[0] == '0');
+        pf_ = packed_pinned_ && !dump_;
         if (packed_pinned_) {  // split mode: misses upload on the copy stream, the compute stream waits only in wait_misses()
             ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
             bank_->set_miss_stream(copy_);

@@ -46,45 +46,20 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_DUMP_FFN` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_DUMP_FFN_SLICE` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
 | `TQLLM_MLX_NAX_DRAFT_SHORTLIST` | - | Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows) |  |
-| `TQLLM_MOE_FUSE_SHARED` | on | 0: decode keeps the shared expert as separate dense matvecs instead of one more assignment in the routed expert launches |  |
-| `TQLLM_MOE_STAGE` | on | 0: --moe-host-mb decode reads host experts in place instead of copying the routed ones to a VRAM stage first (diagnostics) |  |
 | `TQLLM_MOE_PROFILE` | - | FILE: write MoE routing counts per layer and expert (read by --moe-profile for --moe-host-mb); rewritten after every prefill |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
 | `TQLLM_GLM_NO_GRAPH` | off | set (any value): the GLM-5.3-Flash engine decodes eagerly instead of replaying one captured single-token CUDA graph (same tokens, slower). The bring-up scripts' GLM_NO_GRAPH is read as well |  |
 | `TQLLM_GLM_DUMP` | off | set (any value): GLM-5.3-Flash prints the per-stage sums of the forward (same names as glm-ref and llama-eval-callback); implies TQLLM_GLM_NO_GRAPH. The bring-up scripts' GLM_DUMP is read as well |  |
 | `TQLLM_MINIMAX_DUMP` | off | FILE: MiniMax-M3.1-Flash writes the residual stream after every layer to FILE (records int32 layer, pos, n + float [n][hidden]) for the per-layer comparison with tools/minimax_ref.py |  |
 | `TQLLM_MINIMAX_ROUTES` | off | FILE: MiniMax-M3.1-Flash writes its per-layer routed-expert counts (int64 [layers][experts]) at exit, the input of a hot / cold expert map |  |
-| `TQLLM_GLM_EXPERT_PF` | on | 0: GLM-5.3-Flash does not prefetch the experts a MoE layer wanted at the previous token while that layer runs its attention (needs a pinned TQLLM_GLM_EXPERTS file; placement only, the tokens do not change) |  |
 | `TQLLM_MLX_WIRED_MIB` | unset (retain MLX default) | Experimental process-local persistent Metal residency budget in MiB for MLX benchmark tools; 0 disables wiring. Capped by the device recommendation, restored on scope exit. Does not alter system settings. |  |
-| `TQFN_ALLOW_NP_ABOVE_8` | off | allow Flash-Next servers with more than 8 slots (known to end some requests after one token above 8) |  |
 | `TQFN_ARENA_LOG` | off | print the scratch arena high-water mark after each prefill |  |
-| `TQFN_BF16_ACT` | off | BF16 instead of FP16 activations for the Flash-Next native projections (A/B) |  |
 | `TQFN_CPU_CHECK` | off | check the CPU miss pool's int8 gate/up against fp32 and its packed-row rebuild against the GGUF |  |
-| `TQFN_CPU_GGUF_ROWS` | off | debug A/B: the CPU miss pool reads GGUF rows instead of rebuilding them from the pinned packed copy |  |
-| `TQFN_AUTO_KEEP_MB` | - | MB slots=auto keeps free beside the expert banks instead of the full-context attention room (small cards: 512); long prompts borrow banks |  |
 | `TQFN_EXPERT_PROFILE` | - | seed the expert banks from a routing profile (tools/fn_expert_profile.py); measured no effect on the 12 GB first request (prune) |  |
-| `TQFN_CPU_MISS_MAX` | - | K: at most K distinct experts per layer call on the CPU miss pool; the rest are GPU misses (small cards: 5) |  |
-| `TQFN_CPU_REFILL` | off | refill the expert banks from the CPU pool's copies (A/B) |  |
-| `TQFN_CPU_SPIN_MS` | 2 | ms the CPU miss workers spin before sleeping |  |
 | `TQFN_DENSE_INT8` | 0 | 1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path) |  |
 | `TQFN_DUMP_GDN` | - | FILE: dump the GDN layer outputs (fixture comparison) |  |
-| `TQFN_EXACT_F32` | off | every Flash-Next projection on the fp32 reference path (slow; numerics gate) |  |
-| `TQFN_EXPERT_GEMM_MIN` | 65 | rows from which prefill experts use the grouped GEMM instead of the dedup kernel |  |
-| `TQFN_F32_ROUTER` | off | the fp32 per-token router kernel instead of the BF16 GEMV / segmented launch |  |
-| `TQFN_GDN_CHUNK_MIN` | 64 | tokens from which GDN prefill uses the chunked (WY) kernel; 0 = off |  |
-| `TQFN_GDN_SEQ_FAST` | on | 0: the plain sequential GDN kernel instead of the fast pass at dim 128 |  |
-| `TQFN_GDN_WY` | on | 0: GDN chunked prefill without the WY form (A/B) |  |
-| `TQFN_GEMV_TILE` | 16 | router GEMV tile: 8, 16, 164 (16 x 4) or 32 (same output bits) |  |
 | `TQFN_LAYER_MAJOR` | on | 0: prefill chunks token-major instead of layer by layer (routed experts copied once per layer) |  |
-| `TQFN_LAYER_MAJOR_MIN` | 256 | tokens from which a prefill chunk runs layer-major |  |
-| `TQFN_MTP_CATCHUP` | - | positions per MTP catch-up batch when the MTP cache holds every expert |  |
-| `TQFN_MTP_LAYER_MAJOR` | on | 0: the MTP catch-up runs token-major instead of layer-major |  |
-| `TQFN_NO_LAYER_RESET` | off | keep the scratch arena across layers (A/B) |  |
-| `TQFN_NO_PREFETCH` | off | no predicted-expert prefetch in decode |  |
-| `TQFN_PF_K` | 6 | prefetch each token's K best predicted experts |  |
-| `TQFN_PF_KEEP` | off | 1: keep the layer-major buffers and staging halves across requests |  |
 | `TQFN_DRAFT_TAU` | 0.9 (np 1) | t: stop MTP drafting once the last draft's top probability is below t (text unchanged); one sequence defaults to 0.9 and up to 5 drafts; 0 = off |  |
-| `TQFN_VERIFY_WAVES` | off | 1: verify blocks pick the waves path by assignment count (pre-F39 rule; np > 1 text then differs from np 1) |  |
 | `TQFN_PREDICT_N` | 4 (6 with adaptive drafts) | next-layer prediction (prefetch) for verify blocks of up to N tokens |  |
 | `TQFN_PF_MMQ_CHECK` | 0 | N: check up to N layer-major MMQ expert GEMMs against the fp16 grouped kernel |  |
 | `TQFN_PRED_DUMP` | - | FILE: append routed and predicted next-layer ids per trunk layer call (cache simulation) |  |
@@ -97,10 +72,8 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_QSA` | on | 0: dense attention at every length instead of QSA sparse attention past the indexer budget (changes output) |  |
 | `TQFN_QSA_CHECK` | off | QSA selection: compare the top-k select with a full sort (raises on any difference) |  |
 | `TQFN_QSA_SPLIT` | 16 | slices per decode QSA attention row; 0 or 1 = direct attention |  |
-| `TQFN_ROUND32` | - | diagnostic: Q8 activation rounding of the dense projections on the GPU side (all = every tensor; default: none) |  |
 | `TQFN_ROUTE_DUMP` | - | FILE: append routed expert ids per trunk layer call |  |
 | `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
-| `TQFN_WAVE_GEMM_AVG` | - | average tokens per expert from which prefill waves use the grouped GEMM |  |
 
 ## Retired (the tool stops; use the replacement)
 

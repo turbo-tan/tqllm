@@ -11,7 +11,7 @@ struct DecodeModel {
     MixedExpertCache & experts; MixedExpertCache * mtp_experts = nullptr;
     std::vector<RecurrentState> rec; std::vector<AttentionState> att; std::vector<std::unique_ptr<Device<float>>> ple_past;
     PleTokenHistory history; int position = 0;
-    bool prefetch_on = std::getenv("TQFN_NO_PREFETCH") == nullptr; cudaStream_t copy_stream = nullptr, miss_stream = nullptr;
+    bool prefetch_on = true; cudaStream_t copy_stream = nullptr, miss_stream = nullptr;
     // speculative decoding: per-token rollback state, final wide residual rows of the last step, MTP head state
     bool spec = false; int spec_pos0 = 0, spec_n = 0; size_t spec_hist0 = 0;
     std::vector<std::unique_ptr<Device<float>>> ple_saved, ple_old;
