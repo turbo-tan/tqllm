@@ -842,8 +842,9 @@ struct Qwen35::Impl {
         mx::array out=mx::array(0.0f);
         if(m<=16) {
             // int8 KV: decode_attention_int8 (int8 Q x K) for every row count, so a verify row equals the AR step's
-            // call bit for bit
-            out=int8?decode_attention_int8(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
+            // call bit for bit; exact mode (int8 forced by memory) keeps the query FP32 (decode_attention_int8_reference)
+            out=int8?(exact?decode_attention_int8_reference(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
+                            decode_attention_int8(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need)):
                      decode_attention_trellis(q,*kb,*vb,scale,need);
         } else {
             mx::array keys=mx::array(0.0f),values=mx::array(0.0f);

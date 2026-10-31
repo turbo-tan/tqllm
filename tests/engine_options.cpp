@@ -1,4 +1,4 @@
-// tqserve engine options: the Flash-Next prefill parameters parse into EngineOptions, keep -1 (engine default) when absent,
+// tqserve engine options: --mode and the Flash-Next prefill parameters parse into EngineOptions, keep -1 (engine default) when absent,
 // and reject out-of-range values.
 #include "tqllm/options.hpp"
 #include <cstdio>
@@ -38,6 +38,9 @@ int main() {
     expect(throws({"--prefill-chunk", "100"}), "--prefill-chunk below 256 rejected");
     expect(throws({"--prefill-sub", "8"}), "--prefill-sub below 16 rejected");
     expect(throws({"--prefill-stage", "0"}), "--prefill-stage below 1 rejected");
+    expect(d.mode == tqllm::Mode::Speed, "--mode defaults to speed");
+    expect(parse({"--mode", "exact"}).mode == tqllm::Mode::Exact && parse({"--mode", "speed"}).mode == tqllm::Mode::Speed, "--mode exact|speed");
+    expect(throws({"--mode", "fast"}), "unknown --mode rejected");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");
     std::printf(fail ? "ENGINE_OPTIONS FAIL\n" : "ENGINE_OPTIONS PASS\n");

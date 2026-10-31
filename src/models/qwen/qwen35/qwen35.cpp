@@ -1619,7 +1619,7 @@ private:
                 }
                 gemm_w = Buf(mx * 2);
                 // opt-in (--prefill-fp8 on, sm_89+): faster prefill but KLD ~0.01 vs FP16 prefill, so off by default
-                if ((opt.prefill_fp8 == 1 || (opt.prefill_fp8 < 0 && tqllm_cuda::Fp8Gemm::default_on())) && !gemm_w_rows) {
+                if ((opt.prefill_fp8 == 1 || (opt.prefill_fp8 < 0 && opt.mode != tqllm::Mode::Exact && tqllm_cuda::Fp8Gemm::default_on())) && !gemm_w_rows) {
                     if (tqllm_cuda::Fp8Gemm::supported()) {
                         size_t mk = 0;
                         for (const auto & L : layer)
@@ -1645,7 +1645,7 @@ private:
                 }
                 // int8 path (Ampere): int32 results live in gemm_c ([NBUF][mr] x 4 bytes); the FP16 copy the fused SwiGLU
                 // reads goes through gemm_w, which must hold NBUF x mr halves
-                if (!fp8 && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
+                if (!fp8 && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && opt.mode != tqllm::Mode::Exact && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
                     tqllm_cuda::Int8Gemm::supported() &&
                     size_t(NBUF) * mr <= mx) {  // gemm_c below is [NBUF][mr] x 4 bytes: room for int32
                     size_t mk = 0;

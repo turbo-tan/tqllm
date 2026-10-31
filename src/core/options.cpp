@@ -47,7 +47,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--mode") {
         const std::string v = value();
         if (v != "exact" && v != "speed") throw std::invalid_argument("--mode must be exact or speed");
-        o.mode = v;
+        o.mode = v == "exact" ? Mode::Exact : Mode::Speed;
     }
     else if (a == "--kv-store") o.kv_store = value();
     else if (a == "--kv-host") o.kv_host = count(0);

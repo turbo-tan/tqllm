@@ -672,12 +672,24 @@ std::unique_ptr<Engine> load_fitted(const std::string & path, const std::string 
 }  // namespace
 
 namespace { FlashNextFactory g_flashnext = nullptr; }
+// --mode exact must hold on every engine: refuse the approximations a user asked for explicitly, and the engines that
+// have no exact path yet
+static void check_mode(const std::filesystem::path & p, const EngineOptions & o) {
+    if (o.mode != Mode::Exact) return;
+    if (o.prefill_int8 == 1 || o.prefill_fp8 == 1) throw std::invalid_argument("--mode exact cannot run --prefill-int8 / --prefill-fp8 on");
+    if (p.extension() == ".tqfn" && std::getenv("TQFN_PREFILL_INT8") && std::atoi(std::getenv("TQFN_PREFILL_INT8")) != 0)
+        throw std::invalid_argument("--mode exact cannot run with TQFN_PREFILL_INT8 set (int8 prefill)");
+    const bool gguf_like = p.extension() == ".gguf" || hf_folder(p.string());
+    if (gguf_like && (is_minimax_gguf(p.string()) || is_glm5next_gguf(p.string())))
+        throw std::invalid_argument("--mode exact is not available for this engine yet (MiniMax / GLM run speed mode only)");
+}
 void register_flashnext_engine(FlashNextFactory factory) { g_flashnext = factory; }
 // `weights` is either DIR/weights.tqbin (converted Qwen2) or a checkpoint directory / any file inside it.
 Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots, const EngineOptions & o)
     : impl_(std::make_unique<Impl>()) {
     const std::filesystem::path p(w);
     const auto dir = std::filesystem::is_directory(p) ? p : p.parent_path();
+    check_mode(p, o);
     if (p.extension() == ".tqfn") {
         if (!g_flashnext) throw std::invalid_argument("this binary has no Flash-Next engine (use tqserve)");
         impl_->e = g_flashnext(p.string(), t, c, slots, o); return;

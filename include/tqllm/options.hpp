@@ -7,13 +7,15 @@
 #include "tqllm/rope_scaling.hpp"
 
 namespace tqllm {
+// --mode: exact runs every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs) unless
+// memory forces a smaller KV, which is logged; speed (default) lets each engine take its measured approximations
+enum class Mode {Speed, Exact};
+inline const char * mode_name(Mode m) { return m == Mode::Exact ? "exact" : "speed"; }
 struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
-    std::string mode = "speed";  // --mode exact|speed, read by the Metal backend only so far. speed (default) may store the
-                                 // KV in int8 where that is faster (Metal: from 32K keys, int8 query in the verify attention);
-                                 // exact keeps BF16 KV unless memory forces less
+    Mode mode = Mode::Speed;  // --mode exact|speed (enum Mode above)
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
