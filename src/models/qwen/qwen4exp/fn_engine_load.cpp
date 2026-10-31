@@ -412,7 +412,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           }
           // tier A (the floor a bank never drops below): the slots a full-context state leaves, as with one sequence's whole
           // state kept free; tier B (the target) is what the smaller keep allows (decode_rules.hpp auto_keep_bytes)
-          if (slot_tiers(nseq, keep_env != nullptr)) {
+          if (slot_tiers(nseq, false)) {
               const size_t fr = tqllm::device_free_bytes() + f.cache->stats().device_bytes;
               const int tier_a = std::min(f.slots, tqllm::auto_expert_slots(fr, state + reserve + (size_t(256) << 20) + extra, per, c.experts));
               std::vector<int> floor(size_t(c.layers));
