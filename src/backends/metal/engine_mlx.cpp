@@ -13,6 +13,7 @@
 #include "qwen35.hpp"
 #include "kv_tcq.hpp"
 #include "spec_pipeline.hpp"
+#include "draft_tree.hpp"
 #include "width_policy.hpp"
 #include "wired_limit.hpp"
 #include "gguf.hpp"
@@ -65,6 +66,7 @@ public:
     uint32_t eos() const override;
     void spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) override;
     bool spec_advance() override;
+    bool tree_step(int pos, uint32_t limit);
     const std::vector<uint32_t>& spec_tokens(int) const override;
     std::vector<uint32_t> spec_finish(uint64_t* stats) override;
     void spec_step(const int*, int, bool*) override;
@@ -87,6 +89,7 @@ struct MlxQwen35Engine::Impl {
     std::vector<uint32_t> output;
     uint32_t count = 0, pending = 0;
     bool active = false, done = true, sampling = false;
+    bool tree = false;  // this request drafts token trees (greedy, BF16 KV): DFlash2 lattice -> best-first tree -> one verify
     uint64_t steps = 0, drafted = 0, accepted = 0;
     double prefill_us = 0, decode_us = 0;
     // host phases summed over the request's draft-ahead steps (ms); gap = host time between one spec_advance's end
@@ -208,7 +211,8 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     }
     i.output.push_back(i.pending);
     i.ahead.reset();
-    if (!i.sampling && i.pending != i.eos && i.output.size() < i.count) {
+    i.tree = !i.sampling && i.engine->kv_format() == mlx_backend::KvTier::Bf16;
+    if (!i.sampling && !i.tree && i.pending != i.eos && i.output.size() < i.count) {
         i.ahead.emplace(*i.engine, *i.drafter, i.width);
         i.ahead->start(i.pending, i.widths.native() ? i.widths.choose(i.engine->position()) : i.width);
         memlog_point("draft-ahead started");
@@ -256,6 +260,7 @@ bool MlxQwen35Engine::spec_advance() {
         if (i.done) i.ahead.reset();
         return !i.done;
     }
+    if (i.tree) return tree_step(pos, limit);
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
     auto drafted = i.drafter->draft_device(i.pending, pos, want);
     mx::async_eval(drafted);
@@ -307,6 +312,53 @@ bool MlxQwen35Engine::spec_advance() {
     i.engine->accept_prefix(ticket, size_t(acc + 1));
     i.drafter->inject(rows(features, 0, acc + 1), pos);
     if (want == verify && !i.sampling) i.widths.record(verify, acc, pos, us_since(step_start) / 1000.0);
+    if (!i.done) i.done = i.output.size() >= limit || i.output.back() == i.eos;
+    return !i.done;
+}
+
+// One token-tree step (TensorFold's DFlash2 tree, src/spec/draft_tree.hpp): the drafter's selector lattice for the
+// block's 15 positions becomes a best-first tree of up to 15 tokens under the anchor; the target verifies anchor + tree in
+// one 16-row pass under the ancestor mask, the target's argmax walks down the tree from the anchor, and the deepest
+// matching path is committed (KV rows, GDN state, drafter features). Greedy output equals the chain's: every kept token
+// is the target's argmax after its own path.
+bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
+    auto& i = *impl_;
+    constexpr int kPositions = 15;
+    auto lattice = i.drafter->draft_lattice(i.pending, pos, kPositions);
+    const tqllm::DraftLattice view{lattice.positions, lattice.topk, lattice.rank, lattice.tokens.data(), lattice.unary.data(),
+        lattice.gate.data(), lattice.successor.data(),
+        [](void* context, uint32_t token) {return static_cast<const DFlash2::HostLattice*>(context)->predecessor_row(token);},
+        &lattice};
+    const auto tree = tqllm::best_first_tree(view, i.pending, tqllm::DraftTreeOptions{});
+    std::vector<uint32_t> ids{i.pending};
+    std::vector<int32_t> parents{-1};
+    for (size_t r = 0; r < tree.tokens.size(); ++r) {
+        ids.push_back(tree.tokens[r]);
+        parents.push_back(tree.parents[r] < 0 ? 0 : tree.parents[r] + 1);
+    }
+    const int n = int(ids.size());
+    Qwen35::Verification ticket;
+    auto choices = mx::argmax(i.engine->verify_tree_device(mx::array(ids.data(), {n}, mx::uint32), parents, ticket), -1);
+    mx::eval(choices);
+    const uint32_t* target = choices.data<uint32_t>();
+    std::vector<int32_t> path{0};
+    for (int cur = 0;;) {
+        int next = -1;
+        for (int r = cur + 1; r < n && next < 0; ++r) if (parents[r] == cur && ids[r] == target[cur]) next = r;
+        if (next < 0) break;
+        path.push_back(next); cur = next;
+    }
+    const int acc = int(path.size()) - 1;
+    ++i.steps; i.drafted += uint64_t(n - 1); i.accepted += uint64_t(acc);
+    for (int j = 1; j <= acc && i.output.size() < limit; ++j) {
+        i.output.push_back(ids[size_t(path[j])]);
+        if (ids[size_t(path[j])] == i.eos) {i.done = true; break;}
+    }
+    const uint32_t bonus = target[path.back()];
+    if (!i.done && i.output.size() < limit) i.output.push_back(bonus);
+    i.pending = bonus;
+    i.engine->accept_path(ticket, path);
+    i.drafter->inject(i.engine->feature_states(), pos);
     if (!i.done) i.done = i.output.size() >= limit || i.output.back() == i.eos;
     return !i.done;
 }

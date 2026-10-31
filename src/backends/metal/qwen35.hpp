@@ -25,6 +25,10 @@ public:
     // draft and verify
     mlx::core::array verify_device(const mlx::core::array& ids, Verification& batch);
     void accept_prefix(const Verification& batch, size_t count);
+    // token-tree verify (BF16 KV): ids [n <= 16], row 0 the anchor, parents[t] < t the row each token follows. Logits
+    // are per row; accept_path keeps one root-to-node path (rows 0, r1, r2 ... each the previous row's child)
+    mlx::core::array verify_tree_device(const mlx::core::array& ids, const std::vector<int32_t>& parents, Verification& batch);
+    void accept_path(const Verification& batch, const std::vector<int32_t>& rows);
     mlx::core::array hidden_states() const;
     void enable_mtp();
     void draft_shortlist(const mlx::core::array& target_logits, int count);

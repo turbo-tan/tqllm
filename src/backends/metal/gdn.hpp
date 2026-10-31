@@ -40,7 +40,11 @@ GdnStep gdn_step_fused(const mlx::core::array& joined,const mlx::core::array& we
 GdnStep gdn_step_fused(const mlx::core::array& prev,const mlx::core::array& rows,const mlx::core::array& weights,
     const mlx::core::array& input,const mlx::core::array& ab,const mlx::core::array& bias,const mlx::core::array& rate,
     const mlx::core::array& z,const mlx::core::array& norm_weight,float eps,float query_scale,
-    const std::optional<mlx::core::array>& state,int key_heads,int value_heads,int row_stride=0,int z_stride=0,int z_offset=0);
+    const std::optional<mlx::core::array>& state,int key_heads,int value_heads,int row_stride=0,int z_stride=0,int z_offset=0,
+    const mlx::core::array* parents=nullptr);
+// parents (token-tree verify): int32 [m], each row's parent row (-1: follows the history). Conv taps and the
+// recurrence follow the row's ancestors; null is the chain (parent t - 1), bit for bit as before. The returned state
+// and history are then the last row's path only (a tree commit replays its accepted path from the tape).
 // out holds BF16 values as FP16 (the ssm_out matmul's input). row_stride / z_stride / z_offset: rows and z read in place
 // from one packed qkv | z product [m, row_stride] (z at column z_offset), so the projection is a single launch.
 struct GdnScan {

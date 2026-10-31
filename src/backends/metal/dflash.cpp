@@ -533,6 +533,38 @@ void DFlash2::reserve_far(int rows) {
     auto& i=*impl_;
     if(i.far_on())i.ensure_far(rows+2*i.block);
 }
+DFlash2::HostLattice DFlash2::draft_lattice(uint32_t anchor,int position,int count) {
+    auto& i=*impl_;
+    if(i.head_dev)throw std::logic_error("DFlash lattice after device injects");
+    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))throw std::invalid_argument("invalid DFlash lattice request");
+    auto [mapped,unary,gate,successors]=lattice_arrays(anchor,position,count);
+    // rows 1 .. count are the drafted positions (row 0 is the anchor's)
+    auto ids=mx::contiguous(mx::astype(mx::slice(mapped,{1,0},{count+1,mapped.shape(1)}),mx::uint32));
+    auto un=mx::contiguous(mx::slice(unary,{1,0},{count+1,unary.shape(1)}));
+    auto ga=mx::contiguous(mx::astype(mx::slice(gate,{1,0},{count+1,gate.shape(1)}),mx::float32));
+    auto su=mx::contiguous(mx::slice(successors,{1,0,0},{count+1,successors.shape(1),successors.shape(2)}));
+    mx::eval(ids,un,ga,su);
+    HostLattice out;
+    out.positions=count;out.topk=ids.shape(1);out.rank=ga.shape(1);
+    out.tokens.assign(ids.data<uint32_t>(),ids.data<uint32_t>()+ids.size());
+    out.unary.assign(un.data<float>(),un.data<float>()+un.size());
+    out.gate.assign(ga.data<float>(),ga.data<float>()+ga.size());
+    out.successor.assign(su.data<float>(),su.data<float>()+su.size());
+    // the predecessor rows of every candidate and the anchor (the selector reads only these)
+    out.predecessor_tokens=out.tokens;out.predecessor_tokens.push_back(anchor);
+    std::sort(out.predecessor_tokens.begin(),out.predecessor_tokens.end());
+    out.predecessor_tokens.erase(std::unique(out.predecessor_tokens.begin(),out.predecessor_tokens.end()),out.predecessor_tokens.end());
+    auto index=mx::array(out.predecessor_tokens.data(),{int(out.predecessor_tokens.size())},mx::uint32);
+    auto pred=mx::contiguous(mx::astype(mx::take(i.plain.at("selector_predecessor.weight"),index,0),mx::float32));
+    mx::eval(pred);
+    out.predecessor.assign(pred.data<float>(),pred.data<float>()+pred.size());
+    return out;
+}
+const float* DFlash2::HostLattice::predecessor_row(uint32_t token) const {
+    auto it=std::lower_bound(predecessor_tokens.begin(),predecessor_tokens.end(),token);
+    if(it==predecessor_tokens.end() || *it!=token)throw std::out_of_range("predecessor row not in the lattice");
+    return predecessor.data()+size_t(it-predecessor_tokens.begin())*size_t(rank);
+}
 std::vector<double> DFlash2::stage_ms_per_call() const {
     const auto& i=*impl_;std::vector<double> out;
     for(double v:i.stage_ms)out.push_back(i.stage_calls?v/i.stage_calls:0.0);
@@ -579,11 +611,8 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
     if(stages)++i.stage_calls;
     return chosen;
 }
-std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
+DFlash2::LatticeArrays DFlash2::lattice_arrays(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
-    if(i.head_dev)throw std::logic_error("DFlash host draft after device injects: use draft_device_at");
-    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
-        throw std::invalid_argument("invalid DFlash draft request");
     const int rows=i.draft_rows(count);
     std::vector<uint32_t> tokens(rows,i.mask);tokens[0]=anchor;
     auto x=i.target.embed_tokens(tokens);
@@ -623,6 +652,14 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     }
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
+    return {mapped,mx::astype(unary,mx::float32),gate,successors};
+}
+std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
+    auto& i=*impl_;
+    if(i.head_dev)throw std::logic_error("DFlash host draft after device injects: use draft_device_at");
+    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
+        throw std::invalid_argument("invalid DFlash draft request");
+    auto [mapped,unary,gate,successors]=lattice_arrays(anchor,position,count);
     auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
         i.plain.at("selector_predecessor.weight"),anchor,count);
     if(i.device_only) {i.last_chosen=chosen;return {};}

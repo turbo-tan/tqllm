@@ -40,13 +40,16 @@ inline mlx::core::array prefill_attention_rows(const mlx::core::array& q16, cons
     return mx::concatenate(parts, 2);
 }
 
+// tree: the token-tree verify's [n, n] ancestor mask (decode_attention_bf16), n <= 16 rows only
 inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const mlx::core::array& k,
-                                              const mlx::core::array& v, float scale, int kv_valid = -1) {
+                                              const mlx::core::array& v, float scale, int kv_valid = -1,
+                                              const mlx::core::array* tree = nullptr) {
     namespace mx = mlx::core;
     const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2);
     if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
-    if (n <= 16) return decode_attention_bf16(q, k, v, scale, length);
+    if (n <= 16) return decode_attention_bf16(q, k, v, scale, length, tree);
+    if (tree) throw std::invalid_argument("tree attention takes at most 16 rows");
     auto keys = mx::astype(mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}), mx::float16);
     auto values = mx::astype(mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}), mx::float16);
     auto out = prefill_attention_rows(mx::astype(q, mx::float16), keys, values, scale);

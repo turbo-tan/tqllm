@@ -31,7 +31,8 @@ struct AttnQkNormRope {
 };
 AttnQkNormRope attn_qk_norm_rope(const mlx::core::array& q_prod, const mlx::core::array& k_prod, const mlx::core::array& v_prod,
                                  const mlx::core::array& q_norm_w, const mlx::core::array& k_norm_w, int heads, int kvheads,
-                                 int hd, int rot, float theta, float eps, int offset);
+                                 int hd, int rot, float theta, float eps, int offset,
+                                 const mlx::core::array* depth = nullptr);  // depth: per-row positions past offset (tree verify)
 AttnQkNormRope attn_qk_norm_rope_reference(const mlx::core::array& q_prod, const mlx::core::array& k_prod,
                                            const mlx::core::array& v_prod, const mlx::core::array& q_norm_w,
                                            const mlx::core::array& k_norm_w, int heads, int kvheads, int hd, int rot,

@@ -27,6 +27,16 @@ public:
     void reset();
     void inject(const mlx::core::array& features,int position);
     std::vector<uint32_t> draft(uint32_t anchor,int position,int count);
+    // the selector lattice of a host draft (token-tree drafting): per drafted position the top-16 candidate ids, their
+    // unary logits, the selector's gate row and each candidate's successor codebook row, plus the predecessor rows of
+    // the candidates and the anchor (sorted by token). The drafter state advances as for draft()
+    struct HostLattice {
+        int positions=0,topk=0,rank=0;
+        std::vector<uint32_t> tokens,predecessor_tokens;
+        std::vector<float> unary,gate,successor,predecessor;
+        const float* predecessor_row(uint32_t token) const;
+    };
+    HostLattice draft_lattice(uint32_t anchor,int position,int count);
     // the same draft with the selector's ids left unevaluated on the GPU (uint32 [count]); needs
     // feed it to Qwen35::verify_device without reading it back.
     mlx::core::array draft_device(uint32_t anchor,int position,int count);
@@ -54,6 +64,8 @@ public:
     // with TQLLM_DEBUG=dflash_rankstats: the last draft's 16 candidates per proposed token, best unary score first
     const std::vector<std::vector<uint32_t>>& candidates() const;
 private:
+    struct LatticeArrays {mlx::core::array mapped,unary,gate,successors;};
+    LatticeArrays lattice_arrays(uint32_t anchor,int position,int count);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -388,8 +388,11 @@ GdnStep gdn_step_fused(const mx::array& joined,const mx::array& weights,const mx
 }
 GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::array& weights,const mx::array& input,
     const mx::array& ab,const mx::array& bias,const mx::array& rate,const mx::array& z,const mx::array& norm_weight,
-    float eps,float query_scale,const std::optional<mx::array>& state,int kh,int vh,int row_stride,int z_stride,int z_offset) {
+    float eps,float query_scale,const std::optional<mx::array>& state,int kh,int vh,int row_stride,int z_stride,int z_offset,
+    const mx::array* parents) {
     const int m=rows.ndim()==2?rows.shape(0):0,width=2*kh*128+vh*128;
+    if(parents && (parents->shape()!=mx::Shape{m} || parents->dtype()!=mx::int32))
+        throw std::invalid_argument("fused GDN step parents: int32 [m]");
     const int rs=row_stride>0?row_stride:width,zs=z_stride>0?z_stride:vh*128;
     if(rows.ndim()!=2 || rows.shape(1)!=rs || rs<width || zs<vh*128 || z_offset<0 || z_offset+vh*128>zs)
         throw std::invalid_argument("invalid fused GDN step packed product layout");
@@ -425,8 +428,14 @@ for(uint i=tid;i<uint(M)*384u;i+=1024u) {
     const uint t=i/384u,ch=i%384u;
     const uint col=ch<128u?qoff+ch:ch<256u?koff+(ch-128u):voff+(ch-256u);
     float sum=0.0f;
+    // the 4 conv taps of token t walk its ancestors: index c of [prev; rows] (rows at c >= 3); a row's predecessor is
+    // its parent row (par, -1 = the last history row), a history row's is the one before it. A chain (par[t] = t - 1)
+    // reads rows t .. t + 3, the plain sequence
+    uint taps[4];
+    taps[3]=t+3u;
+    for(int u=2;u>=0;--u) {const uint c=taps[u+1];taps[u]=c>=3u?(par[c-3u]<0?2u:uint(par[c-3u])+3u):c-1u;}
     for(uint tap=0;tap<4u;++tap) {
-        const uint r=t+tap;  // row r of [prev; rows]
+        const uint r=taps[tap];  // row r of [prev; rows]
         sum=sum+(r<3u?prev[r*uint(WIDTH)+col]:rows[(r-3u)*uint(RS)+col])*weights[col*4u+tap];
     }
     const float rounded=float(bfloat16_t(sum));
@@ -482,7 +491,26 @@ float s[16];
     const device float* src=initial+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)s[j]=src[j];
 }
+// token tree: a token whose parent is not the token just stepped restarts from the initial state and replays its
+// ancestors (same arithmetic, outputs dropped), so every token sees exactly its own path's state; a chain never replays
+int cur=-1;
 for(uint t=0;t<uint(M);++t) {
+    if(par[t]!=cur) {
+        const device float* src=initial+(head*128u+row)*128u+sub*16u;
+        for(uint j=0;j<16u;++j)s[j]=src[j];
+        uint path[16];uint depth=0;
+        for(int a=par[t];a>=0;a=par[a])path[depth++]=uint(a);
+        for(uint c=depth;c>0;--c) {
+            const uint u=path[c-1u];
+            const float d=dec[u],b=bet[u];
+            const threadgroup float* ku=ks+u*128u+sub*16u;
+            float memory=0.0f;
+            for(uint j=0;j<16u;++j) {s[j]*=d;memory+=s[j]*ku[j];}
+            memory+=simd_shuffle_xor(memory,1u);memory+=simd_shuffle_xor(memory,2u);memory+=simd_shuffle_xor(memory,4u);
+            const float delta=(float(vs[u*128u+row])-memory)*b;
+            for(uint j=0;j<16u;++j)s[j]=s[j]+ku[j]*delta;
+        }
+    }
     const float d=dec[t],b=bet[t];
     const threadgroup float* kt=ks+t*128u+sub*16u;
     const threadgroup float* qt=qs+t*128u+sub*16u;
@@ -494,6 +522,7 @@ for(uint t=0;t<uint(M);++t) {
     for(uint j=0;j<16u;++j) {s[j]=s[j]+kt[j]*delta;value+=s[j]*qt[j];}
     value+=simd_shuffle_xor(value,1u);value+=simd_shuffle_xor(value,2u);value+=simd_shuffle_xor(value,4u);
     if(sub==0u) {os[t*128u+row]=value;deltas[(t*uint(VH)+head)*128u+row]=delta;}
+    cur=int(t);
 }
 {
     device float* dst=state+(head*128u+row)*128u+sub*16u;
@@ -526,10 +555,10 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 )METAL";
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_step_fused",
-        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial"},
+        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial","par"},
         {"out","state","deltas","keys","decay","history"},body);
     static auto kernel_ab=mx::fast::metal_kernel("tqllm_gdn_step_fused_ab",
-        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial"},
+        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial","par"},
         {"out","state","deltas","keys","decay","history"},body);
     const bool abf=input.ndim()==2 && input.shape(1)!=vh;  // [m, hidden] input + [2 vh, hidden] weights instead of alpha / beta
     const int hid=abf?input.shape(1):0;
@@ -537,7 +566,8 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
         throw std::invalid_argument("invalid fused GDN step alpha / beta projection");
     auto result=(abf?kernel_ab:kernel)({mx::contiguous(prev),mx::contiguous(rows),mx::contiguous(weights),mx::contiguous(input),mx::contiguous(ab),
         mx::contiguous(bias),mx::contiguous(rate),mx::contiguous(z),mx::contiguous(norm_weight),mx::array(eps),
-        mx::array(query_scale),mx::contiguous(initial)},
+        mx::array(query_scale),mx::contiguous(initial),
+        parents?mx::contiguous(*parents):mx::subtract(mx::arange(m,mx::int32),mx::array(1,mx::int32))},
         {{m,vh*128},{1,vh,128,128},{m,vh,128},{1,m,kh,128},{1,m,vh},{3,width}},
         {mx::float16,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32},
         {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset}},
