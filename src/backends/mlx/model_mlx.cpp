@@ -38,9 +38,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double us_since(Clock::time_point t) {return std::chrono::duration<double, std::micro>(Clock::now() - t).count();}
 mx::array rows(const mx::array& x, int a, int b) {return mx::slice(x, {a, 0}, {b, x.shape(1)});}
-bool has_tensor(const std::string& path, const std::string& name) {
-    return gguf_open(path).tensors.count(name) > 0;
-}
 }  // namespace
 
 struct ScopedWiredLimitHolder { tqllm::mlx_backend::ScopedWiredLimit limit; };
@@ -48,12 +45,11 @@ struct Model::Impl {
     std::unique_ptr<ScopedWiredLimitHolder> residency;
     std::unique_ptr<Qwen35> engine;
     std::unique_ptr<DFlash2> drafter;
-    // greedy requests with TQLLM_MLX_DRAFT_AHEAD: verify(k) and draft(k+1) chained on the GPU (spec_pipeline.hpp)
+    // greedy requests: verify(k) and draft(k+1) chained on the GPU (spec_pipeline.hpp, gated j892)
     std::optional<tqllm::mlx_backend::DraftAhead> ahead;
     tqllm::mlx_backend::WidthPolicy widths;  // verify 7 or 15 drafted tokens per step (time lines kept across requests)
     uint32_t context_ = 0, eos = 0, vocab = 0, layers_ = 0, hidden_ = 0;
-    int width = 15, chunk = 8192, shortlist = 32768;  // prefill batches of 8192 run layer-major in 2048-row slices
-    bool head4 = false;
+    int width = 15, chunk = 8192;  // block-16 drafts; prefill batches of 8192 run layer-major in 2048-row slices
     bool exact = false;  // --mode exact
     float temperature = 0.f, top_p = 1.f; int top_k = 0; std::mt19937_64 rng{0};
     // the active request
@@ -81,25 +77,19 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     mlx_backend::apply_release_defaults();
     auto& i = *impl_;
     if (const char* c = std::getenv("TQLLM_MLX_PREFILL_CHUNK")) i.chunk = std::max(128, std::atoi(c));
-    i.width = std::atoi(std::getenv("TQLLM_MLX_DFLASH_BLOCK")) >= 16 ? 15 : 7;
-    // the 4-bit proposal head exists only in files that carry output_draft.weight (TQ4_L); elsewhere a shortlist head
-    // TQLLM_MLX_DRAFT_HEAD4=1: the 4-bit proposal head for files without output_draft.weight too (mlxc: full-vocab 4-bit
-    // instead of the 6-bit head, ~1.2 ms less per draft; acceptance under test)
-    i.head4 = has_tensor(weights, "output_draft.weight") ||
-              (std::getenv("TQLLM_MLX_DRAFT_HEAD4") && std::string(std::getenv("TQLLM_MLX_DRAFT_HEAD4")) != "0");
     mx::set_cache_limit(size_t(512) * 1024 * 1024);
     i.residency = std::make_unique<ScopedWiredLimitHolder>();
     i.engine = std::make_unique<Qwen35>(weights, int(context));
     i.drafter = std::make_unique<DFlash2>(options.draft_model, *i.engine);
-    if (i.head4) i.engine->enable_draft_head4();
+    i.engine->enable_draft_head4();  // 4-bit proposal head, matrix-unit layout (gated j892)
     i.exact = options.mode == Mode::Exact;
     i.engine->set_exact(i.exact);
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
-    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block %s, %s head, mode %s\n", options.draft_model.c_str(),
-                 std::getenv("TQLLM_MLX_DFLASH_BLOCK"), i.head4 ? "4-bit proposal" : "shortlist", mode_name(options.mode));
+    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, mode %s\n", options.draft_model.c_str(),
+                 mode_name(options.mode));
 }
 Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
@@ -170,7 +160,6 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
         i.drafter->inject(i.engine->feature_states(), int(off));
         memlog_point("prefill chunk at", long(off));
     }
-    if (!i.head4) i.engine->draft_shortlist(logits, i.shortlist);
     i.pending = mx::argmax(logits).item<uint32_t>();
     mx::set_cache_limit(size_t(512) << 20);
     // the prefill's cached buffers go back to the system before the decode, lean or not: up to 4 GiB left cached pushed a
@@ -188,8 +177,7 @@ void Model::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int)
     }
     i.output.push_back(i.pending);
     i.ahead.reset();
-    static const bool draft_ahead = std::getenv("TQLLM_MLX_DRAFT_AHEAD") && std::string(std::getenv("TQLLM_MLX_DRAFT_AHEAD")) != "0";
-    if (draft_ahead && !i.sampling && i.pending != i.eos && i.output.size() < i.count) {
+    if (!i.sampling && i.pending != i.eos && i.output.size() < i.count) {
         i.ahead.emplace(*i.engine, *i.drafter, i.width);
         i.ahead->start(i.pending, i.widths.native() ? i.widths.choose(i.engine->position()) : i.width);
         memlog_point("draft-ahead started");

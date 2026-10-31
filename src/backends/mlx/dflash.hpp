@@ -20,7 +20,8 @@ mlx::core::array dflash_select(const mlx::core::array& mapped,const mlx::core::a
 std::pair<mlx::core::array,mlx::core::array> dflash_top16(const mlx::core::array& logits);
 class DFlash2 {
 public:
-    DFlash2(const std::string& path,Qwen35& target);
+    // block_rows: the largest draft block (16 served; 8 for block-8 pricing tests)
+    DFlash2(const std::string& path,Qwen35& target,int block_rows=16);
     ~DFlash2();
     const std::vector<int>& feature_layers() const;
     void reset();
@@ -36,7 +37,9 @@ public:
     mlx::core::array draft_device_at(const mlx::core::array& anchor,const mlx::core::array& position,int count);
     // after the step's readback: the last inject_device wrote `rows` rows (tightens the host's bound on the GPU fill)
     void settle_device_inject(int rows);
-    // TQLLM_MLX_DRAFT_STAGES: mean ms per draft_device_at of layers, head, top-16 and selector (each stage synced)
+    // draft bench: time_stages(true) syncs each stage of draft_device_at; stage_ms_per_call() returns the mean ms of
+    // layers, head, top-16 and selector
+    void time_stages(bool on);
     std::vector<double> stage_ms_per_call() const;
     // bytes the far-context caches hold per position (full K / V per layer + chunk key sums); 0 without retrieval
     size_t far_row_bytes() const;

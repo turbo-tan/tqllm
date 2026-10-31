@@ -591,8 +591,6 @@ struct Qwen35::Impl {
         Half h[2]={{bf(embed(tokens.subspan(0,R))),pos,{},{},{},{}},{bf(embed(tokens.subspan(R,R))),pos+R,{},{},{},{}}};
         std::future<void> job;int job_half=-1;
         static const bool timing=std::getenv("TQLLM_MLX_ANE_TIMING")!=nullptr;
-        // TQLLM_MLX_ANE_STUB=1 (timing diagnostic, wrong output): skip the ANE predict, the GPU runs only its share
-        static const bool stub=std::getenv("TQLLM_MLX_ANE_STUB")!=nullptr;
         // direct evidence: ANE calls made, time inside the predict call (worker thread), layers that fell back to the GPU
         std::atomic<double> ane_ms{0},ane_cpu_ms{0};int ane_calls=0,gpu_layers=0;long gpu_share_cols=0;
         double t_eval=0,t_join=0,t_build=0;auto tick=std::chrono::steady_clock::now();
@@ -644,7 +642,6 @@ struct Qwen35::Impl {
                 std::atomic<double>* acc=&ane_ms;
                 std::atomic<double>* cpu_acc=&ane_cpu_ms;
                 job=std::async(std::launch::async,[a,l,xp,yp,hidden,acc,cpu_acc]{
-                    if(stub)return;
                     auto thread_ms=[]{timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec*1e3+t.tv_nsec*1e-6;};
                     const auto t0=std::chrono::steady_clock::now();const double c0=thread_ms();a->predict(l,xp,yp,hidden);
                     const double d=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),c=thread_ms()-c0;
@@ -930,9 +927,8 @@ struct Qwen35::Impl {
         }
         auto in=pack_product16(p+"gdn_in",x);   // qkv | z
         // one launch for conv, gates, q/k norms, the 1-16 token scan, the compact tape and the gated norm (j762: verify
-        // -2.2 ms); on by default since j892 (TQLLM_MLX_GDN_STEP=0 off). Decode, verify and the accept replay share its recurrence
-        static const bool gdn_step=std::getenv("TQLLM_MLX_GDN_STEP") && std::string(std::getenv("TQLLM_MLX_GDN_STEP"))!="0";
-        const bool step_path=gdn_step && m<=16 && conv==4 && dk==128 && dv==128;
+        // -2.2 ms; served since j892). Decode, verify and the accept replay share its recurrence
+        const bool step_path=m<=16 && conv==4 && dk==128 && dv==128;
         auto qkv=in.empty()?mat(p+"attn_qkv.weight",x):round_product(in[0]);
         stage("gdn_proj_in",{qkv});
         auto history=c.conv?*c.conv:mx::zeros({conv-1,width});
@@ -1048,12 +1044,12 @@ struct Qwen35::Impl {
             if(stage_profiling)record(fuse?"ffn_down_gemm_res":"ffn_down",{x});
             if(dispatches)dispatches->take({x},std::string(is_attn?"attn":"gdn")+"/ffn");
         };
-        // TQLLM_MLX_PREFILL_GROUP=S: a prefill batch of more than S rows runs layer-major in S-row slices, each slice with
+        // a prefill batch of more than group_rows rows runs layer-major in slices of that many rows, each slice with
         // the ops (shapes, positions, cache order) of its own S-row forward, so the result equals S-row chunks while each
         // layer's weights are dequantized once for the batch (pass a chunk of G x S rows); the layer is evaluated before
         // the next so one layer's FP16 weights are live at a time
-        // default 2048 since j769 (bitwise equal to 2048-row chunks; prefill +3-6 %: mlxc doc8k 453 -> 480); =0 off
-        static const int group_rows=std::getenv("TQLLM_MLX_PREFILL_GROUP")?std::atoi(std::getenv("TQLLM_MLX_PREFILL_GROUP")):2048;
+        // 2048 since j769 (bitwise equal to 2048-row chunks; prefill +3-6 %: mlxc doc8k 453 -> 480)
+        constexpr int group_rows=2048;
         const bool layer_major=group_rows>16 && m>group_rows && !use_wave && !capture_prefix && !dispatches;  // stage profiles sync per stage inside it
         if(layer_major) {
             const int slice_rows=group_rows;

@@ -1,7 +1,6 @@
 #include <sstream>
 #include "dflash.hpp"
 #include "dflash_retrieve.hpp"
-#include <mlx/compile.h>
 #include "nax_affine.hpp"
 #include "dequant.hpp"
 #include <algorithm>
@@ -9,7 +8,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
-#include <functional>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -104,7 +102,7 @@ mx::array dflash_select(const mx::array& mapped,const mx::array& unary,const mx:
 }
 mx::array dflash_select(const mx::array& mapped,const mx::array& unary,const mx::array& gate,
     const mx::array& successors,const mx::array& predecessors,const mx::array& anchor_id,int count) {
-    const int R=mapped.ndim()==2?mapped.shape(0):0;  // draft block rows (8, or 16 with TQLLM_MLX_DFLASH_BLOCK)
+    const int R=mapped.ndim()==2?mapped.shape(0):0;  // draft block rows (8, or 16: DFlash2 block_rows)
     if((R!=8 && R!=16) || mapped.shape()!=mx::Shape{R,16} || mapped.dtype()!=mx::uint32 ||
        unary.shape()!=mapped.shape() || unary.dtype()!=mx::float32 ||
        gate.shape()!=mx::Shape{R,256} || gate.dtype()!=mx::float32 ||
@@ -226,21 +224,23 @@ struct DFlash2::Impl {
     // (settled fill + block rows per inject not yet settled) to size the attention span
     std::optional<mx::array> head_dev,filled_dev;
     int fill_settled=0,fill_unsettled=0;
-    double stage_ms[4]={0,0,0,0};int stage_calls=0;  // TQLLM_MLX_DRAFT_STAGES: layers, head, top-16, selector
+    bool stages=false;  // time_stages(): draft_device_at syncs and times each stage (draft bench only)
+    double stage_ms[4]={0,0,0,0};int stage_calls=0;  // layers, head, top-16, selector
     void to_device() {
         if(head_dev)return;
         head_dev=mx::array(caches[0].head,mx::int32);filled_dev=mx::array(caches[0].filled,mx::int32);
         fill_settled=caches[0].filled;fill_unsettled=0;
     }
     std::vector<Kv> caches;
-    Impl(const std::string& path,Qwen35& engine):target(engine),file(gguf_open(path)) {
+    Impl(const std::string& path,Qwen35& engine,int block_rows):target(engine),file(gguf_open(path)) {
         if(file.kv.at("general.architecture").str!="dflash")throw std::invalid_argument("DFlash GGUF required");
         hidden=int(file.num("dflash.embedding_length"));heads=int(file.num("dflash.attention.head_count"));
         kvheads=int(file.num("dflash.attention.head_count_kv"));hd=int(file.num("dflash.attention.key_length"));
         block=int(file.num("dflash.block_size"));
-        // TQLLM_MLX_DFLASH_BLOCK=n: draft blocks of up to n rows (block-16 pricing with a block-8 drafter, own block-16 drafters);
-        // a draft of fewer than the file's native block rows runs at the native block (j924: its 7 drafts beat the head of a 16-draft)
-        if(const char* b=std::getenv("TQLLM_MLX_DFLASH_BLOCK"))block=std::atoi(b);native=std::min(block,int(file.num("dflash.block_size")));group=int(file.num("dflash.conv_group_size"));
+        // block_rows: draft blocks of up to that many rows (16 served: block-16 pricing with a block-8 drafter, own block-16
+        // drafters); a draft of fewer than the file's native block rows runs at the native block (j924: its 7 drafts beat the
+        // head of a 16-draft)
+        block=block_rows;native=std::min(block,int(file.num("dflash.block_size")));group=int(file.num("dflash.conv_group_size"));
         window=int(file.num("dflash.attention.sliding_window"));rank=int(file.num("dflash.selector_rank"));
         mask=uint32_t(file.num("tokenizer.ggml.mask_token_id"));
         eps=float(file.num("dflash.attention.layer_norm_rms_epsilon"));theta=float(file.num("dflash.rope.freq_base"));
@@ -281,8 +281,7 @@ struct DFlash2::Impl {
             }
         }
         caches.resize(layers);target.feature_layers(features);
-        // TQLLM_MLX_DFLASH_RING=0: concatenate the window every inject and draft (three window copies per step)
-        ring=window>0 && (!std::getenv("TQLLM_MLX_DFLASH_RING") || std::string(std::getenv("TQLLM_MLX_DFLASH_RING"))!="0");
+        ring=window>0;
     }
     mx::array mat(const std::string& name,const mx::array& x) {
         if(auto found=nax.find(name);found!=nax.end())return nax_affine_matmul(found->second,x,true);
@@ -306,10 +305,6 @@ struct DFlash2::Impl {
     mx::array values(const std::string& p,const mx::array& x) {
         return mx::transpose(mx::reshape(mat(p+"attn_v.weight",x),{1,x.shape(0),kvheads,hd}),{0,2,1,3});
     }
-    // TQLLM_MLX_DFLASH_COMPILE=1: the ring draft's layers as one mx::compile'd graph (traced once per mask state; the
-    // position enters as an array, so the trace is reused at every step): fewer host nodes to build and encode per step
-    bool compile_draft=std::getenv("TQLLM_MLX_DFLASH_COMPILE") && std::string(std::getenv("TQLLM_MLX_DFLASH_COMPILE"))!="0";
-    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> compiled_layers[2];   // [0] full block, [1] native block
     // in: x [block, hidden], position (int32 scalar), [mask over the span], then k, v per layer; attention reads the
     // leading `span` rows (block + filled); out: x, then the updated k, v
     std::vector<mx::array> ring_layers(const std::vector<mx::array>& in,int span,bool masked,bool retr=false,int scored=0,bool ahead=false,int rows=0) {
@@ -367,7 +362,7 @@ struct DFlash2::Impl {
         out.insert(out.end(),anchors.begin(),anchors.end());
         return out;
     }
-    // the ring layers over the leading `span` rows; compiled only in the fixed-shape steady state (full window, no mask)
+    // the ring layers over the leading `span` rows
     mx::array run_ring_layers(const mx::array& x,const mx::array& position,int span,const std::optional<mx::array>& mask,int far_rows=0) {
         std::vector<mx::array> in{x,position};
         if(mask)in.push_back(*mask);
@@ -382,11 +377,8 @@ struct DFlash2::Impl {
             if(ahead) {in.push_back(*sel_next[l]);in.push_back(*sel_next[caches.size()+l]);}
             else if(retr) {in.push_back(*c.kfull);in.push_back(*c.vfull);in.push_back(*c.kfs);in.push_back(*c.vfs);in.push_back(*c.ksum);}
         }
-        const int rows=x.shape(0),slot=rows==block?0:1;
-        const bool fixed=span==window+rows && !mask && !retr;
-        if(compile_draft && fixed && !compiled_layers[slot])
-            compiled_layers[slot]=mx::compile([this,rows](const std::vector<mx::array>& a) {return ring_layers(a,window+rows,false,false,0,false,rows);});
-        auto out=compile_draft && fixed?compiled_layers[slot](in):ring_layers(in,span,mask.has_value(),retr,scored,ahead,rows);
+        const int rows=x.shape(0);
+        auto out=ring_layers(in,span,mask.has_value(),retr,scored,ahead,rows);
         const int L=int(caches.size());
         for(int l=0;l<L;++l) {caches[l].k=out[1+2*l];caches[l].v=out[2+2*l];}
         if(retr) {
@@ -408,7 +400,8 @@ struct DFlash2::Impl {
         return out[0];
     }
 };
-DFlash2::DFlash2(const std::string& path,Qwen35& target):impl_(std::make_unique<Impl>(path,target)) {}
+DFlash2::DFlash2(const std::string& path,Qwen35& target,int block_rows):impl_(std::make_unique<Impl>(path,target,block_rows)) {}
+void DFlash2::time_stages(bool on) {impl_->stages=on;}
 DFlash2::~DFlash2() {if(impl_)impl_->drop_selections();}
 const std::vector<std::vector<uint32_t>>& DFlash2::candidates() const {return impl_->candidates;}
 const std::vector<int>& DFlash2::feature_layers() const {return impl_->features;}
@@ -561,8 +554,8 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
     std::optional<mx::array> mask;
     if(bound>i.fill_settled)  // the GPU's fill is somewhere in (settled, bound]: mask the rows past it
         mask=mx::reshape(mx::less(mx::arange(span,mx::int32),mx::add(*i.filled_dev,mx::array(rows,mx::int32))),{1,1,1,span});
-    // TQLLM_MLX_DRAFT_STAGES=1 (with TQLLM_MLX_DRAFT_BENCH): evaluate after each stage and add its ms to stage_ms
-    static const bool stages=std::getenv("TQLLM_MLX_DRAFT_STAGES")!=nullptr;
+    // time_stages(true) (draft bench): evaluate after each stage and add its ms to stage_ms
+    const bool stages=i.stages;
     auto tick=std::chrono::steady_clock::now();
     auto lap=[&](int k,const std::vector<mx::array>& a) {
         if(!stages)return;

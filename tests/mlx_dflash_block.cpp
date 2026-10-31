@@ -1,4 +1,4 @@
-// A 7-token draft from the block-16 drafter (TQLLM_MLX_DFLASH_BLOCK=16, the served default) runs the file's native
+// A 7-token draft from the block-16 drafter (block_rows 16, the served default) runs the file's native
 // 8-row block and must equal the block-8 drafter's draft token for token, from the same ring (host and device draft
 // paths, window partly and fully filled) when native_block is on; off, a 7-token draft is the head of the 15-draft. Needs TQLLM_TEST_MODEL + TQLLM_TEST_DRAFTER
 // (skips without them).
@@ -17,10 +17,8 @@ int main() {
     const char* draft = std::getenv("TQLLM_TEST_DRAFTER");
     if (!model || !draft) {std::printf("DFLASH_BLOCK_SKIP (TQLLM_TEST_MODEL / TQLLM_TEST_DRAFTER not set)\n"); return 0;}
     Qwen35 engine(model, 8192);
-    setenv("TQLLM_MLX_DFLASH_BLOCK", "16", 1);
-    auto wide = std::make_unique<DFlash2>(draft, engine);
-    setenv("TQLLM_MLX_DFLASH_BLOCK", "8", 1);
-    auto narrow = std::make_unique<DFlash2>(draft, engine);
+    auto wide = std::make_unique<DFlash2>(draft, engine, 16);
+    auto narrow = std::make_unique<DFlash2>(draft, engine, 8);
     int failures = 0;
     for (int length : {600, 3000}) {   // below and above the drafter's window
         std::vector<uint32_t> prompt(static_cast<size_t>(length));

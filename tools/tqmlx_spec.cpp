@@ -25,7 +25,7 @@ int main(int argc,char** argv) {
         mx::set_cache_limit(512*1024*1024);
         Qwen35 engine(argv[1],int(prompt.size())+count+16);
         engine.enable_mtp();
-        const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4") && std::string(std::getenv("TQLLM_MLX_DRAFT_HEAD4"))!="0";
+        const bool head4=true;  // served 4-bit proposal head
         if(head4)engine.enable_draft_head4();
         std::vector<uint32_t> reference,first_spec;
         for(int mode=0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {

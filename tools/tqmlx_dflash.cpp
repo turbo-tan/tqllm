@@ -40,7 +40,7 @@ int main(int argc,char** argv) {
         tqllm::mlx_backend::ScopedWiredLimit residency;
         Qwen35 engine(argv[1],int(prompt.size())+count+16);
         DFlash2 drafter(argv[2],engine);
-        const bool head4=std::getenv("TQLLM_MLX_DRAFT_HEAD4") && std::string(std::getenv("TQLLM_MLX_DRAFT_HEAD4"))!="0";
+        const bool head4=true;  // served 4-bit proposal head
         if(head4)engine.enable_draft_head4();
         // TQLLM_MLX_DRAFT_BENCH=n: after the prefill, n synchronous draft_device calls of `width` rows at the same
         // position; prints the median ms (drafter GPU + host) and exits
@@ -54,8 +54,9 @@ int main(int argc,char** argv) {
             if(!head4)engine.draft_shortlist(logits,shortlist);
             const uint32_t pending=mx::argmax(logits).item<uint32_t>();
             std::vector<double> ms;
-            // TQLLM_MLX_DRAFT_STAGES: time draft_device_at (the draft-ahead draft) per stage instead
+            // TQLLM_MLX_DRAFT_STAGES (this bench only): time draft_device_at (the draft-ahead draft) per stage instead
             const bool stage_mode=std::getenv("TQLLM_MLX_DRAFT_STAGES")!=nullptr;
+            drafter.time_stages(stage_mode);
             for(int r=-3;r<std::max(1,std::atoi(bench));++r) {
                 const auto t0=Clock::now();
                 auto d=stage_mode?drafter.draft_device_at(mx::array(pending),mx::array(engine.position(),mx::int32),width):
@@ -77,8 +78,8 @@ int main(int argc,char** argv) {
         // TQLLM_MLX_DFLASH_SPEC_ONLY=1: speculative runs only (ar_equal_prefix then compares with nothing);
         // TQLLM_MLX_DFLASH_WARM_TOKENS=n: warmup runs stop after n tokens (Metal compiles are not billed to decode)
         const bool spec_only=std::getenv("TQLLM_MLX_DFLASH_SPEC_ONLY")!=nullptr;
-        // TQLLM_MLX_DRAFT_AHEAD=1: verify(k) and draft(k+1) chained on the GPU from device values (spec_pipeline.hpp)
-        const bool draft_ahead=std::getenv("TQLLM_MLX_DRAFT_AHEAD") && std::string(std::getenv("TQLLM_MLX_DRAFT_AHEAD"))!="0";
+        // verify(k) and draft(k+1) chained on the GPU from device values (spec_pipeline.hpp), as served
+        const bool draft_ahead=true;
         const int warm_tokens=std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS")?std::max(2,std::atoi(std::getenv("TQLLM_MLX_DFLASH_WARM_TOKENS"))):count;
         tqllm::mlx_backend::WidthPolicy policy;  // width 0: the per-step verify width, its time lines kept across runs
         for(int mode=spec_only?1:0;mode<2;++mode)for(int run=-warmup;run<reps;++run) {

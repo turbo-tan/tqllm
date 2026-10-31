@@ -15,10 +15,6 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_ANE_STUB
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_ANE_TIMING
     kind: debug
     default: "-"
@@ -40,23 +36,7 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DFLASH_BLOCK
-    kind: user
-    default: "-"
-    doc: "N: drafter block rows (8, or 16 for block-16 drafts and verify)"
   - name: TQLLM_MLX_DFLASH_RANKSTATS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DRAFT_AHEAD
-    kind: user
-    default: "1"
-    doc: "Apple MLX greedy decode: verify(k) and draft(k+1) chained on the GPU (gated j892); 0 turns it off"
-  - name: TQLLM_MLX_DFLASH_COMPILE
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_DFLASH_RING
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
@@ -65,14 +45,6 @@ flags:
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
   - name: TQLLM_MLX_DFLASH_WARM_TOKENS
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_PREFILL_GROUP
-    kind: debug
-    default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_GDN_SCAN_STAGED
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
@@ -99,7 +71,7 @@ flags:
   - name: TQLLM_MLX_DRAFT_STAGES
     kind: debug
     default: "-"
-    doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
+    doc: "tqmlx-dflash draft bench only: time each stage of the draft-ahead draft (layers, head, top-16, selector)"
   - name: TQLLM_MLX_DRAFT_BENCH
     kind: debug
     default: "-"
@@ -112,10 +84,6 @@ flags:
     kind: debug
     default: "-"
     doc: "Apple MLX backend experiment or diagnostic switch; verdict and removal plan in docs/steering FLAGS-TO-PRUNE (MLX rows)"
-  - name: TQLLM_MLX_GDN_STEP
-    kind: user
-    default: "1"
-    doc: "Apple MLX decode: one GDN launch per verify step (gated j892); 0 turns it off"
   - name: TQLLM_MLX_NAX_DRAFT_SHORTLIST
     kind: debug
     default: "-"
@@ -598,10 +566,6 @@ flags:
     replaced_by: "-fitt MiB (-fit on|off)"
 
   # Private experimental Apple MLX backend; unset preserves the base path.
-  - name: TQLLM_MLX_DRAFT_HEAD4
-    kind: user
-    default: "2"
-    doc: "Apple MLX draft proposal head: 2 = 4-bit head in the matrix-unit layout (gated j892, default), 1 = row layout, 0 = off"
   - name: TQLLM_MLX_WIRED_MIB
     kind: debug
     default: "unset (retain MLX default)"

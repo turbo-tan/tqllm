@@ -338,9 +338,9 @@ GdnScan gdn_scan(const mx::array& q,const mx::array& k,const mx::array& v,
     auto initial=state?*state:mx::zeros({1,vh,128,128});
     if(initial.shape()!=mx::Shape{1,vh,128,128} || initial.dtype()!=mx::float32)
         throw std::invalid_argument("invalid GDN scan state");
-    // TQLLM_MLX_GDN_SCAN_STAGED=0: gdn_scan8 (equal output); =16/32 rows per threadgroup, default 16
-    static const int staged=[]{const char* e=std::getenv("TQLLM_MLX_GDN_SCAN_STAGED");return e?std::atoi(e):16;}();
-    if(!snapshots && !compact && m>=64)return staged==16||staged==32?gdn_scan8_staged(q,k,v,decay,beta,initial,staged):gdn_scan8(q,k,v,decay,beta,initial);
+    // long scans: 16 rows per threadgroup (j816: equal output to gdn_scan8, gdn_scan 833 -> 619 ms; tests/mlx_gdn_scan8
+    // keeps gdn_scan8 and 32 rows as references)
+    if(!snapshots && !compact && m>=64)return gdn_scan8_staged(q,k,v,decay,beta,initial,16);
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_scan",{"q","k","v","decay","beta","initial"},{"out","states","deltas"},R"METAL(
 uint lane=thread_position_in_threadgroup.x;
 uint row=thread_position_in_grid.y,head=thread_position_in_grid.z;

@@ -99,9 +99,10 @@ for(uint r=0;r<RT;++r)for(uint t=0;t<2;++t)simdgroup_store(C[r][t],out+r*8*N+(g*
     return m<rows?mx::slice(y,{0,0},{m,N}):y;
 }
 }
-DraftHead4 draft_head4(const Matrix& original) {
-    // matrix-unit layout by default (j785 tqserve mlxc geomean 67.7 vs 65.0 tok/s, draft 8.4 vs 11.6 ms); =1 the fragment head
-    static const bool nax_layout=!std::getenv("TQLLM_MLX_DRAFT_HEAD4") || std::string(std::getenv("TQLLM_MLX_DRAFT_HEAD4"))!="1";
+DraftHead4 draft_head4(const Matrix& original,bool fragment_layout) {
+    // matrix-unit layout served (j785 tqserve mlxc geomean 67.7 vs 65.0 tok/s, draft 8.4 vs 11.6 ms); fragment_layout: the
+    // 8-row simdgroup head (tests)
+    const bool nax_layout=!fragment_layout;
     if(nax_layout) {
         auto weights=mx::quantize(mx::astype(stage_bf16(original),mx::bfloat16),64,4,"affine");
         mx::eval(weights);

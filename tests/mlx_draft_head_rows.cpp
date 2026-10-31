@@ -12,13 +12,12 @@ namespace mx = mlx::core;
 using namespace tqllm::mlx_backend;
 
 int main() {
-    setenv("TQLLM_MLX_DRAFT_HEAD4", "1", 1);  // the fragment layout (the default is the matrix-unit layout)
     int failures = 0;
     auto check = [&](bool ok, const char* what) {if (!ok) {std::printf("FAIL %s\n", what); ++failures;}};
     const int n = 2048, k = 1024;
     mx::random::seed(5);
     auto weights = mx::astype(mx::multiply(mx::random::normal({n, k}), mx::array(0.05f)), mx::bfloat16);
-    auto head = draft_head4(Matrix{weights});
+    auto head = draft_head4(Matrix{weights}, true);  // the fragment layout (served: matrix-unit)
     check(head.frag_codes.has_value(), "fragment layout packed");
     auto x16 = mx::random::normal({16, k});
     auto bits_equal = [](const mx::array& a, const mx::array& b) {
