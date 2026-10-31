@@ -772,7 +772,6 @@ struct Qwen35::Impl {
             }
             if(attn_qk_fused) {stage("attn_qk_norm_rope",{f.q,f.k,f.v,f.gate});return attn_core(p,f.q,f.k,f.v,f.gate,c,offset,layer,m);}
         }
-        if(tree)throw std::invalid_argument("tree verify needs the fused q / k norm + RoPE path");
         auto proj=[&](int i,const char* name) {return in.empty()?mat(p+name,x):round_product(in[i]);};
         auto qg=mx::reshape(proj(0,"attn_q.weight"),{m,heads,2*hd});
         auto q=tail_slice(qg,2,0,hd),gate=tail_slice(qg,2,hd,2*hd);
@@ -780,7 +779,14 @@ struct Qwen35::Impl {
         auto k=mx::reshape(proj(1,"attn_k.weight"),{1,m,kvheads,hd});
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
         auto v=mx::transpose(mx::reshape(proj(2,"attn_v.weight"),{1,m,kvheads,hd}),{0,2,1,3});
-        q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
+        // tree verify: row t sits at offset + depth[t]; each row becomes its own batch element (MLX rope takes a
+        // position per batch element)
+        auto rope_rows=[&](const mx::array& t) {
+            if(!tree)return mx::fast::rope(t,rot,false,theta,1.0f,offset);
+            auto rows=mx::transpose(t,{2,1,0,3});
+            return mx::transpose(mx::fast::rope(rows,rot,false,theta,1.0f,mx::add(tree->depth,mx::array(offset,mx::int32))),{2,1,0,3});
+        };
+        q=bf(rope_rows(q));k=bf(rope_rows(k));
         stage(in.empty()?"attn_proj":"attn_qk_norm_rope",{q,k,v,gate});
         return attn_core(p,q,k,v,gate,c,offset,layer,m);
     }
