@@ -9,6 +9,7 @@
 #include "flags_gen.hpp"
 #if TQLLM_WITH_CUDA
 #include "kv_format.hpp"
+#include "plugin_format.hpp"
 #endif
 #include "kv_store.hpp"
 
@@ -263,6 +264,20 @@ int main(int argc, char ** argv) {
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
         }
+        std::string plugins_json;  // /health "plugins" (only when --plugin was given)
+#if !TQLLM_WITH_CUDA
+        if (!engine.plugins.empty()) throw std::runtime_error("--plugin (weight-format plugins) needs a CUDA build");
+#else
+        for (const auto & path : engine.plugins) {  // before the model: its matrices load with the plugin formats
+            const auto info = tqllm::load_plugin(path);
+            auto list = [](const std::vector<std::string> & v) { std::string s; for (const auto & x : v) s += (s.empty() ? "\"" : ",\"") + x + "\""; return "[" + s + "]"; };
+            plugins_json += std::string(plugins_json.empty() ? "" : ",") + "{\"path\":\"" + path + "\",\"formats\":" + list(info.formats) +
+                            ",\"patches\":" + list(info.patches) + ",\"skipped\":" + list(info.skipped) + "}";
+            for (const auto & p : info.patches) if (p.find("(not exact)") != std::string::npos) engine.inexact_patches.push_back(p.substr(0, p.find(" (not exact)")));
+            std::cerr << "tqserve: plugin " << path << ": " << info.formats.size() << " format(s), " << info.patches.size() << " patch(es)"
+                      << (info.skipped.empty() ? "" : ", " + std::to_string(info.skipped.size()) + " skipped (another GPU)") << "\n";
+        }
+#endif
         tqserve::Vision vis;
 #if !TQLLM_WITH_CUDA
         if (!mmproj.empty()) throw std::runtime_error("--mmproj (image input) needs a CUDA build");
@@ -397,7 +412,8 @@ int main(int argc, char ** argv) {
             if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
-                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"}";
+                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"" +
+                       (plugins_json.empty() ? std::string() : ",\"plugins\":[" + plugins_json + "]") + "}";
             } else if (request.path == "/admin/slots" && (request.method == "GET" || request.method == "POST")) {
                 // live parallelism: POST {"slots": k} admits at most k requests at once (1 .. --np), no reload
                 if (!scheduler) {

@@ -1,6 +1,7 @@
 #pragma once
 // Host dequantisation of GGUF block formats used by drafter checkpoints (load time only).
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace tqllm {
@@ -14,6 +15,9 @@ void scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m);
 // Q3_K: 12-byte packed scales -> 16 signed scales (6-bit value - 32).
 void q3k_scales(const uint8_t * p, int8_t * sc);
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n);
+// a plugin format's CPU reference (include/tqllm/plugin.h ABI 2), used for types no built-in reference covers
+using HostDequant = std::function<void(const void * src, float * dst, int64_t n)>;
+void register_host_dequant(uint32_t type, HostDequant f);
 // The same for a [rows][cols] matrix; layouts whose rows carry their own scales (MXFP8) need the row length.
 void dequantize_host_rows(uint32_t type, const void * src, float * dst, int64_t rows, int64_t cols);
 // TQ3 rotation of one 32-value block (model basis -> the rotated basis TQ3 formats store and decode in)

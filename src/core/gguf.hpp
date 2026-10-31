@@ -58,6 +58,8 @@ struct GgufTensor {
 // computation in the loader (tensor_bytes and the MoE expert slicer both use it) so a block
 // size can never disagree between the two.
 bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes);
+// a plugin format's block (include/tqllm/plugin.h ABI 2): elems values in bytes bytes; built-in types cannot be redefined
+void register_tensor_type(uint32_t type, uint64_t elems, uint64_t bytes);
 
 // One expert slice of a 3-D MoE expert tensor [cols, rows, n_experts].
 //

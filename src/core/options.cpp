@@ -42,6 +42,7 @@ std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext
         for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
             if (const char * s = env(v); s && std::atoi(s) != 0) out.push_back(std::string(v) + " set: an approximation");
     if (no_exact_path) out.push_back("MiniMax / GLM have no exact path yet: they run their approximate path");
+    for (const auto & p : o.inexact_patches) out.push_back("--plugin patch " + p + ": not byte-identical to the built-in kernel");
     return out;
 }
 void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err) {
@@ -118,6 +119,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--tp-rank") o.tp_rank = std::stoi(value()), o.tp_world = 2;
     else if (a == "--tp-peer") o.tp_peer = value();
     else if (a == "--tp-port") o.tp_port = std::stoi(value());
+    else if (a == "--plugin") o.plugins.push_back(value());
     else if (a == "--hot-map") o.hot_map = value();
     else if (a == "--draft-vocab") o.draft_vocab = value();
     else if (a == "--mtp") o.native_mtp = true;
@@ -151,6 +153,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 
 const char * engine_options_usage() {
     return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+           "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"

@@ -74,6 +74,13 @@ void register_weight_format(uint32_t gguf_type, std::unique_ptr<WeightFormat> f)
         throw std::runtime_error("weight format id " + std::to_string(gguf_type) + " registered twice");
 }
 
+void patch_weight_format(uint32_t gguf_type, const std::function<std::unique_ptr<WeightFormat>(std::unique_ptr<WeightFormat>)> & wrap) {
+    builtins();
+    const auto it = table().find(gguf_type);
+    if (it == table().end()) throw std::runtime_error("weight format id " + std::to_string(gguf_type) + " is not registered: nothing to patch");
+    it->second = wrap(std::move(it->second));
+}
+
 const WeightFormat * weight_format(uint32_t gguf_type) {
     builtins();
     const auto it = table().find(gguf_type);

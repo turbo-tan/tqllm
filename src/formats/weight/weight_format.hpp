@@ -98,6 +98,9 @@ struct WeightFormat {
 // e.g. Q4_0 loads as W4S when every 128-group shares one scale.
 const WeightFormat * weight_format(uint32_t gguf_type);
 void register_weight_format(uint32_t gguf_type, std::unique_ptr<WeightFormat>);
+// Replaces format `gguf_type` with wrap(old): the wrapper keeps the old format and forwards what it does not replace (plugin
+// patches, plugin_format.hpp). Call before any model loads: matrices loaded earlier keep the old format.
+void patch_weight_format(uint32_t gguf_type, const std::function<std::unique_ptr<WeightFormat>(std::unique_ptr<WeightFormat>)> & wrap);
 
 // Row-concatenation of matrices of different formats (a fused group such as gate + up quantized to different types):
 // null unless every part has a format with matvec_ld, all share cols and basis. The returned format owns the parts'

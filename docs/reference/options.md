@@ -44,6 +44,7 @@ Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v
 | `--moe-host-mb M\|auto` `--moe-profile FILE` | off | keep the least-routed MoE experts (by FILE's routing counts) in host memory, M MiB of them |
 | `--moe-cache-mb C\|auto` | auto | VRAM cache of recently used host experts |
 | `--hot-map FILE` | none | MiniMax: routing counts; the busiest experts are preloaded, the rest stay on disk |
+| `--plugin PATH` | none | load a weight-format plugin (repeatable, CUDA builds): new GGUF types or kernel patches; each must pass the format contract at load ([plugins](../guides/plugins.md)) |
 | `--tp-rank R --tp-peer IP [--tp-port P]` | single box, port 29600 | MiniMax over two linked boxes (rank 0 serves; rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
 | `--yarn-orig-ctx N` `--yarn-ext-factor F` `--yarn-attn-factor F` `--yarn-beta-fast F` `--yarn-beta-slow F` | model metadata | YaRN context extension, llama.cpp meanings (with `--rope-scaling yarn`) |
 | Flash-Next prefill: `--prefill-chunk N` `--prefill-sub N` `--prefill-stage N` | 16384, 2048, 192 | rows per prefill chunk, per sub-batch, and per expert stage |

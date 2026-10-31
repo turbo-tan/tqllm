@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -378,6 +379,10 @@ void tq3_rotate_block(float * v) {
     for (int i = 0; i < 32; ++i) v[i] *= 1.0f / std::sqrt(32.0f);
 }
 
+namespace {
+std::map<uint32_t, HostDequant> & host_dequants() { static std::map<uint32_t, HostDequant> m; return m; }
+}  // namespace
+
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
     const auto * s = static_cast<const uint8_t *>(src);
     switch (type) {
@@ -500,8 +505,11 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             for (int64_t b = 0; b < n / 256; ++b) q6k(s + b * 210, dst + b * 256);
             return;
     }
+    if (const auto it = host_dequants().find(type); it != host_dequants().end()) { it->second(src, dst, n); return; }
     throw std::runtime_error("dequantize_host: unsupported type " + std::to_string(type));
 }
+
+void register_host_dequant(uint32_t type, HostDequant f) { host_dequants()[type] = std::move(f); }
 
 } // namespace tqllm
 

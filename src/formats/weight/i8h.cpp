@@ -74,10 +74,9 @@ struct I8h final : WeightFormat {
                                   s);
     }
 };
-// Q8_0 (GGUF 8) loader: int8 + FP16 scale per 32 -> I8H (scale repeated per 16), exact.
+// Q8_0 (GGUF 8) loader: int8 + FP16 scale per 32 -> I8H (scale repeated per 16), exact. The run-time format is looked up
+// at load, so a plugin patch of I8H (patch_weight_format) applies.
 struct Q8_0 final : WeightFormat {
-    const WeightFormat * i8h;
-    explicit Q8_0(const WeightFormat * f) : i8h(f) {}
     const char * name() const override { return "Q8_0"; }
     Basis basis() const override { return Basis::Plain; }
     Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
@@ -94,7 +93,7 @@ struct Q8_0 final : WeightFormat {
         const void * p = up(q.data(), q.size());
         const void * a = up(sc.data(), sc.size() * sizeof(__half));
         if (cols % 64 == 0) tqllm_cuda::u4h_family_tune(15, static_cast<const uint8_t *>(p), a, rows, cols, s);
-        return {p, 1000, rows, cols, a, i8h};
+        return {p, 1000, rows, cols, a, weight_format(1000)};
     }
     void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
         throw std::runtime_error("Q8_0 is a loader; matrices run as I8H");
@@ -105,9 +104,7 @@ struct Q8_0 final : WeightFormat {
 };
 }  // namespace
 void register_i8h() {  // no weight_format() lookups here (runs inside the registry's call_once)
-    auto i8h = std::make_unique<I8h>();
-    auto q80 = std::make_unique<Q8_0>(i8h.get());
-    register_weight_format(1000, std::move(i8h));
-    register_weight_format(8, std::move(q80));
+    register_weight_format(1000, std::make_unique<I8h>());
+    register_weight_format(8, std::make_unique<Q8_0>());
 }
 }  // namespace tqllm::formats
