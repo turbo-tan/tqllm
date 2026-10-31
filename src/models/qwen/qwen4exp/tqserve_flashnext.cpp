@@ -1,4 +1,5 @@
 // Flash-Next behind the tqllm Engine interface (tqserve), registered as the .tqfn model type.
+#include "registry.hpp"
 #include "fn_engine.hpp"
 
 namespace {
@@ -16,5 +17,8 @@ std::unique_ptr<tqllm::Engine> make_flashnext(const std::string & manifest, cons
     else if (!o.prefill_borrow.empty() && o.prefill_borrow != "auto") { g_tune.borrow = tqllm::BorrowMode::Count; g_tune.borrow_count = std::atoi(o.prefill_borrow.c_str()); }
     return std::make_unique<FlashNextEngine>(manifest, context, slots);
 }
-const bool registered_flashnext = (tqllm::register_flashnext_engine(&make_flashnext), true);
+// a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects Flash-Next; this object file is linked
+// into tqserve directly (not through the static library), so its registration runs
+const bool registered_flashnext = (tqllm::register_engine({"flashnext", [](const std::filesystem::path & p) { return p.extension() == ".tqfn"; },
+                                                           &make_flashnext}), true);
 }  // namespace

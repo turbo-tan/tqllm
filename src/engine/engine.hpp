@@ -12,15 +12,18 @@ namespace tqllm {
 
 struct Engine {
     virtual ~Engine() = default;
+    std::string note;  // what the load chose instead of the defaults or the asked mode (empty: none); Model::fit_note, /health
+    // step / verify / commit / logits: the token-by-token path. Speculative-only engines (Metal) decode through
+    // spec_begin / spec_advance and keep these defaults.
     // One token at `pos`. With `sample`, runs the LM head and returns the greedy next token (one host sync);
     // otherwise returns 0 without syncing. `capture` (validation only) receives the last-token hidden state after
     // every layer, [layers][hidden], the last entry after the final norm.
-    virtual uint32_t step(uint32_t token, uint32_t pos, bool sample, float * capture) = 0;
+    virtual uint32_t step(uint32_t, uint32_t, bool, float *) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
     // Speculative verify: runs `n` tokens (n <= 8) at positions pos, pos+1, ... in one pass and writes, for each, the
     // greedy next token to `next` (host). KV is written for all n; the recurrent state after each token is kept.
     // commit(k) then keeps the state after the first k tokens (1 <= k <= n); rejected KV entries are overwritten later.
-    virtual void verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) = 0;
-    virtual void commit(int k) = 0;
+    virtual void verify(const uint32_t *, int, uint32_t, uint32_t *) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
+    virtual void commit(int) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
     // Greedy generation with MTP self-speculation (D draft tokens per step, D <= 7). Output equals the greedy decode
     // of the verify path. stats (optional): [0] = steps, [1] = drafted, [2] = accepted drafts, [3] = decode microseconds.
     virtual std::vector<uint32_t> generate_spec(const std::vector<uint32_t> &, uint32_t, int, uint64_t *) {
@@ -71,7 +74,7 @@ struct Engine {
     virtual int drafter_features(const std::vector<uint32_t> &, std::vector<uint16_t> &) { return 0; }
     // Chunked prefill of tokens at positions [pos, pos + n) with no LM head (KV and recurrent state only); false: unsupported.
     virtual bool prefill_state(const std::vector<uint32_t> &, uint32_t) { return false; }
-    virtual const float * logits() const = 0;  // device, [vocab] FP32, valid after a sampling step
+    virtual const float * logits() const { return nullptr; }  // device, [vocab] FP32, valid after a sampling step
     virtual const float * verify_logits() const { return nullptr; }  // device, [n][vocab] FP32 of the last verify
     virtual void set_full_logits(bool) {}  // verify computes every logit (int8 head) instead of the two-stage top-16
     virtual void synchronize() = 0;
@@ -90,11 +93,6 @@ struct Engine {
 
 // Qwen3.5 dense hybrid (Gated DeltaNet + gated attention), BF16 weights read from safetensors in `dir`.
 // `slots` sequences share the weights; each gets `context` positions.
-// Flash-Next (qwen4exp) engine: compiled into tqserve with src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which registers it;
-// a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects it.
-using FlashNextFactory = std::unique_ptr<Engine> (*)(const std::string & manifest, const std::string & tokenizer, uint32_t context,
-                                                     int slots, const EngineOptions & options);
-void register_flashnext_engine(FlashNextFactory factory);
 // GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next.cpp; split GGUFs open from any shard
 bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
