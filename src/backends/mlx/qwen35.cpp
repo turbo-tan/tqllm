@@ -789,7 +789,7 @@ struct Qwen35::Impl {
         stage(in.empty()?"attn_proj":"attn_qk_norm_rope",{q,k,v,gate});
         return attn_core(p,q,k,v,gate,c,offset,layer,m);
     }
-    // attn_core for int8 / trellis KV (kv_tier.hpp): one stored format; decode / verify rows read it in place (v12 /
+    // attn_core for int8 / trellis KV (kv_tier.hpp): one stored format; decode / verify rows read it in place (int8 /
     // trellis kernels), a prefill chunk decodes this layer's prefix to FP16 for the fused SDPA
     mx::array attn_core_compressed(const std::string& p,const mx::array& q,const mx::array& k_in,const mx::array& v_in,
                                    const mx::array& gate,Cache& c,int layer,int m) {
@@ -840,9 +840,10 @@ struct Qwen35::Impl {
         const float scale=1.0f/std::sqrt(float(hd));
         mx::array out=mx::array(0.0f);
         if(m<=16) {
-            // int8: v18 (int8 Q x K) for every row count, so a verify row equals the AR step's call bit for bit
-            out=int8?decode_rows_attention_v18(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
-                     decode_rows_attention_tcq(q,*kb,*vb,scale,need);
+            // int8 KV: decode_attention_int8 (int8 Q x K) for every row count, so a verify row equals the AR step's
+            // call bit for bit
+            out=int8?decode_attention_int8(mx::astype(q,mx::float32),*kb,*vb,*ks,*vs,scale,need):
+                     decode_attention_trellis(q,*kb,*vb,scale,need);
         } else {
             mx::array keys=mx::array(0.0f),values=mx::array(0.0f);
             if(int8) {

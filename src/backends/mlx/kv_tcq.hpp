@@ -1,10 +1,11 @@
 #pragma once
 // Trellis KV cache on Metal (format: tcq_codec.hpp, the CUDA lane's tcq3 K / tcq2 V): the row encoder (Viterbi, one
-// threadgroup per (row, kv head, 128-value group), one thread per trellis state) and decode-rows attention that reads the
-// codes directly (the v12 structure: 16-row tiles, two simdgroups per tile = the two 128-value groups, so each half of S
-// takes its group's norm; values decoded per fragment from the 9 (K) / 8 (V) bit state window). Queries are rotated into
-// the trellis basis before the kernel and the output rotated back after it (K and V are stored rotated). A row's
-// arithmetic depends only on its own query and visible keys: the n-row verify equals n single-row calls bit for bit.
+// threadgroup per (row, kv head, 128-value group), one thread per trellis state) and decode-rows attention that reads
+// the codes directly (the int8_reference structure: 16-row tiles, two simdgroups per tile = the two 128-value groups,
+// so each half of S takes its group's norm; values decoded per fragment from the 9 (K) / 8 (V) bit state window).
+// Queries are rotated into the trellis basis before the kernel and the output rotated back after it (K and V are stored
+// rotated). A row's arithmetic depends only on its own query and visible keys: the n-row verify equals n single-row
+// calls bit for bit.
 #include "attention_decode.hpp"
 #include "tcq_codec.hpp"
 #include <mlx/mlx.h>
@@ -155,7 +156,7 @@ inline mlx::core::array tcq_decode(const mlx::core::array& codes, int kb, int ro
 // q [1, heads, n <= 16, 256] FP32 (original basis); kc [kvh, cap, 26], vc [kvh, cap, 18] uint32; keys [0, length): the
 // last row sees `length` keys, row t of n sees length - n + 1 + t. Returns [1, heads, n, 256] FP32 (BF16-rounded).
 // diag (bench only): 1 skips the K decode, 2 the V decode, 4 the query / output rotations
-inline mlx::core::array decode_rows_attention_tcq(const mlx::core::array& q, const mlx::core::array& kc, const mlx::core::array& vc,
+inline mlx::core::array decode_attention_trellis(const mlx::core::array& q, const mlx::core::array& kc, const mlx::core::array& vc,
                                                   float scale, int length, int diag = 0) {
     namespace mx = mlx::core;
     constexpr int kBlock = 1024, kDim = 256;
@@ -184,7 +185,7 @@ inline mlx::core::array decode_rows_attention_tcq(const mlx::core::array& q, con
         table("TCQ_CBK", tcq::kCodebookK, 512); table("TCQ_CBV", tcq::kCodebookV, 256);
         return h;
     }();
-    static auto pass1 = mx::fast::metal_kernel("tqllm_attn_tcq_pass1", {"Q", "KC", "VC", "CBK", "CBV", "P"}, {"M", "S", "O"}, R"METAL(
+    static auto pass1 = mx::fast::metal_kernel("tqllm_attn_trellis_pass1", {"Q", "KC", "VC", "CBK", "CBV", "P"}, {"M", "S", "O"}, R"METAL(
     constexpr int C = 32, RP = TILES * 16, HD = DIM / 2, CQ = C / 4, KW = 26, VW = 18;
     const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint tid = sg * 32 + lane;
@@ -351,7 +352,7 @@ inline mlx::core::array decode_rows_attention_tcq(const mlx::core::array& q, con
     }
     if (row < ROWS && quarter == 0) {const size_t base = (size_t(kh) * ROWS + row) * NB + blk; M[base] = m; S[base] = s;}
 )METAL", header);
-    static auto pass2 = mx::fast::metal_kernel("tqllm_attn_tcq_pass2", {"M", "S", "O", "P"}, {"Y"}, R"METAL(
+    static auto pass2 = mx::fast::metal_kernel("tqllm_attn_trellis_pass2", {"M", "S", "O", "P"}, {"Y"}, R"METAL(
     const uint lane = thread_index_in_simdgroup;
     const uint r = threadgroup_position_in_grid.x, kh = threadgroup_position_in_grid.y;
     const int ROWS = P[3], NB = P[5];
@@ -395,8 +396,8 @@ inline void warm_compressed_kv_kernels(int heads, int kvheads) {
     for (int n = 1; n <= 16; ++n) {
         if (n > 1 && (group * (n - 1) + 15) / 16 == (group * n + 15) / 16) continue;   // one compile per tile count
         auto q = mx::random::normal({1, heads, n, 256}, mx::float32);
-        out.push_back(decode_rows_attention_tcq(q, kc, vc, 0.0625f, rows));
-        out.push_back(decode_rows_attention_v12(q, kv.k8t, kv.v8, kv.kscale, kv.vscale, 0.0625f, rows));
+        out.push_back(decode_attention_trellis(q, kc, vc, 0.0625f, rows));
+        out.push_back(decode_attention_int8_reference(q, kv.k8t, kv.v8, kv.kscale, kv.vscale, 0.0625f, rows));
     }
     mx::eval(out);
 }

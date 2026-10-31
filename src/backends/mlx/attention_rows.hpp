@@ -46,7 +46,7 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const m
     const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2);
     if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
-    if (n <= 16) return decode_rows_attention(q, k, v, scale, length);
+    if (n <= 16) return decode_attention_bf16(q, k, v, scale, length);
     auto keys = mx::astype(mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}), mx::float16);
     auto values = mx::astype(mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}), mx::float16);
     auto out = prefill_attention_rows(mx::astype(q, mx::float16), keys, values, scale);

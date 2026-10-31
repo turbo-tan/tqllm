@@ -1,7 +1,7 @@
 // Trellis KV on Metal (kv_tcq.hpp): (1) the GPU encoder's records decode (host reference) to the same error as the host
 // encoder's, and most records are bit-identical; (2) attention over the codes equals SDPA over the host-decoded K / V
 // (original basis) within FP16-operand error, causal per row; (3) the n-row call equals n single-row calls bit for bit;
-// (4) timing vs the BF16 decode-rows path (v11) at 8K / 32K / 64K.
+// (4) timing vs the BF16 decode-rows path (bf16_segmented) at 8K / 32K / 64K.
 #include "attention_decode.hpp"
 #include "kv_tcq.hpp"
 #include <mlx/mlx.h>
@@ -62,7 +62,7 @@ int main() {
         auto kd = host_decode(kcodes, 3), vd = host_decode(vcodes, 2);
         for (int nq : {1, 8, 16}) {
             auto q = mx::random::normal({1, heads, nq, dim}, mx::float32);
-            auto got = decode_rows_attention_tcq(q, kcodes, vcodes, scale, length); mx::eval(got);
+            auto got = decode_attention_trellis(q, kcodes, vcodes, scale, length); mx::eval(got);
             double err = 0, ref = 0; bool rows_exact = true;
             for (int t = 0; t < nq; ++t) {
                 const int seen = length - nq + 1 + t;
@@ -71,7 +71,7 @@ int main() {
                 auto mine = mx::slice(got, {0, 0, t, 0}, {1, heads, t + 1, dim});
                 err += mx::sum(mx::square(mx::subtract(mine, want))).item<float>(); ref += mx::sum(mx::square(want)).item<float>();
                 if (nq > 1) {
-                    auto single = decode_rows_attention_tcq(qt, kcodes, vcodes, scale, seen);
+                    auto single = decode_attention_trellis(qt, kcodes, vcodes, scale, seen);
                     rows_exact &= mx::array_equal(single, mine).item<bool>();
                 }
             }
@@ -96,15 +96,15 @@ int main() {
                 const auto t0 = std::chrono::steady_clock::now(); std::vector<mx::array> o; for (int r = 0; r < 16; ++r) o.push_back(fn()); mx::eval(o);
                 return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 16;
             };
-            const double tt = bench([&] {return decode_rows_attention_tcq(q, kcodes, vcodes, scale, length);});
+            const double tt = bench([&] {return decode_attention_trellis(q, kcodes, vcodes, scale, length);});
             if (nq == 8) {
                 double td[4];
-                for (int dg : {1, 2, 3, 4}) td[dg - 1] = bench([&] {return decode_rows_attention_tcq(q, kcodes, vcodes, scale, length, dg);});
+                for (int dg : {1, 2, 3, 4}) td[dg - 1] = bench([&] {return decode_attention_trellis(q, kcodes, vcodes, scale, length, dg);});
                 std::printf("KV_TCQ_DIAG length=%d n=8 full %.1f | no K decode %.1f | no V decode %.1f | no decode %.1f | no rotations %.1f us\n",
                             length, tt, td[0], td[1], td[2], td[3]);
             }
-            const double tb = bench([&] {return decode_rows_attention(q, kb, vb, scale, length);});
-            std::printf("KV_TCQ_BENCH length=%d n=%d tcq %.1f us  bf16 v11 %.1f us  (KV bytes %.0f vs %.0f MB per layer)\n", length, nq, tt, tb,
+            const double tb = bench([&] {return decode_attention_bf16(q, kb, vb, scale, length);});
+            std::printf("KV_TCQ_BENCH length=%d n=%d tcq %.1f us  bf16 bf16_segmented %.1f us  (KV bytes %.0f vs %.0f MB per layer)\n", length, nq, tt, tb,
                         double(length) * kvh * 176 / 1e6, double(length) * kvh * 1024 / 1e6);
         }
     }
