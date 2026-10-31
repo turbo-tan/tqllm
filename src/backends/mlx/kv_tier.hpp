@@ -55,7 +55,10 @@ inline KvTier choose_kv_tier(int64_t rows, int attn_layers, int kvheads, int hea
 inline KvTier speed_kv_tier(int64_t rows) {return rows >= 32768 ? KvTier::Int8 : KvTier::Bf16;}
 // a request's first format follows its prompt plus at most 1K answer rows: max_tokens is a cap (server default 16384),
 // counting all of it would send every 16K+ chat that omits it to int8
-inline KvTier request_kv_first(int64_t prompt_rows, int64_t answer_rows) {return speed_kv_tier(prompt_rows + std::min<int64_t>(answer_rows, 1024));}
+// exact mode (--mode exact): BF16 first at every length; memory still decides below it
+inline KvTier request_kv_first(int64_t prompt_rows, int64_t answer_rows, bool exact = false) {
+    return exact ? KvTier::Bf16 : speed_kv_tier(prompt_rows + std::min<int64_t>(answer_rows, 1024));
+}
 // the drafter's far-context caches (far_row_bytes per row) are worth less than the KV format they would cost: when they
 // would push the request from BF16 / int8 down to trellis, the request runs without them (j1158 248K: trellis with them
 // 13.7 tok/s, j1154 int8 without them 21.0)

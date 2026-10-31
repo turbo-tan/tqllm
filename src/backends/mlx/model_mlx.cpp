@@ -91,12 +91,13 @@ Model::Model(const std::string& weights, const std::string& tokenizer, uint32_t 
     i.engine = std::make_unique<Qwen35>(weights, int(context));
     i.drafter = std::make_unique<DFlash2>(options.draft_model, *i.engine);
     if (i.head4) i.engine->enable_draft_head4();
+    i.engine->set_exact(options.mode == "exact");
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
-    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block %s, %s head\n", options.draft_model.c_str(),
-                 std::getenv("TQLLM_MLX_DFLASH_BLOCK"), i.head4 ? "4-bit proposal" : "shortlist");
+    std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block %s, %s head, mode %s\n", options.draft_model.c_str(),
+                 std::getenv("TQLLM_MLX_DFLASH_BLOCK"), i.head4 ? "4-bit proposal" : "shortlist", options.mode.c_str());
 }
 Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;

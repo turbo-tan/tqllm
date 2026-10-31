@@ -1400,7 +1400,7 @@ KvTier Qwen35::choose_kv_format(int rows,int prefill_chunk,size_t other_row_byte
 KvPlan Qwen35::plan_kv_format(int prompt_rows,int answer_rows,int prefill_chunk,size_t far_row_bytes) const {
     const int rows=prompt_rows+answer_rows+16;
     const size_t lean=(size_t(512)<<20)+size_t(prefill_chunk)*size_t(impl_->hidden)*40;  // the decode-time cache limit
-    return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes,lean,request_kv_first(prompt_rows,answer_rows));
+    return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes,lean,request_kv_first(prompt_rows,answer_rows,exact_));
 }
 int Qwen35::attention_layers() const {return impl_->layers/impl_->interval;}
 int Qwen35::kv_heads() const {return impl_->kvheads;}
