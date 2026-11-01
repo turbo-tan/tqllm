@@ -56,6 +56,8 @@ public:
     mlx::core::array embed_device(const mlx::core::array& ids) const;
     // forward / verify submit their graph and return without waiting (draft-ahead chains the next draft behind it)
     void defer_eval(bool enabled);
+    // ms a deferred forward's submission (verify_tree_device) blocked on the GPU
+    double defer_submit_ms() const;
     mlx::core::array shared_draft_head(const mlx::core::array& normalized) const;
     void enable_draft_head4();
     Qwen35(const std::string& path, int context);

@@ -359,6 +359,7 @@ struct Qwen35::Impl {
     bool build_split=false;
     std::map<std::string,double> build_stage;
     std::chrono::steady_clock::time_point build_tick;
+    double deferred_submit_ms=0;  // the deferred forward's trailing submission: how much of the verify it blocked on
     void build_mark(const char* name) {
         if(!build_split)return;
         auto now=std::chrono::steady_clock::now();
@@ -1135,7 +1136,11 @@ struct Qwen35::Impl {
         live.push_back(logits);
         if(dispatches)dispatches->take(live,"head+rest");
         build_mark("head");
-        if(defer_eval && !dispatches)mx::async_eval(live);else mx::eval(live);
+        if(defer_eval && !dispatches) {
+            const auto tick=std::chrono::steady_clock::now();
+            mx::async_eval(live);
+            deferred_submit_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
+        } else mx::eval(live);
         if(build_split) {
             double total=0;std::string line;
             for(const auto& [name,ms]:build_stage) {char part[64];std::snprintf(part,sizeof part," %s %.2f",name.c_str(),ms);line+=part;total+=ms;}
@@ -1332,6 +1337,7 @@ mx::array Qwen35::embed_device(const mx::array& ids) const {
     return bf(i.embedding8?affine8_embedding(*i.embedding8,ids):q4_embedding(*i.embedding,ids));
 }
 void Qwen35::defer_eval(bool enabled) {impl_->defer_eval=enabled;}
+double Qwen35::defer_submit_ms() const {return impl_->deferred_submit_ms;}
 mx::array Qwen35::shared_draft_head(const mx::array& x) const {
     if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
         throw std::invalid_argument("invalid shared draft-head input");

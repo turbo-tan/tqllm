@@ -123,7 +123,11 @@ public:
         std::vector<int32_t> path;       // the accepted path's rows (row 0 first)
         std::vector<uint32_t> choices;   // the target's argmax per verified row
         int accepted = 0;                // drafted tokens kept (path rows below the anchor)
-        double build_ms = 0, submit_ms = 0, wait_ms = 0, post_ms = 0;  // as DraftAhead::Step
+        // host phases of this step (ms): graph build of verify(k), submit (encode of verify + next draft), wait for
+        // verify(k), post (readback, accept, settle). GPU idle shows as build + submit beyond the previous draft's run
+        double build_ms = 0, submit_ms = 0, wait_ms = 0, post_ms = 0;
+        double inject_ms = 0, encode_ms = 0;  // inside submit: the inject, then the next tree's encode
+        double vsubmit_ms = 0;                // inside build: the verify's submission, i.e. what the GPU had left
     };
     Step step() {
         namespace mx = mlx::core;
@@ -139,6 +143,7 @@ public:
         try {verified = engine_.verify_tree_device(tree.ids, tree.parents, tree.depth, tree.visible, ticket);}
         catch (...) {engine_.defer_eval(false); throw;}
         engine_.defer_eval(false);
+        const double vsubmit_ms = engine_.defer_submit_ms();
         auto choices = mx::astype(mx::argmax(verified, -1), mx::uint32);
         auto walk = tree_path(tree, choices);
         auto rows = mx::add(walk.accepted, mx::array(1, mx::int32));
@@ -147,6 +152,7 @@ public:
         mx::async_eval({choices, walk.accepted, walk.rows, walk.next_anchor, rows, tree.ids, tree.parents});
         // the drafter takes the path's feature rows (the path's rows first, `rows` of them)
         drafter_.inject_device(mx::take(engine_.feature_states(), walk.rows, 0), rows, *position_);
+        const auto t_inject = Clock::now();
         auto next_position = mx::add(*position_, rows);
         auto next = draft(walk.next_anchor, next_position, chain_at(pos + 1, pos + tree.rows));
         const auto t2 = Clock::now();
@@ -173,6 +179,7 @@ public:
         drafter_.settle_device_inject(out.accepted + 1);
         anchor_ = walk.next_anchor; position_ = next_position; tree_ = next;
         out.build_ms = ms(t0, t1); out.submit_ms = ms(t1, t2); out.wait_ms = ms(t2, t3); out.post_ms = ms(t3, Clock::now());
+        out.inject_ms = ms(t1, t_inject); out.encode_ms = ms(t_inject, t2); out.vsubmit_ms = vsubmit_ms;
         return out;
     }
 private:

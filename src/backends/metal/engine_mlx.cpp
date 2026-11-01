@@ -96,6 +96,8 @@ struct MlxQwen35Engine::Impl {
     // host phases summed over the request's draft-ahead steps (ms); gap = host time between one spec_advance's end
     // and the next one's start (the server loop: publish, repeat guard, scheduling)
     double h_build = 0, h_submit = 0, h_wait = 0, h_post = 0, h_gap = 0;
+    double h_inject = 0, h_encode = 0;  // inside h_submit: the drafter's inject, then the next tree's encode
+    double h_vsubmit = 0;               // inside h_build: what the verify's submission blocked on
     std::optional<Clock::time_point> last_advance_end;
     std::vector<double> first_steps; double first_gap_ms = 0;  // first 4 step walls of a request + prefill end -> first step
     std::array<double, 4> first_phases{};  // the first step's host phases: build / submit / wait / post
@@ -165,7 +167,7 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     if (prompt.size() + count + 16 > i.context_) throw std::invalid_argument("prompt and answer exceed the context");
     i.output.clear(); i.count = count; i.steps = i.drafted = i.accepted = 0; i.decode_us = 0; i.widths.begin(int(prompt.size())); i.drafter->native_block(i.widths.native());
-    i.h_build = i.h_submit = i.h_wait = i.h_post = i.h_gap = 0; i.last_advance_end.reset();
+    i.h_build = i.h_submit = i.h_wait = i.h_post = i.h_gap = 0; i.h_inject = i.h_encode = i.h_vsubmit = 0; i.last_advance_end.reset();
     i.sampling = i.temperature > 0.f;
     const auto t0 = Clock::now();
     i.engine->reset(); i.drafter->reset();
@@ -347,6 +349,7 @@ bool MlxQwen35Engine::tree_step(int, uint32_t limit) {
     if (!i.tree_ahead) {i.done = true; return false;}
     const auto st = i.tree_ahead->step();
     i.h_build += st.build_ms; i.h_submit += st.submit_ms; i.h_wait += st.wait_ms; i.h_post += st.post_ms;
+    i.h_inject += st.inject_ms; i.h_encode += st.encode_ms; i.h_vsubmit += st.vsubmit_ms;
     if (i.steps == 0) i.first_phases = {st.build_ms, st.submit_ms, st.wait_ms, st.post_ms};
     ++i.steps; i.drafted += uint64_t(st.ids.size() - 1); i.accepted += uint64_t(st.accepted);
     for (int j = 1; j <= st.accepted && i.output.size() < limit; ++j) {
@@ -381,9 +384,9 @@ std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
     }
     if (i.steps > 1) {
         const double n = double(i.steps);
-        std::fprintf(stderr, "tqserve: host ms per step: build %.2f submit %.2f wait %.2f post %.2f gap %.2f (wall %.2f, %llu steps)\n",
-                     i.h_build / n, i.h_submit / n, i.h_wait / n, i.h_post / n, i.h_gap / n, i.decode_us / 1000.0 / n,
-                     static_cast<unsigned long long>(i.steps));
+        std::fprintf(stderr, "tqserve: host ms per step: build %.2f (vsub %.2f) submit %.2f (inject %.2f encode %.2f) wait %.2f post %.2f gap %.2f (wall %.2f, %llu steps)\n",
+                     i.h_build / n, i.h_vsubmit / n, i.h_submit / n, i.h_inject / n, i.h_encode / n, i.h_wait / n, i.h_post / n,
+                     i.h_gap / n, i.decode_us / 1000.0 / n, static_cast<unsigned long long>(i.steps));
     }
     i.active = false; i.ahead.reset(); i.tree_ahead.reset();
     return i.output;  // EOS stays: finish() turns it into finish_reason "stop"
