@@ -63,8 +63,10 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const m
         }
         auto lo = decode_attention_bf16(mx::slice(q, {0, 0, 0, 0}, {1, heads, 16, dim}), k, v, scale, length - upper,
                                         lo_rows ? &*lo_rows : nullptr, tree_parents);
+        // the hi half sees every key of the block, so its prefix and its rows' block indices come from the block, not
+        // from its own 16 rows
         auto hi = decode_attention_bf16(mx::slice(q, {0, 0, 16, 0}, {1, heads, n, dim}), k, v, scale, length,
-                                        hi_rows ? &*hi_rows : nullptr, tree_parents);
+                                        hi_rows ? &*hi_rows : nullptr, tree_parents, n, 16);
         return mx::concatenate({lo, hi}, 2);
     }
     if (tree) throw std::invalid_argument("tree attention takes at most 32 verify rows");

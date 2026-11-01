@@ -141,7 +141,8 @@ inline std::vector<TreeBranch> tree_side_branches(const std::vector<int32_t>& pa
 inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& q, const mlx::core::array& k,
                                                   const mlx::core::array& v, float scale, int valid = -1,
                                                   int seg = kAttentionSegment, const mlx::core::array* tree = nullptr,
-                                                  const std::vector<int32_t>* tree_parents = nullptr) {
+                                                  const std::vector<int32_t>* tree_parents = nullptr,
+                                                  int block_rows = 0, int block_offset = 0) {
     namespace mx = mlx::core;
     check_decode_rows_shape(q, k, v, valid);
     if (k.dtype() != mx::bfloat16) throw std::invalid_argument("decode attention bf16_segmented reads a BF16 KV cache");
@@ -181,9 +182,12 @@ inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& 
     // segment boundary from this call, and their tail segments from a call on the prefix tail followed by their branch's
     // path keys; the merge folds each row's visible segments in key order, as for AR.
     const auto branches = tree && tree_parents ? tree_side_branches(*tree_parents) : std::vector<TreeBranch>{};
-    const int prefix = length - n, shared = prefix / seg * seg;
+    // a 17-32 row verify's halves: `length` counts every key of the block, and the hi half's rows are block rows 16.. of
+    // a 32-row block, so neither the prefix nor a row's block index follows from this call's own row count
+    const int block = block_rows > 0 ? block_rows : n;
+    const int prefix = length - block, shared = prefix / seg * seg;
     std::vector<int32_t> row_of_slot(size_t(group * rows), -1);  // folded row -> block row (-1: front padding)
-    for (int r = 0; r < group * rows; ++r) {const int t = r % rows - (rows - n); row_of_slot[size_t(r)] = t;}
+    for (int r = 0; r < group * rows; ++r) {const int t = r % rows - (rows - n) + block_offset; row_of_slot[size_t(r)] = t;}
     if (!branches.empty()) {
         std::vector<int32_t> limit(size_t(group * rows), segments * seg);
         for (const auto& b : branches)
@@ -788,7 +792,8 @@ inline Int8Rows quantize_rows_int8(const mlx::core::array& k, const mlx::core::a
 inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int valid,
                                               const mlx::core::array* tree = nullptr,
-                                              const std::vector<int32_t>* tree_parents = nullptr) {
+                                              const std::vector<int32_t>* tree_parents = nullptr,
+                                              int block_rows = 0, int block_offset = 0) {
     if (k.dtype() != mlx::core::bfloat16) throw std::invalid_argument("decode rows attention reads a BF16 KV cache");
 #ifdef MLX_HAS_SDPA_LSE
     if (segmented_attention_available(q.shape(3))) {
@@ -798,7 +803,7 @@ inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const m
         const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), length = valid > 0 ? valid : k.shape(2);
         constexpr int seg = kAttentionSegment;
         if (length <= seg) return decode_attention_bf16_folded(q, k, v, scale, length, tree);
-        if (tree) return decode_attention_bf16_segmented(q, k, v, scale, length, seg, tree, tree_parents);
+        if (tree) return decode_attention_bf16_segmented(q, k, v, scale, length, seg, tree, tree_parents, block_rows, block_offset);
         if (length - n + 1 <= seg) {
             const int below = seg - (length - n);
             auto lo = decode_attention_bf16_folded(mx::slice(q, {0, 0, 0, 0}, {1, heads, below, dim}), k, v, scale, seg);

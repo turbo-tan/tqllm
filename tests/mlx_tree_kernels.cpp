@@ -23,6 +23,15 @@ static mx::array randn(std::mt19937& rng, mx::Shape shape, float scale) {
 }
 static mx::array bf(const mx::array& x) {return mx::astype(mx::astype(x, mx::bfloat16), mx::float32);}
 
+// A failing row is only actionable with its index and depth: the halves of a 17-32 row verify fail differently
+static void print_bad_rows(const char* tag, int start, int n, const std::vector<int>& bad,
+                           const std::vector<std::vector<int>>& paths) {
+    if (bad.empty()) return;
+    std::printf("  %s start %d of %d rows, %zu bad:", tag, start, n, bad.size());
+    for (int t : bad) std::printf(" %d(path %zu parents %s)", t, paths[size_t(t)].size(), t < 16 ? "lo" : "hi");
+    std::printf("\n");
+}
+
 // Verify one tree through the shared mask cache and count the rows that equal their own path stored contiguously.
 static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<int32_t>& parents, int start) {
     const int n = int(parents.size()), heads = 24, kvh = 4, dim = 256;
@@ -36,16 +45,22 @@ static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<in
     auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
     mx::eval(tree);
     int equal = 0;
+    std::vector<int> bad;
+    std::vector<std::vector<int>> paths(size_t(n));
     for (int t = 0; t < n; ++t) {
         const auto p = path_of(t);
+        paths[size_t(t)] = p;
         std::vector<int32_t> order(start);
         for (int i = 0; i < start; ++i) order[size_t(i)] = i;
         for (int a : p) order.push_back(start + a);
         const auto idx = mx::array(order.data(), {int(order.size())}, mx::int32);
         auto kk = mx::take(k, idx, 2), vv = mx::take(v, idx, 2);
         auto one = decode_attention_bf16(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, 0.0625f, int(order.size()));
-        equal += mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+        const bool ok = mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+        equal += ok;
+        if (!ok) bad.push_back(t);
     }
+    print_bad_rows("MASK_CACHE", start, n, bad, paths);
     return equal;
 }
 
@@ -105,16 +120,22 @@ int main() {
             auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
             mx::eval(tree);
             int equal = 0;
+            std::vector<int> bad;
+            std::vector<std::vector<int>> paths(size_t(n));
             for (int t = 0; t < n; ++t) {
                 const auto p = path_of(t);
+                paths[size_t(t)] = p;
                 std::vector<int32_t> order(start);
                 for (int i = 0; i < start; ++i) order[size_t(i)] = i;
                 for (int a : p) order.push_back(start + a);
                 const auto idx = mx::array(order.data(), {int(order.size())}, mx::int32);
                 auto kk = mx::take(k, idx, 2), vv = mx::take(v, idx, 2);
                 auto one = decode_attention_bf16(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, 0.0625f, int(order.size()));
-                equal += mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+                const bool ok = mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+                equal += ok;
+                if (!ok) bad.push_back(t);
             }
+            print_bad_rows("TREE_ATTN", start, n, bad, paths);
             failures += equal != n;
             std::printf("%s TREE_ATTN %d prefix keys: tree rows == their path stored contiguously, bit for bit: %d / %d\n",
                         equal == n ? "PASS" : "FAIL", start, equal, n);
