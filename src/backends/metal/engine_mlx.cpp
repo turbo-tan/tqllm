@@ -215,7 +215,15 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     i.tree = !i.sampling && i.engine->kv_format() == mlx_backend::KvTier::Bf16;
     i.tree_ahead.reset();
     if (i.tree && i.pending != i.eos && i.output.size() < i.count) {
-        i.tree_ahead.emplace(*i.engine, *i.drafter);
+        // TQLLM_DEBUG=tree_rows:32: a 31-node tree in one 32-row verify (12 % fewer steps on the 8K lattice; the release
+        // default stays 16 rows until the Mac row decides)
+        mlx_backend::DeviceTreeOptions tree_options;
+        if (const char* rows = tqllm::debug_cstr("tree_rows")) {
+            const int n = std::atoi(rows);
+            if (n != 16 && n != 32) throw std::invalid_argument("TQLLM_DEBUG tree_rows takes 16 or 32");
+            tree_options.nodes = n - 1;
+        }
+        i.tree_ahead.emplace(*i.engine, *i.drafter, tree_options);
         i.tree_ahead->start(i.pending);
         memlog_point("tree draft-ahead started");
     }

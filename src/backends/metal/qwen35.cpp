@@ -901,7 +901,7 @@ struct Qwen35::Impl {
         kb=mx::slice_update(*kb,k,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         vb=mx::slice_update(*vb,v,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         c.kv_len=need;
-        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need,tree?&tree->visible:nullptr,tree?&tree->host_parents:nullptr);
+        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need,tree?&tree->visible:nullptr,tree?&tree->host_parents:nullptr,capture_prefix);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         stage("attn_core",{out,*kb,*vb});
         out=gate_mul_bf(out,gate);
@@ -934,7 +934,8 @@ struct Qwen35::Impl {
         auto in=pack_product16(p+"gdn_in",x);   // qkv | z
         // one launch for conv, gates, q/k norms, the 1-16 token scan, the compact tape and the gated norm (j762: verify
         // -2.2 ms; served since j892). Decode, verify and the accept replay share its recurrence
-        const bool step_path=m<=16 && conv==4 && dk==128 && dv==128;
+        // 17-32 rows: verify only (a prefill chunk of that size keeps the scan, so prefill values do not move)
+        const bool step_path=(m<=16 || (capture_prefix && m<=32)) && conv==4 && dk==128 && dv==128;
         auto qkv=in.empty()?mat(p+"attn_qkv.weight",x):round_product(in[0]);
         stage("gdn_proj_in",{qkv});
         auto history=c.conv?*c.conv:mx::zeros({conv-1,width});
@@ -956,7 +957,7 @@ struct Qwen35::Impl {
             stage("gdn_scan",{step.out,step.state});
             return mat(p+"ssm_out.weight",step.out);
         }
-        if(tree)throw std::invalid_argument("tree verify needs the fused GDN step (1-16 rows)");
+        if(tree)throw std::invalid_argument("tree verify needs the fused GDN step (1-32 rows)");
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         // fused prep / post kernels on prefill chunks only: verify (16 rows, prefix capture) must run the same ops as AR
@@ -1151,7 +1152,8 @@ struct Qwen35::Verification::State {
     std::vector<int32_t> parents;  // tree verify: each row's parent row (empty: a chain)
 };
 mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
-    if(tokens.empty() || tokens.size()>16)throw std::invalid_argument("MLX prefix verification takes 1-16 tokens");
+    if(tokens.empty() || tokens.size()>32)throw std::invalid_argument("MLX prefix verification takes 1-32 tokens");
+    if(tokens.size()>16 && impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("MLX verification of 17-32 tokens reads a BF16 KV cache");
     batch.state_.reset();
     const auto before=checkpoint();
     impl_->capture_prefix=true;
@@ -1173,8 +1175,8 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
     }
 }
 mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch) {
-    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>16)
-        throw std::invalid_argument("device verification needs uint32 ids [1..16]");
+    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>32)
+        throw std::invalid_argument("device verification needs uint32 ids [1..32]");
     const std::vector<uint32_t> placeholder(size_t(ids.shape(0)),0u);
     impl_->device_ids=ids;
     try {
@@ -1185,8 +1187,8 @@ mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch) {
 }
 mx::array Qwen35::verify_tree_device(const mx::array& ids,const std::vector<int32_t>& parents,Verification& batch) {
     const int n=ids.ndim()==1?ids.shape(0):0;
-    if(n<1 || n>16 || int(parents.size())!=n || parents[0]!=-1)
-        throw std::invalid_argument("tree verification: 1-16 rows, row 0 the anchor (parent -1)");
+    if(n<1 || n>32 || int(parents.size())!=n || parents[0]!=-1)
+        throw std::invalid_argument("tree verification: 1-32 rows, row 0 the anchor (parent -1)");
     if(impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("tree verification reads a BF16 KV cache only");
     std::vector<int32_t> depth(size_t(n),0);std::vector<uint8_t> visible(size_t(n)*size_t(n),0);
     for(int t=0;t<n;++t) {
@@ -1202,9 +1204,9 @@ mx::array Qwen35::verify_tree_device(const mx::array& ids,const std::vector<int3
 mx::array Qwen35::verify_tree_device(const mx::array& ids,const mx::array& parents,const mx::array& depth,const mx::array& visible,
                                      Verification& batch) {
     const int n=ids.ndim()==1?ids.shape(0):0;
-    if(n<1 || n>16 || parents.shape()!=mx::Shape{n} || depth.shape()!=mx::Shape{n} || visible.shape()!=mx::Shape{n,n} ||
+    if(n<1 || n>32 || parents.shape()!=mx::Shape{n} || depth.shape()!=mx::Shape{n} || visible.shape()!=mx::Shape{n,n} ||
        parents.dtype()!=mx::int32 || depth.dtype()!=mx::int32 || visible.dtype()!=mx::bool_)
-        throw std::invalid_argument("device tree verification: 1-16 rows, int32 parents / depth, bool [n, n] ancestors");
+        throw std::invalid_argument("device tree verification: 1-32 rows, int32 parents / depth, bool [n, n] ancestors");
     if(impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("tree verification reads a BF16 KV cache only");
     impl_->tree=Impl::TreeRows{parents,depth,visible,{}};
     try {auto out=verify_device(ids,batch);impl_->tree.reset();return out;}

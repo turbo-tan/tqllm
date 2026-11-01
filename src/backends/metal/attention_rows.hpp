@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
 #include <algorithm>
@@ -40,17 +41,33 @@ inline mlx::core::array prefill_attention_rows(const mlx::core::array& q16, cons
     return mx::concatenate(parts, 2);
 }
 
-// tree: the token-tree verify's [n, n] ancestor mask (decode_attention_bf16), n <= 16 rows only
+// tree: the token-tree verify's [n, n] ancestor mask (decode_attention_bf16). exact_rows (verify): 17-32 rows run as two
+// decode calls (rows 0-15 over the keys up to row 15, the rest over all), so every row equals its one-row step bit for
+// bit as at 16 rows; without it (a prefill chunk) they take the prefill attention as before
 inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int kv_valid = -1,
                                               const mlx::core::array* tree = nullptr,
-                                              const std::vector<int32_t>* tree_parents = nullptr) {
+                                              const std::vector<int32_t>* tree_parents = nullptr,
+                                              bool exact_rows = false) {
     namespace mx = mlx::core;
     const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2);
     if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
     if (n <= 16) return decode_attention_bf16(q, k, v, scale, length, tree, tree_parents);
-    if (tree) throw std::invalid_argument("tree attention takes at most 16 rows");
+    if (exact_rows && n <= 32) {
+        const int heads = q.shape(1), dim = q.shape(3), upper = n - 16;
+        std::optional<mx::array> lo_rows, hi_rows;
+        if (tree) {  // the halves' ancestor rows, made once per verify (cached with the mask)
+            lo_rows = cached_tree_mask(*tree, {2, 0, 16, 16, 0, 0, 0}, [&] {return mx::slice(*tree, {0, 0}, {16, 16});});
+            hi_rows = cached_tree_mask(*tree, {2, 16, n, n, 0, 0, 0}, [&] {return mx::slice(*tree, {16, 0}, {n, n});});
+        }
+        auto lo = decode_attention_bf16(mx::slice(q, {0, 0, 0, 0}, {1, heads, 16, dim}), k, v, scale, length - upper,
+                                        lo_rows ? &*lo_rows : nullptr, tree_parents);
+        auto hi = decode_attention_bf16(mx::slice(q, {0, 0, 16, 0}, {1, heads, n, dim}), k, v, scale, length,
+                                        hi_rows ? &*hi_rows : nullptr, tree_parents);
+        return mx::concatenate({lo, hi}, 2);
+    }
+    if (tree) throw std::invalid_argument("tree attention takes at most 32 verify rows");
     auto keys = mx::astype(mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}), mx::float16);
     auto values = mx::astype(mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}), mx::float16);
     auto out = prefill_attention_rows(mx::astype(q, mx::float16), keys, values, scale);

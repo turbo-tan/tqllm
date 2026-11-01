@@ -69,7 +69,9 @@ std::vector<int32_t> host_walk(const std::vector<uint32_t>& ids, const std::vect
 int main() {
     const char* path = std::getenv("TQLLM_TEST_LATTICE_8K");
     const auto steps = load(path ? path : "tests/data/lattice8k.bin");
+    for (const int tree_nodes : {15, 31}) {  // the 16-row and the 32-row verify
     int same_tree = 0, same_accept = 0;
+    std::printf("-- %d nodes\n", tree_nodes);
     for (const auto& step : steps) {
         const int s = step.produced;
         // the device reads the selector table by token id: give it the fixture's rows under compact ids
@@ -88,9 +90,9 @@ int main() {
         auto predecessor = mx::array(step.predecessor.data(), {int(step.codebook_tokens.size()), kRank}, mx::float32);
         auto anchor = mx::array(compact.at(step.anchor));
         tqllm::mlx_backend::DeviceTreeOptions options;
-        options.nodes = std::min(options.nodes, [&] {  // the implicit tree may be smaller than 15 nodes on a short draft
+        options.nodes = std::min(tree_nodes, [&] {  // the implicit tree may be smaller than 15 nodes on a short draft
             int total = 0, width = 1;
-            for (int d = 0; d < P; ++d) {width = std::min(options.nodes, width * options.children); total += width;}
+            for (int d = 0; d < P; ++d) {width = std::min(tree_nodes, width * options.children); total += width;}
             return total;
         }());
         DeviceTree tree = tqllm::mlx_backend::device_tree(lattice_ids, unary, gate, successor, predecessor, anchor, P, options);
@@ -155,6 +157,7 @@ int main() {
     // the host scores in double, the device in float: a near tie may order two siblings differently, never more than one step
     expect(same_tree + 1 >= int(steps.size()), "device trees equal the host's", -1);
     expect(same_accept == int(steps.size()), "acceptance equal on every step", -1);
+    }
     if (failures) return 1;
     std::printf("mlx_tree_device: ok\n");
     return 0;

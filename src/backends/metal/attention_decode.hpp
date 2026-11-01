@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <functional>
+#include <optional>
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -33,13 +34,15 @@ inline void check_decode_rows_shape(const mlx::core::array& q, const mlx::core::
 inline int decode_row_shape(int n) {return n <= 8 ? 8 : 16;}
 
 // Token-tree verify: block row t sees every key before the block and the block keys of its ancestors and itself
-// (visible [n, n] bool: row t, column j). Rows padded at the front see what row 0 sees (their outputs are dropped). With
-// a chain (visible lower triangular) every real row's mask equals the causal one, so a chain verifies bit for bit as before.
+// (visible [n, nb] bool: query row t, block key j; nb = n, or the whole block when a 17-32 row verify runs its rows as
+// two calls). Rows padded at the front see what row 0 sees (their outputs are dropped). With a chain (visible lower
+// triangular) every real row's mask equals the causal one, so a chain verifies bit for bit as before.
 inline mlx::core::array tree_key_mask(const mlx::core::array& visible, int rows, int n, int length, int total) {
     namespace mx = mlx::core;
+    const int nb = visible.shape(1);
     auto block = visible;
-    if (rows > n) block = mx::concatenate({mx::broadcast_to(mx::slice(visible, {0, 0}, {1, n}), {rows - n, n}), visible}, 0);
-    std::vector<mx::array> parts{mx::full({rows, length - n}, mx::array(true)), block};
+    if (rows > n) block = mx::concatenate({mx::broadcast_to(mx::slice(visible, {0, 0}, {1, nb}), {rows - n, nb}), visible}, 0);
+    std::vector<mx::array> parts{mx::full({rows, length - nb}, mx::array(true)), block};
     if (total > length) parts.push_back(mx::full({rows, total - length}, mx::array(false)));
     return mx::concatenate(parts, 1);
 }
@@ -47,15 +50,20 @@ inline mlx::core::array tree_key_mask(const mlx::core::array& visible, int rows,
 // Every attention layer of one tree verify asks for the same mask (same rows, keys and ancestor table), so it is built
 // on the first layer and reused by the others instead of once per layer. The entry holds the ancestor table it was built
 // from, so its id cannot be reused by a later table while it is cached; a new table replaces the entries.
+// Entries made from an entry (the row halves of a 17-32 row verify) belong to the same verify. Entries hold the arrays
+// they were made from, so no id is reused while cached.
 inline mlx::core::array cached_tree_mask(const mlx::core::array& visible, const std::array<int, 7>& shape,
                                          const std::function<mlx::core::array()>& make) {
     struct Entry {mlx::core::array visible, mask; std::array<int, 7> shape;};
+    struct Cache {std::optional<mlx::core::array> root; std::vector<Entry> entries;};
     // never destroyed: an array must not outlive MLX's allocator at exit
-    static thread_local auto* cache = new std::vector<Entry>();
-    if (!cache->empty() && cache->front().visible.id() != visible.id()) cache->clear();
-    for (const auto& e : *cache) if (e.shape == shape) return e.mask;
-    cache->push_back({visible, make(), shape});
-    return cache->back().mask;
+    static thread_local auto* cache = new Cache();
+    bool known = cache->root && cache->root->id() == visible.id();
+    for (const auto& e : cache->entries) known = known || e.mask.id() == visible.id();
+    if (!known) {cache->entries.clear(); cache->root = visible;}
+    for (const auto& e : cache->entries) if (e.visible.id() == visible.id() && e.shape == shape) return e.mask;
+    cache->entries.push_back({visible, make(), shape});
+    return cache->entries.back().mask;
 }
 
 // bf16_folded: GQA folded into query rows, so each KV head's keys and values are read once for its G query heads: q [1,

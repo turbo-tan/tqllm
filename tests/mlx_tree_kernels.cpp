@@ -3,6 +3,9 @@
 //     (anchor .. row) as a chain;
 // (2) the BF16 verify attention with the ancestor mask: every tree row equals the same row computed with its path keys
 //     stored contiguously after the prefix (the layout an AR step sees).
+// Both for a 10-row tree and for 32 rows (the 17-32 row verify: the GDN step's device-scratch path, attention as two
+// 16-row calls through causal_attention_rows): a 32-row tree and a 32-row chain.
+#include "attention_rows.hpp"
 #include "attention_decode.hpp"
 #include "gdn.hpp"
 #include <mlx/mlx.h>
@@ -23,8 +26,13 @@ static mx::array bf(const mx::array& x) {return mx::astype(mx::astype(x, mx::bfl
 int main() {
     std::mt19937 rng(11);
     int failures = 0;
-    const std::vector<int32_t> parents = {-1, 0, 0, 2, 2, 4, 1, 5, 3, 0};  // a tree with branches at rows 0 and 2
+    std::vector<int32_t> tree32{-1};  // 32 rows in depth-first order: branches at several depths, a 13-deep spine
+    for (int r = 1; r < 32; ++r) tree32.push_back(r < 14 ? r - 1 : r % 5 == 0 ? 0 : r % 3 == 0 ? r - 9 : r - 1);
+    std::vector<int32_t> chain32(32);
+    for (int r = 0; r < 32; ++r) chain32[size_t(r)] = r - 1;
+    for (const auto& parents : {std::vector<int32_t>{-1, 0, 0, 2, 2, 4, 1, 5, 3, 0}, tree32, chain32}) {
     const int n = int(parents.size());
+    std::printf("-- %d rows%s\n", n, n == 32 && parents == chain32 ? " (chain)" : "");
     auto path_of = [&](int t) {std::vector<int> p; for (int a = t; a >= 0; a = parents[size_t(a)]) p.insert(p.begin(), a); return p;};
 
     {   // (1) GDN step
@@ -68,7 +76,7 @@ int main() {
             std::vector<uint8_t> vis(size_t(n) * n, 0);
             for (int t = 0; t < n; ++t) for (int a : path_of(t)) vis[size_t(t) * n + a] = 1;
             auto visible = mx::astype(mx::array(vis.data(), {n, n}, mx::uint8), mx::bool_);
-            auto tree = decode_attention_bf16(q, k, v, 0.0625f, length, &visible, &parents);
+            auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
             mx::eval(tree);
             int equal = 0;
             for (int t = 0; t < n; ++t) {
@@ -85,6 +93,7 @@ int main() {
             std::printf("%s TREE_ATTN %d prefix keys: tree rows == their path stored contiguously, bit for bit: %d / %d\n",
                         equal == n ? "PASS" : "FAIL", start, equal, n);
         }
+    }
     }
     std::printf(failures ? "TREE_KERNELS_FAIL\n" : "TREE_KERNELS_PASS\n");
     return failures ? 1 : 0;
