@@ -624,16 +624,30 @@ DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx:
         i.stage_ms[k]+=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;
     };
     if(stages)mx::eval(x,position);tick=std::chrono::steady_clock::now();
+    // lattice_split (TQLLM_DEBUG): host time of building each part of one lattice, no sync - what a draft's encode
+    // costs the step, apart from the GPU work it submits
+    const bool ls=tqllm::debug_cstr("lattice_split")!=nullptr;
+    auto t_ls=tick;
+    auto lap_ls=[&](const char* name) {
+        if(!ls)return;
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"LATTICE_SPLIT %s %.2f\n",name,std::chrono::duration<double,std::milli>(now-t_ls).count());t_ls=now;
+    };
+    lap_ls("before");
     x=i.run_ring_layers(x,position,span,mask,i.far_on()?i.target.position():0);
+    lap_ls("layers");
     lap(0,{x});
     auto normalized=i.norm("output_norm.weight",x);
     auto logits=i.target.shared_draft_head(normalized);
+    lap_ls("head");
     lap(1,{logits});
     auto top=dflash_top16(logits);auto selected=top.first,unary=top.second;
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
+    lap_ls("top16");
     lap(2,{selected,unary,mapped});
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
+    lap_ls("selector");
     return {mapped,mx::astype(unary,mx::float32),gate,successors};
 }
 mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& position,int count) {
