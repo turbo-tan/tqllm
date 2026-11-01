@@ -335,6 +335,7 @@ struct Qwen35::Impl {
     // layer-major prefill (forward_layer_major): one FP16 dequant per matrix shared by the batch's slices, dropped per layer
     bool share_dequant=false;
     bool defer_eval=false;  // draft-ahead: submit this forward without waiting, the caller chains the next draft behind it
+    bool stream_layers=true;  // submit a layer's ops as they are built (nostream: one submission per forward)
     std::map<const NaxAffine*,mx::array> dequant_cache;
     mx::array dequant(const NaxAffine& w) {
         if(!share_dequant)return nax_affine_dequant(w);
@@ -374,6 +375,7 @@ struct Qwen35::Impl {
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         build_split=tqllm::debug_cstr("build_split")!=nullptr;
+        stream_layers=tqllm::debug_cstr("nostream")==nullptr;
         const auto arch=file.kv.at("general.architecture").str;
         if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
         const std::string a="qwen35.";
@@ -1066,6 +1068,10 @@ struct Qwen35::Impl {
             if(stage_profiling)record(fuse?"ffn_down_gemm_res":"ffn_down",{x});
             build_mark("ffn");
             if(dispatches)dispatches->take({x},std::string(is_attn?"attn":"gdn")+"/ffn");
+            // draft-ahead: submit each group of layers as it is built. One async_eval at the end of the forward leaves
+            // the GPU idle for the host work in between (the rest of the graph and the next draft's); a few layers' worth
+            // of queue is enough to cover it, and one submission per 4 layers is MLX's own command-buffer size
+            if(defer_eval && !dispatches && stream_layers && (l%4==3 || l==layers-1)) mx::async_eval(cache_roots(l,{x,attn}));
         };
         // a prefill batch of more than group_rows rows runs layer-major in slices of that many rows, each slice with
         // the ops (shapes, positions, cache order) of its own S-row forward, so the result equals S-row chunks while each
