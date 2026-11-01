@@ -35,18 +35,20 @@ int main() {
         auto z = randn(rng, {n, vh * 128}, 1.0f), w = randn(rng, {128}, 1.0f), state = randn(rng, {1, vh, 128, 128}, 0.1f);
         mx::eval({prev, rows, weights, alpha, beta, bias, rate, z, w, state});
         // small evaluated inputs reach a custom kernel as `constant` buffers; the model passes fresh device results, so
-        // the test does too (one multiply each, not evaluated here)
-        auto fresh = [](const mx::array& x) {return mx::multiply(x, mx::array(1.0f));};
-        alpha = fresh(alpha); beta = fresh(beta); bias = fresh(bias); rate = fresh(rate); w = fresh(w);
+        // every call here does too (one multiply each, not evaluated): an input evaluated by an earlier call would be
+        // constant again
+        auto fresh = [](const mx::array& x) {return mx::multiply(x, mx::array(1.0f, x.dtype()));};
         const auto par = mx::array(parents.data(), {n}, mx::int32);
-        auto tree = gdn_step_fused(prev, rows, weights, alpha, beta, bias, rate, z, w, 1e-6f, 0.0883883f, state, kh, vh, 0, 0, 0, &par);
+        auto tree = gdn_step_fused(fresh(prev), fresh(rows), fresh(weights), fresh(alpha), fresh(beta), fresh(bias), fresh(rate), fresh(z),
+                                   fresh(w), 1e-6f, 0.0883883f, fresh(state), kh, vh, 0, 0, 0, &par);
         mx::eval(tree.out, tree.deltas, tree.decay);
         int equal = 0;
         for (int t = 0; t < n; ++t) {
             const auto p = path_of(t);
             const auto idx = mx::array(p.data(), {int(p.size())}, mx::int32);
-            auto chain = gdn_step_fused(prev, mx::take(rows, idx, 0), weights, mx::take(alpha, idx, 0), mx::take(beta, idx, 0), bias, rate,
-                                        mx::take(z, idx, 0), w, 1e-6f, 0.0883883f, state, kh, vh);
+            auto chain = gdn_step_fused(fresh(prev), fresh(mx::take(rows, idx, 0)), fresh(weights), fresh(mx::take(alpha, idx, 0)),
+                                        fresh(mx::take(beta, idx, 0)), fresh(bias), fresh(rate), fresh(mx::take(z, idx, 0)), fresh(w), 1e-6f,
+                                        0.0883883f, fresh(state), kh, vh);
             const int last = int(p.size()) - 1;
             auto a = mx::slice(tree.out, {t, 0}, {t + 1, vh * 128}), b = mx::slice(chain.out, {last, 0}, {last + 1, vh * 128});
             auto da = mx::slice(tree.deltas, {t, 0, 0}, {t + 1, vh, 128}), db = mx::slice(chain.deltas, {last, 0, 0}, {last + 1, vh, 128});
