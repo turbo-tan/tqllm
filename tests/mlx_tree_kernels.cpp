@@ -110,8 +110,13 @@ int main() {
     }
     {   // (2) attention: prefix of `start` keys, then the n block keys; each tree row vs its path stored contiguously
         const int heads = 24, kvh = 4, dim = 256;
-        // 992 leaves the 32-row block exactly at the 1024-key segment boundary, 1000 makes it cross it
-        for (int start : {992, 1000, 3000, 9000}) {
+        // 992 leaves the 32-row block exactly at the 1024-key segment boundary, 1000 makes it cross it. A crossing block
+        // is verified as a chain (spec_pipeline chain_at), and a tree's side-branch rows cannot be exact there: their
+        // path keys follow the prefix contiguously, while their AR step puts the keys past 1024 in a second segment. So
+        // the crossing case is asserted for the chain, which is the only shape the engine verifies across a boundary.
+        const bool chain = parents == chain32;
+        if (!chain) std::printf("  note: 1000 prefix keys crosses the segment boundary, verified as a chain (chain_at)\n");
+        for (int start : chain ? std::vector<int>{992, 1000, 3000, 9000} : std::vector<int>{992, 3000, 9000}) {
             const int length = start + n;
             auto q = randn(rng, {1, heads, n, dim}, 1.0f);
             auto k = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16), v = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16);

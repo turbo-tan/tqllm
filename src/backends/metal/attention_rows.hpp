@@ -68,8 +68,9 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const m
             std::optional<mx::array> rows_mask;
             if (tree)  // the half's ancestor rows, made once per verify (cached with the mask)
                 rows_mask = cached_tree_mask(*tree, {2, a, b, b, 0, 0, 0}, [&] {return mx::slice(*tree, {a, 0}, {b, b});});
+            // this half's own last row is where its key range ends, so it is also the block size its prefix follows from
             parts.push_back(decode_attention_bf16(mx::slice(q, {0, 0, a, 0}, {1, heads, b, dim}), k, v, scale, prefix + b,
-                                                 rows_mask ? &*rows_mask : nullptr, tree_parents, n, a));
+                                                 rows_mask ? &*rows_mask : nullptr, tree_parents, b, a));
             a = b;
         }
         return parts.size() == 1 ? parts[0] : mx::concatenate(parts, 2);
