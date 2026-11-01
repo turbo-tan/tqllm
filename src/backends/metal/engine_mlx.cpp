@@ -11,6 +11,7 @@
 #include "sampling.hpp"
 #include "sampling_topk.hpp"
 #include "qwen35.hpp"
+#include "attention_decode.hpp"
 #include "kv_tcq.hpp"
 #include "spec_pipeline.hpp"
 #include "draft_tree.hpp"
@@ -331,7 +332,11 @@ bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
         lattice.gate.data(), lattice.successor.data(),
         [](void* context, uint32_t token) {return static_cast<const DFlash2::HostLattice*>(context)->predecessor_row(token);},
         &lattice};
-    const auto tree = tqllm::best_first_tree(view, i.pending, tqllm::DraftTreeOptions{});
+    // a block that crosses the first attention segment boundary verifies some rows on the folded path and some on the
+    // segmented one in their AR steps; a chain keeps every row's keys where AR has them, so this one step drafts a chain
+    tqllm::DraftTreeOptions shape;
+    if (pos < mlx_backend::kAttentionSegment && pos + kPositions + 1 > mlx_backend::kAttentionSegment) shape.children = 1;
+    const auto tree = tqllm::best_first_tree(view, i.pending, shape);
     // verify rows in depth-first order: each branch's rows are contiguous, so the GDN step replays a token's ancestors
     // only where a new branch starts (a row whose parent is not the row before it), not at every row of best-first order
     const int nodes = int(tree.tokens.size());

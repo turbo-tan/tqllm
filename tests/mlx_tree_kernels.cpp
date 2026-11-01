@@ -30,24 +30,26 @@ int main() {
     {   // (1) GDN step
         const int kh = 2, vh = 4, width = 2 * kh * 128 + vh * 128;
         auto prev = bf(randn(rng, {3, width}, 1.0f)), rows = bf(randn(rng, {n, width}, 1.0f));
-        auto weights = randn(rng, {width, 4}, 0.5f), alpha = randn(rng, {n, vh}, 1.0f), beta = randn(rng, {n, vh}, 1.0f);
+        // alpha / beta projected inside the kernel from the input rows (the served path: x and the ab weights)
+        const int hidden = 512;
+        auto weights = randn(rng, {width, 4}, 0.5f), input = randn(rng, {n, hidden}, 1.0f), ab = randn(rng, {2 * vh, hidden}, 0.05f);
         auto bias = randn(rng, {vh}, 0.5f), rate = mx::negative(mx::abs(randn(rng, {vh}, 0.5f)));
         auto z = randn(rng, {n, vh * 128}, 1.0f), w = randn(rng, {128}, 1.0f), state = randn(rng, {1, vh, 128, 128}, 0.1f);
-        mx::eval({prev, rows, weights, alpha, beta, bias, rate, z, w, state});
+        mx::eval({prev, rows, weights, input, ab, bias, rate, z, w, state});
         // small evaluated inputs reach a custom kernel as `constant` buffers; the model passes fresh device results, so
         // every call here does too (one multiply each, not evaluated): an input evaluated by an earlier call would be
         // constant again
         auto fresh = [](const mx::array& x) {return mx::multiply(x, mx::array(1.0f, x.dtype()));};
         const auto par = mx::array(parents.data(), {n}, mx::int32);
-        auto tree = gdn_step_fused(fresh(prev), fresh(rows), fresh(weights), fresh(alpha), fresh(beta), fresh(bias), fresh(rate), fresh(z),
+        auto tree = gdn_step_fused(fresh(prev), fresh(rows), fresh(weights), fresh(input), fresh(ab), fresh(bias), fresh(rate), fresh(z),
                                    fresh(w), 1e-6f, 0.0883883f, fresh(state), kh, vh, 0, 0, 0, &par);
         mx::eval(tree.out, tree.deltas, tree.decay);
         int equal = 0;
         for (int t = 0; t < n; ++t) {
             const auto p = path_of(t);
             const auto idx = mx::array(p.data(), {int(p.size())}, mx::int32);
-            auto chain = gdn_step_fused(fresh(prev), fresh(mx::take(rows, idx, 0)), fresh(weights), fresh(mx::take(alpha, idx, 0)),
-                                        fresh(mx::take(beta, idx, 0)), fresh(bias), fresh(rate), fresh(mx::take(z, idx, 0)), fresh(w), 1e-6f,
+            auto chain = gdn_step_fused(fresh(prev), fresh(mx::take(rows, idx, 0)), fresh(weights), fresh(mx::take(input, idx, 0)),
+                                        fresh(ab), fresh(bias), fresh(rate), fresh(mx::take(z, idx, 0)), fresh(w), 1e-6f,
                                         0.0883883f, fresh(state), kh, vh);
             const int last = int(p.size()) - 1;
             auto a = mx::slice(tree.out, {t, 0}, {t + 1, vh * 128}), b = mx::slice(chain.out, {last, 0}, {last + 1, vh * 128});
@@ -66,7 +68,7 @@ int main() {
             std::vector<uint8_t> vis(size_t(n) * n, 0);
             for (int t = 0; t < n; ++t) for (int a : path_of(t)) vis[size_t(t) * n + a] = 1;
             auto visible = mx::astype(mx::array(vis.data(), {n, n}, mx::uint8), mx::bool_);
-            auto tree = decode_attention_bf16(q, k, v, 0.0625f, length, &visible);
+            auto tree = decode_attention_bf16(q, k, v, 0.0625f, length, &visible, &parents);
             mx::eval(tree);
             int equal = 0;
             for (int t = 0; t < n; ++t) {

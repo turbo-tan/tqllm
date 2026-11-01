@@ -901,7 +901,7 @@ struct Qwen35::Impl {
         kb=mx::slice_update(*kb,k,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         vb=mx::slice_update(*vb,v,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         c.kv_len=need;
-        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need,tree?&tree->visible:nullptr);
+        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need,tree?&tree->visible:nullptr,tree?&tree->host_parents:nullptr);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         stage("attn_core",{out,*kb,*vb});
         out=gate_mul_bf(out,gate);
