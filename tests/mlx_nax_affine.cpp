@@ -191,6 +191,28 @@ void bench_gemm(int rows, int k, std::mt19937& rng) {
     }
 }
 
+// Decode / verify shapes: the 16-row kernel pads any m <= 16 to a 16-row tile, so this prints what one matmul costs
+// per input-row count (µs, weight GB/s, effective TFLOPS) - the numbers the step attends to.
+void bench_rows(int rows, int k, std::mt19937& rng) {
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() & 15u);
+    std::vector<uint16_t> s(size_t(rows) * (k / 64)), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(0.01f); b[i] = bf16_bits(-0.05f);}
+    auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 64), rows, k, 4, 64);
+    const double gb = double(nax_affine_bytes(rows, k, 4, 64)) * 1e-9;
+    for (int m : {1, 2, 4, 8, 16, 32}) {
+        auto X = mx::random::normal({m, k});
+        mx::eval(X);
+        auto call = [&] {return nax_affine_matmul(w, X, true);};
+        mx::eval(call());
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) mx::eval(call());
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 5;
+        std::printf("NAX_ROWS_BENCH rows=%d k=%d group=64 m=%d %.1f us %.1f GB/s %.1f TFLOPS\n", rows, k, m, us, gb / us * 1e6,
+                    2.0 * m * rows * k / us * 1e-6);
+    }
+}
+
 // fused FP16 rotation equals tq4_rotate rounded to FP16 (to an FP16 ulp: summation order differs), rows independent
 bool run_rotate(std::mt19937& rng) {
     bool ok = true;
@@ -518,6 +540,9 @@ int main() {
         run_ffn_fallback(5120, 17408, false, rng) && run_ffn_fallback(5120, 17408, true, rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
+    bench_rows(17408, 5120, rng);
+    bench_rows(5120, 17408, rng);
+    bench_rows(5120, 5120, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
     return ok ? 0 : 1;
 }
