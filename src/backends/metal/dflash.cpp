@@ -563,19 +563,19 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
             auto v=i.values(p,x);
             if(l==0)it=std::chrono::steady_clock::now();
             c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
-            if(l==0)ilap("ring",&c.v);
+            if(l==0)ilap("ring",&*c.v);
             if(far_index) {
                 const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
                 if(l==0)ilap("quant",&qk.scales);
                 c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
-                if(l==0)ilap("fark",&c.kfull);
+                if(l==0)ilap("fark",&*c.kfull);
                 c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
-                if(l==0)ilap("farv",&c.vfull);
+                if(l==0)ilap("farv",&*c.vfull);
                 c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
                 c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
-                if(l==0)ilap("fars",&c.vfs);
+                if(l==0)ilap("fars",&*c.vfs);
                 c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
-                if(l==0)ilap("ksum",&c.ksum);
+                if(l==0)ilap("ksum",&*c.ksum);
             }
         }
         i.head_dev=mx::remainder(mx::add(*i.head_dev,live),mx::array(i.window,mx::int32));
