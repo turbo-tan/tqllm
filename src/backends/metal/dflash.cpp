@@ -494,7 +494,7 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
     const int passes=n>i.block?2:1;
     for(int pass=0;pass<passes;++pass) {
         const int at=pass*i.block,rows=std::min(n-at,i.block);
-        auto x=pass?mx::slice(encoded,{at,0},{at+rows,encoded.shape(1)}):encoded;
+        auto x=passes>1?mx::slice(encoded,{at,0},{at+rows,encoded.shape(1)}):encoded;
         // rows the target actually accepted at this position; the rest of the block is scratch
         auto live=pass?mx::maximum(mx::subtract(count,mx::array(at,mx::int32)),mx::array(0,mx::int32)):
                       mx::minimum(count,mx::array(i.block,mx::int32));
