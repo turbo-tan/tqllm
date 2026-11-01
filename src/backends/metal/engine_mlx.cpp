@@ -332,11 +332,21 @@ bool MlxQwen35Engine::tree_step(int pos, uint32_t limit) {
         [](void* context, uint32_t token) {return static_cast<const DFlash2::HostLattice*>(context)->predecessor_row(token);},
         &lattice};
     const auto tree = tqllm::best_first_tree(view, i.pending, tqllm::DraftTreeOptions{});
+    // verify rows in depth-first order: each branch's rows are contiguous, so the GDN step replays a token's ancestors
+    // only where a new branch starts (a row whose parent is not the row before it), not at every row of best-first order
+    const int nodes = int(tree.tokens.size());
+    std::vector<std::vector<int>> children(size_t(nodes) + 1);
+    for (int r = 0; r < nodes; ++r) children[size_t(tree.parents[size_t(r)] + 1)].push_back(r);
     std::vector<uint32_t> ids{i.pending};
     std::vector<int32_t> parents{-1};
-    for (size_t r = 0; r < tree.tokens.size(); ++r) {
-        ids.push_back(tree.tokens[r]);
-        parents.push_back(tree.parents[r] < 0 ? 0 : tree.parents[r] + 1);
+    std::vector<int32_t> row_of(size_t(nodes) + 1, 0);
+    std::vector<int> stack(children[0].rbegin(), children[0].rend());
+    while (!stack.empty()) {
+        const int r = stack.back(); stack.pop_back();
+        row_of[size_t(r) + 1] = int32_t(ids.size());
+        ids.push_back(tree.tokens[size_t(r)]);
+        parents.push_back(row_of[size_t(tree.parents[size_t(r)] + 1)]);
+        stack.insert(stack.end(), children[size_t(r) + 1].rbegin(), children[size_t(r) + 1].rend());
     }
     const int n = int(ids.size());
     const auto t2 = Clock::now();
