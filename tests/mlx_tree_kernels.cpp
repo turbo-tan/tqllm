@@ -23,6 +23,32 @@ static mx::array randn(std::mt19937& rng, mx::Shape shape, float scale) {
 }
 static mx::array bf(const mx::array& x) {return mx::astype(mx::astype(x, mx::bfloat16), mx::float32);}
 
+// Verify one tree through the shared mask cache and count the rows that equal their own path stored contiguously.
+static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<int32_t>& parents, int start) {
+    const int n = int(parents.size()), heads = 24, kvh = 4, dim = 256;
+    const int length = start + n;
+    auto q = randn(rng, {1, heads, n, dim}, 1.0f);
+    auto k = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16), v = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16);
+    auto path_of = [&](int t) {std::vector<int> p; for (int a = t; a >= 0; a = parents[size_t(a)]) p.insert(p.begin(), a); return p;};
+    std::vector<uint8_t> vis(size_t(n) * n, 0);
+    for (int t = 0; t < n; ++t) for (int a : path_of(t)) vis[size_t(t) * n + a] = 1;
+    auto visible = mx::astype(mx::array(vis.data(), {n, n}, mx::uint8), mx::bool_);
+    auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
+    mx::eval(tree);
+    int equal = 0;
+    for (int t = 0; t < n; ++t) {
+        const auto p = path_of(t);
+        std::vector<int32_t> order(start);
+        for (int i = 0; i < start; ++i) order[size_t(i)] = i;
+        for (int a : p) order.push_back(start + a);
+        const auto idx = mx::array(order.data(), {int(order.size())}, mx::int32);
+        auto kk = mx::take(k, idx, 2), vv = mx::take(v, idx, 2);
+        auto one = decode_attention_bf16(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, 0.0625f, int(order.size()));
+        equal += mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
+    }
+    return equal;
+}
+
 int main() {
     std::mt19937 rng(11);
     int failures = 0;
@@ -94,6 +120,17 @@ int main() {
                         equal == n ? "PASS" : "FAIL", start, equal, n);
         }
     }
+    }
+    {   // (3) the mask cache must never serve a stale mask: two different trees of the same size at the same lengths,
+        // verified back to back, then 16 and 32 rows alternating
+        const std::vector<int32_t> a16{-1, 0, 0, 1, 3, 1, 5, 2, 7, 0, 9, 4, 11, 6, 13, 8};
+        const std::vector<int32_t> b16{-1, 0, 1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14};
+        for (const auto* t : {&a16, &b16, &a16, &tree32, &chain32, &tree32, &a16}) {
+            const int n = int(t->size()), equal = attention_rows_matching_paths(rng, *t, 3000);
+            failures += equal != n;
+            std::printf("%s MASK_CACHE %d rows after another tree at the same lengths: tree rows == their path, bit for bit: %d / %d\n",
+                        equal == n ? "PASS" : "FAIL", n, equal, n);
+        }
     }
     std::printf(failures ? "TREE_KERNELS_FAIL\n" : "TREE_KERNELS_PASS\n");
     return failures ? 1 : 0;
