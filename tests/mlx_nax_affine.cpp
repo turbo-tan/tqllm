@@ -418,9 +418,87 @@ bool run_swiglu(int rows, int k, bool tq4, std::mt19937& rng) {
     std::printf("NAX_SWIGLU rows=%d k=%d tq4=%d rel=%.2e row_mismatches=%d\n", rows, k, int(tq4), worst / std::max(peak, 1e-30), mismatches);
     return mismatches == 0 && worst / std::max(peak, 1e-30) < 1e-2;
 }
+// 17-32 verify rows take kernels whose tile is 32 rows wide: every row must still be the same row computed alone, or
+// the wider verify is not the one-row step it claims to be.
+bool run_row_invariance(int rows, int k, bool tq4, std::mt19937& rng) {
+    auto make = [&]() -> NaxAffine {
+        if (tq4) {
+            std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+            for (auto& c : codes) c = uint8_t(rng());
+            std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+            for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+            return nax_from_tq4(Tq4Weights{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true});
+        }
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+        std::vector<uint16_t> s(size_t(rows) * (k / 64)), b(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+        return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 64), rows, k, 4, 64);
+    };
+    auto g = make();
+    std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
+    int cells = 0, mismatches = 0;
+    for (int m : {17, 24, 32}) {
+        std::vector<float> x(size_t(m) * k);
+        for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+        auto X = mx::array(x.data(), {m, k}, mx::float32);
+        auto got = rows_of(nax_affine_matmul(g, X, true));
+        for (int r = 0; r < m; ++r) {
+            auto one = rows_of(nax_affine_matmul(g, mx::array(x.data() + size_t(r) * k, {1, k}, mx::float32), true));
+            ++cells;
+            if (std::memcmp(one.data(), got.data() + size_t(r) * rows, size_t(rows) * sizeof(float))) ++mismatches;
+        }
+    }
+    std::printf("%s NAX_ROW_INVARIANCE rows=%d k=%d tq4=%d: %d-row projections == one row at a time, bit for bit: %d / %d\n",
+                mismatches ? "FAIL" : "PASS", rows, k, int(tq4), 32, cells - mismatches, cells);
+    return mismatches == 0;
+}
+
+// The 17-32 row verify runs gate / up and SwiGLU as separate launches where AR (1-16 rows) runs the fused kernel. The
+// two must agree bit for bit or the wider verify is not exact; this is the assumption the whole 17-32 path rests on.
+bool run_ffn_fallback(int rows, int k, bool tq4, std::mt19937& rng) {
+    auto make = [&]() -> NaxAffine {
+        if (tq4) {
+            std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+            for (auto& c : codes) c = uint8_t(rng());
+            std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+            for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+            return nax_from_tq4(Tq4Weights{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true});
+        }
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+        std::vector<uint16_t> s(size_t(rows) * (k / 64)), b(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+        return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 64), rows, k, 4, 64);
+    };
+    auto g = make(), u = make();
+    std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
+    int cells = 0, mismatches = 0;
+    for (int m : {1, 8, 16, 17, 24, 32}) {
+        std::vector<float> x(size_t(m) * k);
+        for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+        auto X = mx::array(x.data(), {m, k}, mx::float32);
+        auto got = rows_of(nax_affine_swiglu(g, u, X));
+        auto gv = rows_of(nax_affine_matmul(g, X, true)), uv = rows_of(nax_affine_matmul(u, X, true));
+        for (size_t i = 0; i < got.size(); ++i) {
+            const float act = bf16_value(bf16_bits(gv[i] / (1.0f + std::exp(-gv[i]))));
+            const float ref = float(mx::float16_t(bf16_value(bf16_bits(act * uv[i]))));
+            ++cells;
+            if (std::memcmp(&ref, &got[i], sizeof(float))) ++mismatches;
+        }
+    }
+    std::printf("%s NAX_FFN_FALLBACK rows=%d k=%d tq4=%d: fused SwiGLU == gate/up + SwiGLU, bit for bit: %d / %d\n",
+                mismatches ? "FAIL" : "PASS", rows, k, int(tq4), cells - mismatches, cells);
+    return mismatches == 0;
+}
+
 int main() {
     std::mt19937 rng(7);
-    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng) && run_from_quantized(256, 512, rng) && run_from_quantized(16384 + 512, 1024, rng) && run_to_mlx(256, 512, 64, rng) && run_to_mlx(256, 512, 128, rng) && run_to_mlx(5120, 2048, 64, rng) && run_prefill(256, 512, 64, false, 1910, rng) && run_prefill(5120, 2048, 64, false, 300, rng) && run_prefill(256, 512, 128, true, 77, rng) && run_prefill(256, 512, 64, false, 2048, rng) && run_prefill(256, 512, 128, true, 256, rng) && run_swiglu(256, 512, false, rng) && run_swiglu(256, 512, true, rng) && run_swiglu(17408, 5120, false, rng) && run_swiglu(17408, 5120, true, rng);
+    bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng) && run_from_quantized(256, 512, rng) && run_from_quantized(16384 + 512, 1024, rng) && run_to_mlx(256, 512, 64, rng) && run_to_mlx(256, 512, 128, rng) && run_to_mlx(5120, 2048, 64, rng) && run_prefill(256, 512, 64, false, 1910, rng) && run_prefill(5120, 2048, 64, false, 300, rng) && run_prefill(256, 512, 128, true, 77, rng) && run_prefill(256, 512, 64, false, 2048, rng) && run_prefill(256, 512, 128, true, 256, rng) && run_swiglu(256, 512, false, rng) && run_swiglu(256, 512, true, rng) && run_swiglu(17408, 5120, false, rng) && run_swiglu(17408, 5120, true, rng) &&
+        run_row_invariance(5120, 17408, false, rng) && run_row_invariance(5120, 17408, true, rng) &&
+        run_ffn_fallback(5120, 17408, false, rng) && run_ffn_fallback(5120, 17408, true, rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
