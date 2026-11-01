@@ -46,7 +46,7 @@ static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<in
     mx::eval(tree);
     int equal = 0;
     std::vector<int> bad;
-    std::vector<std::vector<int>> paths(size_t(n));
+    std::vector<std::vector<int>> paths(n);
     for (int t = 0; t < n; ++t) {
         const auto p = path_of(t);
         paths[size_t(t)] = p;
@@ -121,7 +121,7 @@ int main() {
             mx::eval(tree);
             int equal = 0;
             std::vector<int> bad;
-            std::vector<std::vector<int>> paths(size_t(n));
+            std::vector<std::vector<int>> paths(n);
             for (int t = 0; t < n; ++t) {
                 const auto p = path_of(t);
                 paths[size_t(t)] = p;
