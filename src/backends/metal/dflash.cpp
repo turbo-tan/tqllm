@@ -531,6 +531,8 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
         const auto now=std::chrono::steady_clock::now();
         std::fprintf(stderr,"INJECT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-it).count());it=now;
     };
+    // the flush before any of the inject's own ops: work queued earlier (the verify's tail, the accept's replay)
+    ilap("before",isp?&*i.head_dev:nullptr);
     auto encoded=i.norm("enc.output_norm.weight",i.mat("fc.weight",features));
     ilap("enc",isp?&encoded:nullptr);
     // rows past the block (a 31-node tree's path) go in two ring advances, the second one chained off the first's head
