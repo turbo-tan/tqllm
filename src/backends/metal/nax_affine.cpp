@@ -88,7 +88,7 @@ const char* kSource = R"METAL(
     // step's words, halves and group scales load while this step decodes and runs.
     constexpr int KSTEPS = KS / 16, GPS = GS / 16;
     // Q6: FP32 scales (Q6_K d * sub-block scale, exact), codes 0..63 with the implied bias -32 * scale
-    auto group_scales = [&](int g, float4& q0, float4& q1, float4& r0, float4& r1) {
+    auto group_scales = [&](int g, thread float4& q0, thread float4& q1, thread float4& r0, thread float4& r1) {
         q0 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + fn))
                 : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
                       : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
