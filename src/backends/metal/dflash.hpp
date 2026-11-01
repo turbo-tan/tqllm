@@ -42,11 +42,16 @@ public:
     mlx::core::array draft_device(uint32_t anchor,int position,int count);
     // draft-ahead (ring drafter, device selector): inject `count` (device int32, 1..rows) of the feature rows at `position`
     // (device int32, the first row's position) without a readback, and draft from an anchor id and position on the GPU,
-    // so the next draft is queued behind the verify that produced them
+    // so the next draft is queued behind the verify that produced them. Up to two draft blocks (32 rows) go in two ring
+    // advances, so a tree step's accepted path may exceed the drafter's own block
     void inject_device(const mlx::core::array& features,const mlx::core::array& count,const mlx::core::array& position);
     mlx::core::array draft_device_at(const mlx::core::array& anchor,const mlx::core::array& position,int count);
     // after the step's readback: the last inject_device wrote `rows` rows (tightens the host's bound on the GPU fill)
     void settle_device_inject(int rows);
+    // rows one inject may carry (the pipeline's verify rows: 16, or 32 for a 31-node tree); sizes the attention span of a
+    // draft issued before its inject settles
+    void inject_block(int rows);
+    void reset_inject_block();
     // draft bench: time_stages(true) syncs each stage of draft_device_at; stage_ms_per_call() returns the mean ms of
     // layers, head, top-16 and selector
     void time_stages(bool on);

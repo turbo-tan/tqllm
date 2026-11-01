@@ -9,6 +9,7 @@
 #include "qwen35.hpp"
 #include "tree_device.hpp"
 #include <mlx/mlx.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -20,6 +21,7 @@ class DraftAhead {
 public:
     DraftAhead(Qwen35& engine, DFlash2& drafter, int width) : engine_(engine), drafter_(drafter), width_(width) {
         if (width < 1 || width > 15) throw std::invalid_argument("draft-ahead width must be 1..15");
+        drafter_.reset_inject_block();
     }
     // after the prefill and its host inject: the first draft (`width` tokens, 1..width) from the pending token at the
     // engine's position
@@ -103,9 +105,12 @@ private:
 // (accept_path) while the GPU drafts. Exact: the verify, the walk and the commit are the synchronous tree step's.
 class TreeAhead {
 public:
-    static constexpr int kPositions = 15;  // the drafter's block below the anchor (DFlash2: 16 rows)
+    static constexpr int kPositions = 15;  // the drafter's lattice positions below the anchor (DFlash2: 16 rows)
     TreeAhead(Qwen35& engine, DFlash2& drafter, const DeviceTreeOptions& options = {})
-        : engine_(engine), drafter_(drafter), options_(options) {}
+        : engine_(engine), drafter_(drafter), options_(options) {
+        // the tree may verify more rows than the drafter's block: its accepted path then needs a two-block inject
+        drafter_.inject_block(std::min(std::max(options_.nodes + 1, kPositions + 1), 2 * (kPositions + 1)));
+    }
     void start(uint32_t pending) {
         anchor_ = mlx::core::array(pending);
         position_ = mlx::core::array(engine_.position(), mlx::core::int32);
@@ -174,8 +179,9 @@ private:
     // A block that crosses the first attention segment boundary verifies some rows on the folded path and some on the
     // segmented one in their AR steps; a chain keeps every row's keys where AR has them, so that step drafts a chain.
     // The next tree is drafted before its anchor position is read back, so every anchor the verify could produce counts.
-    static bool chain_at(int anchor_lo, int anchor_hi) {
-        return anchor_lo < kAttentionSegment && anchor_hi + kPositions + 1 > kAttentionSegment;
+    int rows() const {return options_.nodes + 1;}
+    bool chain_at(int anchor_lo, int anchor_hi) const {
+        return anchor_lo < kAttentionSegment && anchor_hi + rows() > kAttentionSegment;
     }
     DeviceTree draft(const mlx::core::array& anchor, const mlx::core::array& position, bool chain) {
         auto lattice = drafter_.draft_lattice_device(anchor, position, kPositions);

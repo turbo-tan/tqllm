@@ -222,9 +222,9 @@ struct DFlash2::Impl {
         c.ksum=mx::slice_update(*c.ksum,mx::add(mx::slice(*c.ksum,{0,0,c0,0},{1,kvheads,c0+nch,hd}),sums),{0,0,c0,0},{1,kvheads,c0+nch,hd});
     }
     // draft-ahead: the ring's head / fill count live on the GPU once injects carry device counts; the host keeps a bound
-    // (settled fill + block rows per inject not yet settled) to size the attention span
+    // (settled fill + fill_bound rows per inject not yet settled) to size the attention span
     std::optional<mx::array> head_dev,filled_dev;
-    int fill_settled=0,fill_unsettled=0;
+    int fill_settled=0,fill_unsettled=0,fill_bound=1;
     bool stages=false;  // time_stages(): draft_device_at syncs and times each stage (draft bench only)
     double stage_ms[4]={0,0,0,0};int stage_calls=0;  // layers, head, top-16, selector
     void to_device() {
@@ -242,6 +242,7 @@ struct DFlash2::Impl {
         // drafters); a draft of fewer than the file's native block rows runs at the native block (j924: its 7 drafts beat the
         // head of a 16-draft)
         block=block_rows;native=std::min(block,int(file.num("dflash.block_size")));group=int(file.num("dflash.conv_group_size"));
+        fill_bound=block;
         window=int(file.num("dflash.attention.sliding_window"));rank=int(file.num("dflash.selector_rank"));
         mask=uint32_t(file.num("tokenizer.ggml.mask_token_id"));
         eps=float(file.num("dflash.attention.layer_norm_rms_epsilon"));theta=float(file.num("dflash.rope.freq_base"));
@@ -485,41 +486,51 @@ mx::array DFlash2::draft_device(uint32_t anchor,int position,int count) {
 }
 void DFlash2::inject_device(const mx::array& features,const mx::array& count,const mx::array& position) {
     auto& i=*impl_;const int n=features.shape(0);
-    if(!i.ring || !i.caches[0].k || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1 || n>i.block)
+    if(!i.ring || !i.caches[0].k || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1 || n>2*i.block)
         throw std::invalid_argument("invalid DFlash device injection (needs the ring drafter after a host prefill inject)");
     i.to_device();
     auto encoded=i.norm("enc.output_norm.weight",i.mat("fc.weight",features));
-    // row j goes to buffer row block + (head + j) % window while j < count, else to block row j (scratch, rewritten by
-    // every draft): one fixed-shape scatter, no readback of the count
-    auto j=mx::arange(n,mx::int32);
-    auto slot=mx::where(mx::less(j,count),mx::add(mx::remainder(mx::add(*i.head_dev,j),mx::array(i.window,mx::int32)),mx::array(i.block,mx::int32)),j);
-    auto index=mx::broadcast_to(mx::reshape(slot,{1,1,n,1}),{1,i.kvheads,n,i.hd});
-    // far context: rows j < count at their positions, the rest into the scratch chunk at the end
-    std::optional<mx::array> far_index,far_scale,far_chunk;
-    if(i.far_on() && i.caches[0].kfull) {
-        i.ensure_far(i.target.position()+2*i.block);
-        auto pos=mx::where(mx::less(j,count),mx::add(position,j),mx::array(i.far_cap-1,mx::int32));
-        far_index=mx::broadcast_to(mx::reshape(pos,{1,1,n,1}),{1,i.kvheads,n,i.hd});
-        far_scale=mx::broadcast_to(mx::reshape(pos,{1,1,n}),{1,i.kvheads,n});
-        far_chunk=mx::broadcast_to(mx::reshape(mx::floor_divide(pos,mx::array(Impl::kChunk,mx::int32)),{1,1,n,1}),{1,i.kvheads,n,i.hd});
-    }
-    for(int l=0;l<int(i.caches.size());++l) {
-        const std::string p="blk."+std::to_string(l)+".";auto& c=i.caches[l];
-        auto k=mx::reshape(i.mat(p+"attn_k.weight",encoded),{1,n,i.kvheads,i.hd});
-        k=bf(mx::fast::rope(mx::transpose(i.norm(p+"attn_k_norm.weight",k),{0,2,1,3}),i.hd,false,i.theta,1.0f,position));
-        auto v=i.values(p,encoded);
-        c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
-        if(far_index) {
-            const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
-            c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
-            c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
-            c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
-            c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
-            c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
+    // rows past the block (a 31-node tree's path) go in two ring advances, the second one chained off the first's head
+    const int passes=n>i.block?2:1;
+    for(int pass=0;pass<passes;++pass) {
+        const int at=pass*i.block,rows=std::min(n-at,i.block);
+        auto x=pass?mx::slice(encoded,{at,0},{at+rows,encoded.shape(1)}):encoded;
+        // rows the target actually accepted at this position; the rest of the block is scratch
+        auto live=pass?mx::maximum(mx::subtract(count,mx::array(at,mx::int32)),mx::array(0,mx::int32)):
+                      mx::minimum(count,mx::array(i.block,mx::int32));
+        auto pos=pass?mx::add(position,mx::array(at,mx::int32)):position;
+        // row j goes to buffer row block + (head + j) % window while j < live, else to block row j (scratch, rewritten by
+        // every draft): one fixed-shape scatter, no readback of the count
+        auto j=mx::arange(rows,mx::int32);
+        auto slot=mx::where(mx::less(j,live),mx::add(mx::remainder(mx::add(*i.head_dev,j),mx::array(i.window,mx::int32)),mx::array(i.block,mx::int32)),j);
+        auto index=mx::broadcast_to(mx::reshape(slot,{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
+        // far context: rows j < live at their positions, the rest into the scratch chunk at the end
+        std::optional<mx::array> far_index,far_scale,far_chunk;
+        if(i.far_on() && i.caches[0].kfull) {
+            i.ensure_far(i.target.position()+n+i.block);
+            auto far=mx::where(mx::less(j,live),mx::add(pos,j),mx::array(i.far_cap-1,mx::int32));
+            far_index=mx::broadcast_to(mx::reshape(far,{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
+            far_scale=mx::broadcast_to(mx::reshape(far,{1,1,rows}),{1,i.kvheads,rows});
+            far_chunk=mx::broadcast_to(mx::reshape(mx::floor_divide(far,mx::array(Impl::kChunk,mx::int32)),{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
         }
+        for(int l=0;l<int(i.caches.size());++l) {
+            const std::string p="blk."+std::to_string(l)+".";auto& c=i.caches[l];
+            auto k=mx::reshape(i.mat(p+"attn_k.weight",x),{1,rows,i.kvheads,i.hd});
+            k=bf(mx::fast::rope(mx::transpose(i.norm(p+"attn_k_norm.weight",k),{0,2,1,3}),i.hd,false,i.theta,1.0f,pos));
+            auto v=i.values(p,x);
+            c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
+            if(far_index) {
+                const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
+                c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
+                c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
+                c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
+                c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
+                c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
+            }
+        }
+        i.head_dev=mx::remainder(mx::add(*i.head_dev,live),mx::array(i.window,mx::int32));
+        i.filled_dev=mx::minimum(mx::add(*i.filled_dev,live),mx::array(i.window,mx::int32));
     }
-    i.head_dev=mx::remainder(mx::add(*i.head_dev,count),mx::array(i.window,mx::int32));
-    i.filled_dev=mx::minimum(mx::add(*i.filled_dev,count),mx::array(i.window,mx::int32));
     ++i.fill_unsettled;
 }
 void DFlash2::far_context(bool enabled) {impl_->far_enabled=enabled;}
@@ -580,8 +591,17 @@ std::vector<double> DFlash2::stage_ms_per_call() const {
 }
 void DFlash2::settle_device_inject(int rows) {
     auto& i=*impl_;
-    if(i.fill_unsettled<1 || rows<1 || rows>i.block)throw std::invalid_argument("invalid DFlash inject settlement");
+    if(i.fill_unsettled<1 || rows<1 || rows>2*i.block)throw std::invalid_argument("invalid DFlash inject settlement");
     --i.fill_unsettled;i.fill_settled=std::min(i.window,i.fill_settled+rows);
+}
+void DFlash2::inject_block(int rows) {
+    auto& i=*impl_;
+    if(rows<i.block || rows>2*i.block)throw std::invalid_argument("DFlash inject block is 1-2 draft blocks");
+    i.fill_bound=rows;
+}
+void DFlash2::reset_inject_block() {
+    auto& i=*impl_;
+    i.fill_bound=i.block;
 }
 DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx::array& position,int count) {
     auto& i=*impl_;
@@ -591,7 +611,7 @@ DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx:
     const int rows=i.draft_rows(count);
     auto ids=mx::concatenate({mx::reshape(anchor,{1}),mx::full({rows-1},i.mask,mx::uint32)},0);
     auto x=i.target.embed_device(ids);
-    const int bound=std::min(i.window,i.fill_settled+i.block*i.fill_unsettled),span=rows+bound;
+    const int bound=std::min(i.window,i.fill_settled+i.fill_bound*i.fill_unsettled),span=rows+bound;
     std::optional<mx::array> mask;
     if(bound>i.fill_settled)  // the GPU's fill is somewhere in (settled, bound]: mask the rows past it
         mask=mx::reshape(mx::less(mx::arange(span,mx::int32),mx::add(*i.filled_dev,mx::array(rows,mx::int32))),{1,1,1,span});

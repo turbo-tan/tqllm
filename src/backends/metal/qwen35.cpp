@@ -353,6 +353,16 @@ struct Qwen35::Impl {
 
     std::map<std::string,double> stages;
     std::chrono::steady_clock::time_point stage_tick;
+    // build_split (TQLLM_DEBUG): host time between marks of one forward, no sync - the graph building of a step with the
+    // GPU idle, which the pipeline's phases report as its build_ms
+    bool build_split=false;
+    std::map<std::string,double> build_stage;
+    std::chrono::steady_clock::time_point build_tick;
+    void build_mark(const char* name) {
+        if(!build_split)return;
+        auto now=std::chrono::steady_clock::now();
+        build_stage[name]+=std::chrono::duration<double,std::milli>(now-build_tick).count();build_tick=now;
+    }
     // with profile_stages: evaluate the arrays and charge the time since the last mark to this stage
     void stage(const char* name,const std::vector<mx::array>& arrays) {
         if(!stage_profiling)return;
@@ -363,6 +373,7 @@ struct Qwen35::Impl {
     }
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
+        build_split=tqllm::debug_cstr("build_split")!=nullptr;
         const auto arch=file.kv.at("general.architecture").str;
         if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
         const std::string a="qwen35.";
@@ -987,6 +998,7 @@ struct Qwen35::Impl {
     }
     mx::array forward(std::span<const uint32_t> tokens,bool all_logits) {
         auto start=std::chrono::steady_clock::now();
+        build_stage.clear();build_tick=start;
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
         stages.clear();dense_input.reset();
         if(stage_profiling) {  // the cost of one sync on an empty graph, to subtract per stage call
@@ -1006,6 +1018,7 @@ struct Qwen35::Impl {
         auto x=use_wave?wave_layers(tokens,features):bf(embed(tokens));
         bool wave_features=use_wave;
         if(stage_profiling)record("embedding",{x});
+        build_mark("embed");
         std::optional<DispatchCount> dispatches;
         if(tqllm::debug_cstr("count_nodes")) {dispatches.emplace();dispatches->take({x},"embed");}
         auto cache_roots=[&](int l,std::vector<mx::array> roots) {
@@ -1021,7 +1034,7 @@ struct Qwen35::Impl {
             constexpr bool pack_on0=true;
             const bool rows16=x.shape(0)<=16;
             auto n=(pack_on0 && !capture_prefix && x.shape(0)>=64)?norm_prefill(x,p+"attn_norm.weight"):rows16?norm_rows(x,p+"attn_norm.weight"):norm(x,p+"attn_norm.weight");
-            stage("norm_in",{n});
+            stage("norm_in",{n});build_mark("norm");
             const bool is_attn=(l+1)%interval==0;
             // prefill chunks: the output projection adds the residual (mixer_added), the down product likewise
             constexpr bool pack_on=true;
@@ -1029,6 +1042,7 @@ struct Qwen35::Impl {
             mixer_residual=fuse?&x:nullptr;mixer_added=false;
             auto attn=is_attn?full_attention(p,n,caches[l],offset,l):gdn(p,n,caches[l],tapes[l]);
             mixer_residual=nullptr;
+            build_mark(is_attn?"mixer_attn":"mixer_gdn");
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
                 for(const std::optional<mx::array>* a:std::initializer_list<const std::optional<mx::array>*>{&c.conv,&c.state,&kv_keys[l],&kv_values[l],&kv_kscale[l],&kv_vscale[l]})if(*a)values.push_back(**a);
@@ -1037,7 +1051,7 @@ struct Qwen35::Impl {
             if(dispatches)dispatches->take(cache_roots(l,{attn}),std::string(is_attn?"attn":"gdn")+"/mixer");
             if(!mixer_added && rows16) {auto an=add_norm_rows(x,attn,p+"post_attention_norm.weight");x=an.first;n=an.second;}
             else {x=mixer_added?attn:add_bf(x,attn);n=fuse?norm_prefill(x,p+"post_attention_norm.weight"):norm(x,p+"post_attention_norm.weight");}
-            stage("norm_post",{n});
+            stage("norm_post",{n});build_mark("norm_post");
             if(auto down=ffn_gemm(p,n,fuse?&x:nullptr)) x=fuse?*down:add_bf(x,*down);
             else if(auto fused=swiglu_rows(p,n)) {
                 if(stage_profiling)record("ffn_gate_up",{*fused});
@@ -1050,6 +1064,7 @@ struct Qwen35::Impl {
                 x=add_bf(x,mat(p+"ffn_down.weight",ff));
             }
             if(stage_profiling)record(fuse?"ffn_down_gemm_res":"ffn_down",{x});
+            build_mark("ffn");
             if(dispatches)dispatches->take({x},std::string(is_attn?"attn":"gdn")+"/ffn");
         };
         // a prefill batch of more than group_rows rows runs layer-major in slices of that many rows, each slice with
@@ -1095,6 +1110,7 @@ struct Qwen35::Impl {
         last_hidden=x;
         if(!features.empty())last_features=wave_features?features[0]:mx::concatenate(features,1);
         x=norm(x,"output_norm.weight");
+        build_mark("norm_out");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
         std::vector<mx::array> live={x};
         if(last_features)live.push_back(*last_features);
@@ -1110,7 +1126,13 @@ struct Qwen35::Impl {
         auto logits=nax.contains("output.weight")?nax_affine_matmul(nax.at("output.weight"),x):linear(matrices.at("output.weight"),x);
         live.push_back(logits);
         if(dispatches)dispatches->take(live,"head+rest");
+        build_mark("head");
         if(defer_eval && !dispatches)mx::async_eval(live);else mx::eval(live);
+        if(build_split) {
+            double total=0;std::string line;
+            for(const auto& [name,ms]:build_stage) {char part[64];std::snprintf(part,sizeof part," %s %.2f",name.c_str(),ms);line+=part;total+=ms;}
+            std::fprintf(stderr,"BUILD_SPLIT m %d pos %d%s total %.2f\n",m,pos,line.c_str(),total);
+        }
         if(dispatches)dispatches->report(m,layers-layers/interval,layers/interval);
         auto end=std::chrono::steady_clock::now();
         times={std::chrono::duration<double,std::milli>(body_end-start).count(),
