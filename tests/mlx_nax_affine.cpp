@@ -455,8 +455,9 @@ bool run_row_invariance(int rows, int k, bool tq4, std::mt19937& rng) {
     return mismatches == 0;
 }
 
-// The 17-32 row verify runs gate / up and SwiGLU as separate launches where AR (1-16 rows) runs the fused kernel. The
-// two must agree bit for bit or the wider verify is not exact; this is the assumption the whole 17-32 path rests on.
+// The 17-32 row verify runs gate / up and SwiGLU as separate launches where AR (1-16 rows) runs the fused kernel.
+// nax_affine_swiglu itself refuses more than 16 rows, so at 17-32 rows the reference is the fused kernel applied to
+// each row on its own: every cell of the composed fallback must equal it bit for bit.
 bool run_ffn_fallback(int rows, int k, bool tq4, std::mt19937& rng) {
     auto make = [&]() -> NaxAffine {
         if (tq4) {
@@ -476,7 +477,7 @@ bool run_ffn_fallback(int rows, int k, bool tq4, std::mt19937& rng) {
     auto g = make(), u = make();
     std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
     int cells = 0, mismatches = 0;
-    for (int m : {1, 8, 16, 17, 24, 32}) {
+    for (int m : {1, 8, 16}) {
         std::vector<float> x(size_t(m) * k);
         for (auto& v : x) v = float(mx::float16_t(xd(rng)));
         auto X = mx::array(x.data(), {m, k}, mx::float32);
@@ -489,7 +490,23 @@ bool run_ffn_fallback(int rows, int k, bool tq4, std::mt19937& rng) {
             if (std::memcmp(&ref, &got[i], sizeof(float))) ++mismatches;
         }
     }
-    std::printf("%s NAX_FFN_FALLBACK rows=%d k=%d tq4=%d: fused SwiGLU == gate/up + SwiGLU, bit for bit: %d / %d\n",
+    for (int m : {17, 24, 32}) {
+        std::vector<float> x(size_t(m) * k);
+        for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+        auto gv = rows_of(nax_affine_matmul(g, mx::array(x.data(), {m, k}, mx::float32), true));
+        auto uv = rows_of(nax_affine_matmul(u, mx::array(x.data(), {m, k}, mx::float32), true));
+        for (int r = 0; r < m; ++r) {
+            auto one = rows_of(nax_affine_swiglu(g, u, mx::array(x.data() + size_t(r) * k, {1, k}, mx::float32)));
+            for (int c = 0; c < rows; ++c) {
+                const size_t i = size_t(r) * rows + c;
+                const float act = bf16_value(bf16_bits(gv[i] / (1.0f + std::exp(-gv[i]))));
+                const float ref = float(mx::float16_t(bf16_value(bf16_bits(act * uv[i]))));
+                ++cells;
+                if (std::memcmp(&ref, &one[size_t(c)], sizeof(float))) ++mismatches;
+            }
+        }
+    }
+    std::printf("%s NAX_FFN_FALLBACK rows=%d k=%d tq4=%d: fused SwiGLU (<=16) and 17-32 row fallback vs one row, bit for bit: %d / %d\n",
                 mismatches ? "FAIL" : "PASS", rows, k, int(tq4), cells - mismatches, cells);
     return mismatches == 0;
 }
