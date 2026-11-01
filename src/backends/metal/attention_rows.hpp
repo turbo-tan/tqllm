@@ -43,7 +43,9 @@ inline mlx::core::array prefill_attention_rows(const mlx::core::array& q16, cons
 
 // tree: the token-tree verify's [n, n] ancestor mask (decode_attention_bf16). exact_rows (verify): 17-32 rows run as two
 // decode calls (rows 0-15 over the keys up to row 15, the rest over all), so every row equals its one-row step bit for
-// bit as at 16 rows; without it (a prefill chunk) they take the prefill attention as before
+// bit as at 16 rows; without it (a prefill chunk) they take the prefill attention as before. A block that crosses the
+// first segment boundary splits there instead: a row whose AR step ends below 1024 keys runs folded there, and one that
+// ends above runs segmented, so a fixed 16-row split puts the lower rows on the wrong kernel
 inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const mlx::core::array& k,
                                               const mlx::core::array& v, float scale, int kv_valid = -1,
                                               const mlx::core::array* tree = nullptr,
@@ -55,18 +57,20 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const m
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
     if (n <= 16) return decode_attention_bf16(q, k, v, scale, length, tree, tree_parents);
     if (exact_rows && n <= 32) {
-        const int heads = q.shape(1), dim = q.shape(3), upper = n - 16;
+        const int heads = q.shape(1), dim = q.shape(3), prefix = length - n;
+        const int split = prefix < kAttentionSegment && prefix + n > kAttentionSegment ? kAttentionSegment - prefix : 16;
+        if (split <= 0 || split >= n) throw std::logic_error("21-32 row verify split outside the block");
         std::optional<mx::array> lo_rows, hi_rows;
         if (tree) {  // the halves' ancestor rows, made once per verify (cached with the mask)
-            lo_rows = cached_tree_mask(*tree, {2, 0, 16, 16, 0, 0, 0}, [&] {return mx::slice(*tree, {0, 0}, {16, 16});});
-            hi_rows = cached_tree_mask(*tree, {2, 16, n, n, 0, 0, 0}, [&] {return mx::slice(*tree, {16, 0}, {n, n});});
+            lo_rows = cached_tree_mask(*tree, {2, 0, split, split, 0, 0, 0}, [&] {return mx::slice(*tree, {0, 0}, {split, split});});
+            hi_rows = cached_tree_mask(*tree, {2, split, n, n, 0, 0, 0}, [&] {return mx::slice(*tree, {split, 0}, {n, n});});
         }
-        auto lo = decode_attention_bf16(mx::slice(q, {0, 0, 0, 0}, {1, heads, 16, dim}), k, v, scale, length - upper,
+        auto lo = decode_attention_bf16(mx::slice(q, {0, 0, 0, 0}, {1, heads, split, dim}), k, v, scale, prefix + split,
                                         lo_rows ? &*lo_rows : nullptr, tree_parents);
         // the hi half sees every key of the block, so its prefix and its rows' block indices come from the block, not
-        // from its own 16 rows
-        auto hi = decode_attention_bf16(mx::slice(q, {0, 0, 16, 0}, {1, heads, n, dim}), k, v, scale, length,
-                                        hi_rows ? &*hi_rows : nullptr, tree_parents, n, 16);
+        // from its own rows
+        auto hi = decode_attention_bf16(mx::slice(q, {0, 0, split, 0}, {1, heads, n, dim}), k, v, scale, length,
+                                        hi_rows ? &*hi_rows : nullptr, tree_parents, n, split);
         return mx::concatenate({lo, hi}, 2);
     }
     if (tree) throw std::invalid_argument("tree attention takes at most 32 verify rows");

@@ -110,7 +110,8 @@ int main() {
     }
     {   // (2) attention: prefix of `start` keys, then the n block keys; each tree row vs its path stored contiguously
         const int heads = 24, kvh = 4, dim = 256;
-        for (int start : {1000, 3000, 9000}) {
+        // 992 leaves the 32-row block exactly at the 1024-key segment boundary, 1000 makes it cross it
+        for (int start : {992, 1000, 3000, 9000}) {
             const int length = start + n;
             auto q = randn(rng, {1, heads, n, dim}, 1.0f);
             auto k = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16), v = mx::astype(randn(rng, {1, kvh, length, dim}, 1.0f), mx::bfloat16);
