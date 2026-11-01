@@ -313,12 +313,16 @@ struct DFlash2::Impl {
         auto x=in[0];const auto& position=in[1];size_t at=2;
         // retr_split (TQLLM_DEBUG): the retrieval's parts, one draft's worth; retr_share selects the far chunks once off
         // the first layer's queries and gathers every layer's keys at those positions
+        // draft_split times the first layer's parts (no sync: host building); draft_split_sync evaluates at each mark,
+        // so the difference between the two is how much of a part the GPU runs
         const bool rsp=tqllm::debug_cstr("retr_split")!=nullptr, rshare=tqllm::debug_cstr("retr_share")!=nullptr;
+        const bool dsp=tqllm::debug_cstr("draft_split")!=nullptr, dsp_sync=tqllm::debug_cstr("draft_split_sync")!=nullptr;
         auto rt=std::chrono::steady_clock::now();
-        auto rlap=[&](const char* what) {
-            if(!rsp)return;
+        auto rlap=[&](const char* what,const mx::array* v=nullptr) {
+            if(!(rsp || dsp))return;
+            if(dsp_sync && v)mx::eval(*v);
             const auto now=std::chrono::steady_clock::now();
-            std::fprintf(stderr,"RETR_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-rt).count());rt=now;
+            std::fprintf(stderr,"DRAFT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-rt).count());rt=now;
         };
         std::optional<mx::array> shared_sel;
         if(rows<=0)rows=block;
@@ -333,6 +337,8 @@ struct DFlash2::Impl {
         const auto far_to=mx::add(far_start,mx::array(kRetrieve*kChunk,mx::int32));
         for(int l=0;l<int(caches.size());++l) {
             const std::string p="blk."+std::to_string(l)+".";
+            const bool mark=dsp && l==0;
+            if(mark)rt=std::chrono::steady_clock::now();
             auto kc=in[at+per*l],vc=in[at+per*l+1];
             auto residual=x,n=norm(p+"attn_norm.weight",x),dynamic=mat(p+"attn_conv_proj.weight",n);
             auto input=dflash_conv(n,dynamic,plain.at(p+"attn_conv_base"),group,0);
@@ -342,6 +348,7 @@ struct DFlash2::Impl {
             auto k=mx::reshape(mat(p+"attn_k.weight",input),{1,rows,kvheads,hd});
             k=bf(mx::fast::rope(mx::transpose(norm(p+"attn_k_norm.weight",k),{0,2,1,3}),hd,false,theta,1.0f,position));
             auto v=values(p,input);
+            if(dsp && l==0)rlap("proj",&v);
             kc=mx::slice_update(kc,mx::astype(k,mx::bfloat16),{0,0,off,0},{1,kvheads,block,hd});vc=mx::slice_update(vc,mx::astype(v,mx::bfloat16),{0,0,off,0},{1,kvheads,block,hd});
             const bool whole=off==0 && span>=cap;
             auto ks=whole?kc:mx::slice(kc,{0,0,off,0},{1,kvheads,off+span,hd}),vs=whole?vc:mx::slice(vc,{0,0,off,0},{1,kvheads,off+span,hd});
@@ -349,7 +356,7 @@ struct DFlash2::Impl {
             if(retr) {
                 // inline (the first retrieving draft): selection from the chunk key sums (int8 codes cannot be scanned,
                 // j1167), gather with the scales
-                rt=std::chrono::steady_clock::now();
+                if(mark)rt=std::chrono::steady_clock::now();
                 std::optional<mx::array> sel;
                 if(!ahead) {
                     if(rshare && shared_sel) sel=*shared_sel;
@@ -372,13 +379,15 @@ struct DFlash2::Impl {
             const auto q16=mx::astype(q,mx::bfloat16);
             auto attention=amask?mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)),"array",*amask):
                 mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)));
-            if(retr)rlap("attn");
+            if(dsp && l==0)rlap("attn",&attention);
             auto flattened=bf(mx::reshape(mx::transpose(attention,{0,2,1,3}),{rows,heads*hd}));
             x=dflash_conv(mat(p+"attn_output.weight",flattened),dynamic,plain.at(p+"attn_conv_base"),group,1,residual);
+            if(dsp && l==0)rlap("out",&x);
             residual=x;n=norm(p+"ffn_norm.weight",x);dynamic=mat(p+"ffn_conv_proj.weight",n);
             input=dflash_conv(n,dynamic,plain.at(p+"ffn_conv_base"),group,0);
             auto ff=mat(p+"ffn_down.weight",swiglu(p,input));
             x=dflash_conv(ff,dynamic,plain.at(p+"ffn_conv_base"),group,1,residual);
+            if(dsp && l==0)rlap("ffn",&x);
             out.push_back(kc);out.push_back(vc);
         }
         out[0]=x;
