@@ -213,6 +213,30 @@ void bench_rows(int rows, int k, std::mt19937& rng) {
     }
 }
 
+// The staged prefill kernel (weights dequantized once into threadgroup memory, several simdgroups per tile) at the
+// verify's row count: if it beats the row kernel at m = 16, the verify could use it.
+void bench_staged(int rows, int k, std::mt19937& rng) {
+    std::vector<uint8_t> codes(size_t(rows) * k);
+    for (auto& c : codes) c = uint8_t(rng() & 15u);
+    std::vector<uint16_t> s(size_t(rows) * (k / 64)), b(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(0.01f); b[i] = bf16_bits(-0.05f);}
+    auto w = nax_affine_load(nax_affine_pack(codes, s, b, rows, k, 4, 64), rows, k, 4, 64);
+    const double gb = double(nax_affine_bytes(rows, k, 4, 64)) * 1e-9;
+    for (int m : {16, 32}) {
+        auto X = mx::random::normal({m, k});
+        mx::eval(X);
+        for (int rs : {16, 32}) for (int sgs : {4, 8}) {
+            auto call = [&] {return nax_affine_prefill(w, X, 0, std::nullopt, rs, 64, sgs);};
+            mx::eval(call());
+            auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 5; ++i) mx::eval(call());
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 5;
+            std::printf("NAX_STAGED_BENCH rows=%d k=%d m=%d rs=%d sgs=%d %.1f us %.1f GB/s %.1f TFLOPS\n", rows, k, m, rs, sgs, us,
+                        gb / us * 1e6, 2.0 * m * rows * k / us * 1e-6);
+        }
+    }
+}
+
 // fused FP16 rotation equals tq4_rotate rounded to FP16 (to an FP16 ulp: summation order differs), rows independent
 bool run_rotate(std::mt19937& rng) {
     bool ok = true;
@@ -543,6 +567,8 @@ int main() {
     bench_rows(17408, 5120, rng);
     bench_rows(5120, 17408, rng);
     bench_rows(5120, 5120, rng);
+    bench_staged(17408, 5120, rng);
+    bench_staged(5120, 17408, rng);
     std::puts(ok ? "MLX_NAX_AFFINE_PASS" : "MLX_NAX_AFFINE_FAIL");
     return ok ? 0 : 1;
 }
