@@ -311,6 +311,16 @@ struct DFlash2::Impl {
     // leading `span` rows (block + filled); out: x, then the updated k, v
     std::vector<mx::array> ring_layers(const std::vector<mx::array>& in,int span,bool masked,bool retr=false,int scored=0,bool ahead=false,int rows=0) {
         auto x=in[0];const auto& position=in[1];size_t at=2;
+        // retr_split (TQLLM_DEBUG): the retrieval's parts, one draft's worth; retr_share selects the far chunks once off
+        // the first layer's queries and gathers every layer's keys at those positions
+        const bool rsp=tqllm::debug_cstr("retr_split")!=nullptr, rshare=tqllm::debug_cstr("retr_share")!=nullptr;
+        auto rt=std::chrono::steady_clock::now();
+        auto rlap=[&](const char* what) {
+            if(!rsp)return;
+            const auto now=std::chrono::steady_clock::now();
+            std::fprintf(stderr,"RETR_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-rt).count());rt=now;
+        };
+        std::optional<mx::array> shared_sel;
         if(rows<=0)rows=block;
         const int off=block-rows;   // the draft rows sit just below the ring, so the attended span stays contiguous
         std::optional<mx::array> mask;if(masked)mask=in[at++];
@@ -339,9 +349,19 @@ struct DFlash2::Impl {
             if(retr) {
                 // inline (the first retrieving draft): selection from the chunk key sums (int8 codes cannot be scanned,
                 // j1167), gather with the scales
+                rt=std::chrono::steady_clock::now();
+                std::optional<mx::array> sel;
+                if(!ahead) {
+                    if(rshare && shared_sel) sel=*shared_sel;
+                    else {
+                        sel=dflash_retrieve_select_sums(q,in[at+per*l+6],far_start,scored,kRetrieve);
+                        if(rshare) shared_sel=sel;
+                    }
+                }
+                rlap("select");
                 const auto r=ahead?DflashRetrieval{in[at+per*l+2],in[at+per*l+3],mx::array(0),kRetrieve*kChunk}:
-                                   dflash_retrieve_gather(dflash_retrieve_select_sums(q,in[at+per*l+6],far_start,scored,kRetrieve),
-                                                          in[at+per*l+2],in[at+per*l+3],far_to,theta,in[at+per*l+4],in[at+per*l+5]);
+                                   dflash_retrieve_gather(*sel,in[at+per*l+2],in[at+per*l+3],far_to,theta,in[at+per*l+4],in[at+per*l+5]);
+                rlap("gather");
                 anchors.push_back(mx::slice(q,{0,0,0,0},{1,heads,1,hd}));
                 ks=mx::concatenate({r.k,ks},2);vs=mx::concatenate({r.v,vs},2);
                 // the retrieved rows are always visible: a mask only while the ring fills (an all-true mask kept the
@@ -352,6 +372,7 @@ struct DFlash2::Impl {
             const auto q16=mx::astype(q,mx::bfloat16);
             auto attention=amask?mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)),"array",*amask):
                 mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)));
+            if(retr)rlap("attn");
             auto flattened=bf(mx::reshape(mx::transpose(attention,{0,2,1,3}),{rows,heads*hd}));
             x=dflash_conv(mat(p+"attn_output.weight",flattened),dynamic,plain.at(p+"attn_conv_base"),group,1,residual);
             residual=x;n=norm(p+"ffn_norm.weight",x);dynamic=mat(p+"ffn_conv_proj.weight",n);
