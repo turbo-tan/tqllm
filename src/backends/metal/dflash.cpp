@@ -325,6 +325,8 @@ struct DFlash2::Impl {
             std::fprintf(stderr,"DRAFT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-rt).count());rt=now;
         };
         std::optional<mx::array> shared_sel;
+        // draft_split_sync's first mark: whatever the inject and the embed left queued before this draft's first layer
+        rlap("pre",&x);
         if(rows<=0)rows=block;
         const int off=block-rows;   // the draft rows sit just below the ring, so the attended span stays contiguous
         std::optional<mx::array> mask;if(masked)mask=in[at++];
