@@ -81,6 +81,63 @@ const char* kSource = R"METAL(
     const device ushort* sp = S + (Q6 ? 2 : 1) * (((size_t)blk * (K / GS) + split * (KS / GS)) * 32);
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
     const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
+#if !NAX_WIDE
+    // Decode / verify: one 16-input step per iteration, and in the plain loop the weight words and input halves a step
+    // needs load in that same step, so the step waits out a DRAM read (j1600: 32 GB/s of the 273 GB/s budget on a
+    // 5120 x 5120 matmul, flat from m = 1 to m = 16 although the tile does the same work either way). Here the next
+    // step's words, halves and group scales load while this step decodes and runs.
+    constexpr int KSTEPS = KS / 16, GPS = GS / 16;
+    // Q6: FP32 scales (Q6_K d * sub-block scale, exact), codes 0..63 with the implied bias -32 * scale
+    auto group_scales = [&](int g, float4& q0, float4& q1, float4& r0, float4& r1) {
+        q0 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + fn))
+                : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
+                      : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
+        q1 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + 16 + fn))
+                : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn)))
+                      : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
+        r0 = Q6 ? -32.0f * q0 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
+        r1 = Q6 ? -32.0f * q1 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
+    };
+    float4 s0, s1, b0, b1;
+    group_scales(0, s0, s1, b0, b1);
+    int g = 0;
+    half4 a0 = fm < rows ? *(const device half4*)(xs) : half4(0.0h);
+    half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K) : half4(0.0h);
+    uint2 w = wp[0];
+    uint h = BITS == 6 ? hp[0] : 0u;
+    for (int ks = 0; ks < KSTEPS; ks++) {
+        const int nk = ks + 1 < KSTEPS ? ks + 1 : KSTEPS - 1, ng = nk / GPS;
+        const half4 na0 = fm < rows ? *(const device half4*)(xs + nk * 16) : half4(0.0h);
+        const half4 na1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + nk * 16) : half4(0.0h);
+        const uint2 nw = wp[nk * 32];
+        const uint nh = BITS == 6 ? hp[nk * 32] : 0u;
+        float4 ns0 = s0, ns1 = s1, nb0 = b0, nb1 = b1;
+        if (ng != g) group_scales(ng, ns0, ns1, nb0, nb1);
+        for (short i = 0; i < 4; i++) { ca[i] = a0[i]; ca[4 + i] = a1[i]; }
+        if (TQ4) {
+            // the constant table is cheaper in this kernel (j582: ALU decode 97.9 vs 70.1 ms)
+            for (short i = 0; i < 8; i++) {
+                const float sa = s0[i & 3], sb = s1[i & 3];
+                cb[i] = half(float(TQ4_LEVEL[(w.x >> (4 * i)) & 15u]) * sa);
+                cb[8 + i] = half(float(TQ4_LEVEL[(w.y >> (4 * i)) & 15u]) * sb);
+            }
+        } else
+        for (short p = 0; p < 4; p++) {
+            uint l0 = (w.x >> (4 * p)) & 0x000F000Fu, l1 = (w.y >> (4 * p)) & 0x000F000Fu;
+            if (BITS == 6) {
+                l0 |= ((h >> (2 * p)) & 0x00030003u) << 4;
+                l1 |= ((h >> (8 + 2 * p)) & 0x00030003u) << 4;
+            }
+            const float2 q0 = float2(as_type<half2>(l0 | 0x64006400u)) - 1024.0f;
+            const float2 q1 = float2(as_type<half2>(l1 | 0x64006400u)) - 1024.0f;
+            const half2 v0 = half2(fma(q0, float2(s0[p]), float2(b0[p])));
+            const half2 v1 = half2(fma(q1, float2(s1[p]), float2(b1[p])));
+            cb[p] = v0.x; cb[p + 4] = v0.y; cb[8 + p] = v1.x; cb[12 + p] = v1.y;
+        }
+        op.run(ca, cb, cc);
+        a0 = na0; a1 = na1; w = nw; h = nh; s0 = ns0; s1 = ns1; b0 = nb0; b1 = nb1; g = ng;
+    }
+#else
     for (int g = 0; g < KS / GS; g++) {
         // Q6: FP32 scales (Q6_K d * sub-block scale, exact), codes 0..63 with the implied bias -32 * scale
         const float4 s0 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + fn))
@@ -151,6 +208,7 @@ const char* kSource = R"METAL(
 #endif
         }
     }
+#endif
     if (SPLIT > 1) {
         // partials meet in threadgroup memory; split 0 adds them in split order, so the sum order is fixed per element
         threadgroup float* mine = part + ((local * SPLIT + split) * 32 + lane) * E;
@@ -222,55 +280,65 @@ const char* kSwiglu = R"METAL(
     const device uint2* wg = (const device uint2*)WG + wofs;
     const device uint2* wu = (const device uint2*)WU + wofs;
     const device half* xs = X + (size_t)fm * K + fn + split * KS;
-    for (int g = 0; g < KS / GS; g++) {
-        float4 sg0, sg1, su0, su1, bg0 = 0.0f, bg1 = 0.0f, bu0 = 0.0f, bu1 = 0.0f;
-        if (TQ4) {
-            sg0 = float4(as_type<half4>(*(const device ushort4*)(SG + sofs + g * 32 + fn)));
-            sg1 = float4(as_type<half4>(*(const device ushort4*)(SG + sofs + g * 32 + 16 + fn)));
-            su0 = float4(as_type<half4>(*(const device ushort4*)(SU + sofs + g * 32 + fn)));
-            su1 = float4(as_type<half4>(*(const device ushort4*)(SU + sofs + g * 32 + 16 + fn)));
-        } else {
-            sg0 = bf16x4(*(const device ushort4*)(SG + sofs + g * 32 + fn));
-            sg1 = bf16x4(*(const device ushort4*)(SG + sofs + g * 32 + 16 + fn));
-            su0 = bf16x4(*(const device ushort4*)(SU + sofs + g * 32 + fn));
-            su1 = bf16x4(*(const device ushort4*)(SU + sofs + g * 32 + 16 + fn));
-            bg0 = bf16x4(*(const device ushort4*)(BG + sofs + g * 32 + fn));
-            bg1 = bf16x4(*(const device ushort4*)(BG + sofs + g * 32 + 16 + fn));
-            bu0 = bf16x4(*(const device ushort4*)(BU + sofs + g * 32 + fn));
-            bu1 = bf16x4(*(const device ushort4*)(BU + sofs + g * 32 + 16 + fn));
-        }
-        for (short t = 0; t < GS / 16; t++) {
-            const int ks = g * (GS / 16) + t;
-            half4 a0 = fm < rows ? *(const device half4*)(xs + ks * 16) : half4(0.0h);
-            half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + ks * 16) : half4(0.0h);
-            for (short i = 0; i < 4; i++) {ca[i] = a0[i]; ca[4 + i] = a1[i];}
-            const uint2 w0 = wg[ks * 32], w1 = wu[ks * 32];
+    // The matmul kernel's prefetch, for both matrices: the next step's words and input halves load while this step
+    // decodes and runs (j1600: in the plain loop every step waits out a DRAM read).
+    constexpr int KSTEPS = KS / 16, GPS = GS / 16;
+    int g = -1;
+    float4 sg0, sg1, su0, su1, bg0, bg1, bu0, bu1;
+    half4 a0 = fm < rows ? *(const device half4*)(xs) : half4(0.0h);
+    half4 a1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K) : half4(0.0h);
+    uint2 w0 = wg[0], w1 = wu[0];
+    for (int ks = 0; ks < KSTEPS; ks++) {
+        const int nk = ks + 1 < KSTEPS ? ks + 1 : KSTEPS - 1, gk = ks / GPS;
+        const half4 na0 = fm < rows ? *(const device half4*)(xs + nk * 16) : half4(0.0h);
+        const half4 na1 = fm + 8 < rows ? *(const device half4*)(xs + 8 * K + nk * 16) : half4(0.0h);
+        const uint2 nw0 = wg[nk * 32], nw1 = wu[nk * 32];
+        if (gk != g) {
+            g = gk;
             if (TQ4) {
-                for (short i = 0; i < 8; i++) {
-                    cg[i] = half(float(TQ4_LEVEL[(w0.x >> (4 * i)) & 15u]) * sg0[i & 3]);
-                    cg[8 + i] = half(float(TQ4_LEVEL[(w0.y >> (4 * i)) & 15u]) * sg1[i & 3]);
-                    cu[i] = half(float(TQ4_LEVEL[(w1.x >> (4 * i)) & 15u]) * su0[i & 3]);
-                    cu[8 + i] = half(float(TQ4_LEVEL[(w1.y >> (4 * i)) & 15u]) * su1[i & 3]);
-                }
+                sg0 = float4(as_type<half4>(*(const device ushort4*)(SG + sofs + g * 32 + fn)));
+                sg1 = float4(as_type<half4>(*(const device ushort4*)(SG + sofs + g * 32 + 16 + fn)));
+                su0 = float4(as_type<half4>(*(const device ushort4*)(SU + sofs + g * 32 + fn)));
+                su1 = float4(as_type<half4>(*(const device ushort4*)(SU + sofs + g * 32 + 16 + fn)));
+                bg0 = bg1 = bu0 = bu1 = float4(0.0f);
             } else {
-                for (short p = 0; p < 4; p++) {
-                    const uint l0 = (w0.x >> (4 * p)) & 0x000F000Fu, l1 = (w0.y >> (4 * p)) & 0x000F000Fu;
-                    const uint m0 = (w1.x >> (4 * p)) & 0x000F000Fu, m1 = (w1.y >> (4 * p)) & 0x000F000Fu;
-                    const float2 q0 = float2(as_type<half2>(l0 | 0x64006400u)) - 1024.0f;
-                    const float2 q1 = float2(as_type<half2>(l1 | 0x64006400u)) - 1024.0f;
-                    const float2 r0 = float2(as_type<half2>(m0 | 0x64006400u)) - 1024.0f;
-                    const float2 r1 = float2(as_type<half2>(m1 | 0x64006400u)) - 1024.0f;
-                    const half2 v0 = half2(fma(q0, float2(sg0[p]), float2(bg0[p])));
-                    const half2 v1 = half2(fma(q1, float2(sg1[p]), float2(bg1[p])));
-                    const half2 u0 = half2(fma(r0, float2(su0[p]), float2(bu0[p])));
-                    const half2 u1 = half2(fma(r1, float2(su1[p]), float2(bu1[p])));
-                    cg[p] = v0.x; cg[p + 4] = v0.y; cg[8 + p] = v1.x; cg[12 + p] = v1.y;
-                    cu[p] = u0.x; cu[p + 4] = u0.y; cu[8 + p] = u1.x; cu[12 + p] = u1.y;
-                }
+                sg0 = bf16x4(*(const device ushort4*)(SG + sofs + g * 32 + fn));
+                sg1 = bf16x4(*(const device ushort4*)(SG + sofs + g * 32 + 16 + fn));
+                su0 = bf16x4(*(const device ushort4*)(SU + sofs + g * 32 + fn));
+                su1 = bf16x4(*(const device ushort4*)(SU + sofs + g * 32 + 16 + fn));
+                bg0 = bf16x4(*(const device ushort4*)(BG + sofs + g * 32 + fn));
+                bg1 = bf16x4(*(const device ushort4*)(BG + sofs + g * 32 + 16 + fn));
+                bu0 = bf16x4(*(const device ushort4*)(BU + sofs + g * 32 + fn));
+                bu1 = bf16x4(*(const device ushort4*)(BU + sofs + g * 32 + 16 + fn));
             }
-            op.run(ca, cg, ag);
-            op.run(ca, cu, au);
         }
+        for (short i = 0; i < 4; i++) {ca[i] = a0[i]; ca[4 + i] = a1[i];}
+        if (TQ4) {
+            for (short i = 0; i < 8; i++) {
+                cg[i] = half(float(TQ4_LEVEL[(w0.x >> (4 * i)) & 15u]) * sg0[i & 3]);
+                cg[8 + i] = half(float(TQ4_LEVEL[(w0.y >> (4 * i)) & 15u]) * sg1[i & 3]);
+                cu[i] = half(float(TQ4_LEVEL[(w1.x >> (4 * i)) & 15u]) * su0[i & 3]);
+                cu[8 + i] = half(float(TQ4_LEVEL[(w1.y >> (4 * i)) & 15u]) * su1[i & 3]);
+            }
+        } else {
+            for (short p = 0; p < 4; p++) {
+                const uint l0 = (w0.x >> (4 * p)) & 0x000F000Fu, l1 = (w0.y >> (4 * p)) & 0x000F000Fu;
+                const uint m0 = (w1.x >> (4 * p)) & 0x000F000Fu, m1 = (w1.y >> (4 * p)) & 0x000F000Fu;
+                const float2 q0 = float2(as_type<half2>(l0 | 0x64006400u)) - 1024.0f;
+                const float2 q1 = float2(as_type<half2>(l1 | 0x64006400u)) - 1024.0f;
+                const float2 r0 = float2(as_type<half2>(m0 | 0x64006400u)) - 1024.0f;
+                const float2 r1 = float2(as_type<half2>(m1 | 0x64006400u)) - 1024.0f;
+                const half2 v0 = half2(fma(q0, float2(sg0[p]), float2(bg0[p])));
+                const half2 v1 = half2(fma(q1, float2(sg1[p]), float2(bg1[p])));
+                const half2 u0 = half2(fma(r0, float2(su0[p]), float2(bu0[p])));
+                const half2 u1 = half2(fma(r1, float2(su1[p]), float2(bu1[p])));
+                cg[p] = v0.x; cg[p + 4] = v0.y; cg[8 + p] = v1.x; cg[12 + p] = v1.y;
+                cu[p] = u0.x; cu[p + 4] = u0.y; cu[8 + p] = u1.x; cu[12 + p] = u1.y;
+            }
+        }
+        op.run(ca, cg, ag);
+        op.run(ca, cu, au);
+        a0 = na0; a1 = na1; w0 = nw0; w1 = nw1;
     }
     if (SPLIT > 1) {
         threadgroup float* mine = part + ((local * SPLIT + split) * 32 + lane) * 32;
