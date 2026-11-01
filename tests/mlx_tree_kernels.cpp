@@ -125,7 +125,8 @@ int main() {
         // verified back to back, then 16 and 32 rows alternating
         const std::vector<int32_t> a16{-1, 0, 0, 1, 3, 1, 5, 2, 7, 0, 9, 4, 11, 6, 13, 8};
         const std::vector<int32_t> b16{-1, 0, 1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14};
-        for (const auto* t : {&a16, &b16, &a16, &tree32, &chain32, &tree32, &a16}) {
+        const std::vector<int32_t>* order[] = {&a16, &b16, &a16, &tree32, &chain32, &tree32, &a16};
+        for (const auto* t : order) {
             const int n = int(t->size()), equal = attention_rows_matching_paths(rng, *t, 3000);
             failures += equal != n;
             std::printf("%s MASK_CACHE %d rows after another tree at the same lengths: tree rows == their path, bit for bit: %d / %d\n",
