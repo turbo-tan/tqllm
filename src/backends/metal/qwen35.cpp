@@ -1199,15 +1199,29 @@ mx::array Qwen35::verify_tree_device(const mx::array& ids,const std::vector<int3
     try {auto out=verify_device(ids,batch);impl_->tree.reset();return out;}
     catch(...) {impl_->tree.reset();throw;}
 }
-void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& rows) {
+mx::array Qwen35::verify_tree_device(const mx::array& ids,const mx::array& parents,const mx::array& depth,const mx::array& visible,
+                                     Verification& batch) {
+    const int n=ids.ndim()==1?ids.shape(0):0;
+    if(n<1 || n>16 || parents.shape()!=mx::Shape{n} || depth.shape()!=mx::Shape{n} || visible.shape()!=mx::Shape{n,n} ||
+       parents.dtype()!=mx::int32 || depth.dtype()!=mx::int32 || visible.dtype()!=mx::bool_)
+        throw std::invalid_argument("device tree verification: 1-16 rows, int32 parents / depth, bool [n, n] ancestors");
+    if(impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("tree verification reads a BF16 KV cache only");
+    impl_->tree=Impl::TreeRows{parents,depth,visible,{}};
+    try {auto out=verify_device(ids,batch);impl_->tree.reset();return out;}
+    catch(...) {impl_->tree.reset();throw;}
+}
+void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& rows,const std::vector<int32_t>* tree_parents) {
     const auto* s=batch.state_.get();
     const int count=int(rows.size());
     if(!s || s->owner!=impl_.get() || s->epoch!=impl_->epoch || s->revision!=impl_->revision || count<1 || count>s->count ||
        impl_->pos!=s->start+s->count || rows[0]!=0)
         throw std::invalid_argument("MLX tree verification is stale or the path is invalid");
+    // a device tree's parents come from the caller (read back with the verify's choices)
+    const auto& parents=s->parents.empty() && tree_parents?*tree_parents:s->parents;
+    if(!parents.empty() && int(parents.size())!=s->count)throw std::invalid_argument("tree path: one parent per verified row");
     bool chain=true;
     for(int i=1;i<count;++i) {
-        const int parent=s->parents.empty()?rows[i]-1:s->parents[size_t(rows[i])];
+        const int parent=parents.empty()?rows[i]-1:parents[size_t(rows[i])];
         if(rows[i]<=0 || rows[i]>=s->count || parent!=rows[i-1])throw std::invalid_argument("tree path: each row is the previous row's child");
         chain=chain && rows[i]==i;
     }

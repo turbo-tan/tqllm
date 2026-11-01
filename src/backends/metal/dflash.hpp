@@ -63,9 +63,16 @@ public:
     void reserve_far(int rows);
     // with TQLLM_DEBUG=dflash_rankstats: the last draft's 16 candidates per proposed token, best unary score first
     const std::vector<std::vector<uint32_t>>& candidates() const;
-private:
+    // the selector lattice of a block (rows 0 .. block - 1, row 0 the anchor's): candidate ids [rows, 16], unary logits,
+    // gate rows [rows, rank] and successor rows [rows, 16, rank], all left on the device
     struct LatticeArrays {mlx::core::array mapped,unary,gate,successors;};
+    // draft_device_at's lattice before the chain selector: the input of a device token tree (tree_device.hpp); the
+    // drafter state advances as for draft_device_at
+    LatticeArrays draft_lattice_device(const mlx::core::array& anchor,const mlx::core::array& position,int count);
+    const mlx::core::array& selector_predecessor() const;  // [vocab, rank]: the predecessor codebook table
+private:
     LatticeArrays lattice_arrays(uint32_t anchor,int position,int count);
+    LatticeArrays device_lattice(const mlx::core::array& anchor,const mlx::core::array& position,int count);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

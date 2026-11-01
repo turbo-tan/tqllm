@@ -1,4 +1,7 @@
 #pragma once
+#include <array>
+#include <functional>
+#include <vector>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -41,6 +44,20 @@ inline mlx::core::array tree_key_mask(const mlx::core::array& visible, int rows,
     return mx::concatenate(parts, 1);
 }
 
+// Every attention layer of one tree verify asks for the same mask (same rows, keys and ancestor table), so it is built
+// on the first layer and reused by the others instead of once per layer. The entry holds the ancestor table it was built
+// from, so its id cannot be reused by a later table while it is cached; a new table replaces the entries.
+inline mlx::core::array cached_tree_mask(const mlx::core::array& visible, const std::array<int, 7>& shape,
+                                         const std::function<mlx::core::array()>& make) {
+    struct Entry {mlx::core::array visible, mask; std::array<int, 7> shape;};
+    // never destroyed: an array must not outlive MLX's allocator at exit
+    static thread_local auto* cache = new std::vector<Entry>();
+    if (!cache->empty() && cache->front().visible.id() != visible.id()) cache->clear();
+    for (const auto& e : *cache) if (e.shape == shape) return e.mask;
+    cache->push_back({visible, make(), shape});
+    return cache->back().mask;
+}
+
 // bf16_folded: GQA folded into query rows, so each KV head's keys and values are read once for its G query heads: q [1,
 // H, n, d] -> [1, KH, G * R, d] (rows padded at the front to R = decode_row_shape(n) per head), one MLX SDPA call per
 // layer with an explicit per-row causal mask (row r sees keys <= L - R + r % R). Rows stay independent of each other,
@@ -71,7 +88,8 @@ inline mlx::core::array decode_attention_bf16_folded(const mlx::core::array& q, 
     auto values = mx::slice(v, {0, 0, 0, 0}, {1, kvh, length, dim});
     auto t = mx::remainder(mx::arange(group * rows), mx::array(rows));                       // token of each folded row
     auto visible = mx::add(t, mx::array(length - rows));                                       // last visible key per row
-    auto mask = tree ? mx::tile(tree_key_mask(*tree, rows, n, length, length), {group, 1})
+    auto mask = tree ? cached_tree_mask(*tree, {0, rows, n, length, length, group, 0},
+                                        [&] {return mx::tile(tree_key_mask(*tree, rows, n, length, length), {group, 1});})
                      : mx::less_equal(mx::reshape(mx::arange(length), {1, length}), mx::reshape(visible, {group * rows, 1}));
     auto out = mx::fast::scaled_dot_product_attention(query, keys, values, scale, "array", mask);
     out = mx::reshape(out, {1, heads, rows, dim});
@@ -145,8 +163,10 @@ inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& 
     auto last = mx::add(mx::remainder(mx::arange(group * rows), mx::array(rows)), mx::array(length - rows));
     auto mask = mx::less_equal(key_index, mx::reshape(last, {1, 1, group * rows, 1}));
     if (tree)
-        mask = mx::reshape(mx::transpose(mx::reshape(mx::tile(tree_key_mask(*tree, rows, n, length, segments * seg), {group, 1}),
-                                                     {group * rows, segments, seg}), {1, 0, 2}), {segments, 1, group * rows, seg});
+        mask = cached_tree_mask(*tree, {1, rows, n, length, segments * seg, group, seg}, [&] {
+            return mx::reshape(mx::transpose(mx::reshape(mx::tile(tree_key_mask(*tree, rows, n, length, segments * seg), {group, 1}),
+                                                         {group * rows, segments, seg}), {1, 0, 2}), {segments, 1, group * rows, seg});
+        });
     // A token tree's side-branch rows must see their ancestors' keys where their AR step has them (prefix, then the path
     // in depth order): the matrix-unit kernel's rounding depends on where a visible key sits in its tiles, so a hole
     // before a key changes the result (mlx_tree_kernels). Those rows take only the full segments below the prefix's last

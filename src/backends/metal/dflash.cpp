@@ -583,7 +583,7 @@ void DFlash2::settle_device_inject(int rows) {
     if(i.fill_unsettled<1 || rows<1 || rows>i.block)throw std::invalid_argument("invalid DFlash inject settlement");
     --i.fill_unsettled;i.fill_settled=std::min(i.window,i.fill_settled+rows);
 }
-mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& position,int count) {
+DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx::array& position,int count) {
     auto& i=*impl_;
     if(!i.ring || !i.caches[0].k || count<1 || count>=i.block || anchor.dtype()!=mx::uint32 || anchor.ndim()!=0)
         throw std::invalid_argument("invalid DFlash device draft request");
@@ -614,11 +614,26 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
     lap(2,{selected,unary,mapped});
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
-    auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
-    lap(3,{chosen});
-    if(stages)++i.stage_calls;
+    return {mapped,mx::astype(unary,mx::float32),gate,successors};
+}
+mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& position,int count) {
+    auto& i=*impl_;
+    auto [mapped,unary,gate,successors]=device_lattice(anchor,position,count);
+    if(i.stages)mx::eval({mapped,unary,gate,successors});  // stage 3: the selector alone
+    auto tick=std::chrono::steady_clock::now();
+    auto chosen=dflash_select(mapped,unary,gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
+    if(i.stages) {
+        mx::eval(chosen);
+        i.stage_ms[3]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
+        ++i.stage_calls;
+    }
     return chosen;
 }
+DFlash2::LatticeArrays DFlash2::draft_lattice_device(const mx::array& anchor,const mx::array& position,int count) {
+    if(impl_->stages)throw std::logic_error("DFlash stage timing covers chain drafts only");
+    return device_lattice(anchor,position,count);
+}
+const mx::array& DFlash2::selector_predecessor() const {return impl_->plain.at("selector_predecessor.weight");}
 DFlash2::LatticeArrays DFlash2::lattice_arrays(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
     const int rows=i.draft_rows(count);

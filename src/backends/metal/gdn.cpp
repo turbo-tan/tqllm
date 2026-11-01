@@ -491,16 +491,25 @@ float s[16];
     const device float* src=initial+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)s[j]=src[j];
 }
-// token tree: a token whose parent is not the token just stepped restarts from the initial state and replays its
-// ancestors (same arithmetic, outputs dropped), so every token sees exactly its own path's state; a chain never replays
+// token tree: a token whose parent is not the token just stepped restarts and replays its ancestors (same arithmetic,
+// outputs dropped), so every token sees exactly its own path's state; a chain never replays. Every branch descends from
+// row 0, so a tree (TREE) keeps the state after row 0 and restarts there: the replay skips row 0 (on the recorded 8K
+// trees 57 of the 151 replayed rows per 12 steps)
 int cur=-1;
+float s0[16];
 for(uint t=0;t<uint(M);++t) {
     if(par[t]!=cur) {
-        const device float* src=initial+(head*128u+row)*128u+sub*16u;
-        for(uint j=0;j<16u;++j)s[j]=src[j];
         uint path[16];uint depth=0;
         for(int a=par[t];a>=0;a=par[a])path[depth++]=uint(a);
-        for(uint c=depth;c>0;--c) {
+        uint first=depth;
+        if(TREE && depth>0u) {  // path[depth - 1] is row 0
+            for(uint j=0;j<16u;++j)s[j]=s0[j];
+            first=depth-1u;
+        } else {
+            const device float* src=initial+(head*128u+row)*128u+sub*16u;
+            for(uint j=0;j<16u;++j)s[j]=src[j];
+        }
+        for(uint c=first;c>0;--c) {
             const uint u=path[c-1u];
             const float d=dec[u],b=bet[u];
             const threadgroup float* ku=ks+u*128u+sub*16u;
@@ -522,6 +531,7 @@ for(uint t=0;t<uint(M);++t) {
     for(uint j=0;j<16u;++j) {s[j]=s[j]+kt[j]*delta;value+=s[j]*qt[j];}
     value+=simd_shuffle_xor(value,1u);value+=simd_shuffle_xor(value,2u);value+=simd_shuffle_xor(value,4u);
     if(sub==0u) {os[t*128u+row]=value;deltas[(t*uint(VH)+head)*128u+row]=delta;}
+    if(TREE && t==0u)for(uint j=0;j<16u;++j)s0[j]=s[j];
     cur=int(t);
 }
 {
@@ -570,7 +580,8 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
         parents?mx::contiguous(*parents):mx::subtract(mx::arange(m,mx::int32),mx::array(1,mx::int32))},
         {{m,vh*128},{1,vh,128,128},{m,vh,128},{1,m,kh,128},{1,m,vh},{3,width}},
         {mx::float16,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32},
-        {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset}},
+        {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset},
+         {"TREE",int(parents!=nullptr)}},
         std::nullopt,false,mx::Device(mx::Device::gpu));
     return {result[0],result[1],result[2],result[3],result[4],result[5]};
 }
