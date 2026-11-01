@@ -521,7 +521,18 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
     if(!i.ring || !i.caches[0].k || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1 || n>2*i.block)
         throw std::invalid_argument("invalid DFlash device injection (needs the ring drafter after a host prefill inject)");
     i.to_device();
+    // inject_split (TQLLM_DEBUG): the parts of one inject, layer 0 only; inject_split_sync evaluates at each mark so a
+    // part's GPU time is its own
+    const bool isp=tqllm::debug_cstr("inject_split")!=nullptr, isp_sync=tqllm::debug_cstr("inject_split_sync")!=nullptr;
+    auto it=std::chrono::steady_clock::now();
+    auto ilap=[&](const char* what,const mx::array* v=nullptr) {
+        if(!isp)return;
+        if(isp_sync && v)mx::eval(*v);
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"INJECT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-it).count());it=now;
+    };
     auto encoded=i.norm("enc.output_norm.weight",i.mat("fc.weight",features));
+    ilap("enc",isp?&encoded:nullptr);
     // rows past the block (a 31-node tree's path) go in two ring advances, the second one chained off the first's head
     const int passes=n>i.block?2:1;
     for(int pass=0;pass<passes;++pass) {
@@ -550,14 +561,21 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
             auto k=mx::reshape(i.mat(p+"attn_k.weight",x),{1,rows,i.kvheads,i.hd});
             k=bf(mx::fast::rope(mx::transpose(i.norm(p+"attn_k_norm.weight",k),{0,2,1,3}),i.hd,false,i.theta,1.0f,pos));
             auto v=i.values(p,x);
+            if(l==0)it=std::chrono::steady_clock::now();
             c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
+            if(l==0)ilap("ring",&c.v);
             if(far_index) {
                 const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
+                if(l==0)ilap("quant",&qk.scales);
                 c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
+                if(l==0)ilap("fark",&c.kfull);
                 c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
+                if(l==0)ilap("farv",&c.vfull);
                 c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
                 c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
+                if(l==0)ilap("fars",&c.vfs);
                 c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
+                if(l==0)ilap("ksum",&c.ksum);
             }
         }
         i.head_dev=mx::remainder(mx::add(*i.head_dev,live),mx::array(i.window,mx::int32));
