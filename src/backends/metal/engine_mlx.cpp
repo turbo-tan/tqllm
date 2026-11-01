@@ -176,12 +176,14 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     {
         const auto plan = i.engine->plan_kv_format(int(prompt.size()), int(count), i.chunk, i.drafter->far_row_bytes());
         const auto tier = plan.tier;
-        i.engine->kv_format(tier); i.drafter->far_context(plan.far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
+        // no_far: the drafter's ring window only, what it costs against the far-context retrieval
+        const bool far = plan.far && !tqllm::debug_on("no_far");
+        i.engine->kv_format(tier); i.drafter->far_context(far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
         if (i.exact && tier != mlx_backend::KvTier::Bf16)
             std::fprintf(stderr, "tqserve: WARN --exact on: KV forced to %s by memory for this request\n", mlx_backend::kv_tier_name(tier));
         if (tier != mlx_backend::KvTier::Bf16 || prompt.size() > 32768)
             std::fprintf(stderr, "tqserve: KV format %s%s for %zu prompt + %u new tokens (in use %.1f GB, usable working set %.1f GB)\n",
-                         mlx_backend::kv_tier_name(tier), plan.far ? (plan.lean ? " (lean prefill)" : "") : (plan.lean ? " (drafter window only, lean prefill)" : " (drafter window only)"), prompt.size(), count, mx::get_active_memory() / 1e9,
+                         mlx_backend::kv_tier_name(tier), far ? (plan.lean ? " (lean prefill)" : "") : (plan.lean ? " (drafter window only, lean prefill)" : " (drafter window only)"), prompt.size(), count, mx::get_active_memory() / 1e9,
                          i.engine->kv_budget(i.chunk).working_set / 1e9);
     }
     mx::reset_peak_memory();
