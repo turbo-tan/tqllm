@@ -1217,6 +1217,7 @@ void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& r
     auto& i=*impl_;
     const auto index=mx::array(rows.data(),{count},mx::int32);
     auto caches=s->after;
+    std::vector<mx::array> moved_kv;
     for(int l=0;l<i.layers;++l) {
         auto& c=caches[l];const auto& tape=s->tapes[l];
         if((l+1)%i.interval==0) {
@@ -1224,11 +1225,9 @@ void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& r
                 auto& a=**kv;
                 auto moved=mx::take(mx::slice(a,{0,0,s->start,0},{1,a.shape(1),s->start+s->count,a.shape(3)}),index,2);
                 a=mx::slice_update(a,moved,{0,0,s->start,0},{1,a.shape(1),s->start+count,a.shape(3)});
+                moved_kv.push_back(a);
             }
             c.kv_len=s->start+count;
-            // run the moves now on this thread's stream: the KV buffers outlive the request, and a later request may run
-            // on another thread (MLX streams are per thread)
-            mx::async_eval({*i.kv_keys[l],*i.kv_values[l]});
         } else {
             if(!tape.conv_rows || !tape.deltas)throw std::invalid_argument("tree path accept needs the fused GDN step tape");
             auto joined=mx::concatenate({*tape.conv_prev,mx::take(*tape.conv_rows,index,0)},0);
@@ -1237,6 +1236,9 @@ void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& r
                                       s->before[l].state,count);
         }
     }
+    // run the moves now, in one submission, on this thread's stream: the KV buffers outlive the request, and a later request
+    // may run on another thread (MLX streams are per thread)
+    mx::async_eval(moved_kv);
     i.caches=std::move(caches);i.pos=s->start+count;++i.revision;
     const int last=rows[count-1];
     i.last_hidden=tail_slice(*s->hidden_after,0,last,last+1);

@@ -543,21 +543,29 @@ DFlash2::HostLattice DFlash2::draft_lattice(uint32_t anchor,int position,int cou
     auto un=mx::contiguous(mx::slice(unary,{1,0},{count+1,unary.shape(1)}));
     auto ga=mx::contiguous(mx::astype(mx::slice(gate,{1,0},{count+1,gate.shape(1)}),mx::float32));
     auto su=mx::contiguous(mx::slice(successors,{1,0,0},{count+1,successors.shape(1),successors.shape(2)}));
-    mx::eval(ids,un,ga,su);
+    // the predecessor rows of every candidate and of the anchor (the selector reads only these), gathered on the GPU so
+    // the whole lattice comes back in one readback
+    const uint32_t anchor_id[1]={anchor};
+    auto parents=mx::concatenate({mx::reshape(ids,{-1}),mx::array(anchor_id,{1},mx::uint32)},0);
+    auto pred=mx::contiguous(mx::astype(mx::take(i.plain.at("selector_predecessor.weight"),parents,0),mx::float32));
+    mx::eval(ids,un,ga,su,pred);
     HostLattice out;
     out.positions=count;out.topk=ids.shape(1);out.rank=ga.shape(1);
     out.tokens.assign(ids.data<uint32_t>(),ids.data<uint32_t>()+ids.size());
     out.unary.assign(un.data<float>(),un.data<float>()+un.size());
     out.gate.assign(ga.data<float>(),ga.data<float>()+ga.size());
     out.successor.assign(su.data<float>(),su.data<float>()+su.size());
-    // the predecessor rows of every candidate and the anchor (the selector reads only these)
-    out.predecessor_tokens=out.tokens;out.predecessor_tokens.push_back(anchor);
-    std::sort(out.predecessor_tokens.begin(),out.predecessor_tokens.end());
-    out.predecessor_tokens.erase(std::unique(out.predecessor_tokens.begin(),out.predecessor_tokens.end()),out.predecessor_tokens.end());
-    auto index=mx::array(out.predecessor_tokens.data(),{int(out.predecessor_tokens.size())},mx::uint32);
-    auto pred=mx::contiguous(mx::astype(mx::take(i.plain.at("selector_predecessor.weight"),index,0),mx::float32));
-    mx::eval(pred);
-    out.predecessor.assign(pred.data<float>(),pred.data<float>()+pred.size());
+    // pred row r belongs to parent token r; keep one row per distinct token, sorted for predecessor_row's lookup
+    std::vector<uint32_t> parent_ids(out.tokens);parent_ids.push_back(anchor);
+    std::vector<size_t> order(parent_ids.size());
+    for(size_t r=0;r<order.size();++r)order[r]=r;
+    std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) {return parent_ids[a]<parent_ids[b];});
+    const float* rows=pred.data<float>();
+    for(size_t r:order) {
+        if(!out.predecessor_tokens.empty() && out.predecessor_tokens.back()==parent_ids[r])continue;
+        out.predecessor_tokens.push_back(parent_ids[r]);
+        out.predecessor.insert(out.predecessor.end(),rows+r*size_t(out.rank),rows+(r+1)*size_t(out.rank));
+    }
     return out;
 }
 const float* DFlash2::HostLattice::predecessor_row(uint32_t token) const {
