@@ -51,8 +51,8 @@ void FlashNextEngine::take_snapshot(SlotState & s) {
     for (size_t l = 0; l < L; ++l) { copy(s.snap_state_[l], m.rec[l].state); copy(s.snap_conv_[l], m.rec[l].history); copy(s.snap_ple_[l], m.ple_past[l]); }
 }
 
-void FlashNextEngine::restore_snapshot(SlotState & s) {
-    auto & m = *s.model_; const int p = s.snap_;
+void FlashNextEngine::restore_snapshot(SlotState & s, int p) {
+    auto & m = *s.model_;
     m.set_spec(false);
     auto back = [](std::unique_ptr<Device<float>> & dst, const std::unique_ptr<Device<float>> & src) {
         require(bool(dst) == bool(src) && (!src || dst->count == src->count), "prompt cache: snapshot does not match the sequence state");
@@ -128,7 +128,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         throw std::runtime_error(std::string("CUDA context lost by an earlier request (") + cudaGetErrorString(e) + "); restart tqserve");
     { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
     if (tqllm::debug_on("mem")) { std::fprintf(stderr, "LEDGER request of %zu prompt tokens\n", prompt.size()); ledger("request start"); }
-    if (P0) restore_snapshot(S());
+    if (P0) restore_snapshot(S(), P0);  // snap_ is already cleared
     else S().model_ = std::make_unique<DecodeModel>(checkpoint, *f_.fixtures, *f_.cache, caching() ? size_t(slot_context()) : prompt.size() + count + 16);
     S().model_->mtp_experts = f_.mtp_cache.get();
     bind();

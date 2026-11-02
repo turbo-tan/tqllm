@@ -64,7 +64,7 @@ class FlashNextEngine final : public tqllm::Engine {
         return s.model_ ? reusable_prefix(s.seq_, s.snap_, prompt) : 0;
     }
     void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
-    void restore_snapshot(SlotState & s);  // back to snap_: recurrent / PLE state copied back, K/V and history cut
+    void restore_snapshot(SlotState & s, int p);  // back to position p (= snap_): recurrent / PLE state copied back, K/V and history cut
     // TQLLM_DEBUG=pc_verify: after a restore, prefill [0, p) into a fresh sequence (64-token steps) and print how far each
     // restored state buffer is from it (relative rms; a wrong buffer is ~1, rounding ~1e-3)
     void pc_verify(const std::vector<int> & ids, int p);
