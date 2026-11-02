@@ -389,9 +389,31 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
       // whole trunk bank in the refill): size them now, the steady state every later request already has
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
+      // several sequences: what one sequence really holds at the full slot context, measured with a one-token probe (trunk
+      // and MTP). The estimate below counts the attention state only; at 16K per slot a request start took ~990 MB against
+      // 610 kept, so np 4 ran out of memory in the third request (11-01, plans/multi-user-c8-20261031.md)
+      size_t measured_state = 0;
+      if (slots_.size() > 1) {
+          rt.kv_capacity = kv_capacity_full;
+          ck(cudaDeviceSynchronize()); const size_t before = tqllm::device_free_bytes();
+          {
+              DecodeModel probe(checkpoint, *f.fixtures, *f.cache, 64);
+              if (probe.miss_stream) f.cache->set_miss_stream(probe.miss_stream);
+              probe.mtp_experts = f.mtp_cache.get();
+              auto pr = probe.step(std::vector<int>{1000}); ck(cudaDeviceSynchronize());
+              (void) probe.mtp_batch(std::vector<int>{1000}, probe.res_keep->p); ck(cudaDeviceSynchronize());
+              const size_t after = tqllm::device_free_bytes();
+              measured_state = before > after ? before - after : 0;
+          }
+          if (warm.miss_stream) f.cache->set_miss_stream(warm.miss_stream);
+          rt.kv_capacity = std::min(kv_capacity_full, 4096);
+          std::fprintf(stderr, "tqllm: one sequence at %d positions holds %.0f MB of device memory (measured)\n", kv_capacity_full,
+                       measured_state / 1048576.0);
+      }
       if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep
           size_t per = 0; for (int l = 0; l < c.layers; ++l) if (f.cache->has_layout(l)) per += f.cache->bank_layout(l).block;
-          const auto [state, reserve] = context_keep();
+          const auto [state_est, reserve] = context_keep();
+          const size_t state = std::max(state_est, measured_state);
           // every slot (--np) keeps its own full-context attention / recurrent / MTP state beside the banks: sized for one,
           // np 4 at 32K ran out of memory in the second request's state (F38)
           const size_t nseq = slots_.size();
