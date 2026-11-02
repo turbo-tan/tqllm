@@ -847,7 +847,26 @@ private:
     // with its most-routed experts; every other expert stays in the GGUF on disk until a token routes to it.
     std::string hot_map_;
     void preload_hot(const std::vector<int> & caps) {
-        if (hot_map_.empty()) return;
+        if (hot_map_.empty()) {  // no routing profile: banks that hold their whole layer are filled now, not by first-use misses
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t filled = 0;
+            for (size_t l = size_t(dense_lead_); l < L_.size(); ++l) {
+                if (caps[l] < experts_) continue;
+                std::vector<int> ids(static_cast<size_t>(experts_));
+                for (int e = 0; e < experts_; ++e) ids[size_t(e)] = e;
+                bank_->prepare(int(l), ids);
+                bank_->wait_misses();
+                filled += ids.size();
+            }
+            if (filled) {
+                ck(cudaStreamSynchronize(stream_));
+                std::fprintf(stderr, "minimax: %zu experts preloaded into banks that hold their whole layer in %.0f s\n", filled,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                const auto b = bank_->stats();
+                base_hits_ = b.hits; base_misses_ = b.misses; base_moved_ = b.transfer_bytes; base_read_ = disk_read_bytes();
+            }
+            return;
+        }
         std::FILE * f = std::fopen(hot_map_.c_str(), "rb");
         if (!f) throw std::runtime_error("minimax: cannot read hot map " + hot_map_);
         std::vector<int64_t> c(L_.size() * size_t(experts_));
