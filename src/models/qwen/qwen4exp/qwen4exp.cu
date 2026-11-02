@@ -1312,10 +1312,128 @@ template<int T> __global__ void fn_gemv_bf16_seg_k(GemvSegs g, const float * x, 
         g.y[seg][int64_t(threadIdx.x) * g.ld[seg] + row] = r;
     }
 }
-void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t s) {
+// R rows of one segment per block (fn_gemv_bf16_seg_k with the tiles kernel's idea): x is read once per R rows instead of
+// once per row. A segment owns ceil(rows / R) consecutive blocks, its block range starting at the prefix sum over the
+// earlier segments; rows past the segment's end are clamped and never written. Each (row, token) sum keeps seg_k's order
+// (same threads, same columns per thread, same reductions), so the output is bit-identical.
+template<int R, int T> __global__ void fn_gemv_bf16_seg_rows_k(GemvSegs g, const float * x, int cols) {
+    int seg = 0, base = 0;
+    for (int s = 0; s < g.n; ++s) {  // g.start has n + 1 entries, so the last segment maps like the others
+        const int nb = (g.start[s + 1] - g.start[s] + R - 1) / R;
+        if (int(blockIdx.x) < base + nb) { seg = s; break; }
+        base += nb;
+    }
+    const int rows = g.start[seg + 1] - g.start[seg], row0 = (int(blockIdx.x) - base) * R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    float sum[R][T];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) sum[r][t] = 0.f;
+    for (int v = threadIdx.x; v < cols / 8; v += blockDim.x) {
+        float xs[T][8];
+        #pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float4 xa = reinterpret_cast<const float4 *>(x + int64_t(t) * cols)[2 * v], xb = reinterpret_cast<const float4 *>(x + int64_t(t) * cols)[2 * v + 1];
+            xs[t][0] = xa.x; xs[t][1] = xa.y; xs[t][2] = xa.z; xs[t][3] = xa.w; xs[t][4] = xb.x; xs[t][5] = xb.y; xs[t][6] = xb.z; xs[t][7] = xb.w;
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint4 packed = reinterpret_cast<const uint4 *>(g.w[seg] + int64_t(min(row0 + r, rows - 1)) * cols)[v];
+            const __nv_bfloat16 * wv = reinterpret_cast<const __nv_bfloat16 *>(&packed);
+            #pragma unroll
+            for (int t = 0; t < T; ++t)
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) sum[r][t] += __bfloat162float(wv[k]) * __bfloat162float(__float2bfloat16_rn(xs[t][k]));
+        }
+    }
+    __shared__ float part[R * T][8];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float s = sum[r][t];
+            for (int d = 16; d; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+            if (!lane) part[r * T + t][warp] = s;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < R * T; i += blockDim.x) {
+        const int r = i / T, t = i % T;
+        if (row0 + r >= rows) continue;
+        float s = 0.f;
+        for (int k = 0; k < int(blockDim.x / 32); ++k) s += part[i][k];
+        g.y[seg][int64_t(t) * g.ld[seg] + row0 + r] = s;
+    }
+}
+// up to 8 tokens per launch: a verify block (5 drafts + 1) reads each weight row once (with chunks of 4 it read it twice);
+// each token's sum keeps its order, so the output does not depend on how the tokens are grouped
+template <template <int> class K, class... A> static void bf16_by_tokens(int k, A... a) {
+    switch (k) {
+    case 1: K<1>::go(a...); break; case 2: K<2>::go(a...); break; case 3: K<3>::go(a...); break; case 4: K<4>::go(a...); break;
+    case 5: K<5>::go(a...); break; case 6: K<6>::go(a...); break; case 7: K<7>::go(a...); break; default: K<8>::go(a...); break;
+    }
+}
+template <int T> struct FewL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t ldy) {
+    fn_gemv_bf16_few_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols, ldy); } };
+template <int T> struct ShortL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
+    fn_gemv_bf16_short_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
+template <int T> struct MultiL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
+    fn_gemv_bf16_multi_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
+// fn_gemv_bf16_tokens' block-per-row path with R rows per block: fn_gemv_bf16_tiles_k (bit-identical to few_k) with one
+// token tile of k tokens.
+template <int R> static void few_rows_by_tokens(int k, int rows, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x,
+                                                float * y, int cols, int64_t ldy) {
+    const unsigned g = unsigned((rows + R - 1) / R);
+    switch (k) {
+    case 1: fn_gemv_bf16_tiles_k<R, 1><<<g, thr, 0, s>>>(w, x, y, rows, cols, 1, ldy); break; case 2: fn_gemv_bf16_tiles_k<R, 2><<<g, thr, 0, s>>>(w, x, y, rows, cols, 2, ldy); break;
+    case 3: fn_gemv_bf16_tiles_k<R, 3><<<g, thr, 0, s>>>(w, x, y, rows, cols, 3, ldy); break; case 4: fn_gemv_bf16_tiles_k<R, 4><<<g, thr, 0, s>>>(w, x, y, rows, cols, 4, ldy); break;
+    case 5: fn_gemv_bf16_tiles_k<R, 5><<<g, thr, 0, s>>>(w, x, y, rows, cols, 5, ldy); break; case 6: fn_gemv_bf16_tiles_k<R, 6><<<g, thr, 0, s>>>(w, x, y, rows, cols, 6, ldy); break;
+    case 7: fn_gemv_bf16_tiles_k<R, 7><<<g, thr, 0, s>>>(w, x, y, rows, cols, 7, ldy); break; default: fn_gemv_bf16_tiles_k<R, 8><<<g, thr, 0, s>>>(w, x, y, rows, cols, 8, ldy); break;
+    }
+}
+template <int R> static void seg_rows_by_tokens(int tokens, int blocks, int thr, cudaStream_t s, const GemvSegs & g, const float * x, int cols) {
+    switch (tokens) {
+    case 1: fn_gemv_bf16_seg_rows_k<R, 1><<<blocks, thr, 0, s>>>(g, x, cols); break; case 2: fn_gemv_bf16_seg_rows_k<R, 2><<<blocks, thr, 0, s>>>(g, x, cols); break;
+    case 3: fn_gemv_bf16_seg_rows_k<R, 3><<<blocks, thr, 0, s>>>(g, x, cols); break; case 4: fn_gemv_bf16_seg_rows_k<R, 4><<<blocks, thr, 0, s>>>(g, x, cols); break;
+    case 5: fn_gemv_bf16_seg_rows_k<R, 5><<<blocks, thr, 0, s>>>(g, x, cols); break; case 6: fn_gemv_bf16_seg_rows_k<R, 6><<<blocks, thr, 0, s>>>(g, x, cols); break;
+    case 7: fn_gemv_bf16_seg_rows_k<R, 7><<<blocks, thr, 0, s>>>(g, x, cols); break; default: fn_gemv_bf16_seg_rows_k<R, 8><<<blocks, thr, 0, s>>>(g, x, cols); break;
+    }
+}
+// the R a block-per-row launch takes: R rows per block read x once per R rows, so the grid shrinks R-fold; the GPU still
+// needs blocks in flight, and T tokens per launch give every thread T times the work, so the floor drops from 128 blocks
+// (1-2 tokens) to 24 (a full verify block). Measured on the 3090 step shapes (PROGRESS_GEMV.md): 320 x 10240 wants R=2
+// at T=1-2 and R=8 from T=4 on (1.24 vs 1.51 ms/step), the 1026-row router R=8 at every T, 48-128 row blocks R=2-4.
+static int gemv_rows_per_block(int blocks_at_one_row, int tokens, int pin) {
+    if (pin > 0) return pin;  // the perf test's A/B: 1 = the old one row per block
+    const int need = tokens <= 2 ? 128 : 24;
+    int r = 8;
+    while (r > 1 && (blocks_at_one_row + r - 1) / r < need) r /= 2;
+    return r;
+}
+static int gemv_seg_blocks(const GemvSegs & g, int r) { int b = 0; for (int s = 0; s < g.n; ++s) b += (g.start[s + 1] - g.start[s] + r - 1) / r; return b; }
+// the block-per-row launch of one row-block: R rows per block (x read once per R rows) when the grid stays wide enough,
+// few_k otherwise; both give the same bits.
+static void bf16_few_launch(int k, int rows, int cols, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int64_t ldy, int pin) {
+    switch (gemv_rows_per_block(rows, k, pin)) {
+    case 2: few_rows_by_tokens<2>(k, rows, thr, s, w, x, y, cols, ldy); return;
+    case 4: few_rows_by_tokens<4>(k, rows, thr, s, w, x, y, cols, ldy); return;
+    case 8: few_rows_by_tokens<8>(k, rows, thr, s, w, x, y, cols, ldy); return;
+    case 16: few_rows_by_tokens<16>(k, rows, thr, s, w, x, y, cols, ldy); return;
+    default: bf16_by_tokens<FewL>(k, unsigned(rows), thr, s, w, x, y, rows, cols, ldy); return;
+    }
+}
+void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t s, int rpb) {
     if (g.n <= 0 || g.n > kGemvSegs || cols <= 0 || cols % 8 || tokens <= 0 || tokens > 8 || !x) throw std::invalid_argument("bf16 gemv segments: invalid shape");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
     const int total = g.start[g.n];
+    const int r = gemv_rows_per_block(total, tokens, rpb);  // one row per block = total blocks
+    switch (r) {
+    case 2: seg_rows_by_tokens<2>(tokens, gemv_seg_blocks(g, 2), thr, s, g, x, cols); return;
+    case 4: seg_rows_by_tokens<4>(tokens, gemv_seg_blocks(g, 4), thr, s, g, x, cols); return;
+    case 8: seg_rows_by_tokens<8>(tokens, gemv_seg_blocks(g, 8), thr, s, g, x, cols); return;
+    case 16: seg_rows_by_tokens<16>(tokens, gemv_seg_blocks(g, 16), thr, s, g, x, cols); return;
+    default: break;
+    }
     switch (tokens) {  // up to 8: a verify block (5 drafts + 1) routes in one launch; per-token sums keep their order
     case 1: fn_gemv_bf16_seg_k<1><<<total, thr, 0, s>>>(g, x, cols); break; case 2: fn_gemv_bf16_seg_k<2><<<total, thr, 0, s>>>(g, x, cols); break;
     case 3: fn_gemv_bf16_seg_k<3><<<total, thr, 0, s>>>(g, x, cols); break; case 4: fn_gemv_bf16_seg_k<4><<<total, thr, 0, s>>>(g, x, cols); break;
@@ -1385,21 +1503,7 @@ void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, flo
     if (rows >= 8) fn_gemv_bf16x_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
     else fn_gemv_bf16x_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
 }
-// up to 8 tokens per launch: a verify block (5 drafts + 1) reads each weight row once (with chunks of 4 it read it twice);
-// each token's sum keeps its order, so the output does not depend on how the tokens are grouped
-template <template <int> class K, class... A> static void bf16_by_tokens(int k, A... a) {
-    switch (k) {
-    case 1: K<1>::go(a...); break; case 2: K<2>::go(a...); break; case 3: K<3>::go(a...); break; case 4: K<4>::go(a...); break;
-    case 5: K<5>::go(a...); break; case 6: K<6>::go(a...); break; case 7: K<7>::go(a...); break; default: K<8>::go(a...); break;
-    }
-}
-template <int T> struct FewL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t ldy) {
-    fn_gemv_bf16_few_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols, ldy); } };
-template <int T> struct ShortL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
-    fn_gemv_bf16_short_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
-template <int T> struct MultiL { static void go(unsigned g, int thr, cudaStream_t s, const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int64_t) {
-    fn_gemv_bf16_multi_k<T><<<g, thr, 0, s>>>(w, x, y, rows, cols); } };
-void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s) {
+void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s, int rpb) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 gemv: invalid shape or pointer");
     const int warps = 8, blocks = (rows + warps - 1) / warps;
     // Block per row when a warp per row leaves the GPU half empty and each row is long enough to share.
@@ -1408,18 +1512,18 @@ void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, in
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
     for (int t0 = 0; t0 < tokens; t0 += 8) {
         const int k = std::min(8, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * rows;
-        if (few) bf16_by_tokens<FewL>(k, unsigned(rows), thr, s, w, xt, yt, rows, cols, int64_t(rows));
+        if (few) bf16_few_launch(k, rows, cols, thr, s, w, xt, yt, int64_t(rows), rpb);
         else if (shrt) bf16_by_tokens<ShortL>(k, unsigned((rows * 8 + 255) / 256), 256, s, w, xt, yt, rows, cols, int64_t(rows));
         else bf16_by_tokens<MultiL>(k, unsigned(blocks), warps * 32, s, w, xt, yt, rows, cols, int64_t(rows));
     }
 }
-void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
+void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s, int rpb) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 strided gemv: invalid shape or pointer");
     if (!(rows <= 16 || (rows <= 1024 && cols >= 1024))) throw std::invalid_argument("Flash-Next bf16 strided gemv: rows take the warp-per-row path");
     const int thr = std::min(256, std::max(32, (cols / 8 / 4 + 31) / 32 * 32));
     for (int t0 = 0; t0 < tokens; t0 += 8) {
         const int k = std::min(8, tokens - t0); const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * ldy;
-        bf16_by_tokens<FewL>(k, unsigned(rows), thr, s, w, xt, yt, rows, cols, ldy);
+        bf16_few_launch(k, rows, cols, thr, s, w, xt, yt, ldy, rpb);
     }
 }
 } // namespace tqllm_cuda

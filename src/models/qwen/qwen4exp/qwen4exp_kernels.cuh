@@ -69,8 +69,9 @@ void fn_attention_gate(float * out, const float * query_gate, int heads, int dim
 // out[t] = sum_k w[t][k] * routed[t][k] + shared_w[t] * shared[t].
 // Single-token BF16 GEMV: y[r] = sum_c W[r][c] * bf16(x[c]), F32 accumulate. One warp per row; cols % 8 == 0.
 void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, cudaStream_t);
-// tokens columns at once ([tokens][cols] -> [tokens][rows]); weights read once per 4 tokens, per-token sums as fn_gemv_bf16.
-void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t);
+// tokens columns at once ([tokens][cols] -> [tokens][rows]); per-token sums as fn_gemv_bf16. rows_per_block: rows of one
+// weight block per CUDA block (x read once per block); 0 = the dispatch's rule, 1 = one row per block.
+void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
 // Prefill chunks on the block-per-row layout (rows <= 16, or rows <= 1024 with cols >= 1024): sums bit-identical to
 // fn_gemv_bf16_tokens, x read once per 8 rows; output row t at y + t * ldy.
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
@@ -78,11 +79,12 @@ void fn_round_bf16(const float * x, __nv_bfloat16 * xb, int64_t n, cudaStream_t)
 void fn_softmax_peak(const float * x, int n, float * out, cudaStream_t);
 void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 // fn_gemv_bf16_tokens on its block-per-row path with output row t at y + t * ldy (same sums, bit-identical).
-void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
+void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t, int rows_per_block = 0);
 constexpr int kGemvSegs = 4;
 struct GemvSegs { int n = 0; int start[kGemvSegs + 1] = {}; const __nv_bfloat16 * w[kGemvSegs] = {}; float * y[kGemvSegs] = {}; int64_t ld[kGemvSegs] = {}; };
 // Only for row-blocks that fn_gemv_bf16_tokens runs on its block-per-row path (rows <= 16, or rows <= 1024 with cols >= 1024).
-void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t);
+// rows_per_block as in fn_gemv_bf16_tokens: R rows of a segment per block, bit-identical.
+void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
 void fn_swiglu_bf16_h(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, int64_t count, cudaStream_t);
 // fn_swiglu_bf16_h on the assignments listed per slot (counts[slots], groups[slots][capacity] of assignment indices, rows of ff)
 void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, const int * counts, const int * groups,
