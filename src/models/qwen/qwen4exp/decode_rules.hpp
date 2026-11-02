@@ -59,6 +59,17 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
 
+// --prompt-cache: prompt tokens a slot reuses. Its last prompt `seq` left its state at `snap` (kTail before that prompt's
+// end); a new prompt reuses [0, snap) when it is longer than snap and equals seq on [0, snap] (the token at snap pairs with
+// residual snap - 1 in the MTP KV). Anything else prefills from 0.
+template<class A, class B> inline int reusable_prefix(const A & seq, int snap, const B & prompt) {
+    if (snap <= 0 || prompt.size() <= size_t(snap) || seq.size() <= size_t(snap)) return 0;
+    for (size_t i = 0; i <= size_t(snap); ++i) if (int64_t(seq[i]) != int64_t(prompt[i])) return 0;
+    return snap;
+}
+// where the next prompt's state is kept: kTail before this prompt's end, when the new part is at least 2 x kTail
+inline int snapshot_at(int prompt, int reused, int tail) { return prompt >= reused + 2 * tail ? prompt - tail : 0; }
+
 // The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
 // easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt
 // 0.72 s of time to first token (cudaMallocHost of 1.6 GB beside an 80 GB pinned expert pack), more at 128K. Never on

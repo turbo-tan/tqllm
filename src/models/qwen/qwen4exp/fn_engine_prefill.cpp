@@ -114,7 +114,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // after it. The catch-up runs the same batches in the same order as when it followed each chunk.
     const int P = int(ids.size()), T = P - P0; const int W = S().model_->width;
     // the snapshot for the next request: a chunk boundary kTail before the prompt's end
-    const int snap = caching() && P >= P0 + 2 * kTail ? P - kTail : 0;
+    const int snap = caching() ? snapshot_at(P, P0, kTail) : 0;
     auto chunk_end = [&](int b, int ch) { const int e = std::min(P, b + ch); return snap > b && snap < e ? snap : e; };
     stamp("model ready");
     // the prefill chunk for this request: the engine's chunk, halved while the plan cannot fit even with every bank

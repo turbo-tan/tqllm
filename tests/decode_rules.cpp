@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace tqllm::flashnext;
 static int failures = 0;
@@ -111,6 +112,16 @@ int main() {
     check(!warm_at_start("per_layer_token_embd.weight", 28.8e9, 24.7e9), "no start-up read of a 28.8 GB embedding on a 23 GiB host");
     // per-layer decode graphs: on unified memory (GB10 +5-6 %) and on PCIe cards before Blackwell (3090: off cost chat
     // 86.5 -> 83.9 tok/s, 32K 75.8 -> 73.9); off on Blackwell PCIe cards (5090: chat 128 -> 154 with graphs off)
+    {   // --prompt-cache: an agent's next turn = the last prompt (its tail re-rendered) + a new message
+        const std::vector<int> seq{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const int snap = snapshot_at(10, 0, 2);
+        check(snap == 8 && snapshot_at(10, 7, 2) == 0 && snapshot_at(3, 0, 2) == 0, "snapshot kTail before the end, only when the new part is >= 2 x kTail");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 99, 11}) == 8, "next turn: equal through the token at snap -> reuse [0, snap)");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8, 42, 10}) == 0, "the token at snap differs (MTP pair snap - 1): no reuse");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 0, 5, 6, 7, 8, 9}) == 0, "an earlier token differs: no reuse");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "a prompt no longer than snap: no reuse");
+        check(reusable_prefix(seq, 0, std::vector<uint32_t>{1, 2, 3}) == 0, "no snapshot: no reuse");
+    }
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
     check(layer_graphs(false, 8) && layer_graphs(false, 9), "RTX 3090 / 4090 (sm_86 / sm_89) keep the decode graphs");
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");

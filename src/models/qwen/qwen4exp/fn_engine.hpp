@@ -9,6 +9,7 @@
 // expert caches persist across requests.
 #include "fn_model.hpp"
 #include "engine.hpp"
+#include "decode_rules.hpp"
 #include "cold_expert_store.hpp"
 #include "cold_expert_memo.hpp"
 #include "expert_read_pool.hpp"
@@ -60,9 +61,7 @@ class FlashNextEngine final : public tqllm::Engine {
     static constexpr int kTail = 64;  // the next turn re-renders the end of the last prompt (assistant header) differently
     bool caching() const { return f_.cp->run.prompt_cache && slots_.size() > 1; }
     static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, snap_) are reusable
-        if (!s.model_ || s.snap_ <= 0 || prompt.size() <= size_t(s.snap_) || s.seq_.size() <= size_t(s.snap_)) return 0;
-        for (int i = 0; i <= s.snap_; ++i) if (uint32_t(s.seq_[size_t(i)]) != prompt[size_t(i)]) return 0;  // + the token at snap_ (its MTP pair)
-        return s.snap_;
+        return s.model_ ? reusable_prefix(s.seq_, s.snap_, prompt) : 0;
     }
     void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
     void restore_snapshot(SlotState & s);  // back to snap_: recurrent / PLE state copied back, K/V and history cut
