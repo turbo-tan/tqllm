@@ -358,6 +358,9 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     // in the same call double-book a slot, caught by test-mixed-expert-cache). If the batch fails, every (id, target) here
     // is rolled back to -1 in the catch block below (10-29 review: without the rollback, a failed copy left the slot
     // reading as a permanent hit on stale bytes - the slot is never re-copied once it reads resident).
+    // misses whose copy is deferred past the loop (batched DMA, zero-copy kernel reads, staged scatter): a later miss of the
+    // same call that throws must take their residency back, or they read as hits on bytes never copied (GB10 takes the
+    // zero-copy path, the 3090 the batched one)
     std::vector<std::pair<int, int>> batch_commit;
     auto flush_batch = [&] {
         if (batch_dst.empty()) return;
@@ -472,6 +475,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
                 }
             }
             s.counters.transfer_bytes += off;
+            batch_commit.push_back({id, target});
         } else if (packed_src) {
             size_t total = 0; for (int p = 0; p < 3; ++p) total += bank->stride[p] + bank->aux_stride[p];
             if (s.registered) checked(cudaMemcpyAsync(s.device_staging + offset, packed_src, total, cudaMemcpyHostToDevice, up));
@@ -486,6 +490,7 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
                 }
             }
             s.counters.transfer_bytes += total;
+            batch_commit.push_back({id, target});
         } else
         for (int p = 0; p < 3 && (idle_host(), true); ++p) {
             const int cols = p == 2 ? s.ff : s.hidden, rows = p == 2 ? s.hidden : s.ff;
