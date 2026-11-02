@@ -122,6 +122,7 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
     i.exact = options.exact;
     i.engine->set_exact(i.exact);
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
+    mlx_backend::warm_split_attention_kernels(i.engine->q_heads(), i.engine->kv_heads());
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());

@@ -147,4 +147,13 @@ inline mlx::core::array decode_attention_split(const mlx::core::array& q, const 
                  std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+// compile the split-attention kernels once at load, so the first verify of a request does not pay the MPP compile
+// (j1769: the first prompt's steps averaged 102.5 ms against 86 on the next four)
+inline void warm_split_attention_kernels(int heads, int kvheads) {
+    namespace mx = mlx::core;
+    if (heads != 6 * kvheads) return;
+    auto q = mx::astype(mx::random::normal({1, heads, 16, 256}), mx::bfloat16);
+    auto k = mx::astype(mx::random::normal({1, kvheads, 1024, 256}), mx::bfloat16);
+    mx::eval(decode_attention_split(q, k, k, 0.0625f, 1000, split_attention_bits(nullptr, 16)));
+}
 }  // namespace tqllm::mlx_backend
