@@ -14,6 +14,7 @@
 // ancestors equal the target's choice after their parent. Sibling tokens are distinct (top-16 candidates), so the
 // accepted rows form one path; in depth-first order its rows ascend.
 #include <mlx/mlx.h>
+#include <algorithm>
 
 #include <cstdint>
 #include <stdexcept>
@@ -61,7 +62,10 @@ inline DeviceTree device_tree(const mlx::core::array& mapped, const mlx::core::a
         throw std::invalid_argument("device tree: invalid lattice");
     if (o.nodes < 1 || o.nodes > 63 || o.children < 1 || o.children > topk || !(o.tau > 0))
         throw std::invalid_argument("device tree: invalid options");
-    const int P = positions, k = o.children, N = o.nodes, n = N + 1;
+    // a short draft (few positions) can offer fewer nodes than asked: the tree takes what the lattice has
+    int avail = 0;
+    for (int d = 0, w = 0; d < positions && avail < o.nodes; ++d) {w = d == 0 ? o.children : std::min(o.nodes, w * o.children); avail += w;}
+    const int P = positions, k = o.children, N = std::min(o.nodes, avail), n = N + 1;
     auto tok = mx::astype(mx::slice(mapped, {1, 0}, {P + 1, topk}), mx::uint32);
     auto un = mx::astype(mx::slice(unary, {1, 0}, {P + 1, topk}), mx::float32);
     auto ga = mx::astype(mx::slice(gate, {1, 0}, {P + 1, rank}), mx::float32);
@@ -116,7 +120,7 @@ inline DeviceTree device_tree(const mlx::core::array& mapped, const mlx::core::a
     }
     auto scores = mx::concatenate(all_score, 0);
     const int total = scores.shape(0);
-    if (total < N) throw std::invalid_argument("device tree: the lattice has fewer nodes than the tree");
+    if (total < N) throw std::logic_error("device tree: node count mismatch");
     auto top = mx::slice(mx::argsort(mx::negative(scores)), {0}, {N});
     auto keys = mx::take(mx::concatenate(all_key, 0), top);
     auto dfs = mx::argsort(keys);  // depth-first: a parent's key is a prefix (smaller), siblings by rank
