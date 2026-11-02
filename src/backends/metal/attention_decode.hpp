@@ -15,6 +15,8 @@
 #include <mlx/ops.h>
 #include <mlx/transforms.h>
 
+#include "attention_split.hpp"
+
 namespace tqllm::mlx_backend {
 // Decode / verify attention for 1-16 query rows over the BF16 KV cache: every call has the shape of a 16-row call, so a
 // row's result does not depend on how many rows share the call (AR and the 16-row verify agree bit for bit).
@@ -803,6 +805,11 @@ inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const m
         const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), length = valid > 0 ? valid : k.shape(2);
         constexpr int seg = kAttentionSegment;
         if (length <= seg) return decode_attention_bf16_folded(q, k, v, scale, length, tree);
+        // token-tree verify (no host side branches, one call of <= 16 rows): split-K over key chunks
+        if (tree && (!tree_parents || tree_parents->empty()) && block_rows == 0 && split_attention_fits(q, k)) {
+            auto bits = cached_tree_mask(*tree, {3, n, 0, 0, 0, 0, 0}, [&] {return split_attention_bits(tree, n);});
+            return decode_attention_split(q, k, v, scale, length, bits);
+        }
         if (tree) return decode_attention_bf16_segmented(q, k, v, scale, length, seg, tree, tree_parents, block_rows, block_offset);
         if (length - n + 1 <= seg) {
             const int below = seg - (length - n);
