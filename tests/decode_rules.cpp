@@ -122,6 +122,7 @@ int main() {
         check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "a prompt no longer than snap: no reuse");
         check(reusable_prefix(seq, 0, std::vector<uint32_t>{1, 2, 3}) == 0, "no snapshot: no reuse");
     }
+    check(qsa_key_ring_cells(true, 32768) == 32768 && qsa_key_ring_cells(false, 32768) == 0, "QSA key ring + host mirror on discrete GPUs only (GB10: the full array, no mirror)");
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
     check(layer_graphs(false, 8) && layer_graphs(false, 9), "RTX 3090 / 4090 (sm_86 / sm_89) keep the decode graphs");
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");

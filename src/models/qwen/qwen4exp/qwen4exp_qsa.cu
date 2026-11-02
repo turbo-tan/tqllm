@@ -3,6 +3,7 @@
 #include <vector>
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
+#include "decode_rules.hpp"
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
@@ -714,9 +715,17 @@ void qsa_attention_selected(const float * query, const __nv_bfloat16 * gathered_
     ck(cudaPeekAtLastError());
 }
 
+namespace {
+bool unified_memory() {
+    static const bool on = [] { int dev = 0, v = 0; cudaGetDevice(&dev);
+        return cudaDeviceGetAttribute(&v, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && v; }();
+    return on;
+}
+}  // namespace
+
 QsaIndexer::QsaIndexer(int max_cells, int ratio, int top_k, int heads, int dim, int rotary,
                        float theta, float epsilon)
-    : keys_(max_cells, ratio, dim), selector_(max_cells, ratio, top_k),
+    : keys_(max_cells, ratio, dim, tqllm::flashnext::qsa_key_ring_cells(unified_memory(), max_cells)), selector_(max_cells, ratio, top_k),
       ratio_(ratio), heads_(heads), dim_(dim), rotary_(rotary),
       theta_(theta), epsilon_(epsilon) {
     if (heads <= 0 || dim <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() ||

@@ -59,6 +59,11 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
 
+// QSA raw indexer keys: a ring of the newest cells plus a pinned host mirror on discrete GPUs (~0.9 GB of VRAM back at
+// 128K); on unified memory (GB10) pinned host memory is the same memory, so the full array stays (no mirror, no D2H per
+// append). Returns the ring's cells (0: the default ring).
+inline int qsa_key_ring_cells(bool unified_memory, int max_cells) { return unified_memory ? max_cells : 0; }
+
 // --prompt-cache: prompt tokens a slot reuses. Its last prompt `seq` left its state at `snap` (kTail before that prompt's
 // end); a new prompt reuses [0, snap) when it is longer than snap and equals seq on [0, snap] (the token at snap pairs with
 // residual snap - 1 in the MTP KV). Anything else prefills from 0.
