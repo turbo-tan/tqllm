@@ -6,6 +6,17 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Added
+- Prompt cache across request slots (Flash-Next, `--prompt-cache on` with `--np` > 1): each slot keeps its conversation,
+  a request goes to the slot that already holds most of its prompt, and only the new part is prefilled. Eight concurrent
+  agent sessions on a GB10: 11.9 vs 4.5 tok/s total, first token 7 s vs 30 s. A reused prompt is not byte-identical to an
+  uncached one, so with `--exact on` the server prints a warning.
+- `repeat_penalty` (LM Studio / llama.cpp; `repetition_penalty` accepted) and `frequency_penalty` per request, and
+  `--repeat-penalty` / `--frequency-penalty` server defaults, next to `presence_penalty` (27B engine; sampling only).
+- Flash-Next: faster decode at long context (multi-row BF16 matrix-vector kernel, indexer keys in a ring with a host
+  mirror, expert banks grown into free memory after a long prompt): 128K exact 79.2 vs 73.5 tok/s on an RTX 3090, chats
+  +3.5-8 %, same output.
+- Quantised mmproj tensors (Q5_0 / Q5_1) load for the vision encoder.
+- MiniMax: `--draft-vocab FILE` runs the DSpark drafter's head over a token subset (exact: the target verifies every token).
 - `--exact on|off`, on by default: every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8
   GEMMs, no CPU-served experts), so greedy output is the same from build to build. `--exact off` turns on each engine's
   measured approximations; an approximation asked for explicitly with `--exact on` runs with one `WARN` line and a
@@ -23,8 +34,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   from 32K to 128K run 2-15 % faster. Changes: the drafter's native 8-row blocks on prompts of 8,000 tokens or more,
   draft-ahead and a per-request width policy, int8 KV from 32K keys, and far-context retrieval for the drafter.
   Verify attention reads the int8 KV in place. Greedy speculative output equals plain decoding.
-- MiniMax-M3.1-Flash from the EXL3 2.15 bpw pack (Hugging Face folder, no conversion) on one GB10 / DGX Spark, with the
-  DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
+- MiniMax-M3.1-Flash (experimental: its greedy output has not yet been checked against a reference implementation and
+  changed in this release; treat its text and speed as preview) from the EXL3 2.15 bpw pack (Hugging Face folder, no
+  conversion) on one GB10 / DGX Spark, with the DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
   when the context needs it, and a draft length that follows the measured acceptance. Prefill 537 tok/s on an 8K prompt
   at 16K context, 492 tok/s at 32K.
 - GLM-5.3-Flash (GSQ GGUF): sparse attention with the DSA indexer, contexts up to 128K on a GB10, prompt chunks of
