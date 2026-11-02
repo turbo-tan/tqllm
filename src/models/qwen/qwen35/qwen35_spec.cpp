@@ -319,13 +319,13 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
 int Qwen35Engine::accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0) {
     int j = 0;
     if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
-        std::vector<uint32_t> recent;  // presence window: the output so far, then each draft token as it is accepted
-        if (samp.presence > 0.f) {
+        std::vector<uint32_t> recent;  // penalty window: the output so far, then each draft token as it is accepted
+        if (samp.penalized()) {
             const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
             recent.assign(gen.out.begin() + long(r0), gen.out.end());
         }
         j = accept_drafts(draft.data(), int(draft.size()), [&](int i, const std::vector<uint32_t> & r) { return dist(col0 + i, r); },
-                          rng, res, recent, samp.presence > 0.f);
+                          rng, res, recent, samp.penalized());
     } else {
         while (j < int(draft.size()) && draft[j] == res[j]) ++j;
     }

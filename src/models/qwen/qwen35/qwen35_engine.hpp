@@ -617,6 +617,7 @@ public:
     void set_full_logits(bool on) override { full_logits = on; }
     const float * verify_logits() const override { return v_logits.as<float>(); }
     void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) override;
+    void set_penalties(float repeat, float frequency) override;
 
     // positions [pos, pos + n) are written next: evict old granules to host if the device window needs room (between
     // launches; remaps keep every address, so captured graphs stay valid) and publish the bytes each layer stages back

@@ -97,6 +97,8 @@ struct SamplingDefaults {
     float temperature = 0.f, top_p = 1.f;
     int top_k = 0;
     float presence_penalty = 0.f;  // Qwen: 1.5 against phrase loops in long sampled thinking
+    float repeat_penalty = 1.f;     // --repeat-penalty (LM Studio / llama.cpp; 1 = off), last 64 output tokens
+    float frequency_penalty = 0.f;  // --frequency-penalty: logit - penalty x count in the last 64 output tokens
 };
 inline SamplingDefaults & sampling_defaults() {
     static SamplingDefaults d;
@@ -122,6 +124,8 @@ struct ChatRequest {
     float top_p = sampling_defaults().top_p;
     int top_k = sampling_defaults().top_k;
     float presence_penalty = sampling_defaults().presence_penalty;  // sampling only: logit - penalty, last 64 output tokens
+    float repeat_penalty = sampling_defaults().repeat_penalty;      // sampling only: repeat_penalty / repetition_penalty
+    float frequency_penalty = sampling_defaults().frequency_penalty;
     uint64_t seed = 0;
     bool ignore_eos = false;  // decode to max_tokens through end-of-sequence tokens (vLLM / llama.cpp field)
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
@@ -206,6 +210,9 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         double tv = 0;
         if (num("temperature", tv)) req.temperature = float(tv);
         if (num("presence_penalty", tv)) req.presence_penalty = float(tv);
+        if (num("frequency_penalty", tv)) req.frequency_penalty = float(tv);
+        if (num("repetition_penalty", tv)) req.repeat_penalty = float(tv);  // vLLM / transformers name
+        if (num("repeat_penalty", tv)) req.repeat_penalty = float(tv);      // llama.cpp / LM Studio / Ollama name
         if (num("top_p", tv)) req.top_p = float(tv);
         if (const auto * x = root.get("top_k"); x && x->kind != tqllm::Json::Null) {
             if (x->kind != tqllm::Json::Number || !std::isfinite(x->num) || x->num < 0 ||
@@ -766,6 +773,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         { tqllm::PrefillObservation progress(observe_prefill(req.observation));
@@ -1190,6 +1198,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+    model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
     { tqllm::PrefillObservation progress(observe_prefill(req.observation));

@@ -1,6 +1,7 @@
 #pragma once
 // Token sampling shared by the engines (temperature > 0): a position's top-16 candidates with exact logits (the head's
-// top-16 kernel) become a distribution (presence penalty, temperature, top-k <= 16, top-p); draws come from it, and
+// top-16 kernel) become a distribution (repeat / frequency / presence penalties, temperature, top-k <= 16, top-p); draws
+// come from it, and
 // speculative acceptance against it gives exact samples of the target with deterministic drafts (accept draft d with
 // p(d), else resample from p without d; bonus token from p).
 #include <algorithm>
@@ -11,7 +12,13 @@
 
 namespace tqllm {
 
-struct SamplingParams { float temperature = 0.f, top_p = 1.f, presence = 0.f; int top_k = 0; };
+// Penalties on the tokens of the last kPresenceLastN outputs (llama.cpp order): repeat (LM Studio / llama.cpp repeat_penalty:
+// a positive logit divided by it, a negative one multiplied), then frequency x count + presence subtracted.
+struct SamplingParams {
+    float temperature = 0.f, top_p = 1.f, presence = 0.f; int top_k = 0;
+    float repeat = 1.f, frequency = 0.f;
+    bool penalized() const { return presence > 0.f || frequency > 0.f || repeat != 1.f; }
+};
 constexpr int kPresenceLastN = 64;  // llama.cpp's default penalty window (repeat_last_n)
 struct TopDist { uint32_t id[16]; double p[16]; int n = 0; };
 
@@ -23,10 +30,14 @@ inline TopDist top_dist(const float * logits16, const uint32_t * ids16, const Sa
     for (int i = 0; i < 16; ++i) ord[i] = i;
     float lg[16];
     std::copy_n(logits16, 16, lg);
-    if (s.presence > 0.f) {
+    if (s.penalized()) {
         const size_t r0 = recent.size() > size_t(kPresenceLastN) ? recent.size() - kPresenceLastN : 0;
-        for (int i = 0; i < 16; ++i)
-            if (std::find(recent.begin() + long(r0), recent.end(), ids16[i]) != recent.end()) lg[i] -= s.presence;
+        for (int i = 0; i < 16; ++i) {
+            const long cnt = std::count(recent.begin() + long(r0), recent.end(), ids16[i]);
+            if (!cnt) continue;
+            if (s.repeat != 1.f) lg[i] = lg[i] > 0.f ? lg[i] / s.repeat : lg[i] * s.repeat;
+            lg[i] -= s.frequency * float(cnt) + s.presence;
+        }
     }
     std::sort(ord, ord + 16, [&](int a, int b) { return lg[a] > lg[b]; });
     const int k = s.top_k > 0 ? std::min(s.top_k, 16) : 16;
@@ -61,11 +72,11 @@ template<class Rng> uint32_t draw(const TopDist & d, Rng & rng, uint32_t exclude
 }
 
 // Speculative acceptance of n drafts: dist_at(j, recent) is position j's distribution (j = n: the bonus position).
-// Writes res[0..j] (res[j] the resampled or bonus token), returns j accepted drafts; with presence, recent grows by each
-// accepted draft.
+// Writes res[0..j] (res[j] the resampled or bonus token), returns j accepted drafts; with penalties (track), recent grows
+// by each accepted draft.
 template<class DistAt, class Rng>
 int accept_drafts(const uint32_t * draft, int n, DistAt && dist_at, Rng & rng, uint32_t * res, std::vector<uint32_t> & recent,
-                  bool presence) {
+                  bool track) {
     std::uniform_real_distribution<double> uni(0.0, 1.0);
     for (int j = 0; j < n; ++j) {
         const TopDist d = dist_at(j, recent);
@@ -75,7 +86,7 @@ int accept_drafts(const uint32_t * draft, int n, DistAt && dist_at, Rng & rng, u
             res[j] = draw(d, rng, draft[j]);
             return j;
         }
-        if (presence) recent.push_back(draft[j]);
+        if (track) recent.push_back(draft[j]);
     }
     res[n] = draw(dist_at(n, recent), rng);
     return n;

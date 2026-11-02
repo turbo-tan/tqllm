@@ -35,6 +35,9 @@ struct Engine {
     // ignore_eos (OpenAI / vLLM / llama.cpp request field): decode to max_tokens through end-of-sequence tokens, for
     // fixed-length benchmarks. Engines that have no stop of their own ignore it.
     virtual void set_ignore_eos(bool) {}
+    // repeat (LM Studio / llama.cpp repeat_penalty, 1 = off) and frequency penalty for the active slot's next request, after
+    // set_sampling; sampling only (temperature > 0). Engines without them keep the default no-op.
+    virtual void set_penalties(float repeat, float frequency) { (void) repeat, (void) frequency; }
     virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) {
         if (temperature > 0.f) throw std::runtime_error("sampling not supported for this model");
         (void) top_p, (void) top_k, (void) seed, (void) presence;

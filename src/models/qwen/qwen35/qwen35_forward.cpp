@@ -776,6 +776,11 @@ void Qwen35Engine::set_sampling(float temperature, float top_p, int top_k, uint6
     rng.seed(seed);
 }
 
+void Qwen35Engine::set_penalties(float repeat, float frequency) {
+    samp.repeat = repeat > 0.f ? repeat : 1.f;
+    samp.frequency = frequency > 0.f ? frequency : 0.f;
+}
+
 void Qwen35Engine::kv_stage_window(uint32_t pos, int n) {
     if (kv_cmp && int64_t(pos) < cmp_pos) cmp_reset();  // a new request rewrites the compacted prefix
     if (!kv_pool->stage_ensure(int64_t(pos), int64_t(pos) + n))

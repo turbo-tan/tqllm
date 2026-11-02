@@ -77,6 +77,7 @@ void Model::commit(int accepted) { impl_->e->commit(accepted); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
 void Model::set_ignore_eos(bool on) { impl_->e->set_ignore_eos(on); }
+void Model::set_penalties(float repeat, float frequency) { impl_->e->set_penalties(repeat, frequency); }
 void Model::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
     impl_->e->set_sampling(temperature, top_p, top_k, seed, presence);
 }

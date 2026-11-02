@@ -37,6 +37,7 @@ public:
                                         uint64_t * stats = nullptr);
     // Sampling for generate_spec: temperature 0 = greedy; top_k <= 16, top_p, seed.
     void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0, float presence = 0.f);
+    void set_penalties(float repeat = 1.f, float frequency = 0.f);  // after set_sampling: repeat (1 = off) / frequency penalty
     void set_ignore_eos(bool on);  // decode to max_tokens through end-of-sequence tokens (fixed-length benchmarks)
     // Multi-slot: select_slot makes a slot active for the calls that follow (set_sampling included).
     int slots() const;

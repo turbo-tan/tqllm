@@ -1,6 +1,7 @@
 // src/spec/token_sampling.hpp against the engines' previous private copies (Qwen35Engine::dist / draw / accept, 10-31): the same
 // distributions, the same tokens and the same RNG draws for random top-16 logits, every parameter combination.
 #include "spec/token_sampling.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -88,6 +89,30 @@ int main() {
         if (j2 == n) res2[size_t(j2)] = old_draw(old_dist(&lg[size_t(j2) * 16], &id[size_t(j2) * 16], s, rec2), r2);
         ++cases;
         if (j1 != j2 || res1[size_t(j1)] != res2[size_t(j2)] || rec1 != rec2 || r1() != r2()) ++fails;
+    }
+    // repeat / frequency penalties (LM Studio / llama.cpp semantics) on a hand-made position: token 1 (logit +4) and token 2
+    // (logit -1) are in the window, token 1 twice; token 0 (+3) is not
+    {
+        float lg16[16]; uint32_t ids[16];
+        for (int i = 0; i < 16; ++i) { lg16[i] = -8.f - float(i); ids[i] = uint32_t(i); }
+        lg16[0] = 3.f; lg16[1] = 4.f; lg16[2] = -1.f;
+        const std::vector<uint32_t> recent{1, 2, 1, 9};
+        auto logp = [&](const tqllm::SamplingParams & s, uint32_t id) {
+            const auto d = tqllm::top_dist(lg16, ids, s, recent);
+            for (int i = 0; i < d.n; ++i) if (d.id[i] == id) return std::log(d.p[i]);
+            return -1e9;
+        };
+        auto expect = [&](bool ok, const char * what) { ++cases; if (!ok) { ++fails; std::printf("SAMPLING FAIL: %s\n", what); } };
+        const tqllm::SamplingParams base{1.f, 1.f, 0.f, 0};
+        tqllm::SamplingParams rep = base; rep.repeat = 2.f;  // token 1: 4 / 2 = 2 (below token 0's 3); token 2: -1 x 2 = -2
+        tqllm::SamplingParams frq = base; frq.frequency = 1.f;  // token 1: 4 - 2 = 2; token 2: -1 - 1 = -2
+        expect(logp(base, 1) > logp(base, 0), "no penalty: token 1 leads");
+        expect(std::fabs((logp(rep, 0) - logp(rep, 1)) - 1.0) < 1e-6, "repeat 2: a positive logit is halved (3 vs 2)");
+        expect(std::fabs((logp(rep, 0) - logp(rep, 2)) - 5.0) < 1e-6, "repeat 2: a negative logit is doubled (3 vs -2)");
+        expect(std::fabs((logp(frq, 0) - logp(frq, 1)) - 1.0) < 1e-6, "frequency 1: minus the count (4 - 2)");
+        expect(std::fabs((logp(frq, 0) - logp(frq, 2)) - 5.0) < 1e-6, "frequency 1: count 1 (-1 - 1)");
+        tqllm::SamplingParams off = base; off.repeat = 1.f; off.frequency = 0.f;
+        expect(!off.penalized() && rep.penalized() && frq.penalized(), "penalized() flags only active penalties");
     }
     std::printf("SAMPLING %s (%d cases, %d mismatches)\n", fails ? "FAIL" : "PASS", cases, fails);
     return fails ? 1 : 0;
