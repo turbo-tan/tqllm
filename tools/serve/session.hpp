@@ -536,6 +536,33 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// Closing tags of the tool-call syntax at the end of plain prose, with no call before them: the model echoes them
+// after a long tool-using conversation ("... done.\n</parameter>"). They are never answer text: where the trailing run
+// of such tags (and whitespace) starts, or t.size() when the text does not end with one. `partial`: a tail that may still
+// grow into one of them counts too (streaming holds it back until the next token decides).
+inline size_t orphan_tool_tail(std::string_view t, bool partial = false) {
+    static const std::string_view closers[3] = {"</" "parameter>", "</" "function>", "</" "tool_call>"};
+    auto ws = [](char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+    size_t end = t.size();
+    if (partial) {
+        size_t hold = 0;
+        for (const auto & m : closers)
+            for (size_t k = std::min(end, m.size() - 1); k > hold; --k)
+                if (t.compare(end - k, k, m.substr(0, k)) == 0) { hold = k; break; }
+        end -= hold;
+    }
+    bool any = false;
+    for (bool cut = true; cut;) {
+        cut = false;
+        size_t e = end;
+        while (e > 0 && ws(t[e - 1])) --e;
+        for (const auto & m : closers)
+            if (e >= m.size() && t.compare(e - m.size(), m.size(), m) == 0) { end = e - m.size(); cut = any = true; break; }
+    }
+    if (any) while (end > 0 && ws(t[end - 1])) --end;
+    return end;
+}
+
 // Streaming with tools: how much of the raw answer text can go out now. extract_tool_calls() cuts the answer at the
 // first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
 // tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
@@ -546,7 +573,7 @@ inline size_t tool_stream_limit(const std::string & t) {
     for (const auto & m : markers)
         for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
             if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
-    return end;
+    return orphan_tool_tail(std::string_view(t).substr(0, end));
 }
 
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
@@ -808,7 +835,10 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
 inline void extract_tool_calls(DecodeResult & r) {
     // <tool_call> / </tool_call> are special tokens the detokenizer drops, so blocks are found by <function=...>.
     const auto first_fn = r.text.find("<function=");
-    if (first_fn == std::string::npos) return;
+    if (first_fn == std::string::npos) {
+        if (const size_t o = orphan_tool_tail(r.text); o < r.text.size()) r.text = trim(r.text.substr(0, o));
+        return;
+    }
     const auto first_tc = r.text.find("<tool_call>");
     const size_t first = std::min(first_fn, first_tc);
     size_t at = first_fn;
@@ -1082,7 +1112,7 @@ private:
         for (const auto & m : markers)
             for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
                 if (t.compare(end - k, k, m, 0, k) == 0) {end -= k; break;}
-        return end;
+        return orphan_tool_tail(t.substr(0, end), true);
     }
     static size_t unstable_tail_view(std::string_view t) {
         if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;

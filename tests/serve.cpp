@@ -150,6 +150,17 @@ void test_tool_stream_limit() {
     check(tool_stream_limit("Hi <tool_call>\n<function=f>") == 3, "tools: a literal <tool_call> cuts like extract_tool_calls");
     check(tool_stream_limit("<function=f>\n</function>") == 0, "tools: a pure call streams nothing");
     check(tool_stream_limit("a < b and 3 <= 4") == 16, "tools: a lone '<' that cannot become a marker is not held");
+    // orphan closing tags after plain prose (the Conductor's "</parameter>", 11-01): never answer text, streamed or not
+    check(tool_stream_limit("Done.\n</parameter>") == 5, "tools: a trailing orphan </parameter> does not stream");
+    check(tool_stream_limit("Done.\n</parameter>\n</function>\n") == 5, "tools: a run of orphan closing tags does not stream");
+    check(tool_stream_limit("Use </div> here.") == 16, "tools: other closing tags are answer text");
+    check(tool_stream_limit("x </parameter> y") == 16, "tools: an orphan tag inside prose stays (only the tail is cut)");
+    check(tqserve::orphan_tool_tail("Done. </par", true) == 6, "tools: streaming holds a tail that may become a closing tag");
+    check(tqserve::orphan_tool_tail("Done. </par") == 11, "tools: the final text keeps an incomplete tag");
+    {
+        tqserve::DecodeResult r; r.text = "All set.\n</parameter>"; tqserve::extract_tool_calls(r);
+        check(r.text == "All set." && r.tool_calls.empty(), "tools: extract_tool_calls drops the orphan tail of plain prose");
+    }
     // whatever streams is a prefix of the parsed answer (up to the whitespace trim): the streamed text never shows markup
     for (const std::string raw : {std::string("Checking now.\n<function=ls>\n</function>"), std::string("Sure. <tool_call>\n<function=f>\n</function>")}) {
         tqserve::DecodeResult r; r.text = raw; tqserve::extract_tool_calls(r);
