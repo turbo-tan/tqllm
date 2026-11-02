@@ -2,6 +2,11 @@
 // goes: rebuilding GGUF rows from the pinned device layout vs the int8 dots, single thread and in the pool. The pool
 // output from the device layout must match the output from the same bytes as GGUF rows (to float rounding). 64 distinct experts (> L3) per run.
 #include "fn_cpu_experts.hpp"
+#if !defined(__x86_64__)
+#include <cstdio>
+// the CPU miss pool and its dots are x86 (AVX2) only: nothing to time on an ARM host (GB10)
+int main() { std::printf("CPU_MISS_PERF SKIP: the CPU miss pool is x86 only\n"); return 0; }
+#else
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -113,3 +118,4 @@ int main() {
     std::printf("cpu_miss_perf: PASS\n");
     return 0;
 }
+#endif  // __x86_64__
