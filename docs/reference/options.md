@@ -34,6 +34,7 @@ Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v
 | Option | Default | What it does |
 |---|---|---|
 | `--temperature T` `--top-p P` `--top-k K` `--presence-penalty X` | greedy, no penalty | sampling defaults for requests that set none |
+| `--repeat-penalty R` `--frequency-penalty F` | 1 (off), 0 | sampling defaults for requests that set none: LM Studio / llama.cpp `repeat_penalty` (a positive logit / R, a negative one x R) and logit - F x count, on the last 64 output tokens; requests may set `repeat_penalty` (or `repetition_penalty`) and `frequency_penalty`. Sampling only (temperature > 0); 27B engine |
 | `--monitor-port N` | the API port | serve the read-only dashboard on its own port |
 | `-fit on\|off` | on | fit the model, KV and buffers into GPU memory at load |
 | `-fitt MiB` | 768 (256 under WSL) | GPU memory to leave free after loading |
