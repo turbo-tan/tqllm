@@ -1,5 +1,6 @@
-// MXFP8 weight format (GGML_MXFP8): matvec (bf16 and f32 out, 1..8 columns, strided) and dequant_h against a host
-// decode of E4M3 x 2^(E8M0 - 127), on random codes and scales including the extremes.
+// MXFP8 weight format (GGML_MXFP8): matvec (bf16 and f32 out, 1..16 columns, strided) and dequant_h against a host
+// decode of E4M3 x 2^(E8M0 - 127), on random codes and scales including the extremes, and the invariant a batched
+// verify rests on: one column's bits do not depend on how many columns the launch holds.
 #include "weight_format.hpp"
 #include "gguf.hpp"
 #include "dequant.hpp"
@@ -8,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -57,7 +59,7 @@ int main() try {
         return d;
     };
     const Mat m = wf->load(raw, rows, cols, upload, s);
-    for (int n : {1, 3, 8}) {
+    for (int n : {1, 3, 8, 12, 16}) {
         std::vector<__half> x(size_t(n) * cols);
         for (auto & v : x) v = __float2half((int(lcg() % 2001) - 1000) / 1000.0f);
         __half * dx; ck(cudaMalloc(&dx, x.size() * 2)); ck(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice)); ck(cudaStreamSynchronize(cudaStreamPerThread));
@@ -74,6 +76,42 @@ int main() try {
         std::printf("mxfp8 matvec n=%d rel_rms %.2e\n", n, std::sqrt(e2 / r2));
         check(std::sqrt(e2 / r2) < 1e-5, "matvec vs host decode, n = " + std::to_string(n));
         cudaFree(dx); cudaFree(dy);
+    }
+    {   // the batched-verify invariant: 16 columns in one launch are the same bits as 16 launches of one column, and the
+        // format says so (max_batch_cols) without raising the cap engines choose their path by (max_matvec_cols).
+        const int NC = 16;
+        check(wf->max_batch_cols() >= NC, "MXFP8 answers a batched verify of 16 columns");
+        check(wf->max_matvec_cols() == 8, "MXFP8's matvec dispatch cap stays 8");
+        std::vector<__half> x(size_t(NC) * cols);
+        for (auto & v : x) v = __float2half((int(lcg() % 2001) - 1000) / 1000.0f);
+        __half * dx; ck(cudaMalloc(&dx, x.size() * 2)); ck(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+        float * wide; ck(cudaMalloc(&wide, size_t(NC) * rows * 4));
+        wf->matvec_f32(m, dx, wide, NC, s); ck(cudaStreamSynchronize(s));
+        std::vector<float> yw(size_t(NC) * rows); ck(cudaMemcpy(yw.data(), wide, yw.size() * 4, cudaMemcpyDeviceToHost));
+        size_t diff = 0;
+        const size_t nrow = size_t(rows);
+        double worst = 0;  // |wide - one| over the largest |reference| of that column: a sum of 1024 signed products can
+        // cancel to ~0, so a relative error per value would be meaningless; the scale is the column's own magnitudes.
+        for (int c = 0; c < NC; ++c) {
+            double refmax = 0;
+            for (int r = 0; r < rows; ++r) {
+                double a = 0;
+                for (int k = 0; k < cols; ++k) a += double(W[size_t(r) * cols + k]) * __half2float(x[size_t(c) * cols + k]);
+                refmax = std::max(refmax, std::fabs(a));
+            }
+            float * one; ck(cudaMalloc(&one, size_t(rows) * 4));
+            wf->matvec_f32(m, dx + size_t(c) * cols, one, 1, s); ck(cudaStreamSynchronize(s));
+            std::vector<float> y1(nrow); ck(cudaMemcpy(y1.data(), one, nrow * 4, cudaMemcpyDeviceToHost));
+            for (int r = 0; r < rows; ++r) {
+                const float a = y1[size_t(r)], b = yw[size_t(c) * rows + r];
+                if (std::memcmp(&a, &b, 4) != 0) ++diff;
+                worst = std::max(worst, std::fabs(double(a) - double(b)) / refmax);
+            }
+            cudaFree(one);
+        }
+        std::printf("mxfp8 batch width: %zu of %d differ, worst |diff| / max|ref| %.2e\n", diff, NC * rows, worst);
+        check(worst < 1e-6, "16 columns in one launch == one column per launch to fp32 rounding");
+        cudaFree(dx); cudaFree(wide);
     }
     __half * dh; ck(cudaMalloc(&dh, size_t(rows) * cols * 2));
     wf->dequant_h(m, dh, s); ck(cudaStreamSynchronize(s));
