@@ -5,7 +5,8 @@
 //   chunk (--prefill-chunk wins), gsq_rco=1, layer_slots=<per-layer routing plan, scaled to the slots>
 // Pilot only: hot_map=<int32 map>, cold_slots=16, cold_host_mb=3072, cold_readers=0; no packed bank or pruning.
 // One slot, greedy MTP speculative decoding (exact: tokens identical to plain greedy). A fresh DecodeModel per request
-// resets the recurrent, PLE, attention and MTP state; the expert caches persist across requests.
+// resets the recurrent, PLE, attention and MTP state (--prompt-cache on with --np > 1: kept, see SlotState::snap_); the
+// expert caches persist across requests.
 #include "fn_model.hpp"
 #include "engine.hpp"
 #include "cold_expert_store.hpp"
@@ -50,7 +51,21 @@ class FlashNextEngine final : public tqllm::Engine {
         std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
         std::chrono::steady_clock::time_point t_begin_, t_decode_;
         float temp_ = 0.f, top_p_ = 1.f; int top_k_ = 0; std::mt19937_64 rng_{1};
+        // --prompt-cache on: the model stays after its request; snap_ = a prompt position (kTail before the end of the
+        // prompt in seq_) whose recurrent conv / state and PLE history rows were copied during the prefill, so a prompt
+        // that starts with seq_[0, snap_] prefills only from snap_ (an agent's next turn: earlier turns + new message)
+        std::vector<int> seq_; int snap_ = 0;
+        std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
     };
+    static constexpr int kTail = 64;  // the next turn re-renders the end of the last prompt (assistant header) differently
+    bool caching() const { return f_.cp->run.prompt_cache && slots_.size() > 1; }
+    static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, snap_) are reusable
+        if (!s.model_ || s.snap_ <= 0 || prompt.size() <= size_t(s.snap_) || s.seq_.size() <= size_t(s.snap_)) return 0;
+        for (int i = 0; i <= s.snap_; ++i) if (uint32_t(s.seq_[size_t(i)]) != prompt[size_t(i)]) return 0;  // + the token at snap_ (its MTP pair)
+        return s.snap_;
+    }
+    void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
+    void restore_snapshot(SlotState & s);  // back to snap_: recurrent / PLE state copied back, K/V and history cut
     std::vector<SlotState> slots_; int cur_ = 0;
     uint64_t batched_steps_ = 0, serial_steps_ = 0;  // spec_step: one verify pass for all slots / one slot at a time (TQLLM_DEBUG=mem)
     SlotState & S() { return slots_[size_t(cur_)]; }
@@ -92,7 +107,8 @@ public:
                          (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
                          (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);
         }
-        S().model_.reset(); S().prompt_res_.reset();
+        if (!caching()) S().model_.reset();
+        S().prompt_res_.reset();
         return r;
     }
     // out_ holds int ids: an append-only uint32 mirror per slot (only new ids converted; rebuilt after a reset)
@@ -103,6 +119,9 @@ public:
         return v;
     }
     int slots() const override { return int(slots_.size()); }
+    uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
+        return caching() && s >= 0 && s < int(slots_.size()) ? uint32_t(reuse(slots_[size_t(s)], prompt)) : 0;
+    }
     void select_slot(int s) override { require(s >= 0 && s < int(slots_.size()), "Flash-Next slot out of range"); cur_ = s; }
     // one step for every listed slot: each drafts with its own MTP state, one verify pass covers all of them
     // (TQFN_SLOT_BATCH=0, a single active slot, more than 64 rows or more experts than cache slots: one slot at a time)

@@ -145,6 +145,7 @@ struct FnConfig {
     bool tile_experts = false;
     float draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
     int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
+    bool prompt_cache = false;  // --prompt-cache on (several slots): a slot keeps its sequence and reuses a shared prompt prefix
 };
 // one engine's mutable state shared by its sequences (one stream): Checkpoint::rt
 struct FnRuntime {

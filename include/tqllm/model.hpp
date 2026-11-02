@@ -65,6 +65,7 @@ public:
     std::vector<uint32_t> spec_finish(uint64_t * stats = nullptr);
     // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
     const std::vector<uint32_t> & spec_tokens(int slot = 0) const;
+    uint32_t prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const;  // prompt tokens the slot would reuse
     // Drafter target features [P][nf * hidden] (BF16 bits) of every position of `tokens` (prefilled from 0); returns nf.
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats);
     // Prefill tokens at positions [pos, pos + n) without the LM head (KV and recurrent state only); false: unsupported.

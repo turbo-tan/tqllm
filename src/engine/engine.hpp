@@ -72,6 +72,9 @@ struct Engine {
     virtual std::vector<uint32_t> spec_finish(uint64_t *) { return {}; }
     // slot's ids so far (streaming), by reference: valid until the slot's next step / begin
     virtual const std::vector<uint32_t> & spec_tokens(int) const { static const std::vector<uint32_t> none; return none; }
+    // prompt tokens slot s would reuse from its previous request (0: none); the scheduler routes a request to the free
+    // slot with the longest reuse
+    virtual uint32_t prefix_reuse(int, const std::vector<uint32_t> &) const { return 0; }
     // DFlash drafter training data: prefill `tokens` from position 0 and return the drafter's target features
     // [P][nf * hidden] (raw BF16 bits) of every position; returns nf (0: no drafter loaded)
     virtual int drafter_features(const std::vector<uint32_t> &, std::vector<uint16_t> &) { return 0; }

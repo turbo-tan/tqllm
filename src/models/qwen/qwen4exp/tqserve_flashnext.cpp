@@ -6,7 +6,7 @@ namespace {
 using tqllm::flashnext::FlashNextEngine;
 std::unique_ptr<tqllm::Engine> make_flashnext(const std::string & manifest, const std::string &, uint32_t context, int slots,
                                               const tqllm::EngineOptions & o) {
-    FnConfig cfg; cfg.exact = o.exact;
+    FnConfig cfg; cfg.exact = o.exact; cfg.prompt_cache = o.prompt_cache;
     if (o.prefill_chunk > 0) { cfg.tune.chunk = o.prefill_chunk; cfg.tune.chunk_set = true; }
     if (o.prefill_sub > 0) cfg.tune.sub = o.prefill_sub;
     if (o.prefill_stage > 0) { cfg.tune.stage = o.prefill_stage; cfg.tune.stage_set = true; }
