@@ -1,12 +1,16 @@
 // Fused GDN verify / decode step (gdn_step_fused) alone on the Qwen3.8-27B shape (16 key heads, 48 value heads, 128 x 128
-// state): 48 independent layers per eval, median ms of 20 evals at 1 / 4 / 8 / 16 rows; per-layer us and the state bytes
-// moved (read + write) as GB/s. usage: bench-mlx-gdn-step
+// state): 48 layers per eval, median ms of 20 evals at 1 / 4 / 8 / 16 rows; per-layer us and the state bytes moved
+// (read + write) as GB/s. Modes: indep (48 independent layers, the GPU may overlap them), chain (each layer starts from
+// the previous layer's state, serial as in the model), tree (chain with a 16-row token tree, i.e. ancestor replays),
+// treeab (tree with the alpha / beta projections inside the kernel, as served).
+// usage: bench-mlx-gdn-step
 #include "gdn.hpp"
 #include <mlx/mlx.h>
 #include <mlx/random.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <vector>
 
 namespace mx = mlx::core;
@@ -20,15 +24,26 @@ int main() {
     std::vector<mx::array> states;
     for (int l = 0; l < layers; ++l) states.push_back(rnd({1, vh, 128, 128}, 0.1f));
     mx::eval(weights, bias, nw, rate); mx::eval(states);
+    // a best-first 16-row tree as served: a main chain with side branches (depth-first row order)
+    const std::vector<int> tree16 = {-1, 0, 1, 2, 3, 4, 5, 6, 4, 8, 2, 10, 0, 12, 6, 1};
+    for (const char* mode : {"indep", "chain", "tree", "treeab"})
     for (int m : {1, 4, 8, 16}) {
+        const bool chain = mode[0] != 'i', tree = mode[0] == 't', abf = mode[4] == 'a';
+        if (tree && m != 16) continue;
         auto prev = rnd({3, width}, 1.0f), rows = rnd({m, width}, 1.0f), alpha = rnd({m, vh}, 1.0f), beta = rnd({m, vh}, 1.0f);
         auto z = rnd({m, vh * 128}, 1.0f);
-        mx::eval(prev, rows, alpha, beta, z);
+        if (abf) {alpha = rnd({m, 5120}, 1.0f); beta = rnd({2 * vh, 5120}, 0.01f);}  // alpha / beta projected in the kernel
+        auto par = mx::array(tree16.data(), {16}, mx::int32);
+        mx::eval(prev, rows, alpha, beta, z, par);
         auto run = [&] {
             std::vector<mx::array> outs;
+            std::optional<mx::array> carry;
             for (int l = 0; l < layers; ++l) {
-                auto s = gdn_step_fused(prev, rows, weights, alpha, beta, bias, rate, z, nw, 1e-6f, 0.0883883f, states[size_t(l)], kh, vh);
+                const mx::array& st = chain && carry ? *carry : states[size_t(l)];
+                auto s = tree ? gdn_step_fused(prev, rows, weights, alpha, beta, bias, rate, z, nw, 1e-6f, 0.0883883f, st, kh, vh, 0, 0, 0, &par)
+                              : gdn_step_fused(prev, rows, weights, alpha, beta, bias, rate, z, nw, 1e-6f, 0.0883883f, st, kh, vh);
                 outs.push_back(s.out); outs.push_back(s.state); outs.push_back(s.deltas);
+                carry = s.state;
             }
             mx::eval(outs);
         };
@@ -40,7 +55,7 @@ int main() {
         }
         std::sort(t.begin(), t.end());
         const double ms = t[t.size() / 2], bytes = double(layers) * vh * 128 * 128 * 4 * 2;
-        std::printf("GDN_STEP m=%2d %d layers %7.3f ms = %6.1f us per layer, state read+write %.0f GB/s\n", m, layers, ms,
-                    ms * 1000 / layers, bytes / ms / 1e6);
+        std::printf("GDN_STEP %-5s m=%2d %d layers %7.3f ms = %6.1f us per layer, state read+write %.0f GB/s\n",
+                    mode, m, layers, ms, ms * 1000 / layers, bytes / ms / 1e6);
     }
 }
