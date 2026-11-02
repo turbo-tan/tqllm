@@ -13,6 +13,9 @@
 
 namespace tqllm::mlx_backend {
 
+// the split kernel only above 12K keys: below it the step is level (j1765) and the folded / segmented path keeps the
+// short-prompt texts (j1783: doc2k 93.1 -> 81.8 tok/s on a changed text with the split kernel)
+constexpr int kSplitAttentionMin = 12288;
 // keys per chunk: about 24 chunks per KV head (96 threadgroups), at least 256 keys, a multiple of 64
 inline int split_attention_chunk(int length) {
     return length <= 12288 ? 1024 : std::max(256, ((length + 23) / 24 + 63) / 64 * 64);  // j1764: 1024 at 8K, ~24 chunks at 16K

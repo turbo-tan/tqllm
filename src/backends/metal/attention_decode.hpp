@@ -806,7 +806,7 @@ inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const m
         constexpr int seg = kAttentionSegment;
         if (length <= seg) return decode_attention_bf16_folded(q, k, v, scale, length, tree);
         // token-tree verify (no host side branches, one call of <= 16 rows): split-K over key chunks
-        if (tree && (!tree_parents || tree_parents->empty()) && block_rows == 0 && split_attention_fits(q, k)) {
+        if (tree && (!tree_parents || tree_parents->empty()) && block_rows == 0 && length > kSplitAttentionMin && split_attention_fits(q, k)) {
             auto bits = cached_tree_mask(*tree, {3, n, 0, 0, 0, 0, 0}, [&] {return split_attention_bits(tree, n);});
             return decode_attention_split(q, k, v, scale, length, bits);
         }
