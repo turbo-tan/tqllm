@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <filesystem>
 #include <cerrno>
 #include <cstdio>
 #include <csignal>
@@ -330,12 +331,18 @@ int main(int argc, char ** argv) {
             if (!tf) { std::cerr << "tqserve: cannot read " << template_file << "\n"; return 2; }
             src.assign(std::istreambuf_iterator<char>(tf), std::istreambuf_iterator<char>());
         } else if (!model_path.empty()) {
-            // a .tqfn manifest has no metadata of its own: the chat template comes from the tokenizer GGUF
-            const bool manifest = model_path.size() > 5 && model_path.compare(model_path.size() - 5, 5, ".tqfn") == 0;
-            const auto g = tqllm::gguf_open(manifest ? tokenizer_path : model_path);
-            if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
-            // a model GGUF without tokenizer metadata (MiniMax-M3 from tools/minimax_convert.cpp): the --tokenizer GGUF's
-            if (src.empty() && !manifest && tokenizer_path != model_path && tokenizer_path.size() > 5 &&
+            // the template is GGUF / Hugging Face metadata; a model file without any (a .tqfn manifest, weights.tqbin, a
+            // plugin engine's file) or without tokenizer metadata (MiniMax-M3 from tools/minimax_convert.cpp) takes the
+            // --tokenizer GGUF's
+            auto metadata = [](const std::string & p) {
+                return std::filesystem::is_directory(p) || (p.size() > 5 && p.compare(p.size() - 5, 5, ".gguf") == 0);
+            };
+            const bool own = metadata(model_path);
+            if (own || metadata(tokenizer_path)) {
+                const auto g = tqllm::gguf_open(own ? model_path : tokenizer_path);
+                if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
+            }
+            if (src.empty() && own && tokenizer_path != model_path && tokenizer_path.size() > 5 &&
                 tokenizer_path.compare(tokenizer_path.size() - 5, 5, ".gguf") == 0) {
                 const auto tg = tqllm::gguf_open_shard(tokenizer_path);
                 if (const auto it = tg.kv.find("tokenizer.chat_template"); it != tg.kv.end()) src = it->second.str;
