@@ -1,5 +1,6 @@
 #include "minimax_kernels.cuh"
-#include "glm5next_kernels.cuh"
+#include "common_kernels.cuh"
+#include "moe_common.cuh"
 
 #include <cuda_fp8.h>
 
@@ -616,20 +617,20 @@ void mm_mv_f32_splitk(const float * w, const float * x, float * y, float * parti
     router_splitk_k<2><<<dim3((rows + 1) / 2, splits), 256, 0, s>>>(w, x, partial, rows, cols, splits, n);
     router_sum_k<<<blocks(size_t(rows) * n, 256), 256, 0, s>>>(partial, y, rows * n, splits);
 }
-// the split-k pass on its own: the partials only, no sum and no routing. The engine calls this and glm_route_partial as
+// the split-k pass on its own: the partials only, no sum and no routing. The engine calls this and moe_common::route_partial as
 // two calls so its stage map can put an event between the two launches; that is the same pair of launches in the same
 // order, so the logits, the ids and the weights are the bits of mm_mv_f32_splitk_route.
 void mm_router_splitk(const float * w, const float * x, float * partial, int rows, int cols, int n, int splits,
                       cudaStream_t s) {
     router_splitk_k<2><<<dim3((rows + 1) / 2, splits), 256, 0, s>>>(w, x, partial, rows, cols, splits, n);
 }
-// the same two launches with the split sum folded into the routing: glm_route_partial walks the partials in the order
+// the same two launches with the split sum folded into the routing: moe_common::route_partial walks the partials in the order
 // router_sum_k added them, so the logits, the ids and the weights are the bits of the path above with one launch fewer.
 void mm_mv_f32_splitk_route(const float * w, const float * x, float * logits, float * partial, int rows, int cols, int n,
                             int splits, const float * bias, int * ids, float * rw, int topk, bool norm, float scale,
                             cudaStream_t s) {
     mm_router_splitk(w, x, partial, rows, cols, n, splits, s);
-    glm_route_partial(partial, logits, bias, ids, rw, rows, topk, norm, scale, s, n, splits);
+    moe_common::route_partial(partial, logits, bias, ids, rw, rows, topk, norm, scale, s, n, splits);
 }
 
 void mm_put_rows_h(const float * src, void * dst, int width, int n, int row0, cudaStream_t s, bool fp8) {

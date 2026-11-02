@@ -6,114 +6,20 @@
 
 namespace tqllm_cuda {
 namespace {
+using common::warp_sum; using common::block_sum; using common::block_max; using common::sigm;
 
 void check_launch() {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("glm5next kernel: ") + cudaGetErrorString(e));
 }
 
-__device__ float warp_sum(float v) {
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-// block-wide sum, every thread gets the result; blockDim.x multiple of 32, <= 1024
-__device__ float block_sum(float v, float * red) {
-    v = warp_sum(v);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    __syncthreads();
-    if (lane == 0) red[warp] = v;
-    __syncthreads();
-    float t = lane < nw ? red[lane] : 0.f;
-    t = warp_sum(t);
-    return t;
-}
-__device__ float block_max(float v, float * red) {
-    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    __syncthreads();
-    if (lane == 0) red[warp] = v;
-    __syncthreads();
-    float t = lane < nw ? red[lane] : -FLT_MAX;
-    for (int o = 16; o; o >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, o));
-    return t;
-}
-__device__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
 __device__ float silu_f(float x) { return x / (1.f + expf(-x)); }
 
-// one warp per row
-__global__ void mv_f32_k(const float * w, const float * x, float * y, int rows, int cols) {
-    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31, t = blockIdx.y;
-    if (r >= rows) return;
-    const float * row = w + size_t(r) * cols, * xt = x + size_t(t) * cols;
-    float acc = 0.f;
-    for (int c = lane; c < cols; c += 32) acc += row[c] * xt[c];
-    acc = warp_sum(acc);
-    if (lane == 0) y[size_t(t) * rows + r] = acc;
-}
 
-// grid (rows, splits, n): block sums its column slice of one row
-__global__ void mv_splitk_k(const float * w, const float * x, float * partial, int rows, int cols, int splits) {
-    __shared__ float red[32];
-    const int r = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
-    const int per = (cols + splits - 1) / splits, c0 = sp * per, c1 = min(cols, c0 + per);
-    const float * row = w + size_t(r) * cols, * xt = x + size_t(t) * cols;
-    float acc = 0.f;
-    for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) acc += row[c] * xt[c];
-    acc = block_sum(acc, red);
-    if (threadIdx.x == 0) partial[(size_t(t) * rows + r) * splits + sp] = acc;
-}
-__global__ void splitk_sum_k(const float * partial, float * y, int count, int splits) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    float v = 0.f;
-    for (int sp = 0; sp < splits; ++sp) v += partial[size_t(i) * splits + sp];
-    y[i] = v;
-}
 
-__global__ void gather_cols_k(const float * in, int stride, int off, int width, int count, float * out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) out[i] = in[size_t(i / width) * stride + off + i % width];
-}
 
-__global__ void bf16_to_f32_k(const __nv_bfloat16 * x, float * y, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __bfloat162float(x[i]);
-}
-__global__ void f32_to_half_k(const float * x, __half * y, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __float2half(x[i]);
-}
 
-// one block per row
-__global__ void rmsnorm_k(const float * x, const float * w, float * y, __half * yh, int n, float eps) {
-    __shared__ float red[32];
-    const float * xr = x + size_t(blockIdx.x) * n;
-    float ss = 0.f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
-    ss = block_sum(ss, red);
-    const float s = rsqrtf(ss / n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i] * s * (w ? w[i] : 1.f);
-        if (y) y[size_t(blockIdx.x) * n + i] = v;
-        if (yh) yh[size_t(blockIdx.x) * n + i] = __float2half(v);
-    }
-}
 
-// short rows (per-head q / k norms): one warp per row, 8 rows per block
-__global__ void rmsnorm_warp_k(const float * x, const float * w, float * y, __half * yh, int n, float eps, int rows) {
-    const int r = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (r >= rows) return;
-    const float * xr = x + size_t(r) * n;
-    float ss = 0.f;
-    for (int i = lane; i < n; i += 32) ss += xr[i] * xr[i];
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-    const float s = rsqrtf(ss / n + eps);
-    for (int i = lane; i < n; i += 32) {
-        const float v = xr[i] * s * (w ? w[i] : 1.f);
-        if (y) y[size_t(r) * n + i] = v;
-        if (yh) yh[size_t(r) * n + i] = __float2half(v);
-    }
-}
 
 // one block: the 24 mixes -> pre / post / comb, then x = sum pre[i] S[i]
 __global__ void hc_pre_k(const float * mix, const float * scale, const float * base, const float * S, float * x,
@@ -381,56 +287,6 @@ __global__ void mla_vb_k(const float * kv, const __half * vb, float * out, __hal
     }
 }
 
-// one block per token; experts <= 1024 (288 for GLM-5.3-Flash). Stable top-k: larger biased prob first, then lower
-// index; each round is a block-wide argmax over (value, -index).
-__global__ void route_k(const float * logits, const float * bias, int * ids, float * w, int experts, int k, bool norm,
-                        float scale) {
-    __shared__ float p[1024], sel[1024];
-    __shared__ int chosen[64];
-    __shared__ float rv[32];
-    __shared__ int ri[32];
-    logits += size_t(blockIdx.x) * experts; ids += blockIdx.x * k; w += blockIdx.x * k;
-    for (int i = threadIdx.x; i < experts; i += blockDim.x) {
-        p[i] = sigm(logits[i]);
-        sel[i] = p[i] + (bias ? bias[i] : 0.f);
-    }
-    __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    for (int r = 0; r < k; ++r) {
-        float bv = -FLT_MAX;
-        int bi = 0x7fffffff;
-        for (int i = threadIdx.x; i < experts; i += blockDim.x)
-            if (sel[i] > bv || (sel[i] == bv && i < bi)) { bv = sel[i]; bi = i; }
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        if (lane == 0) { rv[warp] = bv; ri[warp] = bi; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float v = rv[0];
-            int ix = ri[0];
-            for (int q = 1; q < nw; ++q)
-                if (rv[q] > v || (rv[q] == v && ri[q] < ix)) { v = rv[q]; ix = ri[q]; }
-            chosen[r] = ix;
-            sel[ix] = -FLT_MAX;
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float sum = 0.f;
-        for (int r = 0; r < k; ++r) sum += p[chosen[r]];
-        sum = fmaxf(sum, 6.103515625e-5f);
-        for (int r = 0; r < k; ++r) {
-            float v = p[chosen[r]];
-            if (norm) v /= sum;
-            if (scale != 0.f && scale != 1.f) v *= scale;
-            ids[r] = chosen[r];
-            w[r] = v;
-        }
-    }
-}
 
 __global__ void swiglu_k(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -448,78 +304,13 @@ __global__ void swiglu_f32_k(const float * g, const float * u, __half * out, int
     out[i] = __float2half(silu_f(gg) * uu);
 }
 
-__global__ void moe_sum_k(const __nv_bfloat16 * y, const float * w, const float * shared, float * out, int k, int hidden) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
-    if (j >= hidden) return;
-    y += size_t(t) * k * hidden; w += t * k; out += size_t(t) * hidden;
-    if (shared) shared += size_t(t) * hidden;
-    float v = shared ? shared[j] : 0.f;
-    for (int i = 0; i < k; ++i) v += w[i] * __bfloat162float(y[size_t(i) * hidden + j]);
-    out[j] = v;
-}
 
-__global__ void add_k(float * a, const float * b, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] += b[i];
-}
 
-__global__ void argmax_k(const float * x, int n, int * out) {
-    __shared__ float bv[1024];
-    __shared__ int bi[1024];
-    x += size_t(blockIdx.x) * n; out += blockIdx.x;
-    float v = -FLT_MAX;
-    int idx = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-        if (x[i] > v) { v = x[i]; idx = i; }
-    bv[threadIdx.x] = v; bi[threadIdx.x] = idx;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s; s >>= 1) {
-        if (threadIdx.x < s) {
-            const float o = bv[threadIdx.x + s];
-            const int oi = bi[threadIdx.x + s];
-            if (o > bv[threadIdx.x] || (o == bv[threadIdx.x] && oi < bi[threadIdx.x])) { bv[threadIdx.x] = o; bi[threadIdx.x] = oi; }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) *out = bi[0];
-}
 
 int blocks(int n, int t) { return (n + t - 1) / t; }
 
 }  // namespace
 
-void glm_mv_f32(const float * w, const float * x, float * y, int rows, int cols, int n, cudaStream_t s) {
-    mv_f32_k<<<dim3(blocks(rows, 8), n), 256, 0, s>>>(w, x, y, rows, cols);
-    check_launch();
-}
-void glm_mv_f32_splitk(const float * w, const float * x, float * y, float * partial, int rows, int cols, int n, int splits,
-                       cudaStream_t s) {
-    mv_splitk_k<<<dim3(rows, splits, n), 256, 0, s>>>(w, x, partial, rows, cols, splits);
-    check_launch();
-    splitk_sum_k<<<blocks(rows * n, 256), 256, 0, s>>>(partial, y, rows * n, splits);
-    check_launch();
-}
-void glm_gather_cols(const float * in, int stride, int off, int width, int n, float * out, cudaStream_t s) {
-    gather_cols_k<<<blocks(width * n, 256), 256, 0, s>>>(in, stride, off, width, width * n, out);
-    check_launch();
-}
-void glm_bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t s) {
-    bf16_to_f32_k<<<blocks(n, 256), 256, 0, s>>>(x, y, n);
-    check_launch();
-}
-void glm_f32_to_half(const float * x, __half * y, int n, cudaStream_t s) {
-    f32_to_half_k<<<blocks(n, 256), 256, 0, s>>>(x, y, n);
-    check_launch();
-}
-void glm_rmsnorm(const float * x, const float * w, float * y, __half * yh, int n, float eps, cudaStream_t s, int rows) {
-    if (n <= 256) rmsnorm_warp_k<<<(rows + 7) / 8, 256, 0, s>>>(x, w, y, yh, n, eps, rows);
-    else rmsnorm_k<<<rows, 1024, 0, s>>>(x, w, y, yh, n, eps);
-    check_launch();
-}
-void glm_rmsnorm_rows(const float * x, const float * w, float * y, int rows, int n, float eps, cudaStream_t s) {
-    rmsnorm_k<<<rows, 128, 0, s>>>(x, w, y, nullptr, n, eps);
-    check_launch();
-}
 void glm_hc_pre(const float * mix, const float * scale, const float * base, const float * S, float * x, float * post,
                 float * comb, int hidden, int iters, float eps, cudaStream_t s, int n, int mix_stride) {
     hc_pre_k<<<n, 1024, 0, s>>>(mix, scale, base, S, x, post, comb, hidden, iters, eps, mix_stride);
@@ -615,162 +406,12 @@ void glm_mla_vb(const float * kv, const __half * vb, float * out, __half * outh,
     mla_vb_k<<<dim3(heads, n), 256, size_t(R) * sizeof(float), s>>>(kv, vb, out, outh, R, dv);
     check_launch();
 }
-void glm_route(const float * logits, const float * bias, int * ids, float * w, int experts, int k, bool norm, float scale,
-               cudaStream_t s, int n) {
-    if (experts > 1024 || k > 64 || k > experts) throw std::invalid_argument("glm_route: experts <= 1024, k <= 64");
-    route_k<<<n, 256, 0, s>>>(logits, bias, ids, w, experts, k, norm, scale);
-    check_launch();
-}
-// route_k over the split-k partials: the same sum router_sum_k did (the splits of one expert, ascending) and the same
-// top-k walk, so the logits, the ids and the weights are the bits of the two-launch path with one launch fewer.
-__global__ void route_partial_k(const float * __restrict__ partial, float * __restrict__ logits,
-                                const float * __restrict__ bias, int * __restrict__ ids, float * __restrict__ w,
-                                int experts, int k, bool norm, float scale, int splits) {
-    __shared__ float p[1024], sel[1024];
-    __shared__ int chosen[64];
-    __shared__ float rv[32];
-    __shared__ int ri[32];
-    const float * pp = partial + size_t(blockIdx.x) * experts * splits;
-    ids += blockIdx.x * k; w += blockIdx.x * k;
-    if (logits) logits += size_t(blockIdx.x) * experts;
-    for (int i = threadIdx.x; i < experts; i += blockDim.x) {
-        float v = 0.f;
-        for (int sp = 0; sp < splits; ++sp) v += pp[size_t(i) * splits + sp];
-        if (logits) logits[i] = v;
-        p[i] = sigm(v);
-        sel[i] = p[i] + (bias ? bias[i] : 0.f);
-    }
-    __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    for (int r = 0; r < k; ++r) {
-        float bv = -FLT_MAX;
-        int bi = 0x7fffffff;
-        for (int i = threadIdx.x; i < experts; i += blockDim.x)
-            if (sel[i] > bv || (sel[i] == bv && i < bi)) { bv = sel[i]; bi = i; }
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        if (lane == 0) { rv[warp] = bv; ri[warp] = bi; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float v = rv[0];
-            int ix = ri[0];
-            for (int q = 1; q < nw; ++q)
-                if (rv[q] > v || (rv[q] == v && ri[q] < ix)) { v = rv[q]; ix = ri[q]; }
-            chosen[r] = ix;
-            sel[ix] = -FLT_MAX;
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float sum = 0.f;
-        for (int r = 0; r < k; ++r) sum += p[chosen[r]];
-        sum = fmaxf(sum, 6.103515625e-5f);
-        for (int r = 0; r < k; ++r) {
-            float v = p[chosen[r]];
-            if (norm) v /= sum;
-            if (scale != 0.f && scale != 1.f) v *= scale;
-            ids[r] = chosen[r];
-            w[r] = v;
-        }
-    }
-}
-// route_partial_k with one warp per token and the top-k walk in registers. The block-per-token walk is latency, not
-// work: at the decode router's shape (128 experts, k 8) it costs ~8 us per call, 0.5 ms of a 147 ms step and flat in n,
-// because a round is a scan, a warp tree, two __syncthreads and thread 0's serial pick over the warp partials, with the
-// other 255 threads idle in it. Here a lane owns ceil(experts / 32) candidates in registers (biased value, sigmoid,
-// index) and a round is one warp reduction on the order the block version scans by - larger biased value first, ties to
-// the lower index. That order is total, so the tree's max is the scan's max: the same expert wins every round, removing
-// it is the same `sel = -FLT_MAX`, and the split sums (ascending), the sigmoids, the normalisation sum over the chosen
-// in round order and the ids / weights are the block version's bits.
-template <int MAXE>
-__global__ void route_partial_warp_k(const float * __restrict__ partial, float * __restrict__ logits,
-                                     const float * __restrict__ bias, int * __restrict__ ids, float * __restrict__ w,
-                                     int experts, int k, bool norm, float scale, int splits, int tokens) {
-    __shared__ int chosen[8][64];
-    __shared__ float pv[8][64];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int tok = blockIdx.x * 8 + warp;
-    if (tok >= tokens) return;
-    const float * pp = partial + size_t(tok) * experts * splits;
-    float sel[MAXE], p[MAXE];
-    int ix[MAXE];
-    for (int j = 0; j < MAXE; ++j) {
-        const int e = lane + j * 32;
-        if (e < experts) {
-            float v = 0.f;
-            for (int sp = 0; sp < splits; ++sp) v += pp[size_t(e) * splits + sp];
-            if (logits) logits[size_t(tok) * experts + e] = v;
-            p[j] = sigm(v);
-            sel[j] = p[j] + (bias ? bias[e] : 0.f);
-            ix[j] = e;
-        } else { sel[j] = -FLT_MAX; p[j] = 0.f; ix[j] = 0x7fffffff; }
-    }
-    float sum = 0.f;
-    for (int r = 0; r < k; ++r) {
-        float bv = -FLT_MAX;
-        int bi = 0x7fffffff;
-        for (int j = 0; j < MAXE; ++j)
-            if (sel[j] > bv || (sel[j] == bv && ix[j] < bi)) { bv = sel[j]; bi = ix[j]; }
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        float mine = 0.f;
-        for (int j = 0; j < MAXE; ++j)
-            if (ix[j] == bi) { mine = p[j]; sel[j] = -FLT_MAX; }
-        const float got = __shfl_sync(0xffffffffu, mine, bi & 31);   // the lane that owns the winner holds its sigmoid
-        sum += got;
-        if (lane == 0) { chosen[warp][r] = bi; pv[warp][r] = got; }
-    }
-    if (lane == 0) {
-        ids += tok * k; w += tok * k;
-        sum = fmaxf(sum, 6.103515625e-5f);
-        for (int r = 0; r < k; ++r) {
-            float v = pv[warp][r];
-            if (norm) v /= sum;
-            if (scale != 0.f && scale != 1.f) v *= scale;
-            ids[r] = chosen[warp][r];
-            w[r] = v;
-        }
-    }
-}
-void glm_route_partial(const float * partial, float * logits, const float * bias, int * ids, float * w, int experts,
-                       int k, bool norm, float scale, cudaStream_t s, int n, int splits) {
-    if (experts > 1024 || k > 64 || k > experts) throw std::invalid_argument("glm_route_partial: experts <= 1024, k <= 64");
-    if (experts <= 128) {   // the decode router: eight tokens per block, one warp each, no barrier in the walk
-        route_partial_warp_k<4><<<(n + 7) / 8, 256, 0, s>>>(partial, logits, bias, ids, w, experts, k, norm, scale, splits, n);
-    } else {
-        route_partial_k<<<n, 256, 0, s>>>(partial, logits, bias, ids, w, experts, k, norm, scale, splits);
-    }
-    check_launch();
-}
 void glm_swiglu(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float limit, cudaStream_t s) {
     swiglu_k<<<blocks(n, 256), 256, 0, s>>>(g, u, out, n, limit);
     check_launch();
 }
 void glm_swiglu_f32(const float * g, const float * u, __half * out, int n, float limit, cudaStream_t s) {
     swiglu_f32_k<<<blocks(n, 256), 256, 0, s>>>(g, u, out, n, limit);
-    check_launch();
-}
-void glm_moe_sum(const __nv_bfloat16 * y, const float * w, const float * shared, float * out, int k, int hidden,
-                 cudaStream_t s, int n) {
-    moe_sum_k<<<dim3(blocks(hidden, 256), n), 256, 0, s>>>(y, w, shared, out, k, hidden);
-    check_launch();
-}
-void glm_add(float * a, const float * b, int n, cudaStream_t s) {
-    add_k<<<blocks(n, 256), 256, 0, s>>>(a, b, n);
-    check_launch();
-}
-void glm_argmax(const float * x, int n, int * out, cudaStream_t s) {
-    argmax_k<<<1, 1024, 0, s>>>(x, n, out);
-    check_launch();
-}
-void glm_argmax_rows(const float * x, int n, int rows, int * out, cudaStream_t s) {
-    argmax_k<<<rows, 1024, 0, s>>>(x, n, out);
     check_launch();
 }
 }  // namespace tqllm_cuda

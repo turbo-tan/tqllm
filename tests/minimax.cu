@@ -1,7 +1,8 @@
 // MiniMax kernels against the same math on the CPU: swigluoai, partial NeoX RoPE, causal GQA attention.
 #include "minimax_kernels.cuh"
 #include <cuda_fp8.h>
-#include "glm5next_kernels.cuh"
+#include "common_kernels.cuh"
+#include "moe_common.cuh"
 #include "minimax_memory.hpp"
 #include "minimax_spec.hpp"
 
@@ -380,7 +381,7 @@ int main() try {
                         for (int l = 0; l < 32; ++l) {
                             float acc = 0.f;
                             for (int c = c0 + wp * 32 + l; c < c1; c += 256)
-                                acc += w[size_t(r) * cols + c] * x[size_t(t) * cols + c];
+                                acc = std::fma(w[size_t(r) * cols + c], x[size_t(t) * cols + c], acc);  // the GPU fuses the multiply-add (x86 gcc would not)
                             lane[l] = acc;
                         }
                         red[wp] = tree(lane);
@@ -395,7 +396,7 @@ int main() try {
         require(bad == 0, "the router matvec's bits moved with the verify block width");
         // the router and its routing in two launches instead of three: the top-k walk runs over the split-k partials and
         // sums each expert's splits the way router_sum_k did, so the logits, the ids and the weights are the bits of the
-        // matvec + glm_route path - the experts a step routes cannot move.
+        // matvec + moe_common::route path - the experts a step routes cannot move.
         int fbad = 0;
         for (const int rows : {128, 129})
             for (const int n : {1, 2, 4, 6, 8}) {
@@ -411,7 +412,7 @@ int main() try {
                 ck(cudaMalloc(&i1, size_t(n) * 8 * sizeof(int)));
                 ck(cudaMalloc(&i2, size_t(n) * 8 * sizeof(int)));
                 tqllm_cuda::mm_mv_f32_splitk(dw, dx, y1, dp, rows, cols, n, splits, nullptr);
-                tqllm_cuda::glm_route(y1, dbs, i1, w1, rows, 8, true, 2.5f, nullptr, n);
+                tqllm_cuda::moe_common::route(y1, dbs, i1, w1, rows, 8, true, 2.5f, nullptr, n);
                 tqllm_cuda::mm_mv_f32_splitk_route(dw, dx, lg, dp, rows, cols, n, splits, dbs, i2, w2, 8, true, 2.5f,
                                                    nullptr);
                 const auto a = host(y1, size_t(rows) * n), b = host(lg, size_t(rows) * n);

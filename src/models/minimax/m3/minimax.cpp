@@ -9,9 +9,10 @@
 #include "dev_alloc.cuh"
 #include "engine.hpp"
 #include "expert_bank_plan.hpp"
-#include "glm_experts.hpp"
+#include "stacked_experts.hpp"
 #include "packed_experts.hpp"
-#include "glm5next_kernels.cuh"
+#include "common_kernels.cuh"
+#include "moe_common.cuh"
 #include "gguf.hpp"
 #include "gguf_mapped.hpp"
 #include "minimax_kernels.cuh"
@@ -347,7 +348,7 @@ private:
     uint64_t sm_forwards_ = 0;
     double sm_ms_[SM_N] = {};
     // A diagnostic never leaves a sticky CUDA error behind: an unchecked failure here would be reported by the next
-    // kernel launch's cudaGetLastError (glm5next.cu), i.e. as someone else's bug. The events are created lazily, in
+    // kernel launch's cudaGetLastError, i.e. as someone else's bug. The events are created lazily, in
     // the context that actually runs the forwards.
     void sm_ready() {
         if (sm_ev_[0]) return;
@@ -777,7 +778,7 @@ private:
         return out;
     }
     std::array<ExpertPayload, 3> expert_payload(int layer, int expert) const {
-        return glm_expert_payload("blk." + std::to_string(layer) + ".",
+        return stacked_expert_payload("blk." + std::to_string(layer) + ".",
                                   [this](const std::string & n) -> const MappedGguf & {
                                       const auto & t = tensor(n);
                                       return *map_of_.at(t.file.empty() ? meta_.path : t.file);
@@ -982,17 +983,17 @@ private:
                     throw std::runtime_error("minimax: cuBLAS SGEMM failed");
                 return;
             }
-            tqllm_cuda::glm_f32_to_half(x, scratch_h_.as<__half>(), w.cols * n, stream_);
+            tqllm_cuda::common::f32_to_half(x, scratch_h_.as<__half>(), w.cols * n, stream_);
             gemm(w.m, scratch_h_.as<__half>(), y, n);
             return;
         }
         if (w.f32) {
             if (w.rows <= kSmallRows)
                 tqllm_cuda::mm_mv_f32_splitk(w.f32, x, y, partial_.as<float>(), w.rows, w.cols, n, splits(w.cols), stream_);
-            else tqllm_cuda::glm_mv_f32(w.f32, x, y, w.rows, w.cols, n, stream_);
+            else tqllm_cuda::common::mv_f32(w.f32, x, y, w.rows, w.cols, n, stream_);
             return;
         }
-        tqllm_cuda::glm_f32_to_half(x, scratch_h_.as<__half>(), w.cols * n, stream_);
+        tqllm_cuda::common::f32_to_half(x, scratch_h_.as<__half>(), w.cols * n, stream_);
         if (w.f32_out != 0) {
             try {
                 w.m.fmt->matvec_f32(w.m, scratch_h_.as<__half>(), y, n, stream_);
@@ -1004,7 +1005,7 @@ private:
             }
         }
         w.m.fmt->matvec(w.m, scratch_h_.as<__half>(), bfa_.as<bf16>(), n, stream_);
-        tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
+        tqllm_cuda::common::bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
     }
     // the same matvec with the input already in the FP16 layout the format wants: moe() converts xn once for the routed
     // experts, and the shared expert used to convert those same values a second time into scratch_h_
@@ -1020,7 +1021,7 @@ private:
             }
         }
         w.m.fmt->matvec(w.m, xh, bfa_.as<bf16>(), n, stream_);
-        tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
+        tqllm_cuda::common::bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
     }
     // y FP32 [n][rows] = W x (half), every column in the format's GEMM; no per-token fallback (it would read W n times).
     // FP32 output first: a BF16 output rounded every projection, and over 60 layers the residual drifted from the
@@ -1040,7 +1041,7 @@ private:
         if (fid >= 0 && m.cols % 64 == 0 &&
             tqllm_cuda::u4h_family_gemm_f32(fid, static_cast<const uint8_t *>(m.p), m.aux, xh, y, m.rows, m.cols, n, stream_, m.rows))
             return;
-        if (m.fmt->gemm(m, xh, bfa_.as<bf16>(), n, stream_)) { tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), y, m.rows * n, stream_); return; }
+        if (m.fmt->gemm(m, xh, bfa_.as<bf16>(), n, stream_)) { tqllm_cuda::common::bf16_to_f32(bfa_.as<bf16>(), y, m.rows * n, stream_); return; }
         // a format without a GEMM kernel (X3 trellis): dequantise + cuBLAS at every width
         if (!fits) throw std::runtime_error(std::string("minimax: no prefill GEMM for ") + m.fmt->name());
         dequant_gemm();
@@ -1058,7 +1059,7 @@ private:
             catch (const std::runtime_error &) { if (dn.f32_out == 1) throw; dn.f32_out = 0; }
         }
         dn.m.fmt->matvec(dn.m, act_.as<__half>(), bfa_.as<bf16>(), n, stream_);
-        tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), out, dn.rows * n, stream_);
+        tqllm_cuda::common::bf16_to_f32(bfa_.as<bf16>(), out, dn.rows * n, stream_);
     }
     void moe(Layer & Y, int layer, int n) {
         const float * xn = xn_.as<float>();
@@ -1069,11 +1070,11 @@ private:
             // the pair mm_mv_f32_splitk_route runs as one call, here as two so the map can put an event between them
             tqllm_cuda::mm_router_splitk(rt.f32, xn, partial_.as<float>(), rt.rows, rt.cols, n, splits(rt.cols), stream_);
             sm_mark(SM_MOE_RT_RT);
-            tqllm_cuda::glm_route_partial(partial_.as<float>(), logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(),
+            tqllm_cuda::moe_common::route_partial(partial_.as<float>(), logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(),
                                           d_w_.as<float>(), rt.rows, topk_, true, w_scale_, stream_, n, splits(rt.cols));
         } else {
             mv(rt, xn, logits_.as<float>(), n);
-            tqllm_cuda::glm_route(logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(), d_w_.as<float>(), experts_, topk_,
+            tqllm_cuda::moe_common::route(logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(), d_w_.as<float>(), experts_, topk_,
                                   true, w_scale_, stream_, n);
         }
         sm_mark(SM_MOE_RT_X);
@@ -1108,7 +1109,7 @@ private:
         sm_mark(SM_MOE_SH);
         ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n, xh);
         sm_mark(SM_MOE_SM);
-        tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+        tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
     // A prompt chunk: tokens grouped by routed expert, each expert's rows read once for all its tokens (grouped GEMM);
@@ -1141,7 +1142,7 @@ private:
             tqllm_cuda::mmq_quantize_act(act_.as<__half>(), A, effl_, mq_a_.p, stream_, id == 11);
             mmq(Y.e_down, id, H_, mq_a_.p, A, 1, yd_.as<bf16>());
             ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n);
-            tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+            tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
             reduce(fo_.as<float>(), size_t(n) * H_);
             return;
         }
@@ -1152,7 +1153,7 @@ private:
         need(Y.e_down.fmt->expert_gemm(Y.e_down, act_.as<__half>(), yd_.as<bf16>(), H_, counts, groups, n, experts_, topk_, true, stream_),
              Y.e_down);
         ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n);
-        tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+        tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);
     }
     // A verify block (n > 1): each distinct routed expert is read once for all its tokens (up to kDedupCols per group)
@@ -1189,7 +1190,7 @@ private:
         sm_mark(SM_MOE_SH);
         ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n, xh_.as<__half>());
         sm_mark(SM_MOE_SM);
-        tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+        tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
 
@@ -1205,7 +1206,7 @@ private:
         auto & seen = seen_[size_t(l)];
         for (int id : routed) seen[size_t(id)] = 1;
         spread_[size_t(l)] = double(std::count(seen.begin(), seen.end(), uint8_t(1)));
-        for (const auto & wv : glm_expert_waves(routed, topk_, bank_->slots(l))) {
+        for (const auto & wv : stacked_expert_waves(routed, topk_, bank_->slots(l))) {
             const auto slot = bank_->prepare(l, wv.ids);
             bank_->wait_misses();
             std::vector<int> where(size_t(experts_), -1), phys;
@@ -1226,18 +1227,18 @@ private:
         sm_mark(SM_MOE_SH);
         ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n, xh);
         sm_mark(SM_MOE_SM);
-        tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+        tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
 
     void attention(Layer & Y, uint32_t pos, int n) {
         const int qd = hql_ * hd_, kd = hkl_ * hd_, all = qd + 2 * kd;
         mv(Y.wqkv, xn_.as<float>(), qkv_.as<float>(), n);
-        tqllm_cuda::glm_gather_cols(qkv_.as<float>(), all, 0, qd, n, q_.as<float>(), stream_);
-        tqllm_cuda::glm_gather_cols(qkv_.as<float>(), all, qd, kd, n, k_.as<float>(), stream_);
-        tqllm_cuda::glm_gather_cols(qkv_.as<float>(), all, qd + kd, kd, n, v_.as<float>(), stream_);
-        tqllm_cuda::glm_rmsnorm(q_.as<float>(), Y.q_norm, q_.as<float>(), nullptr, hd_, eps_, stream_, n * hql_);
-        tqllm_cuda::glm_rmsnorm(k_.as<float>(), Y.k_norm, k_.as<float>(), nullptr, hd_, eps_, stream_, n * hkl_);
+        tqllm_cuda::common::gather_cols(qkv_.as<float>(), all, 0, qd, n, q_.as<float>(), stream_);
+        tqllm_cuda::common::gather_cols(qkv_.as<float>(), all, qd, kd, n, k_.as<float>(), stream_);
+        tqllm_cuda::common::gather_cols(qkv_.as<float>(), all, qd + kd, kd, n, v_.as<float>(), stream_);
+        tqllm_cuda::common::rmsnorm(q_.as<float>(), Y.q_norm, q_.as<float>(), nullptr, hd_, eps_, stream_, n * hql_);
+        tqllm_cuda::common::rmsnorm(k_.as<float>(), Y.k_norm, k_.as<float>(), nullptr, hd_, eps_, stream_, n * hkl_);
         tqllm_cuda::mm_rope(q_.as<float>(), n, hql_, hd_, rot_, int(pos), theta_, stream_);
         tqllm_cuda::mm_rope(k_.as<float>(), n, hkl_, hd_, rot_, int(pos), theta_, stream_);
         tqllm_cuda::mm_put_rows_h(k_.as<float>(), Y.kc.p, kd, n, int(pos), stream_, kv8_);
@@ -1248,12 +1249,12 @@ private:
             // index keys for every position (a later, longer context ranks them); index queries only once there are more
             // blocks than the indexer keeps (up to top-k blocks it keeps all, so attention stays dense)
             mv(Y.ik, xn_.as<float>(), ikv_.as<float>(), n);
-            tqllm_cuda::glm_rmsnorm(ikv_.as<float>(), Y.ik_norm, ikv_.as<float>(), nullptr, idim_, eps_, stream_, n);
+            tqllm_cuda::common::rmsnorm(ikv_.as<float>(), Y.ik_norm, ikv_.as<float>(), nullptr, idim_, eps_, stream_, n);
             tqllm_cuda::mm_rope(ikv_.as<float>(), n, 1, idim_, rot_, int(pos), theta_, stream_);
             tqllm_cuda::mm_put_rows_h(ikv_.as<float>(), Y.ikc.p, idim_, n, int(pos), stream_, kv8_);
             if (nblocks > itopk_) {
                 mv(Y.iq, xn_.as<float>(), iqv_.as<float>(), n);
-                tqllm_cuda::glm_rmsnorm(iqv_.as<float>(), Y.iq_norm, iqv_.as<float>(), nullptr, idim_, eps_, stream_, n * ih_);
+                tqllm_cuda::common::rmsnorm(iqv_.as<float>(), Y.iq_norm, iqv_.as<float>(), nullptr, idim_, eps_, stream_, n * ih_);
                 tqllm_cuda::mm_rope(iqv_.as<float>(), n, ih_, idim_, rot_, int(pos), theta_, stream_);
                 // prompt chunks on tensor cores (4 index heads); decode / verify keep the FP32 kernel
                 (n >= 64 && ih_ == 4 && iblock_ <= 128 && iblock_ % 8 == 0 ? tqllm_cuda::mm_index_scores_mma : tqllm_cuda::mm_index_scores)(
@@ -1284,12 +1285,12 @@ private:
     void draft_context(uint32_t pos, int n) {
         const int kd = hk_ * hd_;
         mv(dfc_, feat_.as<float>(), fused_.as<float>(), n);
-        tqllm_cuda::glm_rmsnorm(fused_.as<float>(), dhid_norm_, fused_.as<float>(), nullptr, H_, eps_, stream_, n);
+        tqllm_cuda::common::rmsnorm(fused_.as<float>(), dhid_norm_, fused_.as<float>(), nullptr, H_, eps_, stream_, n);
         for (auto & Y : D_) {
             mv(Y.wkv, fused_.as<float>(), dkv_.as<float>(), n);
-            tqllm_cuda::glm_gather_cols(dkv_.as<float>(), 2 * kd, 0, kd, n, dk_.as<float>(), stream_);
-            tqllm_cuda::glm_gather_cols(dkv_.as<float>(), 2 * kd, kd, kd, n, dv_.as<float>(), stream_);
-            tqllm_cuda::glm_rmsnorm(dk_.as<float>(), Y.k_norm, dk_.as<float>(), nullptr, hd_, eps_, stream_, n * hk_);
+            tqllm_cuda::common::gather_cols(dkv_.as<float>(), 2 * kd, 0, kd, n, dk_.as<float>(), stream_);
+            tqllm_cuda::common::gather_cols(dkv_.as<float>(), 2 * kd, kd, kd, n, dv_.as<float>(), stream_);
+            tqllm_cuda::common::rmsnorm(dk_.as<float>(), Y.k_norm, dk_.as<float>(), nullptr, hd_, eps_, stream_, n * hk_);
             tqllm_cuda::mm_rope(dk_.as<float>(), n, hk_, hd_, rot_, int(pos), theta_, stream_);
             tqllm_cuda::mm_put_rows_h(dk_.as<float>(), Y.kc.p, kd, n, int(pos), stream_, kv8_);
             tqllm_cuda::mm_put_rows_h(dv_.as<float>(), Y.vc.p, kd, n, int(pos), stream_, kv8_);
@@ -1322,40 +1323,40 @@ private:
         ck(cudaMemcpyAsync(dh_.p, h_embed_, size_t(B) * H_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
         sm_mark(SM_DRAFT_LAY);
         for (auto & Y : D_) {
-            tqllm_cuda::glm_rmsnorm(dh_.as<float>(), Y.attn_norm, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
+            tqllm_cuda::common::rmsnorm(dh_.as<float>(), Y.attn_norm, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
             mv(Y.wq, dxn_.as<float>(), dq_.as<float>(), B);
-            tqllm_cuda::glm_rmsnorm(dq_.as<float>(), Y.q_norm, dq_.as<float>(), nullptr, hd_, eps_, stream_, B * hq_);
+            tqllm_cuda::common::rmsnorm(dq_.as<float>(), Y.q_norm, dq_.as<float>(), nullptr, hd_, eps_, stream_, B * hq_);
             tqllm_cuda::mm_rope(dq_.as<float>(), B, hq_, hd_, rot_, int(anchor_pos), theta_, stream_);
             mv(Y.wkv, dxn_.as<float>(), dkv_.as<float>(), B);
-            tqllm_cuda::glm_gather_cols(dkv_.as<float>(), 2 * kd, 0, kd, B, dk_.as<float>(), stream_);
-            tqllm_cuda::glm_gather_cols(dkv_.as<float>(), 2 * kd, kd, kd, B, dv_.as<float>(), stream_);
-            tqllm_cuda::glm_rmsnorm(dk_.as<float>(), Y.k_norm, dk_.as<float>(), nullptr, hd_, eps_, stream_, B * hk_);
+            tqllm_cuda::common::gather_cols(dkv_.as<float>(), 2 * kd, 0, kd, B, dk_.as<float>(), stream_);
+            tqllm_cuda::common::gather_cols(dkv_.as<float>(), 2 * kd, kd, kd, B, dv_.as<float>(), stream_);
+            tqllm_cuda::common::rmsnorm(dk_.as<float>(), Y.k_norm, dk_.as<float>(), nullptr, hd_, eps_, stream_, B * hk_);
             tqllm_cuda::mm_rope(dk_.as<float>(), B, hk_, hd_, rot_, int(anchor_pos), theta_, stream_);
             tqllm_cuda::mm_attn_draft(dq_.as<float>(), Y.kc.p, Y.vc.p, dk_.as<float>(), dv_.as<float>(),
                                       datt_.as<float>(), B, hq_, hk_, hd_, int(anchor_pos), dwindow_, 1.f / std::sqrt(float(hd_)), stream_, kv8_);
             mv(Y.wo, datt_.as<float>(), dfo_.as<float>(), B);
-            tqllm_cuda::glm_add(dh_.as<float>(), dfo_.as<float>(), B * H_, stream_);
-            tqllm_cuda::glm_rmsnorm(dh_.as<float>(), Y.ffn_norm, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
+            tqllm_cuda::common::add(dh_.as<float>(), dfo_.as<float>(), B * H_, stream_);
+            tqllm_cuda::common::rmsnorm(dh_.as<float>(), Y.ffn_norm, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
             ffn(Y.gate_up, Y.down, dxn_.as<float>(), dfo_.as<float>(), B);
-            tqllm_cuda::glm_add(dh_.as<float>(), dfo_.as<float>(), B * H_, stream_);
+            tqllm_cuda::common::add(dh_.as<float>(), dfo_.as<float>(), B * H_, stream_);
         }
         (void)qd;
-        tqllm_cuda::glm_rmsnorm(dh_.as<float>(), dout_norm_, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
+        tqllm_cuda::common::rmsnorm(dh_.as<float>(), dout_norm_, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
         sm_mark(SM_DRAFT_HEAD);
         const int a = int(anchor);
         if (!dv_ids_.empty()) {  // the head and the Markov bias over the draft vocabulary only
             const int V = int(dv_ids_.size());
-            tqllm_cuda::glm_f32_to_half(dxn_.as<float>(), dv_xh_.as<__half>(), B * H_, stream_);
+            tqllm_cuda::common::f32_to_half(dxn_.as<float>(), dv_xh_.as<__half>(), B * H_, stream_);
             gemm_h(dv_head_.as<__half>(), dv_xh_.as<__half>(), dv_log_.as<float>(), V, H_, B);
             ck(cudaMemcpyAsync(dtok_.p, &a, sizeof(int), cudaMemcpyHostToDevice, stream_));
             sm_mark(SM_DRAFT_MKV);
             for (int k = 0; k < mk; ++k) {
                 tqllm_cuda::mm_gather_row(dw1_, dtok_.as<int>() + k, dlat_.as<float>(), drank_, stream_);
-                tqllm_cuda::glm_f32_to_half(dlat_.as<float>(), dv_lath_.as<__half>(), drank_, stream_);
+                tqllm_cuda::common::f32_to_half(dlat_.as<float>(), dv_lath_.as<__half>(), drank_, stream_);
                 if (dv_w2_.p) gemm_h(dv_w2_.as<__half>(), dv_lath_.as<__half>(), dv_bias_.as<float>(), V, drank_, 1);
                 else { mv(dw2_, dlat_.as<float>(), dbias_.as<float>(), 1); tqllm_cuda::mm_gather_ids(dbias_.as<float>(), dv_ids_dev_.as<int>(), dv_bias_.as<float>(), V, stream_); }
                 tqllm_cuda::mm_add(dv_log_.as<float>() + size_t(k) * V, dv_bias_.as<float>(), V, stream_);
-                tqllm_cuda::glm_argmax(dv_log_.as<float>() + size_t(k) * V, V, dv_arg_.as<int>(), stream_);
+                tqllm_cuda::common::argmax(dv_log_.as<float>() + size_t(k) * V, V, dv_arg_.as<int>(), stream_);
                 tqllm_cuda::mm_map_id(dv_ids_dev_.as<int>(), dv_arg_.as<int>(), dtok_.as<int>() + k + 1, stream_);
             }
             sm_mark(SM_DRAFT);
@@ -1371,7 +1372,7 @@ private:
             tqllm_cuda::mm_gather_row(dw1_, dtok_.as<int>() + k, dlat_.as<float>(), drank_, stream_);
             mv(dw2_, dlat_.as<float>(), dbias_.as<float>(), 1);
             tqllm_cuda::mm_add(dlog_.as<float>() + size_t(k) * vocab_, dbias_.as<float>(), vocab_, stream_);
-            tqllm_cuda::glm_argmax(dlog_.as<float>() + size_t(k) * vocab_, vocab_, dtok_.as<int>() + k + 1, stream_);
+            tqllm_cuda::common::argmax(dlog_.as<float>() + size_t(k) * vocab_, vocab_, dtok_.as<int>() + k + 1, stream_);
         }
         sm_mark(SM_DRAFT);   // the ids copy back (and the next forward's host embedding) stay in `draft`
         std::vector<int> ids(size_t(mk) + 1);
@@ -1568,7 +1569,7 @@ private:
                 if (prompt) next[n - 1] = draw(dist(0), rng_);
                 continue;
             }
-            tqllm_cuda::glm_argmax_rows(logits_.as<float>(), vocab_, rows, d_arg_.as<int>(), stream_);
+            tqllm_cuda::common::argmax_rows(logits_.as<float>(), vocab_, rows, d_arg_.as<int>(), stream_);
             std::vector<int> ids(static_cast<size_t>(rows));
             ck(cudaMemcpyAsync(ids.data(), d_arg_.p, size_t(rows) * sizeof(int), cudaMemcpyDeviceToHost, stream_));
             ck(cudaStreamSynchronize(stream_));
@@ -1619,27 +1620,27 @@ private:
         for (size_t li = 0; li < L_.size(); ++li) {
             auto & Y = L_[li];
             sm_mark(SM_NORM);
-            tqllm_cuda::glm_rmsnorm(x_.as<float>(), Y.attn_norm, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
+            tqllm_cuda::common::rmsnorm(x_.as<float>(), Y.attn_norm, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
             sm_mark(SM_ATTN);
             attention(Y, pos, n);
             sm_mark(SM_ADD);
-            tqllm_cuda::glm_add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
+            tqllm_cuda::common::add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
             sm_mark(SM_NORM);
             // an MoE layer reads this block in the format's FP16 layout as well: the norm writes both, so moe() does
             // not convert xn_ a second time
-            tqllm_cuda::glm_rmsnorm(x_.as<float>(), Y.ffn_norm, xn_.as<float>(),
+            tqllm_cuda::common::rmsnorm(x_.as<float>(), Y.ffn_norm, xn_.as<float>(),
                                     int(li) < dense_lead_ ? nullptr : xh_.as<__half>(), H_, eps_, stream_, n);
             sm_mark(SM_MOE);
             if (int(li) < dense_lead_) { ffn(Y.gate_up, Y.down, xn_.as<float>(), fo_.as<float>(), n); reduce(fo_.as<float>(), size_t(n) * H_); }
             else moe(Y, int(li), n);
             sm_mark(SM_ADD);
-            tqllm_cuda::glm_add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
+            tqllm_cuda::common::add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
             sm_mark(SM_CAP);
             dump(int(li), pos, n);
             if (has_draft() && li + 1 < L_.size()) capture(int(li), x_.as<float>(), n);
         }
         sm_mark(SM_NORM);
-        tqllm_cuda::glm_rmsnorm(x_.as<float>(), out_norm_, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
+        tqllm_cuda::common::rmsnorm(x_.as<float>(), out_norm_, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
         // the last layer's state as HF's hidden_states hands it to the drafter: after the final norm
         sm_mark(SM_DRAFT_CTX);
         if (has_draft()) {
