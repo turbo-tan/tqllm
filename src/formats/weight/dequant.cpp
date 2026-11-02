@@ -456,6 +456,23 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             if (n % 32) break;
             for (int64_t b = 0; b < n / 32; ++b) iq4nl(s + b * 18, dst + b * 32);
             return;
+        case 6: case 7:  // Q5_0 / Q5_1: d [, m], qh (bit j = high bit of element j), 16 bytes of low nibbles
+            if (n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                const bool q51 = type == 7;
+                const uint8_t * q = s + b * (q51 ? 24 : 22);
+                const float d = half_to_float(uint16_t(q[0] | (q[1] << 8)));
+                const float m = q51 ? half_to_float(uint16_t(q[2] | (q[3] << 8))) : 0.f;
+                const uint8_t * hb = q + (q51 ? 4 : 2);
+                const uint32_t qh = uint32_t(hb[0]) | uint32_t(hb[1]) << 8 | uint32_t(hb[2]) << 16 | uint32_t(hb[3]) << 24;
+                const uint8_t * qs = hb + 4;
+                for (int j = 0; j < 16; ++j) {
+                    const int lo = (qs[j] & 0x0F) | int((qh >> j) & 1) << 4, hi = (qs[j] >> 4) | int((qh >> (j + 16)) & 1) << 4;
+                    dst[b * 32 + j] = q51 ? d * float(lo) + m : d * float(lo - 16);
+                    dst[b * 32 + j + 16] = q51 ? d * float(hi) + m : d * float(hi - 16);
+                }
+            }
+            return;
         case 8:  // Q8_0: d, 32 int8
             if (n % 32) break;
             for (int64_t b = 0; b < n / 32; ++b) {

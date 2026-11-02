@@ -129,6 +129,8 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
         case GGML_I16:    elems = 1;   bytes = 2;   return true;
         case GGML_Q4_0:   elems = 32;  bytes = 18;  return true;
         case GGML_Q8_0:   elems = 32;  bytes = 34;  return true;
+        case GGML_Q5_0:   elems = 32;  bytes = 22;  return true;  // d, 32 high bits, 16 bytes of low nibbles
+        case GGML_Q5_1:   elems = 32;  bytes = 24;  return true;  // d, m, 32 high bits, 16 bytes of low nibbles
         case GGML_MXFP8:  elems = 32;  bytes = 33;  return true;  // per row: the E4M3 bytes, then the row's scales
         case GGML_GSQ_Q2_0: elems = 64; bytes = 18; return true;
         case GGML_TQ3_4S: elems = 32;  bytes = 16;  return true;

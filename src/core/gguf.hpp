@@ -12,6 +12,7 @@ namespace tqllm {
 // add and to diff. TQLLM-only formats start at 300, clear of ggml's ids.
 enum GgmlType : uint32_t {
     GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
+    GGML_Q5_0 = 6, GGML_Q5_1 = 7,  // vision projectors (Q5_K-MIX mmproj files mix Q5_0 into the ViT)
     GGML_Q2_K = 10,      // MoE expert tensors (GLM-5.3-Flash ffn_down_exps)
     GGML_Q3_K = 11,
     GGML_Q4_K = 12,
