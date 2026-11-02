@@ -48,6 +48,13 @@ target_include_directories(test-dflash-rank-stats PRIVATE ${CMAKE_CURRENT_SOURCE
 add_test(NAME dflash-rank-stats COMMAND test-dflash-rank-stats)
 add_executable(test-tree-columns tests/tree_columns.cpp)
 add_test(NAME tree-columns COMMAND test-tree-columns)
+add_executable(test-draft-tree tests/draft_tree.cpp src/spec/draft_tree.cpp)  # tree selectors (chain / best-first), no CUDA
+add_test(NAME draft-tree COMMAND test-draft-tree)
+add_executable(test-draft-tree-8k tests/draft_tree_8k.cpp src/spec/draft_tree.cpp)  # the 8K release lattice fixture: baselines (ctest) and the policy gate (--gate)
+add_test(NAME draft-tree-8k COMMAND test-draft-tree-8k)
+set_tests_properties(draft-tree-8k PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(test-suffix-copy tests/suffix_copy.cpp src/spec/suffix_copy.cpp)  # copy drafts from the context (no CUDA)
+add_test(NAME suffix-copy COMMAND test-suffix-copy)
 add_executable(test-prefill-plan tests/prefill_plan.cpp)  # Flash-Next prefill memory plan + bank ledger (no CUDA)
 target_include_directories(test-prefill-plan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME prefill-plan COMMAND test-prefill-plan)

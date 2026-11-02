@@ -27,16 +27,31 @@ public:
     void reset();
     void inject(const mlx::core::array& features,int position);
     std::vector<uint32_t> draft(uint32_t anchor,int position,int count);
+    // the selector lattice of a host draft (token-tree drafting): per drafted position the top-16 candidate ids, their
+    // unary logits, the selector's gate row and each candidate's successor codebook row, plus the predecessor rows of
+    // the candidates and the anchor (sorted by token). The drafter state advances as for draft()
+    struct HostLattice {
+        int positions=0,topk=0,rank=0;
+        std::vector<uint32_t> tokens,predecessor_tokens;
+        std::vector<float> unary,gate,successor,predecessor;
+        const float* predecessor_row(uint32_t token) const;
+    };
+    HostLattice draft_lattice(uint32_t anchor,int position,int count);
     // the same draft with the selector's ids left unevaluated on the GPU (uint32 [count]); needs
     // feed it to Qwen35::verify_device without reading it back.
     mlx::core::array draft_device(uint32_t anchor,int position,int count);
     // draft-ahead (ring drafter, device selector): inject `count` (device int32, 1..rows) of the feature rows at `position`
     // (device int32, the first row's position) without a readback, and draft from an anchor id and position on the GPU,
-    // so the next draft is queued behind the verify that produced them
+    // so the next draft is queued behind the verify that produced them. Up to two draft blocks (32 rows) go in two ring
+    // advances, so a tree step's accepted path may exceed the drafter's own block
     void inject_device(const mlx::core::array& features,const mlx::core::array& count,const mlx::core::array& position);
     mlx::core::array draft_device_at(const mlx::core::array& anchor,const mlx::core::array& position,int count);
     // after the step's readback: the last inject_device wrote `rows` rows (tightens the host's bound on the GPU fill)
     void settle_device_inject(int rows);
+    // rows one inject may carry (the pipeline's verify rows: 16, or 32 for a 31-node tree); sizes the attention span of a
+    // draft issued before its inject settles
+    void inject_block(int rows);
+    void reset_inject_block();
     // draft bench: time_stages(true) syncs each stage of draft_device_at; stage_ms_per_call() returns the mean ms of
     // layers, head, top-16 and selector
     void time_stages(bool on);
@@ -53,7 +68,16 @@ public:
     void reserve_far(int rows);
     // with TQLLM_DEBUG=dflash_rankstats: the last draft's 16 candidates per proposed token, best unary score first
     const std::vector<std::vector<uint32_t>>& candidates() const;
+    // the selector lattice of a block (rows 0 .. block - 1, row 0 the anchor's): candidate ids [rows, 16], unary logits,
+    // gate rows [rows, rank] and successor rows [rows, 16, rank], all left on the device
+    struct LatticeArrays {mlx::core::array mapped,unary,gate,successors;};
+    // draft_device_at's lattice before the chain selector: the input of a device token tree (tree_device.hpp); the
+    // drafter state advances as for draft_device_at
+    LatticeArrays draft_lattice_device(const mlx::core::array& anchor,const mlx::core::array& position,int count);
+    const mlx::core::array& selector_predecessor() const;  // [vocab, rank]: the predecessor codebook table
 private:
+    LatticeArrays lattice_arrays(uint32_t anchor,int position,int count);
+    LatticeArrays device_lattice(const mlx::core::array& anchor,const mlx::core::array& position,int count);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

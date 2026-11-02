@@ -309,6 +309,9 @@ struct Qwen35::Impl {
     std::vector<std::optional<mx::array>> kv_kscale,kv_vscale;
     std::vector<PrefixTape> tapes;
     bool capture_prefix=false;
+    // token-tree verify (verify_tree_device): each row's parent row, depth below the anchor and [n, n] ancestor mask
+    struct TreeRows {mx::array parents,depth,visible;std::vector<int32_t> host_parents;};
+    std::optional<TreeRows> tree;
     std::optional<std::pair<mx::array,mx::array>> dense_input;
     std::optional<mx::array> last_hidden;
     std::optional<mx::array> last_features;
@@ -332,6 +335,7 @@ struct Qwen35::Impl {
     // layer-major prefill (forward_layer_major): one FP16 dequant per matrix shared by the batch's slices, dropped per layer
     bool share_dequant=false;
     bool defer_eval=false;  // draft-ahead: submit this forward without waiting, the caller chains the next draft behind it
+    int stream_group=4,stream_layers=1;  // submit a group of layers' ops as they are built (nostream: one submission)
     std::map<const NaxAffine*,mx::array> dequant_cache;
     mx::array dequant(const NaxAffine& w) {
         if(!share_dequant)return nax_affine_dequant(w);
@@ -350,6 +354,17 @@ struct Qwen35::Impl {
 
     std::map<std::string,double> stages;
     std::chrono::steady_clock::time_point stage_tick;
+    // build_split (TQLLM_DEBUG): host time between marks of one forward, no sync - the graph building of a step with the
+    // GPU idle, which the pipeline's phases report as its build_ms
+    bool build_split=false;
+    std::map<std::string,double> build_stage;
+    std::chrono::steady_clock::time_point build_tick;
+    double deferred_submit_ms=0;  // the deferred forward's trailing submission: how much of the verify it blocked on
+    void build_mark(const char* name) {
+        if(!build_split)return;
+        auto now=std::chrono::steady_clock::now();
+        build_stage[name]+=std::chrono::duration<double,std::milli>(now-build_tick).count();build_tick=now;
+    }
     // with profile_stages: evaluate the arrays and charge the time since the last mark to this stage
     void stage(const char* name,const std::vector<mx::array>& arrays) {
         if(!stage_profiling)return;
@@ -360,6 +375,9 @@ struct Qwen35::Impl {
     }
     std::pair<double,double> times={0,0};
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
+        build_split=tqllm::debug_cstr("build_split")!=nullptr;
+        stream_layers=tqllm::debug_cstr("nostream")==nullptr;
+        if(const int g=tqllm::debug_int("stream_group");g>0)stream_group=g;
         const auto arch=file.kv.at("general.architecture").str;
         if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
         const std::string a="qwen35.";
@@ -758,7 +776,7 @@ struct Qwen35::Impl {
         if(!in.empty() && attn_qk_fused_on() && attn_qk_fused!=0) {
             auto f=attn_qk_norm_rope(in[0],in[1],in[2],
                                      plain.at(p+"attn_q_norm.weight"),plain.at(p+"attn_k_norm.weight"),
-                                     heads,kvheads,hd,rot,theta,eps,offset);
+                                     heads,kvheads,hd,rot,theta,eps,offset,tree?&tree->depth:nullptr);
             if(attn_qk_fused<0) {
                 auto ref=attn_qk_norm_rope_reference(in[0],in[1],in[2],
                                                      plain.at(p+"attn_q_norm.weight"),plain.at(p+"attn_k_norm.weight"),
@@ -776,7 +794,14 @@ struct Qwen35::Impl {
         auto k=mx::reshape(proj(1,"attn_k.weight"),{1,m,kvheads,hd});
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
         auto v=mx::transpose(mx::reshape(proj(2,"attn_v.weight"),{1,m,kvheads,hd}),{0,2,1,3});
-        q=bf(mx::fast::rope(q,rot,false,theta,1.0f,offset));k=bf(mx::fast::rope(k,rot,false,theta,1.0f,offset));
+        // tree verify: row t sits at offset + depth[t]; each row becomes its own batch element (MLX rope takes a
+        // position per batch element)
+        auto rope_rows=[&](const mx::array& t) {
+            if(!tree)return mx::fast::rope(t,rot,false,theta,1.0f,offset);
+            auto rows=mx::transpose(t,{2,1,0,3});
+            return mx::transpose(mx::fast::rope(rows,rot,false,theta,1.0f,mx::add(tree->depth,mx::array(offset,mx::int32))),{2,1,0,3});
+        };
+        q=bf(rope_rows(q));k=bf(rope_rows(k));
         stage(in.empty()?"attn_proj":"attn_qk_norm_rope",{q,k,v,gate});
         return attn_core(p,q,k,v,gate,c,offset,layer,m);
     }
@@ -870,7 +895,10 @@ struct Qwen35::Impl {
             out=gate_mul_bf(out,gate);
             return mat(p+"attn_output.weight",mx::reshape(out,{m,heads*hd}));
         }
-        if(kv_tier!=KvTier::Bf16) return attn_core_compressed(p,q,k,v,gate,c,layer,m);
+        if(kv_tier!=KvTier::Bf16) {
+            if(tree)throw std::invalid_argument("tree verify reads a BF16 KV cache only");
+            return attn_core_compressed(p,q,k,v,gate,c,layer,m);
+        }
         auto& kb=kv_keys[layer];auto& vb=kv_values[layer];
         const int need=c.kv_len+m;
         // keys and values are already BF16-rounded, so BF16 storage is exact and halves the cache
@@ -888,7 +916,7 @@ struct Qwen35::Impl {
         kb=mx::slice_update(*kb,k,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         vb=mx::slice_update(*vb,v,{0,0,c.kv_len,0},{1,kvheads,need,hd});
         c.kv_len=need;
-        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need);
+        auto out=causal_attention_rows(q,*kb,*vb,1.0f/std::sqrt(float(hd)),need,tree?&tree->visible:nullptr,tree?&tree->host_parents:nullptr,capture_prefix);
         out=mx::reshape(mx::transpose(out,{0,2,1,3}),{m,heads,hd});
         stage("attn_core",{out,*kb,*vb});
         out=gate_mul_bf(out,gate);
@@ -921,7 +949,8 @@ struct Qwen35::Impl {
         auto in=pack_product16(p+"gdn_in",x);   // qkv | z
         // one launch for conv, gates, q/k norms, the 1-16 token scan, the compact tape and the gated norm (j762: verify
         // -2.2 ms; served since j892). Decode, verify and the accept replay share its recurrence
-        const bool step_path=m<=16 && conv==4 && dk==128 && dv==128;
+        // 17-32 rows: verify only (a prefill chunk of that size keeps the scan, so prefill values do not move)
+        const bool step_path=(m<=16 || (capture_prefix && m<=32)) && conv==4 && dk==128 && dv==128;
         auto qkv=in.empty()?mat(p+"attn_qkv.weight",x):round_product(in[0]);
         stage("gdn_proj_in",{qkv});
         auto history=c.conv?*c.conv:mx::zeros({conv-1,width});
@@ -937,12 +966,13 @@ struct Qwen35::Impl {
                 return {dense_rotated_input->second,ab->second};
             }();
             auto step=gdn_step_fused(history,qkv,weights,gates_in.first,gates_in.second,plain.at(p+"ssm_dt.bias"),plain.at(p+"ssm_a"),z,
-                plain.at(p+"ssm_norm.weight"),eps,1.0f/std::sqrt(float(dk)),c.state,kh,vh);
+                plain.at(p+"ssm_norm.weight"),eps,1.0f/std::sqrt(float(dk)),c.state,kh,vh,0,0,0,tree?&tree->parents:nullptr);
             c.conv=step.history;c.state=step.state;
             if(capture_prefix) {tape.states.reset();tape.keys=step.keys;tape.decay=step.decay;tape.deltas=step.deltas;}
             stage("gdn_scan",{step.out,step.state});
             return mat(p+"ssm_out.weight",step.out);
         }
+        if(tree)throw std::invalid_argument("tree verify needs the fused GDN step (1-32 rows)");
         auto joined=mx::concatenate({history,qkv},0);
         if(capture_prefix)tape.conv_inputs=joined;
         // fused prep / post kernels on prefill chunks only: verify (16 rows, prefix capture) must run the same ops as AR
@@ -972,6 +1002,7 @@ struct Qwen35::Impl {
     }
     mx::array forward(std::span<const uint32_t> tokens,bool all_logits) {
         auto start=std::chrono::steady_clock::now();
+        build_stage.clear();build_tick=start;
         if(tokens.empty()||tokens.size()>size_t(context-pos)) throw std::invalid_argument("MLX token batch exceeds remaining context");
         stages.clear();dense_input.reset();
         if(stage_profiling) {  // the cost of one sync on an empty graph, to subtract per stage call
@@ -991,6 +1022,7 @@ struct Qwen35::Impl {
         auto x=use_wave?wave_layers(tokens,features):bf(embed(tokens));
         bool wave_features=use_wave;
         if(stage_profiling)record("embedding",{x});
+        build_mark("embed");
         std::optional<DispatchCount> dispatches;
         if(tqllm::debug_cstr("count_nodes")) {dispatches.emplace();dispatches->take({x},"embed");}
         auto cache_roots=[&](int l,std::vector<mx::array> roots) {
@@ -1006,7 +1038,7 @@ struct Qwen35::Impl {
             constexpr bool pack_on0=true;
             const bool rows16=x.shape(0)<=16;
             auto n=(pack_on0 && !capture_prefix && x.shape(0)>=64)?norm_prefill(x,p+"attn_norm.weight"):rows16?norm_rows(x,p+"attn_norm.weight"):norm(x,p+"attn_norm.weight");
-            stage("norm_in",{n});
+            stage("norm_in",{n});build_mark("norm");
             const bool is_attn=(l+1)%interval==0;
             // prefill chunks: the output projection adds the residual (mixer_added), the down product likewise
             constexpr bool pack_on=true;
@@ -1014,6 +1046,7 @@ struct Qwen35::Impl {
             mixer_residual=fuse?&x:nullptr;mixer_added=false;
             auto attn=is_attn?full_attention(p,n,caches[l],offset,l):gdn(p,n,caches[l],tapes[l]);
             mixer_residual=nullptr;
+            build_mark(is_attn?"mixer_attn":"mixer_gdn");
             if(stage_profiling) {
                 std::vector<mx::array> values={attn};const auto& c=caches[l];
                 for(const std::optional<mx::array>* a:std::initializer_list<const std::optional<mx::array>*>{&c.conv,&c.state,&kv_keys[l],&kv_values[l],&kv_kscale[l],&kv_vscale[l]})if(*a)values.push_back(**a);
@@ -1022,7 +1055,7 @@ struct Qwen35::Impl {
             if(dispatches)dispatches->take(cache_roots(l,{attn}),std::string(is_attn?"attn":"gdn")+"/mixer");
             if(!mixer_added && rows16) {auto an=add_norm_rows(x,attn,p+"post_attention_norm.weight");x=an.first;n=an.second;}
             else {x=mixer_added?attn:add_bf(x,attn);n=fuse?norm_prefill(x,p+"post_attention_norm.weight"):norm(x,p+"post_attention_norm.weight");}
-            stage("norm_post",{n});
+            stage("norm_post",{n});build_mark("norm_post");
             if(auto down=ffn_gemm(p,n,fuse?&x:nullptr)) x=fuse?*down:add_bf(x,*down);
             else if(auto fused=swiglu_rows(p,n)) {
                 if(stage_profiling)record("ffn_gate_up",{*fused});
@@ -1035,7 +1068,13 @@ struct Qwen35::Impl {
                 x=add_bf(x,mat(p+"ffn_down.weight",ff));
             }
             if(stage_profiling)record(fuse?"ffn_down_gemm_res":"ffn_down",{x});
+            build_mark("ffn");
             if(dispatches)dispatches->take({x},std::string(is_attn?"attn":"gdn")+"/ffn");
+            // draft-ahead: submit each group of layers as it is built. One async_eval at the end of the forward leaves
+            // the GPU idle for the host work in between (the rest of the graph and the next draft's); a few layers' worth
+            // of queue is enough to cover it, and one submission per 4 layers is MLX's own command-buffer size
+            if(defer_eval && !dispatches && stream_layers && (l%stream_group==stream_group-1 || l==layers-1))
+                mx::async_eval(cache_roots(l,{x,attn}));
         };
         // a prefill batch of more than group_rows rows runs layer-major in slices of that many rows, each slice with
         // the ops (shapes, positions, cache order) of its own S-row forward, so the result equals S-row chunks while each
@@ -1080,6 +1119,7 @@ struct Qwen35::Impl {
         last_hidden=x;
         if(!features.empty())last_features=wave_features?features[0]:mx::concatenate(features,1);
         x=norm(x,"output_norm.weight");
+        build_mark("norm_out");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
         std::vector<mx::array> live={x};
         if(last_features)live.push_back(*last_features);
@@ -1095,7 +1135,17 @@ struct Qwen35::Impl {
         auto logits=nax.contains("output.weight")?nax_affine_matmul(nax.at("output.weight"),x):linear(matrices.at("output.weight"),x);
         live.push_back(logits);
         if(dispatches)dispatches->take(live,"head+rest");
-        if(defer_eval && !dispatches)mx::async_eval(live);else mx::eval(live);
+        build_mark("head");
+        if(defer_eval && !dispatches) {
+            const auto tick=std::chrono::steady_clock::now();
+            mx::async_eval(live);
+            deferred_submit_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
+        } else mx::eval(live);
+        if(build_split) {
+            double total=0;std::string line;
+            for(const auto& [name,ms]:build_stage) {char part[64];std::snprintf(part,sizeof part," %s %.2f",name.c_str(),ms);line+=part;total+=ms;}
+            std::fprintf(stderr,"BUILD_SPLIT m %d pos %d%s total %.2f\n",m,pos,line.c_str(),total);
+        }
         if(dispatches)dispatches->report(m,layers-layers/interval,layers/interval);
         auto end=std::chrono::steady_clock::now();
         times={std::chrono::duration<double,std::milli>(body_end-start).count(),
@@ -1134,9 +1184,11 @@ struct Qwen35::Verification::State {
     std::vector<PrefixTape> tapes;
     std::optional<mx::array> hidden_before,hidden_after;
     std::optional<mx::array> features_before,features_after;
+    std::vector<int32_t> parents;  // tree verify: each row's parent row (empty: a chain)
 };
 mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
-    if(tokens.empty() || tokens.size()>16)throw std::invalid_argument("MLX prefix verification takes 1-16 tokens");
+    if(tokens.empty() || tokens.size()>32)throw std::invalid_argument("MLX prefix verification takes 1-32 tokens");
+    if(tokens.size()>16 && impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("MLX verification of 17-32 tokens reads a BF16 KV cache");
     batch.state_.reset();
     const auto before=checkpoint();
     impl_->capture_prefix=true;
@@ -1146,7 +1198,7 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
         batch.state_=std::make_shared<Verification::State>(Verification::State{
             impl_.get(),impl_->epoch,impl_->revision,before.state_->pos,int(tokens.size()),
             before.state_->caches,impl_->caches,impl_->tapes,before.state_->hidden,impl_->last_hidden,
-            before.state_->features,impl_->last_features});
+            before.state_->features,impl_->last_features,impl_->tree?impl_->tree->host_parents:std::vector<int32_t>{}});
         impl_->capture_prefix=false;
         for(auto& tape:impl_->tapes)tape=PrefixTape{};
         return logits;
@@ -1158,8 +1210,8 @@ mx::array Qwen35::verify(std::span<const uint32_t> tokens,Verification& batch) {
     }
 }
 mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch) {
-    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>16)
-        throw std::invalid_argument("device verification needs uint32 ids [1..16]");
+    if(ids.ndim()!=1 || ids.dtype()!=mx::uint32 || ids.shape(0)<1 || ids.shape(0)>32)
+        throw std::invalid_argument("device verification needs uint32 ids [1..32]");
     const std::vector<uint32_t> placeholder(size_t(ids.shape(0)),0u);
     impl_->device_ids=ids;
     try {
@@ -1167,6 +1219,81 @@ mx::array Qwen35::verify_device(const mx::array& ids,Verification& batch) {
         impl_->device_ids.reset();
         return out;
     } catch(...) {impl_->device_ids.reset();throw;}
+}
+mx::array Qwen35::verify_tree_device(const mx::array& ids,const std::vector<int32_t>& parents,Verification& batch) {
+    const int n=ids.ndim()==1?ids.shape(0):0;
+    if(n<1 || n>32 || int(parents.size())!=n || parents[0]!=-1)
+        throw std::invalid_argument("tree verification: 1-32 rows, row 0 the anchor (parent -1)");
+    if(impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("tree verification reads a BF16 KV cache only");
+    std::vector<int32_t> depth(size_t(n),0);std::vector<uint8_t> visible(size_t(n)*size_t(n),0);
+    for(int t=0;t<n;++t) {
+        if(t>0 && (parents[t]<0 || parents[t]>=t))throw std::invalid_argument("tree verification: a parent precedes its row");
+        depth[t]=t?depth[parents[t]]+1:0;
+        for(int a=t;a>=0;a=a?parents[a]:-1)visible[size_t(t)*n+a]=1;
+    }
+    impl_->tree=Impl::TreeRows{mx::array(parents.data(),{n},mx::int32),mx::array(depth.data(),{n},mx::int32),
+                               mx::astype(mx::array(visible.data(),{n,n},mx::uint8),mx::bool_),parents};
+    try {auto out=verify_device(ids,batch);impl_->tree.reset();return out;}
+    catch(...) {impl_->tree.reset();throw;}
+}
+mx::array Qwen35::verify_tree_device(const mx::array& ids,const mx::array& parents,const mx::array& depth,const mx::array& visible,
+                                     Verification& batch) {
+    const int n=ids.ndim()==1?ids.shape(0):0;
+    if(n<1 || n>32 || parents.shape()!=mx::Shape{n} || depth.shape()!=mx::Shape{n} || visible.shape()!=mx::Shape{n,n} ||
+       parents.dtype()!=mx::int32 || depth.dtype()!=mx::int32 || visible.dtype()!=mx::bool_)
+        throw std::invalid_argument("device tree verification: 1-32 rows, int32 parents / depth, bool [n, n] ancestors");
+    if(impl_->kv_tier!=KvTier::Bf16)throw std::invalid_argument("tree verification reads a BF16 KV cache only");
+    impl_->tree=Impl::TreeRows{parents,depth,visible,{}};
+    try {auto out=verify_device(ids,batch);impl_->tree.reset();return out;}
+    catch(...) {impl_->tree.reset();throw;}
+}
+void Qwen35::accept_path(const Verification& batch,const std::vector<int32_t>& rows,const std::vector<int32_t>* tree_parents) {
+    const auto* s=batch.state_.get();
+    const int count=int(rows.size());
+    if(!s || s->owner!=impl_.get() || s->epoch!=impl_->epoch || s->revision!=impl_->revision || count<1 || count>s->count ||
+       impl_->pos!=s->start+s->count || rows[0]!=0)
+        throw std::invalid_argument("MLX tree verification is stale or the path is invalid");
+    // a device tree's parents come from the caller (read back with the verify's choices)
+    const auto& parents=s->parents.empty() && tree_parents?*tree_parents:s->parents;
+    if(!parents.empty() && int(parents.size())!=s->count)throw std::invalid_argument("tree path: one parent per verified row");
+    bool chain=true;
+    for(int i=1;i<count;++i) {
+        const int parent=parents.empty()?rows[i]-1:parents[size_t(rows[i])];
+        if(rows[i]<=0 || rows[i]>=s->count || parent!=rows[i-1])throw std::invalid_argument("tree path: each row is the previous row's child");
+        chain=chain && rows[i]==i;
+    }
+    if(chain) {accept_prefix(batch,size_t(count));return;}
+    // a path that leaves the first rows: its KV rows move to start .. start + count, the GDN conv history and state are
+    // rebuilt from the tape along the path (the replay kernel of a chain accept), hidden and features follow the path
+    auto& i=*impl_;
+    const auto index=mx::array(rows.data(),{count},mx::int32);
+    auto caches=s->after;
+    std::vector<mx::array> moved_kv;
+    for(int l=0;l<i.layers;++l) {
+        auto& c=caches[l];const auto& tape=s->tapes[l];
+        if((l+1)%i.interval==0) {
+            for(auto* kv:{&i.kv_keys[l],&i.kv_values[l]}) {
+                auto& a=**kv;
+                auto moved=mx::take(mx::slice(a,{0,0,s->start,0},{1,a.shape(1),s->start+s->count,a.shape(3)}),index,2);
+                a=mx::slice_update(a,moved,{0,0,s->start,0},{1,a.shape(1),s->start+count,a.shape(3)});
+                moved_kv.push_back(a);
+            }
+            c.kv_len=s->start+count;
+        } else {
+            if(!tape.conv_rows || !tape.deltas)throw std::invalid_argument("tree path accept needs the fused GDN step tape");
+            auto joined=mx::concatenate({*tape.conv_prev,mx::take(*tape.conv_rows,index,0)},0);
+            c.conv=mx::contiguous(tail_slice(joined,0,count,count+i.conv-1));
+            c.state=gdn_replay_prefix(mx::take(*tape.keys,index,1),mx::take(*tape.decay,index,1),mx::take(*tape.deltas,index,0),
+                                      s->before[l].state,count);
+        }
+    }
+    // run the moves now, in one submission, on this thread's stream: the KV buffers outlive the request, and a later request
+    // may run on another thread (MLX streams are per thread)
+    mx::async_eval(moved_kv);
+    i.caches=std::move(caches);i.pos=s->start+count;++i.revision;
+    const int last=rows[count-1];
+    i.last_hidden=tail_slice(*s->hidden_after,0,last,last+1);
+    i.last_features=s->features_after?std::optional<mx::array>(mx::take(*s->features_after,index,0)):s->features_before;
 }
 void Qwen35::accept_prefix(const Verification& batch,size_t count) {
     const auto* s=batch.state_.get();
@@ -1210,6 +1337,7 @@ mx::array Qwen35::embed_device(const mx::array& ids) const {
     return bf(i.embedding8?affine8_embedding(*i.embedding8,ids):q4_embedding(*i.embedding,ids));
 }
 void Qwen35::defer_eval(bool enabled) {impl_->defer_eval=enabled;}
+double Qwen35::defer_submit_ms() const {return impl_->deferred_submit_ms;}
 mx::array Qwen35::shared_draft_head(const mx::array& x) const {
     if(x.ndim()!=2 || x.shape(1)!=impl_->hidden || x.dtype()!=mx::float32)
         throw std::invalid_argument("invalid shared draft-head input");

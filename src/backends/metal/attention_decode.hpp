@@ -1,4 +1,8 @@
 #pragma once
+#include <array>
+#include <functional>
+#include <optional>
+#include <vector>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -10,6 +14,8 @@
 #include <mlx/fast.h>
 #include <mlx/ops.h>
 #include <mlx/transforms.h>
+
+#include "attention_split.hpp"
 
 namespace tqllm::mlx_backend {
 // Decode / verify attention for 1-16 query rows over the BF16 KV cache: every call has the shape of a 16-row call, so a
@@ -29,19 +35,53 @@ inline void check_decode_rows_shape(const mlx::core::array& q, const mlx::core::
 // MLX's fused attention is compute-bound in the folded rows (j990), so 8 rows halve the attention work at long context.
 inline int decode_row_shape(int n) {return n <= 8 ? 8 : 16;}
 
+// Token-tree verify: block row t sees every key before the block and the block keys of its ancestors and itself
+// (visible [n, nb] bool: query row t, block key j; nb = n, or the whole block when a 17-32 row verify runs its rows as
+// two calls). Rows padded at the front see what row 0 sees (their outputs are dropped). With a chain (visible lower
+// triangular) every real row's mask equals the causal one, so a chain verifies bit for bit as before.
+inline mlx::core::array tree_key_mask(const mlx::core::array& visible, int rows, int n, int length, int total) {
+    namespace mx = mlx::core;
+    const int nb = visible.shape(1);
+    auto block = visible;
+    if (rows > n) block = mx::concatenate({mx::broadcast_to(mx::slice(visible, {0, 0}, {1, nb}), {rows - n, nb}), visible}, 0);
+    std::vector<mx::array> parts{mx::full({rows, length - nb}, mx::array(true)), block};
+    if (total > length) parts.push_back(mx::full({rows, total - length}, mx::array(false)));
+    return mx::concatenate(parts, 1);
+}
+
+// Every attention layer of one tree verify asks for the same mask (same rows, keys and ancestor table), so it is built
+// on the first layer and reused by the others instead of once per layer. The entry holds the ancestor table it was built
+// from, so its id cannot be reused by a later table while it is cached; a new table replaces the entries.
+// Entries made from an entry (the row halves of a 17-32 row verify) belong to the same verify. Entries hold the arrays
+// they were made from, so no id is reused while cached.
+inline mlx::core::array cached_tree_mask(const mlx::core::array& visible, const std::array<int, 7>& shape,
+                                         const std::function<mlx::core::array()>& make) {
+    struct Entry {mlx::core::array visible, mask; std::array<int, 7> shape;};
+    struct Cache {std::optional<mlx::core::array> root; std::vector<Entry> entries;};
+    // never destroyed: an array must not outlive MLX's allocator at exit
+    static thread_local auto* cache = new Cache();
+    bool known = cache->root && cache->root->id() == visible.id();
+    for (const auto& e : cache->entries) known = known || e.mask.id() == visible.id();
+    if (!known) {cache->entries.clear(); cache->root = visible;}
+    for (const auto& e : cache->entries) if (e.visible.id() == visible.id() && e.shape == shape) return e.mask;
+    cache->entries.push_back({visible, make(), shape});
+    return cache->entries.back().mask;
+}
+
 // bf16_folded: GQA folded into query rows, so each KV head's keys and values are read once for its G query heads: q [1,
 // H, n, d] -> [1, KH, G * R, d] (rows padded at the front to R = decode_row_shape(n) per head), one MLX SDPA call per
 // layer with an explicit per-row causal mask (row r sees keys <= L - R + r % R). Rows stay independent of each other,
 // and AR uses the same R-row shape, so a row agrees bit for bit across row counts.
 inline mlx::core::array decode_attention_bf16_folded(const mlx::core::array& q, const mlx::core::array& k,
-                                                 const mlx::core::array& v, float scale, int valid = -1) {
+                                                 const mlx::core::array& v, float scale, int valid = -1,
+                                                 const mlx::core::array* tree = nullptr) {
     namespace mx = mlx::core;
     check_decode_rows_shape(q, k, v, valid);
     const int heads = q.shape(1), kvh = k.shape(1), group = heads / kvh, n = q.shape(2), dim = q.shape(3);
     const int shape = decode_row_shape(n);
     const int length = valid > 0 ? valid : k.shape(2), rows = std::min(shape, length);
     constexpr int kSplit = 4096;  // rows <= 4096 keys run as their own call
-    if (length > kSplit && length - n + 1 <= kSplit) {
+    if (!tree && length > kSplit && length - n + 1 <= kSplit) {
         const int below = kSplit - (length - n);
         auto lo = decode_attention_bf16_folded(mx::slice(q, {0, 0, 0, 0}, {1, heads, below, dim}), k, v, scale, kSplit);
         auto hi = decode_attention_bf16_folded(mx::slice(q, {0, 0, below, 0}, {1, heads, n, dim}), k, v, scale, length);
@@ -58,7 +98,9 @@ inline mlx::core::array decode_attention_bf16_folded(const mlx::core::array& q, 
     auto values = mx::slice(v, {0, 0, 0, 0}, {1, kvh, length, dim});
     auto t = mx::remainder(mx::arange(group * rows), mx::array(rows));                       // token of each folded row
     auto visible = mx::add(t, mx::array(length - rows));                                       // last visible key per row
-    auto mask = mx::less_equal(mx::reshape(mx::arange(length), {1, length}), mx::reshape(visible, {group * rows, 1}));
+    auto mask = tree ? cached_tree_mask(*tree, {0, rows, n, length, length, group, 0},
+                                        [&] {return mx::tile(tree_key_mask(*tree, rows, n, length, length), {group, 1});})
+                     : mx::less_equal(mx::reshape(mx::arange(length), {1, length}), mx::reshape(visible, {group * rows, 1}));
     auto out = mx::fast::scaled_dot_product_attention(query, keys, values, scale, "array", mask);
     out = mx::reshape(out, {1, heads, rows, dim});
     return mx::astype(mx::slice(out, {0, 0, rows - n, 0}, {1, heads, rows, dim}), mx::float32);
@@ -74,9 +116,35 @@ constexpr int kAttentionSegment = 1024;  // the KV cache capacity is a multiple 
 // cannot see return -inf and are skipped, so a row's result does not depend on how many rows share the call. K / V are
 // strided views of the cache (its capacity is a multiple of the segment, zero past the filled rows); a shorter buffer
 // (tests) is zero padded. Needs the matrix unit (M5): elsewhere decode_attention_bf16 keeps bf16_folded.
+// Side branches of a token tree (host parents, row 0 = the anchor): the main chain is rows 0, 1, ... while each row's parent
+// is the row before it; every other row belongs to the first leaf path (in row order) that contains it.
+struct TreeBranch {std::vector<int32_t> path; std::vector<int32_t> rows, depths;};  // path: block rows in depth order
+inline std::vector<TreeBranch> tree_side_branches(const std::vector<int32_t>& parents) {
+    const int n = int(parents.size());
+    std::vector<char> on_chain(size_t(n), 0), has_child(size_t(n), 0), taken(size_t(n), 0);
+    for (int t = 0; t < n; ++t) {
+        on_chain[size_t(t)] = t == 0 || (parents[size_t(t)] == t - 1 && on_chain[size_t(t - 1)]);
+        if (parents[size_t(t)] >= 0) has_child[size_t(parents[size_t(t)])] = 1;
+    }
+    std::vector<TreeBranch> out;
+    for (int leaf = 0; leaf < n; ++leaf) {
+        if (has_child[size_t(leaf)] || on_chain[size_t(leaf)]) continue;
+        TreeBranch b;
+        for (int a = leaf; a >= 0; a = parents[size_t(a)]) b.path.insert(b.path.begin(), a);
+        for (size_t d = 0; d < b.path.size(); ++d) {
+            const int row = b.path[d];
+            if (!on_chain[size_t(row)] && !taken[size_t(row)]) {taken[size_t(row)] = 1; b.rows.push_back(row); b.depths.push_back(int32_t(d));}
+        }
+        if (!b.rows.empty()) out.push_back(std::move(b));
+    }
+    return out;
+}
+
 inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& q, const mlx::core::array& k,
                                                   const mlx::core::array& v, float scale, int valid = -1,
-                                                  int seg = kAttentionSegment) {
+                                                  int seg = kAttentionSegment, const mlx::core::array* tree = nullptr,
+                                                  const std::vector<int32_t>* tree_parents = nullptr,
+                                                  int block_rows = 0, int block_offset = 0) {
     namespace mx = mlx::core;
     check_decode_rows_shape(q, k, v, valid);
     if (k.dtype() != mx::bfloat16) throw std::invalid_argument("decode attention bf16_segmented reads a BF16 KV cache");
@@ -84,6 +152,7 @@ inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& 
     const int heads = q.shape(1), kvh = k.shape(1), group = heads / kvh, n = q.shape(2), dim = q.shape(3);
     const int length = valid > 0 ? valid : k.shape(2), rows = std::min(decode_row_shape(n), length);
     const int segments = (length + seg - 1) / seg;
+    const auto source_keys = k, source_values = v;
     auto keys = k, values = v;
     if (keys.shape(2) < segments * seg) {
         const int extra = segments * seg - keys.shape(2);
@@ -104,7 +173,58 @@ inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& 
     auto key_index = mx::reshape(mx::arange(segments * seg), {segments, 1, 1, seg});
     auto last = mx::add(mx::remainder(mx::arange(group * rows), mx::array(rows)), mx::array(length - rows));
     auto mask = mx::less_equal(key_index, mx::reshape(last, {1, 1, group * rows, 1}));
+    if (tree)
+        mask = cached_tree_mask(*tree, {1, rows, n, length, segments * seg, group, seg}, [&] {
+            return mx::reshape(mx::transpose(mx::reshape(mx::tile(tree_key_mask(*tree, rows, n, length, segments * seg), {group, 1}),
+                                                         {group * rows, segments, seg}), {1, 0, 2}), {segments, 1, group * rows, seg});
+        });
+    // A token tree's side-branch rows must see their ancestors' keys where their AR step has them (prefix, then the path
+    // in depth order): the matrix-unit kernel's rounding depends on where a visible key sits in its tiles, so a hole
+    // before a key changes the result (mlx_tree_kernels). Those rows take only the full segments below the prefix's last
+    // segment boundary from this call, and their tail segments from a call on the prefix tail followed by their branch's
+    // path keys; the merge folds each row's visible segments in key order, as for AR.
+    const auto branches = tree && tree_parents ? tree_side_branches(*tree_parents) : std::vector<TreeBranch>{};
+    // a 17-32 row verify's halves: `length` counts every key of the block, and the hi half's rows are block rows 16.. of
+    // a 32-row block, so neither the prefix nor a row's block index follows from this call's own row count
+    const int block = block_rows > 0 ? block_rows : n;
+    const int prefix = length - block, shared = prefix / seg * seg;
+    std::vector<int32_t> row_of_slot(size_t(group * rows), -1);  // folded row -> block row (-1: front padding)
+    for (int r = 0; r < group * rows; ++r) {const int t = r % rows - (rows - n) + block_offset; row_of_slot[size_t(r)] = t;}
+    if (!branches.empty()) {
+        std::vector<int32_t> limit(size_t(group * rows), segments * seg);
+        for (const auto& b : branches)
+            for (int r = 0; r < group * rows; ++r)
+                if (std::find(b.rows.begin(), b.rows.end(), row_of_slot[size_t(r)]) != b.rows.end()) limit[size_t(r)] = shared;
+        mask = mx::logical_and(mask, mx::less(key_index, mx::reshape(mx::array(limit.data(), {group * rows}, mx::int32), {1, 1, group * rows, 1})));
+    }
     auto parts = mx::fast::scaled_dot_product_attention_lse(query, keys, values, scale, mask);
+    std::vector<mx::array> outputs{parts[0]}, lses{parts[1]};
+    int total = segments;
+    for (const auto& b : branches) {
+        const int tail = prefix - shared + int(b.path.size()), count = (tail + seg - 1) / seg;
+        std::vector<int32_t> picks;
+        for (int key = shared; key < prefix; ++key) picks.push_back(key);
+        for (int row : b.path) picks.push_back(prefix + row);
+        const auto index = mx::array(picks.data(), {int(picks.size())}, mx::int32);
+        auto tk = mx::take(source_keys, index, 2), tv = mx::take(source_values, index, 2);
+        if (tail < count * seg) {
+            tk = mx::concatenate({tk, mx::zeros({1, kvh, count * seg - tail, dim}, tk.dtype())}, 2);
+            tv = mx::concatenate({tv, mx::zeros({1, kvh, count * seg - tail, dim}, tv.dtype())}, 2);
+        }
+        tk = mx::reshape(mx::transpose(mx::reshape(tk, {kvh, count, seg, dim}), {1, 0, 2, 3}), {count, kvh, seg, dim});
+        tv = mx::reshape(mx::transpose(mx::reshape(tv, {kvh, count, seg, dim}), {1, 0, 2, 3}), {count, kvh, seg, dim});
+        // a branch row at depth d sees tail keys <= (prefix - shared) + d; every other row sees none of this call
+        std::vector<int32_t> last_key(size_t(group * rows), -1);
+        for (int r = 0; r < group * rows; ++r)
+            for (size_t j = 0; j < b.rows.size(); ++j)
+                if (b.rows[j] == row_of_slot[size_t(r)]) last_key[size_t(r)] = prefix - shared + b.depths[j];
+        auto tail_index = mx::reshape(mx::arange(count * seg), {count, 1, 1, seg});
+        auto tail_mask = mx::less_equal(tail_index, mx::reshape(mx::array(last_key.data(), {group * rows}, mx::int32), {1, 1, group * rows, 1}));
+        auto branch_query = mx::broadcast_to(mx::slice(query, {0, 0, 0, 0}, {1, kvh, group * rows, dim}), {count, kvh, group * rows, dim});
+        auto bp = mx::fast::scaled_dot_product_attention_lse(branch_query, tk, tv, scale, tail_mask);
+        outputs.push_back(bp[0]); lses.push_back(bp[1]); total += count;
+    }
+    if (total > segments) parts = {mx::concatenate(outputs, 0), mx::concatenate(lses, 0)};
     static auto merge = mx::fast::metal_kernel("tqllm_attn_bf16_segment_merge", {"O", "LSE", "P"}, {"Y"}, R"METAL(
     // one thread per (kv head row, dim element): fold the segments in order; a segment with no visible key is skipped
     const uint e = thread_position_in_grid.x, r = thread_position_in_grid.y;
@@ -120,7 +240,7 @@ inline mlx::core::array decode_attention_bf16_segmented(const mlx::core::array& 
     }
     Y[size_t(r) * DIM + e] = acc / den;
 )METAL");
-    std::vector<int32_t> p = {segments, kvh * group * rows};
+    std::vector<int32_t> p = {total, kvh * group * rows};
     auto P = mx::array(p.data(), {2}, mx::int32);
     auto y = merge({parts[0], parts[1], P}, {{1, kvh, group * rows, dim}}, {mx::float32}, {dim, kvh * group * rows, 1}, {std::min(dim, 256), 1, 1},
                    {{"DIM", dim}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
@@ -672,7 +792,10 @@ inline Int8Rows quantize_rows_int8(const mlx::core::array& k, const mlx::core::a
     return {out[0], out[1], out[2], out[3]};
 }
 inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const mlx::core::array& k,
-                                              const mlx::core::array& v, float scale, int valid) {
+                                              const mlx::core::array& v, float scale, int valid,
+                                              const mlx::core::array* tree = nullptr,
+                                              const std::vector<int32_t>* tree_parents = nullptr,
+                                              int block_rows = 0, int block_offset = 0) {
     if (k.dtype() != mlx::core::bfloat16) throw std::invalid_argument("decode rows attention reads a BF16 KV cache");
 #ifdef MLX_HAS_SDPA_LSE
     if (segmented_attention_available(q.shape(3))) {
@@ -681,7 +804,13 @@ inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const m
         namespace mx = mlx::core;
         const int heads = q.shape(1), n = q.shape(2), dim = q.shape(3), length = valid > 0 ? valid : k.shape(2);
         constexpr int seg = kAttentionSegment;
-        if (length <= seg) return decode_attention_bf16_folded(q, k, v, scale, length);
+        if (length <= seg) return decode_attention_bf16_folded(q, k, v, scale, length, tree);
+        // token-tree verify (no host side branches, one call of <= 16 rows): split-K over key chunks
+        if (tree && (!tree_parents || tree_parents->empty()) && block_rows == 0 && split_attention_fits(q, k)) {
+            auto bits = cached_tree_mask(*tree, {3, n, 0, 0, 0, 0, 0}, [&] {return split_attention_bits(tree, n);});
+            return decode_attention_split(q, k, v, scale, length, bits);
+        }
+        if (tree) return decode_attention_bf16_segmented(q, k, v, scale, length, seg, tree, tree_parents, block_rows, block_offset);
         if (length - n + 1 <= seg) {
             const int below = seg - (length - n);
             auto lo = decode_attention_bf16_folded(mx::slice(q, {0, 0, 0, 0}, {1, heads, below, dim}), k, v, scale, seg);
@@ -691,6 +820,6 @@ inline mlx::core::array decode_attention_bf16(const mlx::core::array& q, const m
         return decode_attention_bf16_segmented(q, k, v, scale, valid);
     }
 #endif
-    return decode_attention_bf16_folded(q, k, v, scale, valid);
+    return decode_attention_bf16_folded(q, k, v, scale, valid, tree);
 }
 }  // namespace tqllm::mlx_backend

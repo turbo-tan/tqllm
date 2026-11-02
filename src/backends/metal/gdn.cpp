@@ -388,8 +388,11 @@ GdnStep gdn_step_fused(const mx::array& joined,const mx::array& weights,const mx
 }
 GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::array& weights,const mx::array& input,
     const mx::array& ab,const mx::array& bias,const mx::array& rate,const mx::array& z,const mx::array& norm_weight,
-    float eps,float query_scale,const std::optional<mx::array>& state,int kh,int vh,int row_stride,int z_stride,int z_offset) {
+    float eps,float query_scale,const std::optional<mx::array>& state,int kh,int vh,int row_stride,int z_stride,int z_offset,
+    const mx::array* parents) {
     const int m=rows.ndim()==2?rows.shape(0):0,width=2*kh*128+vh*128;
+    if(parents && (parents->shape()!=mx::Shape{m} || parents->dtype()!=mx::int32))
+        throw std::invalid_argument("fused GDN step parents: int32 [m]");
     const int rs=row_stride>0?row_stride:width,zs=z_stride>0?z_stride:vh*128;
     if(rows.ndim()!=2 || rows.shape(1)!=rs || rs<width || zs<vh*128 || z_offset<0 || z_offset+vh*128>zs)
         throw std::invalid_argument("invalid fused GDN step packed product layout");
@@ -397,7 +400,7 @@ GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::arr
     const bool f32=prev.dtype()==mx::float32 && rows.dtype()==mx::float32 && weights.dtype()==mx::float32 && input.dtype()==mx::float32 &&
         ab.dtype()==mx::float32 && bias.dtype()==mx::float32 && rate.dtype()==mx::float32 && z.dtype()==mx::float32 &&
         norm_weight.dtype()==mx::float32;
-    if(!f32 || m<1 || m>16 || kh<1 || vh<kh || vh%kh || width!=2*kh*128+vh*128 || prev.shape()!=mx::Shape{3,width} ||
+    if(!f32 || m<1 || m>32 || kh<1 || vh<kh || vh%kh || width!=2*kh*128+vh*128 || prev.shape()!=mx::Shape{3,width} ||
        weights.shape()!=mx::Shape{width,4} ||
        (gates_given && (input.shape()!=mx::Shape{m,vh} || ab.shape()!=input.shape())) || bias.shape()!=mx::Shape{vh} ||
        rate.shape()!=bias.shape() || z.shape()!=mx::Shape{m,zs} || norm_weight.shape()!=mx::Shape{128})
@@ -409,10 +412,12 @@ GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::arr
 const uint tid=thread_position_in_threadgroup.x,head=threadgroup_position_in_grid.y;
 const uint khead=head%uint(KH),row=tid>>3,sub=tid&7u;
 const uint qoff=khead*128u,koff=uint(KH)*128u+khead*128u,voff=2u*uint(KH)*128u+head*128u;
-threadgroup float qs[M*128];
+// 17-32 rows (M > 16): the queries and the recurrence outputs live in device scratch (qx, ox) instead of threadgroup
+// memory, so keys, values and gates still fit 32 KB; the values and their arithmetic are the same
+threadgroup float qs[M>16?1:M*128];
 threadgroup float ks[M*128];
 threadgroup bfloat16_t vs[M*128];  // BF16-rounded values: exact in BF16, so 16 tokens fit 32 KB
-threadgroup float os[M*128];
+threadgroup float os[M>16?1:M*128];
 threadgroup float dec[M];
 threadgroup float bet[M];
 // prep: conv + silu, one (token, channel) per iteration; channels 0-127 q, 128-255 k, 256-383 v. Strict fp here
@@ -425,23 +430,30 @@ for(uint i=tid;i<uint(M)*384u;i+=1024u) {
     const uint t=i/384u,ch=i%384u;
     const uint col=ch<128u?qoff+ch:ch<256u?koff+(ch-128u):voff+(ch-256u);
     float sum=0.0f;
+    // the 4 conv taps of token t walk its ancestors: index c of [prev; rows] (rows at c >= 3); a row's predecessor is
+    // its parent row (par, -1 = the last history row), a history row's is the one before it. A chain (par[t] = t - 1)
+    // reads rows t .. t + 3, the plain sequence
+    uint taps[4];
+    taps[3]=t+3u;
+    for(int u=2;u>=0;--u) {const uint c=taps[u+1];taps[u]=c>=3u?(par[c-3u]<0?2u:uint(par[c-3u])+3u):c-1u;}
     for(uint tap=0;tap<4u;++tap) {
-        const uint r=t+tap;  // row r of [prev; rows]
+        const uint r=taps[tap];  // row r of [prev; rows]
         sum=sum+(r<3u?prev[r*uint(WIDTH)+col]:rows[(r-3u)*uint(RS)+col])*weights[col*4u+tap];
     }
     const float rounded=float(bfloat16_t(sum));
     const float gate=1.0f/(1.0f+exp(-rounded));
     const float y=float(bfloat16_t(rounded*gate));
-    if(ch<128u)qs[t*128u+ch]=y;else if(ch<256u)ks[t*128u+ch-128u]=y;else vs[t*128u+ch-256u]=bfloat16_t(y);
+    if(ch<128u) {if(M>16)qx[(head*uint(M)+t)*128u+ch]=y;else qs[t*128u+ch]=y;}
+    else if(ch<256u)ks[t*128u+ch-128u]=y;else vs[t*128u+ch-256u]=bfloat16_t(y);
 }
 }
 // ABF: the alpha / beta projections of this head in-kernel (simdgroup = (token, alpha | beta), 32 lanes x 4 columns per
 // 128-column step, fixed order so m = 1 and m = 16 agree bit for bit), rounded to BF16 like the matmul path's bf()
-threadgroup float abv[32];
+threadgroup float abv[2*M];
 if(ABF) {
     const uint g=tid>>5,lane=tid&31u;
-    if(g<2u*uint(M)) {
-        const uint t=g>>1,which=g&1u;
+    for(uint gg=g;gg<2u*uint(M);gg+=32u) {  // one pass for M <= 16 (32 simdgroups)
+        const uint t=gg>>1,which=gg&1u;
         const device float* xr=A+t*uint(HID)+lane*4u;
         const device float* wr=B+(which*uint(VH)+head)*uint(HID)+lane*4u;
         float acc=0.0f;
@@ -463,8 +475,23 @@ if(tid<uint(M)) {
     bet[tid]=1.0f/(1.0f+exp(-(ABF?abv[tid*2u+1u]:B[tid*uint(VH)+head])));
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
+if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // q / k normalization: simdgroup g < 2 M handles (token g / 2, q or k), 32 lanes x 4 channels
-{
+if(M>16) {  // the same per-vector arithmetic, queries in device scratch, two (token, q | k) vectors per simdgroup
+    const uint g=tid>>5,lane=tid&31u;
+    for(uint gg=g;gg<2u*uint(M);gg+=32u) {
+        const uint t=gg>>1;
+        const bool key=(gg&1u)!=0u;
+        float x4[4];float ss=0.0f;
+        for(uint e=0;e<4u;++e) {x4[e]=key?ks[t*128u+lane*4u+e]:qx[(head*uint(M)+t)*128u+lane*4u+e];ss+=x4[e]*x4[e];}
+        ss=simd_sum(ss);
+        const float factor=rsqrt(ss+1e-6f)*(key?1.0f:qscale);
+        for(uint e=0;e<4u;++e) {
+            const float v=x4[e]*factor;
+            if(key)ks[t*128u+lane*4u+e]=v;else qx[(head*uint(M)+t)*128u+lane*4u+e]=v;
+        }
+    }
+} else {
     const uint g=tid>>5,lane=tid&31u;
     if(g<2u*uint(M)) {
         threadgroup float* vec=(g&1u)?ks+(g>>1)*128u:qs+(g>>1)*128u;
@@ -476,13 +503,46 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
+if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // recurrence over the tokens; the 8 lanes of a row reduce with xor shuffles inside their simdgroup
 float s[16];
 {
     const device float* src=initial+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)s[j]=src[j];
 }
+// token tree: a token whose parent is not the token just stepped restarts and replays its ancestors (same arithmetic,
+// outputs dropped), so every token sees exactly its own path's state; a chain never replays. Every branch descends from
+// row 0, so a tree (TREE) keeps the state after row 0 and after the latest depth-1 row (parent 0) and restarts from the
+// deeper one on the new token's path
+int cur=-1,n1=-1;
+float s0[16],s1[16];
 for(uint t=0;t<uint(M);++t) {
+    if(par[t]!=cur) {
+        uint path[M>16?32:16];uint depth=0;
+        for(int a=par[t];a>=0;a=par[a])path[depth++]=uint(a);
+        uint first=depth;
+        if(TREE && depth>1u && int(path[depth-2u])==n1) {  // path[depth - 2] is the depth-1 row held in s1
+            for(uint j=0;j<16u;++j)s[j]=s1[j];
+            first=depth-2u;
+        } else if(TREE && depth>0u) {  // path[depth - 1] is row 0
+            for(uint j=0;j<16u;++j)s[j]=s0[j];
+            first=depth-1u;
+        } else {
+            const device float* src=initial+(head*128u+row)*128u+sub*16u;
+            for(uint j=0;j<16u;++j)s[j]=src[j];
+        }
+        for(uint c=first;c>0;--c) {
+            const uint u=path[c-1u];
+            const float d=dec[u],b=bet[u];
+            const threadgroup float* ku=ks+u*128u+sub*16u;
+            float memory=0.0f;
+            for(uint j=0;j<16u;++j) {s[j]*=d;memory+=s[j]*ku[j];}
+            memory+=simd_shuffle_xor(memory,1u);memory+=simd_shuffle_xor(memory,2u);memory+=simd_shuffle_xor(memory,4u);
+            const float delta=(float(vs[u*128u+row])-memory)*b;
+            for(uint j=0;j<16u;++j)s[j]=s[j]+ku[j]*delta;
+            if(TREE && par[u]==0) {for(uint j=0;j<16u;++j)s1[j]=s[j];n1=int(u);}
+        }
+    }
     const float d=dec[t],b=bet[t];
     const threadgroup float* kt=ks+t*128u+sub*16u;
     const threadgroup float* qt=qs+t*128u+sub*16u;
@@ -491,11 +551,26 @@ for(uint t=0;t<uint(M);++t) {
     memory+=simd_shuffle_xor(memory,1u);memory+=simd_shuffle_xor(memory,2u);memory+=simd_shuffle_xor(memory,4u);
     const float delta=(float(vs[t*128u+row])-memory)*b;
     float value=0.0f;
-    for(uint j=0;j<16u;++j) {s[j]=s[j]+kt[j]*delta;value+=s[j]*qt[j];}
+    if(M>16) {  // the same update, the query from device scratch
+        const device float* qd=qx+(head*uint(M)+t)*128u+sub*16u;
+        for(uint j=0;j<16u;++j) {s[j]=s[j]+kt[j]*delta;value+=s[j]*qd[j];}
+    } else {
+        for(uint j=0;j<16u;++j) {s[j]=s[j]+kt[j]*delta;value+=s[j]*qt[j];}
+    }
     value+=simd_shuffle_xor(value,1u);value+=simd_shuffle_xor(value,2u);value+=simd_shuffle_xor(value,4u);
-    if(sub==0u) {os[t*128u+row]=value;deltas[(t*uint(VH)+head)*128u+row]=delta;}
+    if(sub==0u) {
+        if(M>16)ox[(head*uint(M)+t)*128u+row]=value;else os[t*128u+row]=value;
+        deltas[(t*uint(VH)+head)*128u+row]=delta;
+    }
+    if(TREE && t==0u)for(uint j=0;j<16u;++j)s0[j]=s[j];
+    if(TREE && par[t]==0) {for(uint j=0;j<16u;++j)s1[j]=s[j];n1=int(t);}
+    cur=int(t);
 }
-{
+// the final state is read only when every row is accepted, i.e. when the rows form a chain; a branched tree's accept
+// rebuilds the state from the tape
+bool chain=true;
+if(TREE)for(uint t=0;t<uint(M);++t)chain=chain && par[t]==int(t)-1;
+if(chain) {
     device float* dst=state+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)dst[j]=s[j];
 }
@@ -509,12 +584,15 @@ for(uint i=tid;i<384u;i+=1024u) {
     if(head<uint(KH)) {history[dst+qoff+c]=src[qoff+c];history[dst+koff+c]=src[koff+c];}
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
+if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // gated norm per token: simdgroup t < M, 32 lanes x 4 rows; bf16(o) -> rms_norm(w, eps) -> * silu(z) -> bf16
 {
     const uint g=tid>>5,lane=tid&31u;
     if(g<uint(M)) {
         float a[4];float ss=0.0f;
-        for(uint e=0;e<4u;++e) {a[e]=float(bfloat16_t(os[g*128u+lane*4u+e]));ss+=a[e]*a[e];}
+        for(uint e=0;e<4u;++e) {
+            a[e]=float(bfloat16_t(M>16?ox[(head*uint(M)+g)*128u+lane*4u+e]:os[g*128u+lane*4u+e]));ss+=a[e]*a[e];
+        }
         ss=simd_sum(ss);
         const float inv=rsqrt(ss/128.0f+eps);
         for(uint e=0;e<4u;++e) {
@@ -526,21 +604,23 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 )METAL";
     static auto kernel=mx::fast::metal_kernel("tqllm_gdn_step_fused",
-        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial"},
-        {"out","state","deltas","keys","decay","history"},body);
+        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial","par"},
+        {"out","state","deltas","keys","decay","history","qx","ox"},body);
     static auto kernel_ab=mx::fast::metal_kernel("tqllm_gdn_step_fused_ab",
-        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial"},
-        {"out","state","deltas","keys","decay","history"},body);
+        {"prev","rows","weights","A","B","bias","rate","z","w","eps","qscale","initial","par"},
+        {"out","state","deltas","keys","decay","history","qx","ox"},body);
     const bool abf=input.ndim()==2 && input.shape(1)!=vh;  // [m, hidden] input + [2 vh, hidden] weights instead of alpha / beta
     const int hid=abf?input.shape(1):0;
     if(abf && (input.shape(0)!=m || hid<128 || hid%128 || ab.shape()!=mx::Shape{2*vh,hid} || ab.dtype()!=mx::float32 || input.dtype()!=mx::float32))
         throw std::invalid_argument("invalid fused GDN step alpha / beta projection");
     auto result=(abf?kernel_ab:kernel)({mx::contiguous(prev),mx::contiguous(rows),mx::contiguous(weights),mx::contiguous(input),mx::contiguous(ab),
         mx::contiguous(bias),mx::contiguous(rate),mx::contiguous(z),mx::contiguous(norm_weight),mx::array(eps),
-        mx::array(query_scale),mx::contiguous(initial)},
-        {{m,vh*128},{1,vh,128,128},{m,vh,128},{1,m,kh,128},{1,m,vh},{3,width}},
-        {mx::float16,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32},
-        {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset}},
+        mx::array(query_scale),mx::contiguous(initial),
+        parents?mx::contiguous(*parents):mx::subtract(mx::arange(m,mx::int32),mx::array(1,mx::int32))},
+        {{m,vh*128},{1,vh,128,128},{m,vh,128},{1,m,kh,128},{1,m,vh},{3,width},{vh,m>16?m:1,128},{vh,m>16?m:1,128}},
+        {mx::float16,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32},
+        {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset},
+         {"TREE",int(parents!=nullptr)}},
         std::nullopt,false,mx::Device(mx::Device::gpu));
     return {result[0],result[1],result[2],result[3],result[4],result[5]};
 }
@@ -556,7 +636,7 @@ mx::array gdn_replay_prefix(const mx::array& keys,const mx::array& decay,const m
        deltas.ndim()!=3 || deltas.shape(0)!=keys.shape(1) || deltas.shape(1)<1 || deltas.shape(2)!=128 ||
        deltas.dtype()!=mx::float32 || deltas.shape(1)%keys.shape(2) ||
        decay.shape()!=mx::Shape{1,keys.shape(1),deltas.shape(1)} || decay.dtype()!=mx::float32 ||
-       count<1 || count>keys.shape(1) || keys.shape(1)>16)
+       count<1 || count>keys.shape(1) || keys.shape(1)>32)
         throw std::invalid_argument("invalid compact GDN prefix tape");
     const int kh=keys.shape(2),vh=deltas.shape(1);
     auto state=initial?*initial:mx::zeros({1,vh,128,128});

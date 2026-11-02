@@ -193,8 +193,10 @@ AttnQkNormRope attn_qk_norm_rope_reference(const mx::array& q_prod, const mx::ar
 
 AttnQkNormRope attn_qk_norm_rope(const mx::array& q_prod, const mx::array& k_prod, const mx::array& v_prod,
                                  const mx::array& q_norm_w, const mx::array& k_norm_w, int heads, int kvheads, int hd,
-                                 int rot, float theta, float eps, int offset) {
+                                 int rot, float theta, float eps, int offset, const mx::array* depth) {
     const int m = q_prod.shape(0);
+    if (depth && (depth->shape() != mx::Shape{m} || depth->dtype() != mx::int32))
+        throw std::invalid_argument("attn_qk_norm_rope: depth int32 [m]");
     if (q_prod.ndim() != 2 || q_prod.dtype() != mx::float16 || q_prod.shape(1) != heads * 2 * hd ||
         k_prod.ndim() != 2 || k_prod.dtype() != mx::float16 || k_prod.shape() != mx::Shape{m, kvheads * hd} ||
         v_prod.ndim() != 2 || v_prod.dtype() != mx::float16 || v_prod.shape() != mx::Shape{m, kvheads * hd} ||
@@ -206,7 +208,7 @@ AttnQkNormRope attn_qk_norm_rope(const mx::array& q_prod, const mx::array& k_pro
     // MLX rms_single_row (hd <= 4096): one row per 64-thread threadgroup (2 simdgroups), N_READS 4,
     // metal::precise::rsqrt; then bf(norm), the non-traditional partial-rotary RoPE of rope.metal (forward true,
     // metal::exp2/fast::cos/sin), and the final BF16 rounding. gate is round_product only (no norm, no rope).
-    static auto qk_kernel = mx::fast::metal_kernel("tqllm_attn_qk_norm_rope", {"qprod", "kprod", "qw", "kw", "offset", "eps", "base"},
+    static auto qk_kernel = mx::fast::metal_kernel("tqllm_attn_qk_norm_rope", {"qprod", "kprod", "qw", "kw", "offset", "eps", "base", "depth"},
                                                    {"q", "k", "gate"}, R"METAL(
     constexpr int N_READS = 4;
     const uint HD = uint(HD_), ROT = uint(ROT_), HALF = ROT / 2u;
@@ -267,7 +269,7 @@ AttnQkNormRope attn_qk_norm_rope(const mx::array& q_prod, const mx::array& k_pro
         if (j < HALF) {
             const float d = float(j) / float(HALF);
             const float inv_freq = metal::exp2(-d * base);
-            const float L = float(off + int64_t(tok));
+            const float L = float(off + int64_t(depth[tok]));
             const float th = L * inv_freq;
             const float ct = metal::fast::cos(th), st = metal::fast::sin(th);
             const float x1 = normed[j], x2 = normed[j + HALF];
@@ -276,7 +278,7 @@ AttnQkNormRope attn_qk_norm_rope(const mx::array& q_prod, const mx::array& k_pro
             const uint jp = j - HALF;
             const float d = float(jp) / float(HALF);
             const float inv_freq = metal::exp2(-d * base);
-            const float L = float(off + int64_t(tok));
+            const float L = float(off + int64_t(depth[tok]));
             const float th = L * inv_freq;
             const float ct = metal::fast::cos(th), st = metal::fast::sin(th);
             const float x1 = normed[jp], x2 = normed[j];
@@ -299,7 +301,8 @@ AttnQkNormRope attn_qk_norm_rope(const mx::array& q_prod, const mx::array& k_pro
     const int nqrows = m * heads, nkrows = m * kvheads;
     const int tg = ((hd + 4 - 1) / 4 + 31) / 32 * 32;  // ceil(hd/N_READS) rounded up to a simd multiple (hd=256 -> 64)
     auto out = qk_kernel({mx::contiguous(q_prod), mx::contiguous(k_prod), mx::contiguous(q_norm_w),
-                          mx::contiguous(k_norm_w), mx::array(offset), mx::array(eps), mx::array(base)},
+                          mx::contiguous(k_norm_w), mx::array(offset), mx::array(eps), mx::array(base),
+                          depth ? mx::contiguous(*depth) : mx::arange(m, mx::int32)},
                          {{1, heads, m, hd}, {1, kvheads, m, hd}, {m, heads, hd}},
                          {mx::float32, mx::float32, mx::float32},
                          {(nqrows + nkrows) * tg, 1, 1}, {tg, 1, 1},

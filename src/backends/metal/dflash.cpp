@@ -222,9 +222,9 @@ struct DFlash2::Impl {
         c.ksum=mx::slice_update(*c.ksum,mx::add(mx::slice(*c.ksum,{0,0,c0,0},{1,kvheads,c0+nch,hd}),sums),{0,0,c0,0},{1,kvheads,c0+nch,hd});
     }
     // draft-ahead: the ring's head / fill count live on the GPU once injects carry device counts; the host keeps a bound
-    // (settled fill + block rows per inject not yet settled) to size the attention span
+    // (settled fill + fill_bound rows per inject not yet settled) to size the attention span
     std::optional<mx::array> head_dev,filled_dev;
-    int fill_settled=0,fill_unsettled=0;
+    int fill_settled=0,fill_unsettled=0,fill_bound=1;
     bool stages=false;  // time_stages(): draft_device_at syncs and times each stage (draft bench only)
     double stage_ms[4]={0,0,0,0};int stage_calls=0;  // layers, head, top-16, selector
     void to_device() {
@@ -242,6 +242,7 @@ struct DFlash2::Impl {
         // drafters); a draft of fewer than the file's native block rows runs at the native block (j924: its 7 drafts beat the
         // head of a 16-draft)
         block=block_rows;native=std::min(block,int(file.num("dflash.block_size")));group=int(file.num("dflash.conv_group_size"));
+        fill_bound=block;
         window=int(file.num("dflash.attention.sliding_window"));rank=int(file.num("dflash.selector_rank"));
         mask=uint32_t(file.num("tokenizer.ggml.mask_token_id"));
         eps=float(file.num("dflash.attention.layer_norm_rms_epsilon"));theta=float(file.num("dflash.rope.freq_base"));
@@ -310,6 +311,22 @@ struct DFlash2::Impl {
     // leading `span` rows (block + filled); out: x, then the updated k, v
     std::vector<mx::array> ring_layers(const std::vector<mx::array>& in,int span,bool masked,bool retr=false,int scored=0,bool ahead=false,int rows=0) {
         auto x=in[0];const auto& position=in[1];size_t at=2;
+        // retr_split (TQLLM_DEBUG): the retrieval's parts, one draft's worth; retr_share selects the far chunks once off
+        // the first layer's queries and gathers every layer's keys at those positions
+        // draft_split times the first layer's parts (no sync: host building); draft_split_sync evaluates at each mark,
+        // so the difference between the two is how much of a part the GPU runs
+        const bool rsp=tqllm::debug_cstr("retr_split")!=nullptr, rshare=tqllm::debug_cstr("retr_share")!=nullptr;
+        const bool dsp=tqllm::debug_cstr("draft_split")!=nullptr, dsp_sync=tqllm::debug_cstr("draft_split_sync")!=nullptr;
+        auto rt=std::chrono::steady_clock::now();
+        auto rlap=[&](const char* what,const mx::array* v=nullptr) {
+            if(!(rsp || dsp))return;
+            if(dsp_sync && v)mx::eval(*v);
+            const auto now=std::chrono::steady_clock::now();
+            std::fprintf(stderr,"DRAFT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-rt).count());rt=now;
+        };
+        std::optional<mx::array> shared_sel;
+        // draft_split_sync's first mark: whatever the inject and the embed left queued before this draft's first layer
+        rlap("pre",&x);
         if(rows<=0)rows=block;
         const int off=block-rows;   // the draft rows sit just below the ring, so the attended span stays contiguous
         std::optional<mx::array> mask;if(masked)mask=in[at++];
@@ -322,6 +339,8 @@ struct DFlash2::Impl {
         const auto far_to=mx::add(far_start,mx::array(kRetrieve*kChunk,mx::int32));
         for(int l=0;l<int(caches.size());++l) {
             const std::string p="blk."+std::to_string(l)+".";
+            const bool mark=dsp && l==0;
+            if(mark)rt=std::chrono::steady_clock::now();
             auto kc=in[at+per*l],vc=in[at+per*l+1];
             auto residual=x,n=norm(p+"attn_norm.weight",x),dynamic=mat(p+"attn_conv_proj.weight",n);
             auto input=dflash_conv(n,dynamic,plain.at(p+"attn_conv_base"),group,0);
@@ -331,6 +350,7 @@ struct DFlash2::Impl {
             auto k=mx::reshape(mat(p+"attn_k.weight",input),{1,rows,kvheads,hd});
             k=bf(mx::fast::rope(mx::transpose(norm(p+"attn_k_norm.weight",k),{0,2,1,3}),hd,false,theta,1.0f,position));
             auto v=values(p,input);
+            if(dsp && l==0)rlap("proj",&v);
             kc=mx::slice_update(kc,mx::astype(k,mx::bfloat16),{0,0,off,0},{1,kvheads,block,hd});vc=mx::slice_update(vc,mx::astype(v,mx::bfloat16),{0,0,off,0},{1,kvheads,block,hd});
             const bool whole=off==0 && span>=cap;
             auto ks=whole?kc:mx::slice(kc,{0,0,off,0},{1,kvheads,off+span,hd}),vs=whole?vc:mx::slice(vc,{0,0,off,0},{1,kvheads,off+span,hd});
@@ -338,9 +358,19 @@ struct DFlash2::Impl {
             if(retr) {
                 // inline (the first retrieving draft): selection from the chunk key sums (int8 codes cannot be scanned,
                 // j1167), gather with the scales
+                if(mark)rt=std::chrono::steady_clock::now();
+                std::optional<mx::array> sel;
+                if(!ahead) {
+                    if(rshare && shared_sel) sel=*shared_sel;
+                    else {
+                        sel=dflash_retrieve_select_sums(q,in[at+per*l+6],far_start,scored,kRetrieve);
+                        if(rshare) shared_sel=sel;
+                    }
+                }
+                rlap("select");
                 const auto r=ahead?DflashRetrieval{in[at+per*l+2],in[at+per*l+3],mx::array(0),kRetrieve*kChunk}:
-                                   dflash_retrieve_gather(dflash_retrieve_select_sums(q,in[at+per*l+6],far_start,scored,kRetrieve),
-                                                          in[at+per*l+2],in[at+per*l+3],far_to,theta,in[at+per*l+4],in[at+per*l+5]);
+                                   dflash_retrieve_gather(*sel,in[at+per*l+2],in[at+per*l+3],far_to,theta,in[at+per*l+4],in[at+per*l+5]);
+                rlap("gather");
                 anchors.push_back(mx::slice(q,{0,0,0,0},{1,heads,1,hd}));
                 ks=mx::concatenate({r.k,ks},2);vs=mx::concatenate({r.v,vs},2);
                 // the retrieved rows are always visible: a mask only while the ring fills (an all-true mask kept the
@@ -351,12 +381,15 @@ struct DFlash2::Impl {
             const auto q16=mx::astype(q,mx::bfloat16);
             auto attention=amask?mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)),"array",*amask):
                 mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)));
+            if(dsp && l==0)rlap("attn",&attention);
             auto flattened=bf(mx::reshape(mx::transpose(attention,{0,2,1,3}),{rows,heads*hd}));
             x=dflash_conv(mat(p+"attn_output.weight",flattened),dynamic,plain.at(p+"attn_conv_base"),group,1,residual);
+            if(dsp && l==0)rlap("out",&x);
             residual=x;n=norm(p+"ffn_norm.weight",x);dynamic=mat(p+"ffn_conv_proj.weight",n);
             input=dflash_conv(n,dynamic,plain.at(p+"ffn_conv_base"),group,0);
             auto ff=mat(p+"ffn_down.weight",swiglu(p,input));
             x=dflash_conv(ff,dynamic,plain.at(p+"ffn_conv_base"),group,1,residual);
+            if(dsp && l==0)rlap("ffn",&x);
             out.push_back(kc);out.push_back(vc);
         }
         out[0]=x;
@@ -485,41 +518,71 @@ mx::array DFlash2::draft_device(uint32_t anchor,int position,int count) {
 }
 void DFlash2::inject_device(const mx::array& features,const mx::array& count,const mx::array& position) {
     auto& i=*impl_;const int n=features.shape(0);
-    if(!i.ring || !i.caches[0].k || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1 || n>i.block)
+    if(!i.ring || !i.caches[0].k || features.ndim()!=2 || features.shape(1)!=int(i.features.size())*i.hidden || n<1 || n>2*i.block)
         throw std::invalid_argument("invalid DFlash device injection (needs the ring drafter after a host prefill inject)");
     i.to_device();
+    // inject_split (TQLLM_DEBUG): the parts of one inject, layer 0 only; inject_split_sync evaluates at each mark so a
+    // part's GPU time is its own
+    const bool isp=tqllm::debug_cstr("inject_split")!=nullptr, isp_sync=tqllm::debug_cstr("inject_split_sync")!=nullptr;
+    auto it=std::chrono::steady_clock::now();
+    auto ilap=[&](const char* what,const mx::array* v=nullptr) {
+        if(!isp)return;
+        if(isp_sync && v)mx::eval(*v);
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"INJECT_SPLIT %s %.2f\n",what,std::chrono::duration<double,std::milli>(now-it).count());it=now;
+    };
+    // the flush before any of the inject's own ops: work queued earlier (the verify's tail, the accept's replay)
+    ilap("before",isp?&*i.head_dev:nullptr);
     auto encoded=i.norm("enc.output_norm.weight",i.mat("fc.weight",features));
-    // row j goes to buffer row block + (head + j) % window while j < count, else to block row j (scratch, rewritten by
-    // every draft): one fixed-shape scatter, no readback of the count
-    auto j=mx::arange(n,mx::int32);
-    auto slot=mx::where(mx::less(j,count),mx::add(mx::remainder(mx::add(*i.head_dev,j),mx::array(i.window,mx::int32)),mx::array(i.block,mx::int32)),j);
-    auto index=mx::broadcast_to(mx::reshape(slot,{1,1,n,1}),{1,i.kvheads,n,i.hd});
-    // far context: rows j < count at their positions, the rest into the scratch chunk at the end
-    std::optional<mx::array> far_index,far_scale,far_chunk;
-    if(i.far_on() && i.caches[0].kfull) {
-        i.ensure_far(i.target.position()+2*i.block);
-        auto pos=mx::where(mx::less(j,count),mx::add(position,j),mx::array(i.far_cap-1,mx::int32));
-        far_index=mx::broadcast_to(mx::reshape(pos,{1,1,n,1}),{1,i.kvheads,n,i.hd});
-        far_scale=mx::broadcast_to(mx::reshape(pos,{1,1,n}),{1,i.kvheads,n});
-        far_chunk=mx::broadcast_to(mx::reshape(mx::floor_divide(pos,mx::array(Impl::kChunk,mx::int32)),{1,1,n,1}),{1,i.kvheads,n,i.hd});
-    }
-    for(int l=0;l<int(i.caches.size());++l) {
-        const std::string p="blk."+std::to_string(l)+".";auto& c=i.caches[l];
-        auto k=mx::reshape(i.mat(p+"attn_k.weight",encoded),{1,n,i.kvheads,i.hd});
-        k=bf(mx::fast::rope(mx::transpose(i.norm(p+"attn_k_norm.weight",k),{0,2,1,3}),i.hd,false,i.theta,1.0f,position));
-        auto v=i.values(p,encoded);
-        c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
-        if(far_index) {
-            const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
-            c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
-            c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
-            c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
-            c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
-            c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
+    ilap("enc",isp?&encoded:nullptr);
+    // rows past the block (a 31-node tree's path) go in two ring advances, the second one chained off the first's head
+    const int passes=n>i.block?2:1;
+    for(int pass=0;pass<passes;++pass) {
+        const int at=pass*i.block,rows=std::min(n-at,i.block);
+        auto x=passes>1?mx::slice(encoded,{at,0},{at+rows,encoded.shape(1)}):encoded;
+        // rows the target actually accepted at this position; the rest of the block is scratch
+        auto live=pass?mx::maximum(mx::subtract(count,mx::array(at,mx::int32)),mx::array(0,mx::int32)):
+                      mx::minimum(count,mx::array(i.block,mx::int32));
+        auto pos=pass?mx::add(position,mx::array(at,mx::int32)):position;
+        // row j goes to buffer row block + (head + j) % window while j < live, else to block row j (scratch, rewritten by
+        // every draft): one fixed-shape scatter, no readback of the count
+        auto j=mx::arange(rows,mx::int32);
+        auto slot=mx::where(mx::less(j,live),mx::add(mx::remainder(mx::add(*i.head_dev,j),mx::array(i.window,mx::int32)),mx::array(i.block,mx::int32)),j);
+        auto index=mx::broadcast_to(mx::reshape(slot,{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
+        // far context: rows j < live at their positions, the rest into the scratch chunk at the end
+        std::optional<mx::array> far_index,far_scale,far_chunk;
+        if(i.far_on() && i.caches[0].kfull) {
+            i.ensure_far(i.target.position()+n+i.block);
+            auto far=mx::where(mx::less(j,live),mx::add(pos,j),mx::array(i.far_cap-1,mx::int32));
+            far_index=mx::broadcast_to(mx::reshape(far,{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
+            far_scale=mx::broadcast_to(mx::reshape(far,{1,1,rows}),{1,i.kvheads,rows});
+            far_chunk=mx::broadcast_to(mx::reshape(mx::floor_divide(far,mx::array(Impl::kChunk,mx::int32)),{1,1,rows,1}),{1,i.kvheads,rows,i.hd});
         }
+        for(int l=0;l<int(i.caches.size());++l) {
+            const std::string p="blk."+std::to_string(l)+".";auto& c=i.caches[l];
+            auto k=mx::reshape(i.mat(p+"attn_k.weight",x),{1,rows,i.kvheads,i.hd});
+            k=bf(mx::fast::rope(mx::transpose(i.norm(p+"attn_k_norm.weight",k),{0,2,1,3}),i.hd,false,i.theta,1.0f,pos));
+            auto v=i.values(p,x);
+            if(l==0)it=std::chrono::steady_clock::now();
+            c.k=mx::put_along_axis(*c.k,index,mx::astype(k,mx::bfloat16),2);c.v=mx::put_along_axis(*c.v,index,mx::astype(v,mx::bfloat16),2);
+            if(l==0)ilap("ring",&*c.v);
+            if(far_index) {
+                const auto qk=dflash_far_quantize(k),qv=dflash_far_quantize(v);
+                if(l==0)ilap("quant",&qk.scales);
+                c.kfull=mx::put_along_axis(*c.kfull,*far_index,qk.codes,2);
+                if(l==0)ilap("fark",&*c.kfull);
+                c.vfull=mx::put_along_axis(*c.vfull,*far_index,qv.codes,2);
+                if(l==0)ilap("farv",&*c.vfull);
+                c.kfs=mx::put_along_axis(*c.kfs,*far_scale,qk.scales,2);
+                c.vfs=mx::put_along_axis(*c.vfs,*far_scale,qv.scales,2);
+                if(l==0)ilap("fars",&*c.vfs);
+                c.ksum=mx::scatter_add_axis(*c.ksum,*far_chunk,mx::astype(mx::astype(k,mx::bfloat16),mx::float32),2);
+                if(l==0)ilap("ksum",&*c.ksum);
+            }
+        }
+        i.head_dev=mx::remainder(mx::add(*i.head_dev,live),mx::array(i.window,mx::int32));
+        i.filled_dev=mx::minimum(mx::add(*i.filled_dev,live),mx::array(i.window,mx::int32));
     }
-    i.head_dev=mx::remainder(mx::add(*i.head_dev,count),mx::array(i.window,mx::int32));
-    i.filled_dev=mx::minimum(mx::add(*i.filled_dev,count),mx::array(i.window,mx::int32));
     ++i.fill_unsettled;
 }
 void DFlash2::far_context(bool enabled) {impl_->far_enabled=enabled;}
@@ -533,6 +596,46 @@ void DFlash2::reserve_far(int rows) {
     auto& i=*impl_;
     if(i.far_on())i.ensure_far(rows+2*i.block);
 }
+DFlash2::HostLattice DFlash2::draft_lattice(uint32_t anchor,int position,int count) {
+    auto& i=*impl_;
+    if(i.head_dev)throw std::logic_error("DFlash lattice after device injects");
+    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))throw std::invalid_argument("invalid DFlash lattice request");
+    auto [mapped,unary,gate,successors]=lattice_arrays(anchor,position,count);
+    // rows 1 .. count are the drafted positions (row 0 is the anchor's)
+    auto ids=mx::contiguous(mx::astype(mx::slice(mapped,{1,0},{count+1,mapped.shape(1)}),mx::uint32));
+    auto un=mx::contiguous(mx::slice(unary,{1,0},{count+1,unary.shape(1)}));
+    auto ga=mx::contiguous(mx::astype(mx::slice(gate,{1,0},{count+1,gate.shape(1)}),mx::float32));
+    auto su=mx::contiguous(mx::slice(successors,{1,0,0},{count+1,successors.shape(1),successors.shape(2)}));
+    // the predecessor rows of every candidate and of the anchor (the selector reads only these), gathered on the GPU so
+    // the whole lattice comes back in one readback
+    const uint32_t anchor_id[1]={anchor};
+    auto parents=mx::concatenate({mx::reshape(ids,{-1}),mx::array(anchor_id,{1},mx::uint32)},0);
+    auto pred=mx::contiguous(mx::astype(mx::take(i.plain.at("selector_predecessor.weight"),parents,0),mx::float32));
+    mx::eval(ids,un,ga,su,pred);
+    HostLattice out;
+    out.positions=count;out.topk=ids.shape(1);out.rank=ga.shape(1);
+    out.tokens.assign(ids.data<uint32_t>(),ids.data<uint32_t>()+ids.size());
+    out.unary.assign(un.data<float>(),un.data<float>()+un.size());
+    out.gate.assign(ga.data<float>(),ga.data<float>()+ga.size());
+    out.successor.assign(su.data<float>(),su.data<float>()+su.size());
+    // pred row r belongs to parent token r; keep one row per distinct token, sorted for predecessor_row's lookup
+    std::vector<uint32_t> parent_ids(out.tokens);parent_ids.push_back(anchor);
+    std::vector<size_t> order(parent_ids.size());
+    for(size_t r=0;r<order.size();++r)order[r]=r;
+    std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) {return parent_ids[a]<parent_ids[b];});
+    const float* rows=pred.data<float>();
+    for(size_t r:order) {
+        if(!out.predecessor_tokens.empty() && out.predecessor_tokens.back()==parent_ids[r])continue;
+        out.predecessor_tokens.push_back(parent_ids[r]);
+        out.predecessor.insert(out.predecessor.end(),rows+r*size_t(out.rank),rows+(r+1)*size_t(out.rank));
+    }
+    return out;
+}
+const float* DFlash2::HostLattice::predecessor_row(uint32_t token) const {
+    auto it=std::lower_bound(predecessor_tokens.begin(),predecessor_tokens.end(),token);
+    if(it==predecessor_tokens.end() || *it!=token)throw std::out_of_range("predecessor row not in the lattice");
+    return predecessor.data()+size_t(it-predecessor_tokens.begin())*size_t(rank);
+}
 std::vector<double> DFlash2::stage_ms_per_call() const {
     const auto& i=*impl_;std::vector<double> out;
     for(double v:i.stage_ms)out.push_back(i.stage_calls?v/i.stage_calls:0.0);
@@ -540,10 +643,19 @@ std::vector<double> DFlash2::stage_ms_per_call() const {
 }
 void DFlash2::settle_device_inject(int rows) {
     auto& i=*impl_;
-    if(i.fill_unsettled<1 || rows<1 || rows>i.block)throw std::invalid_argument("invalid DFlash inject settlement");
+    if(i.fill_unsettled<1 || rows<1 || rows>2*i.block)throw std::invalid_argument("invalid DFlash inject settlement");
     --i.fill_unsettled;i.fill_settled=std::min(i.window,i.fill_settled+rows);
 }
-mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& position,int count) {
+void DFlash2::inject_block(int rows) {
+    auto& i=*impl_;
+    if(rows<i.block || rows>2*i.block)throw std::invalid_argument("DFlash inject block is 1-2 draft blocks");
+    i.fill_bound=rows;
+}
+void DFlash2::reset_inject_block() {
+    auto& i=*impl_;
+    i.fill_bound=i.block;
+}
+DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx::array& position,int count) {
     auto& i=*impl_;
     if(!i.ring || !i.caches[0].k || count<1 || count>=i.block || anchor.dtype()!=mx::uint32 || anchor.ndim()!=0)
         throw std::invalid_argument("invalid DFlash device draft request");
@@ -551,7 +663,7 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
     const int rows=i.draft_rows(count);
     auto ids=mx::concatenate({mx::reshape(anchor,{1}),mx::full({rows-1},i.mask,mx::uint32)},0);
     auto x=i.target.embed_device(ids);
-    const int bound=std::min(i.window,i.fill_settled+i.block*i.fill_unsettled),span=rows+bound;
+    const int bound=std::min(i.window,i.fill_settled+i.fill_bound*i.fill_unsettled),span=rows+bound;
     std::optional<mx::array> mask;
     if(bound>i.fill_settled)  // the GPU's fill is somewhere in (settled, bound]: mask the rows past it
         mask=mx::reshape(mx::less(mx::arange(span,mx::int32),mx::add(*i.filled_dev,mx::array(rows,mx::int32))),{1,1,1,span});
@@ -564,26 +676,52 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
         i.stage_ms[k]+=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;
     };
     if(stages)mx::eval(x,position);tick=std::chrono::steady_clock::now();
+    // lattice_split (TQLLM_DEBUG): host time of building each part of one lattice, no sync - what a draft's encode
+    // costs the step, apart from the GPU work it submits
+    const bool ls=tqllm::debug_cstr("lattice_split")!=nullptr;
+    auto t_ls=tick;
+    auto lap_ls=[&](const char* name) {
+        if(!ls)return;
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"LATTICE_SPLIT %s %.2f\n",name,std::chrono::duration<double,std::milli>(now-t_ls).count());t_ls=now;
+    };
+    lap_ls("before");
     x=i.run_ring_layers(x,position,span,mask,i.far_on()?i.target.position():0);
+    lap_ls("layers");
     lap(0,{x});
     auto normalized=i.norm("output_norm.weight",x);
     auto logits=i.target.shared_draft_head(normalized);
+    lap_ls("head");
     lap(1,{logits});
     auto top=dflash_top16(logits);auto selected=top.first,unary=top.second;
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
+    lap_ls("top16");
     lap(2,{selected,unary,mapped});
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
-    auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
-    lap(3,{chosen});
-    if(stages)++i.stage_calls;
+    lap_ls("selector");
+    return {mapped,mx::astype(unary,mx::float32),gate,successors};
+}
+mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& position,int count) {
+    auto& i=*impl_;
+    auto [mapped,unary,gate,successors]=device_lattice(anchor,position,count);
+    if(i.stages)mx::eval({mapped,unary,gate,successors});  // stage 3: the selector alone
+    auto tick=std::chrono::steady_clock::now();
+    auto chosen=dflash_select(mapped,unary,gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
+    if(i.stages) {
+        mx::eval(chosen);
+        i.stage_ms[3]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
+        ++i.stage_calls;
+    }
     return chosen;
 }
-std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
+DFlash2::LatticeArrays DFlash2::draft_lattice_device(const mx::array& anchor,const mx::array& position,int count) {
+    if(impl_->stages)throw std::logic_error("DFlash stage timing covers chain drafts only");
+    return device_lattice(anchor,position,count);
+}
+const mx::array& DFlash2::selector_predecessor() const {return impl_->plain.at("selector_predecessor.weight");}
+DFlash2::LatticeArrays DFlash2::lattice_arrays(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
-    if(i.head_dev)throw std::logic_error("DFlash host draft after device injects: use draft_device_at");
-    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
-        throw std::invalid_argument("invalid DFlash draft request");
     const int rows=i.draft_rows(count);
     std::vector<uint32_t> tokens(rows,i.mask);tokens[0]=anchor;
     auto x=i.target.embed_tokens(tokens);
@@ -623,6 +761,14 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     }
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
+    return {mapped,mx::astype(unary,mx::float32),gate,successors};
+}
+std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
+    auto& i=*impl_;
+    if(i.head_dev)throw std::logic_error("DFlash host draft after device injects: use draft_device_at");
+    if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
+        throw std::invalid_argument("invalid DFlash draft request");
+    auto [mapped,unary,gate,successors]=lattice_arrays(anchor,position,count);
     auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
         i.plain.at("selector_predecessor.weight"),anchor,count);
     if(i.device_only) {i.last_chosen=chosen;return {};}

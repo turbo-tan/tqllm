@@ -11,6 +11,7 @@
 #include "sampling.hpp"
 #include "sampling_topk.hpp"
 #include "qwen35.hpp"
+#include "attention_decode.hpp"
 #include "kv_tcq.hpp"
 #include "spec_pipeline.hpp"
 #include "width_policy.hpp"
@@ -65,6 +66,7 @@ public:
     uint32_t eos() const override;
     void spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) override;
     bool spec_advance() override;
+    bool tree_step(int pos, uint32_t limit);
     const std::vector<uint32_t>& spec_tokens(int) const override;
     std::vector<uint32_t> spec_finish(uint64_t* stats) override;
     void spec_step(const int*, int, bool*) override;
@@ -78,6 +80,7 @@ struct MlxQwen35Engine::Impl {
     std::unique_ptr<DFlash2> drafter;
     // greedy requests: verify(k) and draft(k+1) chained on the GPU (spec_pipeline.hpp, gated j892)
     std::optional<tqllm::mlx_backend::DraftAhead> ahead;
+    std::optional<tqllm::mlx_backend::TreeAhead> tree_ahead;  // tree requests: the device tree pipeline
     tqllm::mlx_backend::WidthPolicy widths;  // verify 7 or 15 drafted tokens per step (time lines kept across requests)
     uint32_t context_ = 0, eos = 0, vocab = 0, layers_ = 0, hidden_ = 0;
     int width = 15, chunk = 8192;  // block-16 drafts; prefill batches of 8192 run layer-major in 2048-row slices
@@ -87,11 +90,14 @@ struct MlxQwen35Engine::Impl {
     std::vector<uint32_t> output;
     uint32_t count = 0, pending = 0;
     bool active = false, done = true, sampling = false;
+    bool tree = false;  // this request drafts token trees (greedy, BF16 KV): DFlash2 lattice -> best-first tree -> one verify
     uint64_t steps = 0, drafted = 0, accepted = 0;
     double prefill_us = 0, decode_us = 0;
     // host phases summed over the request's draft-ahead steps (ms); gap = host time between one spec_advance's end
     // and the next one's start (the server loop: publish, repeat guard, scheduling)
     double h_build = 0, h_submit = 0, h_wait = 0, h_post = 0, h_gap = 0;
+    double h_inject = 0, h_encode = 0;  // inside h_submit: the drafter's inject, then the next tree's encode
+    double h_vsubmit = 0;               // inside h_build: what the verify's submission blocked on
     std::optional<Clock::time_point> last_advance_end;
     std::vector<double> first_steps; double first_gap_ms = 0;  // first 4 step walls of a request + prefill end -> first step
     std::array<double, 4> first_phases{};  // the first step's host phases: build / submit / wait / post
@@ -161,7 +167,7 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     if (prompt.size() + count + 16 > i.context_) throw std::invalid_argument("prompt and answer exceed the context");
     i.output.clear(); i.count = count; i.steps = i.drafted = i.accepted = 0; i.decode_us = 0; i.widths.begin(int(prompt.size())); i.drafter->native_block(i.widths.native());
-    i.h_build = i.h_submit = i.h_wait = i.h_post = i.h_gap = 0; i.last_advance_end.reset();
+    i.h_build = i.h_submit = i.h_wait = i.h_post = i.h_gap = 0; i.h_inject = i.h_encode = i.h_vsubmit = 0; i.last_advance_end.reset();
     i.sampling = i.temperature > 0.f;
     const auto t0 = Clock::now();
     i.engine->reset(); i.drafter->reset();
@@ -170,12 +176,14 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     {
         const auto plan = i.engine->plan_kv_format(int(prompt.size()), int(count), i.chunk, i.drafter->far_row_bytes());
         const auto tier = plan.tier;
-        i.engine->kv_format(tier); i.drafter->far_context(plan.far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
+        // no_far: the drafter's ring window only, what it costs against the far-context retrieval
+        const bool far = plan.far && !tqllm::debug_on("no_far");
+        i.engine->kv_format(tier); i.drafter->far_context(far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
         if (i.exact && tier != mlx_backend::KvTier::Bf16)
             std::fprintf(stderr, "tqserve: WARN --exact on: KV forced to %s by memory for this request\n", mlx_backend::kv_tier_name(tier));
         if (tier != mlx_backend::KvTier::Bf16 || prompt.size() > 32768)
             std::fprintf(stderr, "tqserve: KV format %s%s for %zu prompt + %u new tokens (in use %.1f GB, usable working set %.1f GB)\n",
-                         mlx_backend::kv_tier_name(tier), plan.far ? (plan.lean ? " (lean prefill)" : "") : (plan.lean ? " (drafter window only, lean prefill)" : " (drafter window only)"), prompt.size(), count, mx::get_active_memory() / 1e9,
+                         mlx_backend::kv_tier_name(tier), far ? (plan.lean ? " (lean prefill)" : "") : (plan.lean ? " (drafter window only, lean prefill)" : " (drafter window only)"), prompt.size(), count, mx::get_active_memory() / 1e9,
                          i.engine->kv_budget(i.chunk).working_set / 1e9);
     }
     mx::reset_peak_memory();
@@ -208,7 +216,27 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     }
     i.output.push_back(i.pending);
     i.ahead.reset();
-    if (!i.sampling && i.pending != i.eos && i.output.size() < i.count) {
+    i.tree = !i.sampling && i.engine->kv_format() == mlx_backend::KvTier::Bf16;
+    i.tree_ahead.reset();
+    if (i.tree && i.pending != i.eos && i.output.size() < i.count) {
+        // TQLLM_DEBUG=tree_rows:32: a 31-node tree in one 32-row verify (the release default stays 16 rows: j1583 priced
+        // the 32-row verify at +70 % of the step for +7 % of the tokens)
+        // tree_children / tree_tau / tree_edge: the shape of the 15-node tree, for a cheap acceptance sweep (it does not
+        // move the verify's cost)
+        mlx_backend::DeviceTreeOptions tree_options;
+        if (const char* rows = tqllm::debug_cstr("tree_rows")) {
+            const int n = std::atoi(rows);
+            if (n != 16 && n != 32) throw std::invalid_argument("TQLLM_DEBUG tree_rows takes 16 or 32");
+            tree_options.nodes = n - 1;
+        }
+        if (const char* k = tqllm::debug_cstr("tree_children")) tree_options.children = std::atoi(k);
+        if (const char* t = tqllm::debug_cstr("tree_tau")) tree_options.tau = float(std::atof(t));
+        if (const char* e = tqllm::debug_cstr("tree_edge")) tree_options.edge = float(std::atof(e));
+        i.tree_ahead.emplace(*i.engine, *i.drafter, tree_options);
+        i.tree_ahead->start(i.pending);
+        memlog_point("tree draft-ahead started");
+    }
+    if (!i.sampling && !i.tree && i.pending != i.eos && i.output.size() < i.count) {
         i.ahead.emplace(*i.engine, *i.drafter, i.width);
         i.ahead->start(i.pending, i.widths.native() ? i.widths.choose(i.engine->position()) : i.width);
         memlog_point("draft-ahead started");
@@ -256,6 +284,7 @@ bool MlxQwen35Engine::spec_advance() {
         if (i.done) i.ahead.reset();
         return !i.done;
     }
+    if (i.tree) return tree_step(pos, limit);
     // draft -> verify as one graph (the draft ids stay on the GPU), one host sync per step
     auto drafted = i.drafter->draft_device(i.pending, pos, want);
     mx::async_eval(drafted);
@@ -311,6 +340,32 @@ bool MlxQwen35Engine::spec_advance() {
     return !i.done;
 }
 
+// One token-tree step (TensorFold's DFlash2 tree, src/spec/draft_tree.hpp): the drafter's selector lattice for the
+// block's 15 positions becomes a best-first tree of up to 15 tokens under the anchor, built on the device
+// (tree_device.hpp); the target verifies anchor + tree in one 16-row pass under the ancestor mask, the target's argmax
+// walks down the tree from the anchor, and the deepest matching path is committed (KV rows, GDN state, drafter features).
+// The next tree is drafted behind the verify on the GPU (TreeAhead), so the host waits once per step. Greedy output equals
+// the chain's: every kept token is the target's argmax after its own path.
+bool MlxQwen35Engine::tree_step(int, uint32_t limit) {
+    auto& i = *impl_;
+    if (!i.tree_ahead) {i.done = true; return false;}
+    const auto st = i.tree_ahead->step();
+    i.h_build += st.build_ms; i.h_submit += st.submit_ms; i.h_wait += st.wait_ms; i.h_post += st.post_ms;
+    i.h_inject += st.inject_ms; i.h_encode += st.encode_ms; i.h_vsubmit += st.vsubmit_ms;
+    if (i.steps == 0) i.first_phases = {st.build_ms, st.submit_ms, st.wait_ms, st.post_ms};
+    ++i.steps; i.drafted += uint64_t(st.ids.size() - 1); i.accepted += uint64_t(st.accepted);
+    for (int j = 1; j <= st.accepted && i.output.size() < limit; ++j) {
+        i.output.push_back(st.ids[size_t(st.path[size_t(j)])]);
+        if (st.ids[size_t(st.path[size_t(j)])] == i.eos) {i.done = true; break;}
+    }
+    const uint32_t bonus = st.choices[size_t(st.path.back())];
+    if (!i.done && i.output.size() < limit) i.output.push_back(bonus);
+    i.pending = bonus;
+    if (!i.done) i.done = i.output.size() >= limit || i.output.back() == i.eos;
+    if (i.done) i.tree_ahead.reset();
+    return !i.done;
+}
+
 const std::vector<uint32_t>& MlxQwen35Engine::spec_tokens(int) const {return impl_->output;}
 
 std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
@@ -331,11 +386,11 @@ std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
     }
     if (i.steps > 1) {
         const double n = double(i.steps);
-        std::fprintf(stderr, "tqserve: host ms per step: build %.2f submit %.2f wait %.2f post %.2f gap %.2f (wall %.2f, %llu steps)\n",
-                     i.h_build / n, i.h_submit / n, i.h_wait / n, i.h_post / n, i.h_gap / n, i.decode_us / 1000.0 / n,
-                     static_cast<unsigned long long>(i.steps));
+        std::fprintf(stderr, "tqserve: host ms per step: build %.2f (vsub %.2f) submit %.2f (inject %.2f encode %.2f) wait %.2f post %.2f gap %.2f (wall %.2f, %llu steps)\n",
+                     i.h_build / n, i.h_vsubmit / n, i.h_submit / n, i.h_inject / n, i.h_encode / n, i.h_wait / n, i.h_post / n,
+                     i.h_gap / n, i.decode_us / 1000.0 / n, static_cast<unsigned long long>(i.steps));
     }
-    i.active = false; i.ahead.reset();
+    i.active = false; i.ahead.reset(); i.tree_ahead.reset();
     return i.output;  // EOS stays: finish() turns it into finish_reason "stop"
 }
 

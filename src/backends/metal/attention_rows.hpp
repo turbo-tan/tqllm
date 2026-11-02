@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
 #include <algorithm>
@@ -40,13 +41,41 @@ inline mlx::core::array prefill_attention_rows(const mlx::core::array& q16, cons
     return mx::concatenate(parts, 2);
 }
 
+// tree: the token-tree verify's [n, n] ancestor mask (decode_attention_bf16). exact_rows (verify): 17-32 rows run as
+// decode calls of at most 16 rows (rows 0-15 over the keys up to row 15, the rest over all), so every row equals its
+// one-row step bit for bit as at 16 rows; without it (a prefill chunk) they take the prefill attention as before
 inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const mlx::core::array& k,
-                                              const mlx::core::array& v, float scale, int kv_valid = -1) {
+                                              const mlx::core::array& v, float scale, int kv_valid = -1,
+                                              const mlx::core::array* tree = nullptr,
+                                              const std::vector<int32_t>* tree_parents = nullptr,
+                                              bool exact_rows = false) {
     namespace mx = mlx::core;
     const int n = q.shape(2), length = kv_valid > 0 ? kv_valid : k.shape(2);
     if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
-    if (n <= 16) return decode_attention_bf16(q, k, v, scale, length);
+    if (n <= 16) return decode_attention_bf16(q, k, v, scale, length, tree, tree_parents);
+    if (exact_rows && n <= 32) {
+        const int heads = q.shape(1), dim = q.shape(3), prefix = length - n;
+        // rows run in calls of at most 16, and the block is cut where it crosses the first segment boundary: the rows
+        // below it run folded in their AR steps and the ones above run segmented, so a call straddling it puts half its
+        // rows on the other kernel. A half sees the keys of every row below it, no more (block row t's ancestors are all
+        // below t), so it reads prefix + b keys with the mask's b columns.
+        const int edge = prefix < kAttentionSegment && prefix + n > kAttentionSegment ? kAttentionSegment - prefix : -1;
+        std::vector<mx::array> parts;
+        for (int a = 0; a < n;) {
+            int b = std::min(n, a + 16);
+            if (edge > a && edge < b) b = edge;
+            std::optional<mx::array> rows_mask;
+            if (tree)  // the half's ancestor rows, made once per verify (cached with the mask)
+                rows_mask = cached_tree_mask(*tree, {2, a, b, b, 0, 0, 0}, [&] {return mx::slice(*tree, {a, 0}, {b, b});});
+            // this half's own last row is where its key range ends, so it is also the block size its prefix follows from
+            parts.push_back(decode_attention_bf16(mx::slice(q, {0, 0, a, 0}, {1, heads, b, dim}), k, v, scale, prefix + b,
+                                                 rows_mask ? &*rows_mask : nullptr, tree_parents, b, a));
+            a = b;
+        }
+        return parts.size() == 1 ? parts[0] : mx::concatenate(parts, 2);
+    }
+    if (tree) throw std::invalid_argument("tree attention takes at most 32 verify rows");
     auto keys = mx::astype(mx::slice(k, {0, 0, 0, 0}, {k.shape(0), k.shape(1), length, k.shape(3)}), mx::float16);
     auto values = mx::astype(mx::slice(v, {0, 0, 0, 0}, {v.shape(0), v.shape(1), length, v.shape(3)}), mx::float16);
     auto out = prefill_attention_rows(mx::astype(q, mx::float16), keys, values, scale);

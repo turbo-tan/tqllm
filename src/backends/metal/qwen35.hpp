@@ -25,6 +25,14 @@ public:
     // draft and verify
     mlx::core::array verify_device(const mlx::core::array& ids, Verification& batch);
     void accept_prefix(const Verification& batch, size_t count);
+    // token-tree verify (BF16 KV): ids [n <= 16], row 0 the anchor, parents[t] < t the row each token follows. Logits
+    // are per row; accept_path keeps one root-to-node path (rows 0, r1, r2 ... each the previous row's child)
+    mlx::core::array verify_tree_device(const mlx::core::array& ids, const std::vector<int32_t>& parents, Verification& batch);
+    // the same verify for a tree built on the device (tree_device.hpp): parents int32 [n], depth int32 [n], visible bool
+    // [n, n], none read back; accept_path then takes the parents the host read after the verify
+    mlx::core::array verify_tree_device(const mlx::core::array& ids, const mlx::core::array& parents, const mlx::core::array& depth,
+                                        const mlx::core::array& visible, Verification& batch);
+    void accept_path(const Verification& batch, const std::vector<int32_t>& rows, const std::vector<int32_t>* parents = nullptr);
     mlx::core::array hidden_states() const;
     void enable_mtp();
     void draft_shortlist(const mlx::core::array& target_logits, int count);
@@ -48,6 +56,8 @@ public:
     mlx::core::array embed_device(const mlx::core::array& ids) const;
     // forward / verify submit their graph and return without waiting (draft-ahead chains the next draft behind it)
     void defer_eval(bool enabled);
+    // ms a deferred forward's submission (verify_tree_device) blocked on the GPU
+    double defer_submit_ms() const;
     mlx::core::array shared_draft_head(const mlx::core::array& normalized) const;
     void enable_draft_head4();
     Qwen35(const std::string& path, int context);
