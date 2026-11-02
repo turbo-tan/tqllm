@@ -38,7 +38,7 @@ void register_builtin_engines() {
                          TpConfig tp;
                          tp.rank = o.tp_rank; tp.world = o.tp_world; tp.peer = o.tp_peer; tp.port = o.tp_port;
                          if (tp.world > 1 && tp.rank != 0) throw std::invalid_argument("tqserve is rank 0; rank 1 runs glm-gpu --tp-rank 1");
-                         return make_minimax_engine(m, c, o.draft_model, t, tp, o.hot_map);  // -md: the DSpark draft GGUF
+                         return make_minimax_engine(m, c, o.draft_model, t, tp, o.hot_map, o.draft_vocab);  // -md: the DSpark draft GGUF
                      },
                      false});
     register_engine({"glm5next", [](const std::filesystem::path & p) { return gguf_like(p) && is_glm5next_gguf(p.string()); },

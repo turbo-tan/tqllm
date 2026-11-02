@@ -107,7 +107,8 @@ bool is_minimax_gguf(const std::string & path);
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",
                                             const std::string & tokenizer = "", const TpConfig & tp = {},
-                                            const std::string & hot_map = "");  // routing counts: preload the hot experts
+                                            const std::string & hot_map = "",  // routing counts: preload the hot experts
+                                            const std::string & draft_vocab = "");  // --draft-vocab: the DSpark head over a token subset
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

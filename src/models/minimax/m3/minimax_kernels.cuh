@@ -8,6 +8,8 @@
 namespace tqllm_cuda {
 // out = (clamp(u, -limit, limit) + 1) * g' * sigmoid(alpha g'),  g' = min(g, limit)
 void mm_swigluoai_f32(const float * g, const float * u, __half * out, int n, float alpha, float limit, cudaStream_t s);
+// the same with gate and up in one [rows][2 * ff] block (a fused gate+up matvec's output): out [rows][ff]
+void mm_swigluoai_f32_pair(const float * gu, __half * out, int rows, int ff, float alpha, float limit, cudaStream_t s);
 void mm_swigluoai_bf16(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float alpha, float limit,
                        cudaStream_t s);
 // x [tokens][heads][dim], rotate the first `rot` dims of every head (NeoX halves: j with j + rot/2) at position pos0 + t;
@@ -50,6 +52,24 @@ void mm_attn_draft(const float * q, const void * kc, const void * vc, const floa
                    int B, int hq, int hk, int dim, int anchor, int window, float scale, cudaStream_t s, bool fp8 = false);
 // out[j] = table[*id][j] for j < width (the id is read on the device)
 void mm_gather_row(const float * table, const int * id, float * out, int width, cudaStream_t s);
+// y [n][rows] = W x for FP32 weights (the router): split-k over the columns, one (row, slice) block reading its slice
+// once for every token. The per-thread terms, the block tree, the partials and their ascending sum are the same bits
+// as one block per (row, slice, token), so the routed experts a step picks cannot move.
+void mm_mv_f32_splitk(const float * w, const float * x, float * y, float * partial, int rows, int cols, int n, int splits,
+                      cudaStream_t s);
+// the router matvec and its routing in two launches instead of three: the split-k pass above, then glm_route's walk over
+// the partials (it sums each expert's splits in the order router_sum_k did). Same logits, same ids, same weights.
+void mm_mv_f32_splitk_route(const float * w, const float * x, float * logits, float * partial, int rows, int cols, int n,
+                            int splits, const float * bias, int * ids, float * rw, int topk, bool norm, float scale,
+                            cudaStream_t s);
+// the split-k pass of that pair alone (it writes the partials, no sum, no routing): the engine runs the pair as these two
+// calls so its stage map can time the two launches apart. Same launches, same order, same bits.
+void mm_router_splitk(const float * w, const float * x, float * partial, int rows, int cols, int n, int splits,
+                      cudaStream_t s);
 // a[j] += b[j]
 void mm_add(float * a, const float * b, int n, cudaStream_t s);
+// *out = table[*idx] (a draft-vocabulary argmax back to its token id)
+void mm_map_id(const int * table, const int * idx, int * out, cudaStream_t s);
+// dst[i] = src[ids[i]], i < n
+void mm_gather_ids(const float * src, const int * ids, float * dst, int n, cudaStream_t s);
 }  // namespace tqllm_cuda

@@ -43,6 +43,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>  // getpid, for the feature dump's file names
+
 namespace tqllm {
 namespace {
 
@@ -91,13 +93,14 @@ struct Layer {
 class MiniMaxEngine final : public Engine {
 public:
     MiniMaxEngine(const std::string & path, uint32_t context, const std::string & draft = "", const std::string & tokenizer = "",
-                  const TpConfig & tp = {}, const std::string & hot_map = "")
+                  const TpConfig & tp = {}, const std::string & hot_map = "", const std::string & draft_vocab = "")
         : context_(context ? context : 32768), hot_map_(hot_map) {
         if (tp.world > 1) {  // both boxes reach this before loading: NCCL comes up first, then each loads its share
             tp_ = std::make_unique<TpComm>(tp.rank, tp.world, tp.peer, tp.port);
             R_ = tp.rank; W_ = tp.world;
         }
         ck(cudaStreamCreate(&stream_));
+        smap_ = tqllm::debug_on("stagemap");
         int dev = 0, integrated = 0;
         ck(cudaGetDevice(&dev));
         ck(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev));
@@ -147,6 +150,18 @@ public:
             if (tg.has("tokenizer.ggml.eos_token_id")) eos_ = uint32_t(tg.num("tokenizer.ggml.eos_token_id"));
         }
         if (!draft.empty()) load_draft(draft);
+        if (!draft.empty() && !draft_vocab.empty()) load_draft_vocab(draft_vocab);
+        // The verify bound: a DSpark block of dblock_ drafts is verified as dblock_ + 1 columns in ONE forward, and that
+        // forward has to stay on the decode path (the matvec and the dedup expert pass), not on the grouped prompt path
+        // its width would otherwise choose. The pack's block_size is 7, so this keeps the default 8; a drafter trained
+        // at a wider block (4c: block 12) raises it to dblock_ + 1, up to the width every weight format answers a
+        // batched verify at (fmt_batch_, which is >= its matvec cap fmt_cols_: the same kernel, one column's bits
+        // independent of how many columns the call holds). Nothing else about a step changes: the block is still
+        // [anchor, drafts], the head still produces every row's argmax, and each column's bits are unchanged.
+        if (has_draft()) chunk_ = std::max(chunk_, std::min(dblock_ + 1, fmt_batch_));
+        if (has_draft() && chunk_ > 8)
+            std::fprintf(stderr, "minimax: verify bound %d columns (draft block %d, formats batch %d, matvec %d)\n",
+                         chunk_, dblock_, fmt_batch_, fmt_cols_);
         if (!integrated_ && W_ == 1) pchunk_ = 2048;
         if (bank_ || tp_) pchunk_ = chunk_;  // the bank and two-box paths keep the verify chunk
         pchunk_ = std::max(pchunk_, chunk_);
@@ -162,6 +177,7 @@ public:
         L_.clear();
         owned_.clear();
         if (h_embed_) cudaFreeHost(h_embed_);
+        for (cudaEvent_t e : sm_ev_) if (e) cudaEventDestroy(e);
         if (cublas_) cublasDestroy(cublas_);
         if (stream_) cudaStreamDestroy(stream_);
     }
@@ -195,6 +211,7 @@ public:
         if (prompt.empty()) throw std::runtime_error("minimax: empty prompt");
         if (prompt.size() >= context_) throw std::runtime_error("minimax: prompt fills the context");
         gen_ = Gen{};
+        ++req_;  // the dumped rows of this request carry this id (TQLLM_DEBUG=dump_feats)
         gen_.count = count;
         // d <= 0: the draft length follows the measured acceptance (minimax_draft_len, up to the DSpark block); d > 0: fixed
         gen_.adaptive = has_draft() && d <= 0;
@@ -213,7 +230,7 @@ public:
         const int dk = std::min<int>(gen_.adaptive ? minimax_draft_len(gen_.acc.rate(), gen_.d) : gen_.d, int(context_ - gen_.pos) - 1);
         std::vector<uint32_t> blk(size_t(dk) + 1), v(size_t(dk) + 1);
         blk[0] = gen_.tok;
-        if (dk > 0) { const auto pr = draft(gen_.tok, gen_.pos); std::copy(pr.begin(), pr.begin() + dk, blk.begin() + 1); }
+        if (dk > 0) { const auto pr = draft(gen_.tok, gen_.pos, dk); std::copy(pr.begin(), pr.end(), blk.begin() + 1); }
         run(blk.data(), dk + 1, gen_.pos, v.data());
         int k = 0;
         if (sampling()) {  // v holds no greedy ids here: accept / resample against each column's distribution
@@ -228,6 +245,10 @@ public:
         }
         if (tqllm::debug_on("draft")) std::fprintf(stderr, "minimax draft pos %u drafted %d kept %d\n", gen_.pos, dk, k);
         ++gen_.steps; gen_.drafted += uint64_t(dk); gen_.accepted += uint64_t(k);
+        for (int j = 1; j <= dk && j < int(gen_.dtry.size()); ++j) {
+            ++gen_.dtry[size_t(j)];
+            gen_.dacc[size_t(j)] += uint64_t(k >= j);
+        }
         gen_.acc.update(dk, k);
         gen_.tok = v[size_t(k)];
         gen_.pos += uint32_t(k + 1);
@@ -235,6 +256,34 @@ public:
         return !gen_.done;
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
+        if (smap_) {
+            sm_flush();
+            double tot = 0.0;
+            for (int i = 0; i < SM_N; ++i) tot += sm_ms_[i];
+            std::fprintf(stderr, "minimax stagemap forwards %llu per request, ms per forward:",
+                         (unsigned long long) sm_forwards_);
+            for (int i = 0; i < SM_N; ++i)
+                std::fprintf(stderr, " %s %.1f", kSmName[i], sm_forwards_ ? sm_ms_[i] / double(sm_forwards_) : 0.0);
+            std::fprintf(stderr, " total %.1f\n", sm_forwards_ ? tot / double(sm_forwards_) : 0.0);
+            for (int i = 0; i < SM_N; ++i) sm_ms_[i] = 0.0;
+            sm_forwards_ = 0;
+            sm_mark_i_ = 0;
+            sm_open_ = SM_EMBED;
+        }
+        if (tqllm::debug_on("accept")) {
+            uint64_t ts = 0, as = 0;
+            std::fprintf(stderr, "minimax accept per depth:");
+            for (size_t j = 1; j < gen_.dtry.size(); ++j)
+                if (gen_.dtry[j]) {
+                    ts += gen_.dtry[j]; as += gen_.dacc[j];
+                    std::fprintf(stderr, " d%zu %llu/%llu=%.3f", j, (unsigned long long) gen_.dacc[j],
+                                 (unsigned long long) gen_.dtry[j], double(gen_.dacc[j]) / double(gen_.dtry[j]));
+                }
+            std::fprintf(stderr, " | kept/step %.2f steps %llu drafted %llu accepted %llu sums %llu/%llu\n",
+                         gen_.steps ? double(gen_.accepted) / double(gen_.steps) : 0.0,
+                         (unsigned long long) gen_.steps, (unsigned long long) gen_.drafted,
+                         (unsigned long long) gen_.accepted, (unsigned long long) as, (unsigned long long) ts);
+        }
         if (stats) {
             stats[0] = gen_.steps; stats[1] = gen_.drafted; stats[2] = gen_.accepted;
             stats[3] = uint64_t(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - gen_.t1).count());
@@ -262,9 +311,101 @@ private:
     const GgufFile * cur_ = &meta_;  // the file tensor() / bytes() read: the model, or the draft while it loads
     std::string a_;
     cudaStream_t stream_ = nullptr;
+    // TQLLM_DEBUG=stagemap: where a verify step goes. The stream is serial, so a ring of CUDA events bounds every
+    // stage: sm_mark(name) records an event, and SM_LAG marks later the interval that ended at that event is read
+    // back into the stage that was open. The read is deferred because cudaEventElapsedTime never waits: while the
+    // stream still has the interval queued it answers cudaErrorNotReady, which zeroes a map read at the mark. Being
+    // SM_LAG launches behind the GPU keeps the device fed, so the sync waits for real device time; host gaps (the
+    // embedding dequant, the argmax copy back) land in the stage that was open. Summed per request, printed by
+    // spec_finish.
+    // `moe` is the step and one number, so it is split: the router, the routed gate / up, the routed down, the shared
+    // expert and the summing. The routed rows are the parts that read expert bytes; the shared expert and the router are
+    // the parts that do not, and they decide whether the next lever is the routed kernel's GB/s or the fixed per-layer
+    // work.
+    // The router is two launches and the map put ~2 ms of its row beyond what those launches cost on .44, so they are
+    // marked apart: `moe.rt.mv` is the split-k pass, `moe.rt.rt` the routing walk over its partials, `moe.rt.x` what is
+    // left between the second launch and the gate / up mark (count_routes, the path checks, the host gap). Their sum is
+    // the `moe.rt` the earlier maps printed. A forward whose block is wider than the verify chunk takes the grouped
+    // path, which is the whole MoE of that forward - prompt prefills mostly - and it is `moe.gr`, not the router rows.
+    // `draft` is the second big block and one number too, so it splits the same way: the drafter's context (its K / V
+    // for the verified rows), its layers, its head over the full lm_head, and the Markov pass - the four have different
+    // byte floors, and only the last two read the vocabulary.
+    enum SmStage { SM_EMBED, SM_NORM, SM_ATTN, SM_ADD, SM_MOE, SM_CAP, SM_DRAFT, SM_HEAD,
+                   SM_MOE_GU, SM_MOE_DN, SM_MOE_SH, SM_MOE_SM,
+                   SM_DRAFT_CTX, SM_DRAFT_LAY, SM_DRAFT_HEAD, SM_DRAFT_MKV,
+                   SM_MOE_RT_MV, SM_MOE_RT_RT, SM_MOE_RT_X, SM_MOE_GR, SM_N };
+    static constexpr const char * kSmName[SM_N] = {"embed", "norm", "attn", "add", "moe", "cap", "draft", "head",
+                                                   "moe.gu", "moe.dn", "moe.sh", "moe.sm",
+                                                   "draft.ctx", "draft.lay", "draft.head", "draft.mkv",
+                                                   "moe.rt.mv", "moe.rt.rt", "moe.rt.x", "moe.gr"};
+    static constexpr int SM_RING = 512, SM_LAG = 256;   // SM_RING > SM_LAG + 1: a slot is reused only after its read
+    bool smap_ = false;
+    cudaEvent_t sm_ev_[SM_RING] = {};
+    int sm_stage_[SM_RING] = {};
+    uint64_t sm_mark_i_ = 0;
+    int sm_open_ = SM_EMBED;
+    uint64_t sm_forwards_ = 0;
+    double sm_ms_[SM_N] = {};
+    // A diagnostic never leaves a sticky CUDA error behind: an unchecked failure here would be reported by the next
+    // kernel launch's cudaGetLastError (glm5next.cu), i.e. as someone else's bug. The events are created lazily, in
+    // the context that actually runs the forwards.
+    void sm_ready() {
+        if (sm_ev_[0]) return;
+        for (int i = 0; i < SM_RING; ++i)
+            if (cudaEventCreate(&sm_ev_[i]) != cudaSuccess) {
+                cudaGetLastError();
+                smap_ = false;
+                std::fprintf(stderr, "minimax: stagemap events unavailable, mapping off\n");
+                return;
+            }
+    }
+    void sm_read(uint64_t end) {   // the interval that ended at mark `end`, into the stage it closed
+        const int e = int(end % SM_RING), s = int((end - 1) % SM_RING);
+        float d = 0.f;
+        if (cudaEventSynchronize(sm_ev_[e]) != cudaSuccess || cudaEventElapsedTime(&d, sm_ev_[s], sm_ev_[e]) != cudaSuccess) {
+            cudaGetLastError();
+            smap_ = false;
+            return;
+        }
+        sm_ms_[sm_stage_[e]] += d;
+    }
+    void sm_mark(int stage) {
+        if (!smap_) return;
+        sm_ready();
+        if (!smap_) return;
+        const uint64_t i = sm_mark_i_++;
+        if (cudaEventRecord(sm_ev_[int(i % SM_RING)], stream_) != cudaSuccess) {
+            cudaGetLastError();
+            smap_ = false;
+            return;
+        }
+        sm_stage_[int(i % SM_RING)] = sm_open_;
+        sm_open_ = stage;
+        if (i >= uint64_t(SM_LAG) + 1) sm_read(i - SM_LAG);
+    }
+    void sm_flush() {   // the intervals still in the ring at the end of a request
+        if (!smap_ || !sm_ev_[0]) return;
+        const uint64_t last = sm_mark_i_;
+        for (uint64_t e = (last > uint64_t(SM_LAG) + 1 ? last - SM_LAG : 1); e < last; ++e) sm_read(e);
+    }
+
     uint32_t context_ = 0, eos_ = 0;
     int H_ = 0, hq_ = 0, hk_ = 0, hd_ = 0, rot_ = 0, experts_ = 0, topk_ = 0, eff_ = 0, ff_ = 0, sh_ff_ = 0, dense_lead_ = 0;
     int vocab_ = 0, chunk_ = 8, pchunk_ = 8, last_rows_ = 1, max_rows_ = 0;  // pchunk_: prompt tokens per forward
+    // chunk_ is the widest forward that runs as a decode / verify block (the matvec and the dedup expert pass, the head
+    // argmax on every row) rather than a prompt chunk (one GEMM pass over the weights, the head on the last row only).
+    // It starts at 8 and is capped by every weight format's own matvec width (fmt_cols_); a drafter whose block is wider
+    // than 7 raises it to its block + 1, since that block plus its anchor is verified in one forward, as far as the
+    // formats answer a batched verify (fmt_batch_: per-column bits unchanged by the batch width).
+    int fmt_cols_ = 1 << 30;  // the widest matvec batch every format in the file answers
+    // the widest batch a verify block may run: a format whose matvec dispatch caps lower may still answer a wider block
+    // as one batched pass with identical per-column bits (max_batch_cols), and that is what a verify forward is.
+    int fmt_batch_ = 1 << 30;
+    void cap_matvec_cols(int c, int batch) {
+        fmt_cols_ = std::min(fmt_cols_, c);
+        chunk_ = std::min(chunk_, c);
+        fmt_batch_ = std::min(fmt_batch_, batch);
+    }
     cublasHandle_t cublas_ = nullptr;  // F32 weights x many tokens (router, indexer keys) in a prompt chunk
     int ih_ = 0, idim_ = 0, itopk_ = 0, iblock_ = 0, ilocal_ = 0;
     // tensor parallelism over W_ boxes (rank R_): this rank's query / KV heads and ff widths; partial sums all-reduced
@@ -301,17 +442,85 @@ private:
     int dblock_ = 0, dmask_ = 0, drank_ = 0, dwindow_ = 0, dff_ = 0;
     Buf feat_, fused_, dh_, dxn_, dq_, dkv_, dk_, dv_, datt_, dfo_, dlog_, dbias_, dlat_, dtok_;
     bool has_draft() const { return !D_.empty(); }
+    // --draft-vocab FILE (uint32 token ids): the drafter's head and Markov W2 over that subset only, FP16, cuBLAS. The full
+    // head (200064 x 6144 EXL3, ~4.7 ms) and W2 (102 MB x up to 7 slots, ~3 ms) per draft step become ~0.2 and ~0.1 GB.
+    // Exact for the output: the target's head verifies every token; a token outside the subset is never drafted.
+    std::vector<int> dv_ids_; Buf dv_ids_dev_, dv_head_, dv_w2_, dv_log_, dv_bias_, dv_xh_, dv_lath_, dv_arg_;
+    // rows `ids` of w as row-major FP16 [ids][cols] on the device
+    Buf subset_rows_h(const M & w, const std::vector<int> & ids) {
+        const int R = w.f32 ? w.rows : w.m.rows, C = w.f32 ? w.cols : w.m.cols;
+        std::vector<__half> out(ids.size() * size_t(C));
+        std::vector<std::vector<int>> by_chunk(size_t((R + HEAD_ROWS - 1) / HEAD_ROWS));
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] < 0 || ids[i] >= R) throw std::runtime_error("minimax: --draft-vocab id " + std::to_string(ids[i]) + " out of range");
+            by_chunk[size_t(ids[i] / HEAD_ROWS)].push_back(int(i));
+        }
+        Buf dq(size_t(HEAD_ROWS) * C * sizeof(float)); std::vector<__half> h(size_t(HEAD_ROWS) * C); std::vector<float> hf;
+        for (int r0 = 0; r0 < R; r0 += HEAD_ROWS) {
+            const auto & want = by_chunk[size_t(r0 / HEAD_ROWS)]; if (want.empty()) continue;
+            const int nr = std::min(HEAD_ROWS, R - r0);
+            if (w.f32) {
+                hf.resize(size_t(nr) * C);
+                ck(cudaMemcpy(hf.data(), w.f32 + size_t(r0) * C, hf.size() * 4, cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < hf.size(); ++i) h[i] = __float2half(hf[i]);
+            } else if (!w.m.fmt) {  // dense BF16
+                std::vector<__nv_bfloat16> b(size_t(nr) * C);
+                ck(cudaMemcpy(b.data(), static_cast<const __nv_bfloat16 *>(w.m.p) + size_t(r0) * C, b.size() * 2, cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < b.size(); ++i) h[i] = __float2half(__bfloat162float(b[i]));
+            } else {
+                if (!w.m.fmt->dequant_rows_h(w.m, dq.as<__half>(), r0, nr, stream_))
+                    throw std::runtime_error(std::string("minimax: ") + w.m.fmt->name() + " has no row-range dequant: no --draft-vocab");
+                ck(cudaMemcpyAsync(h.data(), dq.p, size_t(nr) * C * sizeof(__half), cudaMemcpyDeviceToHost, stream_));
+                ck(cudaStreamSynchronize(stream_));
+            }
+            for (int i : want) std::memcpy(out.data() + size_t(i) * C, h.data() + size_t(ids[size_t(i)] - r0) * C, size_t(C) * sizeof(__half));
+        }
+        Buf d(out.size() * sizeof(__half)); ck(cudaMemcpy(d.p, out.data(), out.size() * sizeof(__half), cudaMemcpyHostToDevice));
+        return d;
+    }
+    void load_draft_vocab(const std::string & file) {
+        std::FILE * f = std::fopen(file.c_str(), "rb");
+        if (!f) throw std::runtime_error("minimax: cannot read --draft-vocab " + file);
+        std::vector<uint32_t> raw; uint32_t v;
+        while (std::fread(&v, 4, 1, f) == 1) raw.push_back(v);
+        std::fclose(f);
+        dv_ids_.assign(raw.begin(), raw.end());
+        if (dv_ids_.empty()) throw std::runtime_error("minimax: --draft-vocab " + file + " is empty");
+        const int V = int(dv_ids_.size()), B = dblock_ + 1;
+        dv_head_ = subset_rows_h(out_, dv_ids_);
+        // W2 in a format without a row-range dequant (I8H): the full bias as before, then its subset (the head saving stays)
+        try { dv_w2_ = subset_rows_h(dw2_, dv_ids_); } catch (const std::runtime_error &) { dv_w2_ = Buf(); }
+        dv_ids_dev_ = Buf(size_t(V) * sizeof(int)); ck(cudaMemcpy(dv_ids_dev_.p, dv_ids_.data(), size_t(V) * sizeof(int), cudaMemcpyHostToDevice));
+        dv_log_ = Buf(size_t(B) * V * 4); dv_bias_ = Buf(size_t(V) * 4); dv_xh_ = Buf(size_t(B) * H_ * 2); dv_lath_ = Buf(size_t(drank_) * 2); dv_arg_ = Buf(4);
+        if (!cublas_) { if (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("minimax: cuBLAS init failed"); cublasSetStream(cublas_, stream_); }
+        std::fprintf(stderr, "minimax: draft vocabulary %s: %d tokens (head %.0f MB FP16, W2 %s)\n", file.c_str(), V,
+                     double(V) * H_ * 2 / 1048576.0, dv_w2_.p ? "subset FP16" : "full, bias gathered");
+    }
+    // y[n][V] = x[n][cols] W[V][cols]^T, FP16 inputs, FP32 accumulate and output
+    void gemm_h(const __half * w, const __half * x, float * y, int V, int cols, int n) {
+        const float one = 1.f, zero = 0.f;
+        if (cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, V, n, cols, &one, w, CUDA_R_16F, cols, x, CUDA_R_16F, cols, &zero, y,
+                         CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("minimax: cuBLAS draft-vocabulary GEMM failed");
+    }
     struct Gen {
         std::vector<uint32_t> out;
         uint32_t count = 0, tok = 0, pos = 0;
         int d = 0;
         bool done = true, adaptive = false;
         MinimaxAcceptRate acc;
+        // TQLLM_DEBUG=accept: the acceptance *per draft depth* (a_d = kept at depth d / drafted at depth d). The pooled
+        // rate the scheduler uses hides the profile, and 4c (drafter quality) is a per-depth question: the tree row
+        // (37413a0) showed depth is what pays, so the profile, not the mean, decides what a better drafter must fix.
+        std::array<uint64_t, 16> dtry{}, dacc{};
         uint64_t steps = 0, drafted = 0, accepted = 0, prefill_us = 0;
         std::chrono::steady_clock::time_point t1;
     } gen_;
-    Buf x_, xn_, xh_, qkv_, q_, k_, v_, att_, fo_, a_f_, b_f_, c_f_, act_, bfa_, scratch_h_, logits_, d_arg_, d_ids_, d_w_, ye_g_,
-        ye_u_, yd_, sh_, partial_;
+    Buf x_, xn_, xh_, qkv_, q_, k_, v_, att_, fo_, a_f_, act_, bfa_, scratch_h_, logits_, d_arg_, d_ids_, d_w_,
+        ye_gu_, yd_, sh_, partial_;
+    // gate and up outputs in ONE allocation (P * topk_ * eff_ rows each): a format that runs both routed matrices in one
+    // pass (x3 expert_matvec2) addresses the up half by a row offset from the gate half, so the pair must be adjacent.
+    bf16 *ye_g_ = nullptr, *ye_u_ = nullptr;
     float * h_embed_ = nullptr;
     // routed experts: the whole stack of every MoE layer on the device when it fits beside the rest, else one bank per
     // layer in the shared MixedExpertCache sized from the free device memory (hot experts stay, the others are read
@@ -460,7 +669,7 @@ private:
             r.m = wf->load(raw, r.rows, r.cols, [this](const void * h, size_t s) { return put(h, s); }, stream_);
             for (const auto & sl : parts) discard(sl.name, bytes(sl.name));
             if (!r.m.fmt || r.m.fmt->basis() != Basis::Plain) throw std::runtime_error("minimax: " + parts[0].name + " format");
-            chunk_ = std::min(chunk_, r.m.fmt->max_matvec_cols());
+            cap_matvec_cols(r.m.fmt->max_matvec_cols(), r.m.fmt->max_batch_cols());
         } else {
             std::vector<float> v;
             for (const auto & sl : parts) { const auto x = slice_f32(sl); v.insert(v.end(), x.begin(), x.end()); }
@@ -489,7 +698,7 @@ private:
         discard(n, b);
         if (!m.fmt || !m.fmt->has_expert_matvec() || m.fmt->basis() != Basis::Plain)
             throw std::runtime_error("minimax: " + n + " has no grouped-expert kernel");
-        chunk_ = std::min(chunk_, m.fmt->max_matvec_cols());
+        cap_matvec_cols(m.fmt->max_matvec_cols(), m.fmt->max_batch_cols());
         return m;
     }
 
@@ -619,7 +828,7 @@ private:
             const auto parts = repack_expert(expert_payload(int(l), 0), H_, eff_, false, &fmt);
             for (int pr = 0; pr < 3; ++pr) {
                 if (!fmt[size_t(pr)].bank_row_layout) throw std::runtime_error("minimax: expert format has no bank row layout");
-                chunk_ = std::min(chunk_, fmt[size_t(pr)].max_matvec_cols);
+                cap_matvec_cols(fmt[size_t(pr)].max_matvec_cols, fmt[size_t(pr)].max_batch_cols);
             }
             for (const auto & part : parts) slot_bytes_[l] += part.size();
         }
@@ -704,13 +913,13 @@ private:
                std::max({qd + 2 * kd, 2 * wf, size_t(H_)}) * std::max({size_t(H_), wf, qd}) * 2;  // wdq_
     }
     void alloc() {
-        const int N = chunk_, P = std::max(chunk_, pchunk_), qd = hq_ * hd_, kd = hk_ * hd_;
+        const int N = chunk_, P = std::max(chunk_, pchunk_), qd = hq_ * hd_, kd = hk_ * hd_;  // N: the verify bound
         auto f = [](size_t n) { return Buf(n * sizeof(float)); };
         x_ = f(size_t(P) * H_); xn_ = f(size_t(P) * H_); xh_ = Buf(size_t(P) * H_ * sizeof(__half));
         qkv_ = f(size_t(P) * (qd + 2 * kd)); q_ = f(size_t(P) * qd); k_ = f(size_t(P) * kd); v_ = f(size_t(P) * kd);
         att_ = f(size_t(P) * qd); fo_ = f(size_t(P) * H_);
         const int widest_ff = std::max({ff_, sh_ff_, eff_});
-        a_f_ = f(size_t(P) * 2 * widest_ff); b_f_ = f(size_t(P) * widest_ff); c_f_ = f(size_t(P) * widest_ff);
+        a_f_ = f(size_t(P) * 2 * widest_ff);
         act_ = Buf(size_t(P) * std::max(topk_ * eff_, widest_ff) * sizeof(__half));
         const int widest = std::max({max_rows_, topk_ * std::max(eff_, H_), H_, widest_ff});
         // the head's vocab rows run on at most N tokens; every other projection on up to P
@@ -719,7 +928,8 @@ private:
         scratch_h_ = Buf(size_t(P) * std::max({H_, qd, widest_ff, dfc_.cols}) * sizeof(__half));
         logits_ = f(std::max(size_t(N) * std::max(vocab_, experts_), size_t(P) * experts_)); d_arg_ = Buf(size_t(N) * sizeof(int));
         d_ids_ = Buf(size_t(P) * topk_ * sizeof(int)); d_w_ = f(size_t(P) * topk_);
-        ye_g_ = Buf(size_t(P) * topk_ * eff_ * sizeof(bf16)); ye_u_ = Buf(size_t(P) * topk_ * eff_ * sizeof(bf16));
+        ye_gu_ = Buf(2 * size_t(P) * topk_ * eff_ * sizeof(bf16));
+        ye_g_ = ye_gu_.as<bf16>(); ye_u_ = ye_g_ + size_t(P) * topk_ * eff_;
         yd_ = Buf(size_t(P) * topk_ * H_ * sizeof(bf16)); sh_ = f(size_t(P) * H_);
         d_slots_ = Buf(size_t(N) * topk_ * sizeof(int));
         moe_counts_ = Buf(size_t(std::max(1, experts_)) * sizeof(int)); moe_groups_ = Buf(size_t(std::max(1, experts_)) * P * sizeof(int));
@@ -750,7 +960,11 @@ private:
         iids_ = Buf(size_t(P) * itopk_ * sizeof(int));
         if (has_draft()) {
             const int B = dblock_;
-            if (B > N) throw std::runtime_error("minimax: draft block wider than the chunk");
+            // spec_begin caps the draft length at chunk_ - 1, and chunk_ is at least dblock_ + 1 unless a weight format
+            // cannot answer a batched verify that wide (then the drafter's block has no decode path to run in).
+            if (B > N) throw std::runtime_error("minimax: draft block " + std::to_string(B) + " wider than the verify bound " +
+                                                std::to_string(chunk_) + " (a weight format caps the batched verify at " +
+                                                std::to_string(fmt_batch_) + " columns)");
             feat_ = f(size_t(P) * target_layers_.size() * H_); fused_ = f(size_t(P) * H_);
             dh_ = f(size_t(B) * H_); dxn_ = f(size_t(B) * H_); dq_ = f(size_t(B) * qd); dkv_ = f(size_t(P) * 2 * kd);
             dk_ = f(size_t(P) * kd); dv_ = f(size_t(P) * kd); datt_ = f(size_t(B) * qd); dfo_ = f(size_t(B) * H_);
@@ -774,7 +988,7 @@ private:
         }
         if (w.f32) {
             if (w.rows <= kSmallRows)
-                tqllm_cuda::glm_mv_f32_splitk(w.f32, x, y, partial_.as<float>(), w.rows, w.cols, n, splits(w.cols), stream_);
+                tqllm_cuda::mm_mv_f32_splitk(w.f32, x, y, partial_.as<float>(), w.rows, w.cols, n, splits(w.cols), stream_);
             else tqllm_cuda::glm_mv_f32(w.f32, x, y, w.rows, w.cols, n, stream_);
             return;
         }
@@ -790,6 +1004,22 @@ private:
             }
         }
         w.m.fmt->matvec(w.m, scratch_h_.as<__half>(), bfa_.as<bf16>(), n, stream_);
+        tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
+    }
+    // the same matvec with the input already in the FP16 layout the format wants: moe() converts xn once for the routed
+    // experts, and the shared expert used to convert those same values a second time into scratch_h_
+    void mv_h(const M & w, const __half * xh, float * y, int n) {
+        if (w.f32_out != 0) {
+            try {
+                w.m.fmt->matvec_f32(w.m, xh, y, n, stream_);
+                w.f32_out = 1;
+                return;
+            } catch (const std::runtime_error &) {
+                if (w.f32_out == 1) throw;
+                w.f32_out = 0;
+            }
+        }
+        w.m.fmt->matvec(w.m, xh, bfa_.as<bf16>(), n, stream_);
         tqllm_cuda::glm_bf16_to_f32(bfa_.as<bf16>(), y, w.rows * n, stream_);
     }
     // y FP32 [n][rows] = W x (half), every column in the format's GEMM; no per-token fallback (it would read W n times).
@@ -815,13 +1045,13 @@ private:
         if (!fits) throw std::runtime_error(std::string("minimax: no prefill GEMM for ") + m.fmt->name());
         dequant_gemm();
     }
-    // down(swigluoai(gate x, up x)) -> out FP32; gu = gate | up rows stacked
-    void ffn(const M & gu, const M & dn, const float * x, float * out, int n) {
+    // down(swigluoai(gate x, up x)) -> out FP32; gu = gate | up rows stacked. `xh`, when given, is `x` already in the
+    // format's FP16 layout (moe() converts the block once for the routed experts and shares it with the shared expert).
+    void ffn(const M & gu, const M & dn, const float * x, float * out, int n, const __half * xh = nullptr) {
         const int ff = gu.rows / 2;
-        mv(gu, x, a_f_.as<float>(), n);  // [n][gate | up]
-        tqllm_cuda::glm_gather_cols(a_f_.as<float>(), 2 * ff, 0, ff, n, b_f_.as<float>(), stream_);
-        tqllm_cuda::glm_gather_cols(a_f_.as<float>(), 2 * ff, ff, ff, n, c_f_.as<float>(), stream_);
-        tqllm_cuda::mm_swigluoai_f32(b_f_.as<float>(), c_f_.as<float>(), act_.as<__half>(), ff * n, alpha_, limit_, stream_);
+        if (xh && n <= chunk_ && !gu.f32) mv_h(gu, xh, a_f_.as<float>(), n);
+        else mv(gu, x, a_f_.as<float>(), n);  // [n][gate | up]
+        tqllm_cuda::mm_swigluoai_f32_pair(a_f_.as<float>(), act_.as<__half>(), n, ff, alpha_, limit_, stream_);
         if (n > chunk_) { gemm(dn.m, act_.as<__half>(), out, n); return; }
         if (dn.f32_out != 0) {
             try { dn.m.fmt->matvec_f32(dn.m, act_.as<__half>(), out, n, stream_); dn.f32_out = 1; return; }
@@ -832,22 +1062,33 @@ private:
     }
     void moe(Layer & Y, int layer, int n) {
         const float * xn = xn_.as<float>();
-        __half * xh = xh_.as<__half>();
-        tqllm_cuda::glm_f32_to_half(xn, xh, H_ * n, stream_);
-        mv(Y.router, xn, logits_.as<float>(), n);
-        tqllm_cuda::glm_route(logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(), d_w_.as<float>(), experts_, topk_, true,
-                              w_scale_, stream_, n);
+        const __half * xh = xh_.as<__half>();   // the ffn norm wrote it beside xn_ (forward())
+        sm_mark(SM_MOE_RT_MV);
+        const M & rt = Y.router;
+        if (n <= chunk_ && rt.f32 && rt.rows <= kSmallRows && rt.rows == experts_) {
+            // the pair mm_mv_f32_splitk_route runs as one call, here as two so the map can put an event between them
+            tqllm_cuda::mm_router_splitk(rt.f32, xn, partial_.as<float>(), rt.rows, rt.cols, n, splits(rt.cols), stream_);
+            sm_mark(SM_MOE_RT_RT);
+            tqllm_cuda::glm_route_partial(partial_.as<float>(), logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(),
+                                          d_w_.as<float>(), rt.rows, topk_, true, w_scale_, stream_, n, splits(rt.cols));
+        } else {
+            mv(rt, xn, logits_.as<float>(), n);
+            tqllm_cuda::glm_route(logits_.as<float>(), Y.probs_bias, d_ids_.as<int>(), d_w_.as<float>(), experts_, topk_,
+                                  true, w_scale_, stream_, n);
+        }
+        sm_mark(SM_MOE_RT_X);
         count_routes(layer, n);
         if (bank_) { moe_bank(Y, layer, n); return; }
-        if (n > chunk_) { moe_grouped(Y, n); return; }
+        if (n > chunk_) { sm_mark(SM_MOE_GR); moe_grouped(Y, n); return; }   // prompt chunks: their own row
         if (n > 1 && Y.e_gate.fmt->has_expert_dedup() && Y.e_gate.fmt == Y.e_up.fmt && Y.e_down.fmt->has_expert_dedup()) {
             moe_dedup(Y, n);
             return;
         }
+        sm_mark(SM_MOE_GU);
         bool done = false;
         if (Y.e_gate.fmt == Y.e_up.fmt && Y.paired != 0) {
             try {
-                Y.e_gate.fmt->expert_matvec2(Y.e_gate, Y.e_up, xh, ye_g_.as<bf16>(), ye_u_.as<bf16>(), effl_, d_ids_.as<int>(), n,
+                Y.e_gate.fmt->expert_matvec2(Y.e_gate, Y.e_up, xh, ye_g_, ye_u_, effl_, d_ids_.as<int>(), n,
                                              topk_, stream_);
                 Y.paired = 1;
                 done = true;
@@ -857,13 +1098,16 @@ private:
             }
         }
         if (!done) {
-            Y.e_gate.fmt->expert_matvec(Y.e_gate, xh, ye_g_.as<bf16>(), effl_, d_ids_.as<int>(), n, topk_, false, stream_);
-            Y.e_up.fmt->expert_matvec(Y.e_up, xh, ye_u_.as<bf16>(), effl_, d_ids_.as<int>(), n, topk_, false, stream_);
+            Y.e_gate.fmt->expert_matvec(Y.e_gate, xh, ye_g_, effl_, d_ids_.as<int>(), n, topk_, false, stream_);
+            Y.e_up.fmt->expert_matvec(Y.e_up, xh, ye_u_, effl_, d_ids_.as<int>(), n, topk_, false, stream_);
         }
-        tqllm_cuda::mm_swigluoai_bf16(ye_g_.as<bf16>(), ye_u_.as<bf16>(), act_.as<__half>(), n * topk_ * effl_, alpha_, limit_,
+        sm_mark(SM_MOE_DN);
+        tqllm_cuda::mm_swigluoai_bf16(ye_g_, ye_u_, act_.as<__half>(), n * topk_ * effl_, alpha_, limit_,
                                       stream_);
         Y.e_down.fmt->expert_matvec(Y.e_down, act_.as<__half>(), yd_.as<bf16>(), H_, d_ids_.as<int>(), n, topk_, true, stream_);
-        ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n);
+        sm_mark(SM_MOE_SH);
+        ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n, xh);
+        sm_mark(SM_MOE_SM);
         tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
@@ -891,9 +1135,9 @@ private:
             // IQ1_S reads each 32-value block's sum (DS4 layout); gate and up share one format per layer
             if (ig != iu) throw std::runtime_error("minimax: gate and up in different formats");
             tqllm_cuda::mmq_quantize_act(xh, n, H_, mq_x_.p, stream_, ig == 11);
-            mmq(Y.e_gate, ig, effl_, mq_x_.p, n, topk_, ye_g_.as<bf16>());
-            mmq(Y.e_up, iu, effl_, mq_x_.p, n, topk_, ye_u_.as<bf16>());
-            tqllm_cuda::mm_swigluoai_bf16(ye_g_.as<bf16>(), ye_u_.as<bf16>(), act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
+            mmq(Y.e_gate, ig, effl_, mq_x_.p, n, topk_, ye_g_);
+            mmq(Y.e_up, iu, effl_, mq_x_.p, n, topk_, ye_u_);
+            tqllm_cuda::mm_swigluoai_bf16(ye_g_, ye_u_, act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
             tqllm_cuda::mmq_quantize_act(act_.as<__half>(), A, effl_, mq_a_.p, stream_, id == 11);
             mmq(Y.e_down, id, H_, mq_a_.p, A, 1, yd_.as<bf16>());
             ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n);
@@ -902,9 +1146,9 @@ private:
             return;
         }
         auto need = [](bool ok, const Mat & m) { if (!ok) throw std::runtime_error(std::string("minimax: no grouped expert GEMM for ") + m.fmt->name()); };
-        need(Y.e_gate.fmt->expert_gemm(Y.e_gate, xh, ye_g_.as<bf16>(), effl_, counts, groups, n, experts_, topk_, false, stream_), Y.e_gate);
-        need(Y.e_up.fmt->expert_gemm(Y.e_up, xh, ye_u_.as<bf16>(), effl_, counts, groups, n, experts_, topk_, false, stream_), Y.e_up);
-        tqllm_cuda::mm_swigluoai_bf16(ye_g_.as<bf16>(), ye_u_.as<bf16>(), act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
+        need(Y.e_gate.fmt->expert_gemm(Y.e_gate, xh, ye_g_, effl_, counts, groups, n, experts_, topk_, false, stream_), Y.e_gate);
+        need(Y.e_up.fmt->expert_gemm(Y.e_up, xh, ye_u_, effl_, counts, groups, n, experts_, topk_, false, stream_), Y.e_up);
+        tqllm_cuda::mm_swigluoai_bf16(ye_g_, ye_u_, act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
         need(Y.e_down.fmt->expert_gemm(Y.e_down, act_.as<__half>(), yd_.as<bf16>(), H_, counts, groups, n, experts_, topk_, true, stream_),
              Y.e_down);
         ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n);
@@ -914,6 +1158,7 @@ private:
     // A verify block (n > 1): each distinct routed expert is read once for all its tokens (up to kDedupCols per group)
     // instead of once per assignment; same per-assignment outputs as expert_matvec.
     void moe_dedup(Layer & Y, int n) {
+        sm_mark(SM_MOE_GU);
         const int A = n * topk_, DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
         std::vector<int> ids(static_cast<size_t>(A));
         ck(cudaMemcpyAsync(ids.data(), d_ids_.p, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_));
@@ -937,10 +1182,13 @@ private:
         ck(cudaMemcpyAsync(dmap_.p, map.data(), map.size() * sizeof(int), cudaMemcpyHostToDevice, stream_));
         ck(cudaStreamSynchronize(stream_));  // `map` is a host vector: the copy must land before it goes away
         const int * dm = dmap_.as<int>();
-        Y.e_gate.fmt->expert_matvec_dedup2(Y.e_gate, Y.e_up, xh_.as<__half>(), ye_g_.as<bf16>(), ye_u_.as<bf16>(), effl_, dm, g_in, stream_);
-        tqllm_cuda::mm_swigluoai_bf16(ye_g_.as<bf16>(), ye_u_.as<bf16>(), act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
+        Y.e_gate.fmt->expert_matvec_dedup2(Y.e_gate, Y.e_up, xh_.as<__half>(), ye_g_, ye_u_, effl_, dm, g_in, stream_);
+        sm_mark(SM_MOE_DN);
+        tqllm_cuda::mm_swigluoai_bf16(ye_g_, ye_u_, act_.as<__half>(), A * effl_, alpha_, limit_, stream_);
         Y.e_down.fmt->expert_matvec_dedup(Y.e_down, act_.as<__half>(), yd_.as<bf16>(), H_, dm + size_t(A) * DS, g_dn, stream_);
-        ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n);
+        sm_mark(SM_MOE_SH);
+        ffn(Y.sh_gate_up, Y.sh_down, xn_.as<float>(), sh_.as<float>(), n, xh_.as<__half>());
+        sm_mark(SM_MOE_SM);
         tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
@@ -948,6 +1196,7 @@ private:
     // the routed ids go to the host, prepare() loads what the layer's bank lacks, and the grouped expert kernels run on
     // the bank's slot ids (the same rows, another index): the output is the stack path's
     void moe_bank(Layer & Y, int l, int n) {
+        sm_mark(SM_MOE_GU);
         const float * xn = xn_.as<float>();
         const __half * xh = xh_.as<__half>();
         std::vector<int> routed(size_t(n) * topk_);
@@ -966,14 +1215,17 @@ private:
             const size_t off = size_t(wv.first) * topk_;
             const Mat g = bank_->gate(), u = bank_->up(), dn = bank_->down();
             const __half * xw = xh + size_t(wv.first) * H_;
-            bf16 * gw = ye_g_.as<bf16>() + off * eff_, * uw = ye_u_.as<bf16>() + off * eff_;
+            bf16 * gw = ye_g_ + off * eff_, * uw = ye_u_ + off * eff_;
             g.fmt->expert_matvec(g, xw, gw, eff_, d_slots_.as<int>(), wv.tokens, topk_, false, stream_);
             u.fmt->expert_matvec(u, xw, uw, eff_, d_slots_.as<int>(), wv.tokens, topk_, false, stream_);
+            sm_mark(SM_MOE_DN);
             tqllm_cuda::mm_swigluoai_bf16(gw, uw, act_.as<__half>() + off * eff_, wv.tokens * topk_ * eff_, alpha_, limit_, stream_);
             dn.fmt->expert_matvec(dn, act_.as<__half>() + off * eff_, yd_.as<bf16>() + off * H_, H_, d_slots_.as<int>(), wv.tokens,
                                   topk_, true, stream_);
         }
-        ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n);
+        sm_mark(SM_MOE_SH);
+        ffn(Y.sh_gate_up, Y.sh_down, xn, sh_.as<float>(), n, xh);
+        sm_mark(SM_MOE_SM);
         tqllm_cuda::glm_moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
         reduce(fo_.as<float>(), size_t(n) * H_);  // routed + shared partial sums of this rank's ff share
     }
@@ -1043,17 +1295,32 @@ private:
             tqllm_cuda::mm_put_rows_h(dv_.as<float>(), Y.vc.p, kd, n, int(pos), stream_, kv8_);
         }
     }
-    // one draft pass: block [anchor, mask ...] at positions anchor_pos ..; returns the block's greedy tokens
-    std::vector<uint32_t> draft(uint32_t anchor, uint32_t anchor_pos) {
-        const int B = dblock_, kd = hk_ * hd_, qd = hq_ * hd_;
+    // one draft pass: block [anchor, mask ...] at positions anchor_pos ..; returns the block's greedy tokens.
+    // `slots` is what the scheduler will verify. The block is one batch: every row's embedding is the anchor or the mask
+    // token (never a drafted token) and its attention runs over the whole block, so the first `slots` drafts do not
+    // depend on the rows past them. Only the Markov chain does, and slot k's bias is W2 W1[slot k-1's token] - so the
+    // chain stops at `slots` and the slots the scheduler discards are never paid for. The Markov GEMV over W2 (102 MB
+    // per slot, serial by construction) is the one part of the drafter whose cost scales with the block; the layers and
+    // the head read their weights once whatever the block width, so they keep running all dblock_ rows and the drafted
+    // tokens cannot move.
+    std::vector<uint32_t> draft(uint32_t anchor, uint32_t anchor_pos, int slots) {
+        const int B = dblock_, mk = std::max(1, std::min(slots, B)), kd = hk_ * hd_, qd = hq_ * hd_;
         const auto & et = tensor("token_embd.weight");
         uint64_t el = 0, by = 0;
         gguf_block_layout(et.type, el, by);
         ck(cudaStreamSynchronize(stream_));
-        for (int t = 0; t < B; ++t)
-            dequantize_host(et.type, bytes("token_embd.weight").data + size_t(t ? uint32_t(dmask_) : anchor) * (uint64_t(H_) / el * by),
-                            h_embed_ + size_t(t) * H_, H_);
+        sm_mark(SM_DRAFT);
+        const uint64_t estride = uint64_t(H_) / el * by;
+        const char * emb = bytes("token_embd.weight").data;
+        dequantize_host(et.type, emb + size_t(anchor) * estride, h_embed_, H_);
+        // rows 1.. are the mask token: one dequantise and a copy, the same bytes the per-row walk wrote
+        if (B > 1) {
+            dequantize_host(et.type, emb + size_t(uint32_t(dmask_)) * estride, h_embed_ + H_, H_);
+            for (int t = 2; t < B; ++t)
+                std::copy_n(h_embed_ + H_, H_, h_embed_ + size_t(t) * H_);
+        }
         ck(cudaMemcpyAsync(dh_.p, h_embed_, size_t(B) * H_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        sm_mark(SM_DRAFT_LAY);
         for (auto & Y : D_) {
             tqllm_cuda::glm_rmsnorm(dh_.as<float>(), Y.attn_norm, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
             mv(Y.wq, dxn_.as<float>(), dq_.as<float>(), B);
@@ -1074,16 +1341,40 @@ private:
         }
         (void)qd;
         tqllm_cuda::glm_rmsnorm(dh_.as<float>(), dout_norm_, dxn_.as<float>(), nullptr, H_, eps_, stream_, B);
-        mv(out_, dxn_.as<float>(), dlog_.as<float>(), B);
+        sm_mark(SM_DRAFT_HEAD);
         const int a = int(anchor);
+        if (!dv_ids_.empty()) {  // the head and the Markov bias over the draft vocabulary only
+            const int V = int(dv_ids_.size());
+            tqllm_cuda::glm_f32_to_half(dxn_.as<float>(), dv_xh_.as<__half>(), B * H_, stream_);
+            gemm_h(dv_head_.as<__half>(), dv_xh_.as<__half>(), dv_log_.as<float>(), V, H_, B);
+            ck(cudaMemcpyAsync(dtok_.p, &a, sizeof(int), cudaMemcpyHostToDevice, stream_));
+            sm_mark(SM_DRAFT_MKV);
+            for (int k = 0; k < mk; ++k) {
+                tqllm_cuda::mm_gather_row(dw1_, dtok_.as<int>() + k, dlat_.as<float>(), drank_, stream_);
+                tqllm_cuda::glm_f32_to_half(dlat_.as<float>(), dv_lath_.as<__half>(), drank_, stream_);
+                if (dv_w2_.p) gemm_h(dv_w2_.as<__half>(), dv_lath_.as<__half>(), dv_bias_.as<float>(), V, drank_, 1);
+                else { mv(dw2_, dlat_.as<float>(), dbias_.as<float>(), 1); tqllm_cuda::mm_gather_ids(dbias_.as<float>(), dv_ids_dev_.as<int>(), dv_bias_.as<float>(), V, stream_); }
+                tqllm_cuda::mm_add(dv_log_.as<float>() + size_t(k) * V, dv_bias_.as<float>(), V, stream_);
+                tqllm_cuda::glm_argmax(dv_log_.as<float>() + size_t(k) * V, V, dv_arg_.as<int>(), stream_);
+                tqllm_cuda::mm_map_id(dv_ids_dev_.as<int>(), dv_arg_.as<int>(), dtok_.as<int>() + k + 1, stream_);
+            }
+            sm_mark(SM_DRAFT);
+            std::vector<int> ids(size_t(mk) + 1);
+            ck(cudaMemcpyAsync(ids.data(), dtok_.p, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            ck(cudaStreamSynchronize(stream_));
+            return std::vector<uint32_t>(ids.begin() + 1, ids.end());
+        }
+        mv(out_, dxn_.as<float>(), dlog_.as<float>(), B);
         ck(cudaMemcpyAsync(dtok_.p, &a, sizeof(int), cudaMemcpyHostToDevice, stream_));
-        for (int k = 0; k < B; ++k) {  // Markov: each slot's logits + W2 W1[the token chosen before it]
+        sm_mark(SM_DRAFT_MKV);
+        for (int k = 0; k < mk; ++k) {  // Markov: each slot's logits + W2 W1[the token chosen before it]
             tqllm_cuda::mm_gather_row(dw1_, dtok_.as<int>() + k, dlat_.as<float>(), drank_, stream_);
             mv(dw2_, dlat_.as<float>(), dbias_.as<float>(), 1);
             tqllm_cuda::mm_add(dlog_.as<float>() + size_t(k) * vocab_, dbias_.as<float>(), vocab_, stream_);
             tqllm_cuda::glm_argmax(dlog_.as<float>() + size_t(k) * vocab_, vocab_, dtok_.as<int>() + k + 1, stream_);
         }
-        std::vector<int> ids(size_t(B + 1));
+        sm_mark(SM_DRAFT);   // the ids copy back (and the next forward's host embedding) stay in `draft`
+        std::vector<int> ids(size_t(mk) + 1);
         ck(cudaMemcpyAsync(ids.data(), dtok_.p, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_));
         ck(cudaStreamSynchronize(stream_));
         return std::vector<uint32_t>(ids.begin() + 1, ids.end());
@@ -1122,6 +1413,117 @@ private:
         std::fwrite(h.data(), 4, h.size(), f);
         std::fflush(f);
     }
+
+    // TQLLM_DEBUG=dump_feats:DIR: the drafter's own input, for the DSpark fine-tune (4c). draft_context() fuses feat_, one row per
+    // token of the forward that produced it, so feat_ is exactly what a trainer needs the drafter to see. One record per row
+    // every forward hands the drafter's context, prompt prefill included, appended in the order the engine ran them: a
+    // verify row that is rejected later is written again by the forward that replaces it, so the trainer keeps the LAST
+    // record per (request, position), and the request id keeps the records of different prompts apart.
+    //   DIR/feats-<pid>.bin  per row, row-major [target_layers_.size()][H] F32 - the feat_ row itself
+    //   DIR/toks-<pid>.bin   per row, uint32 {request, position, token}, the same order as feats
+    // and once per run DIR/head.f16 (dump_head), the head the engine multiplies by dequantised to FP16.
+    // F32, not BF16: feat_ holds F32, and the replay below has to be bit-identical - a BF16 dump would make it measure its
+    // own rounding rather than the dump. TQLLM_DEBUG=replay_feats:FILE names one feats file and feeds it to draft_context() in
+    // place of the captures, in file order: the run's draft tokens, its acceptance counts and its greedy text must then be
+    // identical to the dumped run, which is the dump's gate.
+    std::FILE * feats_f_ = nullptr, * toks_f_ = nullptr, * rp_f_ = nullptr;
+    uint32_t req_ = 0;  // one id per spec_begin, written with every dumped row
+    // TQLLM_DEBUG=dump_feats:DIR / replay_feats:DIR: DSpark drafter training data (the target layers' rows per request) /
+    // a replay of a dump instead of the live rows
+    static const char * feats_dir() { static const char * d = tqllm::debug_cstr("dump_feats"); return d; }
+    static const char * feats_replay() { static const char * d = tqllm::debug_cstr("replay_feats"); return d; }
+    size_t feat_row() const { return size_t(target_layers_.size()) * size_t(H_); }
+    void dump_feats(const uint32_t * tokens, int n, uint32_t pos) {
+        const char * dir = feats_dir();
+        if (!dir || !has_draft()) return;
+        if (!feats_f_) {
+            const std::string pid = std::to_string(int(::getpid()));
+            feats_f_ = std::fopen((std::string(dir) + "/feats-" + pid + ".bin").c_str(), "ab");
+            toks_f_ = std::fopen((std::string(dir) + "/toks-" + pid + ".bin").c_str(), "ab");
+            if (!feats_f_ || !toks_f_) throw std::runtime_error(std::string("minimax: cannot write the feature dump in ") + dir);
+            std::fprintf(stderr, "minimax: dumping draft features (F32 [layers][%d]) and tokens to %s\n", H_, dir);
+        }
+        const size_t row = feat_row();
+        std::vector<float> h(row * size_t(n));
+        for (int at = 0; at < n; at += FEAT_ROWS) {  // a prompt chunk is 2048 rows: copy it in pieces, not 250 MB at a time
+            const int c = std::min(FEAT_ROWS, n - at);
+            ck(cudaMemcpyAsync(h.data() + size_t(at) * row, feat_.as<float>() + size_t(at) * row, row * size_t(c) * 4,
+                               cudaMemcpyDeviceToHost, stream_));
+            ck(cudaStreamSynchronize(stream_));
+        }
+        for (int t = 0; t < n; ++t) {
+            if (!std::fwrite(h.data() + size_t(t) * row, 4, row, feats_f_)) throw std::runtime_error("minimax: feature dump write failed");
+            const uint32_t rec[3] = {req_, pos + uint32_t(t), tokens[t]};
+            if (!std::fwrite(rec, 4, 3, toks_f_)) throw std::runtime_error("minimax: feature dump write failed");
+        }
+        std::fflush(feats_f_);
+        std::fflush(toks_f_);
+        if (!head_dumped_ && R_ == 0) { head_dumped_ = true; dump_head(n - 1); }  // the head lives on rank 0
+    }
+    void replay_feats(int n) {
+        const char * path = feats_replay();
+        if (!path || !has_draft()) return;
+        if (!rp_f_) {
+            rp_f_ = std::fopen(path, "rb");
+            if (!rp_f_) throw std::runtime_error(std::string("minimax: cannot read ") + path);
+            std::fprintf(stderr, "minimax: replaying draft features from %s\n", path);
+        }
+        const size_t row = feat_row();
+        std::vector<float> h(row * size_t(n));
+        if (std::fread(h.data(), 4, h.size(), rp_f_) != h.size()) throw std::runtime_error("minimax: replay file shorter than the run");
+        ck(cudaMemcpyAsync(feat_.p, h.data(), h.size() * 4, cudaMemcpyHostToDevice, stream_));
+    }
+    static constexpr int FEAT_ROWS = 256;
+
+    // DIR/head.f16, written once per run next to the feature dump: the head the engine multiplies by (out_), dequantised
+    // row-major [vocab][hidden] FP16. The model dir's lm_head is EXL3 trellis the trainer cannot read, and training
+    // against any other head would teach the drafter the wrong logits, so the file has to be the exact bytes this engine
+    // uses - it is, because they come out of the same dequant kernels the head matvec reads. The engine has no
+    // whole-matrix FP16 scratch (wdq_ holds one dense matrix, which is why the head never takes the dequant + cuBLAS
+    // path), so the matrix is walked in 2048-row chunks through WeightFormat::dequant_rows_h.
+    // The gate the note asks for, measured once per run: the dumped row of the token the engine's own head argmaxes,
+    // dotted with the normed state that produced it, is that step's top logit - up to the FP16 rounding of the row.
+    void dump_head(int at) {
+        const char * dir = feats_dir();  // never null: dump_head is called from dump_feats
+        const int rows = out_.m.rows;
+        const size_t nh = size_t(H_), nv = size_t(rows), vh = nv * nh;
+        std::FILE * f = std::fopen((std::string(dir) + "/head.f16").c_str(), "wb");
+        if (!f) throw std::runtime_error(std::string("minimax: cannot write ") + dir + "/head.f16");
+        std::vector<float> st(nh);  // this forward's last normed state: the row the head multiplies
+        ck(cudaMemcpyAsync(st.data(), xn_.as<float>() + size_t(at) * H_, nh * 4, cudaMemcpyDeviceToHost, stream_));
+        mv(out_, xn_.as<float>() + size_t(at) * H_, logits_.as<float>(), 1);  // the engine's own head over that row
+        std::vector<float> lg(nv);
+        ck(cudaMemcpyAsync(lg.data(), logits_.as<float>(), nv * 4, cudaMemcpyDeviceToHost, stream_));
+        ck(cudaStreamSynchronize(stream_));
+        int best = 0;
+        for (int r = 1; r < rows; ++r) if (lg[r] > lg[best]) best = r;
+        const size_t chunk = size_t(HEAD_ROWS) * size_t(H_);
+        Buf dq(chunk * sizeof(__half));
+        std::vector<__half> h(chunk), row(nh);
+        bool got = false;
+        for (int r0 = 0; r0 < rows; r0 += HEAD_ROWS) {
+            const int nr = std::min(HEAD_ROWS, rows - r0);  // rows is a multiple of 128, so nr is too
+            if (!out_.m.fmt->dequant_rows_h(out_.m, dq.as<__half>(), r0, nr, stream_))
+                throw std::runtime_error(std::string("minimax: ") + out_.m.fmt->name() + " has no row-range dequant: head.f16 cannot be dumped");
+            ck(cudaMemcpyAsync(h.data(), dq.p, size_t(nr) * H_ * sizeof(__half), cudaMemcpyDeviceToHost, stream_));
+            ck(cudaStreamSynchronize(stream_));
+            if (best >= r0 && best < r0 + nr) {
+                std::copy(h.begin() + size_t(best - r0) * H_, h.begin() + size_t(best - r0 + 1) * H_, row.begin());
+                got = true;
+            }
+            if (std::fwrite(h.data(), 2, size_t(nr) * H_, f) != size_t(nr) * H_) throw std::runtime_error("minimax: head.f16 write failed");
+        }
+        std::fclose(f);
+        if (!got) throw std::runtime_error("minimax: head.f16 check row not reached");
+        double dot = 0.0;
+        for (int c = 0; c < H_; ++c) dot += double(__half2float(row[c])) * double(st[c]);
+        const double top = double(lg[best]);
+        std::fprintf(stderr, "minimax: head.f16 %d x %d (%.2f GB): row %d . normed state = %.6g, the engine's logit for it = %.6g (rel %.2e)\n",
+                     rows, H_, double(vh) * 2.0 / 1e9, best, dot, top,
+                     std::abs(dot - top) / std::max(std::abs(top), 1e-3));
+    }
+    static constexpr int HEAD_ROWS = 2048;  // 2048 x 6144 halves = 25 MB of device scratch
+    bool head_dumped_ = false;
 
     // rank 0 -> rank 1 before every forward: {n, pos, tokens[chunk]} (n < 0: stop)
     void send_header(int n, int pos, const uint32_t * tokens) {
@@ -1206,27 +1608,47 @@ private:
         uint64_t el = 0, by = 0;
         gguf_block_layout(et.type, el, by);
         ck(cudaStreamSynchronize(stream_));
+        sm_mark(SM_EMBED);
         for (int t = 0; t < n; ++t) {
             if (int(tokens[t]) >= vocab_) throw std::runtime_error("minimax: token id beyond the vocabulary");
             dequantize_host(et.type, bytes("token_embd.weight").data + size_t(tokens[t]) * (uint64_t(H_) / el * by),
                             h_embed_ + size_t(t) * H_, H_);
         }
         ck(cudaMemcpyAsync(x_.p, h_embed_, size_t(n) * H_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        if (smap_) ++sm_forwards_;
         for (size_t li = 0; li < L_.size(); ++li) {
             auto & Y = L_[li];
+            sm_mark(SM_NORM);
             tqllm_cuda::glm_rmsnorm(x_.as<float>(), Y.attn_norm, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
+            sm_mark(SM_ATTN);
             attention(Y, pos, n);
+            sm_mark(SM_ADD);
             tqllm_cuda::glm_add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
-            tqllm_cuda::glm_rmsnorm(x_.as<float>(), Y.ffn_norm, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
+            sm_mark(SM_NORM);
+            // an MoE layer reads this block in the format's FP16 layout as well: the norm writes both, so moe() does
+            // not convert xn_ a second time
+            tqllm_cuda::glm_rmsnorm(x_.as<float>(), Y.ffn_norm, xn_.as<float>(),
+                                    int(li) < dense_lead_ ? nullptr : xh_.as<__half>(), H_, eps_, stream_, n);
+            sm_mark(SM_MOE);
             if (int(li) < dense_lead_) { ffn(Y.gate_up, Y.down, xn_.as<float>(), fo_.as<float>(), n); reduce(fo_.as<float>(), size_t(n) * H_); }
             else moe(Y, int(li), n);
+            sm_mark(SM_ADD);
             tqllm_cuda::glm_add(x_.as<float>(), fo_.as<float>(), n * H_, stream_);
+            sm_mark(SM_CAP);
             dump(int(li), pos, n);
             if (has_draft() && li + 1 < L_.size()) capture(int(li), x_.as<float>(), n);
         }
+        sm_mark(SM_NORM);
         tqllm_cuda::glm_rmsnorm(x_.as<float>(), out_norm_, xn_.as<float>(), nullptr, H_, eps_, stream_, n);
         // the last layer's state as HF's hidden_states hands it to the drafter: after the final norm
-        if (has_draft()) { capture(int(L_.size()) - 1, xn_.as<float>(), n); draft_context(pos, n); }
+        sm_mark(SM_DRAFT_CTX);
+        if (has_draft()) {
+            capture(int(L_.size()) - 1, xn_.as<float>(), n);
+            replay_feats(n);              // no-ops unless TQLLM_DEBUG=replay_feats
+            dump_feats(tokens, n, pos);   // no-ops unless TQLLM_DEBUG=dump_feats
+            draft_context(pos, n);
+        }
+        sm_mark(SM_HEAD);   // the verify block's argmax and its copy back to the host fall into head as well
         if (R_ == 0 && rows > 0) mv(out_, xn_.as<float>() + size_t(n - rows) * H_, logits_.as<float>(), rows);
         if (rows > 0) last_rows_ = rows;
     }
@@ -1237,8 +1659,9 @@ private:
 bool is_minimax_gguf(const std::string & path) { return gguf_architecture(path) == "minimax-m3"; }
 
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft,
-                                            const std::string & tokenizer, const TpConfig & tp, const std::string & hot_map) {
-    return std::make_unique<MiniMaxEngine>(path, context, draft, tokenizer, tp, hot_map);
+                                            const std::string & tokenizer, const TpConfig & tp, const std::string & hot_map,
+                                            const std::string & draft_vocab) {
+    return std::make_unique<MiniMaxEngine>(path, context, draft, tokenizer, tp, hot_map, draft_vocab);
 }
 
 }  // namespace tqllm

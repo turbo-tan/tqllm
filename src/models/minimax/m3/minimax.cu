@@ -1,4 +1,5 @@
 #include "minimax_kernels.cuh"
+#include "glm5next_kernels.cuh"
 
 #include <cuda_fp8.h>
 
@@ -26,6 +27,16 @@ __device__ __forceinline__ float oai(float g, float u, float alpha, float limit)
 __global__ void swigluoai_f32_k(const float * g, const float * u, __half * out, int n, float alpha, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(oai(g[i], u[i], alpha, limit));
+}
+// gate | up as one [rows][2 * ff] block (what a fused gate+up matvec writes): the same oai on the same values, without
+// the two gather passes that copied the halves into their own buffers first
+__global__ void swigluoai_f32_pair_k(const float * gu, __half * out, int ff, int total, float alpha, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const int t = i / ff, c = i - t * ff;
+        const float * r = gu + size_t(t) * 2 * ff;
+        out[i] = __float2half(oai(r[c], r[ff + c], alpha, limit));
+    }
 }
 __global__ void swigluoai_bf16_k(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float alpha, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -525,6 +536,56 @@ __global__ void add_k(float * a, const float * b, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] += b[i];
 }
+__device__ __forceinline__ float mm_warp_sum(float v) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+// grid ((rows + R) / R, splits): one block per R rows and column slice, every token of the block. The old shape put the
+// token in gridDim.z, so a verify block of n tokens read the router's FP32 weights n times; R = 2 rows share the two
+// barriers of the reduction and the block's input slice, and run two independent chains, which is what the kernel was
+// missing: at cols / splits = 512 a thread owns 2 columns, so ~20 reduction instructions feed 2 FMAs and the pass runs
+// at 90-170 GB/s of the box's 230 whatever the arm. The per-row terms, the per-row warp tree and the per-row tree over
+// the warp partials are the reference's exactly, so the logits - and the experts a step routes - do not move.
+template <int R>
+__global__ void router_splitk_k(const float * w, const float * x, float * partial, int rows, int cols, int splits, int n) {
+    __shared__ float red[R * 32];
+    const int r0 = blockIdx.x * R, sp = blockIdx.y;
+    const int per = (cols + splits - 1) / splits, c0 = sp * per, c1 = min(cols, c0 + per);
+    const bool two = r0 + 1 < rows;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int t = 0; t < n; ++t) {
+        const float * xt = x + size_t(t) * cols;
+        float a0 = 0.f, a1 = 0.f;
+        for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) {
+            const float xv = xt[c];
+            a0 += w[size_t(r0) * cols + c] * xv;
+            if (two) a1 += w[size_t(r0 + 1) * cols + c] * xv;
+        }
+        a0 = mm_warp_sum(a0);
+        if (two) a1 = mm_warp_sum(a1);
+        __syncthreads();
+        if (lane == 0) {
+            red[warp] = a0;
+            if (two) red[32 + warp] = a1;
+        }
+        __syncthreads();
+        float v0 = lane < nw ? red[lane] : 0.f;
+        v0 = mm_warp_sum(v0);
+        if (threadIdx.x == 0) partial[(size_t(t) * rows + r0) * splits + sp] = v0;
+        if (two) {
+            float v1 = lane < nw ? red[32 + lane] : 0.f;
+            v1 = mm_warp_sum(v1);
+            if (threadIdx.x == 0) partial[(size_t(t) * rows + r0 + 1) * splits + sp] = v1;
+        }
+    }
+}
+__global__ void router_sum_k(const float * partial, float * y, int count, int splits) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float v = 0.f;
+    for (int sp = 0; sp < splits; ++sp) v += partial[size_t(i) * splits + sp];
+    y[i] = v;
+}
 }  // namespace
 
 void mm_attn_draft(const float * q, const void * kc, const void * vc, const float * kn, const float * vn, float * out,
@@ -538,6 +599,38 @@ void mm_gather_row(const float * table, const int * id, float * out, int width, 
     gather_row_k<<<blocks(width, 256), 256, 0, s>>>(table, id, out, width);
 }
 void mm_add(float * a, const float * b, int n, cudaStream_t s) { add_k<<<blocks(n, 256), 256, 0, s>>>(a, b, n); }
+namespace {
+__global__ void map_id_k(const int * table, const int * idx, int * out) { *out = table[*idx]; }
+}  // namespace
+void mm_map_id(const int * table, const int * idx, int * out, cudaStream_t s) { map_id_k<<<1, 1, 0, s>>>(table, idx, out); }
+namespace {
+__global__ void gather_ids_k(const float * src, const int * ids, float * dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[ids[i]];
+}
+}  // namespace
+void mm_gather_ids(const float * src, const int * ids, float * dst, int n, cudaStream_t s) { gather_ids_k<<<blocks(n, 256), 256, 0, s>>>(src, ids, dst, n); }
+
+void mm_mv_f32_splitk(const float * w, const float * x, float * y, float * partial, int rows, int cols, int n, int splits,
+                      cudaStream_t s) {
+    router_splitk_k<2><<<dim3((rows + 1) / 2, splits), 256, 0, s>>>(w, x, partial, rows, cols, splits, n);
+    router_sum_k<<<blocks(size_t(rows) * n, 256), 256, 0, s>>>(partial, y, rows * n, splits);
+}
+// the split-k pass on its own: the partials only, no sum and no routing. The engine calls this and glm_route_partial as
+// two calls so its stage map can put an event between the two launches; that is the same pair of launches in the same
+// order, so the logits, the ids and the weights are the bits of mm_mv_f32_splitk_route.
+void mm_router_splitk(const float * w, const float * x, float * partial, int rows, int cols, int n, int splits,
+                      cudaStream_t s) {
+    router_splitk_k<2><<<dim3((rows + 1) / 2, splits), 256, 0, s>>>(w, x, partial, rows, cols, splits, n);
+}
+// the same two launches with the split sum folded into the routing: glm_route_partial walks the partials in the order
+// router_sum_k added them, so the logits, the ids and the weights are the bits of the path above with one launch fewer.
+void mm_mv_f32_splitk_route(const float * w, const float * x, float * logits, float * partial, int rows, int cols, int n,
+                            int splits, const float * bias, int * ids, float * rw, int topk, bool norm, float scale,
+                            cudaStream_t s) {
+    mm_router_splitk(w, x, partial, rows, cols, n, splits, s);
+    glm_route_partial(partial, logits, bias, ids, rw, rows, topk, norm, scale, s, n, splits);
+}
 
 void mm_put_rows_h(const float * src, void * dst, int width, int n, int row0, cudaStream_t s, bool fp8) {
     const long e = long(n) * width;
@@ -594,6 +687,10 @@ void mm_attn_mma(const float * q, const void * k, const void * v, float * out, i
 
 void mm_swigluoai_f32(const float * g, const float * u, __half * out, int n, float alpha, float limit, cudaStream_t s) {
     swigluoai_f32_k<<<blocks(n, 256), 256, 0, s>>>(g, u, out, n, alpha, limit);
+}
+void mm_swigluoai_f32_pair(const float * gu, __half * out, int rows, int ff, float alpha, float limit, cudaStream_t s) {
+    const int total = rows * ff;
+    swigluoai_f32_pair_k<<<blocks(total, 256), 256, 0, s>>>(gu, out, ff, total, alpha, limit);
 }
 void mm_swigluoai_bf16(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float alpha, float limit,
                        cudaStream_t s) {
