@@ -103,6 +103,12 @@ void codec_dequant_rows(half* W, int ld, const uint16_t* T, const half* suh, con
 }
 
 template <class Codec>
+void codec_dequant_rows_range(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
+                              int r0, int nr, cudaStream_t stream) {
+    reconstruct_had_rows_range<Codec>(W, ld, T, suh, svh, cols, rows, r0, nr, stream);
+}
+
+template <class Codec>
 void codec_dequant_rows_i8(int8_t* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
                            const float* sc, cudaStream_t stream) {
     reconstruct_had_rows_i8<Codec>(W, ld, T, suh, svh, cols, rows, sc, stream);
@@ -117,6 +123,12 @@ size_t codec_ws_bytes(int size_k, int size_n) {
 template <class Codec>
 constexpr auto codec_window() -> void (*)(const XwList&, const half*, __nv_bfloat16*, int, cudaStream_t) {
     if constexpr (Codec::supports_gemv_x3v) return &xw_matvec<Codec>;
+    else return nullptr;
+}
+
+template <class Codec>
+constexpr auto codec_window_f32() -> void (*)(const XwList&, const half*, float*, int, cudaStream_t) {
+    if constexpr (Codec::supports_gemv_x3v) return &xw_matvec_f32<Codec>;
     else return nullptr;
 }
 
@@ -136,9 +148,11 @@ template <int KH>
 constexpr X3Codec mul1_row(const char* name) {
     return {X3_CODEC_MUL1, 8 * KH, name, true, Mul1Codec<KH>::supports_gemv_x3v,
             &codec_gemv<Mul1Codec<KH>>, &codec_dequant<Mul1Codec<KH>>, &codec_dequant_rows<Mul1Codec<KH>>,
+            &codec_dequant_rows_range<Mul1Codec<KH>>,
             &codec_dequant_rows_i8<Mul1Codec<KH>>,
             &codec_ws_bytes<Mul1Codec<KH>>,
-            codec_window<Mul1Codec<KH>>(), codec_moe<Mul1Codec<KH>>(), codec_pmoe<Mul1Codec<KH>>()};
+            codec_window<Mul1Codec<KH>>(), codec_window_f32<Mul1Codec<KH>>(),
+            codec_moe<Mul1Codec<KH>>(), codec_pmoe<Mul1Codec<KH>>()};
 }
 
 const X3Codec kTable[] = {
@@ -147,7 +161,8 @@ const X3Codec kTable[] = {
     mul1_row<8>("mul1-K4.0"),  mul1_row<10>("mul1-K5.0"), mul1_row<12>("mul1-K6.0"),
     {2, 128, "testscalar-K8.0", false, true,
      &codec_gemv<TestScalarCodec>, &codec_dequant<TestScalarCodec>, &codec_dequant_rows<TestScalarCodec>,
-     &codec_dequant_rows_i8<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>, nullptr, nullptr, nullptr},
+     &codec_dequant_rows_range<TestScalarCodec>,
+     &codec_dequant_rows_i8<TestScalarCodec>, &codec_ws_bytes<TestScalarCodec>, nullptr, nullptr, nullptr, nullptr},
 };
 
 }  // namespace
@@ -155,19 +170,11 @@ const X3Codec kTable[] = {
 bool x3_window_enabled() { return !x3_use_x3v(); }
 
 void x3_moe_build_dedup(const int* ids, int n, int topk, const void* bank, int rows, int cols, int kparts, int ncodec,
-                        const half* x, half* staged, half* A, float* P, int* slot, int* part_expert, int* nparts,
-                        XwMoeList* lists, cudaStream_t stream) {
+                        const half* x, bool per_slot_input, half* A, float* P, int* aindex, XwMoeList* lists,
+                        cudaStream_t stream) {
     if (n * topk > XW_MOE_MAX_PARTS || n > XW_MAX_N) throw std::runtime_error("x3 moe: verify block too wide");
-    xw_moe_build_dedup<<<1, 32, 0, stream>>>(ids, n, topk, static_cast<const XwExpert*>(bank), rows, cols, kparts, ncodec,
-                                              x, staged, A, P, slot, part_expert, nparts, lists);
-}
-void x3_moe_stage(const half* x, const int* slot, int n, int topk, int cols, const int* nparts, half* staged, cudaStream_t stream) {
-    xw_moe_stage<<<dim3(unsigned(ceil_div(cols, 8 * 256)), unsigned(n * topk), unsigned(n)), 256, 0, stream>>>(x, slot, n, topk, cols,
-                                                                                                         nparts, staged);
-}
-void x3_moe_unslot(const __nv_bfloat16* Y, const int* slot, int count, int topk, int rows, int ldy, __nv_bfloat16* y,
-                   cudaStream_t stream) {
-    xw_moe_unslot<<<dim3(unsigned(ceil_div(rows, 256)), unsigned(count)), 256, 0, stream>>>(Y, slot, topk, rows, ldy, y);
+    xw_moe_build_dedup<<<1, XW_DEDUP_THREADS, 0, stream>>>(ids, n, topk, static_cast<const XwExpert*>(bank), rows, cols,
+                                                           kparts, ncodec, x, per_slot_input, A, P, aindex, lists);
 }
 
 void x3_moe_gather(const half* x, const int* group, int count, int topk, bool per_slot_input, int cols, half* out,
@@ -181,6 +188,23 @@ void x3_moe_scatter_bf16(const __nv_bfloat16* in, const int* group, int count, i
 }
 void x3_moe_scatter(const float* in, const int* group, int count, int rows, __nv_bfloat16* y, cudaStream_t stream) {
     if (count > 0) xw_moe_scatter<<<dim3(unsigned(ceil_div(rows, 256)), unsigned(count)), 256, 0, stream>>>(in, group, rows, y);
+}
+
+void x3_moe_build2(const int* ids, int count, int topk, const void* bankA, const void* bankB, int rows, int cols,
+                   int kparts, int ncodec, const half* x, int up_base, half* A, float* P, XwMoeList* lists,
+                   cudaStream_t stream) {
+    if (2 * count > XW_MOE_MAX_PARTS) throw std::runtime_error("x3 moe: paired slots exceed XW_MOE_MAX_PARTS");
+    xw_moe_build2<<<1, 32, 0, stream>>>(ids, count, topk, static_cast<const XwExpert*>(bankA),
+                                        static_cast<const XwExpert*>(bankB), rows, cols, kparts, ncodec, x, up_base,
+                                        A, P, lists);
+}
+void x3_moe_build_dedup2(const int* ids, int n, int topk, const void* bankA, const void* bankB, int rows, int cols,
+                         int kparts, int ncodec, const half* x, int up_base, half* A, float* P,
+                         int* aindex, XwMoeList* lists, cudaStream_t stream) {
+    if (2 * n * topk > XW_MOE_MAX_PARTS || n > XW_MAX_N) throw std::runtime_error("x3 moe: paired verify block too wide");
+    xw_moe_build_dedup2<<<1, XW_DEDUP_THREADS, 0, stream>>>(ids, n, topk, static_cast<const XwExpert*>(bankA),
+                                                            static_cast<const XwExpert*>(bankB), rows, cols, kparts,
+                                                            ncodec, x, up_base, A, P, aindex, lists);
 }
 
 void x3_moe_build(const int* ids, int count, int topk, bool per_slot_input, const void* bank, int rows, int cols,

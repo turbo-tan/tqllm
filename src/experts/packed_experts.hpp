@@ -86,10 +86,12 @@ inline std::array<int, 3> expert_u4h_ids(const std::array<ExpertPayload, 3> & pa
 }
 
 // What one projection's loaded device format can do, reported by repack_expert: the grouped-kernel id, the widest matvec
-// it takes, and whether an expert bank can hold its row layout at all (row-sliceable, plain basis, grouped kernel).
+// it takes (and the widest a batched verify may take), and whether an expert bank can hold its row layout at all
+// (row-sliceable, plain basis, grouped kernel).
 struct ExpertFormat {
     int u4h_id = -1;
     int max_matvec_cols = 0;
+    int max_batch_cols = 0;
     bool bank_row_layout = false;
 };
 
@@ -119,6 +121,7 @@ inline std::array<std::vector<char>, 6> repack_expert(const std::array<ExpertPay
         if (fmt) {
             (*fmt)[p].u4h_id = m.fmt->u4h_id();
             (*fmt)[p].max_matvec_cols = m.fmt->max_matvec_cols();
+            (*fmt)[p].max_batch_cols = m.fmt->max_batch_cols();
             (*fmt)[p].bank_row_layout = m.fmt->has_expert_matvec() && m.fmt->basis() == Basis::Plain && m.fmt->row_bytes(cols);
         }
         const int bpb = tile ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;

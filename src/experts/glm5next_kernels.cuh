@@ -79,6 +79,12 @@ void glm_mla_vb(const float * kv, const __half * vb, float * out, __half * outh,
 // n tokens: logits [n][experts], ids / w [n][k]
 void glm_route(const float * logits, const float * bias, int * ids, float * w, int experts, int k, bool norm, float scale,
                cudaStream_t s, int n = 1);
+// the same routing over the split-k partials of a router matvec instead of over summed logits: partial
+// [(t * experts + e) * splits + sp] is what a split-k router pass writes (mm_mv_f32_splitk). The block sums its
+// expert's splits in the ascending order router_sum_k used and runs the same top-k walk, so logits / ids / w are the
+// bits glm_route of those logits would give, with one launch fewer per layer. `logits` may be null.
+void glm_route_partial(const float * partial, float * logits, const float * bias, int * ids, float * w, int experts,
+                       int k, bool norm, float scale, cudaStream_t s, int n, int splits);
 // out[i] = silu(min(g, limit)) * clamp(u, -limit, limit) (no clamp when limit <= 1e-6); g, u BF16 [n]
 void glm_swiglu(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float limit, cudaStream_t s);
 // same on FP32 inputs

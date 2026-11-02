@@ -64,11 +64,15 @@ struct WeightFormat {
     void expert_matvec_dedup(const Mat &, const __half *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
     // two matrices of this format (gate, up) over the same dedup map in one launch
     void expert_matvec_dedup2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
-    // two stacked matrices of this format (gate, up) over the same device IDs in one launch; per row expert_matvec
-    void expert_matvec2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * ids, int n,
-                        int topk, cudaStream_t) const;
+    // two stacked matrices of this format (gate, up) over the same device IDs in one launch; per row expert_matvec.
+    // Virtual: a format with its own paired expert path (x3) runs both matrices with one build and one launch set.
+    virtual void expert_matvec2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * ids, int n,
+                                int topk, cudaStream_t) const;
     // FP16 [rows][cols] in basis(), for the cuBLAS prefill GEMM.
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
+    // Rows [row0, row0 + nrows) of dequant_h into out [nrows][cols], for an engine that has no whole-matrix FP16 scratch
+    // (the target's 200K-row lm_head is dumped in 2048-row chunks for the drafter's trainer). false: no row-range kernel.
+    virtual bool dequant_rows_h(const Mat &, __half * out, int row0, int nrows, cudaStream_t) const { return false; }
     // int8 prefill without an FP16 round trip: weights quantised straight to int8 [rows][cols] (row-major) plus the
     // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
     // dequant_h + per-chunk quantise path (the default for every format).

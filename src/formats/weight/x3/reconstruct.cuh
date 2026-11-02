@@ -202,6 +202,19 @@ void reconstruct_had_rows(half* W, int ld, const uint16_t* T, const half* suh, c
     reconstruct_had_kernel<Codec, true><<<grid, X3_RH_THREADS, 0, stream>>>(W, T, suh, svh, m / 16, 0, ld);
 }
 
+// A range of that: out rows [r0, r0 + nr) of a matrix with m out rows, written to W[0 .. nr). Tiles are k-major with
+// the out-row tile minor (x3_layout.hpp), so a row range is a pointer advance of r0/16 tiles - and the k-major stride
+// passed to the kernel stays the matrix's full m / 16, which is why this is a separate launcher and not the same one
+// with a smaller m. svh carries one half per out row, so it advances by r0; suh is per in column and stays.
+// r0 and nr must be multiples of 128 (the kernel runs 128-row tiles).
+template <class Codec>
+void reconstruct_had_rows_range(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int n, int m,
+                                int r0, int nr, cudaStream_t stream) {
+    dim3 grid((nr + 127) / 128, (n + 127) / 128);
+    reconstruct_had_kernel<Codec, true><<<grid, X3_RH_THREADS, 0, stream>>>(W, T + size_t(r0 / 16) * Codec::words, suh,
+                                                                           svh + r0, m / 16, 0, ld);
+}
+
 // Same matrix straight to int8 [rows][cols]: q[r][c] = round(clamp(half2float(W[r][c]) * inv_r, -127, 127)) with
 // inv_r = 1 / sc[r], sc the load-time row scales (amax/127, 1 for a zero row) - quant_rows_k's formula, so the
 // bytes are identical to dequantising to FP16 and quantising. ld is the int8 row stride (a multiple of 4).

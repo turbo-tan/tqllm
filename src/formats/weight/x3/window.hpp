@@ -13,6 +13,11 @@ namespace x3 {
 constexpr int XW_MAX_PARTS = 4;
 constexpr int XW_MAX_N = 16;
 constexpr int XW_MAX_ITEM_SLICES = 160;   // k slices per gemv item: the A stage stays <= 41 KB at n = 8 (two blocks per SM)
+// Routed-expert items were tried at 192 slices (x3-moe-bench --cold: +8-10 % at n = 1-4, -20 % at n = 8, where the
+// 49.3 KB stage plus the list copy no longer fits two blocks per SM). Kept at the dense bound: another kparts is
+// another fp32 summation order for every column, and vbench at 192 slices moved the greedy text of all nine prompts
+// (prose 2 stopped repeating: acceptance 79/515 -> 415/534), so its row is not comparable with the base row.
+constexpr int XW_MOE_MAX_ITEM_SLICES = XW_MAX_ITEM_SLICES;
 
 // gemv block geometry: WK warps split an item's k slices, each warp owns WNT adjacent 16-column tiles,
 // PF k slices of weights in flight per warp, fp16 accumulators folded to fp32 every FOLD slices.
@@ -32,11 +37,19 @@ struct XwPart {
     int rows;            // output rows of the part
     int kparts;          // k split across items (divides cols / 16)
     int item0;           // first gemv item of this part
-    int out_off;         // row offset of the part inside y
+    int out_off;         // row offset of the part inside y (dense / decode lists); with aidx it is 0, or the row offset
+                         // of the up half when gate and up ran as one call
     const half* x;       // MoE lists: this part's input [cols] (dense lists: the call's x, nullptr here)
     const int* gsrc;     // prompt MoE lists: the pass's assignment ids (column t = assignment gsrc[t])
     int nv;              // prompt MoE lists: valid columns of the pass (the rest stage zeros, write nothing)
     int sdiv;            // prompt MoE lists: input row of assignment a = a / sdiv (1: per-slot input, else topk)
+    // MoE verify lists: aidx[t] = the assignment whose row of y takes this part's column t, -1 when token t did not
+    // route here. The out launch then writes y[a][rows] itself and no unslot pass copies it out of the part scratch.
+    const int* aidx;
+    // MoE verify lists with a per-slot input (the down projection): xaidx[t] = the assignment whose row of x is this
+    // part's column t, -1 when token t did not route here (its A row is zero). had_in reads x through it, so the
+    // input never has to be staged into a per-part copy first.
+    const int* xaidx;
 };
 
 struct XwList {
@@ -68,6 +81,14 @@ struct XwExpert {
 };
 
 inline int xw_moe_kparts(int cols) {
+    int kp = 1;
+    while (cols / 16 / kp > XW_MOE_MAX_ITEM_SLICES && (cols / 16) % (2 * kp) == 0) kp *= 2;
+    return kp;
+}
+
+// Prompt expert lists keep the short item: xw_pmoe_item stages an item's whole k range for all XW_MAX_N rows at once
+// (no WK split), so its A stage bounds the launch on its own.
+inline int xw_pmoe_kparts(int cols) {
     int kp = 1;
     while (cols / 16 / kp > XW_MAX_ITEM_SLICES && (cols / 16) % (2 * kp) == 0) kp *= 2;
     return kp;
@@ -107,7 +128,7 @@ inline bool xw_add(XwList& L, const uint16_t* B, const half* suh, const half* sv
     p.suh = suh; p.svh = svh; p.rows = rows; p.out_off = out_off;
     p.kparts = xw_kparts(rows, L.cols, num_sms);
     p.item0 = L.items;
-    p.A = nullptr; p.P = nullptr; p.x = nullptr;
+    p.A = nullptr; p.P = nullptr; p.x = nullptr; p.aidx = nullptr; p.xaidx = nullptr;
     L.items += (rows / XwGeom::COLS) * p.kparts;
     return true;
 }
