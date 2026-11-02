@@ -512,16 +512,19 @@ float s[16];
 }
 // token tree: a token whose parent is not the token just stepped restarts and replays its ancestors (same arithmetic,
 // outputs dropped), so every token sees exactly its own path's state; a chain never replays. Every branch descends from
-// row 0, so a tree (TREE) keeps the state after row 0 and restarts there: the replay skips row 0 (on the recorded 8K
-// trees 57 of the 151 replayed rows per 12 steps)
-int cur=-1;
-float s0[16];
+// row 0, so a tree (TREE) keeps the state after row 0 and after the latest depth-1 row (parent 0) and restarts from the
+// deeper one on the new token's path
+int cur=-1,n1=-1;
+float s0[16],s1[16];
 for(uint t=0;t<uint(M);++t) {
     if(par[t]!=cur) {
         uint path[M>16?32:16];uint depth=0;
         for(int a=par[t];a>=0;a=par[a])path[depth++]=uint(a);
         uint first=depth;
-        if(TREE && depth>0u) {  // path[depth - 1] is row 0
+        if(TREE && depth>1u && int(path[depth-2u])==n1) {  // path[depth - 2] is the depth-1 row held in s1
+            for(uint j=0;j<16u;++j)s[j]=s1[j];
+            first=depth-2u;
+        } else if(TREE && depth>0u) {  // path[depth - 1] is row 0
             for(uint j=0;j<16u;++j)s[j]=s0[j];
             first=depth-1u;
         } else {
@@ -537,6 +540,7 @@ for(uint t=0;t<uint(M);++t) {
             memory+=simd_shuffle_xor(memory,1u);memory+=simd_shuffle_xor(memory,2u);memory+=simd_shuffle_xor(memory,4u);
             const float delta=(float(vs[u*128u+row])-memory)*b;
             for(uint j=0;j<16u;++j)s[j]=s[j]+ku[j]*delta;
+            if(TREE && par[u]==0) {for(uint j=0;j<16u;++j)s1[j]=s[j];n1=int(u);}
         }
     }
     const float d=dec[t],b=bet[t];
@@ -559,9 +563,14 @@ for(uint t=0;t<uint(M);++t) {
         deltas[(t*uint(VH)+head)*128u+row]=delta;
     }
     if(TREE && t==0u)for(uint j=0;j<16u;++j)s0[j]=s[j];
+    if(TREE && par[t]==0) {for(uint j=0;j<16u;++j)s1[j]=s[j];n1=int(t);}
     cur=int(t);
 }
-{
+// the final state is read only when every row is accepted, i.e. when the rows form a chain; a branched tree's accept
+// rebuilds the state from the tape
+bool chain=true;
+if(TREE)for(uint t=0;t<uint(M);++t)chain=chain && par[t]==int(t)-1;
+if(chain) {
     device float* dst=state+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)dst[j]=s[j];
 }
