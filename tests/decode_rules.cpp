@@ -124,6 +124,8 @@ int main() {
     }
     check(qsa_key_ring_cells(true, 32768) == 32768 && qsa_key_ring_cells(false, 32768) == 0, "QSA key ring + host mirror on discrete GPUs only (GB10: the full array, no mirror)");
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
+    check(preload_all_experts(512, 512) && preload_all_experts(600, 512) && !preload_all_experts(168, 512) && !preload_all_experts(512, 0),
+          "banks that hold every expert are filled at start-up; smaller banks keep the first-use fill");
     check(layer_graphs(false, 8) && layer_graphs(false, 9), "RTX 3090 / 4090 (sm_86 / sm_89) keep the decode graphs");
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");
     // the pinned residual buffer of a multi-chunk prefill: pinned at start-up when the host easily holds it (pinning it per

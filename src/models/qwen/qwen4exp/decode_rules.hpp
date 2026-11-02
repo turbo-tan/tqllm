@@ -59,6 +59,12 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
 
+// A layer whose bank holds every expert (a GB10: 512 slots for 512 experts) loads them all at start-up: filled on first use
+// instead, every expert a prompt touched for the first time was a miss inside that prompt's prefill (11-02, .55: the first
+// requests paid ~1 s of loads per layer, later ones still up to 85 loads in a layer). A bank smaller than the layer keeps
+// its first-use fill (which experts to hold is the routing's call).
+inline bool preload_all_experts(int bank_slots, int experts) { return experts > 0 && bank_slots >= experts; }
+
 // QSA raw indexer keys: a ring of the newest cells plus a pinned host mirror on discrete GPUs (~0.9 GB of VRAM back at
 // 128K); on unified memory (GB10) pinned host memory is the same memory, so the full array stays (no mirror, no D2H per
 // append). Returns the ring's cells (0: the default ring).

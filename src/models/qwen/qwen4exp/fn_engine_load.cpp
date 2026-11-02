@@ -463,6 +463,20 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           ck(cudaDeviceSynchronize());
           std::fprintf(stderr, "tqllm: expert banks seeded from %s: %d experts\n", prof, seeded);
       }
+      {   // banks that hold every expert of their layer are filled now, not one prompt's misses at a time (decode_rules.hpp)
+          using pclk = std::chrono::steady_clock; const auto t0 = pclk::now(); int layers_filled = 0, loaded = 0;
+          for (int l = 0; l < c.layers; ++l) {
+              if (!f.cache->has_layout(l) || !preload_all_experts(f.cache->slots(l), c.experts)) continue;
+              std::vector<int> ids(size_t(c.experts)); for (int e = 0; e < c.experts; ++e) ids[size_t(e)] = e;
+              const auto before = f.cache->stats().misses;
+              (void) f.cache->prepare(l, ids); f.cache->wait_misses();
+              loaded += int(f.cache->stats().misses - before); ++layers_filled;
+          }
+          ck(cudaDeviceSynchronize());
+          if (layers_filled)
+              std::fprintf(stderr, "tqllm: expert banks filled at start-up: %d layers hold all %d experts (%d loaded) in %.1f s\n",
+                           layers_filled, c.experts, loaded, std::chrono::duration<double>(pclk::now() - t0).count());
+      }
       // spec_begin grows pinned residuals to the actual prompt, not the configured slot capacity.
       f.cache->set_miss_stream(nullptr);
       if (tqllm::debug_on("mem")) checkpoint.resident_report();
