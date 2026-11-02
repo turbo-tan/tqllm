@@ -90,7 +90,7 @@ struct MlxQwen35Engine::Impl {
     std::vector<uint32_t> output;
     uint32_t count = 0, pending = 0;
     bool active = false, done = true, sampling = false;
-    bool tree = false;  // this request drafts token trees (greedy, BF16 KV): DFlash2 lattice -> best-first tree -> one verify
+    bool tree = false;  // this request drafts token trees (BF16 KV; sampled rows draw on the device): DFlash2 lattice -> best-first tree -> one verify
     uint64_t steps = 0, drafted = 0, accepted = 0;
     double prefill_us = 0, decode_us = 0;
     // host phases summed over the request's draft-ahead steps (ms); gap = host time between one spec_advance's end
@@ -217,7 +217,7 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     }
     i.output.push_back(i.pending);
     i.ahead.reset();
-    i.tree = !i.sampling && i.engine->kv_format() == mlx_backend::KvTier::Bf16;
+    i.tree = i.engine->kv_format() == mlx_backend::KvTier::Bf16;
     i.tree_ahead.reset();
     if (i.tree && i.pending != i.eos && i.output.size() < i.count) {
         // TQLLM_DEBUG=tree_rows:32: a 31-node tree in one 32-row verify (the release default stays 16 rows: j1583 priced
@@ -234,6 +234,7 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
         if (const char* t = tqllm::debug_cstr("tree_tau")) tree_options.tau = float(std::atof(t));
         if (const char* e = tqllm::debug_cstr("tree_edge")) tree_options.edge = float(std::atof(e));
         i.tree_ahead.emplace(*i.engine, *i.drafter, tree_options);
+        if (i.sampling) i.tree_ahead->sample(i.temperature, i.top_k, i.top_p, &i.rng);
         i.tree_ahead->start(i.pending);
         memlog_point("tree draft-ahead started");
     }

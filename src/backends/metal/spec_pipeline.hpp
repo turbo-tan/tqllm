@@ -7,12 +7,14 @@
 #include "attention_decode.hpp"
 #include "dflash.hpp"
 #include "qwen35.hpp"
+#include "sampling_topk.hpp"
 #include "tree_device.hpp"
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -103,6 +105,8 @@ private:
 // chained behind verify(k) on the GPU like the chain's draft, from device values (the walked path's rows, the next
 // anchor and position). The host reads back only the verify's choices, the tree and the walked path; it commits the path
 // (accept_path) while the GPU drafts. Exact: the verify, the walk and the commit are the synchronous tree step's.
+// Sampled requests (sample()): each verified row draws its token on the device (sample_rows) in place of the argmax, so
+// the walk and the next draft stay on the GPU.
 class TreeAhead {
 public:
     static constexpr int kPositions = 15;  // the drafter's lattice positions below the anchor (DFlash2: 16 rows)
@@ -110,6 +114,9 @@ public:
         : engine_(engine), drafter_(drafter), options_(options) {
         // the tree may verify more rows than the drafter's block: its accepted path then needs a two-block inject
         drafter_.inject_block(std::min(std::max(options_.nodes + 1, kPositions + 1), 2 * (kPositions + 1)));
+    }
+    void sample(float temperature, int top_k, float top_p, std::mt19937_64* rng) {
+        temperature_ = temperature; top_k_ = top_k; top_p_ = top_p; rng_ = rng;
     }
     void start(uint32_t pending) {
         anchor_ = mlx::core::array(pending);
@@ -121,7 +128,7 @@ public:
     struct Step {
         std::vector<uint32_t> ids;       // the verified rows' tokens (row 0 the anchor)
         std::vector<int32_t> path;       // the accepted path's rows (row 0 first)
-        std::vector<uint32_t> choices;   // the target's argmax per verified row
+        std::vector<uint32_t> choices;   // the target's token per verified row (argmax, or its draw when sampling)
         int accepted = 0;                // drafted tokens kept (path rows below the anchor)
         // host phases of this step (ms): graph build of verify(k), submit (encode of verify + next draft), wait for
         // verify(k), post (readback, accept, settle). GPU idle shows as build + submit beyond the previous draft's run
@@ -144,7 +151,8 @@ public:
         catch (...) {engine_.defer_eval(false); throw;}
         engine_.defer_eval(false);
         const double vsubmit_ms = engine_.defer_submit_ms();
-        auto choices = mx::astype(mx::argmax(verified, -1), mx::uint32);
+        auto choices = temperature_ > 0.f ? sample_rows(mx::reshape(verified, {tree.rows, -1}), temperature_, top_k_, top_p_, (*rng_)())
+                                          : mx::astype(mx::argmax(verified, -1), mx::uint32);
         auto walk = tree_path(tree, choices);
         auto rows = mx::add(walk.accepted, mx::array(1, mx::int32));
         const auto t1 = Clock::now();
@@ -202,6 +210,9 @@ private:
     Qwen35& engine_;
     DFlash2& drafter_;
     DeviceTreeOptions options_;
+    float temperature_ = 0.f, top_p_ = 1.f;
+    int top_k_ = 0;
+    std::mt19937_64* rng_ = nullptr;
     std::optional<mlx::core::array> anchor_, position_;
     std::optional<DeviceTree> tree_;
 };
