@@ -58,9 +58,10 @@ class FlashNextEngine final : public tqllm::Engine {
         std::vector<int> seq_; int snap_ = 0;
         std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
     };
-    // the next turn re-renders the end of the last prompt (assistant header) differently; 256 = layer-major prefill's
-    // minimum chunk (DecodeModel::step lm_min), so the reused request's tail runs the same kernels as an uncached prompt
-    static constexpr int kTail = 256;
+    // the next turn re-renders the end of the last prompt (assistant header) differently. A reused prompt is not
+    // byte-identical to an uncached one at any tail (10de944a: 256, both chunks layer-major, still differed): the prefill
+    // kernels are not chunk-size invariant, so --exact on warns (exact_conflicts)
+    static constexpr int kTail = 64;
     bool caching() const { return f_.cp->run.prompt_cache && slots_.size() > 1; }
     static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, snap_) are reusable
         return s.model_ ? reusable_prefix(s.seq_, s.snap_, prompt) : 0;

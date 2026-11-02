@@ -9,13 +9,15 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
 #include <vector>
 
 namespace tqllm {
 namespace {
 // --exact on conflicts (approximations asked for explicitly): one WARN each, the asked options win; returns the /health note
-std::string check_mode(const std::filesystem::path & p, const EngineOptions & o, const EngineEntry & engine) {
-    const auto conflicts = exact_conflicts(o, p.extension() == ".tqfn", !engine.exact_path);
+std::string check_mode(const std::filesystem::path & p, const EngineOptions & o, const EngineEntry & engine, int slots) {
+    const auto conflicts = exact_conflicts(o, p.extension() == ".tqfn", !engine.exact_path,
+                                           [](const char * n) -> const char * { return std::getenv(n); }, slots);
     if (conflicts.empty()) return {};
     warn_exact_conflicts(conflicts, std::cerr);
     std::string note = "exact on, overridden by:";
@@ -33,7 +35,7 @@ Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots
         if (p.extension() == ".tqfn") throw std::invalid_argument("this binary has no Flash-Next engine (use tqserve)");
         throw std::invalid_argument("no engine in this build serves " + w);
     }
-    const std::string mode_note = check_mode(p, o, *engine);
+    const std::string mode_note = check_mode(p, o, *engine, slots);
     impl_->e = engine->make(w, t, c, slots, o);
     auto & note = impl_->e->note;
     if (!mode_note.empty()) note = note.empty() ? mode_note : mode_note + " " + note;

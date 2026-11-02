@@ -32,7 +32,7 @@ std::string EngineOptions::kv_format() const {
 }
 
 std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
-                                         const char * (*env)(const char *)) {
+                                         const char * (*env)(const char *), int slots) {
     std::vector<std::string> out;
     if (!o.exact) return out;
     if (o.prefill_int8 == 1) out.push_back("--prefill-int8 on: int8 prefill GEMMs (KLD 0.003-0.007 vs FP16 prefill)");
@@ -42,6 +42,8 @@ std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext
         for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
             if (const char * s = env(v); s && std::atoi(s) != 0) out.push_back(std::string(v) + " set: an approximation");
     if (no_exact_path) out.push_back("MiniMax / GLM have no exact path yet: they run their approximate path");
+    if (flashnext && o.prompt_cache && slots > 1)
+        out.push_back("--prompt-cache on: a reused prompt prefix splits the prefill, so the text can differ from an uncached prompt");
     for (const auto & p : o.inexact_patches) out.push_back("--plugin patch " + p + ": not byte-identical to the built-in kernel");
     return out;
 }

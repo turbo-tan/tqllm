@@ -53,6 +53,9 @@ int main() {
     expect(tqllm::exact_conflicts(parse({"-ctk", "q8"}), false, false, no_env).size() == 1, "exact + lossy KV");
     expect(tqllm::exact_conflicts(parse({}), true, false, cpu_miss).size() == 1 &&
            tqllm::exact_conflicts(parse({}), false, false, cpu_miss).empty(), "TQFN_* only for Flash-Next");
+    expect(tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 4).size() == 1 &&
+           tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 1).empty() &&
+           tqllm::exact_conflicts(parse({"--prompt-cache", "on", "--exact", "off"}), true, false, no_env, 4).empty(), "Flash-Next prompt cache: a conflict with several slots only");
     expect(tqllm::exact_conflicts(parse({}), false, true, no_env).size() == 1, "engine without an exact path");
     std::ostringstream err;
     tqllm::warn_exact_conflicts(tqllm::exact_conflicts(parse({"--prefill-int8", "on"}), false, false, no_env), err);

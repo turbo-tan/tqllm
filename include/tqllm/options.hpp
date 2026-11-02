@@ -86,9 +86,11 @@ struct Drafters { bool dflash = false, mtp = false; };
 Drafters drafters(const EngineOptions & o);
 
 // --exact on conflicts: the approximations a run asked for explicitly (empty: none). flashnext: a .tqfn model (its TQFN_*
-// approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM). The asked options win.
+// approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM); slots: --np (Flash-Next keeps a
+// prompt cache only with several). The asked options win.
 std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
-                                         const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); });
+                                         const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); },
+                                         int slots = 1);
 // one "tqserve: WARN --exact on with ..." line per conflict
 void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err);
 
