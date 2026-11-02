@@ -1,6 +1,7 @@
 // Flash-Next request prefill: memory plan, expert bank borrow and refill, chunked prompt, MTP catch-up.
 #include "debug.hpp"
 #include "fn_engine.hpp"
+#include <cmath>
 #include <map>
 #include "decode_rules.hpp"
 #include "prefill_observer_cuda.hpp"
@@ -63,6 +64,41 @@ void FlashNextEngine::restore_snapshot(SlotState & s) {
     m.history.rollback(size_t(p)); m.position = p;
 }
 
+void FlashNextEngine::pc_verify(const std::vector<int> & ids, int p) {
+    auto & checkpoint = *f_.cp; ck(cudaDeviceSynchronize());
+    auto ref = std::make_unique<DecodeModel>(checkpoint, *f_.fixtures, *f_.cache, size_t(slot_context()));
+    ref->mtp_experts = f_.mtp_cache.get();
+    for (int b = 0; b < p; b += 64) { if (g_arena) g_arena->used = 0; (void) ref->step(std::vector<int>(ids.begin() + b, ids.begin() + std::min(p, b + 64))); }
+    ck(cudaDeviceSynchronize());
+    auto & m = *S().model_;
+    auto host = [](const float * d, size_t n) { std::vector<float> h(n); ck(cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost)); return h; };
+    auto host16 = [](const __nv_bfloat16 * d, size_t n) { std::vector<__nv_bfloat16> b(n); ck(cudaMemcpy(b.data(), d, n * 2, cudaMemcpyDeviceToHost));
+                                                          std::vector<float> h(n); for (size_t i = 0; i < n; ++i) h[i] = __bfloat162float(b[i]); return h; };
+    auto rel = [](const std::vector<float> & a, const std::vector<float> & b) { double d = 0, r = 0;
+        for (size_t i = 0; i < a.size(); ++i) { d += double(a[i] - b[i]) * (a[i] - b[i]); r += double(b[i]) * b[i]; } return std::sqrt(d / std::max(r, 1e-30)); };
+    double worst = 0; std::string where = "-";
+    auto note = [&](const std::string & what, double e) { if (e > 2e-2) std::fprintf(stderr, "PCV %s rel %.3g\n", what.c_str(), e); if (e > worst) { worst = e; where = what; } };
+    const size_t row = size_t(checkpoint.attention_kvheads) * checkpoint.attention_dim;
+    for (size_t l = 0; l < m.rec.size(); ++l) {
+        const std::string L = "layer " + std::to_string(l);
+        auto & a = m.rec[l]; auto & b = ref->rec[l];
+        if (a.state && b.state) note(L + " gdn state", rel(host(a.state->p, a.state->count), host(b.state->p, b.state->count)));
+        if (a.history && b.history) note(L + " gdn conv", rel(host(a.history->p, a.history->count), host(b.history->p, b.history->count)));
+        if (bool(a.state) != bool(b.state)) note(L + " gdn state presence", 1);
+        if (m.ple_past[l] && ref->ple_past[l]) note(L + " ple past", rel(host(m.ple_past[l]->p, m.ple_past[l]->count), host(ref->ple_past[l]->p, ref->ple_past[l]->count)));
+        if (l < m.att.size() && m.att[l].k && ref->att[l].k) {
+            note(L + " k", rel(host16(m.att[l].k->p, size_t(p) * row), host16(ref->att[l].k->p, size_t(p) * row)));
+            note(L + " v", rel(host16(m.att[l].v->p, size_t(p) * row), host16(ref->att[l].v->p, size_t(p) * row)));
+            if (m.att[l].len != ref->att[l].len) note(L + " len " + std::to_string(m.att[l].len) + " vs " + std::to_string(ref->att[l].len), 1);
+            if (m.att[l].qsa && ref->att[l].qsa && m.att[l].qsa->size() < ref->att[l].qsa->size()) note(L + " qsa size", 1);
+        }
+    }
+    if (m.position != ref->position || m.history.size() != ref->history.size())
+        note("position " + std::to_string(m.position) + " / " + std::to_string(ref->position) + ", history " + std::to_string(m.history.size()) + " / " + std::to_string(ref->history.size()), 1);
+    std::fprintf(stderr, "PCV restored state at %d vs a fresh prefill: worst rel %.3g (%s)\n", p, worst, where.c_str());
+    ref.reset(); bind();
+}
+
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
@@ -98,6 +134,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     bind();
     const std::vector<int> ids(prompt.begin(), prompt.end());
     if (P0) std::fprintf(stderr, "tqllm: prompt cache: %d of %zu prompt tokens reused\n", P0, prompt.size());
+    if (P0 && tqllm::debug_on("pc_verify")) pc_verify(ids, P0);
     // TQLLM_DEBUG=profile_req:N: cudaProfilerStart at the N-th request's prefill, stop after it (nsys --capture-range=cudaProfilerApi)
     static const int prof_req = tqllm::debug_cstr("profile_req") ? std::atoi(tqllm::debug_cstr("profile_req")) : 0; static int req_no = 0;
     // TQLLM_DEBUG=profile_decode:1: the capture covers that request's decode instead of its prefill
