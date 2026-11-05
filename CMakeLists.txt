@@ -666,6 +666,7 @@ if(BUILD_TESTING)
   add_test(NAME launch_codex COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_launch_codex.py)
   add_test(NAME flags_registry COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_flags.py --check)
   add_test(NAME docs_map COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_docs_map.py)
+  add_test(NAME python_cli COMMAND python3 -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_python_cli.py)
   # Host-only gates for the MoE work. Both are plain C++ (no CUDA, no GPU, no model), so they
   # build and run regardless of TQLLM_CUDA. Sources are compiled directly into the test so they
   # do not depend on which translation units the tqllm library carries in a CUDA build.

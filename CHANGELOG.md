@@ -3,6 +3,17 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.4.2.1 (2026-11-06)
+
+### Added
+- macOS (Apple Silicon): `brew install turbo-tan/tap/tqllm` and `pip install "tqllm[mlx]"` build tqserve against the stock
+  MLX 0.32.4 wheel; the `tqllm` command: `tqllm serve` downloads the model and drafter on first run, `tqllm claude` /
+  `tqllm codex` start the agent pointed at the local server.
+
+### Fixed
+- Metal: the exact attention kernel was switched off on stock MLX builds (it checked for the patched MLX instead of the
+  matrix unit).
+
 ## 1.4.2 (2026-11-05)
 
 ### Fixed

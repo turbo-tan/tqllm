@@ -24,7 +24,7 @@ mx::array row(const mx::array& out, int t) {   // [1, heads, n, dim] -> [heads, 
 }  // namespace
 
 int main() {
-    if (!segmented_attention_available(256)) {std::printf("ATTENTION_EXACT_SKIP (needs the matrix unit)\n"); return 0;}
+    if (!matrix_unit_available()) {std::printf("ATTENTION_EXACT_SKIP (needs the matrix unit)\n"); return 0;}
     const int heads = 24, kvh = 4, dim = 256, cap = 70144;
     const float scale = 0.0625f;
     mx::random::seed(3);

@@ -1,0 +1,37 @@
+# pip package (macOS arm64): `pip install "tqllm[mlx]"` builds tqserve against the stock MLX wheel and installs the
+# `tqllm` command (serve / pull). Linux users run the Docker images (see README); `tqllm` there prints the command.
+[build-system]
+requires = ["scikit-build-core>=0.10", "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tqllm"
+version = "1.4.2.1"
+description = "tqLLM: fast exact LLM serving (Apple Silicon build of tqserve)"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# the C++ ABI of MLX changes between releases: the wheel runs against the exact MLX it was built with
+mlx = ["mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'", "huggingface_hub>=0.24"]
+
+[project.scripts]
+tqllm = "tqllm.cli:main"
+
+[project.urls]
+Homepage = "https://tqllm.com"
+Source = "https://github.com/turbo-tan/tqllm"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+wheel.packages = ["python/tqllm"]
+build.targets = ["tqserve"]
+install.components = ["wheel"]
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+TQLLM_CUDA = "OFF"
+TQLLM_MLX = "ON"
+BUILD_TESTING = "OFF"

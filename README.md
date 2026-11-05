@@ -40,7 +40,15 @@ Recorded with a real model. The local hostname is hidden; telemetry is unmodifie
 
 ## Run locally
 
-On a Mac (Apple Silicon), follow the [Mac guide](docs/guides/mac.md). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
+On a Mac (Apple Silicon, macOS 15 or newer):
+
+```sh
+brew install turbo-tan/tap/tqllm     # or: pip install "tqllm[mlx]"
+tqllm serve                          # first run downloads the model and drafter
+tqllm claude                         # Claude Code pointed at the local server (or: tqllm codex)
+```
+
+More in the [Mac guide](docs/guides/mac.md). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
 `models/model.gguf`, then build from source:
 
 ```sh
