@@ -81,9 +81,13 @@ Decode tokens per second, one request, greedy, 256 output tokens after long-docu
 
 | Context | 8K | 16K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|---|
-| tqLLM 1.4.0 | 47.7 | 57.0 | **53.1** | **48.1** | **38.8** | **27.6** |
+| tqLLM 1.4.1 | 51.9 | 62.1 | **56.1** | **48.8** | **38.9** | **27.5** |
+| tqLLM 1.4.1, QSA file | dense | dense | dense | 45.7 | **49.6** | |
 | TensorFold 1.2.1 | **61.0** | 54.4 | 49.9 | 41.4 | 34.7 | does not fit |
 | Splash 1.4.0 (int8 KV) | 60.8 | **62.4** | 48.4 | 43.9 | 35.9 | 24.5 |
 
-Short prompts are mixed: tqLLM leads on some (110.8 vs TensorFold 87.7 on one chat prompt) and trails on others (72.2
-vs 97.0); see [Benchmarks](../BENCHMARKS.md).
+Every tqLLM text equals plain one-token-at-a-time decoding (`--exact on`). The QSA file (`Qwen3.8-27B-MLX-4bit-QSA.gguf`)
+reads only the 2,048 keys its indexers pick once a step is past 48K keys (`--qsa-from`), which changes the text.
+
+Short prompts are mixed: tqLLM leads on some (99.6 vs TensorFold 91.1 on a 2K document) and trails on others (80.6 vs
+97.0 on a chat prompt); see [Benchmarks](../BENCHMARKS.md).
