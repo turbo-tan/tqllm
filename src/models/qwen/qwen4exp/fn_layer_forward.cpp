@@ -31,7 +31,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
 int DecodeModel::hc_path(const std::string & prefix, int n) const {
     if (tqllm::hc_row_scales_only(n, cp.is_bf16(prefix + "hc_attn_down.weight") && cp.is_bf16(prefix + "hc_ffn_down.weight"),
                                   cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight"))) return 1;
-    // quantised mixers (hcq8: Q8_0) take the same row-scale path with an FP16 image instead (hc_row_scales_h)
+    // quantised mixers (Q8_0) take the same row-scale path with an FP16 image instead (hc_row_scales_h)
     auto quant = [&](const std::string & w) { const int ty = int(cp.file(prefix + w).file().tensors.at(prefix + w).type);
                                               return ty != GGML_TQ3_4S && ty != GGML_F32 && ty != GGML_BF16 && ty != GGML_F16; };
     const bool inj_bf16 = cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight");

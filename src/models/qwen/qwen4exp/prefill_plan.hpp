@@ -46,7 +46,7 @@ inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 // normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
 // a quantized down / inject reads the fp32 rows.
 inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
-// the same for quantised down mixers (hcq8: Q8_0): the norm writes an FP16 image (and a BF16 one when the inject weights are
+// the same for quantised down mixers (Q8_0): the norm writes an FP16 image (and a BF16 one when the inject weights are
 // BF16), which the projections read as their converted input (equal to converting the fp32 rows); resident GPU projections only
 inline bool hc_row_scales_h(int tokens, bool down_quant, bool inject_quant_or_bf16, bool gpu_projections) {
     return tokens > 64 && down_quant && inject_quant_or_bf16 && gpu_projections;

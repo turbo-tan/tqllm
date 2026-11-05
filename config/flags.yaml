@@ -215,7 +215,7 @@ flags:
     doc: "removed"
     replaced_by: "-fitt MiB (-fit on|off)"
 
-  # Private experimental Apple MLX backend; unset preserves the base path.
+  # Apple MLX backend; unset preserves the base path.
   - name: TQFN_ARENA_MB
     kind: user
     default: "-"

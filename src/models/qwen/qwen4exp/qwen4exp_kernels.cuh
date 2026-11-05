@@ -27,7 +27,7 @@ void hc_low_silu_bf16(float * low_rank, __nv_bfloat16 * low_rank_bf16, int count
 void hc_norm_rs_bf16(const float * residual, const float * gamma, float * rs, __nv_bfloat16 * normalized_bf16,
                      int hidden, int streams, int tokens, float eps, cudaStream_t);
 // the same with an FP16 image (mixer weights in a quantised format read FP16 activations)
-// normalized_bf16 (optional): also the BF16 image, for a BF16 projection beside the quantised one (hcq8: BF16 inject)
+// normalized_bf16 (optional): also the BF16 image, for a BF16 projection beside the quantised one (8-bit mixers: BF16 inject)
 void hc_norm_rs_h(const float * residual, const float * gamma, float * rs, __half * normalized_h, int h, int c, int n, float eps,
                   cudaStream_t stream, __nv_bfloat16 * normalized_bf16 = nullptr);
 void hc_combine_norm_rs_h(const float * residual, const float * block_out, const float * inject_logits, float * out, const float * gamma,

@@ -18,6 +18,10 @@ Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
    README.md. Copied code is listed in NOTICE with its licence, and only licences compatible with Apache-2.0 are
    accepted.
 5. **No private paths or hosts** in shipped files. `tests/test_no_private_paths.py` checks this.
+6. **The repository holds the product only.** Benchmark dumps, experiment notes, agent handovers, logs and internal
+   labels stay out; results that matter go into docs as measured rows. `tests/test_public_tree.py` checks this on every
+   pull request (CI job "public tree"). Install the same check as a pre-commit hook once per clone:
+   `git config core.hooksPath tools/dev/hooks`.
 
 ## Build and test
 
@@ -164,6 +168,7 @@ the PR. For changes that should not move speed, show that they do not.
 
 Before you open one:
 
+- [ ] No working material: no result dumps, logs, handovers or experiment notes (`tests/test_public_tree.py`).
 - [ ] Builds, and `ctest` passes (CPU build at least; `ctest -L gpu` on a CUDA card for kernel or engine changes).
 - [ ] New behaviour has a test; a bug fix has a test that failed before.
 - [ ] Exactness stated: identical tokens, or the measured quality cost.

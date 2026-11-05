@@ -70,7 +70,7 @@ template<> __device__ __forceinline__ float wr<float>(float v) { return v; }
 template<> __device__ __forceinline__ __nv_bfloat16 wr<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
 template<> __device__ __forceinline__ __nv_bfloat16 img16<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
 template<> __device__ __forceinline__ __half img16<__half>(float v) { return __float2half_rn(v); }
-// outb2 (optional): a BF16 image beside the T image, for a BF16 projection next to a quantised one (hcq8: BF16 inject)
+// outb2 (optional): a BF16 image beside the T image, for a BF16 projection next to a quantised one (8-bit mixers: BF16 inject)
 template<class T, class R = float> __global__ void norm_rs_k(const R * x, const float * gamma, float * rs, T * outb, int h, int c, float eps,
                                                          __nv_bfloat16 * outb2 = nullptr) {
     const int row = blockIdx.x, tid = threadIdx.x;

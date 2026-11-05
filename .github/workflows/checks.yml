@@ -18,6 +18,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # seconds, no build: the public tree holds the product only (tests/test_public_tree.py) and no private paths
+  public-tree:
+    name: public tree (no internal files, labels or secrets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Public tree and private-path checks
+        run: python3 -m unittest tests/test_public_tree.py tests/test_no_private_paths.py -v
+
   cpu:
     name: cpu build and tests
     runs-on: ubuntu-24.04
