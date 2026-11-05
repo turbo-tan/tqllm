@@ -191,6 +191,12 @@ inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool, bool ev
     if (cpu_pool) return {std::min(manifest_drafts, kCpuPoolRows - 1), false};
     return {std::max(manifest_drafts, every_expert_resident ? 7 : 5), true};
 }
+// One sequence after slots=auto sized the banks: every expert resident (GB10: 512 of 512) drafts as a pinned slots=512
+// manifest does; the count chosen at load came before the slots were known (GB10 decode 104 instead of 122 tok/s).
+inline int auto_slot_drafts(int manifest_drafts, int chosen, int slots, int experts, bool cpu_pool) {
+    if (cpu_pool || slots < experts) return chosen;
+    return std::max(chosen, one_sequence_drafts(manifest_drafts, false, true).drafts);
+}
 
 // CPU-owned experts (small cards, F26): a fixed eighth of each layer's experts, a pure function of (layer, expert), runs
 // on the CPU expert pool and is kept out of the GPU banks; every other expert runs on the GPU, resident or not. Which

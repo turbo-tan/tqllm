@@ -130,6 +130,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
     // cards: their CPU expert pool takes blocks of at most kCpuPoolRows rows (decode_rules.hpp one_sequence_drafts).
     // --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
+    const int manifest_drafts = f.drafts;
     if (slots_.size() == 1) {
         const DraftPlan plan = one_sequence_drafts(f.drafts, run.small_card, !f.slots_auto && f.slots >= c.experts);
         f.drafts = plan.drafts;
@@ -447,6 +448,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               if (after >= need || f.slots <= 1) break;
               extra += need - after;
           }
+          if (slots_.size() == 1) f.drafts = auto_slot_drafts(manifest_drafts, f.drafts, f.slots, c.experts, run.small_card);
           // tier A (the floor a bank never drops below): the slots a full-context state leaves, as with one sequence's whole
           // state kept free; tier B (the target) is what the smaller keep allows (decode_rules.hpp auto_keep_bytes)
           if (slot_tiers(nseq, false)) {

@@ -148,6 +148,22 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
     }
     if (fixtures) compare("gdn_projected_output" + suffix, [&] { std::vector<float> v(size_t(n) * c.hidden); ck(cudaMemcpy(v.data(), result, v.size() * 4, cudaMemcpyDeviceToHost)); return v; }(), fixtures->values("linear_attn_out" + suffix), .02);
 }
+// Decode reads of host K/V (TQFN_KV_HOST): one gather per layer, each with a 16K-row device cache of host rows (consecutive
+// steps select mostly the same positions: at 128K 81.6 % of the host rows a step reads were read recently). Sized for the
+// slot context and an 8-token verify block of attention_core's widest selection (top_k 2048 + ratio 4 - 1): no allocation
+// inside graph capture. kv_to_host makes them before the bank refill sizes the banks around them (made at the first
+// decode step, after the refill took the free memory, a 145K prompt on a 3090 at slots=auto ran out of memory).
+inline std::unique_ptr<tqllm_cuda::QsaGather> & host_gather(int layer) {
+    static std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> gathers;
+    if (size_t(layer) >= gathers.size()) gathers.resize(size_t(layer) + 1);
+    return gathers[size_t(layer)];
+}
+inline void make_host_gather(const Checkpoint & checkpoint, int layer) {
+    auto & gather = host_gather(layer); if (gather) return;
+    const size_t row = size_t(checkpoint.attention_kvheads) * checkpoint.attention_dim * sizeof(__nv_bfloat16);
+    PersistentAlloc keep;
+    gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(checkpoint.rt.kv_capacity, checkpoint.rt.kv_capacity_full), row, 16384, 8 * (2048 + 4 - 1));
+}
 // pre: q (with gate), k, v of this sequence's rows projected for a whole batch; raw_out: write the attention output
 // there and stop before the gate and the output projection (both row-wise, done for the batch)
 struct AttnPre { const float * qg, * k, * v; };
@@ -257,14 +273,10 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
                 // part of this layer's K/V in host memory (TQFN_KV_HOST): the selected rows go to one compact device copy
                 // first (read once, wide loads), then the attention reads that copy with the same rows in the same order
                 if (nb < 32 && carry->k->vmm && carry->k->any_host()) {
-                    // one gather per layer, each with a 16K-row device cache of host rows: consecutive steps select mostly the
-                    // same positions (128K: 81.6 % of the host rows a step reads were read recently)
-                    static std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> gathers; static std::vector<uint64_t> epochs;
+                    static std::vector<uint64_t> epochs;
+                    if (size_t(layer) >= epochs.size()) epochs.resize(size_t(layer) + 1, 0);
                     const size_t row = size_t(kvheads) * dim * sizeof(__nv_bfloat16);
-                    if (size_t(layer) >= gathers.size()) { gathers.resize(size_t(layer) + 1); epochs.resize(size_t(layer) + 1, 0); }
-                    auto & gather = gathers[size_t(layer)];
-                    // sized for the slot context and an 8-token verify block: no allocation inside graph capture
-                    if (!gather) { PersistentAlloc keep; gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(checkpoint.rt.kv_capacity, checkpoint.rt.kv_capacity_full), row, 16384, 8 * sel.width); }
+                    make_host_gather(checkpoint, layer); auto & gather = host_gather(layer);
                     const int written_from = epochs[size_t(layer)] == checkpoint.rt.kv_epoch ? pos : 0;  // a new request: the cache starts empty
                     epochs[size_t(layer)] = checkpoint.rt.kv_epoch;
                     gather->run(sel.positions, sel.valid, nb, sel.width, pos + q0 + 1, carry->k->p, carry->v->p, nullptr,

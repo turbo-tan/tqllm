@@ -25,11 +25,13 @@ struct DecodeModel {
     size_t kv_to_host() {
         static const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
         size_t freed = 0;
-        for (auto & a : att) {
+        for (size_t l = 0; l < att.size(); ++l) {
+            auto & a = att[l];
             if (!a.k || !a.k->vmm || a.len <= 2 * keep) continue;
             const size_t row = a.k->bytes / size_t(kv_cap(a, cp.rt.kv_capacity)), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
             for (size_t i = 0; i < cut; ++i) for (KvBuf * b : {a.k.get(), a.v.get()})
                 if (!b->on_host[i] && b->move(i, true)) freed += b->page;
+            if (a.k->any_host()) make_host_gather(cp, int(l));  // decode reads these rows through it: made before the bank refill
         }
         return freed;
     }

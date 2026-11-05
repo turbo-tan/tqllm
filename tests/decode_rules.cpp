@@ -143,6 +143,10 @@ int main() {
         check(copy_draft(self, {&old}, 3, 2) == std::vector<int>({3, 1}), "copy: the context itself before the history");
         check(copy_draft({1, 2}, {&old}, 3, 2).empty(), "copy: a context shorter than n");
     }
+    check(auto_slot_drafts(3, 5, 512, 512, false) == 7, "slots=auto with every expert resident drafts up to 7 (GB10 drafted 5)");
+    check(auto_slot_drafts(3, 5, 159, 512, false) == 5, "slots=auto on a 24 GB card keeps 5");
+    check(auto_slot_drafts(3, 3, 512, 512, true) == 3, "CPU pool keeps its block");
+    check(auto_slot_drafts(0, 0, 512, 512, false) == 0, "no MTP: no drafts");
     check(one_sequence_drafts(0, false).drafts == 0 && !one_sequence_drafts(0, true).adaptive, "no MTP: no drafts");
 
     // CPU-owned experts: the device an expert runs on does not depend on residency (F26), owned experts stay out of banks

@@ -3,6 +3,22 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.4.2 (2026-11-05)
+
+### Fixed
+- Flash-Next, `slots=auto` without per-layer slots: a 128K prompt on a 24 GB card no longer runs out of memory at the
+  first decode step. The device buffers that read the K/V rows moved to host memory are now made before the expert
+  banks refill after the prompt, so the refill sizes the banks around them (RTX 3090, tqLLM's own Flash-Next file,
+  145K-token prompt: three requests out of memory with 1.4.1, all answered with 1.4.2).
+- Flash-Next on DGX Spark / GB10 with `slots=auto`: when every expert fits on the device, one request drafts up to 7
+  tokens as a manifest with fixed slots does (the draft length was chosen before the slots were known). tqLLM's own
+  Flash-Next file, one request: 120.7 vs 104.1 tok/s.
+
+### Added
+- tqLLM's own Flash-Next file on Hugging Face ([YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM),
+  `mixed/`, 82.4 GB in two parts, manifest `flashnext-tqllm.tqfn`): the ISTA-DASLab IQ3_S experts, IQ4_XS dense layers
+  and 8-bit hyper-connection mixers. One manifest for RTX 30 / 40 / 50 (24 GB) and GB10.
+
 ## 1.4.1 (2026-11-05)
 
 The first public release since 1.2.3: it carries everything below (the 1.3.0 and 1.4.0 candidates were not published).
