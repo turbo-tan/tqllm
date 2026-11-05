@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compact expert pack for TQFN_KEEP_MAP: from a full TQFNEXP1 / TQFNEXPT pack and a keep map, write a pack with K experts per layer
+"""Compact expert pack for TQLLM_DEBUG=keep_map: from a full TQFNEXP1 / TQFNEXPT pack and a keep map, write a pack with K experts per layer
 (kept experts in compact-index order). OUT '-' streams to stdout. usage: fn_pack_slice.py FULL.tqfnexp KEEP.map OUT"""
 import sys, struct, numpy as np
 full, mapf, out = sys.argv[1], sys.argv[2], sys.argv[3]

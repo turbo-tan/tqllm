@@ -1,6 +1,6 @@
 {
   "model": "ornith-15",
-  "gguf": "/mnt/data2t/gguf/ornith-1.5-35b-a3b/Ornith-1.5-35B-A3B-TQ3_4S.gguf",
+  "gguf": "Ornith-1.5-35B-A3B-TQ3_4S.gguf",
   "port": 18132,
   "reasoning": "off",
   "context": 40960,

@@ -25,6 +25,60 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
 
+### More engine options
+
+Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v`, `-md` / `--model-draft`,
+`-ub` / `--ubatch-size`, `-ncmoe` / `--n-cpu-moe`, `-fit` / `--fit`, `-fitt` / `--fit-target`, `-fitc` / `--fit-ctx`,
+`-fitl` / `--fit-lossy`, `--temperature` / `--temp`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--temperature T` `--top-p P` `--top-k K` `--presence-penalty X` | greedy, no penalty | sampling defaults for requests that set none |
+| `--repeat-penalty R` `--frequency-penalty F` | 1 (off), 0 | sampling defaults for requests that set none: LM Studio / llama.cpp `repeat_penalty` (a positive logit / R, a negative one x R) and logit - F x count, on the last 64 output tokens; requests may set `repeat_penalty` (or `repetition_penalty`) and `frequency_penalty`. Sampling only (temperature > 0); 27B engine |
+| `--monitor-port N` | the API port | serve the read-only dashboard on its own port |
+| `-fit on\|off` | on | fit the model, KV and buffers into GPU memory at load |
+| `-fitt MiB` | 768 (256 under WSL) | GPU memory to leave free after loading |
+| `-fitc N` | 4096 | smallest context per slot the fit may choose |
+| `-fitl on\|off` | on | on: the fit may pick KV codec / context / prefill buffers and announces them; off: refuse to start instead |
+| `-ub N` | engine default | prefill micro-batch rows |
+| `-ncmoe N` | 0 | keep the MoE experts of the first N layers in host memory |
+| `--moe-host-mb M\|auto` `--moe-profile FILE` | off | keep the least-routed MoE experts (by FILE's routing counts) in host memory, M MiB of them |
+| `--moe-cache-mb C\|auto` | auto | VRAM cache of recently used host experts |
+| `--hot-map FILE` | none | MiniMax: routing counts; the busiest experts are preloaded, the rest stay on disk |
+| `--plugin PATH` | none | load a weight-format plugin (repeatable, CUDA builds): new GGUF types or kernel patches; each must pass the format contract at load ([plugins](../guides/plugins.md)) |
+| `--tp-rank R --tp-peer IP [--tp-port P]` | single box, port 29600 | MiniMax over two linked boxes (rank 0 serves; rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
+| `--yarn-orig-ctx N` `--yarn-ext-factor F` `--yarn-attn-factor F` `--yarn-beta-fast F` `--yarn-beta-slow F` | model metadata | YaRN context extension, llama.cpp meanings (with `--rope-scaling yarn`) |
+| Flash-Next prefill: `--prefill-chunk N` `--prefill-sub N` `--prefill-stage N` | 16384, 2048, 192 | rows per prefill chunk, per sub-batch, and per expert stage |
+| Flash-Next: `--prefill-reserve-mb N` `--prefill-arena-mb N` `--dense-cache-mb N` | 1000, 3800, 600 | GPU memory kept free during prefill, the prefill arena, the dense-weight cache |
+| Flash-Next: `--prefill-borrow auto\|all\|N` | auto | expert banks the prefill may borrow (all, or N of them) for its arena |
+
+Environment variables (`TQLLM_*`, `TQFN_*`) are listed with their defaults and status in [FLAGS.md](../FLAGS.md).
+
+### Exact and speed (`--exact on|off`)
+
+`--exact on` (default) runs every step at the reference precision: FP16 / BF16 activations and KV, no int8 / FP8 GEMMs,
+no CPU-served experts. Greedy output is then the same from build to build. `--exact off` lets each engine use its
+measured approximations (the middle column below): faster, with a small, measured change in the output. Published speed
+numbers say which one they ran.
+
+If memory forces a smaller KV cache with `--exact on`, the server says so on stderr and in `/health`
+("exact on: ..."). An approximation asked for explicitly with `--exact on` (the last column) is a conflict: the server
+prints one `WARN --exact on with ...` line per option, runs the asked option, and `/health` shows
+"exact on, overridden by: ...".
+
+| Engine | What `--exact off` changes | `--exact on`, and its conflicts |
+|---|---|---|
+| Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 | FP16 prefill; conflicts: `--prefill-int8 on`, `--prefill-fp8 on`, a lossy `-ctk` / `-ctv` / `--kv` |
+| Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; conflicts: `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
+| Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs `--exact on` at 32K-128K) | BF16 KV while it fits; when memory forces int8 KV (one `WARN`), the int8-query attention, whose rows equal their single-row calls bit for bit, so greedy spec output still equals plain decoding |
+| MiniMax, GLM | (their only path) | no exact path yet: they run their approximate path with a WARN |
+
+QSA sparse attention (Metal, Qwen3.8 27B): a model file that carries QSA indexers (the 16 of higa2515/Qwen3.8-27B-QSA-BF16,
+added with `tools/qsa_indexer_gguf.py` + `tools/gguf_add.py`) makes each decode step past `--qsa-from N` keys (default
+the file's `qsa.sparse_from`, else 49152) attend the 2,048 keys its indexer picks plus the recent keys, instead of the whole
+cache. `--qsa-from off` keeps every step dense. QSA changes the text, but under `--exact on` spec output still equals the
+same file's plain decoding. Files without indexers ignore the option.
+
 ### Reasoning and chat template
 
 | Option | Default | What it does |
@@ -43,7 +97,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 |---|---|---|
 | `-md FILE` | | DFlash2 drafter GGUF (exact: the output equals decoding without it) |
 | `--draft-vocab FILE` | | the drafter's token list (65,536 ids) |
-| `--draft-max N` | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there. MiniMax with its DSpark drafter: unset, the length follows the measured acceptance (1 to the drafter's block of 7); set, it is fixed |
+| `--draft-max N` (`--draft N`) | 7 | drafted tokens per step (1-15); hybrid Qwen3.5 / 3.8 models verify at most 8 columns, so 7 is the effective maximum there. MiniMax with its DSpark drafter: unset, the length follows the measured acceptance (1 to the drafter's block of 7); set, it is fixed |
 | `--no-tree` | tree on | verify a single draft chain instead of a token tree |
 | `--draft-window N` | GGUF value | drafter attention window over the context (0 = whole context) |
 | `--lookup L [--lookup-first K]` | off | prompt-lookup drafts (copies of earlier text) next to the tree; shares the verify budget |

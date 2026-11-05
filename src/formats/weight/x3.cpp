@@ -42,6 +42,7 @@ struct X3Desc {
     // routed-expert bank (every part the same rows): one XwExpert per part on the device, the bank's codecs by slot
     x3::XwExpert* bank = nullptr;
     std::vector<const x3::X3Codec*> codecs;
+    std::vector<int> expert_codec;  // expert (part) -> its codec slot, the host copy of XwExpert::codec (gate / up pairing)
 };
 
 struct Scratch {
@@ -57,9 +58,7 @@ struct Scratch {
     x3::XwMoeList* moe_pl = nullptr; size_t moe_pl_cap = 0;  // prompt path: the batched (expert, pass) lists and
     half*  pm_a = nullptr; size_t pm_a_cap = 0;                // their own A / partial sums (decode graphs hold moe_a / moe_p)
     float* pm_p = nullptr; size_t pm_p_cap = 0;
-    half*  moe_s = nullptr; size_t moe_s_cap = 0;      // verify blocks: staged down inputs, part outputs, slot map
-    __nv_bfloat16* moe_y = nullptr; size_t moe_y_cap = 0;
-    int*   moe_i = nullptr; size_t moe_i_cap = 0;
+    int*   moe_ai = nullptr; size_t moe_ai_cap = 0;    // aindex[part][t] = the assignment of token t at that part
     half*  gw = nullptr; size_t gw_cap = 0;   // prompt path: one expert in FP16, its gathered inputs, FP32 outputs
     half*  gx = nullptr; size_t gx_cap = 0;
     float* gy = nullptr; size_t gy_cap = 0;
@@ -120,6 +119,19 @@ bool window_ok(const X3Desc& d) {
         if (!p.codec->window) return false;
     return true;
 }
+
+// The f32-output window GEMV (matvec_f32): the same kernel with the out stage storing the bf16 value it already
+// computed as f32.
+bool window_f32_ok(const X3Desc& d) {
+    if (!x3::x3_window_enabled()) return false;
+    for (const X3Part& p : d.parts)
+        if (!p.codec->window_f32) return false;
+    return true;
+}
+
+// The codec's window entry point of an output type.
+inline auto xw_entry(const x3::X3Codec& c, __nv_bfloat16* y) { (void) y; return c.window; }
+inline auto xw_entry(const x3::X3Codec& c, float* y) { (void) y; return c.window_f32; }
 
 struct X3Format final : WeightFormat {
     const char* name() const override { return "x3"; }
@@ -259,17 +271,51 @@ struct X3Format final : WeightFormat {
                 d->codecs[c]->moe(sc.moe_l + c, count, 1, rows, d->cols, kp, y, 0, s);
             return;
         }
-        // verify block: each distinct expert read once for all n columns (bit-identical per column to n = 1)
-        int* slot = sc.moe_i;
-        int* part_expert = sc.moe_i + x3::XW_MOE_MAX_PARTS;
-        int* nparts = sc.moe_i + 2 * x3::XW_MOE_MAX_PARTS;
-        const int ldy = count * rows;
-        x3::x3_moe_build_dedup(ids, n, topk, d->bank, rows, d->cols, kp, int(d->codecs.size()), x,
-                               per_slot_input ? sc.moe_s : nullptr, sc.moe_a, sc.moe_p, slot, part_expert, nparts, sc.moe_l, s);
-        if (per_slot_input) x3::x3_moe_stage(x, slot, n, topk, d->cols, nparts, sc.moe_s, s);
+        // verify block: each distinct expert read once for all n columns (bit-identical per column to n = 1). The
+        // build's assignment map lets had_in read a per-slot input straight from x and the out launch write
+        // y [assignment][rows] itself: no staged input, no part scratch, no unslot.
+        x3::x3_moe_build_dedup(ids, n, topk, d->bank, rows, d->cols, kp, int(d->codecs.size()), x, per_slot_input,
+                               sc.moe_a, sc.moe_p, sc.moe_ai, sc.moe_l, s);
         for (size_t c = 0; c < d->codecs.size(); ++c)
-            d->codecs[c]->moe(sc.moe_l + c, count, n, rows, d->cols, kp, sc.moe_y, ldy, s);
-        x3::x3_moe_unslot(sc.moe_y, slot, count, topk, rows, ldy, y, s);
+            d->codecs[c]->moe(sc.moe_l + c, count, n, rows, d->cols, kp, y, 0, s);
+    }
+
+    // gate and up of one layer in ONE pass over the routing: one build and one had_in / gemv / out per codec for both
+    // matrices instead of the pair twice (7 launches per layer instead of 14, and the gemv sees 2x the items, which
+    // balances its tail). Bit-identical to two expert_matvec calls: each part keeps its own items, k split and partial
+    // sums, and the out launch sums each part's own P into its own half of the caller's one output allocation.
+    void expert_matvec2(const Mat& a, const Mat& b, const __half* x, __nv_bfloat16* ya, __nv_bfloat16* yb, int rows,
+                        const int* ids, int n, int topk, cudaStream_t s) const override {
+        const auto* da = static_cast<const X3Desc*>(a.aux);
+        const auto* db = static_cast<const X3Desc*>(b.aux);
+        if (!can_pair(*da, *db, rows) || yb < ya || yb - ya > INT32_MAX)
+            throw std::runtime_error("x3: gate / up banks are not pairable (one pass)");
+        if (2 * n * topk > x3::XW_MOE_MAX_PARTS) {   // a drafter block too wide for one part list: the two calls
+            expert_matvec(a, x, ya, rows, ids, n, topk, false, s);
+            expert_matvec(b, x, yb, rows, ids, n, topk, false, s);
+            return;
+        }
+        const int count = n * topk, kp = x3::xw_moe_kparts(da->cols);
+        const int up_base = int(yb - ya);   // elements: the up half of the caller's single [2 * count][rows] buffer
+        Scratch& sc = scratch();
+        std::lock_guard<std::mutex> lock(sc.mtx);
+        if (n == 1) {
+            x3::x3_moe_build2(ids, count, topk, da->bank, db->bank, rows, da->cols, kp, int(da->codecs.size()), x,
+                              up_base, sc.moe_a, sc.moe_p, sc.moe_l, s);
+        } else {
+            x3::x3_moe_build_dedup2(ids, n, topk, da->bank, db->bank, rows, da->cols, kp, int(da->codecs.size()), x,
+                                    up_base, sc.moe_a, sc.moe_p, sc.moe_ai, sc.moe_l, s);
+        }
+        for (size_t c = 0; c < da->codecs.size(); ++c)
+            da->codecs[c]->moe(sc.moe_l + c, 2 * count, n, rows, da->cols, kp, ya, 0, s);
+    }
+
+    // The pair needs the same shape, the same codec per expert and one codec index space. The part lists bound the
+    // verify block (2 x tokens x top-k parts); the A / P scratch is sized for XW_MOE_MAX_PARTS parts at XW_MAX_N
+    // columns, which that same bound keeps inside.
+    static bool can_pair(const X3Desc& a, const X3Desc& b, int rows) {
+        return a.bank && b.bank && a.rows == b.rows && a.cols == b.cols && a.parts.size() == b.parts.size() &&
+               rows == a.parts.front().rows && a.codecs == b.codecs && a.expert_codec == b.expert_codec;
     }
 
     // A prompt chunk, grouped by expert (counts [experts], groups [experts][capacity] of assignments): each expert
@@ -295,7 +341,7 @@ struct X3Format final : WeightFormat {
             // 16 parts per list: at 64 the lists' partial sums (12-25 MB) evicted the weights from L2 between an
             // expert's passes (GB10 8.1K prefill 310 vs 256 tok/s)
             constexpr int MP = 16;
-            const int kp = x3::xw_moe_kparts(d->cols);
+            const int kp = x3::xw_pmoe_kparts(d->cols);
             half* A = static_cast<half*>(grow(reinterpret_cast<void**>(&sc.pm_a), sc.pm_a_cap, size_t(MP) * N * d->cols * sizeof(half)));
             float* P = static_cast<float*>(grow(reinterpret_cast<void**>(&sc.pm_p), sc.pm_p_cap, size_t(MP) * kp * N * rows * sizeof(float)));
             std::vector<x3::XwMoeList> lists;
@@ -322,6 +368,7 @@ struct X3Format final : WeightFormat {
                     q.gsrc = groups + size_t(e) * capacity + t0;
                     q.nv = std::min(N, cnt[size_t(e)] - t0);
                     q.sdiv = per_slot_input ? 1 : topk;
+                    q.aidx = nullptr; q.xaidx = nullptr;
                     L.items += (rows / x3::XW_PMOE_COLS) * kp;
                 }
             }
@@ -362,12 +409,15 @@ private:
     static void build_bank(X3Desc& d, Scratch& sc) {
         if (d.parts.size() < 2) return;
         std::vector<x3::XwExpert> host;
+        std::vector<int> ec;
         for (const X3Part& p : d.parts) {
             if (p.rows != d.parts.front().rows || !p.codec->moe) return;
             auto it = std::find(d.codecs.begin(), d.codecs.end(), p.codec);
             if (it == d.codecs.end()) it = d.codecs.insert(d.codecs.end(), p.codec);
-            host.push_back({reinterpret_cast<const uint32_t*>(p.trellis), p.suh, p.svh, int(it - d.codecs.begin())});
+            ec.push_back(int(it - d.codecs.begin()));
+            host.push_back({reinterpret_cast<const uint32_t*>(p.trellis), p.suh, p.svh, ec.back()});
         }
+        d.expert_codec = std::move(ec);
         void* dev = nullptr;
         if (cudaMalloc(&dev, host.size() * sizeof(x3::XwExpert)) != cudaSuccess ||
             cudaMemcpy(dev, host.data(), host.size() * sizeof(x3::XwExpert), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -378,13 +428,12 @@ private:
         grow(reinterpret_cast<void**>(&sc.moe_a), sc.moe_a_cap, cols_n * d.cols * sizeof(half));
         grow(reinterpret_cast<void**>(&sc.moe_p), sc.moe_p_cap, cols_n * x3::xw_moe_kparts(d.cols) * rows * sizeof(float));
         grow(reinterpret_cast<void**>(&sc.moe_l), sc.moe_l_cap, d.codecs.size() * sizeof(x3::XwMoeList));
-        grow(reinterpret_cast<void**>(&sc.moe_s), sc.moe_s_cap, cols_n * d.cols * sizeof(half));
-        grow(reinterpret_cast<void**>(&sc.moe_y), sc.moe_y_cap, size_t(x3::XW_MAX_N) * slots * rows * sizeof(__nv_bfloat16));
-        grow(reinterpret_cast<void**>(&sc.moe_i), sc.moe_i_cap, 3 * slots * sizeof(int));
+        grow(reinterpret_cast<void**>(&sc.moe_ai), sc.moe_ai_cap, slots * x3::XW_MAX_N * sizeof(int));
     }
 
     // Every part into y at its own rows, one window call per same-codec run.
-    void run_window(const X3Desc& d, const __half* x, __nv_bfloat16* y, int n, int ldy, cudaStream_t s) const {
+    template <class Out>
+    void run_window(const X3Desc& d, const __half* x, Out* y, int n, int ldy, cudaStream_t s) const {
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
         void* ws = window_scratch(sc, d);
@@ -397,7 +446,7 @@ private:
                 off += p.rows;
             }
             x3::xw_bind_scratch(L, ws);
-            d.parts[i].codec->window(L, x, y, ldy, s);
+            xw_entry(*d.parts[i].codec, y)(L, x, y, ldy, s);
         });
     }
 
@@ -427,6 +476,17 @@ public:
         }
     }
 
+    // F32 output through the window GEMV. The out stage holds the f32 value it rounds to bf16, so storing that value as
+    // f32 is exactly what an engine got from matvec plus its own bf16 -> f32 pass, without the bf16 scratch round trip
+    // and without that pass (minimax pays two of them per layer for the shared expert). Throws when a part has no
+    // window kernel (TQLLM_DEBUG=x3v), which is how callers learn to use matvec.
+    void matvec_f32(const Mat& m, const __half* x, float* y, int n, cudaStream_t s) const override {
+        if (n < 1 || n > max_matvec_cols()) throw std::runtime_error("x3: matvec batch out of range");
+        const auto* d = static_cast<const X3Desc*>(m.aux);
+        if (!window_f32_ok(*d)) throw std::runtime_error("x3: no f32-output window GEMV for this matrix");
+        run_window(*d, x, y, n, m.rows, s);
+    }
+
     // The engine wants [rows][cols] (cuBLAS OP_T, lda = cols): each part is reconstructed straight into its
     // row block (dequant_rows, the out-major form of reconstruct; no scratch, no transpose pass).
     void dequant_h(const Mat& m, __half* out, cudaStream_t s) const override {
@@ -436,6 +496,22 @@ public:
             p.codec->dequant_rows(out + size_t(off) * m.cols, m.cols, p.trellis, p.suh, p.svh, p.rows, p.cols, s);
             off += p.rows;
         }
+    }
+
+    // A row range of it: the same walk, clipped to the parts the range touches. Record rows are multiples of 128
+    // (checked at load), so a range whose own bounds are multiples of 128 clips to whole 128-row kernel tiles.
+    bool dequant_rows_h(const Mat& m, __half* out, int row0, int nrows, cudaStream_t s) const override {
+        const auto* d = static_cast<const X3Desc*>(m.aux);
+        if (row0 < 0 || nrows <= 0 || row0 + nrows > m.rows || row0 % 128 || nrows % 128) return false;
+        int off = 0;
+        for (const X3Part& p : d->parts) {
+            const int a = std::max(row0, off), b = std::min(row0 + nrows, off + p.rows);
+            if (a < b)
+                p.codec->dequant_rows_range(out + size_t(a - row0) * m.cols, m.cols, p.trellis, p.suh, p.svh, p.rows,
+                                            p.cols, a - off, b - a, s);
+            off += p.rows;
+        }
+        return true;
     }
 
     // int8 prefill: each part reconstructed straight to int8 with the load-time row scales (no FP16 round trip, no

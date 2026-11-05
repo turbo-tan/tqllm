@@ -18,7 +18,7 @@ constexpr int kParamCopyMax = 8192;  // bytes per launch (kernel parameters, CUD
 void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream);
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,
               int experts, int topk, int n, float scale, cudaStream_t);
-// TQFN_KEEP_MAP pruning: logits[t][e] += mask[e] (0 kept / -inf pruned) for e < experts, rows of stride ld
+// TQLLM_DEBUG=keep_map pruning: logits[t][e] += mask[e] (0 kept / -inf pruned) for e < experts, rows of stride ld
 void logits_mask(float * logits, const float * mask, int n, int ld, int experts, cudaStream_t);
 // moe_topk on two routings in one launch (this layer's and the next layer's prediction); e <= 1024, warp path.
 void moe_topk2(const float * logits, int * ids, float * weights, float * shared_weights,
@@ -31,6 +31,14 @@ void moe_group(const int * ids, int * counts, int * groups, int experts, int n, 
 // lives in the other set), so one expert launch per set covers every assignment exactly once.
 void moe_split_ids(const int * ids, const int * hot_slot, const int * cold_slot, int * hot_ids, int * cold_ids,
                    int count, cudaStream_t stream);
+// Slot and dedup maps of one routed call built on the device, for a layer whose bank holds every expert (slot_of[e]):
+// slots[a] = slot_of[ids[a]]; gu / dn (each count groups of kDedupStride ints, may be null) hold the groups the host
+// build makes (opened in assignment order, up to kDedupCols columns each; inputs: the token for gu, the assignment for
+// dn), and the groups after them slot -1 (the dedup kernels skip those). count <= 1024; groups >= count.
+void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
+                    cudaStream_t stream);
+// moe_dedup_maps totals since start: calls, groups, distinct experts (synchronous read)
+void moe_dedup_stats(unsigned long long out[3]);
 // counts[ids[i]] += 1 (routing profile)
 void moe_count(const int * ids, unsigned long long * counts, int count, cudaStream_t stream);
 // --moe-host-mb: copy the routed host (cold) experts of one layer into a device stage, one slot per assignment.

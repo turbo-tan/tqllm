@@ -21,6 +21,7 @@ namespace tqllm {
 struct PrefillShape {
     int hidden = 0, hc = 0, expert_ff = 0, topk = 0, experts = 0, layers = 0;
     size_t expert_block_bytes = 0;  // one staged expert (gate + up + down, data + aux) in the bank layout
+    bool wide_bf16 = false;         // DecodeModel::prefill_wide_bf16: BF16 wide rows beside res_keep
 };
 
 struct PrefillTuning {
@@ -45,6 +46,11 @@ inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 // normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
 // a quantized down / inject reads the fp32 rows.
 inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
+// the same for quantised down mixers (hcq8: Q8_0): the norm writes an FP16 image (and a BF16 one when the inject weights are
+// BF16), which the projections read as their converted input (equal to converting the fp32 rows); resident GPU projections only
+inline bool hc_row_scales_h(int tokens, bool down_quant, bool inject_quant_or_bf16, bool gpu_projections) {
+    return tokens > 64 && down_quant && inject_quant_or_bf16 && gpu_projections;
+}
 // the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
 // block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB
 // without their scores; 3519+ MB short at 32768 with 3800). 0.15 MB per token + 128 MB; an overflow falls back to the pool.
@@ -76,7 +82,7 @@ inline PrefillChunkBytes prefill_chunk_bytes(const PrefillShape & s, const Prefi
     // pf_eg, pf_eu bf16 [A ff], pf_ax half [A ff], pf_ed bf16 [A h]
     b.expert_io = 3 * A * ff * 2 + A * h * 2;
     b.staging = 2 * align256(size_t(t.stage) * s.expert_block_bytes);
-    b.residual = n * h * size_t(s.hc) * 4;  // res_keep: the chunk's wide residual rows
+    b.residual = n * h * size_t(s.hc) * (s.wide_bf16 ? 6 : 4);  // res_keep: the chunk's wide residual rows (+ their BF16 copy)
     b.arena = std::max(t.arena_bytes, prefill_arena_bytes(t.chunk)); b.dense_cache = t.dense_cache_bytes; b.workspace = t.workspace_bytes;
     return b;
 }

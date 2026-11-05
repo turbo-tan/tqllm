@@ -1,0 +1,233 @@
+diff -ruN mlx-a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h mlx-b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
+--- mlx-a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
++++ mlx-b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
+@@ -17,6 +17,7 @@
+ constant bool has_mask [[function_constant(300)]];
+ constant bool do_causal [[function_constant(301)]];
+ constant bool has_sinks [[function_constant(302)]];
++constant bool has_lse [[function_constant(303)]];
+ 
+ template <typename T>
+ struct TransformScale {
+@@ -516,6 +517,7 @@
+     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
+     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
+     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
++    device float* lse [[buffer(8), function_constant(has_lse)]],
+     uint simd_lane_id [[thread_index_in_simdgroup]],
+     uint simd_group_id [[simdgroup_index_in_threadgroup]],
+     uint3 tid [[threadgroup_position_in_grid]],
+@@ -894,6 +896,21 @@
+     V += BK * int(params->V_strides[2]);
+   }
+ 
++  // Per-row log-sum-exp of the scaled scores (natural log) for callers that merge
++  // attention over key segments: one lane per row of the first D group writes.
++  // A row's elements sit in rows fm and fm + 8 of its fragment (kElemRowsJump).
++  if (has_lse && d_group == 0 && (simd_lane_id & 9) == 0) {
++    const short fm = short(((simd_lane_id >> 2) & 4) | ((simd_lane_id >> 1) & 3));
++    STEEL_PRAGMA_UNROLL
++    for (short i = 0; i < kRowsPT; ++i) {
++      const int r = int(tid.x) * BQ + tm + fm + i * 8;
++      if (r < params->qL) {
++        lse[(int64_t(tid.z) * params->H + tid.y) * params->qL + r] =
++            (float(max_score[i]) + metal::log2(float(sum_score[i]))) * M_LN2_F;
++      }
++    }
++  }
++
+   // Normalize output
+   threadgroup_barrier(mem_flags::mem_none);
+ 
+diff -ruN mlx-a/mlx/backend/metal/scaled_dot_product_attention.cpp mlx-b/mlx/backend/metal/scaled_dot_product_attention.cpp
+--- mlx-a/mlx/backend/metal/scaled_dot_product_attention.cpp
++++ mlx-b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -25,7 +25,8 @@
+     array& o,
+     bool do_causal_,
+     const std::optional<array>& mask,
+-    const std::optional<array>& sinks) {
++    const std::optional<array>& sinks,
++    array* lse = nullptr) {
+   using namespace mlx::steel;
+ 
+   int bd = q.shape(-1);
+@@ -79,13 +80,19 @@
+   const bool has_mask = mask.has_value();
+   const bool do_causal = do_causal_;
+   const bool has_sinks = sinks.has_value();
++  const bool has_lse = lse != nullptr;
++  if (has_lse && !split_d) {
++    throw std::invalid_argument(
++        "[scaled_dot_product_attention] the log-sum-exp output needs the head-dim split kernel (head dim 256 or 512).");
++  }
+ 
+   metal::MTLFCList func_consts = {
+       {&align_Q, MTL::DataType::DataTypeBool, 200},
+       {&align_K, MTL::DataType::DataTypeBool, 201},
+       {&has_mask, MTL::DataType::DataTypeBool, 300},
+       {&do_causal, MTL::DataType::DataTypeBool, 301},
+-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
++      {&has_sinks, MTL::DataType::DataTypeBool, 302},
++      {&has_lse, MTL::DataType::DataTypeBool, 303}};
+ 
+   std::string base_name;
+   concatenate(
+@@ -120,7 +127,9 @@
+       "_do_causal_",
+       (do_causal ? 't' : 'n'),
+       "_has_sinks_",
+-      (has_sinks ? 't' : 'n'));
++      (has_sinks ? 't' : 'n'),
++      "_has_lse_",
++      (has_lse ? 't' : 'n'));
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+ 
+@@ -191,6 +200,9 @@
+   if (has_sinks) {
+     compute_encoder.set_input_array(*sinks, 7);
+   }
++  if (has_lse) {
++    compute_encoder.set_output_array(*lse, 8);
++  }
+ 
+   MTL::Size grid_dims = MTL::Size(NQ, H, B);
+   MTL::Size group_dims = MTL::Size(32, wm, wn);
+@@ -209,7 +221,8 @@
+     array& o,
+     bool do_causal_,
+     const std::optional<array>& mask,
+-    const std::optional<array>& sinks) {
++    const std::optional<array>& sinks,
++    array* lse = nullptr) {
+   int B = q.shape(0);
+   int H = q.shape(1);
+   int D = q.shape(3);
+@@ -231,7 +244,12 @@
+         /* array& o = */ o,
+         /* bool do_causal_ = */ do_causal_,
+         /* const std::optional<array>& mask = */ mask,
+-        /* const std::optional<array>& sinks = */ sinks);
++        /* const std::optional<array>& sinks = */ sinks,
++        /* array* lse = */ lse);
++  }
++  if (lse != nullptr) {
++    throw std::invalid_argument(
++        "[scaled_dot_product_attention] the log-sum-exp output needs the NAX attention kernel.");
+   }
+ 
+   // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
+@@ -726,11 +744,14 @@
+   if (s.device != Device::gpu) {
+     return {false, "the fused kernels require a GPU (Metal) stream."};
+   }
+-  if (output_logsumexp) {
++  if (output_logsumexp &&
++      !(metal::is_nax_available() && q.shape(2) > 8 && v.shape(-1) == q.shape(-1) &&
++        (q.shape(-1) == 256 || q.shape(-1) == 512) &&
++        (env::enable_tf32() || q.dtype() != float32))) {
+     return {
+         false,
+-        "the fused forward does not produce the logsumexp required for "
+-        "the fused VJP; use default routing when training."};
++        "the fused forward produces the logsumexp only on the NAX head-dim "
++        "split kernel (head dim 256 / 512, more than 8 queries)."};
+   }
+ 
+   const int value_head_dim = v.shape(-1);
+@@ -1048,8 +1069,13 @@
+         ? std::optional<array>{copy_unless(is_matrix_contiguous, inputs[3])}
+         : std::nullopt;
+ 
++    array* lse = nullptr;
++    if (output_logsumexp_) {
++      lse = &outputs[1];
++      lse->set_data(allocator::malloc(lse->nbytes()));
++    }
+     sdpa_full_self_attention_metal(
+-        s, d, q, k, v, scale_, o, do_causal_, mask, sinks);
++        s, d, q, k, v, scale_, o, do_causal_, mask, sinks, lse);
+   }
+ 
+   metal::get_command_encoder(s).add_temporaries(std::move(copies));
+diff -ruN mlx-a/mlx/fast.cpp mlx-b/mlx/fast.cpp
+--- mlx-a/mlx/fast.cpp
++++ mlx-b/mlx/fast.cpp
+@@ -970,6 +970,54 @@
+   return fallback(std::move(inputs))[0];
+ }
+ 
++std::vector<array> scaled_dot_product_attention_lse(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    const array& mask,
++    StreamOrDevice s /* = {} */) {
++  for (const auto& tensor : {queries, keys, values, mask}) {
++    if (tensor.ndim() != 4) {
++      throw std::invalid_argument(
++          "[scaled_dot_product_attention_lse] queries, keys, values and mask must be 4D.");
++    }
++  }
++  if (mask.dtype() != bool_) {
++    throw std::invalid_argument("[scaled_dot_product_attention_lse] the mask must be bool.");
++  }
++  auto final_type = result_type(queries, keys, values);
++  auto stream = to_stream(s);
++  auto q = astype(queries, final_type, stream);
++  auto k = astype(keys, final_type, stream);
++  auto v = astype(values, final_type, stream);
++  auto mask_shape = q.shape();
++  mask_shape.back() = k.shape(-2);
++  std::vector<array> inputs = {q, k, v, broadcast_to(mask, mask_shape, stream)};
++  // force_fused: throws when no fused kernel can produce the log-sum-exp
++  ScaledDotProductAttention::use_fallback(
++      q, k, v, true, true, false, false, true, true, stream);
++  if (!ScaledDotProductAttention::supports_bool_mask()) {
++    float inf = std::numeric_limits<float>::infinity();
++    inputs[3] = where(
++        inputs[3],
++        full_like(inputs[3], 0, final_type, stream),
++        full_like(inputs[3], -inf, final_type, stream),
++        stream);
++  }
++  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
++    throw std::runtime_error("[scaled_dot_product_attention_lse] no fallback");
++  };
++  auto primitive = std::make_shared<ScaledDotProductAttention>(
++      stream, fallback, scale, false, false, true, true);
++  return array::make_arrays(
++      {Shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)},
++       Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
++      {final_type, float32},
++      primitive,
++      std::move(inputs));
++}
++
+ std::vector<array> ScaledDotProductAttention::vjp(
+     const std::vector<array>& primals,
+     const std::vector<array>& cotangents,
+diff -ruN mlx-a/mlx/fast.h mlx-b/mlx/fast.h
+--- mlx-a/mlx/fast.h
++++ mlx-b/mlx/fast.h
+@@ -60,6 +60,18 @@
+     bool force_fused = false,
+     StreamOrDevice s = {});
+ 
++#define MLX_HAS_SDPA_LSE 1
++/** Fused attention that also returns each query row's log-sum-exp of the scaled scores (natural log), shape
++ * [B, H, L_q, 1] float32, for merging attention computed over key segments. Bool array mask only; NAX GPUs, head dim
++ * 256 / 512, more than 8 queries (throws otherwise). */
++MLX_API std::vector<array> scaled_dot_product_attention_lse(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    const array& mask,
++    StreamOrDevice s = {});
++
+ MLX_API std::vector<array> gated_delta_update(
+     const array& queries,
+     const array& keys,

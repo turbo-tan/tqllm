@@ -72,13 +72,27 @@ __device__ __forceinline__ void xw_had_in_body(const List& L, const half* __rest
     XwWarpTask w;
     if (!xw_warp_task(L, L.cols, w)) return;
     const XwPart& P = L.p[w.part];
-    xw_had_row((P.x ? P.x : x) + (size_t) w.t * L.cols, P.suh, P.A + (size_t) w.t * L.cols, w.c0);
+    half* a = P.A + (size_t) w.t * L.cols;
+    // a per-slot input (the routed down projection) reads x through the build's assignment map: column t is the row of
+    // the assignment that routed here, zero when token t did not route to this expert (H128 of a zero row is zero).
+    const int row = P.xaidx ? P.xaidx[w.t] : w.t;
+    if (row < 0) {
+        *reinterpret_cast<uint2*>(a + w.c0) = make_uint2(0u, 0u);
+        return;
+    }
+    xw_had_row((P.x ? P.x : x) + (size_t) row * L.cols, P.suh, a, w.c0);
 }
 
 static __global__ void xw_had_in(XwList L, const half* __restrict__ x) { xw_had_in_body(L, x); }
 
-// y row = bf16(svh * H128(sum_kp P[kp][t])) for one lane's 4 elements of a 128 block
-__device__ __forceinline__ void xw_out_row(const XwPart& P, int n, int t, int c0, __nv_bfloat16* o) {
+// The store of one output element. The f32 form keeps the bf16 rounding: an engine that asked for f32 used to get
+// bf16 here and widen it itself, so this is the same value with the bf16 buffer and the widening pass left out.
+__device__ __forceinline__ void xw_put(__nv_bfloat16* o, float v) { *o = __float2bfloat16(v); }
+__device__ __forceinline__ void xw_put(float* o, float v) { *o = __bfloat162float(__float2bfloat16(v)); }
+
+// y row = svh * H128(sum_kp P[kp][t]) for one lane's 4 elements of a 128 block
+template <class Out>
+__device__ __forceinline__ void xw_out_row(const XwPart& P, int n, int t, int c0, Out* o) {
     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int kp = 0; kp < P.kparts; ++kp) {
         const float4 q = *reinterpret_cast<const float4*>(P.P + ((size_t) kp * n + t) * P.rows + c0);
@@ -90,14 +104,14 @@ __device__ __forceinline__ void xw_out_row(const XwPart& P, int n, int t, int c0
     shuffle_had_f2x32(v.z, v.w, threadIdx.x & 31);
     const half2* sv = reinterpret_cast<const half2*>(P.svh + c0);
     const half2 sa = sv[0], sb = sv[1];
-    o[0] = __float2bfloat16(v.x * kRScale * __low2float(sa));
-    o[1] = __float2bfloat16(v.y * kRScale * __high2float(sa));
-    o[2] = __float2bfloat16(v.z * kRScale * __low2float(sb));
-    o[3] = __float2bfloat16(v.w * kRScale * __high2float(sb));
+    xw_put(o + 0, v.x * kRScale * __low2float(sa));
+    xw_put(o + 1, v.y * kRScale * __high2float(sa));
+    xw_put(o + 2, v.z * kRScale * __low2float(sb));
+    xw_put(o + 3, v.w * kRScale * __high2float(sb));
 }
 
-template <class List>
-__device__ __forceinline__ void xw_out_body(const List& L, __nv_bfloat16* __restrict__ y, int ldy) {
+template <class List, class Out>
+__device__ __forceinline__ void xw_out_body(const List& L, Out* __restrict__ y, int ldy) {
     XwWarpTask w;
     if (!xw_warp_task(L, -1, w)) return;
     const XwPart& P = L.p[w.part];
@@ -105,6 +119,7 @@ __device__ __forceinline__ void xw_out_body(const List& L, __nv_bfloat16* __rest
 }
 
 static __global__ void xw_out(XwList L, __nv_bfloat16* __restrict__ y, int ldy) { xw_out_body(L, y, ldy); }
+static __global__ void xw_out_f32(XwList L, float* __restrict__ y, int ldy) { xw_out_body(L, y, ldy); }
 
 // ---------------------------------------------------------------------------------------------------------
 // gemv: a persistent grid walks the items (XwGeom: WK k-split warps x WNT tiles, PF slices in flight).
@@ -124,24 +139,30 @@ __device__ __forceinline__ void xw_mma(const FragB& f0, const FragB& f1, uint32_
 }
 
 // Shared memory of one gemv block: the A stage (n rows, padded stride) or the k-split reduction, whichever is larger.
+// The reduction holds 8 * NB batch rows - the rows one item actually writes (NB = the mma halves it runs, so 8 at
+// n <= 8 and 16 above), not XW_MAX_N: at the decode shapes the stage is far below a 16-row reduction, and the launch's
+// shared memory is what sizes the resident grid (32 KB is 3 blocks per SM, 16 KB is 6).
 __host__ __device__ constexpr int xw_a_stride(int k_slices) { return k_slices * 8 + 4; }
-inline size_t xw_gemv_smem(int n, int k_slices) {
+__host__ __device__ constexpr int xw_red_rows(int nb) { return 8 * nb; }
+inline size_t xw_gemv_smem(int n, int k_slices, int nb) {
     const size_t a = (size_t) n * xw_a_stride(k_slices) * 4;
-    const size_t red = (size_t) XwGeom::WK * XW_MAX_N * XwGeom::COLS * 4;
+    const size_t red = (size_t) XwGeom::WK * xw_red_rows(nb) * XwGeom::COLS * 4;
     return a > red ? a : red;
 }
 
-// One item (part, column group, k part): P_part[kp][t][group columns].
+// One item (part, column group, k part): P_part[kp][t][group columns]. `smem` is the block's stage: the dynamic
+// shared memory for the dense lists, which starts after the MoE kernel's compact list copy.
 template <class Codec, int NB, class List>
-__device__ __forceinline__ void xw_item(const List& L, int item) {
+__device__ __forceinline__ void xw_item(const List& L, int item, uint32_t* xw_smem) {
     using G = XwGeom;
+    constexpr bool PACKED = Codec::packed_wnt(G::WNT);
     constexpr int TWORDS = Codec::u32words;
     constexpr int LOADS = Codec::loads(G::WNT);
-    constexpr int LSTRIDE = Codec::ld_stride;
+    constexpr int LSTRIDE = Codec::ld_stride_wnt(G::WNT);
 
     int pi = 0;
     while (pi + 1 < L.count && item >= L.p[pi + 1].item0) ++pi;
-    const XwPart& P = L.p[pi];
+    const auto& P = L.p[pi];   // XwPart, or the gemv kernel's compact XwGemvPart copy of it
     item -= P.item0;
 
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -156,8 +177,8 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
     const size_t slice_stride = (size_t) ntiles * TWORDS;
     const uint32_t* bp = P.B + (size_t) x3_tile_offset(ks0, group * G::WNT, ntiles) * TWORDS + lane;
     auto ld_b = [&](int i, int l) -> uint32_t {
-        if constexpr (Codec::ld_lanes < 32)
-            return lane < Codec::ld_lanes ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
+        if constexpr (Codec::ld_lanes_wnt(G::WNT) < 32)
+            return lane < Codec::ld_lanes_wnt(G::WNT) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0u;
         else
             return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
     };
@@ -173,7 +194,6 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
     // The item's activations (n rows x its k range) are staged in shared memory once, behind the first
     // weight loads: per-slice L2 reads of A were a stall of the loop. Row stride padded by 4 words so the
     // 8 batch rows of a warp read hit 32 distinct banks.
-    extern __shared__ __align__(16) uint32_t xw_smem[];
     const int a_words = k_slices * 8, a_stride = xw_a_stride(k_slices);
     {
         const uint4* src = reinterpret_cast<const uint4*>(P.A) + (size_t) kp * a_words / 4;
@@ -225,7 +245,7 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
             #pragma unroll
             for (int t = 0; t < G::WNT; ++t) {
                 FragB f0, f1;
-                codec.tile(bw, t, f0, f1);
+                codec.template tile<PACKED>(bw, t, f0, f1);
                 #pragma unroll
                 for (int h = 0; h < NB; ++h) xw_mma(f0, f1, alo[h], ahi[h], ch[t][h]);
             }
@@ -246,7 +266,7 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
 
     // k-split warps summed in fixed order through shared memory (reusing the A stage): red[warp][row][column]
     __syncthreads();
-    auto red = reinterpret_cast<float (*)[XW_MAX_N][G::COLS]>(xw_smem);
+    auto red = reinterpret_cast<float (*)[xw_red_rows(NB)][G::COLS]>(xw_smem);
     {
         const int g = lane >> 2, q2 = 2 * (lane & 3);
         #pragma unroll
@@ -274,22 +294,37 @@ __device__ __forceinline__ void xw_item(const List& L, int item) {
 }
 
 // Persistent: a resident grid walks the items, so block start-up and drain are paid once per launch.
+// Blocks per SM the compiler is asked for: a 256-thread block at K5 / K6 holds 145-161 registers, which is the whole
+// register file, so one block per SM runs the dense stage. Asking for two caps it at 128 and the K5 decode fits that
+// (no spill; cold 6144x6144 K5 57.6 / 59.0 / 64.1 us against 67.7 / 77.5 / 80.6 at n = 1 / 4 / 8, +17-24 %), while the
+// K6 decode spills to stack and loses 2-4 %, so the bound follows the codec's words per tile.
+template <class Codec>
+constexpr int xw_gemv_min_blocks() { return Codec::u32words <= 40 ? 2 : 1; }
+
 template <class Codec, int NB>
-__global__ __launch_bounds__(XwGeom::THREADS) void xw_gemv(XwList L) {
-    for (int item = blockIdx.x; item < L.items; item += gridDim.x) xw_item<Codec, NB>(L, item);
+__global__ __launch_bounds__(XwGeom::THREADS, xw_gemv_min_blocks<Codec>()) void xw_gemv(XwList L) {
+    extern __shared__ __align__(16) uint32_t xw_smem[];
+    for (int item = blockIdx.x; item < L.items; item += gridDim.x) xw_item<Codec, NB>(L, item, xw_smem);
 }
 
-// One gemv launch with NB batch halves; the resident grid is sized once per instantiation.
+// One gemv launch with NB batch halves; the resident grid is sized from the shared memory this launch asks for.
 template <class Codec, int NB>
 void xw_gemv_launch(const XwList& L, size_t smem, cudaStream_t s) {
-    static int resident = [] {
-        const size_t most = xw_gemv_smem(8 * NB, XW_MAX_ITEM_SLICES);   // NB = 2: above the 48 KB default
+    static const int sms = [] {
+        const size_t most = xw_gemv_smem(8 * NB, XW_MAX_ITEM_SLICES, NB);   // NB = 2: above the 48 KB default
         cudaFuncSetAttribute(xw_gemv<Codec, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(most));
-        int b = 1, sms = 1;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, xw_gemv<Codec, NB>, XwGeom::THREADS, most);
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-        return max(1, b) * sms;
+        int v = 1;
+        cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0);
+        return max(1, v);
     }();
+    static size_t last_smem = 0;
+    static int resident = 0;
+    if (smem != last_smem) {   // a 16-row reduction and a 160-slice stage is not what a decode launch asks for
+        int b = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, xw_gemv<Codec, NB>, XwGeom::THREADS, smem);
+        resident = max(1, b) * sms;
+        last_smem = smem;
+    }
     xw_gemv<Codec, NB><<<min(L.items, resident), XwGeom::THREADS, smem, s>>>(L);
 }
 
@@ -302,16 +337,29 @@ inline int xw_warp_blocks(const XwList& L, bool in) {
     return ceil_div(warps, 8);
 }
 
-// The three launches. Every part of L must use Codec (the dispatcher splits mixed lists).
+// The had_in + gemv pair of a dense matvec (the out stage then decides the output type).
 template <class Codec>
-void xw_matvec(const XwList& L, const half* x, __nv_bfloat16* y, int ldy, cudaStream_t s) {
+void xw_gemv_pair(const XwList& L, const half* x, cudaStream_t s) {
     xw_had_in<<<xw_warp_blocks(L, true), 256, 0, s>>>(L, x);
     int ks_max = 0;
     for (int i = 0; i < L.count; ++i) ks_max = max(ks_max, L.cols / 16 / L.p[i].kparts);
-    const size_t smem = xw_gemv_smem(L.n, ks_max);
+    const size_t smem = xw_gemv_smem(L.n, ks_max, L.n > 8 ? 2 : 1);
     if (L.n > 8) xw_gemv_launch<Codec, 2>(L, smem, s);
     else xw_gemv_launch<Codec, 1>(L, smem, s);
+}
+
+template <class Codec>
+void xw_matvec(const XwList& L, const half* x, __nv_bfloat16* y, int ldy, cudaStream_t s) {
+    xw_gemv_pair<Codec>(L, x, s);
     xw_out<<<xw_warp_blocks(L, false), 256, 0, s>>>(L, y, ldy);
+}
+
+// The same three launches with the out stage writing f32 (the bf16 value widened): what an engine that converts
+// matvec's output to f32 itself pays a bf16 buffer and a pass for.
+template <class Codec>
+void xw_matvec_f32(const XwList& L, const half* x, float* y, int ldy, cudaStream_t s) {
+    xw_gemv_pair<Codec>(L, x, s);
+    xw_out_f32<<<xw_warp_blocks(L, false), 256, 0, s>>>(L, y, ldy);
 }
 
 }  // namespace x3

@@ -1,5 +1,6 @@
 #include "vision.hpp"
 
+#include "dequant.hpp"
 #include "gguf.hpp"
 #include "vision_kernels.cuh"
 
@@ -73,7 +74,7 @@ float f16_bits_to_f32(uint16_t b) {
     return __half2float(h);
 }
 
-// host FP32 copy of an F32 / F16 tensor
+// host FP32 copy of a tensor (F32, F16, or any type with a CPU reference: Q8_0, Q5_0 / Q5_1, K-quants)
 std::vector<float> host_f32(const GgufFile & f, const std::string & name, size_t expect) {
     const auto it = f.tensors.find(name);
     if (it == f.tensors.end()) throw std::runtime_error("mmproj: missing tensor " + name);
@@ -86,7 +87,13 @@ std::vector<float> host_f32(const GgufFile & f, const std::string & name, size_t
             std::memcpy(&b, raw.data() + 2 * i, 2);
             out[i] = f16_bits_to_f32(b);
         }
-    else throw std::runtime_error("mmproj: unexpected type or size for " + name);
+    else {
+        try {
+            dequantize_host(it->second.type, raw.data(), out.data(), int64_t(expect));
+        } catch (const std::exception & e) {
+            throw std::runtime_error("mmproj: tensor " + name + " (type " + std::to_string(it->second.type) + "): " + e.what());
+        }
+    }
     return out;
 }
 

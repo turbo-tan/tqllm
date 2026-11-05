@@ -3,7 +3,7 @@
 
 Names, metadata and the non-quantized tensors come from the BF16 GGUF that convert_hf_to_gguf.py made from the
 dequantized export (mlx_dequant_stream.py). Quantized matrices are re-packed from the export's codes, scales and
-biases in the lane order of the M5 matrix unit (src/backends/mlx/nax_affine.cpp); the token embedding keeps a row-major
+biases in the lane order of the M5 matrix unit (src/backends/metal/nax_affine.cpp); the token embedding keeps a row-major
 8-bit layout for gathers. Every converted tensor is dequantized and compared with the BF16 GGUF before writing.
 """
 import argparse, json, os, re, sys

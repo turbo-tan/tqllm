@@ -6,6 +6,7 @@
 #include <fstream>
 #include <regex>
 #include <limits>
+#include <map>
 #include <stdexcept>
 
 namespace tqllm {
@@ -100,6 +101,18 @@ uint64_t tensor_bytes(uint32_t type, uint64_t n, const std::string & name, const
 
 } // namespace
 
+namespace {
+std::map<uint32_t, std::pair<uint64_t, uint64_t>> & plugin_types() { static std::map<uint32_t, std::pair<uint64_t, uint64_t>> t; return t; }
+}  // namespace
+
+void register_tensor_type(uint32_t type, uint64_t elems, uint64_t bytes) {
+    uint64_t e, b;
+    if (!elems || !bytes) throw std::invalid_argument("tensor type " + std::to_string(type) + ": empty block");
+    if (gguf_block_layout(type, e, b) && (e != elems || b != bytes))
+        throw std::invalid_argument("tensor type " + std::to_string(type) + " is already defined with another block");
+    plugin_types()[type] = {elems, bytes};
+}
+
 bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
     // elems = weights per block, bytes = encoded size of one block.
     // The 2-bit K-quants (Q2_K, IQ2_S) carry MoE expert tensors - GLM-5.3-Flash uses
@@ -108,13 +121,17 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
     // tensors divide evenly, none is out of bounds, and per-shard byte sums match the file
     // payload to within alignment padding (560/480/480/280 B, 0.0000%). Table in
     // docs/MOE_PLAN.md 3b.
+    if (const auto it = plugin_types().find(type); it != plugin_types().end()) { elems = it->second.first; bytes = it->second.second; return true; }
     switch (type) {
         case GGML_F32:    elems = 1;   bytes = 4;   return true;
         case GGML_F16:
         case GGML_BF16:
         case GGML_I16:    elems = 1;   bytes = 2;   return true;
         case GGML_Q4_0:   elems = 32;  bytes = 18;  return true;
+        case GGML_Q4_1:   elems = 32;  bytes = 20;  return true;  // d, m, 16 bytes of nibbles (MLX affine 4-bit group 32)
         case GGML_Q8_0:   elems = 32;  bytes = 34;  return true;
+        case GGML_Q5_0:   elems = 32;  bytes = 22;  return true;  // d, 32 high bits, 16 bytes of low nibbles
+        case GGML_Q5_1:   elems = 32;  bytes = 24;  return true;  // d, m, 32 high bits, 16 bytes of low nibbles
         case GGML_MXFP8:  elems = 32;  bytes = 33;  return true;  // per row: the E4M3 bytes, then the row's scales
         case GGML_GSQ_Q2_0: elems = 64; bytes = 18; return true;
         case GGML_TQ3_4S: elems = 32;  bytes = 16;  return true;

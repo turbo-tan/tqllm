@@ -10,7 +10,7 @@
 //   bytes per 32 weights). Matches dequantize_host case 20 (src/formats/weight/dequant.cpp:380-383),
 //   which strides iq4nl(s + b*18, dst + b*32).
 //   Shapes from blk.ffn_*_exps.weight headers: gate/up rows=640 cols=2560,
-//   down rows=2560 cols=640. (Claude's spec said 2048; hidden is 2560 -- see agora c1f99c07.)
+//   down rows=2560 cols=640 (hidden is 2560, not 2048).
 //
 // TWO KERNELS:
 //   *_fp32  : exact dequant to fp32 + FMA. This is the one that must hit <=1e-5 relative

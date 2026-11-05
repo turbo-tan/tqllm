@@ -3,7 +3,7 @@
 #include <unordered_map>
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
-#include "../src/cuda_recover.hpp"
+#include "cuda_recover.hpp"
 #include "dev_alloc.cuh"
 #include "tq3_expert_cache.hpp"
 #include "packed_experts.hpp"
@@ -68,17 +68,6 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }
-// expert slots hold lane-contiguous tiles: only with a packed experts file (cold GGUF uploads stay untiled); --pack-experts
-// writes tiled blocks unless TQFN_TILED=0
-inline bool g_tile_experts = false;
-// attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
-// it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
-inline int g_kv_capacity = 2048;
-inline int g_kv_capacity_full = 0;  // the slot context's K/V capacity (g_kv_capacity follows each request)
-// slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
-// banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
-inline bool g_small_card = false;
-inline bool g_cpu_owned = false;  // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
 
 using namespace tqllm;
 inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = __builtin_LINE()) {
@@ -87,27 +76,20 @@ inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = 
     throw std::runtime_error(std::string(cudaGetErrorString(rc)) + " (" + (base ? base + 1 : file) + ":" + std::to_string(line) + ")");
 }
 inline void require(bool ok, const std::string & why) { if (!ok) throw std::runtime_error(why); }
-inline bool exact_f32() { static const bool on = std::getenv("TQFN_EXACT_F32") != nullptr; return on; }
+inline bool exact_f32() { return false; }  // the fp32 reference path is for tests only
 inline void f32_to_half_host(const float * src, __half * dst, size_t count) {
     std::vector<float> v(count); ck(cudaMemcpy(v.data(), src, count * sizeof(float), cudaMemcpyDeviceToHost));
     std::vector<__half> h(count); for (size_t i = 0; i < count; ++i) h[i] = __float2half_rn(v[i]);
     ck(cudaMemcpy(dst, h.data(), count * sizeof(__half), cudaMemcpyHostToDevice));
 }
-inline bool bf16_act() { static const bool on = std::getenv("TQFN_BF16_ACT") != nullptr; return on; }
+inline bool bf16_act() { return false; }  // FP16 activations
 inline void round_bf16_device(float * p, size_t count) {
     std::vector<float> v(count); ck(cudaMemcpy(v.data(), p, count * sizeof(float), cudaMemcpyDeviceToHost));
     for (auto & x : v) { uint32_t u; std::memcpy(&u, &x, 4); u = (u + 0x7fff + ((u >> 16) & 1)) & 0xffff0000u; std::memcpy(&x, &u, 4); }
     ck(cudaMemcpy(p, v.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-inline bool round32_gpu_side(const std::string & name) {
-    static const char * mode = std::getenv("TQFN_ROUND32");
-    if (!mode) return false;
-    if (std::string(mode) == "all") return true;
-    for (const char * cpu : {"ssm_alpha", "ssm_beta", "attn_qkv", "attn_gate", "shexp", "ffn_gate_inp", "hc_", "ple", "per_layer"})
-        if (name.find(cpu) != std::string::npos) return false;
-    return true;
-}
+inline bool round32_gpu_side(const std::string &) { return false; }  // the Q8-rounding diagnostic (KLD hunt 10-08) is closed
 
 inline void cpu_q8_round(std::vector<float> & values) {
     require(values.size() % 32 == 0, "Q8 diagnostic needs complete blocks");
@@ -135,37 +117,65 @@ inline void cpu_q8k_round(std::vector<float> & values) {
 // one buffer that is reset per decode step, so a token makes no allocation calls. State that outlives a step must be
 // allocated under PersistentAlloc.
 struct ScratchArena { char * base = nullptr; size_t size = 0, used = 0, high = 0; };
-inline bool g_prefill_log = std::getenv("TQFN_PREFILL_LOG") != nullptr; inline double g_qsa_ms = 0;  // prefill profile (syncs)
+inline const bool kPrefillLog = tqllm::debug_cstr("fn_prefill_log") != nullptr;  // prefill profile (syncs)
 inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
-inline bool g_profile_decode_req = false;  // TQFN_PROFILE_DECODE: the profiled request is in its decode
-inline int g_qsa_block = 2048;  // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
-inline int g_sub_req = 0;       // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
-inline int g_prefill_epoch = 0;  // bumped when a prefill releases decode scratch: graph capture warms up again
-inline uint64_t g_kv_epoch = 0;   // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
-inline std::unique_ptr<tqllm_cuda::QsaBatchScratch> g_qsa_batch;  // QSA selection scratch, sized by g_qsa_block
-// TQFN_KEEP_MAP (expert pruning): per trunk layer [experts] device mask (0 kept, -inf pruned), null when off
-inline const std::vector<int32_t> * g_hot_map = nullptr;
-inline MixedExpertCache * g_cold_cache = nullptr;
-inline const float * g_keep_mask = nullptr;
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
 // 256-token sub-chunk of that layer (the pool is a prefill borrow: counted in the bank eviction, freed with the prefill buffers)
-struct DenseHalfCache { char * base = nullptr; size_t cap = 0, used = 0, high = 0; int layer = -2; std::unordered_map<const void *, __half *> map; };
-inline DenseHalfCache g_dhc;
+struct DenseHalfCache {
+    char * base = nullptr; size_t cap = 0, used = 0, high = 0; int layer = -2; std::unordered_map<const void *, __half *> map;
+    void release() {
+        if (base && kPrefillLog) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", high / 1048576.0, cap / 1048576.0);
+        if (base) cudaFree(base); *this = DenseHalfCache{};
+    }
+};
 // layer-major prefill tuning (tqserve parameters --prefill-*, --dense-cache-mb; set before the engine starts)
 struct FnTune { int chunk = 16384, sub = 2048, stage = 192, dense_min = 256, borrow_count = 0; long reserve_mb = 1000, arena_mb = 3800, dense_cache_mb = 600;
                 tqllm::BorrowMode borrow = tqllm::BorrowMode::Auto;
                 bool dense_cache_set = false, chunk_set = false, stage_set = false; };  // set: given on the command line
-inline FnTune g_tune;
-inline size_t dense_half_pool_bytes() { return size_t(std::max(0L, g_tune.dense_cache_mb)) << 20; }
-inline void dense_half_release() {
-    if (g_dhc.base && std::getenv("TQFN_PREFILL_LOG")) std::fprintf(stderr, "tqllm: dense fp16 pool high-water %.0f of %.0f MB\n", g_dhc.high / 1048576.0, g_dhc.cap / 1048576.0);
-    if (g_dhc.base) cudaFree(g_dhc.base); g_dhc = DenseHalfCache{};
-}
+// one engine's run-time choices: tqserve options (tune, exact) and what the load decided (the rest); Checkpoint::run
+struct FnConfig {
+    FnTune tune;
+    bool exact = false;  // --exact on: no CPU miss pool (CPU-served experts make greedy text vary run to run)
+    // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
+    // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
+    bool small_card = false;
+    // expert slots hold lane-contiguous tiles: only with a packed experts file (cold GGUF uploads stay untiled); --pack-experts
+    // writes tiled blocks unless TQFN_TILED=0
+    bool tile_experts = false;
+    float draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
+    int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
+    bool prompt_cache = false;  // --prompt-cache on (several slots): a slot keeps its sequence and reuses a shared prompt prefix
+    bool unified_memory = false;  // the GPU shares system memory (GB10): set at load
+};
+// one engine's mutable state shared by its sequences (one stream): Checkpoint::rt
+struct FnRuntime {
+    // attention KV positions per sequence: 2048 = the QSA indexer budget (dense attention is exact below it); the server raises
+    // it for long contexts (dense attention over every position, see TQFN_SERVE_ENGINE)
+    int kv_capacity = 2048;
+    int kv_capacity_full = 0;  // the slot context's K/V capacity (kv_capacity follows each request)
+    bool cpu_owned = false;    // the CPU expert pool computes the owned experts (decode_rules.hpp cpu_owned); set by the decode pool
+    bool profile_decode_req = false;  // TQLLM_DEBUG=profile_decode: the profiled request is in its decode
+    double qsa_ms = 0;         // prefill profile (kPrefillLog)
+    int qsa_block = 2048;      // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
+    int block_seqs = 1;        // sequences in the decode block being run (batched np > 1 verify): predicts() scales its row limit
+    int trace_waves = 0, trace_min_slots = 1 << 30;  // TQLLM_DEBUG=steptrace: decode layers on the waves path / fewest bank slots this step
+    int sub_req = 0;           // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
+    int prefill_epoch = 0;     // bumped when a prefill releases decode scratch: graph capture warms up again
+    uint64_t kv_epoch = 0;     // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
+    std::unique_ptr<tqllm_cuda::QsaBatchScratch> qsa_batch;  // QSA selection scratch, sized by qsa_block
+    // release_prefill trims the memory pool only when free device memory is below this (the refill and the MTP bank need
+    // it); the trim costs 60-100 ms of idle GPU, so a request whose refill fits without it skips it
+    size_t trim_below = SIZE_MAX;
+    DenseHalfCache dhc;
+    // pilot hot / cold split (hot_map=) and TQLLM_DEBUG=keep_map (expert pruning: per trunk layer [experts] device mask,
+    // 0 kept, -inf pruned); null when off
+    const std::vector<int32_t> * hot_map = nullptr;
+    MixedExpertCache * cold_cache = nullptr;
+    const float * keep_mask = nullptr;
+};
+inline size_t dense_half_pool_bytes(const FnTune & tune) { return size_t(std::max(0L, tune.dense_cache_mb)) << 20; }
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)
-// release_prefill trims the memory pool only when free device memory is below this (the refill and the MTP bank need
-// it); the trim costs 60-100 ms of idle GPU, so a request whose refill fits without it skips it
-inline size_t g_trim_below = SIZE_MAX;
 struct ArenaMark { size_t at = g_arena ? g_arena->used : 0; ~ArenaMark() { if (g_arena) g_arena->used = at; } };
 template<class T> struct Device {
     T * p = nullptr; size_t count; bool owned = true, plain = false;
@@ -191,6 +201,10 @@ template<class T> struct Device {
             ck(cudaThreadExchangeStreamCaptureMode(&mode));
             if (e != cudaSuccess) { cudaGetLastError(); throw std::runtime_error(std::string(cudaGetErrorString(e)) + ": device buffer of " + std::to_string(bytes >> 20) + " MiB in a graph capture"); }
             plain = true; return;
+        }
+        if (bytes >= (size_t(1) << 20)) {  // TQLLM_DEBUG=seqmem: every pool allocation of 1 MiB or more (who holds a sequence's memory)
+            static const bool log = tqllm::debug_on("seqmem");
+            if (log) std::fprintf(stderr, "SEQMEM %s %zu KiB (%zu x %zu B)\n", g_persistent ? "persistent" : "temporary", bytes >> 10, n, sizeof(T));
         }
         if (const cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&p), bytes, nullptr); e != cudaSuccess) {
             cudaGetLastError(); size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);

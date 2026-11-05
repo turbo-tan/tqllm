@@ -2,15 +2,24 @@
 // Engine options, fixed when a Model is built. Every tool parses them with parse_engine_option (llama.cpp names
 // where llama.cpp has the option); tqserve's memory fit fills the placement fields itself.
 #include <cstdint>
+#include <cstdlib>
+#include <iosfwd>
 #include <string>
+#include <vector>
 
 #include "tqllm/rope_scaling.hpp"
 
 namespace tqllm {
+// --exact on (default): every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs, no
+// CPU-served experts) unless memory forces a smaller KV, which is logged. --exact off lets each engine take its measured
+// approximations (docs/reference/options.md, "Exact and speed")
 struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
                                    // V = K, or K = tq3. --kv FORMAT names a whole-cache format (tqserve --list-kv)
     std::string kv;
+    bool exact = true;  // --exact on|off (see above)
+    int qsa_from = -1;  // --qsa-from N|off: QSA sparse attention for rows past N keys when the model file carries QSA indexers
+                        // (-1: the file's qsa.sparse_from, else 49152; 0 / off: always dense). The value changes the text.
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -28,6 +37,8 @@ struct EngineOptions {
     std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (the MTP head is then not loaded)
     int tp_rank = 0, tp_world = 1, tp_port = 29600;  // --tp-rank R --tp-peer IP [--tp-port P]: MiniMax over two linked boxes
     std::string tp_peer;       // rank 0's address on the linked network (rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`)
+    std::vector<std::string> plugins;          // --plugin PATH (repeatable): weight-format plugins, CUDA builds (docs/guides/plugins.md)
+    std::vector<std::string> inexact_patches;  // set by the plugin loader: applied patches not byte-identical to the built-in
     std::string hot_map;       // --hot-map FILE: MiniMax routing counts; the busiest experts are preloaded, the rest stay on disk
     bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 4 by default)
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
@@ -75,6 +86,19 @@ struct EngineOptions {
 // with --mtp: the unused drafter is never loaded or run.
 struct Drafters { bool dflash = false, mtp = false; };
 Drafters drafters(const EngineOptions & o);
+
+// --exact on conflicts: the approximations a run asked for explicitly (empty: none). flashnext: a .tqfn model (its TQFN_*
+// approximations count); no_exact_path: an engine without an exact path (MiniMax, GLM); slots: --np (Flash-Next keeps a
+// prompt cache only with several). The asked options win.
+std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
+                                         const char * (*env)(const char *) = [](const char * n) -> const char * { return std::getenv(n); },
+                                         int slots = 1);
+// Metal: may a prompt that extends the previous request's text prefill only its tail (a thinking budget's second phase)?
+// The reused rows were built by decode steps, not by a prefill, so the text can differ from a fresh prefill: not under
+// --exact on unless --prompt-cache on asks for it
+bool tail_prefill_reuse(const EngineOptions & o);
+// one "tqserve: WARN --exact on with ..." line per conflict
+void warn_exact_conflicts(const std::vector<std::string> & conflicts, std::ostream & err);
 
 // Parses the engine option at argv[i] (moving i past its value); false when argv[i] is not one.
 bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o);

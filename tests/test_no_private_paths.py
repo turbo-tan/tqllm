@@ -19,6 +19,13 @@ FORBIDDEN = [
     "/home/" + "awee",
     "/home/" + "ywtan",
     "DESKTOP-" + "RAINBOW",
+    "/mnt/" + "data2t",
+    "/." + "hermes/",
+    "ago" + "ra",
+    "gx10-" + "galaxy",
+    "gx10-" + "space",
+    "awee-" + "livingroom",
+    "192.168." + "1.",
 ]
 
 # Binary/irrelevant extensions to skip (byte-noise false positives, per the .npz lesson).

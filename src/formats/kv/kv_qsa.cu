@@ -400,8 +400,7 @@ constexpr int64_t kQsaSplitPart = int64_t(16) * 32 * 16 * (256 + 2);  // rows x 
 void qsa_set_split(int splits) { g_qsa_split = splits; }
 // TQFN_QSA_SPLIT (default 16; 0 or 1 = attention_direct): slices per decode attention row
 static int qsa_split_count() {
-    static const int env = std::getenv("TQFN_QSA_SPLIT") ? std::atoi(std::getenv("TQFN_QSA_SPLIT")) : 16;
-    return g_qsa_split >= 0 ? g_qsa_split : env;
+    return g_qsa_split >= 0 ? g_qsa_split : 16;  // slices per decode QSA attention row (tests set g_qsa_split)
 }
 static float * g_qsa_split_part = nullptr;
 static float * qsa_split_scratch(cudaStream_t stream) {
@@ -450,7 +449,9 @@ __device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
 }
 constexpr size_t smem_bytes() { return size_t(16 * QP + 2 * TK * KP + 16 * PP) * 2 + size_t(16 * TK + 3 * 16) * 4 + 2 * TK * 4; }
 }  // namespace qsatc
-__global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __restrict__ query, const __nv_bfloat16 * __restrict__ keys,
+// NW warps: 4 (each S / softmax / PV share as below) or 8 (two blocks per SM either way: the extra warps add gathers in
+// flight; S stays on warps 0-3, softmax rows and PV output dims split 8 ways; every value is computed in the same order)
+template<int NW> __global__ void __launch_bounds__(NW * 32) qsa_prefill_tc_k(const float * __restrict__ query, const __nv_bfloat16 * __restrict__ keys,
                                                            const __nv_bfloat16 * __restrict__ values, const int32_t * __restrict__ positions,
                                                            const uint8_t * __restrict__ valid, float * __restrict__ output,
                                                            int width, int first_cells, int kv_heads) {
@@ -462,25 +463,33 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
     int * cell = reinterpret_cast<int *>(arow + 16), * vflag = cell + TK;  // vflag: the row is valid (a score, 0 when not read)
     const int kv_head = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tq = lane & 3;
     const int heads = G * kv_heads, cells = first_cells + t;
-    positions += int64_t(t) * width; valid += int64_t(t) * width;
+    // positions null: dense causal attention over cells 0 .. cells - 1 (no selection lists; tiles past the cut are skipped)
+    const bool dense = positions == nullptr;
+    if (!dense) { positions += int64_t(t) * width; valid += int64_t(t) * width; }
+    const int lim = dense ? min(width, cells) : width;
     const float scale = rsqrtf(float(D));
-    for (int i = tid; i < 16 * D; i += NT) {  // rows 12..15 zero
+    constexpr int NTW = NW * 32, DW = D / NW, JT = DW / 8, RW = 16 / NW;  // threads, PV dims per warp, its n8 tiles, softmax rows
+    for (int i = tid; i < 16 * D; i += NTW) {  // rows 12..15 zero
         const int r = i / D, d = i % D;
         Qs[r * QP + d] = __float2bfloat16(r < G ? query[(int64_t(t) * heads + kv_head * G + r) * D + d] * scale : 0.f);
     }
     if (tid < 16) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
-    float acc[8][4];  // warp: output dims warp * 64 .. + 63 (8 n8 tiles), rows g / g + 8
+    float acc[JT][4];  // warp: output dims warp * DW .. + DW - 1 (JT n8 tiles), rows g / g + 8
 #pragma unroll
-    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-    for (int base = 0; base < width; base += TK) {
+    for (int j = 0; j < JT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    for (int base = 0; base < lim; base += TK) {
         __syncthreads();  // previous tile's K / V / P reads are done
         if (tid < TK) {
-            const int row = base + tid, pos = row < width ? positions[row] : -1;
-            vflag[tid] = row < width && valid[row];
-            cell[tid] = vflag[tid] && pos >= 0 && pos < cells ? pos : -1;
+            const int row = base + tid;
+            if (dense) { vflag[tid] = row < lim; cell[tid] = row < lim ? row : -1; }
+            else {
+                const int pos = row < width ? positions[row] : -1;
+                vflag[tid] = row < width && valid[row];
+                cell[tid] = vflag[tid] && pos >= 0 && pos < cells ? pos : -1;
+            }
         }
         __syncthreads();
-        for (int i = tid; i < TK * (D / 8); i += NT) {  // 16-byte pieces of the gathered rows (zero for unread rows)
+        for (int i = tid; i < TK * (D / 8); i += NTW) {  // 16-byte pieces of the gathered rows (zero for unread rows)
             const int r = i / (D / 8), c8 = (i % (D / 8)) * 8, pos = cell[r];
             uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (pos >= 0) {
@@ -490,7 +499,7 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
             *reinterpret_cast<uint4 *>(Ks + r * KP + c8) = kk; *reinterpret_cast<uint4 *>(Vs + r * KP + c8) = vv;
         }
         __syncthreads();
-        {   // S = Q K^T: warp w -> keys w * 8 .. + 7 (one n8 tile), k over D
+        if (warp < 4) {   // S = Q K^T: warp w -> keys w * 8 .. + 7 (one n8 tile), k over D
             float c[4] = {0.f, 0.f, 0.f, 0.f};
             const int n0 = warp * 8;
 #pragma unroll 4
@@ -508,10 +517,10 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
             Ss[(g + 8) * TK + n0 + tq * 2] = c[2]; Ss[(g + 8) * TK + n0 + tq * 2 + 1] = c[3];
         }
         __syncthreads();
-        // online softmax: warp w -> rows 4w .. 4w + 3, lane = key
+        // online softmax: warp w -> rows RW w .. RW w + RW - 1, lane = key
 #pragma unroll
-        for (int rr = 0; rr < 4; ++rr) {
-            const int r = warp * 4 + rr;
+        for (int rr = 0; rr < RW; ++rr) {
+            const int r = warp * RW + rr;
             const float sv = !vflag[lane] ? -INFINITY : cell[lane] >= 0 ? Ss[r * TK + lane] : 0.f;  // as grouped_scores: valid, unread = 0
             float mx = sv;
             for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
@@ -527,10 +536,10 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
             }
         }
         __syncthreads();
-        {   // O = alpha O + P V: warp w -> output dims w * 64 .. + 63, k over the tile's keys
+        {   // O = alpha O + P V: warp w -> output dims w * DW .. + DW - 1, k over the tile's keys
             const float al0 = arow[g], al1 = arow[g + 8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { acc[j][0] *= al0; acc[j][1] *= al0; acc[j][2] *= al1; acc[j][3] *= al1; }
+            for (int j = 0; j < JT; ++j) { acc[j][0] *= al0; acc[j][1] *= al0; acc[j][2] *= al1; acc[j][3] *= al1; }
 #pragma unroll
             for (int k0 = 0; k0 < TK; k0 += 16) {
                 uint32_t a[4];
@@ -539,8 +548,8 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
                 a[2] = *reinterpret_cast<const uint32_t *>(Ps + g * PP + k0 + tq * 2 + 8);
                 a[3] = *reinterpret_cast<const uint32_t *>(Ps + (g + 8) * PP + k0 + tq * 2 + 8);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int n = warp * 64 + j * 8 + g;  // B[k][n] = V[key k][dim n]
+                for (int j = 0; j < JT; ++j) {
+                    const int n = warp * DW + j * 8 + g;  // B[k][n] = V[key k][dim n]
                     const uint32_t b0 = pack2(Vs[(k0 + tq * 2) * KP + n], Vs[(k0 + tq * 2 + 1) * KP + n]);
                     const uint32_t b1 = pack2(Vs[(k0 + tq * 2 + 8) * KP + n], Vs[(k0 + tq * 2 + 9) * KP + n]);
                     mma16816(acc[j], a, b0, b1);
@@ -551,8 +560,8 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
     __syncthreads();
     const float il0 = lrow[g] > 0.f ? 1.f / lrow[g] : 0.f, il1 = lrow[g + 8] > 0.f ? 1.f / lrow[g + 8] : 0.f;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int d = warp * 64 + j * 8 + tq * 2;
+    for (int j = 0; j < JT; ++j) {
+        const int d = warp * DW + j * 8 + tq * 2;
         if (g < G) {
             float * o = output + (int64_t(t) * heads + kv_head * G + g) * D + d;
             o[0] = acc[j][0] * il0; o[1] = acc[j][1] * il0;
@@ -563,8 +572,170 @@ __global__ void __launch_bounds__(qsatc::NT) qsa_prefill_tc_k(const float * __re
         }
     }
 }
-static int g_qsa_tc = 1;  // tensor-core prefill attention (qsa_set_tc(0): the scalar kernel, tests)
+// qsa_prefill_tc_k<8> with the gathers overlapped (cp.async): K of tile i + 1 loads during tile i's softmax and PV, V of
+// tile i + 1 during S of tile i + 1; the same shared buffers (only the cell lists are doubled) and every value computed in
+// the same order, so the output is bit-identical (test qsa_tc)
+namespace qsatc {
+__device__ __forceinline__ void cp16(void * dst, const void * src, bool on) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(d), "l"(src), "r"(on ? 16 : 0));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
+constexpr size_t smem_pipe_bytes() { return smem_bytes() + 2 * TK * 4; }
+}  // namespace qsatc
+__global__ void __launch_bounds__(256) qsa_prefill_tc_pipe_k(const float * __restrict__ query, const __nv_bfloat16 * __restrict__ keys,
+                                                            const __nv_bfloat16 * __restrict__ values, const int32_t * __restrict__ positions,
+                                                            const uint8_t * __restrict__ valid, float * __restrict__ output,
+                                                            int width, int first_cells, int kv_heads) {
+    using namespace qsatc;
+    constexpr int NW = 8;
+    extern __shared__ __align__(16) unsigned char sm_raw[];
+    __nv_bfloat16 * Qs = reinterpret_cast<__nv_bfloat16 *>(sm_raw);
+    __nv_bfloat16 * Ks = Qs + 16 * QP, * Vs = Ks + TK * KP, * Ps = Vs + TK * KP;
+    float * Ss = reinterpret_cast<float *>(Ps + 16 * PP), * mrow = Ss + 16 * TK, * lrow = mrow + 16, * arow = lrow + 16;
+    int * cellb = reinterpret_cast<int *>(arow + 16), * vflagb = cellb + 2 * TK;  // [2][TK] each
+    const int kv_head = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const int heads = G * kv_heads, cells = first_cells + t;
+    const bool dense = positions == nullptr;
+    if (!dense) { positions += int64_t(t) * width; valid += int64_t(t) * width; }
+    const int lim = dense ? min(width, cells) : width;
+    const float scale = rsqrtf(float(D));
+    constexpr int NTW = NW * 32, DW = D / NW, JT = DW / 8, RW = 16 / NW;
+    for (int i = tid; i < 16 * D; i += NTW) {
+        const int r = i / D, d = i % D;
+        Qs[r * QP + d] = __float2bfloat16(r < G ? query[(int64_t(t) * heads + kv_head * G + r) * D + d] * scale : 0.f);
+    }
+    if (tid < 16) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    float acc[JT][4];
+#pragma unroll
+    for (int j = 0; j < JT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    auto cells_of = [&](int base, int b) {  // threads < TK: the tile's cell list into buffer b
+        if (tid < TK) {
+            const int row = base + tid;
+            int vf, cl;
+            if (dense) { vf = row < lim; cl = row < lim ? row : -1; }
+            else {
+                const int pos = row < width ? positions[row] : -1;
+                vf = row < width && valid[row];
+                cl = vf && pos >= 0 && pos < cells ? pos : -1;
+            }
+            vflagb[b * TK + tid] = vf; cellb[b * TK + tid] = cl;
+        }
+    };
+    auto issue = [&](__nv_bfloat16 * dst, const __nv_bfloat16 * src, int b) {  // the tile's rows of K or V (zero for unread rows)
+        for (int i = tid; i < TK * (D / 8); i += NTW) {
+            const int r = i / (D / 8), c8 = (i % (D / 8)) * 8, pos = cellb[b * TK + r];
+            cp16(dst + r * KP + c8, src + (int64_t(pos >= 0 ? pos : 0) * kv_heads + kv_head) * D + c8, pos >= 0);
+        }
+        cp_commit();
+    };
+    if (lim > 0) { cells_of(0, 0); __syncthreads(); issue(Ks, keys, 0); issue(Vs, values, 0); }
+    for (int base = 0, it = 0; base < lim; base += TK, ++it) {
+        const int b = it & 1;
+        cp_wait1(); __syncthreads();  // K of this tile landed (V may still be in flight)
+        if (warp < 4) {
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            const int n0 = warp * 8;
+#pragma unroll 4
+            for (int k0 = 0; k0 < D; k0 += 16) {
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t *>(Qs + g * QP + k0 + tq * 2);
+                a[1] = *reinterpret_cast<const uint32_t *>(Qs + (g + 8) * QP + k0 + tq * 2);
+                a[2] = *reinterpret_cast<const uint32_t *>(Qs + g * QP + k0 + tq * 2 + 8);
+                a[3] = *reinterpret_cast<const uint32_t *>(Qs + (g + 8) * QP + k0 + tq * 2 + 8);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t *>(Ks + (n0 + g) * KP + k0 + tq * 2);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t *>(Ks + (n0 + g) * KP + k0 + tq * 2 + 8);
+                mma16816(c, a, b0, b1);
+            }
+            Ss[g * TK + n0 + tq * 2] = c[0]; Ss[g * TK + n0 + tq * 2 + 1] = c[1];
+            Ss[(g + 8) * TK + n0 + tq * 2] = c[2]; Ss[(g + 8) * TK + n0 + tq * 2 + 1] = c[3];
+        }
+        const bool more = base + TK < lim;
+        if (more) cells_of(base + TK, b ^ 1);
+        __syncthreads();  // S done (Ks free), next cell list written
+        if (more) issue(Ks, keys, b ^ 1); else cp_commit();  // an empty group keeps the wait count uniform
+        const int * cell = cellb + b * TK; const int * vflag = vflagb + b * TK;
+#pragma unroll
+        for (int rr = 0; rr < RW; ++rr) {
+            const int r = warp * RW + rr;
+            const float sv = !vflag[lane] ? -INFINITY : cell[lane] >= 0 ? Ss[r * TK + lane] : 0.f;
+            float mx = sv;
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = mrow[r], m_new = fmaxf(m_old, mx);
+            const float p = m_new == -INFINITY ? 0.f : __expf(sv - m_new);
+            float sum = p;
+            for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            Ps[r * PP + lane] = __float2bfloat16(p);
+            __syncwarp();
+            if (lane == 0) {
+                const float alpha = m_old == -INFINITY ? 0.f : __expf(m_old - m_new);
+                arow[r] = alpha; lrow[r] = lrow[r] * alpha + sum; mrow[r] = m_new;
+            }
+        }
+        cp_wait1(); __syncthreads();  // V of this tile landed (the next K may still be in flight), P written
+        {
+            const float al0 = arow[g], al1 = arow[g + 8];
+#pragma unroll
+            for (int j = 0; j < JT; ++j) { acc[j][0] *= al0; acc[j][1] *= al0; acc[j][2] *= al1; acc[j][3] *= al1; }
+#pragma unroll
+            for (int k0 = 0; k0 < TK; k0 += 16) {
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t *>(Ps + g * PP + k0 + tq * 2);
+                a[1] = *reinterpret_cast<const uint32_t *>(Ps + (g + 8) * PP + k0 + tq * 2);
+                a[2] = *reinterpret_cast<const uint32_t *>(Ps + g * PP + k0 + tq * 2 + 8);
+                a[3] = *reinterpret_cast<const uint32_t *>(Ps + (g + 8) * PP + k0 + tq * 2 + 8);
+#pragma unroll
+                for (int j = 0; j < JT; ++j) {
+                    const int n = warp * DW + j * 8 + g;
+                    const uint32_t b0 = pack2(Vs[(k0 + tq * 2) * KP + n], Vs[(k0 + tq * 2 + 1) * KP + n]);
+                    const uint32_t b1 = pack2(Vs[(k0 + tq * 2 + 8) * KP + n], Vs[(k0 + tq * 2 + 9) * KP + n]);
+                    mma16816(acc[j], a, b0, b1);
+                }
+            }
+        }
+        __syncthreads();  // PV done (Vs free)
+        if (more) issue(Vs, values, b ^ 1); else cp_commit();
+    }
+    asm volatile("cp.async.wait_all;\n" ::);
+    __syncthreads();
+    const float il0 = lrow[g] > 0.f ? 1.f / lrow[g] : 0.f, il1 = lrow[g + 8] > 0.f ? 1.f / lrow[g + 8] : 0.f;
+#pragma unroll
+    for (int j = 0; j < JT; ++j) {
+        const int d = warp * DW + j * 8 + tq * 2;
+        if (g < G) {
+            float * o = output + (int64_t(t) * heads + kv_head * G + g) * D + d;
+            o[0] = acc[j][0] * il0; o[1] = acc[j][1] * il0;
+        }
+        if (g + 8 < G) {
+            float * o = output + (int64_t(t) * heads + kv_head * G + g + 8) * D + d;
+            o[0] = acc[j][2] * il1; o[1] = acc[j][3] * il1;
+        }
+    }
+}
+// tensor-core prefill attention at 8 warps (test qsa_tc, bit-identical to 4 warps: GB10 1.12-1.28x, RTX 3090 1.24-1.26x);
+// qsa_set_tc(0 / 1 / 2 / 3): the scalar kernel / 4 / 8 warps / 8 warps with overlapped gathers (tests)
+static int g_qsa_tc = 3;  // 3: 8 warps with the gathers overlapped (bit-identical to 2)
 void qsa_set_tc(int on) { g_qsa_tc = on; }
+static int qsa_tc_mode() { return g_qsa_tc; }
+static void qsa_tc_attr() {
+    static bool attr = false;
+    if (!attr) { for (auto * k : {qsa_prefill_tc_k<4>, qsa_prefill_tc_k<8>}) cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
+                 cudaFuncSetAttribute(qsa_prefill_tc_pipe_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_pipe_bytes())); attr = true; }
+}
+bool qsa_attention_dense_tc(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values, float * output,
+                            int tokens, int first_cells, int heads, int kv_heads, int dim, cudaStream_t stream) {
+    const int tc = qsa_tc_mode();
+    if (tc == 0 || kv_heads <= 0 || heads != 12 * kv_heads || dim != 256 || tokens <= 0 || tokens > 65535 || first_cells <= 0) return false;
+    if (!query || !keys || !values || !output) throw std::invalid_argument("QSA dense attention: null pointer");
+    qsa_tc_attr();
+    const int width = first_cells + tokens - 1;
+    if (tc == 3) qsa_prefill_tc_pipe_k<<<dim3(kv_heads, tokens), 256, qsatc::smem_pipe_bytes(), stream>>>(query, keys, values, nullptr, nullptr, output, width, first_cells, kv_heads);
+    else if (tc == 2) qsa_prefill_tc_k<8><<<dim3(kv_heads, tokens), 256, qsatc::smem_bytes(), stream>>>(query, keys, values, nullptr, nullptr, output, width, first_cells, kv_heads);
+    else qsa_prefill_tc_k<4><<<dim3(kv_heads, tokens), 128, qsatc::smem_bytes(), stream>>>(query, keys, values, nullptr, nullptr, output, width, first_cells, kv_heads);
+    ck(cudaPeekAtLastError());
+    return true;
+}
 void qsa_attention_grouped(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                            const QsaDeviceSelection & selected, float * scores, float * inv, float * output, int tokens,
                            int first_cells, int heads, int kv_heads, int dim, cudaStream_t stream) {
@@ -572,11 +743,15 @@ void qsa_attention_grouped(const float * query, const __nv_bfloat16 * keys, cons
         tokens > 65535 || selected.width <= 0 || heads <= 0 || kv_heads <= 0 || heads % kv_heads ||
         heads / kv_heads > kQsaMaxGroup || dim <= 0 || dim > 256)
         throw std::invalid_argument("QSA grouped attention: invalid dimensions or pointer");
-    if (g_qsa_tc != 0 && heads / kv_heads == 12 && dim == 256) {
-        static bool attr = false;
-        if (!attr) { cudaFuncSetAttribute(qsa_prefill_tc_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes())); attr = true; }
-        qsa_prefill_tc_k<<<dim3(kv_heads, tokens), qsatc::NT, qsatc::smem_bytes(), stream>>>(query, keys, values, selected.positions, selected.valid,
-                                                                                          output, selected.width, first_cells, kv_heads);
+    const int tc = qsa_tc_mode();
+    if (tc != 0 && heads / kv_heads == 12 && dim == 256) {
+        qsa_tc_attr();
+        if (tc == 3) qsa_prefill_tc_pipe_k<<<dim3(kv_heads, tokens), 256, qsatc::smem_pipe_bytes(), stream>>>(query, keys, values, selected.positions, selected.valid,
+                                                                                                         output, selected.width, first_cells, kv_heads);
+        else if (tc == 2) qsa_prefill_tc_k<8><<<dim3(kv_heads, tokens), 256, qsatc::smem_bytes(), stream>>>(query, keys, values, selected.positions, selected.valid,
+                                                                                               output, selected.width, first_cells, kv_heads);
+        else qsa_prefill_tc_k<4><<<dim3(kv_heads, tokens), 128, qsatc::smem_bytes(), stream>>>(query, keys, values, selected.positions, selected.valid,
+                                                                                         output, selected.width, first_cells, kv_heads);
         ck(cudaPeekAtLastError());
         return;
     }

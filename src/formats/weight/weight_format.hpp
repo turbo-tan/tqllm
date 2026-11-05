@@ -37,6 +37,9 @@ struct WeightFormat {
     // `raw`: GGUF bytes of `rows` rows (one tensor or several row-concatenated tensors of this type).
     virtual Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t) const = 0;
     virtual int max_matvec_cols() const { return 8; }
+    // columns one matvec_f32 may take with each column's result equal to launches of max_matvec_cols() (tests/matvec_wide.cu):
+    // a several-sequence verify block then reads the weights once, not once per max_matvec_cols() columns
+    virtual int max_exact_cols() const { return max_matvec_cols(); }
     // Column limit of matvec() in a batched verify (per-column results identical to narrower calls).
     virtual int max_batch_cols() const { return max_matvec_cols(); }
     // y[n][rows] = W x[n] for n <= max_matvec_cols(); x in basis().
@@ -60,15 +63,19 @@ struct WeightFormat {
                                const int *, int n, int topk, bool per_expert_input, cudaStream_t) const;
     // u4h-family kernel id (-1: none). Dedup: one block per unique expert, map layout in quant_kernels.cuh.
     virtual int u4h_id() const { return -1; }
-    bool has_expert_dedup() const { return u4h_id() >= 0; }
-    void expert_matvec_dedup(const Mat &, const __half *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
+    virtual bool has_expert_dedup() const { return u4h_id() >= 0; }
+    virtual void expert_matvec_dedup(const Mat &, const __half *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
     // two matrices of this format (gate, up) over the same dedup map in one launch
-    void expert_matvec_dedup2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
-    // two stacked matrices of this format (gate, up) over the same device IDs in one launch; per row expert_matvec
-    void expert_matvec2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * ids, int n,
-                        int topk, cudaStream_t) const;
+    virtual void expert_matvec_dedup2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
+    // two stacked matrices of this format (gate, up) over the same device IDs in one launch; per row expert_matvec.
+    // Virtual: a format with its own paired expert path (x3) runs both matrices with one build and one launch set.
+    virtual void expert_matvec2(const Mat &, const Mat &, const __half *, __nv_bfloat16 *, __nv_bfloat16 *, int rows, const int * ids, int n,
+                                int topk, cudaStream_t) const;
     // FP16 [rows][cols] in basis(), for the cuBLAS prefill GEMM.
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
+    // Rows [row0, row0 + nrows) of dequant_h into out [nrows][cols], for an engine that has no whole-matrix FP16 scratch
+    // (the target's 200K-row lm_head is dumped in 2048-row chunks for the drafter's trainer). false: no row-range kernel.
+    virtual bool dequant_rows_h(const Mat &, __half * out, int row0, int nrows, cudaStream_t) const { return false; }
     // int8 prefill without an FP16 round trip: weights quantised straight to int8 [rows][cols] (row-major) plus the
     // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
     // dequant_h + per-chunk quantise path (the default for every format).
@@ -98,6 +105,9 @@ struct WeightFormat {
 // e.g. Q4_0 loads as W4S when every 128-group shares one scale.
 const WeightFormat * weight_format(uint32_t gguf_type);
 void register_weight_format(uint32_t gguf_type, std::unique_ptr<WeightFormat>);
+// Replaces format `gguf_type` with wrap(old): the wrapper keeps the old format and forwards what it does not replace (plugin
+// patches, plugin_format.hpp). Call before any model loads: matrices loaded earlier keep the old format.
+void patch_weight_format(uint32_t gguf_type, const std::function<std::unique_ptr<WeightFormat>(std::unique_ptr<WeightFormat>)> & wrap);
 
 // Row-concatenation of matrices of different formats (a fused group such as gate + up quantized to different types):
 // null unless every part has a format with matvec_ld, all share cols and basis. The returned format owns the parts'

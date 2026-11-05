@@ -89,6 +89,19 @@ __device__ __forceinline__ uint32_t pick_word(uint32_t lo, uint32_t hi, int idx,
     return idx < S ? a : b;
 }
 
+// Word `idx` (< `words`) of tile t when the slice was fetched PACKED, i.e. as full-warp loads: the slice's
+// word u32words*t + idx sits in register (u32words*t + idx) / 32 at lane (u32words*t + idx) % 32. `base` and
+// `off` are the quotient and remainder of u32words*t (both compile-time: t is an unrolled constant), so the
+// register is base or base + 1. Both shuffles run and the select picks one; `words` bounds idx, which is what
+// says whether base + 1 is a register that exists.
+__device__ __forceinline__ uint32_t pick_packed(const uint32_t* bw, int base, int off, int words, int idx) {
+    const uint32_t full = 0xffffffffu;
+    const int w = idx + off;
+    const uint32_t a = __shfl_sync(full, bw[base], uint32_t(w) & 31u);
+    const uint32_t b = __shfl_sync(full, bw[off + words - 1 >= 32 ? base + 1 : base], uint32_t(w) & 31u);
+    return w < 32 ? a : b;
+}
+
 // Extract the 8 window values (t_offset .. t_offset + 7) as uint16 each. One branch per K, ported
 // from paw-x3.cu dq8 / dq8_aligned_{1,2,4}bits / dq8_frac.
 template <int KH>
@@ -185,7 +198,19 @@ struct Mul1Codec {
     static constexpr int  ld_stride = frac ? u32words : (bits == 3 ? 24 : (bits >= 5 ? half_words : 32));
     static constexpr int  ld_lanes  = ld_stride;
     static constexpr bool supports_gemv_x3v = (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || frac);
-    static __host__ __device__ constexpr int loads(int WNT) { return WNT * u32words / ld_stride; }
+
+    // A warp load is 32 lanes x 4 B. One tile at a time (ld_stride lanes) leaves 12 lanes idle at K5 (80 B per
+    // warp instruction) and 8 at K3 / K6 (96 B), and the dense passes pay it: the K5 item's pattern reads
+    // 211-212 GB/s against 222 for the same words as full-warp loads (dense44, .44). When WNT tiles' words are a
+    // whole number of warp loads the slice is fetched PACKED - full-width, WNT * u32words / 32 loads - and the
+    // decode picks each word by its index in the slice (pick_packed). Same words, same order, only which lane
+    // holds which moves, so every column's terms and their order are unchanged.
+    static __host__ __device__ constexpr bool packed_wnt(int WNT) {
+        return !frac && (bits == 3 || bits >= 5) && (WNT * u32words) % 32 == 0;
+    }
+    static __host__ __device__ constexpr int ld_stride_wnt(int WNT) { return packed_wnt(WNT) ? 32 : ld_stride; }
+    static __host__ __device__ constexpr int ld_lanes_wnt(int WNT)  { return packed_wnt(WNT) ? 32 : ld_lanes; }
+    static __host__ __device__ constexpr int loads(int WNT) { return WNT * u32words / ld_stride_wnt(WNT); }
 
     // ---- sq path (int8 dp4a): windows x codebook magic, then dp4a against int8 activations ----
     static constexpr bool supports_sq = true;
@@ -216,6 +241,7 @@ struct Mul1Codec {
                 }
             }
         }
+        template <bool PACKED>
         __device__ __forceinline__ void tile(const uint32_t* bw, int t, FragB& f0, FragB& f1) const {
             if constexpr (frac) {
                 constexpr int P = 2 * ka + 1;
@@ -232,12 +258,15 @@ struct Mul1Codec {
                 }
                 mul1_decode8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], f0, f1);
             } else {
-                regs_decode(bw, t, lane, f0, f1);
+                regs_decode<PACKED>(bw, t, lane, f0, f1);
             }
         }
     };
 
     // 8 weights of tile `t` for `lane`, from the warp's loaded words bw (x3v_dq8_regs_* ported).
+    // PACKED says how bw was loaded: one tile per ld_stride lanes (load 2t / 2t+1 hold tile t's two halves,
+    // lane = word index) or the whole slice as full-warp loads (load l holds slice words 32l..32l+31).
+    template <bool PACKED>
     __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
         const uint32_t full = 0xffffffffu;
         if constexpr (bits == 4) {
@@ -262,10 +291,12 @@ struct Mul1Codec {
             BFE16_IMM(w3, b, 8); BFE16_IMM(w2, b, 10); BFE16_IMM(w1, b, 12); BFE16_IMM(w0, b, 14);
             mul1_decode8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
         } else if constexpr (bits == 5 || bits == 6) {
-            // exl3_dq.cuh dq_dispatch: two dq4 groups. Load 2t holds tile words 0..S-1 (lane = word),
-            // load 2t+1 the rest, so each group's two words are one shuffle each.
+            // exl3_dq.cuh dq_dispatch: two dq4 groups. Unpacked, load 2t holds tile words 0..S-1 (lane = word),
+            // load 2t+1 the rest, so each group's two words are one shuffle each. Packed, the tile's words are at
+            // slice index u32words*t + idx, i.e. in registers base / base+1 at lane off + idx.
             constexpr int S = half_words;
             constexpr int RW = 2 * S;                 // uint32 words per tile
+            const int base = PACKED ? RW * t / 32 : 0, off = PACKED ? RW * t % 32 : 0;
             uint32_t w[8];
             #pragma unroll
             for (int g = 0; g < 2; ++g) {
@@ -274,8 +305,10 @@ struct Mul1Codec {
                 const int b2 = b0 + 3 * bits + 16;
                 const int i0 = (b0 / 32) % RW, i2 = ((b2 - 1) / 32) % RW;
                 const int s2 = ((b2 - 1) / 32 + 1) * 32 - b2;
-                const uint32_t a = pick_word(bw[2 * t], bw[2 * t + 1], i0, S);
-                const uint32_t b = pick_word(bw[2 * t], bw[2 * t + 1], i2, S);
+                const uint32_t a = PACKED ? pick_packed(bw, base, off, RW, i0)
+                                          : pick_word(bw[2 * t], bw[2 * t + 1], i0, S);
+                const uint32_t b = PACKED ? pick_packed(bw, base, off, RW, i2)
+                                          : pick_word(bw[2 * t], bw[2 * t + 1], i2, S);
                 w[4 * g + 3] = fshift(b, a, s2)            & 0xffff;
                 w[4 * g + 2] = fshift(b, a, s2 + bits)     & 0xffff;
                 w[4 * g + 1] = fshift(b, a, s2 + bits * 2) & 0xffff;
@@ -305,8 +338,11 @@ struct Mul1Codec {
             const int i0 = (b1 - 16) / 32;
             const int i2 = (b2 - 1) / 32;
             const int x_s2 = (i2 + 1) * 32 - b2;
-            const uint32_t awv = __shfl_sync(full, bw[t], i0 % 24);
-            const uint32_t bwv = __shfl_sync(full, bw[t], i2 % 24);
+            const int base = PACKED ? 24 * t / 32 : 0, off = PACKED ? 24 * t % 32 : 0;
+            const uint32_t awv = PACKED ? pick_packed(bw, base, off, 24, i0 % 24)
+                                        : __shfl_sync(full, bw[t], i0 % 24);
+            const uint32_t bwv = PACKED ? pick_packed(bw, base, off, 24, i2 % 24)
+                                        : __shfl_sync(full, bw[t], i2 % 24);
             uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
             w7 = fshift(bwv, awv, x_s2); w6 = w7 >> 3; w5 = w6 >> 3; w4 = w5 >> 3;
             w3 = fshift(bwv, awv, x_s2 + 12); w2 = w3 >> 3; w1 = w2 >> 3; w0 = w1 >> 3;

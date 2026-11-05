@@ -1,7 +1,9 @@
 #include <string>
 #include <cstdlib>
 #include <vector>
+#include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
+#include "decode_rules.hpp"
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
@@ -43,13 +45,14 @@ __global__ void score_blocks(const float * pooled_keys, const float * query, flo
 }
 
 __global__ void pool_raw_keys(const float * raw, float * pooled, int first_block,
-                              int nblocks, int ratio, int dim) {
+                              int nblocks, int ratio, int dim, int ring) {
     const int b = first_block + blockIdx.x;
     if (blockIdx.x >= nblocks) return;
+    auto at = [&](int64_t cell) { return (cell % ring) * dim; };  // raw keys live in a ring of the newest cells
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float sum = raw[int64_t(b) * ratio * dim + d];
+        float sum = raw[at(int64_t(b) * ratio) + d];
         for (int r = 1; r < ratio; ++r)
-            sum = __fadd_rn(sum, raw[(int64_t(b) * ratio + r) * dim + d]);
+            sum = __fadd_rn(sum, raw[at(int64_t(b) * ratio + r) + d]);
         pooled[int64_t(b) * dim + d] = __fmul_rn(sum, 1.f / ratio);
     }
 }
@@ -556,24 +559,27 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
     ck(cudaPeekAtLastError());
 }
 
-QsaRawKeyCache::QsaRawKeyCache(int max_cells, int ratio, int dim)
+QsaRawKeyCache::QsaRawKeyCache(int max_cells, int ratio, int dim, int ring)
     : max_cells_(max_cells), ratio_(ratio), dim_(dim) {
     if (max_cells <= 0 || ratio <= 0 || ratio > 64 || dim <= 0 ||
         int64_t(max_cells) * dim > std::numeric_limits<size_t>::max() / sizeof(float))
         throw std::invalid_argument("QSA raw-key cache: invalid dimensions");
     try {
-        ck(cudaMalloc(&raw_, size_t(max_cells) * dim * sizeof(float)));
+        ring_ = std::min(max_cells, ring > 0 ? ring : 4096 + 2 * ratio + kRollback);
+        ck(cudaMalloc(&raw_, size_t(ring_) * dim * sizeof(float)));
+        if (ring_ < max_cells) ck(cudaMallocHost(&host_raw_, size_t(max_cells) * dim * sizeof(float)));
         if (max_cells >= ratio)
             ck(cudaMalloc(&pooled_, size_t(max_cells / ratio) * dim * sizeof(float)));
         if (max_cells >= ratio)
             ck(cudaMalloc(&normalized_, size_t(max_cells / ratio) * dim * sizeof(float)));
     } catch (...) {
-        cudaFree(normalized_); cudaFree(pooled_); cudaFree(raw_);
+        cudaFree(normalized_); cudaFree(pooled_); cudaFree(raw_); if (host_raw_) cudaFreeHost(host_raw_);
         throw;
     }
 }
 
 QsaRawKeyCache::~QsaRawKeyCache() {
+    if (host_raw_) cudaFreeHost(host_raw_);
     cudaFree(normalized_);
     cudaFree(pooled_);
     cudaFree(raw_);
@@ -588,16 +594,37 @@ void QsaRawKeyCache::normalize_new(const float * weight, int rotary, float theta
     normalized_blocks_ += count;
 }
 
+// a larger ring keeps the cells a later pool or truncate may read: the newest (size % ratio + kRollback + ratio) cells
+void QsaRawKeyCache::reserve_ring(int cells, cudaStream_t stream) {
+    cells = std::min(cells, max_cells_);
+    if (cells <= ring_) return;
+    float * next = nullptr; ck(cudaMalloc(&next, size_t(cells) * dim_ * sizeof(float)));
+    const int keep = std::min({size_, ring_, size_ % ratio_ + kRollback + ratio_});
+    for (int c = size_ - keep; c < size_;) {  // contiguous runs in both rings
+        const int run = std::min({size_ - c, ring_ - c % ring_, cells - c % cells});
+        ck(cudaMemcpyAsync(next + int64_t(c % cells) * dim_, raw_ + int64_t(c % ring_) * dim_, size_t(run) * dim_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice, stream));
+        c += run;
+    }
+    ck(cudaStreamSynchronize(stream)); cudaFree(raw_); raw_ = next; ring_ = cells;
+}
+
 void QsaRawKeyCache::append(const float * keys, int tokens, cudaStream_t stream) {
     if (!keys || tokens <= 0 || tokens > max_cells_ - size_)
         throw std::invalid_argument("QSA raw-key cache: invalid append");
+    reserve_ring(tokens + size_ % ratio_ + 2 * ratio_ + kRollback, stream);
     const int end = size_ + tokens;
-    ck(cudaMemcpyAsync(raw_ + int64_t(size_) * dim_, keys, size_t(tokens) * dim_ * sizeof(float),
-                       cudaMemcpyDeviceToDevice, stream));
+    for (int c = size_; c < end;) {  // into the ring, wrapping
+        const int run = std::min(end - c, ring_ - c % ring_);
+        ck(cudaMemcpyAsync(raw_ + int64_t(c % ring_) * dim_, keys + int64_t(c - size_) * dim_, size_t(run) * dim_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice, stream));
+        c += run;
+    }
+    if (host_raw_) ck(cudaMemcpyAsync(host_raw_ + int64_t(size_) * dim_, keys, size_t(tokens) * dim_ * sizeof(float), cudaMemcpyDeviceToHost, stream));
     const int first = size_ / ratio_;
     const int count = end / ratio_ - first;
     if (count > 0) {
-        pool_raw_keys<<<count, 128, 0, stream>>>(raw_, pooled_, first, count, ratio_, dim_);
+        pool_raw_keys<<<count, 128, 0, stream>>>(raw_, pooled_, first, count, ratio_, dim_, ring_);
         ck(cudaPeekAtLastError());
     }
     size_ = end;
@@ -605,6 +632,14 @@ void QsaRawKeyCache::append(const float * keys, int tokens, cudaStream_t stream)
 
 void QsaRawKeyCache::truncate(int cells) {
     if (cells < 0 || cells > size_) throw std::invalid_argument("QSA raw-key cache: invalid truncate");
+    if (host_raw_ && size_ - cells > kRollback && cells % ratio_) {  // the ring no longer holds that block's first cells
+        ck(cudaDeviceSynchronize());  // the mirror's copies have landed
+        for (int c = cells / ratio_ * ratio_; c < cells;) {
+            const int run = std::min(cells - c, ring_ - c % ring_);
+            ck(cudaMemcpy(raw_ + int64_t(c % ring_) * dim_, host_raw_ + int64_t(c) * dim_, size_t(run) * dim_ * sizeof(float), cudaMemcpyHostToDevice));
+            c += run;
+        }
+    }
     size_ = cells;
     normalized_blocks_ = std::min(normalized_blocks_, cells / ratio_);
 }
@@ -680,9 +715,17 @@ void qsa_attention_selected(const float * query, const __nv_bfloat16 * gathered_
     ck(cudaPeekAtLastError());
 }
 
+namespace {
+bool unified_memory() {
+    static const bool on = [] { int dev = 0, v = 0; cudaGetDevice(&dev);
+        return cudaDeviceGetAttribute(&v, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && v; }();
+    return on;
+}
+}  // namespace
+
 QsaIndexer::QsaIndexer(int max_cells, int ratio, int top_k, int heads, int dim, int rotary,
                        float theta, float epsilon)
-    : keys_(max_cells, ratio, dim), selector_(max_cells, ratio, top_k),
+    : keys_(max_cells, ratio, dim, tqllm::flashnext::qsa_key_ring_cells(unified_memory(), max_cells)), selector_(max_cells, ratio, top_k),
       ratio_(ratio), heads_(heads), dim_(dim), rotary_(rotary),
       theta_(theta), epsilon_(epsilon) {
     if (heads <= 0 || dim <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() ||
@@ -738,8 +781,8 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
     const int width = std::min(cells, scratch.width_cap);
     // blocks a selection can reach: rank < width - tail, so block index <= (width - 1) / ratio
     const int need_cap = (width - 1) / ratio_ + 1;
-    constexpr bool topk_on = true;  // top-k select instead of a full sort (TQFN_QSA_CHECK compares them)
-    static const bool check = std::getenv("TQFN_QSA_CHECK") != nullptr;
+    constexpr bool topk_on = true;  // top-k select instead of a full sort (TQLLM_DEBUG=qsa_check compares them)
+    static const bool check = tqllm::debug_cstr("qsa_check") != nullptr;
     const bool topk = topk_on && need_cap <= kTopkCap && int64_t(tokens) * kTopkCap <= int64_t(scratch.max_queries) * scratch.max_blocks;
     int stride = blocks;
     if (blocks > 0 && topk) {

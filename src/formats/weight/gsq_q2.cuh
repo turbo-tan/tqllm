@@ -12,4 +12,7 @@ void gsq_q2_dequant(const void *, __half *, int rows, int cols, cudaStream_t);
 // experts grouped by moe_group (counts [experts], groups [experts][capacity] of assignment ids), y [assignments][rows]
 void gsq_q2_expert_grouped(const void *, const __half *, __nv_bfloat16 *, int rows, int cols, const int * counts, const int * groups,
                            int capacity, int experts, int topk, bool per_expert, cudaStream_t);
+// dedup map (quant_kernels.cuh kDedupStride layout): each group's row blocks read once for its columns; per column the
+// products and their order are those of gsq_q2_expert_matvec (bit-identical)
+void gsq_q2_expert_dedup(const void *, const __half *, __nv_bfloat16 *, int rows, int cols, const int * dmap, int groups, cudaStream_t);
 }

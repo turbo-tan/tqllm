@@ -34,6 +34,10 @@ struct Fp final : WeightFormat {
     void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
         tqllm_cuda::fp_matvec(bf16, m.p, x, y, true, m.rows, m.cols, n, s);
     }
+    // The kernel answers 1..16 columns and a column's bits do not depend on the batch width, so a batched verify may run
+    // 16 at once. max_matvec_cols() stays at its default 8: engines choose their path by it (qwen35's prefill dispatch,
+    // glm5next's GEMM), and raising it would move their decode at n = 9..16 for no reason.
+    int max_batch_cols() const override { return 16; }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::fp_dequant_h(bf16, m.p, out, size_t(m.rows) * m.cols, s);
     }

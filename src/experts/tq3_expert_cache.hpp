@@ -17,6 +17,9 @@ struct ExpertCacheStats {
     uint64_t pf_pending = 0, pf_running = 0, pf_waited_unread = 0, pf_skipped = 0;  // pf_skipped: no device room for the staging
     uint64_t bank_builds = 0, bank_drops = 0;  // whole layer banks created / dropped (evicted or released)
     uint64_t drops_budget = 0, drops_oom = 0;   // of the drops: over the cache budget / a failed device allocation
+    // the same expert copied again after its eviction (any distance / within 8 calls of its layer), its bytes, and
+    // prefetched experts evicted before any use
+    uint64_t refetch = 0, refetch_soon = 0, refetch_bytes = 0, pf_evicted_unused = 0;
     uint64_t miss_copies = 0, miss_copy_bytes = 0, pf_copy_bytes = 0;  // H2D DMAs of demand misses (pieces), prefetch bytes
 };
 
@@ -105,6 +108,12 @@ public:
     // the slots set so far become each layer's target; a bank built while the free memory cannot hold the target gets the
     // largest count that fits, not below floor[layer]
     void set_layer_tiers(const std::vector<int> & floor, size_t keep_bytes = size_t(256) << 20);  // keep: left free beside the banks
+    // after a long prompt's prefill: every bank grows by the same number of slots into the device memory beyond keep_free
+    // (at most max_slots, at most every expert), keeps the experts it held and fills its new slots with the layer's most
+    // routed experts (this prompt's prefill counts included); the targets stay (a refill after the next prompt rebuilds to
+    // them, so decode's own buffers have room before the banks grow again). Returns the banks grown.
+    int grow_into(size_t keep_free, int max_slots);
+    size_t device_staging_bytes() const;  // device staging held (only an unregistered prepacked pack needs it)
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
     int regrow(size_t keep_free);  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
     int experts() const; int layers() const;
@@ -119,6 +128,8 @@ public:
     void reset_usage();                  // forgets the expert frequencies (victim policy), keeps the banks
     void reserve_staging(int min_cap = 0);  // staging for a whole bank (at least min_cap experts), so no prepare grows it mid-request
     bool resident(int layer, int expert) const;  // in the layer's bank now (no side effects)
+    // every expert of the layer sits in its bank with no copy pending: slot_of[expert] = its slot (no side effects)
+    bool full_bank(int layer, std::vector<int> & slot_of) const;
     BankLayout bank_layout(int layer) const;                // piece sizes; src0 set when a prepacked source exists
     BankState bank_state(int layer) const;                  // waits for pending host-side copies first
     void bank_import(int layer, const BankState &);

@@ -1,4 +1,6 @@
-// Dense BF16 / F16 matrices: one warp per row, FP32 accumulation, up to 8 input columns per launch.
+// Dense BF16 / F16 matrices: one warp per row, FP32 accumulation, up to 16 input columns per launch. Each column keeps
+// its own accumulator, the same per-lane walk and the same warp tree, so a column's bits do not depend on how many
+// columns the launch holds - which is what lets a batched verify run wider than the matvec dispatch cap.
 #include "quant_kernels.cuh"
 
 #include <algorithm>
@@ -64,7 +66,15 @@ void launch(const T * w, const __half * x, void * y, int rows, int k, int n, cud
         case 6: fp_matvec_k<T, 6, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
         case 7: fp_matvec_k<T, 7, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
         case 8: fp_matvec_k<T, 8, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
-        default: throw std::invalid_argument("fp_matvec: 1..8 columns");
+        case 9: fp_matvec_k<T, 9, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 10: fp_matvec_k<T, 10, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 11: fp_matvec_k<T, 11, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 12: fp_matvec_k<T, 12, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 13: fp_matvec_k<T, 13, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 14: fp_matvec_k<T, 14, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 15: fp_matvec_k<T, 15, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 16: fp_matvec_k<T, 16, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        default: throw std::invalid_argument("fp_matvec: 1..16 columns");
     }
 }
 }  // namespace

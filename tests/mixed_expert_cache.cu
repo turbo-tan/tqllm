@@ -142,6 +142,7 @@ static void run() {
                 compare(l, {0, 4});
             }
             require(current.prefetch_used() > 0, "registered prefetch was never consumed");
+            require(current.device_staging_bytes() == 0, "a registered prepacked pack held device staging it never reads");
             current.clear(); compare(0, {0, 1});
             current.set_miss_stream(nullptr);
         }
@@ -284,6 +285,24 @@ static void run() {
         std::printf("registered prepacked misses %s: byte-exact projections / mixed formats / duplicates / prefetch / eviction / reset PASS\n",
                     "mapped scatter");
     }
+    {   // 10-29 review: a failing copy inside a batched call must not leave the slot reading as a permanent hit on stale
+        // bytes. Expert 0 goes through the registered+split batched path first (needed is sorted, so 0 is queued before 1);
+        // prepacked() itself throws for expert 1 (deterministic, no real CUDA failure needed) - the exception must roll
+        // back expert 0's optimistic residency mark, not leave it reading as resident with nothing ever copied.
+        MixedExpertCache rb(layers, experts, hidden, ff, slots, budget, source, nullptr);
+        rb.set_prepacked([&](int l, int id) -> const char * {
+            if (id == 1) throw std::runtime_error("injected test failure");
+            return blocks[size_t(l) * size_t(experts) + size_t(id)];
+        }, true);
+        rb.set_miss_stream(misses);
+        bool threw = false;
+        try { rb.prepare(2, {0, 1}); rb.wait_misses(); } catch (const std::exception &) { threw = true; }
+        require(threw, "rollback test: the injected failure did not propagate");
+        require(!rb.resident(2, 0), "rollback test: a miss queued into a batch stayed resident after a later miss in the same call failed");
+        rb.set_prepacked([&](int l, int id) { return blocks[size_t(l) * size_t(experts) + size_t(id)]; }, true);
+        selected = &rb; compare(2, {0, 0}, true); selected = &cache;
+        std::puts("mixed cache: a failed batch rolls back the residency it queued, byte-exact on retry PASS");
+    }
     check(cudaStreamDestroy(copies)); check(cudaStreamDestroy(misses)); check(cudaFreeHost(pinned));
     std::printf("cache owned-device peak=%zu tight-budget=%zu bytes (includes loader staging)\n", tight.peak_device_bytes(), tight_budget);
     {  // per-layer slots: each bank holds its own count, projections stay byte-exact, the per-layer limit is enforced
@@ -323,6 +342,29 @@ static void run() {
         selected = &grown; compare(1, {1, 0}, true);
         selected = &cache;
         std::puts("regrow: every floor bank grown to its target in place, experts kept, byte-exact PASS");
+    }
+    {   // decode-time growth after a long prompt (10-28: 3.6 GB of VRAM stayed idle in a 128K decode at 133 slots / layer
+        // while Strata held ~172): every bank grows into the free memory, keeps its experts, and takes the layer's most routed
+        // missing experts into the new slots
+        auto same = [&](int, int id) { return source(1, id); };
+        MixedExpertCache g(layers, experts, hidden, ff, 2, budget, same, nullptr);
+        for (int l = 0; l < layers; ++l) { g.prepare(l, {0, 1}); g.wait_misses(); }
+        for (int l = 0; l < layers; ++l) for (int r = 0; r < 3; ++r) { g.prepare(l, {4}); g.wait_misses(); }  // 4 is this prompt's hot expert
+        std::vector<std::vector<int>> held(layers);
+        for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) if (g.resident(l, e)) held[size_t(l)].push_back(e);
+        const int n = g.grow_into(0, 4);
+        std::string bad;
+        for (int l = 0; l < layers; ++l) {
+            if (g.slots(l) != 4) bad += " layer " + std::to_string(l) + " at " + std::to_string(g.slots(l)) + " slots;";
+            for (int e : held[size_t(l)]) if (!g.resident(l, e)) bad += " layer " + std::to_string(l) + " lost " + std::to_string(e) + ";";
+            if (!g.resident(l, 4)) bad += " layer " + std::to_string(l) + " hot expert 4 not resident;";
+        }
+        require(n == layers && bad.empty(), ("grow_into: " + std::to_string(n) + " of " + std::to_string(layers) + " grown;" + bad).c_str());
+        require(g.grow_into(0, 4) == 0, "grow_into at the cap grew again");
+        selected = &g; compare(1, {4, 0}, true); selected = &cache;
+        for (int l = 0; l < layers; ++l) g.release_bank(l);  // the next long prompt borrows them back
+        require(g.stats().device_bytes == 0, "grown banks did not release");
+        std::puts("grow_into: banks grow into free memory with their experts and the hot ones, byte-exact, released by the next prompt PASS");
     }
     std::puts("mixed IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS + IQ4_NL/Q2_0 banks: cold/warm/grouped/duplicates/per-expert/eviction/budget/clear PASS");
 }

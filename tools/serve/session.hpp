@@ -97,6 +97,8 @@ struct SamplingDefaults {
     float temperature = 0.f, top_p = 1.f;
     int top_k = 0;
     float presence_penalty = 0.f;  // Qwen: 1.5 against phrase loops in long sampled thinking
+    float repeat_penalty = 1.f;     // --repeat-penalty (LM Studio / llama.cpp; 1 = off), last 64 output tokens
+    float frequency_penalty = 0.f;  // --frequency-penalty: logit - penalty x count in the last 64 output tokens
 };
 inline SamplingDefaults & sampling_defaults() {
     static SamplingDefaults d;
@@ -122,11 +124,14 @@ struct ChatRequest {
     float top_p = sampling_defaults().top_p;
     int top_k = sampling_defaults().top_k;
     float presence_penalty = sampling_defaults().presence_penalty;  // sampling only: logit - penalty, last 64 output tokens
+    float repeat_penalty = sampling_defaults().repeat_penalty;      // sampling only: repeat_penalty / repetition_penalty
+    float frequency_penalty = sampling_defaults().frequency_penalty;
     uint64_t seed = 0;
     bool ignore_eos = false;  // decode to max_tokens through end-of-sequence tokens (vLLM / llama.cpp field)
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
     bool return_token_ids = false;  // add the generated token ids to the response (choices[0].token_ids)
+    int continuation = 0;  // server-owned: thinking budget phase (1 / 2, Engine::set_continuation), never parsed
     bool ok = false;
     std::string error;
 };
@@ -206,6 +211,9 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         double tv = 0;
         if (num("temperature", tv)) req.temperature = float(tv);
         if (num("presence_penalty", tv)) req.presence_penalty = float(tv);
+        if (num("frequency_penalty", tv)) req.frequency_penalty = float(tv);
+        if (num("repetition_penalty", tv)) req.repeat_penalty = float(tv);  // vLLM / transformers name
+        if (num("repeat_penalty", tv)) req.repeat_penalty = float(tv);      // llama.cpp / LM Studio / Ollama name
         if (num("top_p", tv)) req.top_p = float(tv);
         if (const auto * x = root.get("top_k"); x && x->kind != tqllm::Json::Null) {
             if (x->kind != tqllm::Json::Number || !std::isfinite(x->num) || x->num < 0 ||
@@ -536,6 +544,33 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// Closing tags of the tool-call syntax at the end of plain prose, with no call before them: the model echoes them
+// after a long tool-using conversation ("... done.\n</parameter>"). They are never answer text: where the trailing run
+// of such tags (and whitespace) starts, or t.size() when the text does not end with one. `partial`: a tail that may still
+// grow into one of them counts too (streaming holds it back until the next token decides).
+inline size_t orphan_tool_tail(std::string_view t, bool partial = false) {
+    static const std::string_view closers[3] = {"</" "parameter>", "</" "function>", "</" "tool_call>"};
+    auto ws = [](char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+    size_t end = t.size();
+    if (partial) {
+        size_t hold = 0;
+        for (const auto & m : closers)
+            for (size_t k = std::min(end, m.size() - 1); k > hold; --k)
+                if (t.compare(end - k, k, m.substr(0, k)) == 0) { hold = k; break; }
+        end -= hold;
+    }
+    bool any = false;
+    for (bool cut = true; cut;) {
+        cut = false;
+        size_t e = end;
+        while (e > 0 && ws(t[e - 1])) --e;
+        for (const auto & m : closers)
+            if (e >= m.size() && t.compare(e - m.size(), m.size(), m) == 0) { end = e - m.size(); cut = any = true; break; }
+    }
+    if (any) while (end > 0 && ws(t[end - 1])) --end;
+    return end;
+}
+
 // Streaming with tools: how much of the raw answer text can go out now. extract_tool_calls() cuts the answer at the
 // first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
 // tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
@@ -546,7 +581,7 @@ inline size_t tool_stream_limit(const std::string & t) {
     for (const auto & m : markers)
         for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
             if (t.compare(end - k, k, m, 0, k) == 0) { end -= k; break; }
-    return end;
+    return orphan_tool_tail(std::string_view(t).substr(0, end));
 }
 
 // stats from generate_spec / spec_finish: steps, drafted, accepted, decode us, prefill us
@@ -739,7 +774,9 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
+        model.set_continuation(req.continuation);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         { tqllm::PrefillObservation progress(observe_prefill(req.observation));
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
@@ -808,7 +845,10 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
 inline void extract_tool_calls(DecodeResult & r) {
     // <tool_call> / </tool_call> are special tokens the detokenizer drops, so blocks are found by <function=...>.
     const auto first_fn = r.text.find("<function=");
-    if (first_fn == std::string::npos) return;
+    if (first_fn == std::string::npos) {
+        if (const size_t o = orphan_tool_tail(r.text); o < r.text.size()) r.text = trim(r.text.substr(0, o));
+        return;
+    }
     const auto first_tc = r.text.find("<tool_call>");
     const size_t first = std::min(first_fn, first_tc);
     size_t at = first_fn;
@@ -1082,7 +1122,7 @@ private:
         for (const auto & m : markers)
             for (size_t k = std::min(end, m.size() - 1); k > 0; --k)
                 if (t.compare(end - k, k, m, 0, k) == 0) {end -= k; break;}
-        return end;
+        return orphan_tool_tail(t.substr(0, end), true);
     }
     static size_t unstable_tail_view(std::string_view t) {
         if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
@@ -1160,13 +1200,28 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+    model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
+        model.set_continuation(req.continuation);
     if (!images.spans.empty()) model.set_prompt_images(images.spans);
-    { tqllm::PrefillObservation progress(observe_prefill(req.observation));
+    // the prefill chooses the first token before its remaining work (MTP catch-up, bank refill): engines with the hook
+    // stream it from there, the others right after spec_begin, so the time to first token is the prefill's
+    bool live = true, sent = false;
+    auto send_first = [&] {
+        if (sent) return; sent = true;
+        if (const auto & first = model.spec_tokens(0); !first.empty()) {
+            if (req.observation) req.observation->tokens(static_cast<uint32_t>(first.size()));
+            if (!on_tokens(first)) { if (req.observation) req.observation->finish("cancelled"); live = false; }
+        } else sent = false;
+    };
+    {   struct HookReset { tqllm::Model & m; ~HookReset() { m.set_first_token_hook(nullptr); } } hook_reset{model};
+        model.set_first_token_hook(send_first);
+        tqllm::PrefillObservation progress(observe_prefill(req.observation));
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
-    while (model.spec_advance()) {
+    send_first();
+    while (live && model.spec_advance()) {
         const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;

@@ -23,7 +23,7 @@ int DecodeModel::mtp_batch(const std::vector<int> & tokens, const float * h_rows
     Device<float> norm{size_t(width)}, out{size_t(h)};
     tqllm_cuda::hc_norm(residual->p + size_t(n - 1) * width, cp.dense_device(nx + "hc_head_norm.weight"), norm.p, h, c.hc, 1, float(cp.epsilon), nullptr);
     mix_device(cp, nx + "hc_head_", norm.p, 1, out.p, nullptr);
-    static const bool conf_on = std::getenv("TQFN_DRAFT_TAU") != nullptr;
+    const bool conf_on = cp.run.draft_tau > 0.f;
     return cp.draft_head_argmax_device(out.p, 1, conf_on ? &draft_conf : nullptr);
 }
 
@@ -32,10 +32,10 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
     const std::string nx = "blk." + std::to_string(L) + ".nextn.", prefix = "blk." + std::to_string(L) + ".";
     const int kvh = cp.attention_kvheads, ad = cp.attention_dim; const size_t row = size_t(kvh) * ad;
     AttentionState & a = mtp_att;
-    if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(g_kv_capacity) * row * sizeof(__nv_bfloat16)); }
-    require(a.len + n <= g_kv_capacity, "MTP KV exceeds the attention KV capacity");
+    if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(kv_cap(a, cp.rt.kv_capacity)) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(kv_cap(a, cp.rt.kv_capacity)) * row * sizeof(__nv_bfloat16)); }
+    require(a.len + n <= kv_cap(a, cp.rt.kv_capacity), "MTP KV exceeds the attention KV capacity");
     const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
-    const bool qsa_keys = tqfn_default_on("TQFN_QSA") && cp.has_tensor(prefix + "indexer.k_proj.weight");
+    const bool qsa_keys = cp.has_tensor(prefix + "indexer.k_proj.weight");
     for (int d = 0; d < n; d += 2048) {
         const int m = std::min(2048, n - d); ArenaMark scratch;
         Device<float> de(size_t(m) * h), en(size_t(m) * h), hn(size_t(m) * width), cat(size_t(m) * c.hc * 2 * h), res(size_t(m) * width);
@@ -71,7 +71,7 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
         ck(cudaMemcpyAsync(a.k->p + size_t(a.len) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         ck(cudaMemcpyAsync(a.v->p + size_t(a.len) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
         if (qsa_keys) {  // the indexer keys as attention_core appends them
-            if (!a.qsa) { PersistentAlloc keep; a.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(g_kv_capacity, 4, 2048, 4, 128,
+            if (!a.qsa) { PersistentAlloc keep; a.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(kv_cap(a, cp.rt.kv_capacity), 4, 2048, 4, 128,
                               std::min(cp.rotary, 128), cp.theta, float(cp.epsilon)); }
             if (a.qsa->size() > a.len) a.qsa->truncate(a.len);
             Device<float> ik(size_t(m) * 128);
@@ -147,15 +147,19 @@ std::vector<int> DecodeModel::mtp_batch_multi(const std::vector<DecodeModel *> &
         auto residual = std::make_unique<Device<float>>(size_t(N) * width);
         cp.project(nx + "eh_proj.weight", cat.p, residual->p, 2 * h, h, N * c.hc);
         layer_forward(L, residual, N, nullptr, nullptr, *mtp_experts, &segs);
+        // every sequence's draft head in one launch and one readback (a readback per sequence drained the stream each
+        // time: ~15 synchronous copies per np 2 step, 3090 nsys 11-03)
+        Device<float> outs(size_t(g1 - g0) * h);
         for (size_t i = g0; i < g1; ++i) {
             const auto & sg = segs[i - g0]; DecodeModel & m = *sg.m;
             const float * last = residual->p + size_t(sg.off + sg.n - 1) * width;
             ck(cudaMemcpyAsync(m.mtp_h->p, last, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
-            Device<float> norm{size_t(width)}, out{size_t(h)};
+            Device<float> norm{size_t(width)};
             tqllm_cuda::hc_norm(last, cp.dense_device(nx + "hc_head_norm.weight"), norm.p, h, c.hc, 1, float(cp.epsilon), nullptr);
-            mix_device(cp, nx + "hc_head_", norm.p, 1, out.p, nullptr);
-            result[i] = cp.draft_head_argmax_device(out.p, 1);
+            mix_device(cp, nx + "hc_head_", norm.p, 1, outs.p + size_t(i - g0) * h, nullptr);
         }
+        const auto best = cp.draft_head_argmax_many(outs.p, int(g1 - g0));
+        for (size_t i = g0; i < g1; ++i) result[i] = best[i - g0];
         g0 = g1;
     }
     return result;
@@ -184,9 +188,9 @@ std::vector<int> DecodeModel::mtp_drafts(int d1, int count) {
     if (count <= 0) return {};  // drafts=0: plain decode (the length fix-up below assumes at least one draft)
     std::vector<int> d{d1};
     Device<float> hcopy{size_t(width)};
-    // TQFN_DRAFT_TAU=t: stop drafting once the last draft's top probability is below t (at least one draft). The verify
+    // cp.run.draft_tau = t: stop drafting once the last draft's top probability is below t (at least one draft). The verify
     // output does not depend on the block length (greedy text identical for drafts 2-5), so the text is unchanged.
-    static const float tau = std::getenv("TQFN_DRAFT_TAU") ? std::strtof(std::getenv("TQFN_DRAFT_TAU"), nullptr) : 0.f;
+    const float tau = cp.run.draft_tau;
     for (int i = 1; i < count && tqllm::flashnext::keep_drafting(tau, draft_conf); ++i) {
         ck(cudaMemcpyAsync(hcopy.p, mtp_h->p, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         d.push_back(mtp_batch({d.back()}, hcopy.p));

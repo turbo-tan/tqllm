@@ -1,6 +1,8 @@
-// Bench only: grouped dedup expert matvec at the Flash-Next decode shape (G distinct experts from a 64-slot bank,
-// 1-2 token columns each), isolated from copies; prints us and effective GB/s per format.
+// Bench only: grouped dedup expert matvec at the Flash-Next decode shape (G distinct experts of a 512-slot bank, the
+// calls rotating over disjoint expert sets so the weights stream from DRAM as in decode, not from L2), isolated from
+// copies; prints us and effective GB/s per format.
 // usage: expert-dedup-bench [groups=16] [cols_per_group=2] [iters=200]
+#include <algorithm>
 #include "weight_format.hpp"
 #include "quant_kernels.cuh"
 #include <cuda_fp16.h>
@@ -13,7 +15,8 @@
 #include <functional>
 int main(int argc, char ** argv) {
     const int G = argc > 1 ? std::atoi(argv[1]) : 16, C = argc > 2 ? std::atoi(argv[2]) : 2, iters = argc > 3 ? std::atoi(argv[3]) : 200;
-    const int slots = 64, ntok = 4, DS = tqllm_cuda::kDedupStride;
+    const int pad = argc > 4 ? std::atoi(argv[4]) : 0;  // empty groups (slot -1) after the G real ones, as a launch sized by an upper bound
+    const int slots = 512, ntok = 8, DS = tqllm_cuda::kDedupStride;
     std::mt19937 g(7);
     struct Case { unsigned ty; int bb, rows, cols; const char * what; };
     for (const Case cs : {Case{22, 82, 640, 2560, "gate/up IQ2_S"}, Case{18, 98, 640, 2560, "gate/up IQ3_XXS"}, Case{21, 110, 640, 2560, "gate/up IQ3_S"},
@@ -30,13 +33,15 @@ int main(int argc, char ** argv) {
         std::vector<__half> x(size_t(ntok) * cs.cols, __float2half(0.01f));
         __half * dx; cudaMalloc(&dx, x.size() * 2); cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice);
         __nv_bfloat16 * dy; cudaMalloc(&dy, size_t(ntok) * 10 * cs.rows * 2);
-        std::vector<int> map(size_t(3) * 40 * DS, -1);
-        for (int q = 0; q < G; ++q) {
-            int * e = map.data() + q * DS; e[0] = (q * 37) % slots; e[1] = C;
+        const int per = std::max(120, G + pad), R = std::max(1, slots / std::max(1, G));  // R maps over disjoint experts
+        std::vector<int> map(size_t(per) * R * DS, -1);
+        for (int q = 0; q < G * R; ++q) {
+            int * e = map.data() + (size_t(q / G) * per + q % G) * DS; e[0] = (q * 37) % slots; e[1] = C;
             for (int c = 0; c < C; ++c) { e[2 + c] = (q + c) % ntok; e[2 + tqllm_cuda::kDedupCols + c] = (q * C + c) % 40; }
         }
         int * dm; cudaMalloc(&dm, map.size() * 4); cudaMemcpy(dm, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
-        auto call = [&] { m.fmt->expert_matvec_dedup(m, dx, dy, cs.rows, dm, G, nullptr); };
+        int rot = 0;
+        auto call = [&] { m.fmt->expert_matvec_dedup(m, dx, dy, cs.rows, dm + size_t(rot++ % R) * per * DS, G + pad, nullptr); };
         for (int i = 0; i < 20; ++i) call();
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0);
         for (int i = 0; i < iters; ++i) call();
@@ -67,7 +72,7 @@ int main(int argc, char ** argv) {
         if (cs.ty != 20) {  // paired gate + up (same matrix twice stands in for up): one launch vs two
             __nv_bfloat16 * dy2; cudaMalloc(&dy2, size_t(ntok) * 10 * cs.rows * 2);
             auto two = [&] { call(); call(); };
-            auto pair = [&] { m.fmt->expert_matvec_dedup2(m, m, dx, dy, dy2, cs.rows, dm, G, nullptr); };
+            auto pair = [&] { m.fmt->expert_matvec_dedup2(m, m, dx, dy, dy2, cs.rows, dm + size_t(rot++ % R) * per * DS, G + pad, nullptr); };
             for (auto [nm, fn] : {std::pair<const char *, std::function<void()>>{"two launches", two}, {"paired", pair}}) {
                 for (int i = 0; i < 20; ++i) fn();
                 cudaEventRecord(e0); for (int i = 0; i < iters; ++i) fn(); cudaEventRecord(e1); cudaEventSynchronize(e1);

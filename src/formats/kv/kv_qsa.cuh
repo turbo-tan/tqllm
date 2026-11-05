@@ -21,6 +21,10 @@ void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const
 
 // Same results as qsa_attention_direct, K/V rows read once per kv head: scores [tokens][heads][width] and inv
 // [tokens][heads] are caller scratch.
+// Causal dense attention on the tensor-core prefill kernel (query t sees cells 0 .. first_cells + t - 1): the numerics of the
+// selected prefill path, so a prompt's first top-k tokens are computed as its later ones. false: shape not covered.
+bool qsa_attention_dense_tc(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values, float * output,
+                            int tokens, int first_cells, int heads, int kv_heads, int dim, cudaStream_t);
 void qsa_attention_grouped(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                            const QsaDeviceSelection & selected, float * scores, float * inv, float * output, int tokens,
                            int first_cells, int heads, int kv_heads, int dim, cudaStream_t);

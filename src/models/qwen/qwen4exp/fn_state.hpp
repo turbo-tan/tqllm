@@ -27,10 +27,11 @@ struct KvBuf {
     char * at(size_t i) const { return reinterpret_cast<char *>(p) + i * page; }
     explicit KvBuf(size_t n) : bytes(n) {
         auto & m = mem(); const size_t g = m.granule();
+        { static const bool log = tqllm::debug_on("seqmem"); if (log) std::fprintf(stderr, "SEQMEM kvbuf %zu KiB asked\n", n >> 10); }
         // host K/V (kv_host_enabled: discrete GPUs by default): VMM pages, so old ones can move to host memory; else
         // plain allocations
         if (g && kv_host_enabled()) {
-            page = std::max(g, (size_t(32) << 20) / g * g); span = (n + page - 1) / page * page;
+            page = tqllm::flashnext::kv_page_bytes(n, g); span = (n + page - 1) / page * page;
             if (void * va = m.reserve(span)) {
                 p = static_cast<__nv_bfloat16 *>(va); vmm = true; on_host.assign(span / page, 0);
                 for (size_t i = 0; i < on_host.size(); ++i)
@@ -82,7 +83,8 @@ inline const tqllm::KvFormat & kv_fmt() {
     }();
     return *f;
 }
-struct AttentionState { std::unique_ptr<KvBuf> k, v; int len = 0;
+struct AttentionState { std::unique_ptr<KvBuf> k, v; int len = 0; int cap = 0;  // cap: this sequence's K/V positions (0: rt.kv_capacity)
                         std::unique_ptr<tqllm_cuda::QsaIndexer> qsa; };  // QSA indexer keys (beyond the indexer budget)
+inline int kv_cap(const AttentionState & a, int global) { return a.cap > 0 ? a.cap : global; }
 // pre: the row-wise projections of this sequence's rows were done for a whole batch (qkv, z, alpha, beta slices);
 // raw_out: write the recurrence output there and stop before the gated norm and the output projection (also batched)

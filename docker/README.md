@@ -7,4 +7,3 @@ Set `DRAFT_MODEL_FILE`, `DRAFT_VOCAB_FILE`, and `KV_FORMAT` for optional acceler
 These map to `-md`, `--draft-vocab`, and `--kv`; retired `TQLLM_*` options are rejected by the runtime.
 Pass other native options after the image name, including `-ctk`, `-ctv`, `--no-tree`, `--lookup`, and `-fit`.
 `CONTEXT`, `PARALLEL`, `MAX_TOKENS`, and `REASONING` retain their container defaults.
-This candidate has not passed the full release gates and must not be published.

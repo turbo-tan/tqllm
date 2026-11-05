@@ -1,4 +1,4 @@
-// GLM-5.3-Flash kernels (src/models/glm/glm5next.cu) against CPU code that is the math of tools/glm_ref.cpp, which
+// GLM-5.3-Flash kernels (src/models/glm/glm5next/glm5next.cu) against CPU code that is the math of tools/glm_ref.cpp, which
 // matches llama.cpp. Stateful kernels (KDA conv history and recurrence, MLA cache) run several steps.
 #include "glm5next_kernels.cuh"
 #include "moe.hpp"
@@ -101,7 +101,7 @@ void test_rms_mv() {
     auto want = x;
     rms(want.data(), n, w.data(), 1e-5f);
     float * dx = dev(x), * dw = dev(w), * dy = dev0<float>(size_t(n));
-    tqllm_cuda::glm_rmsnorm(dx, dw, dy, nullptr, n, 1e-5f, nullptr);
+    tqllm_cuda::common::rmsnorm(dx, dw, dy, nullptr, n, 1e-5f, nullptr);
     compare("rmsnorm", host(dy, size_t(n)), want, 1e-5f);
     {  // short rows (one warp per row): 37 rows of 128, FP32 and FP16 outputs
         const int sr = 37, sn = 128;
@@ -110,7 +110,7 @@ void test_rms_mv() {
         for (int r = 0; r < sr; ++r) rms(ref.data() + size_t(r) * sn, sn, ws.data(), 1e-5f);
         float * dxs = dev(xs), * dws = dev(ws), * dys = dev0<float>(xs.size());
         __half * dyh = dev0<__half>(xs.size());
-        tqllm_cuda::glm_rmsnorm(dxs, dws, dys, dyh, sn, 1e-5f, nullptr, sr);
+        tqllm_cuda::common::rmsnorm(dxs, dws, dys, dyh, sn, 1e-5f, nullptr, sr);
         compare("rmsnorm short rows", host(dys, xs.size()), ref, 1e-5f);
         const auto hh = host(dyh, xs.size());
         std::vector<float> hf(hh.size()); for (size_t i = 0; i < hh.size(); ++i) hf[i] = __half2float(hh[i]);
@@ -121,7 +121,7 @@ void test_rms_mv() {
     std::vector<float> y(static_cast<size_t>(rows));
     for (int r = 0; r < rows; ++r) { double a = 0; for (int c = 0; c < cols; ++c) a += double(W[size_t(r) * cols + c]) * v[size_t(c)]; y[size_t(r)] = float(a); }
     float * dW = dev(W), * dv = dev(v), * dyy = dev0<float>(size_t(rows));
-    tqllm_cuda::glm_mv_f32(dW, dv, dyy, rows, cols, 1, nullptr);
+    tqllm_cuda::common::mv_f32(dW, dv, dyy, rows, cols, 1, nullptr);
     compare("mv_f32", host(dyy, size_t(rows)), y, 1e-5f);
     {  // split-K for few rows: hc_fn shape (24 x 16384), 3 tokens
         const int r2 = 24, c2 = 16384, n2 = 3, sp = 32;
@@ -133,10 +133,10 @@ void test_rms_mv() {
             y2[size_t(t) * r2 + r] = float(a);
         }
         float * dW2 = dev(W2), * dx2 = dev(x2), * dy2 = dev0<float>(y2.size()), * part = dev0<float>(size_t(n2) * r2 * sp);
-        tqllm_cuda::glm_mv_f32_splitk(dW2, dx2, dy2, part, r2, c2, n2, sp, nullptr);
+        tqllm_cuda::common::mv_f32_splitk(dW2, dx2, dy2, part, r2, c2, n2, sp, nullptr);
         compare("mv_f32 split-K (24 x 16384, 3 tokens)", host(dy2, y2.size()), y2, 1e-4f);
         const auto first = host(dy2, y2.size());
-        tqllm_cuda::glm_mv_f32_splitk(dW2, dx2, dy2, part, r2, c2, n2, sp, nullptr);
+        tqllm_cuda::common::mv_f32_splitk(dW2, dx2, dy2, part, r2, c2, n2, sp, nullptr);
         compare("mv_f32 split-K is deterministic", host(dy2, y2.size()), first, 0.f);
     }
 }
@@ -244,7 +244,7 @@ void test_route() {
         const auto sel = tqllm::moe_route(mc, logits.data(), bias.data());
         float * dl = dev(logits), * db = dev(bias), * dw = dev0<float>(size_t(k));
         int * di = dev0<int>(size_t(k));
-        tqllm_cuda::glm_route(dl, db, di, dw, E, k, true, 2.5f, nullptr);
+        tqllm_cuda::moe_common::route(dl, db, di, dw, E, k, true, 2.5f, nullptr);
         const auto ids = host(di, size_t(k));
         const auto w = host(dw, size_t(k));
         if (ids != sel.ids) { ++failures; std::printf("FAIL route trial %d: selected experts differ\n", trial); }
@@ -277,12 +277,12 @@ void test_ffn_bits() {
     for (int j = 0; j < H; ++j) { float v = sh[size_t(j)]; for (int i = 0; i < k; ++i) v += w[size_t(i)] * __bfloat162float(yb[size_t(i) * H + j]); sum[size_t(j)] = v; }
     float * dw = dev(w), * dsh = dev(sh), * ds = dev0<float>(size_t(H));
     __nv_bfloat16 * dy = dev(yb);
-    tqllm_cuda::glm_moe_sum(dy, dw, dsh, ds, k, H, nullptr);
+    tqllm_cuda::moe_common::moe_sum(dy, dw, dsh, ds, k, H, nullptr);
     compare("moe weighted sum", host(ds, size_t(H)), sum, 1e-5f);
     auto x = rnd(100000);
     x[77777] = 5.f;
     int * da = dev0<int>(1);
-    tqllm_cuda::glm_argmax(dev(x), int(x.size()), da, nullptr);
+    tqllm_cuda::common::argmax(dev(x), int(x.size()), da, nullptr);
     if (host(da, 1)[0] != 77777) { ++failures; std::printf("FAIL argmax\n"); } else std::printf("PASS argmax\n");
 }
 
@@ -359,10 +359,10 @@ void test_chunks() {
     const int rows = 29, cols = 300;
     auto W = rnd(size_t(rows) * cols), x = rnd(size_t(n) * cols);
     float * dW = dev(W), * dx = dev(x), * y = dev0<float>(size_t(n) * rows), * y1v = dev0<float>(size_t(rows));
-    tqllm_cuda::glm_mv_f32(dW, dx, y, rows, cols, n, nullptr);
+    tqllm_cuda::common::mv_f32(dW, dx, y, rows, cols, n, nullptr);
     std::vector<float> ys;
     for (int t = 0; t < n; ++t) {
-        tqllm_cuda::glm_mv_f32(dW, dx + size_t(t) * cols, y1v, rows, cols, 1, nullptr);
+        tqllm_cuda::common::mv_f32(dW, dx + size_t(t) * cols, y1v, rows, cols, 1, nullptr);
         const auto r = host(y1v, size_t(rows));
         ys.insert(ys.end(), r.begin(), r.end());
     }

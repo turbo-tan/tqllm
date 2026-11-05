@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
-"""Generate src/core/flags_gen.hpp and docs/FLAGS.md from config/flags.yaml (the single registry of TQLLM_* / TQFN_* flags).
+"""Generate src/core/flags_gen.hpp and docs/FLAGS.md from config/flags.yaml (the single registry of TQLLM_* / TQFN_* flags)
+and config/flags_removed.yaml (names removed in a release, listed in docs/FLAGS.md with what replaces them).
 
---check: fail if the generated files are stale, if code reads a TQLLM_* or TQFN_* variable that is not registered, or if a
-registered flag is read nowhere (stdlib only; the YAML is a fixed subset: a list of name/kind/default/doc/replaced_by)."""
+--check: fail if the generated files are stale, if code reads a TQLLM_* or TQFN_* variable that is not registered, if the
+engine (src/) reads any other environment variable, if a
+registered flag is read nowhere, or if a removed name is registered or read again (stdlib only; the YAML is a fixed
+subset: a list of name/kind/default/doc/replaced_by, and of name/since/use)."""
 import pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KINDS = ("user", "debug", "retired")
 
 
-def load():
+def load(path="config/flags.yaml", fields=("kind", "default", "doc", "replaced_by")):
     flags, cur = [], None
-    for raw in (ROOT / "config/flags.yaml").read_text().splitlines():
+    for raw in (ROOT / path).read_text().splitlines():
         line = raw.split(" #")[0].rstrip() if not raw.lstrip().startswith("#") else ""
         m = re.match(r"\s*-\s*name:\s*(\S+)$", line)
         if m:
-            cur = {"name": m.group(1), "kind": "", "default": "", "doc": "", "replaced_by": ""}
+            cur = {"name": m.group(1), **{k: "" for k in fields}}
             flags.append(cur)
             continue
-        m = re.match(r"\s+(kind|default|doc|replaced_by):\s*(.*)$", line)
+        m = re.match(r"\s+(" + "|".join(fields) + r"):\s*(.*)$", line)
         if m and cur is not None:
             v = m.group(2).strip()
             if v.startswith('"') and v.endswith('"'):
                 v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
             cur[m.group(1)] = v
     for f in flags:
-        assert f["kind"] in KINDS, f
+        assert all(f[k] for k in fields if k in ("since", "use")) and f.get("kind", "user") in KINDS, f
     return flags
+
+
+def load_removed():
+    return load("config/flags_removed.yaml", ("since", "use"))
 
 
 def cstr(s):
@@ -62,7 +69,7 @@ inline const Flag * find(const char * name) {{
 """
 
 
-def gen_md(flags):
+def gen_md(flags, removed):
     out = ["# TQLLM flags", "", "Generated from `config/flags.yaml` (`tools/gen_flags.py`). `tqserve --list-flags` prints the same table;",
            "every tool stops at start-up when a retired name is set and warns about unknown `TQLLM_*` names. Settings are",
            "command-line options (`docs/CONFIG.md`).", ""]
@@ -71,21 +78,35 @@ def gen_md(flags):
         out += [f"## {titles[k]}", "", "| Flag | Default | What it does | Use instead |", "|---|---|---|---|"]
         out += [f"| `{f['name']}` | {f['default']} | {f['doc']} | {f['replaced_by']} |" for f in flags if f["kind"] == k]
         out.append("")
+    for since in sorted({r["since"] for r in removed}, reverse=True):
+        out += [f"## Removed in {since} (no effect; use the replacement)", "", "| Flag | Use instead |", "|---|---|"]
+        out += [f"| `{r['name']}` | {r['use']} |" for r in removed if r["since"] == since]
+        out.append("")
     return "\n".join(out)
 
 
 def used_names():
     names = set()
-    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")):
+    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("tools/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")) + list(ROOT.glob("src/**/*.mm")):
         if p.name == "flags_gen.hpp":
             continue
         names |= set(re.findall(r'"((?:TQLLM|TQFN)_[A-Z0-9_]+)"', p.read_text(errors="ignore")))
     return names
 
 
+def foreign_env_reads():
+    """getenv names in the engine (src/) outside the registry's TQLLM_* / TQFN_* names: switches nobody can find"""
+    found = set()
+    for p in list(ROOT.glob("src/**/*.[ch]pp")) + list(ROOT.glob("src/**/*.cu*")) + list(ROOT.glob("src/**/*.mm")) + list(ROOT.glob("src/**/*.h")):
+        for n in re.findall(r'getenv\(\s*"([A-Za-z0-9_]+)"', p.read_text(errors="ignore")):
+            if not re.match(r"(TQLLM|TQFN)_", n):
+                found.add(f"{n} ({p.relative_to(ROOT)})")
+    return found
+
+
 def main():
-    flags = load()
-    hpp, md = gen_hpp(flags), gen_md(flags)
+    flags, removed = load(), load_removed()
+    hpp, md = gen_hpp(flags), gen_md(flags, removed)
     targets = {ROOT / "src/core/flags_gen.hpp": hpp, ROOT / "docs/FLAGS.md": md}
     if "--check" not in sys.argv:
         for p, t in targets.items():
@@ -96,9 +117,13 @@ def main():
     reg = {f["name"] for f in flags}
     used = used_names()
     bad += [f"{n} is read in the code but not in config/flags.yaml" for n in sorted(used - reg)]
+    bad += [f"{n}: an environment switch outside the registry (name it TQLLM_* / TQFN_* in config/flags.yaml, or remove it)" for n in sorted(foreign_env_reads())]
     retired = {f["name"] for f in flags if f["kind"] == "retired"}
     bad += [f"{n} is retired but still read in the code" for n in sorted(used & retired)]
     bad += [f"{n} is registered but read nowhere" for n in sorted(reg - used - retired)]
+    gone = {r["name"] for r in removed}
+    bad += [f"{n} is in config/flags_removed.yaml and registered again" for n in sorted(gone & reg)]
+    bad += [f"{n} is in config/flags_removed.yaml and read in the code again" for n in sorted(gone & used)]
     for b in bad:
         print("FLAGS:", b)
     print("flags registry:", "FAIL" if bad else f"ok ({len(flags)} flags)")

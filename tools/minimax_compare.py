@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Engine residual stream (TQLLM_MINIMAX_DUMP) against the oracle's h1..hN (tools/minimax_ref.py --stream npz).
+"""Engine residual stream (TQLLM_DEBUG=minimax_dump) against the oracle's h1..hN (tools/minimax_ref.py --stream npz).
 
   minimax_compare.py engine.dump ref.npz [--head CKPT]   per layer: relative error and cosine per position;
   with --head, the oracle's logits for the cut (final norm + lm_head on h_N) to compare with the engine's top tokens.

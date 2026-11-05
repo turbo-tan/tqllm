@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "tqllm/options.hpp"
 #include "tqllm/tokenizer.hpp"
 #include <cstdint>
@@ -37,7 +38,10 @@ public:
                                         uint64_t * stats = nullptr);
     // Sampling for generate_spec: temperature 0 = greedy; top_k <= 16, top_p, seed.
     void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0, float presence = 0.f);
+    void set_penalties(float repeat = 1.f, float frequency = 0.f);  // after set_sampling: repeat (1 = off) / frequency penalty
     void set_ignore_eos(bool on);  // decode to max_tokens through end-of-sequence tokens (fixed-length benchmarks)
+    void set_first_token_hook(std::function<void()> hook);  // the next spec_begin calls it once its first token is picked
+    void set_continuation(int phase);  // thinking budget: 1 phase 1, 2 phase 2 (continues phase 1), 0 neither (Engine::set_continuation)
     // Multi-slot: select_slot makes a slot active for the calls that follow (set_sampling included).
     int slots() const;
     uint32_t context() const;  // positions per slot (the memory fit may have halved the requested context)
@@ -64,6 +68,7 @@ public:
     std::vector<uint32_t> spec_finish(uint64_t * stats = nullptr);
     // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
     const std::vector<uint32_t> & spec_tokens(int slot = 0) const;
+    uint32_t prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const;  // prompt tokens the slot would reuse
     // Drafter target features [P][nf * hidden] (BF16 bits) of every position of `tokens` (prefilled from 0); returns nf.
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats);
     // Prefill tokens at positions [pos, pos + n) without the LM head (KV and recurrent state only); false: unsupported.

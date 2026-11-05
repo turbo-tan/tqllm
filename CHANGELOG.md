@@ -3,11 +3,51 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.4.1 (2026-11-05)
+
+The first public release since 1.2.3: it carries everything below (the 1.3.0 and 1.4.0 candidates were not published).
 
 ### Added
-- MiniMax-M3.1-Flash from the EXL3 2.15 bpw pack (Hugging Face folder, no conversion) on one GB10 / DGX Spark, with the
-  DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
+- Flash-Next serves several requests at once in one batched verify step (`--np` 2-8), with every request's text equal
+  to its `--np 1` text under `--exact on`. RTX 3090, same IQ3_S GGUF and 8 prompts, total tok/s per round against
+  Strata 0.2.10: `--np 2` 113 / 93 vs 72-79, `--np 4` 89 / 86 vs 73-79, `--np 1` 154 / 92 vs 93-115, `--np 8` 68 / 72
+  vs 70-74. Expert slots are sized per request count from the measured state (`slots=auto`).
+- Prompt cache across request slots (Flash-Next, `--prompt-cache on` with `--np` > 1): each slot keeps its conversation,
+  a request goes to the slot that already holds most of its prompt, and only the new part is prefilled. Eight concurrent
+  agent sessions on a GB10: 11.9 vs 4.5 tok/s total, first token 7 s vs 30 s. A reused prompt is not byte-identical to an
+  uncached one, so with `--exact on` the server prints a warning.
+- `repeat_penalty` (LM Studio / llama.cpp; `repetition_penalty` accepted) and `frequency_penalty` per request, and
+  `--repeat-penalty` / `--frequency-penalty` server defaults, next to `presence_penalty` (27B engine; sampling only).
+- Flash-Next: faster decode at long context (multi-row BF16 matrix-vector kernel, indexer keys in a ring with a host
+  mirror, expert banks grown into free memory after a long prompt): 128K exact 79.2 vs 73.5 tok/s on an RTX 3090, chats
+  +3.5-8 %, same output.
+- Quantised mmproj tensors (Q5_0 / Q5_1) load for the vision encoder.
+- MiniMax: `--draft-vocab FILE` runs the DSpark drafter's head over a token subset (exact: the target verifies every token).
+- `--exact on|off`, on by default: every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8
+  GEMMs, no CPU-served experts), so greedy output is the same from build to build. `--exact off` turns on each engine's
+  measured approximations; an approximation asked for explicitly with `--exact on` runs with one `WARN` line and a
+  `/health` note. Per-engine table in [options](docs/reference/options.md#exact-and-speed---exact-onoff).
+- One server front for every backend: CUDA and Apple Silicon (Metal) builds of `tqserve` share the same model front and
+  pick the engine from a registry (`src/backends/<platform>/`); a new architecture registers there
+  ([Adding a model](docs/guides/adding-a-model.md)).
+- Weight-format plugins (experimental, CUDA): `--plugin PATH` loads a shared library that adds a GGUF tensor type or a
+  faster kernel for a built-in format. Each is checked against the format contract at load, and a patch that claims to
+  be exact is compared bit for bit with the built-in kernel; `/health` lists what was loaded ([Plugins](docs/guides/plugins.md)).
+- Format contract test: every GGUF weight format's GPU dequantisation against a CPU reference and its matrix-vector
+  product against a double-precision dot (14 of 19 formats pass; IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_S are known gaps).
+- Metal (Apple Silicon): Qwen3.8-27B decode with the DFlash2 drafter on the same mlx-community 4-bit weights as
+  Splash 1.4.0 is faster on 13 of 18 measured prompts on an M5 Pro 48 GB (2 ties, 3 losses). Short prompts run 2-20 % faster. Contexts
+  from 32K to 128K run 2-15 % faster. Changes: the drafter's native 8-row blocks on prompts of 8,000 tokens or more,
+  draft-ahead and a per-request width policy, int8 KV from 32K keys, and far-context retrieval for the drafter.
+  Verify attention reads the int8 KV in place. Greedy speculative output equals plain decoding.
+- Metal: 256K-token prompts on a 48 GB M5 Pro decode at 27.6 tok/s (Splash 1.4.0 24.5; TensorFold 1.2.1 cannot hold
+  the context). The KV cache is freed when a request ends (idle server 17.9 GB, was 26.3 GB after a 256K request), and
+  under `--exact on` an int8 KV cache forced by memory uses the int8-query attention (bit-identical rows, so greedy
+  speculative output still equals plain decoding; 23.2 -> 27.6 tok/s at 256K). Build guide: [Mac](docs/guides/mac.md),
+  with the MLX 0.32.3 patch in `third_party/mlx`.
+- MiniMax-M3.1-Flash (experimental: its greedy output has not yet been checked against a reference implementation and
+  changed in this release; treat its text and speed as preview) from the EXL3 2.15 bpw pack (Hugging Face folder, no
+  conversion) on one GB10 / DGX Spark, with the DSpark drafter: prompt chunks on tensor cores (attention, indexer, routed experts in batched trellis lists), FP8 KV
   when the context needs it, and a draft length that follows the measured acceptance. Prefill 537 tok/s on an 8K prompt
   at 16K context, 492 tok/s at 32K.
 - GLM-5.3-Flash (GSQ GGUF): sparse attention with the DSA indexer, contexts up to 128K on a GB10, prompt chunks of
@@ -18,6 +58,39 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Guide: [RTX 5090](docs/guides/rtx-5090.md): Flash-Next and Qwen3.8-27B numbers and what the engine sizes by itself.
 
 ### Changed
+- **Flash-Next prompt processing on GB10 / DGX Spark**, against TensorFold 1.2.2 on the same machine, same client and
+  prompts (tqLLM on its mixed Flash-Next file with 8-bit mixers, TensorFold on its MLX 4-bit folder): 8K / 16K / 32K / 64K prompts take 4.32 / 8.14 /
+  16.83 / 35.64 s vs 4.90 / 9.21 / 18.58 / 38.11 s (1.07-1.13x faster). The layer-major prefill runs dense attention on
+  tensor cores, the router and the hyper-connection mixers as FP16 / BF16 GEMMs (down and inject in one GEMM), writes
+  the 16-bit rows each projection reads instead of converting, combines the MoE and hyper-connection updates in one pass
+  and keeps the prompt's residual rows in BF16 between layers (files with 8-bit hyper-connection mixers). Decode is unchanged (1 / 2 / 4 / 8
+  requests: 122 / 97 / 106 / 120 tok/s on a repeated prompt); 8 requests' text still equals each request alone; GSM8K-200
+  96.0 % (paired with the previous build: 3 lost, 3 gained).
+- **Mac (Metal): `--exact on` output now equals plain one-token-at-a-time decoding, token for token**, also with the token
+  tree: one attention kernel serves plain decoding, chains and trees, summing each row's last 16-79 keys in plain-decoding
+  order. Decode on an M5 Pro 48 GB, same mlx-community 4-bit file as TensorFold 1.2.1 / Splash 1.4.0: 8K 51.9, 16K 62.1,
+  32K 56.1, 64K 48.8, 128K 38.9, 256K 27.5 tok/s (TensorFold 61.0 / 54.4 / 49.9 / 41.4 / 34.7 / does not fit; Splash
+  60.8 / 62.4 / 48.4 / 43.9 / 35.9 / 24.5).
+- **Mac: QSA sparse attention** for model files that carry QSA indexers (the 16 of higa2515/Qwen3.8-27B-QSA-BF16, added
+  with `tools/qsa_indexer_gguf.py` + `tools/gguf_add.py`): past `--qsa-from N` keys (default 49152) a step attends the
+  2,048 keys the indexer picks plus the recent ones. 128K decode 38.9 -> 49.6 tok/s. QSA changes the text; spec output
+  still equals the same file's plain decoding.
+- Mac: a thinking budget's second phase continues on the first phase's state under `--exact on` (only the closing tag is
+  prefilled, not the prompt and thinking again).
+- Flash-Next with several requests reads each dense weight once per step instead of once per 8 verify rows (the
+  hyper-connection mixers, the router and every quantised dense projection), the expert down projection takes two
+  16-row tiles per block, and the per-layer token embedding is read into memory again after the expert banks are built
+  (the bank build had pushed it out, so each step read random rows from the disk). GB10 / DGX Spark, total tok/s per
+  round: `--np 2` 75 / 59 (was 61 / 48), `--np 4` 90 / 80 (63 / 59), `--np 8` 99 / 100 (64 / 89), `--np 1` 55 / 48
+  (55 / 42); same output.
+- The decode reserve on a 3090-class card is 256 MB up to a 64K context (512 MB sat idle in decode): more expert slots.
+- Every environment switch the engine reads is a registered `TQLLM_*` / `TQFN_*` flag (`tools/gen_flags.py --check` fails
+  on any other); three unregistered switches were removed.
+- **Default precision:** with `--exact on` (the new default) the Qwen3.8-27B prefill runs FP16 GEMMs on CUDA where
+  1.3.0 used int8 (RTX 30 / 40 / 50) or FP8 (GB10). `--exact off` restores the 1.3.0 prefill.
+- **Environment variables:** 55 remain (20 settings, `TQLLM_DEBUG`, 35 retired names that stop the tool and name their
+  replacement). Diagnostics are `TQLLM_DEBUG` keys; settled A/B switches are gone, fixed at their measured defaults.
+  [docs/FLAGS.md](docs/FLAGS.md) lists every removed name with what replaces it.
 - Flash-Next decode launches its per-layer kernels directly on Blackwell PCIe cards (RTX 5090, `sm_120`) and keeps CUDA
   graphs on unified-memory GPUs (GB10 / DGX Spark, +5-6 % decode) and older PCIe cards (RTX 3090: -3 % chat without them).
   RTX 5090 with a server CPU: chat 128 -> 154, 64K context 118 -> 134 tok/s. Output identical.

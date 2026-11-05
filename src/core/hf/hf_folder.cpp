@@ -2,8 +2,17 @@
 #include "hf_arch.hpp"
 #include "x3_record.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -237,6 +246,261 @@ void HfFolder::tokenizer(GgufFile & f, const std::string & pre, uint64_t vocab) 
     special("bos_token", "tokenizer.ggml.bos_token_id");
     special("pad_token", "tokenizer.ggml.padding_token_id");
     if (fs::exists(dir_ / "chat_template.jinja")) f.kv["tokenizer.chat_template"].str = slurp(dir_ / "chat_template.jinja");
+}
+
+// ---- MLX affine 4-bit (group 32) ----
+namespace {
+
+// BF16 bits -> FP16 bits. Exact for every normal FP16 value; a value in FP16's subnormal range rounds to the nearest
+// subnormal (TensorFold's Flash-Next folder: 2,501 of 11.2 billion scales / biases, all below 7.3e-6, moved by at most
+// 3e-8). Out of FP16 range is an error (the repack would change the weights).
+uint16_t bf16_to_f16_exact(uint16_t b, const std::string & what) {
+    const uint32_t u = uint32_t(b) << 16, sign = (u >> 16) & 0x8000u;
+    const int exp = int((u >> 23) & 0xff) - 127;
+    const uint32_t mant = u & 0x7fffffu;  // BF16: the low 16 bits are zero
+    if (((u >> 23) & 0xff) == 0 && mant == 0) return uint16_t(sign);
+    if (((u >> 23) & 0xff) == 0xff || exp > 15) throw std::runtime_error("hf: " + what + ": a BF16 scale / bias is outside FP16");
+    if (exp >= -14) return uint16_t(sign | uint32_t(exp + 15) << 10 | mant >> 13);
+    // FP16 subnormal: value = m 2^-24 needs an integer m
+    const int shift = -14 - exp;                         // 1 .. : the implicit bit moves into the mantissa
+    const uint32_t full = (mant | 0x800000u) >> 13;      // 11 bits: 1.mmmmmmm0000
+    if (shift > 11) return uint16_t(sign);  // below half the smallest FP16 subnormal
+    uint32_t r = full >> shift; const uint32_t rem = full & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (r & 1u))) ++r;
+    return uint16_t(sign | r);
+}
+float bf16_f(uint16_t v) { uint32_t u = uint32_t(v) << 16; float f; std::memcpy(&f, &u, 4); return f; }
+uint16_t f_bf16(float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16); }
+uint16_t f_f16(float f) {  // round to nearest even (dequantised values; not on the exact path)
+    uint32_t u; std::memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u; int e = int((u >> 23) & 0xff) - 127; uint32_t m = u & 0x7fffffu;
+    if (e > 15) return uint16_t(sign | 0x7c00u);
+    if (e < -24) return uint16_t(sign);
+    if (e < -14) { m |= 0x800000u; const int sh = -1 - e; uint32_t r = m >> sh; if ((m >> (sh - 1)) & 1u && ((m & ((1u << (sh - 1)) - 1)) || (r & 1u))) ++r; return uint16_t(sign | r); }
+    uint32_t r = uint32_t(e + 15) << 10 | m >> 13; const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) ++r;
+    return uint16_t(sign | r);
+}
+
+struct Affine {  // one MLX affine 4-bit matrix (or a bank: [experts][rows][cols / 8])
+    SafeTensor w, s, b; uint64_t experts = 1, rows = 0, cols = 0;
+};
+Affine affine_of(const HfFolder & h, const std::string & m) {
+    Affine a{h.at(m + ".weight"), h.at(m + ".scales"), h.at(m + ".biases")};
+    if (a.w.dtype != "U32" || a.s.dtype != "BF16" || a.b.dtype != "BF16") throw std::runtime_error("hf: " + m + " is not MLX affine 4-bit");
+    const auto & ws = a.w.shape;
+    if (ws.size() == 3) { a.experts = ws[0]; a.rows = ws[1]; a.cols = ws[2] * 8; }
+    else if (ws.size() == 2) { a.rows = ws[0]; a.cols = ws[1] * 8; }
+    else throw std::runtime_error("hf: " + m + ".weight rank");
+    if (a.s.bytes != a.experts * a.rows * (a.cols / 32) * 2 || a.b.bytes != a.s.bytes)
+        throw std::runtime_error("hf: " + m + ": only group 32 is read as Q4_1 (scales " + std::to_string(a.s.bytes) + " bytes)");
+    return a;
+}
+constexpr uint64_t kQ41 = 20;  // bytes per 32 weights: d, m (FP16), 16 bytes of nibbles
+
+// rows [r0, r0 + n) of slice `e` (every row: words, scales, biases) from the three byte arrays
+void q4_1_rows(const Affine & a, const char * w, const char * s, const char * b, uint64_t r0, uint64_t n, char * out, const std::string & what) {
+    const uint64_t words = a.cols / 8, groups = a.cols / 32;
+    for (uint64_t r = r0; r < r0 + n; ++r) {
+        const auto * wr = reinterpret_cast<const uint32_t *>(w) + r * words;
+        const auto * sr = reinterpret_cast<const uint16_t *>(s) + r * groups;
+        const auto * br = reinterpret_cast<const uint16_t *>(b) + r * groups;
+        char * o = out + (r - r0) * groups * kQ41;
+        for (uint64_t g = 0; g < groups; ++g) {
+            const uint16_t d = bf16_to_f16_exact(sr[g], what), mn = bf16_to_f16_exact(br[g], what);
+            std::memcpy(o + g * kQ41, &d, 2); std::memcpy(o + g * kQ41 + 2, &mn, 2);
+            auto q = [&](uint64_t e) { return uint8_t((wr[g * 4 + e / 8] >> (4 * (e % 8))) & 15u); };
+            for (int i = 0; i < 16; ++i) o[g * kQ41 + 4 + i] = char(q(i) | q(i + 16) << 4);
+        }
+    }
+}
+void affine_rows_f32(const Affine & a, const char * w, const char * s, const char * b, uint64_t r0, uint64_t n, float * out) {
+    const uint64_t words = a.cols / 8, groups = a.cols / 32;
+    for (uint64_t r = r0; r < r0 + n; ++r) {
+        const auto * wr = reinterpret_cast<const uint32_t *>(w) + r * words;
+        const auto * sr = reinterpret_cast<const uint16_t *>(s) + r * groups;
+        const auto * br = reinterpret_cast<const uint16_t *>(b) + r * groups;
+        for (uint64_t c = 0; c < a.cols; ++c)
+            out[(r - r0) * a.cols + c] = float((wr[c / 8] >> (4 * (c % 8))) & 15u) * bf16_f(sr[c / 32]) + bf16_f(br[c / 32]);
+    }
+}
+
+// block j of the result = block order[j] (blocks of `block` units of `unit` bytes, after `offset` units)
+std::vector<char> reorder(std::vector<char> src, const HfFolder::BlockOrder & o, uint64_t units, uint64_t unit, uint64_t lines = 1) {
+    if (o.order.empty()) return src;
+    if ((o.offset + o.order.size() * o.block) > units) throw std::runtime_error("hf: block order exceeds the tensor");
+    std::vector<char> out(src);
+    const uint64_t line = units * unit, run = o.block * unit;
+    for (uint64_t l = 0; l < lines; ++l)
+        for (size_t j = 0; j < o.order.size(); ++j)
+            std::memcpy(out.data() + l * line + (o.offset + j * o.block) * unit, src.data() + l * line + (o.offset + uint64_t(o.order[j]) * o.block) * unit, run);
+    return out;
+}
+
+// read-only mappings of shard files, shared by the gather / warm hooks of one tensor
+struct ShardMaps {
+    std::mutex lock;  // the bank build's workers slice experts concurrently
+    std::map<std::string, std::pair<const char *, size_t>> maps;
+    const char * at(const SafeTensor & t) {
+        std::lock_guard<std::mutex> hold(lock);
+        auto it = maps.find(t.file);
+        if (it == maps.end()) {
+            const int fd = open(t.file.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) throw std::runtime_error("hf: cannot open " + t.file);
+            struct stat st{}; fstat(fd, &st);
+            void * p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0); close(fd);
+            if (p == MAP_FAILED) throw std::runtime_error("hf: cannot map " + t.file);
+            madvise(p, size_t(st.st_size), MADV_RANDOM);
+            it = maps.emplace(t.file, std::make_pair(static_cast<const char *>(p), size_t(st.st_size))).first;
+        }
+        return it->second.first + t.begin;
+    }
+    ~ShardMaps() { for (auto & [f, m] : maps) munmap(const_cast<char *>(m.first), m.second); }
+};
+
+}  // namespace
+
+bool HfFolder::affine4(const std::string & m) const {
+    return has(m + ".weight") && has(m + ".scales") && has(m + ".biases") && at(m + ".weight").dtype == "U32";
+}
+
+GgufTensor HfFolder::q4(const std::string & m, const BlockOrder & rows, const BlockOrder & cols) const {
+    const Affine a = affine_of(*this, m);
+    if (a.experts != 1) throw std::runtime_error("hf: " + m + " is a bank (q4_experts)");
+    if (!cols.order.empty() && (cols.block % 32 || cols.offset % 32)) throw std::runtime_error("hf: column blocks of " + m + " split a group");
+    GgufTensor t; t.type = GGML_Q4_1; t.ne = {a.cols, a.rows}; t.bytes = a.rows * (a.cols / 32) * kQ41;
+    t.make = [a, rows, cols, m] {
+        const auto w = safetensors_read(a.w), s = safetensors_read(a.s), b = safetensors_read(a.b);
+        std::vector<char> out(a.rows * (a.cols / 32) * kQ41);
+        q4_1_rows(a, w.data(), s.data(), b.data(), 0, a.rows, out.data(), m);
+        BlockOrder c = cols; c.block /= 32; c.offset /= 32;
+        out = reorder(std::move(out), c, a.cols / 32, kQ41, a.rows);
+        return reorder(std::move(out), rows, a.rows, (a.cols / 32) * kQ41);
+    };
+    return t;
+}
+
+GgufTensor HfFolder::q4_cols(const std::vector<std::string> & ms) const {
+    std::vector<Affine> as; for (const auto & m : ms) as.push_back(affine_of(*this, m));
+    uint64_t cols = 0; for (const auto & a : as) { if (a.rows != as[0].rows || a.experts != 1) throw std::runtime_error("hf: column concat shapes"); cols += a.cols; }
+    GgufTensor t; t.type = GGML_Q4_1; t.ne = {cols, as[0].rows}; t.bytes = as[0].rows * (cols / 32) * kQ41;
+    t.make = [as, cols, ms] {
+        const uint64_t rows = as[0].rows, line = (cols / 32) * kQ41;
+        std::vector<char> out(rows * line); uint64_t at = 0;
+        for (size_t i = 0; i < as.size(); ++i) {
+            const auto w = safetensors_read(as[i].w), s = safetensors_read(as[i].s), b = safetensors_read(as[i].b);
+            const uint64_t part = (as[i].cols / 32) * kQ41; std::vector<char> one(rows * part);
+            q4_1_rows(as[i], w.data(), s.data(), b.data(), 0, rows, one.data(), ms[i]);
+            for (uint64_t r = 0; r < rows; ++r) std::memcpy(out.data() + r * line + at, one.data() + r * part, part);
+            at += part;
+        }
+        return out;
+    };
+    return t;
+}
+
+GgufTensor HfFolder::q4_experts(const std::string & m) const {
+    const Affine a = affine_of(*this, m);
+    const uint64_t per = a.rows * (a.cols / 32) * kQ41;
+    GgufTensor t; t.type = GGML_Q4_1; t.ne = {a.cols, a.rows, a.experts}; t.bytes = a.experts * per;
+    auto maps = std::make_shared<ShardMaps>();
+    t.make_slice = [a, per, m, maps](uint64_t e) {
+        if (e >= a.experts) throw std::runtime_error("hf: expert index");
+        std::vector<char> out(per);
+        const uint64_t wb = a.rows * (a.cols / 8) * 4, sb = a.rows * (a.cols / 32) * 2;
+        q4_1_rows(a, maps->at(a.w) + e * wb, maps->at(a.s) + e * sb, maps->at(a.b) + e * sb, 0, a.rows, out.data(), m);
+        return out;
+    };
+    t.make = [t] { std::vector<char> out; for (uint64_t e = 0; e < t.ne[2]; ++e) { const auto s = t.make_slice(e); out.insert(out.end(), s.begin(), s.end()); } return out; };
+    return t;
+}
+
+GgufTensor HfFolder::q4_rows(const std::vector<std::string> & ms) const {
+    auto as = std::make_shared<std::vector<Affine>>(); auto starts = std::make_shared<std::vector<uint64_t>>();
+    uint64_t rows = 0;
+    for (const auto & m : ms) {
+        as->push_back(affine_of(*this, m));
+        if (as->back().cols != as->front().cols || as->back().experts != 1) throw std::runtime_error("hf: row concat shapes");
+        starts->push_back(rows); rows += as->back().rows;
+    }
+    const uint64_t cols = as->front().cols;
+    GgufTensor t; t.type = GGML_Q4_1; t.ne = {cols, rows}; t.bytes = rows * (cols / 32) * kQ41;
+    auto maps = std::make_shared<ShardMaps>();
+    t.gather = [as, starts, maps, cols](const std::vector<uint64_t> & want, float * out) {
+        for (size_t i = 0; i < want.size(); ++i) {
+            const size_t k = size_t(std::upper_bound(starts->begin(), starts->end(), want[i]) - starts->begin()) - 1;
+            const Affine & a = (*as)[k];
+            affine_rows_f32(a, maps->at(a.w), maps->at(a.s), maps->at(a.b), want[i] - (*starts)[k], 1, out + i * cols);
+        }
+    };
+    t.warm = [as](int threads) {
+        std::vector<const SafeTensor *> parts; for (const auto & a : *as) for (const SafeTensor * p : {&a.w, &a.s, &a.b}) parts.push_back(p);
+        std::atomic<size_t> next{0}, done{0}; std::vector<std::thread> pool;
+        for (int i = 0; i < std::max(1, threads); ++i) pool.emplace_back([&] {
+            std::vector<char> buf(size_t(1) << 24);
+            for (size_t j; (j = next++) < parts.size();) {
+                const SafeTensor & p = *parts[j]; const int fd = open(p.file.c_str(), O_RDONLY | O_CLOEXEC); if (fd < 0) continue;
+                for (uint64_t at = 0; at < p.bytes; at += buf.size()) {
+                    const ssize_t r = pread(fd, buf.data(), size_t(std::min<uint64_t>(buf.size(), p.bytes - at)), off_t(p.begin + at));
+                    if (r <= 0) break; done += size_t(r);
+                }
+                close(fd);
+            }
+        });
+        for (auto & th : pool) th.join();
+        return size_t(done);
+    };
+    t.make = []() -> std::vector<char> { throw std::runtime_error("hf: a row-gathered table is read by row (gather_rows), not whole"); };
+    return t;
+}
+
+GgufTensor HfFolder::dequant(const std::string & m, uint32_t type, const BlockOrder & rows, uint64_t row0, uint64_t nrows) const {
+    const uint64_t es = type == GGML_F32 ? 4 : 2;
+    GgufTensor t; t.type = type;
+    if (affine4(m)) {
+        const Affine a = affine_of(*this, m);
+        const uint64_t n = nrows ? nrows : a.rows - row0;
+        t.ne = {a.cols, n}; t.bytes = a.cols * n * es;
+        t.make = [a, rows, row0, n, type, es] {
+            const auto w = safetensors_read(a.w), s = safetensors_read(a.s), b = safetensors_read(a.b);
+            std::vector<float> f(a.cols * n); affine_rows_f32(a, w.data(), s.data(), b.data(), row0, n, f.data());
+            std::vector<char> out(f.size() * es);
+            for (size_t i = 0; i < f.size(); ++i) {
+                if (type == GGML_F32) std::memcpy(out.data() + 4 * i, &f[i], 4);
+                else { const uint16_t v = type == GGML_BF16 ? f_bf16(f[i]) : f_f16(f[i]); std::memcpy(out.data() + 2 * i, &v, 2); }
+            }
+            return reorder(std::move(out), rows, n, a.cols * es);
+        };
+        return t;
+    }
+    const auto & s = at(m + ".weight");
+    if (s.shape.size() != 2) throw std::runtime_error("hf: " + m + ".weight is not a matrix");
+    return values(m + ".weight", type, {s.shape[0], s.shape[1]}, nullptr, rows);
+}
+
+GgufTensor HfFolder::values(const std::string & n, uint32_t type, std::vector<uint64_t> ne, float (*f)(float), const BlockOrder & rows) const {
+    const auto & s = at(n);
+    uint64_t count = 1; for (auto d : ne) count *= d;
+    const uint64_t in_es = s.dtype == "F32" ? 4 : 2;
+    if (s.dtype != "BF16" && s.dtype != "F16" && s.dtype != "F32") throw std::runtime_error("hf: " + n + " dtype " + s.dtype);
+    if (count * in_es != s.bytes) throw std::runtime_error("hf: " + n + ": shape does not match the stored size");
+    const uint64_t es = type == GGML_F32 ? 4 : 2;
+    GgufTensor t; t.type = type; t.ne.assign(ne.rbegin(), ne.rend()); t.bytes = count * es;
+    const uint64_t line = ne.size() > 1 ? count / ne[0] : 1, lines = ne.size() > 1 ? ne[0] : count;
+    t.make = [s, type, f, rows, count, es, line, lines] {
+        const auto raw = safetensors_read(s);
+        std::vector<char> out(count * es);
+        for (uint64_t i = 0; i < count; ++i) {
+            float v;
+            if (s.dtype == "F32") std::memcpy(&v, raw.data() + 4 * i, 4);
+            else { uint16_t h; std::memcpy(&h, raw.data() + 2 * i, 2); v = s.dtype == "BF16" ? bf16_f(h) : f16_value(h); }
+            if (f) v = f(v);
+            if (type == GGML_F32) std::memcpy(out.data() + 4 * i, &v, 4);
+            else { const uint16_t o = type == GGML_BF16 ? f_bf16(v) : f_f16(v); std::memcpy(out.data() + 2 * i, &o, 2); }
+        }
+        return reorder(std::move(out), rows, lines, line * es);
+    };
+    return t;
 }
 
 std::string hf_folder_arch(const std::string & path) {

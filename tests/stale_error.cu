@@ -1,7 +1,7 @@
 // A request that failed on a CUDA out-of-memory must not break the next one: the pending (non-sticky) error is cleared
 // at the start of a request, after which QSA (which checks with cudaPeekAtLastError) works again.
 #include "qwen4exp_kernels.cuh"
-#include "../src/cuda_recover.hpp"
+#include "../src/core/cuda_recover.hpp"
 
 #include <cstdio>
 #include <stdexcept>

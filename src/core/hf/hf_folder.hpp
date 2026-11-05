@@ -21,6 +21,9 @@
 
 namespace tqllm {
 
+// blocks of `block` rows (or columns) after `offset` in a new order: block j of the result is the stored block order[j]
+struct HfBlockOrder { std::vector<uint32_t> order; uint64_t block = 0, offset = 0; };
+
 class HfFolder {
 public:
     explicit HfFolder(const std::string & path);
@@ -43,6 +46,21 @@ public:
     GgufTensor norm(const std::string & tensor, bool plus_one) const;
     // A tensor stored as is (BF16 / F16 / F32), the engine type from its dtype.
     GgufTensor plain(const std::string & tensor) const;
+    // MLX affine 4-bit (`module`.weight U32 [rows][cols / 8], .scales / .biases BF16 [rows][cols / 32]) as GGML_Q4_1, the
+    // same values: d = scale, m = bias per 32 weights (each BF16 is checked exact in FP16). A BlockOrder puts blocks of
+    // `block` rows (or columns) after `offset` in a new order: block j of the result is the stored block order[j].
+    using BlockOrder = HfBlockOrder;
+    bool affine4(const std::string & module) const;
+    GgufTensor q4(const std::string & module, const BlockOrder & rows = {}, const BlockOrder & cols = {}) const;
+    GgufTensor q4_cols(const std::vector<std::string> & modules) const;  // the modules side by side (same rows)
+    GgufTensor q4_experts(const std::string & module) const;  // [experts][rows][cols / 8]: built one expert at a time
+    // The modules stacked along the rows (a sharded per-layer token embedding): built on read, gathered by row, warmed.
+    GgufTensor q4_rows(const std::vector<std::string> & modules) const;
+    // An affine 4-bit or stored matrix dequantised to `type` (BF16 / F32 / F16), rows [row0, row0 + nrows) (0: all).
+    GgufTensor dequant(const std::string & module, uint32_t type, const BlockOrder & rows = {}, uint64_t row0 = 0, uint64_t nrows = 0) const;
+    // A stored tensor as `type` with `ne` (row-major, last dimension contiguous), each value through `f`, rows reordered.
+    GgufTensor values(const std::string & tensor, uint32_t type, std::vector<uint64_t> ne, float (*f)(float) = nullptr,
+                      const BlockOrder & rows = {}) const;
     // tokenizer.json + tokenizer_config.json (+ chat_template.jinja): byte-level BPE keys of the GGUF tokenizer.
     void tokenizer(GgufFile & f, const std::string & pre, uint64_t vocab) const;
 

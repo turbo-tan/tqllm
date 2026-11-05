@@ -5,9 +5,12 @@
 //   chunk (--prefill-chunk wins), gsq_rco=1, layer_slots=<per-layer routing plan, scaled to the slots>
 // Pilot only: hot_map=<int32 map>, cold_slots=16, cold_host_mb=3072, cold_readers=0; no packed bank or pruning.
 // One slot, greedy MTP speculative decoding (exact: tokens identical to plain greedy). A fresh DecodeModel per request
-// resets the recurrent, PLE, attention and MTP state; the expert caches persist across requests.
+// resets the recurrent, PLE, attention and MTP state (--prompt-cache on with --np > 1: kept, see SlotState::snap_); the
+// expert caches persist across requests.
 #include "fn_model.hpp"
+#include <array>
 #include "engine.hpp"
+#include "decode_rules.hpp"
 #include "cold_expert_store.hpp"
 #include "cold_expert_memo.hpp"
 #include "expert_read_pool.hpp"
@@ -38,6 +41,7 @@ struct FnServe {
 };
 class FlashNextEngine final : public tqllm::Engine {
     FnServe f_; uint32_t context_;
+    std::vector<std::vector<int>> copy_history_;  // the last requests' prompt + output, latest last (copy drafts)
     // one sequence per slot (KV, recurrent and MTP state, sampling); weights, expert caches and scratch are shared
     struct SlotState {
         std::unique_ptr<DecodeModel> model_; std::unique_ptr<Device<float>> prompt_res_;
@@ -47,11 +51,35 @@ class FlashNextEngine final : public tqllm::Engine {
         ColdExpertStore::Stats cold_store_at_decode_{};
         ColdFetchQueue::Stats cold_fetch_at_decode_{};
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free
-        std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0; uint64_t prefill_us_ = 0, decode_us_ = 0;
+        bool refilled_ = false;                     // this request's prefill borrowed banks and the refill brought them back
+        // per request: offered_ drafts, taken_[m] the steps that kept m tokens (LEDGER decode steps)
+        std::vector<int> ctx_; size_t plen_ = 0; uint64_t copied_ = 0;  // prompt + output so far (copy drafts), steps that verified a copy
+        std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0, offered_ = 0; std::array<uint64_t, 17> taken_{}; uint64_t prefill_us_ = 0, decode_us_ = 0;
         std::chrono::steady_clock::time_point t_begin_, t_decode_;
         float temp_ = 0.f, top_p_ = 1.f; int top_k_ = 0; std::mt19937_64 rng_{1};
+        // --prompt-cache on: the model stays after its request; snap_ = a prompt position (kTail before the end of the
+        // prompt in seq_) whose recurrent conv / state and PLE history rows were copied during the prefill, so a prompt
+        // that starts with seq_[0, snap_] prefills only from snap_ (an agent's next turn: earlier turns + new message)
+        std::vector<int> seq_; int snap_ = 0;
+        std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
     };
+    // the next turn re-renders the end of the last prompt (assistant header) differently. A reused prompt is not
+    // byte-identical to an uncached one at any tail (10de944a: 256, both chunks layer-major, still differed): the prefill
+    // kernels are not chunk-size invariant, so --exact on warns (exact_conflicts)
+    static constexpr int kTail = 64;
+    bool caching() const { return f_.cp->run.prompt_cache && slots_.size() > 1; }
+    static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, snap_) are reusable
+        return s.model_ ? reusable_prefix(s.seq_, s.snap_, prompt) : 0;
+    }
+    void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
+    void restore_snapshot(SlotState & s, int p);  // back to position p (= snap_): recurrent / PLE state copied back, K/V and history cut
+    // TQLLM_DEBUG=pc_verify: after a restore, prefill [0, p) into a fresh sequence (64-token steps) and print how far each
+    // restored state buffer is from it (relative rms; a wrong buffer is ~1, rounding ~1e-3)
+    void pc_verify(const std::vector<int> & ids, int p);
     std::vector<SlotState> slots_; int cur_ = 0;
+    std::function<void()> first_token_hook_;  // set_first_token_hook
+    void trace_step(int slots, int drafts, const std::vector<std::pair<size_t, std::vector<int>>> & per_slot, const std::vector<int> & slot_ids);
+    uint64_t batched_steps_ = 0, serial_steps_ = 0;  // spec_step: one verify pass for all slots / one slot at a time (TQLLM_DEBUG=mem)
     SlotState & S() { return slots_[size_t(cur_)]; }
     uint32_t slot_context() const { return context_; }  // Model passes the per-slot context (tqserve: --context / --np)
     // the shared caches copy misses on the active slot's stream
@@ -61,7 +89,7 @@ class FlashNextEngine final : public tqllm::Engine {
     // sample, so the output follows the target exactly (greedy drafts just lower the acceptance)
     std::vector<int> pick(const float * rows, int n);
 public:
-    FlashNextEngine(const std::string & manifest, uint32_t context, int nslots);
+    FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options);
     // TQLLM_DEBUG=mem: where the device memory is (MiB); "other" = KV, QSA keys, recurrent state, CUDA context
     void ledger(const char * at) const;
     // borrowed banks back, filled with the prompt's most-routed experts (Strata does the same)
@@ -71,6 +99,7 @@ public:
     void arena_resize(size_t bytes);
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) override;
     bool spec_advance() override;
+    void remember_copy(SlotState & sl);
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
         bind();
         while (spec_advance()) {}
@@ -84,13 +113,25 @@ public:
                          100.0 * double(s.hits - b.hits) / std::max<double>(1, double(s.hits - b.hits + s.misses - b.misses)),
                          double(s.transfer_bytes - b.transfer_bytes) / 1e9, s.device_bytes / 1048576.0,
                          (unsigned long long) (m.hits - mb.hits), (unsigned long long) (m.misses - mb.misses), double(m.transfer_bytes - mb.transfer_bytes) / 1e9, m.device_bytes / 1048576.0);
-            std::fprintf(stderr, "LEDGER decode copies: demand %llu DMAs %.2f GB, prefetch %.2f GB\n", (unsigned long long) (s.miss_copies - b.miss_copies),
-                         double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e9, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e9);
+            std::fprintf(stderr, "LEDGER decode copies: demand %llu DMAs %.2f GB, prefetch %.2f GB | copied again after eviction %llu (%llu within 8 layer calls) %.2f GB, prefetched and evicted unused %llu\n",
+                         (unsigned long long) (s.miss_copies - b.miss_copies), double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e9, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e9,
+                         (unsigned long long) (s.refetch - b.refetch), (unsigned long long) (s.refetch_soon - b.refetch_soon), double(s.refetch_bytes - b.refetch_bytes) / 1e9,
+                         (unsigned long long) (s.pf_evicted_unused - b.pf_evicted_unused));
+            { unsigned long long d[3] = {0, 0, 0}; tqllm_cuda::moe_dedup_stats(d);
+              if (d[0]) std::fprintf(stderr, "LEDGER device maps since start: %llu layer calls, %.1f groups and %.1f distinct experts per call\n",
+                                     d[0], double(d[1]) / double(d[0]), double(d[2]) / double(d[0])); }
+            std::string kept; for (size_t m = 1; m < S().taken_.size(); ++m) if (S().taken_[m]) kept += " " + std::to_string(m) + ":" + std::to_string(S().taken_[m]);
+            std::fprintf(stderr, "LEDGER decode steps: %llu steps, %.2f tokens per step, %.1f ms per step, %llu drafts offered, %llu steps verified a copy | steps by tokens kept:%s\n",
+                         (unsigned long long) S().steps_, double(S().toks_) / std::max<double>(1, double(S().steps_)),
+                         S().decode_us_ / 1e3 / std::max<double>(1, double(S().steps_)), (unsigned long long) S().offered_, (unsigned long long) S().copied_, kept.c_str());
+            std::fprintf(stderr, "LEDGER slot steps since start: batched %llu, one slot at a time %llu | decode arena high %.0f of %.0f MB | host blocked since start: ids D2H %.0f ms, cache prepare %.0f ms, prefetch issue %.0f ms\n", (unsigned long long) batched_steps_, (unsigned long long) serial_steps_,
+                         f_.arena.high / 1048576.0, f_.arena.size / 1048576.0, g_host_ms[0], g_host_ms[1], g_host_ms[2]);
             std::fprintf(stderr, "LEDGER decode rounds %llu | since start: prefetched %llu used %llu, pf pending %llu running %llu waited-unread %llu skipped %llu\n",
                          (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
                          (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);
         }
-        S().model_.reset(); S().prompt_res_.reset();
+        if (!caching()) S().model_.reset();
+        S().prompt_res_.reset();
         return r;
     }
     // out_ holds int ids: an append-only uint32 mirror per slot (only new ids converted; rebuilt after a reset)
@@ -101,6 +142,10 @@ public:
         return v;
     }
     int slots() const override { return int(slots_.size()); }
+    void set_first_token_hook(std::function<void()> hook) override { first_token_hook_ = std::move(hook); }
+    uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
+        return caching() && s >= 0 && s < int(slots_.size()) ? uint32_t(reuse(slots_[size_t(s)], prompt)) : 0;
+    }
     void select_slot(int s) override { require(s >= 0 && s < int(slots_.size()), "Flash-Next slot out of range"); cur_ = s; }
     // one step for every listed slot: each drafts with its own MTP state, one verify pass covers all of them
     // (TQFN_SLOT_BATCH=0, a single active slot, more than 64 rows or more experts than cache slots: one slot at a time)

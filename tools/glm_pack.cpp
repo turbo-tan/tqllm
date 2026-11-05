@@ -2,7 +2,7 @@
 // every expert of every layer in the expert bank's row layout, so a bank miss is a copy instead of a loader repack.
 // Layers without routed experts (the leading dense blocks) get an empty block, which the engine reads as "not packed".
 //   glm-pack-experts MODEL.gguf OUT.tqfnexp
-#include "glm_experts.hpp"
+#include "stacked_experts.hpp"
 #include "gguf.hpp"
 #include "gguf_mapped.hpp"
 #include "packed_experts.hpp"
@@ -40,7 +40,7 @@ int main(int argc, char ** argv) {
         const int dense = int(meta.num(a + "leading_dense_block_count"));
         write_packed_experts(argv[2], layers, experts, false, [&](int l, int e) {
             if (l < dense) return std::array<std::vector<char>, 6>{};  // no routed experts in this layer
-            return repack_expert(glm_expert_payload("blk." + std::to_string(l) + ".", map_of, e), hidden, ff, false);
+            return repack_expert(stacked_expert_payload("blk." + std::to_string(l) + ".", map_of, e), hidden, ff, false);
         });
         std::printf("PACK_DONE %s layers %d experts %d hidden %d ff %d\n", argv[2], layers, experts, hidden, ff);
         return 0;

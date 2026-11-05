@@ -1,4 +1,4 @@
-// GLM-5.3-Flash routed experts from the shared expert bank (src/models/glm/glm_experts.hpp): a layer's experts in a
+// GLM-5.3-Flash routed experts from the shared expert bank (src/experts/stacked_experts.hpp): a layer's experts in a
 // MixedExpertCache of `slots` slots, the grouped expert kernels on the bank's slot ids, waves when a chunk routes past
 // the slots. It must give the whole-expert-stack output bit for bit (same rows, same bytes, another row index) and both
 // must match a CPU reference of the same layer (dequantise + multiply, the math of tools/glm_ref.cpp). Mock routing
@@ -6,7 +6,7 @@
 // IQ2_S + Q2_K), and the packed expert file round trip (a miss is a copy, not a loader repack).
 #include "dequant.hpp"
 #include "glm5next_kernels.cuh"
-#include "glm_experts.hpp"
+#include "stacked_experts.hpp"
 #include "expert_bank_plan.hpp"
 #include "moe.hpp"
 #include "packed_experts.hpp"
@@ -159,7 +159,7 @@ std::vector<float> moe_layer(const std::array<Mat, 3> & m, const int * d_ids, co
     m[1].fmt->expert_matvec(m[1], d_x, yu.p, kFf, d_ids, n, kTopk, false, nullptr);
     tqllm_cuda::glm_swiglu(yg.p, yu.p, act.p, A * kFf, clamp, nullptr);
     m[2].fmt->expert_matvec(m[2], act.p, yd.p, kHidden, d_ids, n, kTopk, true, nullptr);
-    tqllm_cuda::glm_moe_sum(yd.p, d_w, nullptr, out.p, kTopk, kHidden, nullptr, n);
+    tqllm_cuda::moe_common::moe_sum(yd.p, d_w, nullptr, out.p, kTopk, kHidden, nullptr, n);
     return out.get(size_t(n) * kHidden);
 }
 
@@ -207,7 +207,7 @@ std::vector<float> moe_bank(MixedExpertCache & cache, int layer, const std::vect
                             const float * d_w, float clamp) {
     const int n = int(ids.size()) / kTopk;
     std::vector<float> out(size_t(n) * kHidden);
-    for (const auto & wv : glm_expert_waves(ids, kTopk, cache.slots(layer))) {
+    for (const auto & wv : stacked_expert_waves(ids, kTopk, cache.slots(layer))) {
         const auto physical = cache.prepare(layer, wv.ids);
         std::vector<int> slot_of(size_t(kExperts), -1);
         for (size_t i = 0; i < wv.ids.size(); ++i) slot_of[size_t(wv.ids[i])] = physical[i];
@@ -275,7 +275,7 @@ void run() {
     const int used = int(used_ids.size());
 
     for (int cap : {kTopk, 16, kExperts}) {  // waves cover every assignment exactly once, in token order, within the slots
-        const auto waves = glm_expert_waves(ids, kTopk, cap);
+        const auto waves = stacked_expert_waves(ids, kTopk, cap);
         std::vector<char> seen(ids.size(), 0);
         bool cover = true, fits = true, order = true, sets = true;
         int at = 0;

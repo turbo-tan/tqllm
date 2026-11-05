@@ -19,7 +19,7 @@ namespace tqserve {
 class Scheduler {
 public:
     Scheduler(const tqllm::Tokenizer & tokenizer, tqllm::Model & model, uint32_t slot_context)
-        : tokenizer_(tokenizer), model_(model), context_(slot_context), active_(size_t(model.slots())),
+        : tokenizer_(tokenizer), model_(model), context_(slot_context), active_(size_t(model.slots())), used_(size_t(model.slots()), 0),
           limit_(model.slots()) {
         thread_ = std::thread([this] { run(); });
     }
@@ -179,13 +179,22 @@ private:
                 }
                 int busy = 0;
                 for (const auto & j : active_) busy += j != nullptr;
-                for (size_t s = 0; s < active_.size() && !queue_.empty() && busy < limit_; ++s)
-                    if (!active_[s]) {
-                        ++busy;
-                        active_[s] = queue_.front();
-                        queue_.pop_front();
-                        admitted.push_back(active_[s]);
+                // first come first served; each request takes the free slot that reuses most of its prompt (an agent's
+                // next turn goes back to the slot holding its conversation), else the free slot reused least recently
+                while (!queue_.empty() && busy < limit_) {
+                    int best = -1; uint32_t reuse = 0;
+                    for (size_t s = 0; s < active_.size(); ++s) {
+                        if (active_[s]) continue;
+                        const uint32_t r = queue_.front()->images.spans.empty() ? model_.prefix_reuse(int(s), queue_.front()->prompt) : 0;
+                        if (best < 0 || r > reuse || (r == reuse && used_[s] < used_[size_t(best)])) { best = int(s); reuse = r; }
                     }
+                    if (best < 0) break;
+                    ++busy;
+                    used_[size_t(best)] = ++clock_;
+                    active_[size_t(best)] = queue_.front();
+                    queue_.pop_front();
+                    admitted.push_back(active_[size_t(best)]);
+                }
             }
             for (size_t s = 0; s < active_.size(); ++s) {  // prefill newly admitted requests
                 auto & job = active_[s];
@@ -193,12 +202,19 @@ private:
                 try {
                     model_.select_slot(int(s));
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed, job->req.presence_penalty);
+                    model_.set_penalties(job->req.repeat_penalty, job->req.frequency_penalty);
                     model_.set_ignore_eos(job->req.ignore_eos);
+                    model_.set_continuation(job->req.continuation);
                     if (!job->images.spans.empty()) model_.set_prompt_images(job->images.spans);
                     if (job->req.observation) job->req.observation->prefill(job->result.prompt_tokens);
+                    struct HookReset { tqllm::Model & m; ~HookReset() { m.set_first_token_hook(nullptr); } } hook_reset{model_};  // also on a throw
+                    if (job->stream) model_.set_first_token_hook([this, &job, s] { publish(*job, model_.spec_tokens(int(s))); });
                     { tqllm::PrefillObservation progress(observe_prefill(job->req.observation));
                     model_.spec_begin(job->prompt, job->count, draft_length()); }
                     if (job->req.observation) job->req.observation->decoding();
+                    // the prefill picked the first token: stream it now, not after every admitted prompt is prefilled
+                    // and the first batched step has run (8 prompts at once: each waited for all eight prefills)
+                    if (job->stream) publish(*job, model_.spec_tokens(int(s)));
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);
@@ -248,6 +264,8 @@ private:
     tqllm::Model & model_;
     uint32_t context_;
     std::vector<std::shared_ptr<Job>> active_;  // engine thread only
+    std::vector<uint64_t> used_;  // admission clock per slot (least recently used free slot first)
+    uint64_t clock_ = 0;
     std::deque<std::shared_ptr<Job>> queue_;
     int limit_ = 1;  // admitted at once (POST /admin/slots)
     std::mutex mutex_;

@@ -5,23 +5,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "common_kernels.cuh"
+#include "moe_common.cuh"
 
 namespace tqllm_cuda {
-// y[r] = W[r] . x for an FP32 row-major [rows][cols] matrix
-// y[t][r] = W[r] . x[t] for t < n
-void glm_mv_f32(const float * w, const float * x, float * y, int rows, int cols, int n, cudaStream_t s);
-// same result for matrices with few rows: each row split over `splits` blocks; partials [n][rows][splits] summed in
-// order (deterministic, no atomics). partial must hold n * rows * splits floats.
-void glm_mv_f32_splitk(const float * w, const float * x, float * y, float * partial, int rows, int cols, int n, int splits,
-                       cudaStream_t s);
-void glm_bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t s);
-// y = x / sqrt(mean(x^2) + eps) * w (w may be null); writes FP32 and / or FP16 copies (either may be null)
-void glm_rmsnorm(const float * x, const float * w, float * y, __half * yh, int n, float eps, cudaStream_t s, int rows = 1);
-// rows of length n: each normalised on its own (KDA output heads)
-void glm_rmsnorm_rows(const float * x, const float * w, float * y, int rows, int n, float eps, cudaStream_t s);
-void glm_f32_to_half(const float * x, __half * y, int n, cudaStream_t s);
-// out[t][j] = in[t * stride + off + j], j < width, t < n
-void glm_gather_cols(const float * in, int stride, int off, int width, int n, float * out, cudaStream_t s);
 
 // mHC (hc = 4): mix [24] -> pre [4] (sigmoid + eps), post [4] (2 sigmoid), comb [4][4] = Sinkhorn(softmax over dst
 // for each src + eps) with `iters` alternating normalisations; then x = sum_i pre[i] S[i]
@@ -74,21 +61,10 @@ void glm_copy_rows_at(const float * src, __half * dst, int R, int n, const int *
 void glm_mla_vb(const float * kv, const __half * vb, float * out, __half * outh, int heads, int R, int dv, cudaStream_t s,
                 int n = 1);
 
-// sigmoid routing: p = sigmoid(logits); select top-k of p + bias; weights = p[sel] (normalised if `norm`, times `scale`
-// unless it is 0 or 1). ids / w [k]
-// n tokens: logits [n][experts], ids / w [n][k]
-void glm_route(const float * logits, const float * bias, int * ids, float * w, int experts, int k, bool norm, float scale,
-               cudaStream_t s, int n = 1);
 // out[i] = silu(min(g, limit)) * clamp(u, -limit, limit) (no clamp when limit <= 1e-6); g, u BF16 [n]
 void glm_swiglu(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __half * out, int n, float limit, cudaStream_t s);
 // same on FP32 inputs
 void glm_swiglu_f32(const float * g, const float * u, __half * out, int n, float limit, cudaStream_t s);
-// out[j] = shared[j] + sum_i w[i] y[i][j]   y BF16 [k][hidden]
-// n tokens: y [n][k][hidden], w [n][k], shared / out [n][hidden]
-void glm_moe_sum(const __nv_bfloat16 * y, const float * w, const float * shared, float * out, int k, int hidden,
-                 cudaStream_t s, int n = 1);
-// a += b
-void glm_add(float * a, const float * b, int n, cudaStream_t s);
 // DSA k-pool indexer (glm5next_dsa.cu). Positions [*d_pos or pos0, + n) of the FP16 key|gate ring kg [ring][2D] (position
 // p in row p % ring: a key is only read to build its pool, so ring >= n + r holds every row a pool needs) get
 // LayerNorm(k) | g; a token at position p with p % r == r - 1 writes pooled[p / r] = softmax_m(g + ape) . k over its pool.
@@ -106,8 +82,4 @@ void glm_mla_attn_sparse(const float * qabs, const float * lat, float * kv, int 
                          const int * count, int stride, float scale, int tokens, cudaStream_t s);
 void glm_mla_attn_sparse(const float * qabs, const __half * lat, float * kv, int heads, int R, const int * cells,
                          const int * count, int stride, float scale, int tokens, cudaStream_t s);
-// index of the largest value (first on ties)
-void glm_argmax(const float * x, int n, int * out, cudaStream_t s);
-// per row of x [rows][n]
-void glm_argmax_rows(const float * x, int n, int rows, int * out, cudaStream_t s);
 }  // namespace tqllm_cuda

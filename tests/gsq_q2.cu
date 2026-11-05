@@ -58,7 +58,7 @@ static void run(int cols, int n, bool per_expert, int rows=19) {
         require(std::abs(got - expect) <= .005 * std::abs(expect) + 2e-5, "Q2 grouped dot differs from independent double oracle");
     }
     std::vector<__nv_bfloat16> full_grouped;
-    {   // grouped experts (prefill): tensor-core kernel, and the scalar one with TQFN_Q2_DOT_GROUPED=1
+    {   // grouped experts (prefill): tensor-core kernel
         const int capacity = n * topk;
         std::vector<int> counts(experts, 0), groups(size_t(experts) * capacity, 0);
         for (int a = 0; a < n * topk; ++a) groups[size_t(ids[a]) * capacity + counts[ids[a]]++] = a;

@@ -1,5 +1,6 @@
 #pragma once
 // Internal per-architecture decode engine behind tqllm::Model.
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -12,15 +13,18 @@ namespace tqllm {
 
 struct Engine {
     virtual ~Engine() = default;
+    std::string note;  // what the load chose instead of the defaults or the asked mode (empty: none); Model::fit_note, /health
+    // step / verify / commit / logits: the token-by-token path. Speculative-only engines (Metal) decode through
+    // spec_begin / spec_advance and keep these defaults.
     // One token at `pos`. With `sample`, runs the LM head and returns the greedy next token (one host sync);
     // otherwise returns 0 without syncing. `capture` (validation only) receives the last-token hidden state after
     // every layer, [layers][hidden], the last entry after the final norm.
-    virtual uint32_t step(uint32_t token, uint32_t pos, bool sample, float * capture) = 0;
+    virtual uint32_t step(uint32_t, uint32_t, bool, float *) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
     // Speculative verify: runs `n` tokens (n <= 8) at positions pos, pos+1, ... in one pass and writes, for each, the
     // greedy next token to `next` (host). KV is written for all n; the recurrent state after each token is kept.
     // commit(k) then keeps the state after the first k tokens (1 <= k <= n); rejected KV entries are overwritten later.
-    virtual void verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) = 0;
-    virtual void commit(int k) = 0;
+    virtual void verify(const uint32_t *, int, uint32_t, uint32_t *) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
+    virtual void commit(int) { throw std::runtime_error("this engine decodes through spec_begin / spec_advance"); }
     // Greedy generation with MTP self-speculation (D draft tokens per step, D <= 7). Output equals the greedy decode
     // of the verify path. stats (optional): [0] = steps, [1] = drafted, [2] = accepted drafts, [3] = decode microseconds.
     virtual std::vector<uint32_t> generate_spec(const std::vector<uint32_t> &, uint32_t, int, uint64_t *) {
@@ -32,6 +36,15 @@ struct Engine {
     // ignore_eos (OpenAI / vLLM / llama.cpp request field): decode to max_tokens through end-of-sequence tokens, for
     // fixed-length benchmarks. Engines that have no stop of their own ignore it.
     virtual void set_ignore_eos(bool) {}
+    // called on the engine thread as soon as the next spec_begin has picked the first output token (before its
+    // remaining prefill work, e.g. the MTP catch-up), so a stream can send it; empty: none
+    virtual void set_first_token_hook(std::function<void()>) {}
+    // thinking budget (one request in two phases): 1 = phase 1, a continuation may follow; 2 = phase 2, its prompt is phase
+    // 1's prompt + emitted text + the closing tag; 0 = neither, and a held phase 1 state is released
+    virtual void set_continuation(int) {}
+    // repeat (LM Studio / llama.cpp repeat_penalty, 1 = off) and frequency penalty for the active slot's next request, after
+    // set_sampling; sampling only (temperature > 0). Engines without them keep the default no-op.
+    virtual void set_penalties(float repeat, float frequency) { (void) repeat, (void) frequency; }
     virtual void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence = 0.f) {
         if (temperature > 0.f) throw std::runtime_error("sampling not supported for this model");
         (void) top_p, (void) top_k, (void) seed, (void) presence;
@@ -66,12 +79,15 @@ struct Engine {
     virtual std::vector<uint32_t> spec_finish(uint64_t *) { return {}; }
     // slot's ids so far (streaming), by reference: valid until the slot's next step / begin
     virtual const std::vector<uint32_t> & spec_tokens(int) const { static const std::vector<uint32_t> none; return none; }
+    // prompt tokens slot s would reuse from its previous request (0: none); the scheduler routes a request to the free
+    // slot with the longest reuse
+    virtual uint32_t prefix_reuse(int, const std::vector<uint32_t> &) const { return 0; }
     // DFlash drafter training data: prefill `tokens` from position 0 and return the drafter's target features
     // [P][nf * hidden] (raw BF16 bits) of every position; returns nf (0: no drafter loaded)
     virtual int drafter_features(const std::vector<uint32_t> &, std::vector<uint16_t> &) { return 0; }
     // Chunked prefill of tokens at positions [pos, pos + n) with no LM head (KV and recurrent state only); false: unsupported.
     virtual bool prefill_state(const std::vector<uint32_t> &, uint32_t) { return false; }
-    virtual const float * logits() const = 0;  // device, [vocab] FP32, valid after a sampling step
+    virtual const float * logits() const { return nullptr; }  // device, [vocab] FP32, valid after a sampling step
     virtual const float * verify_logits() const { return nullptr; }  // device, [n][vocab] FP32 of the last verify
     virtual void set_full_logits(bool) {}  // verify computes every logit (int8 head) instead of the two-stage top-16
     virtual void synchronize() = 0;
@@ -84,18 +100,15 @@ struct Engine {
     virtual size_t kv_host_bytes() const { return 0; }   // KV bytes in host memory (the --kv-host tail)
     virtual size_t kv_device_bytes() const { return 0; } // KV bytes in device memory (pool pages incl. granule rounding)
     virtual size_t kv_round_bytes() const { return 0; }  // most device memory a host tail rounds up (mapping granules)
+    // device bytes this load moved to host memory for the LM head (head true) / token embeddings (the fit's placement)
+    virtual size_t host_placed_bytes(bool head) const { (void)head; return 0; }
     virtual bool kv_idle_pending() const { return false; }  // TqCache compaction work is waiting (call kv_idle_step when idle)
     virtual bool kv_idle_step() { return false; }           // compacts one old block; true while more is pending
 };
 
 // Qwen3.5 dense hybrid (Gated DeltaNet + gated attention), BF16 weights read from safetensors in `dir`.
 // `slots` sequences share the weights; each gets `context` positions.
-// Flash-Next (qwen4exp) engine: compiled into tqserve with src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which registers it;
-// a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects it.
-using FlashNextFactory = std::unique_ptr<Engine> (*)(const std::string & manifest, const std::string & tokenizer, uint32_t context,
-                                                     int slots, const EngineOptions & options);
-void register_flashnext_engine(FlashNextFactory factory);
-// GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next.cpp; split GGUFs open from any shard
+// GLM-5.3-Flash (GGUF arch glm5-next / glm5next), src/models/glm/glm5next/glm5next.cpp; split GGUFs open from any shard
 bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);
@@ -103,7 +116,8 @@ bool is_minimax_gguf(const std::string & path);
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",
                                             const std::string & tokenizer = "", const TpConfig & tp = {},
-                                            const std::string & hot_map = "");  // routing counts: preload the hot experts
+                                            const std::string & hot_map = "",  // routing counts: preload the hot experts
+                                            const std::string & draft_vocab = "");  // --draft-vocab: the DSpark head over a token subset
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

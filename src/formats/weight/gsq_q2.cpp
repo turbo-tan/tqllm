@@ -34,6 +34,15 @@ struct GsqQ2 final : WeightFormat {
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::gsq_q2_dequant(m.p, out, m.rows, m.cols, s);
     }
+    bool has_expert_dedup() const override { return true; }
+    void expert_matvec_dedup(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows, const int * dmap, int groups, cudaStream_t s) const override {
+        tqllm_cuda::gsq_q2_expert_dedup(m.p, x, y, rows, m.cols, dmap, groups, s);
+    }
+    void expert_matvec_dedup2(const Mat & a, const Mat & b, const __half * x, __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows,
+                              const int * dmap, int groups, cudaStream_t s) const override {
+        tqllm_cuda::gsq_q2_expert_dedup(a.p, x, ya, rows, a.cols, dmap, groups, s);
+        tqllm_cuda::gsq_q2_expert_dedup(b.p, x, yb, rows, b.cols, dmap, groups, s);
+    }
 };
 }
 void register_gsq_q2() { register_weight_format(GGML_GSQ_Q2_0, std::make_unique<GsqQ2>()); }

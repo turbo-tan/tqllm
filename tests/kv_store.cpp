@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
@@ -25,9 +26,10 @@ static int phys_fd() {
 #if defined(__linux__)
     return memfd_create("kvphys", 0);
 #else
-    char path[] = "/tmp/tqllm-kvphys-XXXXXX";
-    const int f = mkstemp(path);
-    if (f >= 0) unlink(path);
+    const char* dir = std::getenv("TMPDIR");
+    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/tqllm-kvphys-XXXXXX";
+    const int f = mkstemp(path.data());
+    if (f >= 0) unlink(path.c_str());
     return f;
 #endif
 }

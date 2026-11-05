@@ -9,7 +9,7 @@
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000) [![GoFundMe](https://img.shields.io/badge/GoFundMe-support%20TQLLM-00B964?logo=gofundme&logoColor=white)](https://gofund.me/0f79d4274)
 
-C++/CUDA inference for supported Qwen models and TurboQuant GGUF weights,
+C++ inference for supported Qwen models and TurboQuant GGUF weights on NVIDIA GPUs (CUDA) and Apple Silicon (Metal),
 with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
@@ -17,7 +17,7 @@ with an OpenAI-compatible HTTP server.
 **New: Qwen3.8-Flash-Next (125B MoE, 6B active) on one RTX 3090.** Against Strata 0.2.2 on the same card, file and
 session: decode 1.63x after a 128K prompt (77.1 against 47.2 tok/s), 1.34x after 64K, first token sooner at every
 length, and up to 8 users at once with the same text as one. [Details](docs/BENCHMARKS.md#qwen38-flash-next-125b-6b-active-on-one-rtx-3090).
-Run it with image 1.2.3 or newer (RTX 30 or newer with 24 GB, or a GB10): [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
+Run it with image 1.4.1 or newer (RTX 30 or newer with 24 GB, or a GB10): [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
 GGUF plus a few small files; 24 GB GPU, 64 GB RAM or more).
 
 ## See what your model is doing
@@ -40,7 +40,7 @@ Recorded with a real model. The local hostname is hidden; telemetry is unmodifie
 
 ## Run locally
 
-Requires Linux and an NVIDIA GPU. Place a supported Qwen GGUF at
+On a Mac (Apple Silicon), follow the [Mac guide](docs/guides/mac.md). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
 `models/model.gguf`, then build from source:
 
 ```sh
@@ -60,6 +60,7 @@ updates. See [installation and requirements](docs/guides/quickstart.md).
 
 | You want to... | Read |
 |---|---|
+| Run on a Mac (Apple Silicon, Metal) | [Mac](docs/guides/mac.md) |
 | Download a model and add a drafter | [DFlash2 and MTP](docs/guides/speculative-decoding.md) |
 | Run MiniMax-M3.1-Flash or GLM-5.3-Flash on a DGX Spark / GB10 | [Big MoE models on one GB10](docs/guides/gb10-big-moe.md) |
 | Run on an RTX 5090 (numbers, what is automatic) | [RTX 5090](docs/guides/rtx-5090.md) |
@@ -79,5 +80,5 @@ spiritbuun, turboderp ([ExLlamaV3](https://github.com/turboderp-org/exllamav3): 
 X3 and our EXL3 support) and the contributors listed in [Credits](docs/CREDITS.md).
 Third-party notices remain in [NOTICE](NOTICE). Thank you to our community testers.
 
-tqLLM is Apache-2.0 licensed. Model weights and third-party components retain
-their own licences.
+tqLLM is created by David Y. Tan and licensed under Apache-2.0: if you copy or redistribute it, keep the
+[NOTICE](NOTICE) file's credit with your copy. Model weights and third-party components retain their own licences.

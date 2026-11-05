@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next weights: the GGUF checkpoint, resident tensors and the dense projection dispatch; stage fixtures.
+#include "debug.hpp"
 #include "decode_rules.hpp"
 #include "fn_runtime.hpp"
 #include <functional>
@@ -57,10 +58,13 @@ public:
     size_t warm_tensors(int threads, double host_ram_bytes) const {
         size_t n = 0;
         for (const auto & [name, i] : owners_)
-            if (tqllm::flashnext::warm_at_start(name, double(files_[i]->tensor(name).size), host_ram_bytes)) n += files_[i]->warm_tensor(name, threads);
+            if (tqllm::flashnext::warm_at_start(name, double(files_[i]->file().tensors.at(name).bytes), host_ram_bytes))  // the size, not a read
+                n += files_[i]->warm_tensor(name, threads);
         return n;
     }
     Qwen4ExpConfig config;
+    FnConfig run;  // this engine's run-time choices (options and load decisions)
+    mutable FnRuntime rt;  // this engine's mutable shared state (KV capacity, epochs, QSA / dense scratch)
     double epsilon = 0.;
     int key_heads = 0, value_heads = 0, state_dim = 0, conv_kernel = 0;
     int attention_heads = 0, attention_kvheads = 0, attention_dim = 0, rotary = 0;
@@ -185,14 +189,21 @@ public:
             require(metadata.num("split.count", 1) == expected, "shard count differs");
             const int part = int(metadata.num("split.no", 0));
             require(part >= 0 && part < expected && parts.insert(part).second, "invalid shard ID");
-            for (const auto & [name, tensor] : metadata.tensors)
+            // a Hugging Face folder holds the MTP block too: as the trunk it leaves blk.<layers>.* to --mtp
+            const std::string mtp_prefix = "blk." + std::to_string(config.layers) + ".";
+            for (const auto & [name, tensor] : metadata.tensors) {
+                if (file->folder() && name.rfind(mtp_prefix, 0) == 0) continue;
                 require(owners_.emplace(name, files_.size()).second, "duplicate tensor " + name);
+            }
             files_.push_back(std::move(file));
         }
         require(int(files_.size()) == expected && std::isfinite(epsilon) && epsilon > 0., "incomplete shards or invalid norm epsilon");
         for (auto & m : mtp_files_) {
-            for (const auto & [name, tensor] : m->file().tensors)
+            const std::string mtp_prefix = "blk." + std::to_string(config.layers) + ".";
+            for (const auto & [name, tensor] : m->file().tensors) {
+                if (m->folder() && name.rfind(mtp_prefix, 0) != 0) continue;  // a folder as --mtp: only its MTP block
                 require(owners_.emplace(name, files_.size()).second, "duplicate tensor " + name);
+            }
             files_.push_back(std::move(m)); has_mtp = true;
         }
         mtp_files_.clear();
@@ -248,7 +259,9 @@ public:
             const auto & t = f.file().tensors.at(name);
             require(t.ne == std::vector<uint64_t>{uint64_t(i == 2 ? config.expert_ff : config.hidden),
                 uint64_t(i == 2 ? config.hidden : config.expert_ff), uint64_t(config.experts)}, "mixed expert shape differs");
-            result[i] = {t.type, f.expert(name, id)};
+            auto [bytes, owner] = f.expert_owned(name, id);
+            result[i] = {t.type, bytes};
+            if (owner) { result[i].owner = std::move(owner); continue; }  // built on read (a folder's MLX 4-bit expert)
             if(reclaim_expert_pages) {
                 const auto view=result[i].bytes;
                 result[i].owner=std::shared_ptr<const void>(view.data,[&f,view](const void *) { (void)f.discard_pages(view); });
@@ -276,6 +289,67 @@ public:
         return output.get();
     }
     // head logits for several hidden rows (row-major, `hidden` floats each) with one load of the output matrix
+    // A BF16 projection on an FP16 input image (the rows its quantised neighbours read): the weight's FP16 copy (made once,
+    // __float2half_rn of each BF16 value) and one FP16 tensor-core GEMM, fp32 accumulate and output
+    // the layer's FP16 copy of a dense-path weight in the dense cache pool (filled once per layer per prompt chunk), or in
+    // `fallback` when the pool is full
+    const __half * dense_half(const std::string & name, const void * key, size_t elems, const std::function<void(__half *)> & fill,
+                              std::unique_ptr<Device<__half>> & fallback) const {
+        if (const size_t pool = dense_half_pool_bytes(run.tune)) {
+            int layer = -1; std::sscanf(name.c_str(), "blk.%d.", &layer);
+            if (layer != rt.dhc.layer) { rt.dhc.used = 0; rt.dhc.map.clear(); rt.dhc.layer = layer; }
+            if (auto it = rt.dhc.map.find(key); it != rt.dhc.map.end()) return it->second;
+            const size_t b = (elems * sizeof(__half) + 255) / 256 * 256;
+            if (!rt.dhc.base && cudaMalloc(reinterpret_cast<void **>(&rt.dhc.base), pool) == cudaSuccess) rt.dhc.cap = pool;
+            cudaGetLastError();
+            if (rt.dhc.base && rt.dhc.used + b <= rt.dhc.cap) {
+                auto * w = reinterpret_cast<__half *>(rt.dhc.base + rt.dhc.used); rt.dhc.used += b; rt.dhc.high = std::max(rt.dhc.high, rt.dhc.used);
+                fill(w); rt.dhc.map[key] = w; return w;
+            }
+        }
+        fallback = std::make_unique<Device<__half>>(elems); fill(fallback->p); return fallback->p;
+    }
+    // two projections of one FP16 image (the HC mixer's down and inject) in one dense FP16 GEMM over the stacked weight
+    // [a rows | b rows | zero rows to a multiple of 8]: y is [tokens][ld], ld = (ra + rb) rounded up to 8. The image is
+    // read once and the GEMM keeps aligned shapes (inject's 4 rows alone took a slow unaligned kernel). False when `a` is
+    // not on the dense FP16 path; the caller then runs the two projections.
+    static int stacked_ld(int ra, int rb) { return (ra + rb + 7) / 8 * 8; }
+    bool project_stacked_h(const std::string & a, const std::string & b, const __half * x, float * y, int cols, int ra, int rb, int tokens) const {
+        const auto & ta = file(a).file().tensors.at(a), & tb = file(b).file().tensors.at(b);
+        require(ta.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(ra)} && tb.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(rb)},
+                "stacked projection shape differs: " + a + " / " + b);
+        if (!takes_half_input(a) || dense_int8_mode() || f32_q6_projection || run.tune.dense_cache_mb <= 0 || run.tune.dense_min <= 0 ||
+            tokens < run.tune.dense_min || tb.type != GGML_BF16) return false;
+        const auto ia = resident_.find(a);
+        if (ia == resident_.end() || !ia->second->m.fmt) return false;  // loaded by its first plain projection (load warm-up)
+        const Mat & ma = ia->second->m; const __nv_bfloat16 * wb = bf16_device(b);
+        const int ld = stacked_ld(ra, rb);
+        std::unique_ptr<Device<__half>> wh;
+        const __half * w = dense_half(a, reinterpret_cast<const char *>(ma.p) + 1, size_t(ld) * cols, [&](__half * d) {
+            ma.fmt->dequant_h(ma, d, nullptr);
+            tqllm_cuda::bf16_to_h(wb, d + size_t(ra) * cols, rb * cols, nullptr);
+            if (ld > ra + rb) ck(cudaMemsetAsync(d + size_t(ra + rb) * cols, 0, size_t(ld - ra - rb) * cols * sizeof(__half), nullptr));
+        }, wh);
+        const float alpha = 1.f, beta = 0.f;
+        require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, ld, tokens, cols, &alpha, w, CUDA_R_16F, cols, x, CUDA_R_16F, cols, &beta,
+                             y, CUDA_R_32F, ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS,
+                "stacked fp16 GEMM failed: " + a);
+        return true;
+    }
+    void project_h_bf16w(const std::string & name, const __half * x, float * y, int cols, int rows, int tokens) const {
+        const auto & t = file(name).file().tensors.at(name);
+        require(t.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(rows)}, "FP16-image projection shape differs: " + name);
+        const __nv_bfloat16 * b = bf16_device(name);
+        auto & r = resident_[name + "#f16"]; if (!r) r = std::make_unique<Resident>();
+        if (r->mem.empty()) {
+            PersistentAlloc keep; auto buffer = std::make_unique<Device<char>>(size_t(rows) * cols * sizeof(__half));
+            tqllm_cuda::bf16_to_h(b, reinterpret_cast<__half *>(buffer->p), rows * cols, nullptr); r->mem.push_back(std::move(buffer));
+        }
+        const float alpha = 1.f, beta = 0.f;
+        require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha, r->mem[0]->p, CUDA_R_16F, cols,
+                             x, CUDA_R_16F, cols, &beta, y, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS,
+                "FP16-image projection failed: " + name);
+    }
     // Resident raw BF16 tensor on the device (decode GEMVs read it directly).
     const __nv_bfloat16 * bf16_device(const std::string & name) const {
         const auto & f = file(name); const auto & t = f.file().tensors.at(name);
@@ -296,7 +370,7 @@ public:
     // Greedy head for the last row of a device [count][hidden] F32 block; the matrix stays resident.
     // Greedy head for every row of a device [count][hidden] F32 block in one weight read (speculative verify).
     std::vector<int> head_argmax_rows(const float * rows, int count) const {
-        static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;  // diagnostic: where a slow first token goes
+        static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;  // diagnostic: where a slow first token goes
         const auto t0 = std::chrono::steady_clock::now();
         const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
         const auto * r = &head_resident();
@@ -305,7 +379,7 @@ public:
         Device<__half> input(size_t(count) * H); Device<float> output(size_t(count) * V);
         const double t_alloc = ms();
         tqllm_cuda::vis_f32_to_h(rows, input.p, int64_t(count) * H, nullptr);
-        const int step = std::max(1, r->m.fmt->max_matvec_cols());
+        const int step = head_step(r->m, count);
         for (int b = 0; b < count; b += step)
             r->m.fmt->matvec_f32(r->m, input.p + size_t(b) * H, output.p + size_t(b) * V, std::min(step, count - b), nullptr);
         const double t_launch = ms();
@@ -313,6 +387,11 @@ public:
         if (req_log) std::fprintf(stderr, "tqllm: head argmax %d rows: resident %.0f ms, alloc %.0f ms, launches %.0f ms, argmax+sync %.0f ms\n",
                                   count, t_res, t_alloc - t_res, t_launch - t_alloc, ms() - t_launch);
         return best;
+    }
+    // columns per head launch: a several-sequence verify block (up to 32 rows) reads the head once when the format's
+    // wide matvec equals its 8-column launches (max_exact_cols, tests/matvec_wide.cu at the head's shape)
+    static int head_step(const Mat & m, int count) {
+        return std::max(1, count <= m.fmt->max_exact_cols() ? count : m.fmt->max_matvec_cols());
     }
     // Device argmax per row (ties -> lowest index, as std::max_element): only the ids leave the GPU.
     static std::vector<int> argmax_rows(const float * logits, int V, int count) {
@@ -327,7 +406,7 @@ public:
         const size_t V = r->m.rows, H = config.hidden;
         Device<__half> input(size_t(count) * H); Device<float> output(size_t(count) * V);
         tqllm_cuda::vis_f32_to_h(rows, input.p, int64_t(count) * H, nullptr);
-        const int step = std::max(1, r->m.fmt->max_matvec_cols());
+        const int step = head_step(r->m, count);
         for (int b = 0; b < count; b += step)
             r->m.fmt->matvec_f32(r->m, input.p + size_t(b) * H, output.p + size_t(b) * V, std::min(step, count - b), nullptr);
         return output.get();
@@ -355,7 +434,7 @@ public:
         }
         return ids.empty() ? nullptr : &ids;
     }
-    // conf (optional): the draft's top softmax probability over the draft vocabulary (TQFN_DRAFT_TAU)
+    // conf (optional): the draft's top softmax probability over the draft vocabulary (FnConfig::draft_tau)
     int draft_head_argmax_device(const float * rows, int count, float * conf = nullptr) const {
         const auto * ids = draft_vocab();
         if (!ids) { if (conf) *conf = 1.f; return head_argmax_device(rows, count); }
@@ -382,8 +461,26 @@ public:
         if (conf) { Device<float> pk(1); tqllm_cuda::fn_softmax_peak(output.p, int(ids->size()), pk.p, nullptr); *conf = pk.get()[0]; }
         return (*ids)[size_t(argmax_rows(output.p, int(ids->size()), 1)[0])];
     }
+    // draft_head_argmax_device for every row of a device [count][hidden] F32 block: one weight read, one readback
+    std::vector<int> draft_head_argmax_many(const float * rows, int count) const {
+        const auto * ids = draft_vocab();
+        if (!ids) return head_argmax_rows(rows, count);
+        if (count == 1) return {draft_head_argmax_device(rows, 1)};
+        if (const auto it = resident_.find("draft_head"); it == resident_.end() || !it->second || !it->second->m.fmt)
+            (void) draft_head_argmax_device(rows, 1);  // builds the draft head (first call only)
+        const auto & r = *resident_.at("draft_head");
+        const size_t K = ids->size(), H = config.hidden;
+        Device<__half> input(size_t(count) * H); Device<float> output(size_t(count) * K);
+        tqllm_cuda::vis_f32_to_h(rows, input.p, int64_t(count) * H, nullptr);
+        const int step = head_step(r.m, count);
+        for (int b = 0; b < count; b += step)
+            r.m.fmt->matvec_f32(r.m, input.p + size_t(b) * H, output.p + size_t(b) * K, std::min(step, count - b), nullptr);
+        auto best = argmax_rows(output.p, int(K), count);
+        for (auto & v : best) v = (*ids)[size_t(v)];
+        return best;
+    }
     const Resident & head_resident() const {
-        static const bool req_log = std::getenv("TQFN_PROFILE_REQ") != nullptr;
+        static const bool req_log = tqllm::debug_cstr("profile_req") != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         const auto & f = file("output.weight"); const auto & t = f.file().tensors.at("output.weight");
         auto & r = resident_["output.weight"]; if (!r) r = std::make_unique<Resident>();
@@ -429,10 +526,28 @@ public:
         }
         return out;
     }
-    void project(const std::string & name, const float * input, float * output, int cols, int rows, int tokens) const {
+    // a projection of `name` takes a caller's FP16 image of its input (SharedInput): resident quantised weights
+    bool takes_half_input(const std::string & name) const {
+        const int ty = int(file(name).file().tensors.at(name).type);
+        return resident && !cpu_q8_projection && !exact_f32() && ty != GGML_TQ3_4S && ty != GGML_F32 && ty != GGML_BF16 && ty != GGML_F16;
+    }
+    static int dense_int8_mode() { static const int v = std::getenv("TQFN_DENSE_INT8") ? std::atoi(std::getenv("TQFN_DENSE_INT8")) : 0; return v; }
+    // output_h: FP16 output instead of `output` (null then). The dense FP16 GEMM rounds its fp32 sums to FP16 once; every
+    // other path computes fp32 and converts.
+    void project(const std::string & name, const float * input, float * output, int cols, int rows, int tokens, __half * output_h = nullptr) const {
         const auto & f = file(name); const auto & t = f.file().tensors.at(name);
         require(t.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(rows)},
                 "stage projection shape/type differs: " + name);
+        if (output_h) {
+            const bool quantised = t.type != GGML_TQ3_4S && t.type != GGML_F32 && t.type != GGML_BF16 && t.type != GGML_F16;
+            const bool dense_h = quantised && !exact_f32() && !(f32_q6_projection && t.type == GGML_Q6_K) && !cpu_q8_projection &&
+                                 !(dense_int8_mode() && tokens > 64 && cols % 64 == 0) && run.tune.dense_cache_mb > 0 &&
+                                 run.tune.dense_min > 0 && tokens >= run.tune.dense_min;
+            if (!dense_h) {
+                Device<float> y(size_t(rows) * tokens); project(name, input, y.p, cols, rows, tokens);
+                tqllm_cuda::vis_f32_to_h(y.p, output_h, int64_t(y.count), nullptr); return;
+            }
+        }
         require(!owners_.count(name.substr(0, name.size() - 6) + "input_scale"), "HC input scale needs an explicit implementation");
         if (f32_q6_projection && t.type == GGML_Q6_K) {
             require(cols % 256 == 0, "Q6_K diagnostic needs 256-column blocks");
@@ -487,7 +602,7 @@ public:
             // TQFN_PROJ_GEMM (default on): prefill chunks above 64 tokens use the u4h-family GEMM (weights once per 64 tokens);
             // decode, verify and short chunks keep the exact matvec path
             // TQFN_DENSE_INT8: int8 activations for the dense prefill projections (1 per-32 scales, 2 per token)
-            static const int dense_int8 = std::getenv("TQFN_DENSE_INT8") ? std::atoi(std::getenv("TQFN_DENSE_INT8")) : 0;
+            const int dense_int8 = dense_int8_mode();
             if (dense_int8 && tokens > 64 && cols % 64 == 0) {
                 Device<int8_t> xq8(size_t(cols) * tokens); Device<float> xs8(size_t(tokens) * (cols / 32)); Device<int16_t> xsum8(size_t(tokens) * (cols / 32) * 2);
                 tqllm_cuda::k_quant_act_rows(xp, nullptr, nullptr, 0, 0, tokens, cols, xq8.p, xs8.p, xsum8.p, nullptr, dense_int8);
@@ -498,27 +613,14 @@ public:
             }
             // dense FP16 cache (Strata's dense path, --dense-cache-mb): chunks of >= 256 tokens dequantise the weight to fp16 once and run one
             // cuBLAS fp16 tensor-core GEMM (fp32 accumulate); the weight decode is amortised over the whole chunk
-            const int dense_deq = g_tune.dense_cache_mb > 0 ? g_tune.dense_min : 0;
+            const int dense_deq = run.tune.dense_cache_mb > 0 ? run.tune.dense_min : 0;
             if (dense_deq > 0 && tokens >= dense_deq) {
-                __half * whp = nullptr; std::unique_ptr<Device<__half>> wh;
-                if (const size_t pool = dense_half_pool_bytes()) {
-                    int layer = -1; std::sscanf(name.c_str(), "blk.%d.", &layer);
-                    if (layer != g_dhc.layer) { g_dhc.used = 0; g_dhc.map.clear(); g_dhc.layer = layer; }
-                    if (auto it = g_dhc.map.find(matrix.p); it != g_dhc.map.end()) whp = it->second;
-                    else {
-                        const size_t b = (size_t(rows) * cols * sizeof(__half) + 255) / 256 * 256;
-                        if (!g_dhc.base && cudaMalloc(reinterpret_cast<void **>(&g_dhc.base), pool) == cudaSuccess) g_dhc.cap = pool;
-                        cudaGetLastError();
-                        if (g_dhc.base && g_dhc.used + b <= g_dhc.cap) {
-                            whp = reinterpret_cast<__half *>(g_dhc.base + g_dhc.used); g_dhc.used += b; g_dhc.high = std::max(g_dhc.high, g_dhc.used);
-                            matrix.fmt->dequant_h(matrix, whp, nullptr); g_dhc.map[matrix.p] = whp;
-                        }
-                    }
-                }
-                if (!whp) { wh = std::make_unique<Device<__half>>(size_t(rows) * cols); matrix.fmt->dequant_h(matrix, wh->p, nullptr); whp = wh->p; }
+                std::unique_ptr<Device<__half>> wh;
+                const __half * whp = dense_half(name, matrix.p, size_t(rows) * cols, [&](__half * w) { matrix.fmt->dequant_h(matrix, w, nullptr); }, wh);
                 const float alpha = 1.f, beta = 0.f;
                 require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha, whp, CUDA_R_16F, cols,
-                                     xp, CUDA_R_16F, cols, &beta, output, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
+                                     xp, CUDA_R_16F, cols, &beta, output_h ? static_cast<void *>(output_h) : static_cast<void *>(output),
+                                     output_h ? CUDA_R_16F : CUDA_R_32F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
                         == CUBLAS_STATUS_SUCCESS, "dense fp16 GEMM failed: " + name);
                 if (!resident) ck(cudaDeviceSynchronize());
                 return;
@@ -527,7 +629,10 @@ public:
                 if (!resident) ck(cudaDeviceSynchronize());
                 return;
             }
-            const int step = matrix.fmt->max_matvec_cols(); require(step > 0, "invalid native matvec width");
+            // a several-sequence verify block (9..32 tokens) in one matvec: the weights read once, not once per 8 tokens
+            // (each column's result is the same, tests/matvec_wide.cu)
+            const int wide = matrix.fmt->max_exact_cols();
+            const int step = tokens <= wide ? tokens : matrix.fmt->max_matvec_cols(); require(step > 0, "invalid native matvec width");
             for (int base = 0; base < tokens; base += step)
                 matrix.fmt->matvec_f32(matrix, xp + size_t(base) * cols, output + size_t(base) * rows, std::min(step, tokens - base), nullptr);
             if (!resident) ck(cudaDeviceSynchronize());

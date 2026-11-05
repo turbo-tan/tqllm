@@ -1,3 +1,6 @@
+> Development log of the Metal backend (kept for its kernel and Neural Engine notes; the early stages below are out of
+> date). To build and run tqLLM on a Mac, see [the Mac guide](guides/mac.md).
+
 # MLX backend implementation lane
 
 Branch: feat/mlx-backend. Initial base: release main 776e257.
@@ -64,7 +67,7 @@ gate, and it increases weight storage.
 
 ## GGUF matrix boundary
 
-`src/backends/mlx/weights.hpp` dispatches native compressed matrices and reverses GGUF
+`src/backends/metal/weights.hpp` dispatches native compressed matrices and reverses GGUF
 column-first dimensions into MLX row-major dimensions. TQ matrices apply their
 128-point input rotation exactly once. Plain F32/F16/BF16 tensors retain their
 stored values. Unsupported types and malformed lengths fail explicitly.

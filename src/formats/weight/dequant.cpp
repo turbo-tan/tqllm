@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -359,6 +360,29 @@ void iq4nl(const uint8_t * b, float * y) {
 
 } // namespace
 
+// TQ3_4S (llama.cpp-tq3 dequantize_row_tq3_4s): per 32 weights four E3M5 group scales and 3-bit centroid indices in the
+// randomized-Hadamard basis; the values are rotated back to the model basis.
+namespace {
+constexpr float kTq3Centroids[8] = {-1.996684f, -1.291398f, -0.740341f, -0.247508f, 0.230106f, 0.725222f, 1.277503f, 1.988943f};
+constexpr float kTq3Signs[32] = {1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1};
+float tq3_scale(uint8_t b) { return b ? std::ldexp(1.0f + float(b & 31) / 32.0f, (b >> 5) - 9) : 0.0f; }
+void wht32(float * v) {
+    for (int step = 1; step < 32; step <<= 1)
+        for (int i = 0; i < 32; i += step << 1)
+            for (int j = i; j < i + step; ++j) { const float a = v[j], b = v[j + step]; v[j] = a + b; v[j + step] = a - b; }
+}
+}  // namespace
+// The TQ3 rotation of one 32-value block (sign flips, Walsh-Hadamard, 1/sqrt(32)): model basis -> rotated basis.
+void tq3_rotate_block(float * v) {
+    for (int i = 0; i < 32; ++i) v[i] *= kTq3Signs[i];
+    wht32(v);
+    for (int i = 0; i < 32; ++i) v[i] *= 1.0f / std::sqrt(32.0f);
+}
+
+namespace {
+std::map<uint32_t, HostDequant> & host_dequants() { static std::map<uint32_t, HostDequant> m; return m; }
+}  // namespace
+
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
     const auto * s = static_cast<const uint8_t *>(src);
     switch (type) {
@@ -374,6 +398,47 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         case 0: std::memcpy(dst, src, size_t(n) * 4); return;
+        case 3:  // Q4_1: d, m, 16 bytes of nibbles (low = elements 0..15, high = 16..31), value = q d + m
+            if (n < 0 || n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                uint16_t hd, hm; std::memcpy(&hd, s + b * 20, 2); std::memcpy(&hm, s + b * 20 + 2, 2);
+                const float d = half_to_float(hd), m = half_to_float(hm);
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t q = s[b * 20 + 4 + j];
+                    dst[b * 32 + j] = int(q & 15) * d + m;
+                    dst[b * 32 + j + 16] = int(q >> 4) * d + m;
+                }
+            }
+            return;
+        case 2:  // Q4_0: d, 16 bytes of nibbles (low nibbles = elements 0..15, high = 16..31), value = (q - 8) d
+            if (n < 0 || n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                uint16_t hd; std::memcpy(&hd, s + b * 18, 2);
+                const float d = half_to_float(hd);
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t q = s[b * 18 + 2 + j];
+                    dst[b * 32 + j] = (int(q & 15) - 8) * d;
+                    dst[b * 32 + j + 16] = (int(q >> 4) - 8) * d;
+                }
+            }
+            return;
+        case GGML_TQ3_4S:
+            if (n < 0 || n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                const uint8_t * blk = s + b * 16;
+                float v[32];
+                for (int g = 0; g < 4; ++g) {
+                    const float d = tq3_scale(blk[g]);
+                    const uint8_t * qp = blk + 4 + g * 3;
+                    const uint8_t idx[8] = {uint8_t(qp[0] & 7), uint8_t((qp[0] >> 3) & 7), uint8_t(((qp[0] >> 6) | (qp[1] << 2)) & 7),
+                                            uint8_t((qp[1] >> 1) & 7), uint8_t((qp[1] >> 4) & 7), uint8_t(((qp[1] >> 7) | (qp[2] << 1)) & 7),
+                                            uint8_t((qp[2] >> 2) & 7), uint8_t((qp[2] >> 5) & 7)};
+                    for (int j = 0; j < 8; ++j) v[g * 8 + j] = kTq3Centroids[idx[j]] * d;
+                }
+                wht32(v);  // inverse rotation: WHT, 1/sqrt(32), undo the sign flips
+                for (int i = 0; i < 32; ++i) dst[b * 32 + i] = v[i] * (1.0f / std::sqrt(32.0f)) * kTq3Signs[i];
+            }
+            return;
         case 1:
             for (int64_t i = 0; i < n; ++i) {
                 uint16_t h;
@@ -402,6 +467,23 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
         case 20:
             if (n % 32) break;
             for (int64_t b = 0; b < n / 32; ++b) iq4nl(s + b * 18, dst + b * 32);
+            return;
+        case 6: case 7:  // Q5_0 / Q5_1: d [, m], qh (bit j = high bit of element j), 16 bytes of low nibbles
+            if (n % 32) break;
+            for (int64_t b = 0; b < n / 32; ++b) {
+                const bool q51 = type == 7;
+                const uint8_t * q = s + b * (q51 ? 24 : 22);
+                const float d = half_to_float(uint16_t(q[0] | (q[1] << 8)));
+                const float m = q51 ? half_to_float(uint16_t(q[2] | (q[3] << 8))) : 0.f;
+                const uint8_t * hb = q + (q51 ? 4 : 2);
+                const uint32_t qh = uint32_t(hb[0]) | uint32_t(hb[1]) << 8 | uint32_t(hb[2]) << 16 | uint32_t(hb[3]) << 24;
+                const uint8_t * qs = hb + 4;
+                for (int j = 0; j < 16; ++j) {
+                    const int lo = (qs[j] & 0x0F) | int((qh >> j) & 1) << 4, hi = (qs[j] >> 4) | int((qh >> (j + 16)) & 1) << 4;
+                    dst[b * 32 + j] = q51 ? d * float(lo) + m : d * float(lo - 16);
+                    dst[b * 32 + j + 16] = q51 ? d * float(hi) + m : d * float(hi - 16);
+                }
+            }
             return;
         case 8:  // Q8_0: d, 32 int8
             if (n % 32) break;
@@ -452,8 +534,11 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             for (int64_t b = 0; b < n / 256; ++b) q6k(s + b * 210, dst + b * 256);
             return;
     }
+    if (const auto it = host_dequants().find(type); it != host_dequants().end()) { it->second(src, dst, n); return; }
     throw std::runtime_error("dequantize_host: unsupported type " + std::to_string(type));
 }
+
+void register_host_dequant(uint32_t type, HostDequant f) { host_dequants()[type] = std::move(f); }
 
 } // namespace tqllm
 

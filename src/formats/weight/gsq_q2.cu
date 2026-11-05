@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstdint>
 #include "gsq_q2.cuh"
+#include "quant_kernels.cuh"
 #include "common.cuh"
 #include <climits>
 #include <cstdlib>
@@ -217,6 +219,84 @@ void shape(const void * w, const void * x, const void * y, int rows, int cols, i
         throw std::invalid_argument("GSQ Q2_0: invalid pointer, shape or grid");
 }
 }
+namespace {
+// Dedup: warp per (row, group); the row's 18-byte blocks are read once for the group's columns. Per column the sums are
+// dot_warp's (k < 3072) or dot_wide's (k >= 3072), in the same order.
+// narrow rows: block = 64 rows (8 warps x 8), the group's inputs staged in shared memory once per block (each warp read
+// them per column before: input traffic, not weights, bounded it at np 8); wide rows: warp per row, inputs from global
+template<bool WIDE> __global__ void __launch_bounds__(256) dot_dedup(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int cols, const int * dmap, int groups) {
+    constexpr int DC = tqllm_cuda::kDedupCols;
+    extern __shared__ __half2 xs[];  // narrow: [nc][cols / 2]
+    for (int gi = int(blockIdx.y); gi < groups; gi += int(gridDim.y)) {  // groups past the grid; padding ends at slot -1
+    const int * e = dmap + int64_t(gi) * tqllm_cuda::kDedupStride;
+    if (e[0] < 0) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, nc = e[1], nb = cols / 64;
+    if (gi != int(blockIdx.y)) __syncthreads();  // the previous group's staged inputs are read before they are replaced
+    if constexpr (!WIDE) {
+        for (int i = threadIdx.x; i < nc * (cols / 2); i += blockDim.x)
+            xs[i] = reinterpret_cast<const __half2 *>(x + int64_t(e[2 + i / (cols / 2)]) * cols)[i % (cols / 2)];
+        __syncthreads();
+    }
+    for (int rr = 0; rr < (WIDE ? 1 : 8); ++rr) {
+    const int row = WIDE ? blockIdx.x * 8 + warp : blockIdx.x * 64 + warp * 8 + rr;
+    if (row >= rows) break;
+    const unsigned char * r = weights + (int64_t(e[0]) * rows + row) * nb * 18;
+    float sum[DC];
+#pragma unroll
+    for (int c = 0; c < DC; ++c) sum[c] = 0.f;
+    if constexpr (!WIDE) {
+        for (int b = 0; b < nb; ++b) {
+            const unsigned char * block = r + b * 18;
+            const float scale = __half2float(__ushort_as_half(uint16_t(block[0] | block[1] << 8)));
+            const unsigned q = block[2 + lane / 2] >> (4 * (lane & 1));
+#pragma unroll
+            for (int c = 0; c < DC; ++c) {
+                if (c >= nc) break;
+                const float2 xx = __half22float2(xs[c * (cols / 2) + b * 32 + lane]);
+                sum[c] += scale * (int(q & 3u) - 1) * xx.x;
+                sum[c] += scale * (int((q >> 2) & 3u) - 1) * xx.y;
+            }
+        }
+    } else {
+        const int sub = lane & 7, which = lane >> 3;
+        for (int b = which; b < nb; b += 4) {
+            const unsigned char * block = r + b * 18;
+            const float scale = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned q = *reinterpret_cast<const uint16_t *>(block + 2 + sub * 2);
+#pragma unroll
+            for (int c = 0; c < DC; ++c) {
+                if (c >= nc) break;
+                const uint4 xv = *reinterpret_cast<const uint4 *>(x + int64_t(e[2 + c]) * cols + b * 64 + sub * 8);
+                const __half2 * xh = reinterpret_cast<const __half2 *>(&xv);
+                float part = 0.f;
+                for (int i = 0; i < 4; ++i) {
+                    const float2 xx = __half22float2(xh[i]);
+                    part += (int((q >> (4 * i)) & 3u) - 1) * xx.x;
+                    part += (int((q >> (4 * i + 2)) & 3u) - 1) * xx.y;
+                }
+                sum[c] += scale * part;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < DC; ++c) {
+        if (c >= nc) break;
+        float v = sum[c];
+        for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+        if (!lane) y[int64_t(e[2 + DC + c]) * rows + row] = __float2bfloat16_rn(v);
+    }
+    }
+    }
+}
+}
+void gsq_q2_expert_dedup(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, const int * dmap, int groups, cudaStream_t s) {
+    shape(w, x, y, r, k, 1, 1);
+    if (!dmap || groups <= 0 || groups > 65535) throw std::invalid_argument("GSQ Q2_0: invalid dedup map");
+    const unsigned gy = unsigned(std::min(groups, tqllm_cuda::kDedupGridGroups));
+    if (k >= 3072) { dot_dedup<true><<<dim3(unsigned((r + 7) / 8), gy), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, dmap, groups); return; }
+    const size_t smem = size_t(tqllm_cuda::kDedupCols) * k * sizeof(__half);  // k < 3072: at most 48 KB
+    dot_dedup<false><<<dim3(unsigned((r + 63) / 64), gy), 256, smem, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, dmap, groups);
+}
 void gsq_q2_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, int n, cudaStream_t s) {
     shape(w, x, y, r, k, n);
     dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, 1, nullptr, 1, false);
@@ -240,8 +320,8 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     shape(w, x, y, r, k, 1, 1);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid grouped expert dimensions");
-    // TQFN_Q2_DOT_GROUPED=1: the scalar kernel (A/B); default: tensor cores when k is a multiple of 64
-    static const bool scalar = std::getenv("TQFN_Q2_DOT_GROUPED") && std::atoi(std::getenv("TQFN_Q2_DOT_GROUPED")) != 0;
+    // tensor cores when k is a multiple of 64 (dfd89eb: 32K prefill 1029.7 -> 1105.1, identical tokens)
+    constexpr bool scalar = false;
     if (!scalar && capacity <= 65535 * 64) {
         if(capacity<=8)q2_gemm_grouped<1><<<dim3(unsigned((r+63)/64),1,unsigned(experts)),256,0,s>>>(
             static_cast<const unsigned char *>(w),x,y,r,k,counts,groups,capacity,topk,per_expert);

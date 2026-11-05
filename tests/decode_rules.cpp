@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace tqllm::flashnext;
 static int failures = 0;
@@ -28,11 +29,74 @@ int main() {
 
     // F38: the keep grows with every sequence
     const size_t state = size_t(900) << 20, reserve = size_t(1200) << 20;
-    check(auto_keep_bytes(4, state, reserve) - auto_keep_bytes(2, state, reserve) == 2 * (state + (size_t(256) << 20)),
-          "slots=auto keeps each extra sequence's state and working room");
+    check(auto_keep_bytes(4, state, reserve) - auto_keep_bytes(2, state, reserve) == 2 * state,
+          "slots=auto keeps each extra sequence's state (its working buffers are in the measured state)");
+    // 3090 np 8 (11-03): measured state 286 MB, reserve 512 MB: kept 4562 MB and 2.9 GB stayed idle with all 8 decoding
+    check(auto_keep_bytes(8, size_t(286) << 20, size_t(512) << 20) == size_t(7 * 286 + 512 + 256) << 20,
+          "np 8 keeps seven states, the reserve and one working room");
     check(auto_keep_bytes(1, state, reserve) == reserve + (size_t(256) << 20), "one sequence keeps the reserve only (long prompts borrow banks)");
-    check(auto_keep_bytes(2, state, reserve) >= 2 * state, "several sequences keep every state");
+    check(auto_keep_bytes(2, state, reserve) >= state + reserve, "several sequences keep every state beyond the warm-up's");
+    // 3090 np 2 (11-02): measured state 1212 MB, reserve 512 MB: kept 3448 MB and 3.35 GB stayed idle with both decoding
+    check(auto_keep_bytes(2, size_t(1212) << 20, size_t(512) << 20) == size_t(1212 + 512 + 256) << 20,
+          "np 2 keeps one extra sequence's state (the warm-up holds the first while the banks are sized)");
 
+    // prefetch at np > 1 (11-03): a batched block of np sequences x 4 rows predicts like one sequence's 4 rows
+    check(predicts(4, 4, 1), "np 1: a 4-row verify block prefetches");
+    check(predicts(8, 4, 2), "np 2: two 4-row blocks in one step prefetch");
+    check(predicts(32, 4, 8), "np 8: eight 4-row blocks prefetch");
+    check(!predicts(1024, 4, 1), "a prompt chunk does not");
+    check(prefetch_ranks(1).last == 6 && prefetch_ranks(2).last == 3 && prefetch_ranks(4).last == 3, "np > 1 prefetches each token's 3 best only");
+
+    // K/V mapping (3090 np 2, 11-03): np sequences at context C / np must map no more K/V than one sequence at C (the
+    // same positions); a fixed 32 MB page made every sequence map 26 x 32 MB whatever its context (832 MB at 4K)
+    {
+        const size_t MB = size_t(1) << 20, g = 2 * MB, row = 1024;  // Flash-Next: 2 KV heads x 256 x BF16 per position
+        const int buffers = 26;                                      // 12 attention layers + MTP, K and V each
+        auto span = [&](size_t n, size_t page) { return (n + page - 1) / page * page; };
+        auto seq_bytes = [&](int ctx, bool old_rule) {
+            const size_t n = size_t(ctx) * row;
+            const size_t page = old_rule ? std::max(g, (size_t(32) << 20) / g * g) : kv_page_bytes(n, g);
+            return size_t(buffers) * span(n, page);
+        };
+        for (int C : {32768, 65536, 131072})
+            for (int np : {2, 4, 8}) {
+                const size_t one = seq_bytes(C, false), many = size_t(np) * seq_bytes(C / np, false);
+                check(many <= one + size_t(np * buffers) * g, "np sequences at C / np map no more K/V than one at C (+1 granule per buffer)");
+            }
+        check(8 * seq_bytes(65536 / 8, true) > 2 * seq_bytes(65536, true), "the old 32 MB page: np 8 at 8K mapped over twice one 64K sequence");
+        check(seq_bytes(4096, false) == size_t(buffers) * 4 * MB, "a 4K sequence maps 4 MB per buffer, not 32");
+        check(kv_page_bytes(size_t(64) << 20, g) == size_t(32) << 20, "long buffers keep 32 MB pages (host moves)");
+        check(kv_page_bytes(1, g) == g && kv_page_bytes(5 * MB, g) == 6 * MB, "short buffers: one granule-rounded page");
+        check(kv_page_bytes(5 * MB, 0) == 5 * MB, "no VMM granule: the buffer itself");
+    }
+    // batched steps at high np (3090, 11-03): fewer drafts per slot instead of one slot at a time
+    check(batch_drafts(2, 3, 10, 145, 512) == 3, "np 2, 145 slots: 8 rows x 10 fit, full drafts");
+    check(batch_drafts(4, 3, 10, 114, 512) == 1, "np 4, 114 slots: 2 rows per slot (80 routed) fit, 4 would not (160)");
+    check(batch_drafts(8, 3, 10, 120, 512) == 0, "np 8, 120 slots: one token per slot (80 routed) batched");
+    check(batch_drafts(8, 3, 10, 51, 512) == -1, "np 8, 51 slots: not even one token per slot fits: one at a time");
+    // np 8 (3090, 11-03): 122 slots on average but 86 in the smallest layer; sized by the average, 6 slots x 3 rows routed up
+    // to 180 experts there: waves path, 1-2 of 8 answers differed from np 1
+    check(batch_drafts(6, 3, 10, 86, 512) == 0 && 6 * (0 + 1) * 10 <= 86, "np 6, smallest layer 86: one token per slot");
+    check(batch_drafts(8, 3, 10, 86, 512) == 0, "np 8, smallest layer 86: 80 routed fit");
+    check(batch_drafts(4, 3, 10, 0, 512) == -1, "a lent bank (0 slots): one slot at a time");
+    check(batch_drafts(8, 5, 10, 512, 512) == 5, "every expert resident (GB10): the routed count does not limit");
+    check(batch_drafts(16, 5, 10, 512, 512) == 3, "rows stay within 64 (16 x 4)");
+    check(batch_drafts(1, 3, 10, 10, 512) == 3, "one sequence: its own drafts");
+    // CPU misses: miss-driven on discrete cards (any non-resident expert), the static eighth on small cards (F26)
+    {
+        int owned = 0; for (int e = 0; e < 512; ++e) owned += cpu_owned(3, e);
+        check(owned > 0 && owned < 512, "static partition: a fixed share of each layer");
+        int e_res = 0; while (e_res < 512 && !cpu_owned(3, e_res)) ++e_res;  // an owned expert
+        check(runs_on_cpu(3, e_res, true, true) && !runs_on_cpu(3, e_res, true, true, true), "an owned, resident expert: CPU when static, GPU when miss-driven");
+        int e_not = 0; while (e_not < 512 && cpu_owned(3, e_not)) ++e_not;      // a not-owned expert
+        check(!runs_on_cpu(3, e_not, false, true) && runs_on_cpu(3, e_not, false, true, true), "a not-owned miss: PCIe when static, CPU when miss-driven");
+        check(!runs_on_cpu(3, e_not, false, false, true), "no pool for this call: never the CPU");
+    }
+    // adaptive CPU miss budget: the pool takes only what it finishes inside the GPU's work for the call
+    check(next_cpu_budget(4, 210.0, 0) == 3, "the host waited 0.21 ms: one expert fewer");
+    check(next_cpu_budget(3, 2.0, 0) == 4 && next_cpu_budget(4, 2.0, 0) == 4, "finished in time: one more, capped");
+    check(next_cpu_budget(1, 50.0, 0) == 0, "still waiting at one: every miss over PCIe");
+    check(next_cpu_budget(0, 0.0, 10) == 0 && next_cpu_budget(0, 0.0, 64) == 1, "at zero: a probe call every 64 tries one again");
     // slot tiers: the floor scales with the slot total, never exceeds the target, never drops below 64 (F39: a 6-row verify
     // routes to at most 60 distinct experts, so the split path holds at every bank size)
     check(slot_floor(157, 144, 157) == 144 && slot_floor(247, 144, 157) == 226, "floor scales each layer's target like the total");
@@ -63,6 +127,22 @@ int main() {
     }
     check(one_sequence_drafts(3, false).drafts == 5 && one_sequence_drafts(3, false).adaptive, "no CPU pool: adaptive, up to 5");
     check(one_sequence_drafts(7, false).drafts == 7, "no CPU pool: a larger manifest count stays");
+    check(one_sequence_drafts(3, false, true).drafts == 7 && one_sequence_drafts(3, false, true).adaptive, "every expert resident: adaptive, up to 7");
+    check(one_sequence_drafts(3, true, true).drafts + 1 <= kCpuPoolRows, "CPU pool wins over residency");
+    {  // copy drafts
+        const std::vector<int> ctx = {5, 1, 2, 3, 9, 8, 7, 4, 1, 2, 3, 6, 6, 1, 2, 3};
+        check(copy_draft(ctx, {}, 3, 4) == std::vector<int>({6, 6, 1, 2}), "copy: the latest earlier match wins");
+        check(copy_draft(ctx, {}, 3, 1) == std::vector<int>({6}), "copy: at most max_len tokens");
+        const std::vector<int> fresh = {7, 7, 2, 3, 1};
+        check(copy_draft(fresh, {}, 3, 4).empty(), "copy: no earlier match, no draft");
+        const std::vector<int> old = {0, 7, 2, 3, 1, 4, 4, 4};
+        const std::vector<int> fresh2 = {9, 3, 1, 4};
+        check(copy_draft(fresh2, {&old}, 3, 3) == std::vector<int>({4, 4}), "copy: an earlier request continues it");
+        check(copy_draft(fresh2, {&old}, 3, 9) == std::vector<int>({4, 4}), "copy: ends at the history's end");
+        const std::vector<int> self = {3, 1, 4, 3, 1, 4};
+        check(copy_draft(self, {&old}, 3, 2) == std::vector<int>({3, 1}), "copy: the context itself before the history");
+        check(copy_draft({1, 2}, {&old}, 3, 2).empty(), "copy: a context shorter than n");
+    }
     check(one_sequence_drafts(0, false).drafts == 0 && !one_sequence_drafts(0, true).adaptive, "no MTP: no drafts");
 
     // CPU-owned experts: the device an expert runs on does not depend on residency (F26), owned experts stay out of banks
@@ -111,7 +191,22 @@ int main() {
     check(!warm_at_start("per_layer_token_embd.weight", 28.8e9, 24.7e9), "no start-up read of a 28.8 GB embedding on a 23 GiB host");
     // per-layer decode graphs: on unified memory (GB10 +5-6 %) and on PCIe cards before Blackwell (3090: off cost chat
     // 86.5 -> 83.9 tok/s, 32K 75.8 -> 73.9); off on Blackwell PCIe cards (5090: chat 128 -> 154 with graphs off)
+    {   // --prompt-cache: an agent's next turn = the last prompt (its tail re-rendered) + a new message
+        const std::vector<int> seq{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const int snap = snapshot_at(10, 0, 2);
+        check(snap == 8 && snapshot_at(10, 7, 2) == 0 && snapshot_at(3, 0, 2) == 0, "snapshot kTail before the end, only when the new part is >= 2 x kTail");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 99, 11}) == 8, "next turn: equal through the token at snap -> reuse [0, snap)");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8, 42, 10}) == 0, "the token at snap differs (MTP pair snap - 1): no reuse");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 0, 5, 6, 7, 8, 9}) == 0, "an earlier token differs: no reuse");
+        check(reusable_prefix(seq, snap, std::vector<uint32_t>{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "a prompt no longer than snap: no reuse");
+        check(reusable_prefix(seq, 0, std::vector<uint32_t>{1, 2, 3}) == 0, "no snapshot: no reuse");
+    }
+    check(qsa_key_ring_cells(true, 32768) == 32768 && qsa_key_ring_cells(false, 32768) == 0, "QSA key ring + host mirror on discrete GPUs only (GB10: the full array, no mirror)");
+    check(keep_prefill_buffers(true, size_t(26) << 30) && !keep_prefill_buffers(false, size_t(26) << 30), "GB10 keeps the engine's prefill buffers between requests; discrete cards hand them to the banks");
+    check(!keep_prefill_buffers(true, size_t(16) << 30), "GB10 below its 20 GB margin hands them back too");
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
+    check(preload_all_experts(512, 512) && preload_all_experts(600, 512) && !preload_all_experts(168, 512) && !preload_all_experts(512, 0),
+          "banks that hold every expert are filled at start-up; smaller banks keep the first-use fill");
     check(layer_graphs(false, 8) && layer_graphs(false, 9), "RTX 3090 / 4090 (sm_86 / sm_89) keep the decode graphs");
     check(!layer_graphs(false, 12), "RTX 5090 (sm_120, PCIe) launches the kernels directly");
     // the pinned residual buffer of a multi-chunk prefill: pinned at start-up when the host easily holds it (pinning it per

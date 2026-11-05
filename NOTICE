@@ -1,5 +1,9 @@
-TQLLM
-Copyright 2026 The TQLLM authors
+tqLLM
+Copyright 2026 David Y. Tan (turbo-tan), https://tqllm.com
+Original work by David Y. Tan, including the tqLLM engine, the TurboQuant (TQ) weight formats (TQ3_1S, TQ3_4S, TQ3,
+TQ4, TQ_XS to TQ_L), TqCache and TQueue. The TurboQuant method itself (arXiv 2504.19874, KV-cache and vector
+quantization) is Google Research's work; the TQ weight formats apply its transform-quantization ideas to model weights.
+Redistributions must keep this notice (Apache License 2.0, section 4(d)).
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -18,6 +22,10 @@ This product includes third-party code under its own licence:
   MIT License, Copyright (c) 2023-2026 The ggml authors (licenses/ggml-MIT.txt) and Copyright (c) 2025 Turboderp
   (licenses/exllamav3-MIT.txt).
 
+* third_party/ggml_mmq - the CUDA MMQ (quantised matrix-multiply) kernels from llama.cpp ggml/src/ggml-cuda (commit fb4b273);
+  the tile loaders of the codebook expert formats changed to read tqLLM's bank layout (third_party/ggml_mmq/NOTICE).
+  MIT License, Copyright (c) 2023-2026 The ggml authors. Licence: licenses/ggml-MIT.txt.
+
 * third_party/stb/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
@@ -31,5 +39,9 @@ Credits - work this project builds on or learned from (ideas and formats, no cod
 * TheTom (turboquant_plus): TurboQuant KV-cache ideas and the REFRACT distance-from-reference quality metric.
 * Avarok (TorQuant): learned rotations for quantisation.
 * Unsloth: the UD GGUF quantisations, which TQLLM runs natively and benchmarks against.
+* Strata (MIT, Niko1221 and the Strata contributors): the idea of launching MMQ directly per expert group from the
+  prefill path.
+* Splash (Apache-2.0): the staged prefill GEMM tile on Apple GPUs (weights dequantized once per threadgroup into a
+  double-buffered threadgroup stage, one matmul2d per simdgroup per step), reimplemented for the NAX 4-bit layout.
 
 The full credits table, including methods and comparison baselines, is in README.md (Credits).

@@ -2,7 +2,7 @@
 """BF16 DFlash2 drafter GGUF (tools/dflash2_hf_to_gguf.py) -> drafter GGUF with 4-bit affine group-64 NAX projections.
 
 Each projection is quantized as MLX's affine quantization rounds it (mx.quantize, group 64, 4 bits; the draft
-precision Splash runs) and packed in the M5 matrix-unit lane order (GGUF type 317, src/backends/mlx/nax_affine.cpp). The
+precision Splash runs) and packed in the M5 matrix-unit lane order (GGUF type 317, src/backends/metal/nax_affine.cpp). The
 selector codebooks, norms, convolution kernels and any matrix whose shape the kernel cannot tile stay as stored.
 """
 import argparse, os, sys

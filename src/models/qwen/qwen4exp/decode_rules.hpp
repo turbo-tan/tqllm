@@ -14,7 +14,7 @@ namespace tqllm::flashnext {
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
 // distinct experts fit the layer's slots: the waves path sums the down projection in another order, so choosing it by
 // the assignment count made a multi-sequence block (np 4: 4 x 4 rows = 160 assignments) differ from np 1 (F39).
-// old_rule = the pre-F39 choice (assignments vs slots), kept behind TQFN_VERIFY_WAVES for A/B.
+// old_rule = the pre-F39 choice (assignments vs slots), kept for its unit test.
 inline bool layer_takes_waves(const std::vector<int> & routed, int n, int topk, int slots, bool spec, bool old_rule = false) {
     if (!(n * topk > slots || (!spec && n > 1))) return false;
     if (!spec || n <= 1 || old_rule) return true;
@@ -26,10 +26,44 @@ inline bool layer_takes_waves(const std::vector<int> & routed, int n, int topk, 
 // working room: a long prompt borrows banks for its attention state and the refill after it stops short of the last
 // 512 MB (keeping its full-context state free cost 3090 chats ~16 slots per layer, 85.9 vs 95.7 tok/s at 140 vs 157).
 // Several sequences (--np) each keep their own full-context attention / recurrent / MTP state and working room: sized
-// for one, np 4 at 32K ran out of memory (F38).
+// for one, np 4 at 32K ran out of memory (F38). The banks are sized while the warm-up model holds a sequence's buffers,
+// so that one is in use already: counting it again left 3.35 GB idle at np 2 with both sequences decoding (3090, 11-02:
+// 131 slots / layer vs 160 at np 1, 77-79 % hits vs 91 %, aggregate 60-75 vs 80-95 tok/s).
+// Mapping page of a VMM K/V buffer of n bytes: 32 MB pages for long buffers (fewer host moves), but never more than the
+// buffer itself rounded to the granule: with a fixed 32 MB page every sequence mapped 26 x 32 MB = 832 MB of K/V however
+// short its request (3090 np 2, 11-03: the start-up probe measured 1212 MB per sequence and the keep starved the banks).
+inline size_t kv_page_bytes(size_t n, size_t granule) {
+    if (!granule) return n;
+    const size_t big = std::max(granule, (size_t(32) << 20) / granule * granule);
+    return std::min(big, (std::max<size_t>(n, 1) + granule - 1) / granule * granule);
+}
+// Next-layer prediction (expert prefetch) for a decode block: up to predict_n rows per sequence. Counting the rows of the
+// whole block switched prefetch off for every batched step (np 2: 2 x 4 rows > 4): 3090 np 2, 11-03, demand misses
+// 20-26 -> 75-105 GB per request, prefetch 14-19 -> 0-4.5 GB, aggregate below np 1. Placement only.
+// Predicted experts prefetched per token: ranks 1-3 first, then up to rank 6 over stale victims (one sequence, +3.3 % vs
+// all ten, 10-11). Several sequences in a step: ranks 1-3 only - the link is busy 67-78 % at np 2-4 and ~12 % of np 4's
+// copies were prefetches evicted unused (3090, 11-03).
+struct PrefetchRanks { int high, last; };
+// (2 best at np >= 4 measured slower: np 4 86 / 82 vs 89 / 84 tok/s, 067fa3d3)
+inline PrefetchRanks prefetch_ranks(int sequences) { return sequences > 1 ? PrefetchRanks{3, 3} : PrefetchRanks{3, 6}; }
+inline bool predicts(int rows, int predict_n, int sequences) { return rows <= predict_n * std::max(1, sequences); }
+// Drafts per slot for one batched verify step of `active` sequences: the most (up to `drafts`) whose rows fit the batch
+// (rows <= max_rows; rows x topk routed experts <= the fewest bank slots of any layer unless every expert is resident:
+// no layer may take the waves path, or the text differs from np 1). -1: not even one
+// token per slot fits, the slots step one at a time. With the full drafts only, np 8 on a 3090 (51 slots / layer)
+// stepped one slot at a time for 259 of 260 steps: 27 tok/s together against 84-100 at np 1 (11-03).
+inline int batch_drafts(int active, int drafts, int topk, int slots, int experts, int max_rows = 64) {
+    if (active < 2) return drafts;
+    for (int d = std::max(drafts, 0); d >= 0; --d) {
+        const int rows = active * (d + 1);
+        if (rows <= max_rows && (slots >= experts || rows * topk <= slots)) return d;
+    }
+    return -1;
+}
+// The measured state already holds a sequence's working buffers; the 256 MB working room is one shared margin, as at
+// np 1: a working room per sequence left 2.9 GB idle at np 8 with all 8 decoding (3090, 11-03: 120 slots / layer).
 inline size_t auto_keep_bytes(size_t sequences, size_t state, size_t reserve) {
-    if (sequences <= 1) return reserve + (size_t(256) << 20);
-    return sequences * state + reserve + sequences * (size_t(256) << 20);
+    return (std::max<size_t>(sequences, 1) - 1) * state + reserve + (size_t(256) << 20);
 }
 // The fewest slots a bank keeps: every distinct expert of the largest verify block (drafts + 1 rows of topk), rounded up
 // to 8 (5 drafts x top-10: 64; a small card's 3 drafts: 40), so layer_takes_waves keeps the split path at every bank size.
@@ -58,6 +92,35 @@ inline size_t regrow_keep_bytes(size_t base, size_t state_full, int state_tokens
 // cards before Blackwell (3090: chat 86.5 vs 83.9 tok/s without), but on a Blackwell PCIe card the re-capture costs more host
 // time than it saves (5090 + EPYC 7543: chat 154 without vs 128 with)
 inline bool layer_graphs(bool unified_memory, int cc_major) { return unified_memory || cc_major < 12; }
+
+// Between requests the engine-wide prefill buffers (staging halves, dense fp16 pool, QSA / GDN scratch) and the larger
+// prefill arena are handed back so a discrete card's expert banks can use the memory. On unified memory
+// (GB10: every expert resident, ~25 GB free in prefill) they stay: freeing and re-allocating them cost each request
+// ~0.1-0.3 s (the 3.4K request's arena resize alone 0.12 s). Only while 20 GB stay free (the GB10 margin: a .44 brain at
+// np 4 x 131K had 16.3 GB free with them kept after a 24K prompt; below the margin they are handed back as on a 3090).
+inline bool keep_prefill_buffers(bool unified_memory, size_t free_bytes) { return unified_memory && free_bytes >= (size_t(20) << 30); }
+
+// A layer whose bank holds every expert (a GB10: 512 slots for 512 experts) loads them all at start-up: filled on first use
+// instead, every expert a prompt touched for the first time was a miss inside that prompt's prefill (11-02, .55: the first
+// requests paid ~1 s of loads per layer, later ones still up to 85 loads in a layer). A bank smaller than the layer keeps
+// its first-use fill (which experts to hold is the routing's call).
+inline bool preload_all_experts(int bank_slots, int experts) { return experts > 0 && bank_slots >= experts; }
+
+// QSA raw indexer keys: a ring of the newest cells plus a pinned host mirror on discrete GPUs (~0.9 GB of VRAM back at
+// 128K); on unified memory (GB10) pinned host memory is the same memory, so the full array stays (no mirror, no D2H per
+// append). Returns the ring's cells (0: the default ring).
+inline int qsa_key_ring_cells(bool unified_memory, int max_cells) { return unified_memory ? max_cells : 0; }
+
+// --prompt-cache: prompt tokens a slot reuses. Its last prompt `seq` left its state at `snap` (kTail before that prompt's
+// end); a new prompt reuses [0, snap) when it is longer than snap and equals seq on [0, snap] (the token at snap pairs with
+// residual snap - 1 in the MTP KV). Anything else prefills from 0.
+template<class A, class B> inline int reusable_prefix(const A & seq, int snap, const B & prompt) {
+    if (snap <= 0 || prompt.size() <= size_t(snap) || seq.size() <= size_t(snap)) return 0;
+    for (size_t i = 0; i <= size_t(snap); ++i) if (int64_t(seq[i]) != int64_t(prompt[i])) return 0;
+    return snap;
+}
+// where the next prompt's state is kept: kTail before this prompt's end, when the new part is at least 2 x kTail
+inline int snapshot_at(int prompt, int reused, int tail) { return prompt >= reused + 2 * tail ? prompt - tail : 0; }
 
 // The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
 // easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt
@@ -95,17 +158,38 @@ inline std::vector<int> tail_skip_targets(const std::vector<int> & routed, int t
 // Adaptive draft length: draft again only while the last draft's top probability reaches tau (tau <= 0: fixed count).
 inline bool keep_drafting(float tau, float last_draft_probability) { return !(tau > 0.f && last_draft_probability < tau); }
 
+// Copy drafts: the continuation (up to max_len tokens) after the latest earlier occurrence of the context's last n
+// tokens, searched in the context itself, then in earlier requests (latest first); empty when none. Exact: the verify
+// keeps only what the model itself emits, so only the tokens per step change.
+inline std::vector<int> copy_draft(const std::vector<int> & ctx, const std::vector<const std::vector<int> *> & history, int n, int max_len) {
+    if (n <= 0 || max_len <= 0 || int(ctx.size()) < n) return {};
+    const int * tail = ctx.data() + ctx.size() - size_t(n);
+    auto search = [&](const std::vector<int> & s, int last_start) -> std::vector<int> {
+        for (int i = last_start; i >= 0; --i) {
+            if (!std::equal(tail, tail + n, s.begin() + i)) continue;
+            const int b = i + n, e = std::min(int(s.size()), b + max_len);
+            if (b < e) return std::vector<int>(s.begin() + b, s.begin() + e);
+        }
+        return {};
+    };
+    if (auto d = search(ctx, int(ctx.size()) - n - 1); !d.empty()) return d;
+    for (const auto * h : history) if (h && int(h->size()) > n) if (auto d = search(*h, int(h->size()) - n - 1); !d.empty()) return d;
+    return {};
+}
+
 // Rows a decode layer call may have for the CPU expert pool to serve its misses (its pinned input / output buffers).
 constexpr int kCpuPoolRows = 4;
 
 // One sequence's draft count. Without a CPU expert pool: adaptive length, up to 5 drafts (3090 chat +0.6 %, 32K +3 %).
 // With one (small cards): a verify block must fit the pool's rows, or every miss of the step goes over PCIe instead
 // (12 GB 3090: 5 drafts 44.8 / 44.6 tok/s, 3 drafts 49-50).
+// Every expert resident (GB10): a longer block costs no copies, so up to 7 drafts (an 8-row block still runs in the layer
+// graphs); GB10 np 1 at 5 drafts ended 27 of 123 steps with every draft kept.
 struct DraftPlan { int drafts; bool adaptive; };
-inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool) {
+inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool, bool every_expert_resident = false) {
     if (manifest_drafts < 1) return {manifest_drafts, false};
     if (cpu_pool) return {std::min(manifest_drafts, kCpuPoolRows - 1), false};
-    return {std::max(manifest_drafts, 5), true};
+    return {std::max(manifest_drafts, every_expert_resident ? 7 : 5), true};
 }
 
 // CPU-owned experts (small cards, F26): a fixed eighth of each layer's experts, a pure function of (layer, expert), runs
@@ -114,9 +198,29 @@ inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool) {
 // depend on what is resident, and neither does the greedy text (12 GB: the pool computing whatever missed made the same
 // 16K prompt twice differ). Owned experts in the banks only took slots decode never used (ec0cf00: -2 tok/s).
 inline bool cpu_owned(int layer, int expert) { return (uint32_t(expert) * 2654435761u + uint32_t(layer) * 40503u) >> 29 == 0; }
-inline bool runs_on_cpu(int layer, int expert, bool resident, bool pool_serves_call) {
-    (void) resident;
-    return pool_serves_call && cpu_owned(layer, expert);
+// Miss-driven (discrete cards, --exact off): whatever is not resident runs on the CPU pool, up to cpu_miss_budget distinct
+// experts per layer call, so its bytes never cross PCIe (Strata: ~93 % of misses on the CPU). The static partition above
+// made the pool compute a fixed eighth of all experts, hot ones included, while the other misses still went over PCIe:
+// 3090 np 1, 14 threads, 11-03: 71-86 vs 89-105 tok/s without the pool, 40 vs 45 GB of copies per 384 tokens. Which
+// device computes an expert then depends on residency: not reproducible run to run (F26), acceptable only off exact.
+inline bool runs_on_cpu(int layer, int expert, bool resident, bool pool_serves_call, bool miss_driven = false) {
+    if (!pool_serves_call) return false;
+    return miss_driven ? !resident : cpu_owned(layer, expert);
+}
+// Distinct missed experts per decode layer call the pool takes (the rest are PCIe misses): what it finishes while the GPU
+// runs the hits. 5950X, 14 threads: ~0.1 ms per expert (tests/cpu_miss_perf); a 3090 decode layer call ~0.55 ms (np 1,
+// 4-row verify, ~26 ms per step over 48 layers): 4 experts.
+constexpr int kCpuMissBudget = 4;
+// The next layer call's CPU budget from how long the host just waited for the pool: the CPU is only worth its misses while
+// it finishes inside the GPU's own work for the call (3090 np 1, 11-03: a fixed 4 left the host waiting 0.21 ms per call,
+// 75-86 vs 86-102 tok/s without the pool, though PCIe demand copies fell from ~25 to 10.6 GB). One expert less after a
+// wait over waited_us, one more after a call it finished in time; 0 sends every miss over PCIe until a probe call
+// (every probe_every calls) tries one expert again.
+inline int next_cpu_budget(int budget, double waited_us, int calls_at_zero, int max_budget = kCpuMissBudget,
+                           double over_us = 20.0, int probe_every = 64) {
+    if (budget <= 0) return calls_at_zero >= probe_every ? 1 : 0;
+    if (waited_us > over_us) return budget - 1;
+    return std::min(max_budget, budget + 1);
 }
 // The experts a layer's bank is built with: the most routed first (ties by id), at most cap, owned experts left out when
 // a CPU pool computes them.

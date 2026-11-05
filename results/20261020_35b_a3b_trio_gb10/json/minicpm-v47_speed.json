@@ -1,6 +1,6 @@
 {
   "model": "minicpm-v47",
-  "gguf": "/mnt/data2t/gguf/minicpm-v47-35b-a3b/tq3_4s/MiniCPM-V-4_7-35B-A3B-TQ3_4S.gguf",
+  "gguf": "MiniCPM-V-4_7-35B-A3B-TQ3_4S.gguf",
   "port": 18131,
   "reasoning": "off",
   "context": 40960,

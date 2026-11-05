@@ -150,6 +150,10 @@ int main() {
     expect(hc_row_scales_only(512, true, true), "BF16 mixer, long chunk: row scales only");
     expect(!hc_row_scales_only(64, true, true), "short chunk keeps the fp32 rows");
     expect(!hc_row_scales_only(512, false, true), "IQ4_XS hc down needs the fp32 rows");
+    expect(hc_row_scales_h(512, true, true, true), "Q8_0 mixers, long chunk: row scales + FP16 image");
+    expect(!hc_row_scales_h(64, true, true, true) && !hc_row_scales_h(512, true, false, true), "short chunk, or an inject that is neither quantised nor BF16, keeps the plain path");
+    expect(!hc_row_scales_h(512, false, true, true), "BF16 down mixers take the BF16 row-scale path instead");
+    expect(!hc_row_scales_h(512, true, true, false), "CPU-side projections need the fp32 rows");
     expect(!hc_row_scales_only(512, true, false), "non-BF16 inject needs the fp32 rows");
 
     // 8. expert slots from free memory (manifest slots=auto). RTX 3090, Flash-Next IQ4_XS on 10-18: one slot of every
@@ -165,6 +169,12 @@ int main() {
         expect(auto_expert_slots(free_b, keep, 0, 512) == 512, "no per-slot size known: every expert");
     }
 
+    {   // BF16 wide rows beside res_keep: the chunk's residual term grows by half (16K x 2560 x 4: 671 MB -> 1007 MB)
+        PrefillShape s = shape(); const auto plain = prefill_chunk_bytes(s, tuning(16384), 16384);
+        s.wide_bf16 = true; const auto b16 = prefill_chunk_bytes(s, tuning(16384), 16384);
+        expect(plain.residual == size_t(16384) * 2560 * 4 * 4 && b16.residual == plain.residual / 2 * 3, "wide_bf16 residual bytes");
+        expect(b16.total() == plain.total() + plain.residual / 2, "wide_bf16 adds only the BF16 rows");
+    }
     std::printf(fails ? "PREFILL_PLAN FAIL\n" : "PREFILL_PLAN PASS\n");
     return fails ? 1 : 0;
 }

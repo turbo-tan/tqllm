@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include "moe_kernels.cuh"
+#include "formats/weight/quant_kernels.cuh"
 #include <stdexcept>
 #include <math_constants.h>
 // TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
@@ -437,7 +438,7 @@ void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream
         else param_launch<kParamCopyMax>(src, len, d, stream);
     }
 }
-// Expert pruning (TQFN_KEEP_MAP): logits[t][e] += mask[e] for e < experts (0 kept, -inf pruned); the shared-expert column stays.
+// Expert pruning (TQLLM_DEBUG=keep_map): logits[t][e] += mask[e] for e < experts (0 kept, -inf pruned); the shared-expert column stays.
 __global__ void logits_mask_k(float * logits, const float * mask, int n, int ld, int experts) {
     const int t = blockIdx.x;
     for (int e = threadIdx.x; e < experts; e += blockDim.x) logits[size_t(t) * ld + e] += mask[e];
@@ -446,3 +447,48 @@ void logits_mask(float * logits, const float * mask, int n, int ld, int experts,
     if (n > 0) logits_mask_k<<<unsigned(n), 256, 0, stream>>>(logits, mask, n, ld, experts);
 }
 }  // namespace tqllm_cuda
+
+namespace {
+__device__ unsigned long long g_dedup_stats[3];  // calls, groups, distinct experts (TQLLM_DEBUG=mem LEDGER)
+__global__ void dedup_maps_k(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups) {
+    constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
+    __shared__ int slot[1024]; __shared__ unsigned char opens[1024];
+    const int a = threadIdx.x;
+    for (int i = a; i < groups * DS; i += blockDim.x) { if (gu) gu[i] = -1; if (dn) dn[i] = -1; }
+    const int s = a < count && ids[a] >= 0 ? slot_of[ids[a]] : -1;
+    if (a < count) { slot[a] = s; if (slots) slots[a] = s; }
+    __syncthreads();
+    int rank = 0, total = 0;
+    if (a < count && s >= 0) for (int b = 0; b < count; ++b) if (slot[b] == s) { rank += b < a; ++total; }
+    if (a < count) opens[a] = s >= 0 && rank % DC == 0;
+    __syncthreads();
+    // LEDGER counters: block-wide counts (a serial count in one thread was O(count^2): np 8 lost 15 % of its decode)
+    const int groups_here = __syncthreads_count(a < count && opens[a]);
+    const int distinct = __syncthreads_count(a < count && s >= 0 && rank == 0);
+    if (a == 0) { atomicAdd(&g_dedup_stats[0], 1ull); atomicAdd(&g_dedup_stats[1], (unsigned long long) groups_here); atomicAdd(&g_dedup_stats[2], (unsigned long long) distinct); }
+    if (a >= count || s < 0) return;
+    const int chunk = rank / DC, col = rank % DC;
+    int opener = a;  // the assignment that opened this one's group: the (chunk * DC)-th of its slot
+    for (int b = 0, seen = 0; b <= a; ++b) if (slot[b] == s) { if (seen == chunk * DC) { opener = b; break; } ++seen; }
+    int g = 0;
+    for (int b = 0; b < opener; ++b) g += opens[b];
+    const int cols = min(DC, total - chunk * DC);
+    for (int part = 0; part < 2; ++part) {
+        int * e = (part ? dn : gu);
+        if (!e) continue;
+        e += g * DS;
+        if (col == 0) { e[0] = s; e[1] = cols; }
+        e[2 + col] = part ? a : a / topk; e[2 + DC + col] = a;
+    }
+}
+}
+namespace tqllm_cuda {
+void moe_dedup_stats(unsigned long long out[3]) {
+    cudaMemcpyFromSymbol(out, g_dedup_stats, sizeof(unsigned long long) * 3);
+}
+void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
+                    cudaStream_t stream) {
+    if (!ids || !slot_of || count <= 0 || count > 1024 || topk <= 0 || groups < count) throw std::invalid_argument("moe_dedup_maps: invalid shape");
+    dedup_maps_k<<<1, (count + 31) / 32 * 32, 0, stream>>>(ids, slot_of, count, topk, slots, gu, dn, groups);
+}
+}

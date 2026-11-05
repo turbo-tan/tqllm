@@ -15,6 +15,9 @@ void hc_combine_norm(const float * residual, const float * block, const float * 
 void hc_norm(const float * residual, const float * gamma, float * normalized,
               int hidden, int streams, int tokens, float epsilon, cudaStream_t);
 void hc_low_silu(float * low_rank, int count, int streams, cudaStream_t);
+// rows [n][ld] of the stacked down + inject GEMM -> FP16 silu(low / streams) [n][low] (= hc_low_silu then the conversion)
+// and inject [n][streams] (columns low .. low + streams)
+void hc_low_split_h(const float * stacked, int ld, int low, int streams, __half * low_h, float * inject, int n, cudaStream_t);
 // _bf16 variants: the same results plus their BF16 images (bit-identical to f32_to_bf16 of the f32 outputs)
 void hc_norm_bf16(const float * residual, const float * gamma, float * normalized, __nv_bfloat16 * normalized_bf16,
                   int hidden, int streams, int tokens, float eps, cudaStream_t);
@@ -23,8 +26,31 @@ void hc_low_silu_bf16(float * low_rank, __nv_bfloat16 * low_rank_bf16, int count
 // value from (residual, rs, gamma) exactly as hc_norm does, so hc_mix_rs == hc_mix(hc_norm(...)) bit for bit
 void hc_norm_rs_bf16(const float * residual, const float * gamma, float * rs, __nv_bfloat16 * normalized_bf16,
                      int hidden, int streams, int tokens, float eps, cudaStream_t);
+// the same with an FP16 image (mixer weights in a quantised format read FP16 activations)
+// normalized_bf16 (optional): also the BF16 image, for a BF16 projection beside the quantised one (hcq8: BF16 inject)
+void hc_norm_rs_h(const float * residual, const float * gamma, float * rs, __half * normalized_h, int h, int c, int n, float eps,
+                  cudaStream_t stream, __nv_bfloat16 * normalized_bf16 = nullptr);
+void hc_combine_norm_rs_h(const float * residual, const float * block_out, const float * inject_logits, float * out, const float * gamma,
+                          float * rs, __half * normalized_h, int h, int c, int n, float eps, cudaStream_t stream,
+                          __nv_bfloat16 * normalized_bf16 = nullptr);
+// BF16 wide rows (the layer-major prefill's residual storage): read as fp32, the combined rows written rounded to BF16, their
+// sum of squares and image taken from the rounded values; the fp32-input form writes BF16 rows from fp32 ones (after a PLE)
+void hc_norm_rs_h(const __nv_bfloat16 * residual, const float * gamma, float * rs, __half * normalized_h, int h, int c, int n, float eps,
+                  cudaStream_t stream, __nv_bfloat16 * normalized_bf16 = nullptr);
+void hc_combine_norm_rs_h(const float * residual, const float * block_out, const float * inject_logits, __nv_bfloat16 * out, const float * gamma,
+                          float * rs, __half * normalized_h, int h, int c, int n, float eps, cudaStream_t stream,
+                          __nv_bfloat16 * normalized_bf16 = nullptr);
+void hc_combine_norm_rs_h(const __nv_bfloat16 * residual, const float * block_out, const float * inject_logits, __nv_bfloat16 * out, const float * gamma,
+                          float * rs, __half * normalized_h, int h, int c, int n, float eps, cudaStream_t stream,
+                          __nv_bfloat16 * normalized_bf16 = nullptr);
+void wide_unpack(const __nv_bfloat16 * rows, float * out, int64_t count, cudaStream_t);
+void wide_pack(const float * rows, __nv_bfloat16 * out, int64_t count, cudaStream_t);
 void hc_mix_rs(const float * residual, const float * rs, const float * gamma, const float * gate_logits, float * mixed,
                int hidden, int streams, int tokens, cudaStream_t);
+void hc_mix_rs_h(const float * residual, const float * rs, const float * gamma, const __half * gate_logits, float * mixed,
+                 int hidden, int streams, int tokens, cudaStream_t, __half * mixed_h = nullptr, __nv_bfloat16 * mixed_bf16 = nullptr);  // FP16 gate logits; mixed_h: + FP16 image
+void hc_mix_rs_h(const __nv_bfloat16 * residual, const float * rs, const float * gamma, const __half * gate_logits, float * mixed,
+                 int hidden, int streams, int tokens, cudaStream_t, __half * mixed_h = nullptr, __nv_bfloat16 * mixed_bf16 = nullptr);
 void hc_mix(const float * normalized, const float * gate_logits, float * mixed,
              int hidden, int streams, int tokens, cudaStream_t);
 // hc_combine followed by hc_norm_rs_bf16 in one kernel (out may alias residual): bit-identical to the pair
@@ -48,10 +74,19 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
             const float * dt_bias, const float * state, float * next_state, float * out,
             int kheads, int vheads, int dim, int tokens, float epsilon, cudaStream_t);
 // Same as fn_gdn, also writing the state after every token to states[t][vheads][value][key] (speculative rollback).
-// Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default TQFN_GDN_CHUNK_MIN or 64). Tests.
+// Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default 64). Tests.
 void fn_gdn_set_chunk_min(int n);
 void fn_gdn_set_kh(int on);
+// the per-token kernel's value columns per warp, 2 / 4 / 8 (tests; 0: by device)
+void fn_gdn_set_vpw(int v);
 void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);
+// the FP16 image of fn_gated_rms / fn_attention_gate's output (the input of a quantised projection; same values)
+void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t);
+void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t);
+// ple_conv on FP16 input rows (the GDN qkv projection's FP16 output in prefill); history and output stay fp32
+void ple_conv(const __half * x, const float * history, const float * kernel, float * out, float * next_history,
+              int channels, int tokens, int taps, int dilation, cudaStream_t);
+void fn_attention_gate_h(const float * in, const float * qg, __half * out, int heads, int dim, int tokens, cudaStream_t);
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
                   int heads, int dim, int tokens, float epsilon, cudaStream_t);
 // Text-only positions. An interleaved query input stores [q|gate] per head.
@@ -69,8 +104,9 @@ void fn_attention_gate(float * out, const float * query_gate, int heads, int dim
 // out[t] = sum_k w[t][k] * routed[t][k] + shared_w[t] * shared[t].
 // Single-token BF16 GEMV: y[r] = sum_c W[r][c] * bf16(x[c]), F32 accumulate. One warp per row; cols % 8 == 0.
 void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, cudaStream_t);
-// tokens columns at once ([tokens][cols] -> [tokens][rows]); weights read once per 4 tokens, per-token sums as fn_gemv_bf16.
-void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t);
+// tokens columns at once ([tokens][cols] -> [tokens][rows]); per-token sums as fn_gemv_bf16. rows_per_block: rows of one
+// weight block per CUDA block (x read once per block); 0 = the dispatch's rule, 1 = one row per block.
+void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
 // Prefill chunks on the block-per-row layout (rows <= 16, or rows <= 1024 with cols >= 1024): sums bit-identical to
 // fn_gemv_bf16_tokens, x read once per 8 rows; output row t at y + t * ldy.
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
@@ -78,16 +114,22 @@ void fn_round_bf16(const float * x, __nv_bfloat16 * xb, int64_t n, cudaStream_t)
 void fn_softmax_peak(const float * x, int n, float * out, cudaStream_t);
 void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 // fn_gemv_bf16_tokens on its block-per-row path with output row t at y + t * ldy (same sums, bit-identical).
-void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
+void fn_gemv_bf16_tokens_ld(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t, int rows_per_block = 0);
 constexpr int kGemvSegs = 4;
 struct GemvSegs { int n = 0; int start[kGemvSegs + 1] = {}; const __nv_bfloat16 * w[kGemvSegs] = {}; float * y[kGemvSegs] = {}; int64_t ld[kGemvSegs] = {}; };
 // Only for row-blocks that fn_gemv_bf16_tokens runs on its block-per-row path (rows <= 16, or rows <= 1024 with cols >= 1024).
-void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t);
+// rows_per_block as in fn_gemv_bf16_tokens: R rows of a segment per block, bit-identical.
+void fn_gemv_bf16_segments(const GemvSegs & g, const float * x, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
 void fn_swiglu_bf16_h(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, int64_t count, cudaStream_t);
 // fn_swiglu_bf16_h on the assignments listed per slot (counts[slots], groups[slots][capacity] of assignment indices, rows of ff)
 void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, const int * counts, const int * groups,
                              int slots, int capacity, int ff, cudaStream_t);
 void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t);
+// fn_moe_combine + hc_combine in place over `wide` ([n][c][h]) in one pass (same values)
+void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * inject,
+                       float * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
+void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * inject,
+                       __nv_bfloat16 * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
 void fn_moe_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
                     float * out, int hidden, int topk, int tokens, cudaStream_t);
 
@@ -101,9 +143,13 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
 
 // Raw indexer keys stay on device. Completed blocks are updated only when new
 // keys make them complete; truncate invalidates later blocks for speculative rollback.
+// Raw keys are read only while their block is being pooled, so they live in a ring of the newest cells (one append + two
+// blocks + a rollback margin, grown on a larger append): 10-28 the full-context FP32 copy took ~1 GB of a 128K decode's VRAM.
+// A pinned host mirror of every appended key serves a truncate further back than the ring (same values, any rollback).
 class QsaRawKeyCache {
 public:
-    QsaRawKeyCache(int max_cells, int ratio, int dim);
+    // ring: initial raw-key cells (0: min(max_cells, 4096 + 2 x ratio + kRollback))
+    QsaRawKeyCache(int max_cells, int ratio, int dim, int ring = 0);
     ~QsaRawKeyCache();
     QsaRawKeyCache(const QsaRawKeyCache &) = delete;
     QsaRawKeyCache & operator=(const QsaRawKeyCache &) = delete;
@@ -116,9 +162,14 @@ public:
     const float * pooled() const { return pooled_; }
     const float * normalized() const { return normalized_; }
 
+    int ring() const { return ring_; }
+    static constexpr int kRollback = 64;  // cells a truncate may go back (a verify block is <= 8)
+
 private:
-    int max_cells_, ratio_, dim_, size_ = 0;
+    void reserve_ring(int cells, cudaStream_t stream);
+    int max_cells_, ratio_, dim_, size_ = 0, ring_ = 0;
     float * raw_ = nullptr;
+    float * host_raw_ = nullptr;  // pinned, max_cells x dim
     float * pooled_ = nullptr;
     float * normalized_ = nullptr;
     int normalized_blocks_ = 0;
@@ -170,7 +221,7 @@ public:
     int32_t * positions = nullptr;  // [max_queries][width_cap]
     uint8_t * valid = nullptr;
     // lean: only the top-k path can run (every query needs <= 1024 blocks and the context has >= 1024): keys holds 32-bit
-    // score bits and sorted 1024 keys per query, no sort temp; full() switches to the full-sort buffers (TQFN_QSA_CHECK)
+    // score bits and sorted 1024 keys per query, no sort temp; full() switches to the full-sort buffers (TQLLM_DEBUG=qsa_check)
     bool lean = false;
     void full();
 };

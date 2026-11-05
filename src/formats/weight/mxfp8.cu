@@ -1,6 +1,8 @@
 // MXFP8 matrices (OCP microscaling FP8: E4M3 values, one E8M0 scale per 32 along a row), as the original MiniMax /
 // DSpark checkpoints store their projections. Row-major rows of k E4M3 bytes followed by that row's k / 32 scale bytes,
-// so stacked matrices and row ranges are plain byte ranges. One warp per row, FP32 accumulation, up to 8 columns.
+// so stacked matrices and row ranges are plain byte ranges. One warp per row, FP32 accumulation, up to 16 columns: each
+// column keeps its own accumulator, the same per-lane walk and the same warp tree, so a column's terms and their order do
+// not depend on how many columns the launch holds.
 #include "quant_kernels.cuh"
 
 #include <cuda_fp8.h>
@@ -70,7 +72,15 @@ void launch(const uint8_t * w, const __half * x, void * y, int rows, int k, int 
         case 6: mxfp8_matvec_k<6, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
         case 7: mxfp8_matvec_k<7, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
         case 8: mxfp8_matvec_k<8, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
-        default: throw std::invalid_argument("mxfp8_matvec: 1..8 columns");
+        case 9: mxfp8_matvec_k<9, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 10: mxfp8_matvec_k<10, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 11: mxfp8_matvec_k<11, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 12: mxfp8_matvec_k<12, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 13: mxfp8_matvec_k<13, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 14: mxfp8_matvec_k<14, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 15: mxfp8_matvec_k<15, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        case 16: mxfp8_matvec_k<16, F32><<<grid, block, 0, s>>>(w, x, y, rows, k, ldy); break;
+        default: throw std::invalid_argument("mxfp8_matvec: 1..16 columns");
     }
 }
 }  // namespace

@@ -2,6 +2,7 @@
 #include "gguf.hpp"
 #include <cstddef>
 #include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -11,7 +12,9 @@ struct GgufBytes { const char * data = nullptr; size_t size = 0; };
 // Views remain valid until their owning mapping is destroyed. The tensor bytes are immutable.
 class MappedGguf {
     struct Mapping;
+    struct Folder;
     std::unique_ptr<Mapping> mapping_;
+    std::unique_ptr<Folder> folder_;  // a Hugging Face checkpoint folder: its shards' mappings, the tensors built on read
     GgufFile file_;
     GgufBytes checked(const GgufTensor &) const;
     struct Raw {};
@@ -28,6 +31,9 @@ public:
     const GgufFile & file() const { return file_; }
     GgufBytes tensor(const std::string & name) const;
     GgufBytes expert(const std::string & name, uint64_t index) const;
+    // One expert's bytes; for a folder's expert built on read (MLX 4-bit -> Q4_1), also the buffer that owns them.
+    std::pair<GgufBytes, std::shared_ptr<const void>> expert_owned(const std::string & name, uint64_t index) const;
+    bool folder() const { return bool(folder_); }
     // Drop this file's pages from memory; views stay valid and fault back in on access.
     void release_pages() const;
     // Drop one tensor's pages (whole pages inside it); its view stays valid and faults back in on access.

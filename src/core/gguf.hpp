@@ -11,7 +11,8 @@ namespace tqllm {
 // Numeric GGUF type ids follow ggml exactly. Keep entries in id order so a new format is easy to
 // add and to diff. TQLLM-only formats start at 300, clear of ggml's ids.
 enum GgmlType : uint32_t {
-    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
+    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q8_0 = 8,
+    GGML_Q5_0 = 6, GGML_Q5_1 = 7,  // vision projectors (Q5_K-MIX mmproj files mix Q5_0 into the ViT)
     GGML_Q2_K = 10,      // MoE expert tensors (GLM-5.3-Flash ffn_down_exps)
     GGML_Q3_K = 11,
     GGML_Q4_K = 12,
@@ -50,7 +51,13 @@ struct GgufTensor {
     std::vector<char> header;
     std::vector<GgufTensor> parts;  // each part: its own header (if any), then `bytes` at `offset` of its file
     std::function<std::vector<char>()> make;  // a tensor built on read (EXL3 folders: norms 1 + w, MXFP8 -> BF16)
-    bool built() const { return make || !parts.empty() || !header.empty(); }
+    // Hugging Face folders whose tensors are built on read, where reading the whole tensor would cost too much:
+    // one slice of the last dimension (an expert of a routed bank), rows dequantised to F32 (a per-layer token
+    // embedding read 16 rows a token), and one read of the stored bytes so the page cache holds them (bytes read).
+    std::function<std::vector<char>(uint64_t)> make_slice;
+    std::function<void(const std::vector<uint64_t> &, float *)> gather;
+    std::function<size_t(int)> warm;
+    bool built() const { return make || make_slice || gather || !parts.empty() || !header.empty(); }
 };
 
 // Block layout of a quantised GGUF type: `elems` weights per block, `bytes` per block.
@@ -58,6 +65,8 @@ struct GgufTensor {
 // computation in the loader (tensor_bytes and the MoE expert slicer both use it) so a block
 // size can never disagree between the two.
 bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes);
+// a plugin format's block (include/tqllm/plugin.h ABI 2): elems values in bytes bytes; built-in types cannot be redefined
+void register_tensor_type(uint32_t type, uint64_t elems, uint64_t bytes);
 
 // One expert slice of a 3-D MoE expert tensor [cols, rows, n_experts].
 //

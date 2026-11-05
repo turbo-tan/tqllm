@@ -1,6 +1,8 @@
 #include "fit_context.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <memory>
+#include <stdexcept>
 
 int main() {
     const size_t GB = 1000000000ull, MB = size_t(1) << 20;
@@ -135,6 +137,108 @@ int main() {
         const auto cap = tqllm::moe_auto_place(q5, 0, 40000, -1);
         expect("cache capped at 1536 MiB", cap.cache_mb == 1536 && cap.host_mb == 41536);
         expect("no host experts: an explicit cache is dropped", tqllm::moe_auto_place(q5, 0, 0, 800).cache_mb == 0);
+    }
+    {   // Qwopus Q4_K_M, 3090, 131072, no drafter (11-02): the load with all KV on host left 5.60 GB, the estimate from it put
+        // every position back on the GPU, that load ran out of memory and the fit halved the context twice (32768).
+        // Device model: free = 5.60 GB - (ctx - host) x the real per-position cost, which the 0.75 GB / 131072 estimate undershoots.
+        const uint32_t ctx = 131072;
+        const size_t margin = 810 * MB, real_tb = 46000;  // 6.0 GB for all 131072 positions on the device: out of memory
+        auto free_at = [&](uint32_t host) -> long long { return (long long)(5.60 * GB) - (long long)(ctx - host) * (long long)real_tb; };
+        expect("unmeasured out of memory: measure with all KV on host",
+               tqllm::fit_host_next(ctx, 0, false, 0, margin, 0, false, 0, 0, 0) == ctx);
+        expect("measured, then out of memory: try a tail, do not give up context",
+               tqllm::fit_host_next(ctx, 0, false, 0, margin, 0, true, ctx, 0, 0) > 0);
+        // the step before 11-02: once measured, an out-of-memory load had no host step left, so the context was halved
+        auto old_next = [&](uint32_t c, uint32_t h, bool loaded, size_t fr, size_t tb, bool measured, int t, size_t pf) {
+            if (t > 0 && !tqllm::fit_host_again(t, fr, pf, h, c)) return h;
+            if (!loaded || !tb) return measured ? h : c;
+            return tqllm::fit_host_tokens(c, h, fr, margin, tb, 1024, measured);
+        };
+        // replays the fit's host step from the measuring load's all-on-device estimate; true when a tail meets the margin
+        auto replay = [&](auto && next, auto && free_fn, uint32_t & host, int & loads) {
+            host = 0, loads = 0;
+            int tries = 0;
+            size_t prev = 0;
+            while (loads < 12) {
+                ++loads;
+                const long long fr = free_fn(host);
+                if (fr >= (long long)margin) return true;
+                const bool oom = fr < 0;
+                const uint32_t h = next(host, !oom, oom ? 0 : size_t(fr), oom ? 0 : size_t(32768), tries, prev);
+                if (h <= host) return false;  // the fit halves the context here
+                prev = oom ? 0 : size_t(fr), host = h, ++tries;
+            }
+            return false;
+        };
+        auto new_step = [&](uint32_t h, bool l, size_t fr, size_t tb, int t, size_t pf) {
+            return tqllm::fit_host_next(ctx, h, l, fr, margin, tb, true, ctx, t, pf);
+        };
+        auto old_step = [&](uint32_t h, bool l, size_t fr, size_t tb, int t, size_t pf) { return old_next(ctx, h, l, fr, tb, true, t, pf); };
+        uint32_t host = 0;
+        int loads = 0;
+        expect("Qwopus case, old step: gives up the context (the bug)", !replay(old_step, free_at, host, loads));
+        const bool fit = replay(new_step, free_at, host, loads);
+        expect("Qwopus case: a host tail meets the margin at the full context", fit && host < ctx && free_at(host) >= (long long)margin);
+        expect("Qwopus case: bounded reloads", loads <= 8);
+        // heavier per-position cost: the first bisected tail still loads short, so the estimate path (capped at the
+        // known-good tail) has to finish the fit
+        auto free_heavy = [&](uint32_t h) -> long long { return (long long)(5.60 * GB) - (long long)(ctx - h) * 80000; };
+        expect("heavy case, old step: gives up the context", !replay(old_step, free_heavy, host, loads));
+        const bool fit_heavy = replay(new_step, free_heavy, host, loads);
+        expect("heavy case: refined past the first bisection to a fitting tail",
+               fit_heavy && host > 65536 && host < ctx && free_heavy(host) >= (long long)margin);
+        expect("heavy case: bounded reloads", loads <= 8);
+        // bisection: halves toward the known-good tail, aligned, ends on it
+        expect("bisect halves the gap", tqllm::fit_host_bisect(0, 131072) == 65536);
+        expect("bisect is aligned", tqllm::fit_host_bisect(1000, 131072) % 1024 == 0);
+        expect("bisect near the known-good tail takes it", tqllm::fit_host_bisect(128000, 131072) == 131072);
+        expect("bisect without a known-good tail: nothing", tqllm::fit_host_bisect(4096, 0) == 4096);
+        expect("short estimate is capped at the known-good tail",
+               tqllm::fit_host_next(ctx, 0, true, 100 * MB, margin, 1000, true, 65536, 0, 0) == 65536);
+        expect("no known-good tail, refinement stalled: give up the step",
+               tqllm::fit_host_next(ctx, 21504, true, 50 * MB, margin, 32768, true, 0, 3, 50 * MB) == 21504);
+        expect("all KV on host already: nothing left", tqllm::fit_host_next(ctx, ctx, false, 0, margin, 0, true, ctx, 0, 0) == ctx);
+    }
+    {   // one measuring load decides the placement (Qwopus Q4_K_M 131072 + DFlash2, 3090, 11-02: all KV / head / embeddings in
+        // host memory left 4.43 GB; the step fit then took 10 loads, 10.5 min, and forced -ub 512 + 2048-row weight blocks)
+        const uint32_t ctx = 131072;
+        const size_t margin = 810 * MB, tb = 33280, round_b = 64 * MB, head_b = size_t(1.43 * GB), embed_b = size_t(0.72 * GB);
+        const auto p = tqllm::fit_place(ctx, size_t(4.43 * GB), margin, round_b, tb, head_b, embed_b, false, false);
+        expect("plan: full context, a KV tail, the margin kept",
+               p.kv_host > 0 && p.kv_host < ctx && size_t(ctx - p.kv_host) * tb + round_b + margin <= size_t(4.43 * GB));
+        expect("plan: the tail is the smallest that fits (within one block)",
+               size_t(ctx - p.kv_host + 1024) * tb + round_b + margin > size_t(4.43 * GB));
+        expect("plan: tail aligned", p.kv_host % 1024 == 0);
+        expect("plan: head and embeddings stay in host memory while KV is", p.head_host && p.embed_host);
+        const auto all = tqllm::fit_place(ctx, size_t(8.0 * GB), margin, round_b, tb, head_b, embed_b, false, false);
+        expect("plenty of room: everything on the device", all.kv_host == 0 && !all.head_host && !all.embed_host);
+        const auto mid = tqllm::fit_place(ctx, margin + round_b + ctx * tb + head_b + MB, margin, round_b, tb, head_b,
+                                          embed_b, false, false);
+        expect("room for KV + head only: embeddings stay in host memory", mid.kv_host == 0 && !mid.head_host && mid.embed_host);
+        const auto user = tqllm::fit_place(ctx, size_t(8.0 * GB), margin, round_b, tb, head_b, embed_b, true, false);
+        expect("asked head in host memory: stays there", user.head_host && !user.embed_host);
+        const auto none = tqllm::fit_place(ctx, 500 * MB, margin, round_b, tb, head_b, embed_b, false, false);
+        expect("below the margin: nothing comes back", none.kv_host == ctx && none.head_host && none.embed_host);
+    }
+    {   // 3090 Qwopus Q4_K_M 131072 + DFlash2 (11-02): a failed give-back left the CUDA last error set and the reload without it
+        // died on its first stream check ("CUDA kernel launch failed: out of memory"). The fit's loads clear it.
+        bool last_error = false;
+        int made = 0;
+        auto make = [&](bool fail) {
+            return [&, fail]() -> std::unique_ptr<int> {
+                if (last_error) throw std::runtime_error("CUDA kernel launch failed: out of memory");
+                if (fail) { last_error = true; throw std::runtime_error("CUDA error: out of memory"); }
+                return std::make_unique<int>(++made);
+            };
+        };
+        auto clear = [&] { last_error = false; };
+        expect("out of memory: no engine", !tqllm::fit_try_load(make(true), clear));
+        const auto again = tqllm::fit_try_load(make(false), clear);
+        expect("reload after an out-of-memory load succeeds", again && *again == 1);
+        bool other = false;
+        try { tqllm::fit_try_load([]() -> std::unique_ptr<int> { throw std::runtime_error("bad GGUF"); }, clear); }
+        catch (const std::exception &) { other = true; }
+        expect("other errors propagate", other);
     }
     if (bad) return 1;
     std::printf("PASS fit_context (5060 Ti case -> %u)\n", c);

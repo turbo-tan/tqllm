@@ -138,9 +138,6 @@ void switch_j(mmq_args a, const Plan & pl, cudaStream_t s) {
         for (int z = 0; z < pl.slots; ++z) cost += int64_t((pl.counts_host[z] + J - 1) / J) * (J + 32);
         if (cost < best) { jb = J; best = cost; }
     }
-    static const int force_j = std::getenv("TQ_MMQ_J") ? std::atoi(std::getenv("TQ_MMQ_J")) : 0;
-    if (force_j) jb = force_j;
-    if (std::getenv("TQ_MMQ_VERBOSE")) std::fprintf(stderr, "mmq: J %d\n", jb);
     static thread_local std::vector<int2> tl;
     tl.clear();
     for (int z = 0; z < pl.slots; ++z) for (int j = 0; j * jb < pl.counts_host[z]; ++j) tl.push_back(make_int2(z, j));

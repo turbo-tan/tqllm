@@ -88,7 +88,7 @@ static void check_layout_matches_legacy() {
 }
 
 // Observed in GLM-5.3-Flash-TQ3_4S.gguf-00001-of-00004.gguf (read-only header parse,
-// 2026-09-29, script ~/.hermes/scripts/verify_block_sizes.py + gguf_tensors.py).
+// 2026-09-29).
 struct Observed {
     const char * what;
     uint32_t type;

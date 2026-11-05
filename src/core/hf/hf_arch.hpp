@@ -16,5 +16,6 @@ const HfArch * hf_arch(const std::string & hf_name);
 // arch_minimax_m3.cpp, arch_minimax_m3_dspark.cpp
 void hf_map_minimax_m3(const HfFolder & h, GgufFile & f);
 void hf_map_minimax_m3_dspark(const HfFolder & h, GgufFile & f);
+void hf_map_qwen4_exp(const HfFolder & h, GgufFile & f);  // arch_qwen4_exp.cpp
 
 }  // namespace tqllm

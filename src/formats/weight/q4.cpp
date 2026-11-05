@@ -1,3 +1,4 @@
+#include "parallel_blocks.hpp"
 #include "matvec_rules.hpp"
 #include "dequant.hpp"
 #include "quant_kernels.cuh"
@@ -28,11 +29,13 @@ inline void expert_matvec_u4h(int fmt, const Mat & m, const __half * x, __nv_bfl
                                 ids, n, topk, per_expert_input, s);
 }
 constexpr uint32_t ID_U4H = 1001, ID_W4S = 1002, ID_K4 = 1003, ID_K3 = 1004, /* 1005: retired IQ4 */ ID_IQ3 = 1006, ID_IQ3X = 1007,
-                   ID_IQ4N = 1008, ID_IQ4L = 1009, ID_K5 = 1010, ID_K6 = 1011, ID_UDQ = 1012 /* 1012..1016: UD types, see Udq */;
+                   ID_IQ4N = 1008, ID_IQ4L = 1009, ID_K5 = 1010, ID_K6 = 1011, ID_UDQ = 1012 /* 1012..1016: UD types, see Udq */,
+ ID_U4HR = 1017;
 
 // u4h (engine id 1001): 4-bit codes in 16-groups (element 4u + j -> byte (u / 2) * 4 + j, nibble u % 2),
 // FP16 (scale, min) per 32. Produced from Q4_K (drafter) or non-uniform Q4_0.
-struct U4h final : WeightFormat {
+struct U4h : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     const char * name() const override { return "U4H"; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
@@ -83,6 +86,7 @@ struct U4h final : WeightFormat {
 // K4 (engine id 1003): native Q4_K, u4h codes + the raw 16-byte Q4_K superblock header (d, dmin, 6-bit scales / mins)
 // per 256 weights: 4.5 bpw on the device instead of u4h's 5.0.
 struct K4 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -136,6 +140,7 @@ struct K4 final : WeightFormat {
 
 // IQ3X (engine id 1007): native IQ3_XXS, per 32 weights 12 B (grid-index bytes + scale/sign word) + 4 B per 256 (d).
 struct Iq3x final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     int u4h_id() const override { return 5; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -195,14 +200,14 @@ struct IQ3_XXS final : WeightFormat {
         if (cols % 256) throw std::runtime_error("IQ3_XXS needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w3(size_t(nb) * 96), rec(size_t(nb) * 4, 0);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 98;
             for (int ib = 0; ib < 8; ++ib) {
                 std::memcpy(w3.data() + b * 96 + ib * 12, blk + 2 + ib * 8, 8);
                 std::memcpy(w3.data() + b * 96 + ib * 12 + 8, blk + 66 + ib * 4, 4);
             }
             std::memcpy(rec.data() + b * 4, blk, 2);
-        }
+        });
         const void * p = up(w3.data(), w3.size());
         const void * a = up(rec.data(), rec.size());
         tqllm_cuda::iq3x_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -219,6 +224,7 @@ struct IQ3_XXS final : WeightFormat {
 // IQ3 (engine id 1006): native IQ3_S, per 32 weights 12 B (grid-index low bytes, sign bytes) + per 256 a 16-byte record
 // (d, qh[8], scales[4], pad): 3.5 bpw on the device.
 struct Iq3 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     int u4h_id() const override { return 4; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -293,7 +299,7 @@ struct IQ3_S final : WeightFormat {
         if (cols % 256) throw std::runtime_error("IQ3_S needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w3(size_t(nb) * 96), rec(size_t(nb) * 16, 0);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 110;
             for (int ib = 0; ib < 8; ++ib) {
                 std::memcpy(w3.data() + b * 96 + ib * 12, blk + 2 + ib * 8, 8);
@@ -302,7 +308,7 @@ struct IQ3_S final : WeightFormat {
             std::memcpy(rec.data() + b * 16, blk, 2);
             std::memcpy(rec.data() + b * 16 + 2, blk + 66, 8);
             std::memcpy(rec.data() + b * 16 + 10, blk + 106, 4);
-        }
+        });
         const void * p = up(w3.data(), w3.size());
         const void * a = up(rec.data(), rec.size());
         tqllm_cuda::iq3_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -320,6 +326,7 @@ struct IQ3_S final : WeightFormat {
 // unchanged 8-byte record per 256 weights (d, scales_h, scales_l), on the 16-row split-K kernel (<= 16 columns; wider
 // batches dequantise to FP16). 4.25 bpw on the device, same as the file.
 struct Iq4n final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     int u4h_id() const override { return 13; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -369,6 +376,7 @@ struct Iq4n final : WeightFormat {
 
 // IQ4L (engine id 1009): IQ4_NL in natural nibble order (16 B per 32 weights) + one FP16 scale per 32 weights (aux).
 struct Iq4l final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     int u4h_id() const override { return 14; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -429,11 +437,11 @@ struct IQ4_NL final : WeightFormat {
             };
             const int64_t nb = int64_t(rows) * cols / 32;
             std::vector<char> q8(size_t(nb) * 34);
-            for (int64_t b = 0; b < nb; ++b) {
+            tqllm::parallel_blocks(nb, [&](int64_t b) {
                 const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 18;
                 char * o = q8.data() + b * 34; std::memcpy(o, blk, 2);
                 for (int j = 0; j < 16; ++j) { o[2 + j] = char(kv[blk[2 + j] & 0xF]); o[2 + 16 + j] = char(kv[blk[2 + j] >> 4]); }
-            }
+            });
             const WeightFormat * q80 = weight_format(8);
             if (!q80) throw std::runtime_error("IQ4_NL: Q8_0 format not registered");
             return q80->load(q8, rows, cols, up, s);
@@ -441,13 +449,13 @@ struct IQ4_NL final : WeightFormat {
         const int64_t nb = int64_t(rows) * cols / 32;
         std::vector<uint8_t> w(size_t(nb) * 16);
         std::vector<uint16_t> d(static_cast<size_t>(nb));
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 18;
             std::memcpy(&d[size_t(b)], blk, 2);
             const uint8_t * qs = blk + 2;
             auto q = [&](int e) { return e < 16 ? qs[e] & 0xF : qs[e - 16] >> 4; };
             for (int j = 0; j < 16; ++j) w[size_t(b) * 16 + j] = uint8_t(q(2 * j) | (q(2 * j + 1) << 4));
-        }
+        });
         const void * p = up(w.data(), w.size());
         const void * a = up(d.data(), d.size() * 2);
         tqllm_cuda::u4h_family_tune(14, static_cast<const uint8_t *>(p), a, rows, cols, s);
@@ -471,7 +479,7 @@ struct IQ4_XS final : WeightFormat {
         const int64_t nb = int64_t(rows) * cols / 256;
         // natural nibble order for the split-K kernel; the record stays as stored
         std::vector<uint8_t> w(size_t(nb) * 128), rec(size_t(nb) * 8);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 136;
             std::memcpy(rec.data() + b * 8, blk, 8);
             for (int ib = 0; ib < 8; ++ib) {
@@ -479,7 +487,7 @@ struct IQ4_XS final : WeightFormat {
                 auto q = [&](int e) { return e < 16 ? qs[e] & 0xF : qs[e - 16] >> 4; };
                 for (int j = 0; j < 16; ++j) w[size_t(b) * 128 + ib * 16 + j] = uint8_t(q(2 * j) | (q(2 * j + 1) << 4));
             }
-        }
+        });
         const void * p = up(w.data(), w.size());
         const void * a = up(rec.data(), rec.size());
         tqllm_cuda::u4h_family_tune(13, static_cast<const uint8_t *>(p), a, rows, cols, s);
@@ -496,6 +504,7 @@ struct IQ4_XS final : WeightFormat {
 // K3 (engine id 1004): native Q3_K, 3-bit planes (12 B per 32 weights) + per 256 weights a 20-byte record (16 int8
 // scales, FP16 d): 3.6 bpw on the device. Matvec / dequant: the u4h kernels with FMT 2.
 struct K3 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     const char * name() const override { return "K3"; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
@@ -553,7 +562,7 @@ struct Q3_K final : WeightFormat {
         if (cols % 256) throw std::runtime_error("Q3_K needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w3(size_t(nb) * 96, 0), rec(size_t(nb) * 20, 0);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 110;
             q3k_scales(blk + 96, reinterpret_cast<int8_t *>(rec.data() + b * 20));
             std::memcpy(rec.data() + b * 20 + 16, blk + 108, 2);
@@ -566,7 +575,7 @@ struct Q3_K final : WeightFormat {
                 o[g * 4 + jj] |= uint8_t((code & 3) << (2 * u));
                 o[8 + jj] |= uint8_t((code >> 2) << (u + 4 * g));
             }
-        }
+        });
         const void * p = up(w3.data(), w3.size());
         const void * a = up(rec.data(), rec.size());
         tqllm_cuda::k3_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -582,6 +591,7 @@ struct Q3_K final : WeightFormat {
 
 // W4S (engine id 1002): symmetric 4-bit in the u4h code layout, FP16 scale per 128 (the W4A16 group-128 layout).
 struct W4s final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     const char * name() const override { return "W4S"; }
     size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
     size_t aux_row_bytes(int cols) const override { return size_t(cols) / 128 * sizeof(__half); }
@@ -614,7 +624,7 @@ struct Q4_0 final : WeightFormat {
         const int64_t nb = int64_t(rows) * cols / 32;
         std::vector<uint8_t> w4(size_t(nb) * 16, 0);
         std::vector<__half2> sm(static_cast<size_t>(nb));
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 18;
             __half hd;
             std::memcpy(&hd, blk, 2);
@@ -626,7 +636,7 @@ struct Q4_0 final : WeightFormat {
                 const int grp = e / 16, ei = e % 16, u = ei / 4, j = ei % 4;
                 out[grp * 8 + (u / 2) * 4 + j] |= q << ((u % 2) * 4);
             }
-        }
+        });
         bool g128 = cols % 128 == 0;
         for (int64_t b = 0; g128 && b < nb; b += 4)
             for (int i = 1; i < 4; ++i) g128 = g128 && std::memcmp(raw.data() + b * 18, raw.data() + (b + i) * 18, 2) == 0;
@@ -645,6 +655,44 @@ struct Q4_0 final : WeightFormat {
         throw std::runtime_error("Q4_0 is a loader; matrices run as W4S or U4H");
     }
 };
+// u4h matrices loaded from Q4_1 (an MLX affine 4-bit checkpoint's routed experts): the u4h kernels with the grouped
+// expert paths on (kernel fmt 0). Kept apart from U4h so the drafters and dense matrices that load as U4h keep their paths.
+struct U4hRouted final : U4h {
+    int u4h_id() const override { return 0; }
+};
+// Q4_1 (GGUF 3) loader: exact repack to u4h (scale d, min m per 32), the layout of an MLX affine 4-bit group-32
+// checkpoint converted without requantising.
+struct Q4_1 final : WeightFormat {
+    const WeightFormat * u4h;
+    explicit Q4_1(const WeightFormat * b) : u4h(b) {}
+    const char * name() const override { return "Q4_1"; }
+    Basis basis() const override { return Basis::Plain; }
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t) const override {
+        const int64_t nb = int64_t(rows) * cols / 32;
+        std::vector<uint8_t> w4(size_t(nb) * 16, 0);
+        std::vector<__half2> sm(static_cast<size_t>(nb));
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
+            const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 20;
+            __half hd, hm;
+            std::memcpy(&hd, blk, 2); std::memcpy(&hm, blk + 2, 2);
+            sm[b] = __halves2half2(hd, hm);
+            uint8_t * out = w4.data() + b * 16;
+            for (int e = 0; e < 32; ++e) {
+                const uint8_t q = e < 16 ? blk[4 + e] & 0xF : blk[4 + e - 16] >> 4;
+                const int grp = e / 16, ei = e % 16, u = ei / 4, j = ei % 4;
+                out[grp * 8 + (u / 2) * 4 + j] |= q << ((u % 2) * 4);
+            }
+        }, int64_t(1) << 18);  // an expert slice (51,200 blocks) repacks inline: the bank build runs experts in parallel already
+        const void * p = up(w4.data(), w4.size());
+        return {p, ID_U4HR, rows, cols, up(sm.data(), sm.size() * sizeof(__half2)), u4h};
+    }
+    void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
+        throw std::runtime_error("Q4_1 is a loader; matrices run as U4H");
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error("Q4_1 is a loader; matrices run as U4H");
+    }
+};
 // Q4_K (GGUF 12) loader -> K4: u4h-layout codes + the raw 16-byte superblock header.
 struct Q4_K final : WeightFormat {
     const WeightFormat * k4;
@@ -655,7 +703,7 @@ struct Q4_K final : WeightFormat {
         if (cols % 256) throw std::runtime_error("Q4_K needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w4(size_t(nb) * 128, 0), kh(size_t(nb) * 16);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 144;
             std::memcpy(kh.data() + b * 16, blk, 16);
             uint8_t * out = w4.data() + b * 128;
@@ -664,7 +712,7 @@ struct Q4_K final : WeightFormat {
                 const int grp = e / 16, ei = e % 16, u = ei / 4, j = ei % 4;
                 out[grp * 8 + (u / 2) * 4 + j] |= q << ((u % 2) * 4);
             }
-        }
+        });
         const void * p = up(w4.data(), w4.size());
         const void * a = up(kh.data(), kh.size());
         tqllm_cuda::k4_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -682,6 +730,7 @@ struct Q4_K final : WeightFormat {
 // K6 (engine id 1011): native Q6_K. Per 32 weights 16 nibble bytes in K4 order + 2 words of 2-bit highs; aux = per 256
 // weights the 20-byte K3 record (16 int8 scales, FP16 d); value d * scale * (code - 32).
 struct K6 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -742,8 +791,8 @@ struct Q6_K final : WeightFormat {
         if (cols % 256) throw std::runtime_error("Q6_K needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w6(size_t(nb) * 192, 0), kr(size_t(nb) * 20, 0);
-        uint8_t v[256];
         for (int64_t b = 0; b < nb; ++b) {
+            uint8_t v[256];
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 210;
             std::memcpy(kr.data() + b * 20, blk + 192, 18);
             const uint8_t * ql = blk, * qh = blk + 128;
@@ -776,6 +825,7 @@ struct Q6_K final : WeightFormat {
 // K5 (engine id 1010): native Q5_K. Per 32 weights 16 nibble bytes in K4 order + one word of high code bits; aux = the
 // 16-byte Q5_K header (d, dmin, scales) per 256 weights per row.
 struct K5 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -837,7 +887,7 @@ struct Q5_K final : WeightFormat {
         if (cols % 256) throw std::runtime_error("Q5_K needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w5(size_t(nb) * 160, 0), kh(size_t(nb) * 16);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * 176;
             std::memcpy(kh.data() + b * 16, blk, 16);
             const uint8_t * qh = blk + 16, * qs = blk + 48;
@@ -849,7 +899,7 @@ struct Q5_K final : WeightFormat {
                 out[h * 8 + (u / 2) * 4 + j] |= q << ((u % 2) * 4);
                 out[16 + (16 * h + ei) / 8] |= uint8_t(hbit << ((16 * h + ei) % 8));
             }
-        }
+        });
         const void * p = up(w5.data(), w5.size());
         const void * a = up(kh.data(), kh.size());
         tqllm_cuda::k5_tune(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -865,6 +915,7 @@ struct Q5_K final : WeightFormat {
 // UD low-bit types (engine ids 1012..1016, kernel fmt 8..12) on the u4h kernel: per 32 weights the GGUF block's code
 // bytes, per row and 256 weights a record of its scalars (src/formats/weight/quant_kernels.cuh, udq_*).
 struct Udq final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
     int u4h_id() const override { return fmt == 10 ? 10 : -1; }
     int gemm_f32_id() const override { return fmt; }
     bool has_expert_matvec() const override { return true; }  // every UD format (grouped kernels cover u4h fmt 0..15)
@@ -935,7 +986,7 @@ struct UdqLoader final : WeightFormat {
         if (cols % 256) throw std::runtime_error(std::string(nm) + " needs a multiple of 256 columns");
         const int64_t nb = int64_t(rows) * cols / 256;
         std::vector<uint8_t> w(size_t(nb) * 8 * bpb, 0), rec(size_t(nb) * rb, 0);
-        for (int64_t b = 0; b < nb; ++b) {
+        tqllm::parallel_blocks(nb, [&](int64_t b) {
             const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * block_bytes;
             uint8_t * o = w.data() + size_t(b) * 8 * bpb, * r = rec.data() + size_t(b) * rb;
             switch (gguf_type) {
@@ -971,7 +1022,7 @@ struct UdqLoader final : WeightFormat {
                     }
                     break;
             }
-        }
+        });
         const void * p = up(w.data(), w.size());
         const void * a = up(rec.data(), rec.size());
         tqllm_cuda::udq_tune(int(id - ID_UDQ) + 8, static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(a), rows, cols, s);
@@ -988,6 +1039,8 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     auto u4h = std::make_unique<U4h>();
     auto w4s = std::make_unique<W4s>();
     auto q40 = std::make_unique<Q4_0>(w4s.get(), u4h.get());
+    auto u4hr = std::make_unique<U4hRouted>();
+    auto q41 = std::make_unique<Q4_1>(u4hr.get());
     auto k4 = std::make_unique<K4>();
     auto k3 = std::make_unique<K3>();
     auto iq3 = std::make_unique<Iq3>();
@@ -1005,6 +1058,7 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     auto q6k = std::make_unique<Q6_K>(k6.get());
     auto q5k = std::make_unique<Q5_K>(k5.get());
     register_weight_format(ID_U4H, std::move(u4h));
+    register_weight_format(ID_U4HR, std::move(u4hr));
     register_weight_format(ID_W4S, std::move(w4s));
     register_weight_format(ID_K4, std::move(k4));
     register_weight_format(ID_K3, std::move(k3));
@@ -1018,6 +1072,7 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     register_weight_format(20, std::move(iq4nl));
     register_weight_format(11, std::move(q3k));
     register_weight_format(2, std::move(q40));
+    register_weight_format(3, std::move(q41));
     register_weight_format(12, std::move(q4k));
     register_weight_format(ID_K5, std::move(k5));
     register_weight_format(13, std::move(q5k));
@@ -1043,9 +1098,6 @@ bool WeightFormat::expert_gemm_i8(const Mat & m, const int8_t * xq, const float 
                                    cudaStream_t stream, int mode) const {
     const int id = u4h_id();
     if (id != 1 && id != 4 && id != 5 && id != 6 && id != 7 && id != 10 && id != 13 && id != 14) return false;
-    // TQFN_PREFILL_INT8_FMT: comma list of u4h ids allowed on the int8 path (default all); e.g. 13,14 = IQ4 formats only
-    static const std::string allow = std::getenv("TQFN_PREFILL_INT8_FMT") ? std::getenv("TQFN_PREFILL_INT8_FMT") : "";
-    if (!allow.empty() && ("," + allow + ",").find("," + std::to_string(id) + ",") == std::string::npos) return false;
     tqllm_cuda::k_expert_gemm_i8(id, static_cast<const uint8_t *>(m.p), m.aux, xq, xs, xsum, y, rows, m.cols, counts, groups,
                                  capacity, experts, topk, per_expert_input, stream, mode);
     return true;

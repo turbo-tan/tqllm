@@ -1,5 +1,6 @@
 #pragma once
 // Flash-Next CPU expert-miss pool (x86 AVX2): missed experts computed on the CPU from the pinned packed copy.
+#include "debug.hpp"
 #include "fn_checkpoint.hpp"
 #if defined(__x86_64__)
 inline const int8_t kCpuIq4nl[16] = {
@@ -181,6 +182,93 @@ __attribute__((target("avx2,fma"))) static float cpu_dot_q2_0_q8p(const uint8_t 
     }
     return cpu_hsum(acc) + tail;
 }
+inline int64_t cpu_block_off(int r, int s, int nb, int bpb, bool tiled);
+// IQ3_S / IQ3_XXS / IQ2_S rows straight from the pinned device layout (the same per-32 math as the GGUF-row kernels above,
+// so the same floats): the pool rebuilt a GGUF row per matrix row first (~0.074 of 0.47 ms per gate matrix, 640 x 2560)
+__attribute__((target("avx2,fma"))) static void cpu_dot_iq3s_dev_q8(const char * dev, const char * aux, int r, int nb, bool tiled,
+                                                                    const int8_t * const * xqc, const float * const * xdc, int nc, float * out) {
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    const int kb = nb / 8;
+    for (int b = 0, sb = 0; b < kb; ++b) {
+        const uint8_t * rec = reinterpret_cast<const uint8_t *>(aux) + (int64_t(r) * kb + b) * 16;
+        const float d = cpu_h2f(rec); const uint8_t * qh = rec + 2, * sc = rec + 10;
+        for (int ib = 0; ib < 8; ++ib, ++sb) {
+            const uint8_t * blk = reinterpret_cast<const uint8_t *>(dev + cpu_block_off(r, sb, nb, 12, tiled));
+            const int hb = qh[ib];
+            int g[8]; for (int k = 0; k < 8; ++k) g[k] = int(kCpuIq3s[blk[k] | (((hb >> k) & 1) << 8)]);
+            const __m256i mag = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(g));
+            uint32_t sbits; std::memcpy(&sbits, blk + 8, 4);
+            const float db = d * float(1 + 2 * ((sc[ib / 2] >> 4 * (ib % 2)) & 0xf)); const __m256i neg = cpu_sign_mask(sbits);
+            for (int c = 0; c < nc; ++c)
+                acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(db * xdc[c][sb]), _mm256_cvtepi32_ps(cpu_mag_dot(mag, neg, xqc[c] + sb * 32)), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) out[c] = cpu_hsum(acc[c]);
+}
+__attribute__((target("avx2,fma"))) static void cpu_dot_iq3xxs_dev_q8(const char * dev, const char * aux, int r, int nb, bool tiled,
+                                                                      const int8_t * const * xqc, const float * const * xdc, int nc, float * out) {
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    const int kb = nb / 8;
+    for (int b = 0, sb = 0; b < kb; ++b) {
+        const float d = cpu_h2f(reinterpret_cast<const uint8_t *>(aux) + (int64_t(r) * kb + b) * 4);
+        for (int ib = 0; ib < 8; ++ib, ++sb) {
+            const uint8_t * q = reinterpret_cast<const uint8_t *>(dev + cpu_block_off(r, sb, nb, 12, tiled));
+            uint32_t a; std::memcpy(&a, q + 8, 4);
+            uint32_t sbits = 0;
+            for (int l = 0; l < 4; ++l) { const uint32_t i7 = (a >> 7 * l) & 127; sbits |= (i7 | ((__builtin_popcount(i7) & 1) << 7)) << (8 * l); }
+            const __m256i mag = _mm256_set_epi32(int(kCpuIq3xxs[q[7]]), int(kCpuIq3xxs[q[6]]), int(kCpuIq3xxs[q[5]]), int(kCpuIq3xxs[q[4]]),
+                                                 int(kCpuIq3xxs[q[3]]), int(kCpuIq3xxs[q[2]]), int(kCpuIq3xxs[q[1]]), int(kCpuIq3xxs[q[0]]));
+            const float db = d * (0.5f + float(a >> 28)) * 0.5f; const __m256i neg = cpu_sign_mask(sbits);
+            for (int c = 0; c < nc; ++c)
+                acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(db * xdc[c][sb]), _mm256_cvtepi32_ps(cpu_mag_dot(mag, neg, xqc[c] + sb * 32)), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) out[c] = cpu_hsum(acc[c]);
+}
+__attribute__((target("avx2,fma"))) static void cpu_dot_iq2s_dev_q8(const char * dev, const char * aux, int r, int nb, bool tiled,
+                                                                    const int8_t * const * xqc, const float * const * xdc, int nc, float * out) {
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    const int kb = nb / 8;
+    for (int b = 0, sb = 0; b < kb; ++b) {
+        const uint8_t * rec = reinterpret_cast<const uint8_t *>(aux) + (int64_t(r) * kb + b) * 20;
+        const float d = cpu_h2f(rec); const uint8_t * qh = rec + 2, * sc = rec + 10;
+        for (int ib = 0; ib < 8; ++ib, ++sb) {
+            const uint8_t * blk = reinterpret_cast<const uint8_t *>(dev + cpu_block_off(r, sb, nb, 8, tiled));
+            int64_t g[4]; for (int l = 0; l < 4; ++l) g[l] = int64_t(kCpuIq2s[blk[l] | ((qh[ib] << (8 - 2 * l)) & 0x300)]);
+            const __m256i mag = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(g));
+            uint32_t sbits; std::memcpy(&sbits, blk + 4, 4);
+            const float d0 = d * (0.5f + float(sc[ib] & 0xf)) * 0.25f, d1 = d * (0.5f + float(sc[ib] >> 4)) * 0.25f;
+            const __m256 dd = _mm256_setr_ps(d0, d0, d0, d0, d1, d1, d1, d1); const __m256i neg = cpu_sign_mask(sbits);
+            for (int c = 0; c < nc; ++c)
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(dd, _mm256_set1_ps(xdc[c][sb])), _mm256_cvtepi32_ps(cpu_mag_dot(mag, neg, xqc[c] + sb * 32)), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) out[c] = cpu_hsum(acc[c]);
+}
+// IQ4_NL row straight from the pinned device layout (byte i = e[2i] | e[2i+1] << 4, fp16 scales apart): the activation
+// comes permuted to [even, odd] per 32 block (cpu_permute_nl), so no GGUF row is rebuilt (the rebuild cost 3x the dot)
+__attribute__((target("avx2,fma"))) static void cpu_dot_iq4nl_dev_q8_mc(const char * dev, const uint16_t * dh, int r, int nb, bool tiled,
+                                                                       const int8_t * const * xqc, const float * const * xdc, int nc, float * out) {
+    const __m256i table = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(kCpuIq4nl)));
+    const __m256i low = _mm256_set1_epi8(0x0f), ones = _mm256_set1_epi16(1);
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int b = 0; b < nb; ++b) {
+        __half_raw hr; hr.x = dh[b]; const float d = __half2float(__half(hr));
+        const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dev + cpu_block_off(r, b, nb, 16, tiled)));
+        const __m256i wv = _mm256_shuffle_epi8(table, _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(q, 4), q), low));
+        const __m256i wa = _mm256_sign_epi8(wv, wv);
+        for (int c = 0; c < nc; ++c) {
+            const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xqc[c] + b * 32));
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(wa, _mm256_sign_epi8(xv, wv)), ones);
+            acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(d * xdc[c][b]), _mm256_cvtepi32_ps(p32), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) out[c] = cpu_hsum(acc[c]);
+}
+// int8 activation per 32 block in the device IQ4_NL order: even elements, then odd
+inline void cpu_permute_nl(const int8_t * xq, int n, int8_t * out) {
+    for (int b = 0; b < n / 32; ++b) for (int i = 0; i < 16; ++i) { out[b * 32 + i] = xq[b * 32 + 2 * i]; out[b * 32 + 16 + i] = xq[b * 32 + 2 * i + 1]; }
+}
 inline void cpu_permute_q2(const int8_t * xq, int n, int8_t * out, int * sums) {
     for (int b = 0; b < n / 32; ++b) {
         int sum = 0;
@@ -273,7 +361,7 @@ public:
                                 double(jobs_sum_) / calls_, double(cols_sum_) / calls_, gu_wall_ms_ / calls_, cpu_ns_gu_.load() / 1e6 / calls_,
                                 dn_wall_ms_ / calls_, cpu_ns_dn_.load() / 1e6 / calls_);
         for (auto & [t, e] : check_gu_) std::printf("CPU_CHECK gate/up type %u int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", t, e.first, e.second);
-        if (std::getenv("TQFN_CPU_CHECK")) std::printf("CPU_CHECK packed-row rebuild mismatches vs GGUF: %llu\n", (unsigned long long) row_mismatch_);
+        if (tqllm::debug_cstr("cpu_check")) std::printf("CPU_CHECK packed-row rebuild mismatches vs GGUF: %llu\n", (unsigned long long) row_mismatch_);
         if (check_mag_ > 0) std::printf("CPU_CHECK down int8 vs fp32: max abs diff %.3g, max |ref| %.3g\n", check_err_, check_mag_);
     }
     // x: n tokens x hidden (fp32, rounded to fp16 like the GPU input); out: one bf16 row of `hidden` per job column.
@@ -285,6 +373,8 @@ public:
         for (auto & j : jobs_) { j.slot = cols; cols += j.ncols; }
         jobs_sum_ += jobs_.size(); cols_sum_ += uint64_t(cols);
         act_.assign(size_t(cols) * ff_, 0.f);
+        if (act_q_.size() < jobs_.size()) act_q_ = std::vector<JobAct>(jobs_.size());
+        for (size_t q = 0; q < jobs_.size(); ++q) act_q_[q].state.store(0, std::memory_order_relaxed);
         // about two items per worker in each phase, whatever the number of experts (load balance)
         const int k = std::max<int>(1, int(jobs_.size())), tw = 2 * int(workers_.size());
         chunks_[0] = std::clamp((tw + k - 1) / k, 4, 64); chunks_[1] = std::clamp((tw + k - 1) / k, 4, 128);
@@ -304,6 +394,10 @@ public:
         pending_ = false;
     }
 private:
+    struct JobAct { std::atomic<int> state{0}; std::vector<int8_t> aq, ap; std::vector<float> ad; std::vector<int> as;
+                    JobAct() = default; JobAct(JobAct && o) noexcept : aq(std::move(o.aq)), ap(std::move(o.ap)), ad(std::move(o.ad)), as(std::move(o.as)) {}
+                    JobAct & operator=(JobAct && o) noexcept { aq = std::move(o.aq); ap = std::move(o.ap); ad = std::move(o.ad); as = std::move(o.as); return *this; } };
+    std::vector<JobAct> act_q_;  // per job: its activation quantised once per call (down phase)
     int chunks_[2] = {20, 32};
     // the GGUF bytes of row r of matrix m: rebuilt from the pinned packed copy when available, else the GGUF mapping
     const char * row_src(const Job & j, int m, int r, int cols) {
@@ -321,7 +415,7 @@ private:
                 std::printf("CPU_MISS first GGUF-mapping row: matrix %d fmt %d gguf type %u\n", m, j.fmt[m], j.type[m]);
             return gguf;
         }
-        static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+        static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
         if (check && std::memcmp(q, gguf, j.row_bytes[m]) != 0) { std::lock_guard<std::mutex> l(m_); ++row_mismatch_; }
         return q;
     }
@@ -338,17 +432,20 @@ private:
             for (int c = 0; c < j.ncols; ++c) { xqc[c] = xq_.data() + size_t(j.cols_t[c]) * hidden_; xdc[c] = xd_.data() + size_t(j.cols_t[c]) * hidden_ / 32; }
             for (int m = 0; m < 2; ++m) {
                 const DotQ8 fast = hidden_ % 256 ? nullptr : j.type[m] == 18 ? cpu_dot_iq3xxs_q8 : j.type[m] == 21 ? cpu_dot_iq3s_q8 : j.type[m] == 22 ? cpu_dot_iq2s_q8 : nullptr;
+                using DevDot = void (*)(const char *, const char *, int, int, bool, const int8_t * const *, const float * const *, int, float *);
+                const DevDot dev = !fast || !j.dev[m] ? nullptr : j.fmt[m] == 4 ? cpu_dot_iq3s_dev_q8 : j.fmt[m] == 5 ? cpu_dot_iq3xxs_dev_q8 : j.fmt[m] == 10 ? cpu_dot_iq2s_dev_q8 : nullptr;
                 for (int r = r0; r < r1; ++r) {
-                    const char * wr = row_src(j, m, r, hidden_);
+                    const char * wr = dev ? nullptr : row_src(j, m, r, hidden_);  // the device layout is read in place (no GGUF row rebuilt)
                     float fo[8];
-                    if (fast) for (int c0 = 0; c0 < j.ncols; c0 += 4) fast(reinterpret_cast<const uint8_t *>(wr), xqc + c0, xdc + c0, std::min(4, j.ncols - c0), hidden_ / 256, fo + c0);
+                    if (dev) for (int c0 = 0; c0 < j.ncols; c0 += 4) dev(j.dev[m], j.aux[m], r, hidden_ / 32, j.tiled, xqc + c0, xdc + c0, std::min(4, j.ncols - c0), fo + c0);
+                    else if (fast) for (int c0 = 0; c0 < j.ncols; c0 += 4) fast(reinterpret_cast<const uint8_t *>(wr), xqc + c0, xdc + c0, std::min(4, j.ncols - c0), hidden_ / 256, fo + c0);
                     else dequantize_host(j.type[m], wr, row.data(), hidden_);
                     for (int c = 0; c < j.ncols; ++c) {
                         const int t = j.cols_t[c];
                         const float acc = fast ? fo[c] : cpu_dot_f32(row.data(), x_.data() + size_t(t) * hidden_, hidden_);
-                        static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+                        static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
                         if (check && fast) {
-                            std::vector<float> ref(hidden_); dequantize_host(j.type[m], wr, ref.data(), hidden_);
+                            std::vector<float> ref(hidden_); dequantize_host(j.type[m], wr ? wr : row_src(j, m, r, hidden_), ref.data(), hidden_);
                             const float want = cpu_dot_f32(ref.data(), x_.data() + size_t(t) * hidden_, hidden_);
                             std::lock_guard<std::mutex> l(m_); auto & e = check_gu_[j.type[m]];
                             e.first = std::max(e.first, double(std::fabs(acc - want))); e.second = std::max(e.second, double(std::fabs(want)));
@@ -363,19 +460,34 @@ private:
         } else {
             const int r0 = part * hidden_ / chunks, r1 = (part + 1) * hidden_ / chunks;
             const bool nl = j.type[2] == 20 && ff_ % 32 == 0, q2 = j.type[2] == GGML_GSQ_Q2_0 && ff_ % 64 == 0;
-            thread_local std::vector<int8_t> aq, ap; thread_local std::vector<float> ad; thread_local std::vector<int> as;
+            const bool nl_dev = nl && j.dev[2] && j.fmt[2] == 14;
+            // the job's activation is quantised (and permuted) once per call by its first down item: every item of the job
+            // read the same ff values, and redid this for each of its ~30 items (one expert on 15 threads)
+            const int jidx = it / chunks; JobAct & qa = act_q_[size_t(jidx)];
             if (nl || q2) {
-                aq.resize(size_t(j.ncols) * ff_); ad.resize(size_t(j.ncols) * ff_ / 32);
-                for (int c = 0; c < j.ncols; ++c) cpu_quant_q8(act_.data() + size_t(j.slot + c) * ff_, ff_, aq.data() + size_t(c) * ff_, ad.data() + size_t(c) * ff_ / 32);
+                int expect = 0;
+                if (qa.state.compare_exchange_strong(expect, 1, std::memory_order_acq_rel)) {
+                    qa.aq.resize(size_t(j.ncols) * ff_); qa.ad.resize(size_t(j.ncols) * ff_ / 32);
+                    for (int c = 0; c < j.ncols; ++c) cpu_quant_q8(act_.data() + size_t(j.slot + c) * ff_, ff_, qa.aq.data() + size_t(c) * ff_, qa.ad.data() + size_t(c) * ff_ / 32);
+                    if (nl_dev) { qa.ap.resize(qa.aq.size()); for (int c = 0; c < j.ncols; ++c) cpu_permute_nl(qa.aq.data() + size_t(c) * ff_, ff_, qa.ap.data() + size_t(c) * ff_); }
+                    if (q2) { qa.ap.resize(qa.aq.size()); qa.as.resize(qa.ad.size());
+                              for (int c = 0; c < j.ncols; ++c) cpu_permute_q2(qa.aq.data() + size_t(c) * ff_, ff_, qa.ap.data() + size_t(c) * ff_, qa.as.data() + size_t(c) * ff_ / 32); }
+                    qa.state.store(2, std::memory_order_release);
+                } else while (qa.state.load(std::memory_order_acquire) != 2) _mm_pause();
             }
-            if (q2) {
-                ap.resize(aq.size()); as.resize(ad.size());
-                for (int c = 0; c < j.ncols; ++c) cpu_permute_q2(aq.data() + size_t(c) * ff_, ff_, ap.data() + size_t(c) * ff_, as.data() + size_t(c) * ff_ / 32);
-            }
+            const std::vector<int8_t> & aq = qa.aq, & ap = qa.ap; const std::vector<float> & ad = qa.ad; const std::vector<int> & as = qa.as;
             for (int r = r0; r < r1; ++r) {
+                float nlo[8];
+                if (nl_dev) {
+                    const int8_t * xqc[8]; const float * xdc[8];
+                    for (int c = 0; c < j.ncols; ++c) { xqc[c] = ap.data() + size_t(c) * ff_; xdc[c] = ad.data() + size_t(c) * ff_ / 32; }
+                    const auto * dh = reinterpret_cast<const uint16_t *>(j.aux[2]) + int64_t(r) * (ff_ / 32);
+                    for (int c0 = 0; c0 < j.ncols; c0 += 4) cpu_dot_iq4nl_dev_q8_mc(j.dev[2], dh, r, ff_ / 32, j.tiled, xqc + c0, xdc + c0, std::min(4, j.ncols - c0), nlo + c0);
+                    for (int c = 0; c < j.ncols; ++c) out_[size_t(j.slot + c) * hidden_ + r] = __float2bfloat16_rn(nlo[c]);
+                    continue;
+                }
                 const char * wr = row_src(j, 2, r, ff_);
                 if (!nl && !q2) dequantize_host(j.type[2], wr, row.data(), ff_);
-                float nlo[8];
                 if (nl) {
                     const int8_t * xqc[8]; const float * xdc[8];
                     for (int c = 0; c < j.ncols; ++c) { xqc[c] = aq.data() + size_t(c) * ff_; xdc[c] = ad.data() + size_t(c) * ff_ / 32; }
@@ -387,7 +499,7 @@ private:
                                     : q2 ? cpu_dot_q2_0_q8p(wu, ap.data() + size_t(c) * ff_, ad.data() + size_t(c) * ff_ / 32, as.data() + size_t(c) * ff_ / 32, ff_ / 64)
                                          : cpu_dot_f32(row.data(), act_.data() + size_t(j.slot + c) * ff_, ff_);
                     out_[size_t(j.slot + c) * hidden_ + r] = __float2bfloat16_rn(acc);
-                    static const bool check = std::getenv("TQFN_CPU_CHECK") != nullptr;
+                    static const bool check = tqllm::debug_cstr("cpu_check") != nullptr;
                     if (check && (nl || q2)) {  // int8 kernel vs dequantize_host + fp32 dot
                         std::vector<float> ref(ff_); dequantize_host(j.type[2], wr, ref.data(), ff_);
                         const float want = cpu_dot_f32(ref.data(), act_.data() + size_t(j.slot + c) * ff_, ff_);
@@ -406,7 +518,7 @@ private:
             for (int spin = 0; (g = gen_.load(std::memory_order_acquire)) == seen; ++spin) {
                 _mm_pause();
                 // decode calls arrive every ~0.5 ms; after 2 ms idle (prefill, between prompts) sleep instead of spinning
-                static const int spin_ms = std::getenv("TQFN_CPU_SPIN_MS") ? std::atoi(std::getenv("TQFN_CPU_SPIN_MS")) : 2;
+                constexpr int spin_ms = 2;  // CPU miss workers spin this long before sleeping
                 if ((spin & 1023) == 1023 && std::chrono::steady_clock::now() - idle0 > std::chrono::milliseconds(spin_ms)) {
                     std::unique_lock<std::mutex> l(m_); ++sleepers_;
                     cv_.wait(l, [&] { return gen_.load() != seen; }); --sleepers_;

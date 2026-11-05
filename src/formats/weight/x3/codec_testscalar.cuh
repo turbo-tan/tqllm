@@ -32,6 +32,9 @@ struct TestScalarCodec {
     static constexpr int  ld_stride = 32;
     static constexpr int  ld_lanes  = 32;
     static constexpr bool supports_gemv_x3v = true;
+    static __host__ __device__ constexpr bool packed_wnt(int) { return false; }   // already full-width loads
+    static __host__ __device__ constexpr int ld_stride_wnt(int) { return ld_stride; }
+    static __host__ __device__ constexpr int ld_lanes_wnt(int) { return ld_lanes; }
     static __host__ __device__ constexpr int loads(int WNT) { return WNT * u32words / ld_stride; }
 
     // The int8 dp4a "sq" path relies on the mul1 linear codebook, so this codec does not provide it.
@@ -39,6 +42,7 @@ struct TestScalarCodec {
     static __host__ __device__ constexpr int row_u32(int size_n) { return size_n * u32words / 16; }
     __device__ static void sq_windows(const uint32_t*, int, uint32_t (&)[8]) {}
 
+    template <bool PACKED>
     __device__ static void regs_decode(const uint32_t* bw, int t, int lane, FragB& f0, FragB& f1) {
         const uint32_t full = 0xffffffffu;
         // Load l holds tile word (l*32 + lane). A lane needs words 2*lane and 2*lane+1; the shfl

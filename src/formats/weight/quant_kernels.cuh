@@ -24,7 +24,9 @@ void k_expert_gemm_gateup(int fmt, const uint8_t * wg, const void * auxg, const 
                           int capacity, int experts, int topk, cudaStream_t);
 // Stacked K4/K5/K6 experts selected entirely on device; output [n * topk][rows].
 // Dedup grouped matvec: per unique expert kDedupStride ints = slot, columns (<= kDedupCols), input rows, output rows.
-constexpr int kDedupCols = 4, kDedupStride = 2 + 2 * kDedupCols;
+constexpr int kDedupCols = 8, kDedupStride = 2 + 2 * kDedupCols;
+// most groups per dedup launch grid; a block walks the groups past it (empty padding groups then cost no blocks)
+constexpr int kDedupGridGroups = 128;
 void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
                            int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
 // Layer-major prefill experts (src/experts/mmq_experts.cu): llama.cpp's MMQ on our expert banks. gate / act on the up

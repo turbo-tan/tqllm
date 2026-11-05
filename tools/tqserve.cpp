@@ -9,6 +9,7 @@
 #include "flags_gen.hpp"
 #if TQLLM_WITH_CUDA
 #include "kv_format.hpp"
+#include "plugin_format.hpp"
 #endif
 #include "kv_store.hpp"
 
@@ -17,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <filesystem>
 #include <cerrno>
 #include <cstdio>
 #include <csignal>
@@ -24,6 +26,9 @@
 #include <fstream>
 #include <iostream>
 #include <atomic>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <chrono>
 #include <memory>
 #include <condition_variable>
@@ -119,7 +124,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X --repeat-penalty R --frequency-penalty F (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
@@ -228,6 +233,8 @@ int main(int argc, char ** argv) {
             else if (arg == "--draft-max" || arg == "--draft") tqserve::serve_options().draft_max = std::clamp(std::stoi(value()), 1, 15);
             else if (arg == "--repeat-limit") tqserve::serve_options().repeat_limit = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--presence-penalty") tqserve::sampling_defaults().presence_penalty = std::stof(value());
+            else if (arg == "--repeat-penalty") tqserve::sampling_defaults().repeat_penalty = std::stof(value());
+            else if (arg == "--frequency-penalty") tqserve::sampling_defaults().frequency_penalty = std::stof(value());
             else if (arg == "--np") np = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--mmproj") mmproj = value();
             else if (arg == "--image-min-tokens") image_min_tokens = std::stoi(value());
@@ -263,6 +270,20 @@ int main(int argc, char ** argv) {
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
         }
+        std::string plugins_json;  // /health "plugins" (only when --plugin was given)
+#if !TQLLM_WITH_CUDA
+        if (!engine.plugins.empty()) throw std::runtime_error("--plugin (weight-format plugins) needs a CUDA build");
+#else
+        for (const auto & path : engine.plugins) {  // before the model: its matrices load with the plugin formats
+            const auto info = tqllm::load_plugin(path);
+            auto list = [](const std::vector<std::string> & v) { std::string s; for (const auto & x : v) s += (s.empty() ? "\"" : ",\"") + x + "\""; return "[" + s + "]"; };
+            plugins_json += std::string(plugins_json.empty() ? "" : ",") + "{\"path\":\"" + path + "\",\"formats\":" + list(info.formats) +
+                            ",\"patches\":" + list(info.patches) + ",\"skipped\":" + list(info.skipped) + "}";
+            for (const auto & p : info.patches) if (p.find("(not exact)") != std::string::npos) engine.inexact_patches.push_back(p.substr(0, p.find(" (not exact)")));
+            std::cerr << "tqserve: plugin " << path << ": " << info.formats.size() << " format(s), " << info.patches.size() << " patch(es)"
+                      << (info.skipped.empty() ? "" : ", " + std::to_string(info.skipped.size()) + " skipped (another GPU)") << "\n";
+        }
+#endif
         tqserve::Vision vis;
 #if !TQLLM_WITH_CUDA
         if (!mmproj.empty()) throw std::runtime_error("--mmproj (image input) needs a CUDA build");
@@ -280,7 +301,17 @@ int main(int argc, char ** argv) {
                       << " tokens per image)\n";
         }
 #endif
+#if defined(__GLIBC__)
+        // loading allocates and frees ~17 GB of large host buffers per load (tensor reads, repacks): by default each comes
+        // back from the kernel as fresh pages (page faults + zeroing: 10 of a 60 s 27B load on a 3090, 11-02); keep freed
+        // blocks for reuse while loading, then hand the heap back
+        mallopt(M_MMAP_THRESHOLD, 1 << 30);
+        mallopt(M_TRIM_THRESHOLD, 1 << 30);
+#endif
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
         std::unique_ptr<tqserve::Monitor> monitor;
@@ -315,12 +346,18 @@ int main(int argc, char ** argv) {
             if (!tf) { std::cerr << "tqserve: cannot read " << template_file << "\n"; return 2; }
             src.assign(std::istreambuf_iterator<char>(tf), std::istreambuf_iterator<char>());
         } else if (!model_path.empty()) {
-            // a .tqfn manifest has no metadata of its own: the chat template comes from the tokenizer GGUF
-            const bool manifest = model_path.size() > 5 && model_path.compare(model_path.size() - 5, 5, ".tqfn") == 0;
-            const auto g = tqllm::gguf_open(manifest ? tokenizer_path : model_path);
-            if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
-            // a model GGUF without tokenizer metadata (MiniMax-M3 from tools/minimax_convert.cpp): the --tokenizer GGUF's
-            if (src.empty() && !manifest && tokenizer_path != model_path && tokenizer_path.size() > 5 &&
+            // the template is GGUF / Hugging Face metadata; a model file without any (a .tqfn manifest, weights.tqbin, a
+            // plugin engine's file) or without tokenizer metadata (MiniMax-M3 from tools/minimax_convert.cpp) takes the
+            // --tokenizer GGUF's
+            auto metadata = [](const std::string & p) {
+                return std::filesystem::is_directory(p) || (p.size() > 5 && p.compare(p.size() - 5, 5, ".gguf") == 0);
+            };
+            const bool own = metadata(model_path);
+            if (own || metadata(tokenizer_path)) {
+                const auto g = tqllm::gguf_open(own ? model_path : tokenizer_path);
+                if (const auto it = g.kv.find("tokenizer.chat_template"); it != g.kv.end()) src = it->second.str;
+            }
+            if (src.empty() && own && tokenizer_path != model_path && tokenizer_path.size() > 5 &&
                 tokenizer_path.compare(tokenizer_path.size() - 5, 5, ".gguf") == 0) {
                 const auto tg = tqllm::gguf_open_shard(tokenizer_path);
                 if (const auto it = tg.kv.find("tokenizer.chat_template"); it != tg.kv.end()) src = it->second.str;
@@ -397,7 +434,8 @@ int main(int argc, char ** argv) {
             if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
-                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"}";
+                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"" +
+                       (plugins_json.empty() ? std::string() : ",\"plugins\":[" + plugins_json + "]") + "}";
             } else if (request.path == "/admin/slots" && (request.method == "GET" || request.method == "POST")) {
                 // live parallelism: POST {"slots": k} admits at most k requests at once (1 .. --np), no reload
                 if (!scheduler) {
@@ -482,6 +520,7 @@ int main(int argc, char ** argv) {
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {
                         auto phase1 = parsed;  // thinking budget, streamed: phase 1 deltas, then phase 2 continues the answer
                         phase1.max_tokens = parsed.thinking_budget;
+                        phase1.continuation = 1;
                         tqserve::StreamWriter w1(tokenizer, phase1, name, send);
                         auto first = run_stream(phase1, w1);
                         if (!first.error.empty()) w1.error(first.error);
@@ -492,6 +531,7 @@ int main(int argc, char ** argv) {
                             w1.flush(first);
                             auto phase2 = parsed;
                             phase2.thinking = false;
+                            phase2.continuation = 2;
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, first.completion_tokens);
                             phase2.prompt_text += closed ? first.reasoning + "\n" + tqserve::serve_options().think_close + "\n\n" + first.text
                                                          : first.reasoning + tqserve::serve_options().think_close;  // llama.cpp: message + end tag forced
@@ -515,6 +555,7 @@ int main(int argc, char ** argv) {
                         if (!generated.error.empty()) out.error(generated.error);
                         else out.close(generated);
                     }
+                    if (!scheduler) model.set_continuation(0);  // a thinking budget's held phase 1 state, if phase 2 did not run
                     if (parsed.observation) parsed.observation->finish();
                     ::close(client);
                     return;
@@ -530,11 +571,13 @@ int main(int argc, char ** argv) {
                         // the documented sentence and continue the answer from prompt + thinking (one extra prefill)
                         auto phase1 = parsed;
                         phase1.max_tokens = parsed.thinking_budget;
+                        phase1.continuation = 1;
                         generated = run(phase1);
                         const bool closed = !generated.text.empty() || generated.finish_reason == "stop";
                         if (generated.error.empty() && generated.finish_reason == "length") {
                             auto phase2 = parsed;
                             phase2.thinking = false;
+                            phase2.continuation = 2;
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
                             if (!closed) generated.reasoning = tqserve::trim_incomplete_utf8(generated.reasoning) + parsed.budget_message;
                             phase2.prompt_text += generated.reasoning;
@@ -555,6 +598,7 @@ int main(int argc, char ** argv) {
                     } else {
                         generated = run(parsed);
                     }
+                    if (!scheduler) model.set_continuation(0);
                     if (!generated.error.empty()) {
                         status = generated.error.rfind(kFailed, 0) == 0 ? 500 : 400;
                         body = tqserve::json_error(generated.error, status == 500 ? "server_error" : "invalid_request_error");

@@ -31,6 +31,11 @@ struct X3Codec {
     // The same matrix in the engine's GEMM layout: W[r * ld + c], r < rows (out), c < cols (in); ld % 4 == 0.
     void (*dequant_rows)(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
                          cudaStream_t stream);
+    // A row range of it: out rows [r0, r0 + nr) (both multiples of 128) into W[0 .. nr); rows / cols are the part's
+    // full extents, which set the trellis' k-major stride. The head dump (4c) walks a 200K-row matrix in chunks
+    // because the engine has no whole-matrix FP16 scratch.
+    void (*dequant_rows_range)(half* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
+                               int r0, int nr, cudaStream_t stream);
     // The same matrix quantised straight to int8 (no FP16 round trip): W[r * ld + c] = round(clamp(half2float(v) / sc[r])),
     // sc the load-time row scales (amax/127, 1 for a zero row); ld % 4 == 0.
     void (*dequant_rows_i8)(int8_t* W, int ld, const uint16_t* T, const half* suh, const half* svh, int rows, int cols,
@@ -40,6 +45,9 @@ struct X3Codec {
     // Window GEMV (gemv_window.cu) over a list of this codec's parts: y[t][out_off + r] = bf16(W x[t]),
     // x half [n][cols], y bf16 with row stride ldy. nullptr when the codec has no register path.
     void (*window)(const XwList& L, const half* x, __nv_bfloat16* y, int ldy, cudaStream_t stream);
+    // The same GEMV with an f32 output: y[t][out_off + r] = f32(bf16(W x[t])), the values of `window` widened, so an
+    // engine that converts matvec's output to f32 can skip its own bf16 buffer and the conversion pass.
+    void (*window_f32)(const XwList& L, const half* x, float* y, int ldy, cudaStream_t stream);
     // Routed-expert window GEMV (moe_window.cuh) over a device-built list of at most `parts` parts; nullptr: none.
     // Part u's column t lands at y[t * ldy + u * rows].
     void (*moe)(const XwMoeList* L, int parts, int n, int rows, int cols, int kparts, __nv_bfloat16* y, int ldy,
@@ -50,20 +58,27 @@ struct X3Codec {
                  cudaStream_t stream);
 };
 
-// Verify blocks: one part per distinct expert with all n columns; slot[a] = part of assignment a. staged != nullptr:
-// per-assignment inputs (the down projection), staged per part by x3_moe_stage after the build.
+// Verify blocks: one part per distinct expert with all n columns; aindex[u * n + t] = the assignment of token t routed
+// to part u (-1 for none), which the out launch uses to write y [assignment][rows] directly and, for a per-slot input
+// (the down projection), which had_in uses to read the assignment's row of x: no staged per-part copy.
 void x3_moe_build_dedup(const int* ids, int n, int topk, const void* bank, int rows, int cols, int kparts, int ncodec,
-                        const half* x, half* staged, half* A, float* P, int* slot, int* part_expert, int* nparts,
-                        XwMoeList* lists, cudaStream_t stream);
-void x3_moe_stage(const half* x, const int* slot, int n, int topk, int cols, const int* nparts, half* staged, cudaStream_t stream);
-void x3_moe_unslot(const __nv_bfloat16* Y, const int* slot, int count, int topk, int rows, int ldy, __nv_bfloat16* y,
-                   cudaStream_t stream);
+                        const half* x, bool per_slot_input, half* A, float* P, int* aindex, XwMoeList* lists,
+                        cudaStream_t stream);
 
 // Prompt path: rows of x picked by an expert's assignments, and that expert's [count][rows] output scattered to y.
 void x3_moe_gather(const half* x, const int* group, int count, int topk, bool per_slot_input, int cols, half* out,
                    cudaStream_t stream);
 void x3_moe_scatter(const float* in, const int* group, int count, int rows, __nv_bfloat16* y, cudaStream_t stream);
 void x3_moe_scatter_bf16(const __nv_bfloat16* in, const int* group, int count, int rows, __nv_bfloat16* y, cudaStream_t stream);
+
+// The same pass over the routing for gate and up together (two banks, one codec index space, the caller's two outputs in
+// one allocation `up_base` = yb - ya elements apart): two parts per routed slot / distinct expert, A / P slot 2u + m.
+void x3_moe_build2(const int* ids, int count, int topk, const void* bankA, const void* bankB, int rows, int cols,
+                   int kparts, int ncodec, const half* x, int up_base, half* A, float* P, XwMoeList* lists,
+                   cudaStream_t stream);
+void x3_moe_build_dedup2(const int* ids, int n, int topk, const void* bankA, const void* bankB, int rows, int cols,
+                         int kparts, int ncodec, const half* x, int up_base, half* A, float* P,
+                         int* aindex, XwMoeList* lists, cudaStream_t stream);
 
 // Device bank of routed experts -> one list per codec slot, from the routing ids (count = tokens x top-k).
 void x3_moe_build(const int* ids, int count, int topk, bool per_slot_input, const void* bank, int rows, int cols,

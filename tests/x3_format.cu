@@ -3,11 +3,15 @@
 // the test-only scalar codec through the same reconstruct/gemv skeletons. sq (n=1) and x3v (n=2..8)
 // are both exercised. The straight-to-int8 reconstruct must equal the engine's own quantise kernel
 // (int8_quant_rows on dequant_rows' output) bit for bit. The window GEMV (the serving default) runs
-// every row that has one: column bit-identity for n = 1..16 and the same host GEMV reference.
+// every row that has one: column bit-identity for n = 1..16 and the same host GEMV reference. Its f32-output form
+// (the engine's matvec_f32) returns exactly those bf16 values widened, at the codec seam and through the registry.
 // No llama-paw needed here (that bit-match lives in the porting notes).
 #include "int8_gemm.cuh"
 #include "window.hpp"
 #include "x3.cuh"
+#include "weight_format.hpp"
+#include "x3_record.hpp"
+#include "gguf.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -16,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -38,6 +43,13 @@ T* dev_up(const std::vector<T>& h) {
     if (cudaMalloc(&d, h.size() * sizeof(T)) != cudaSuccess) { std::fprintf(stderr, "cudaMalloc failed\n"); std::exit(2); }
     cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return d;
+}
+
+template <typename T>
+std::vector<T> down(T* d, size_t n) {
+    std::vector<T> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    return h;
 }
 
 std::string fname(const char* n, int nv) { return std::string(n) + "=" + std::to_string(nv); }
@@ -101,6 +113,40 @@ void rows_identity(const x3::X3Codec* c, int rows, int cols, int ld) {
             eq &= R[size_t(r) * ld + k] == (k < cols ? W[size_t(k) * rows + r] : uint16_t(0x7b7b));
     check(eq, std::string(c->name) + ": dequant_rows == dequant transposed (rows=" + std::to_string(rows) +
               " cols=" + std::to_string(cols) + " ld=" + std::to_string(ld) + ")");
+    cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_R);
+}
+
+// A row range of dequant_rows is exactly the same rows of the whole matrix, bit for bit, and writes nothing outside the
+// range: the trellis' k-major stride is the matrix's full row-tile count, so a range is a pointer advance and not a
+// smaller matrix (the head dump of 4c walks a 200K-row matrix this way).
+void rows_range_identity(const x3::X3Codec* c, int rows, int cols) {
+    std::vector<uint16_t> trellis(size_t(rows / 16) * (cols / 16) * c->words);
+    for (auto& v : trellis) v = uint16_t(lcg() >> 13);
+    std::vector<half> suh(cols), svh(rows);
+    for (auto& v : suh) v = __float2half(0.5f + rnd());
+    for (auto& v : svh) v = __float2half(0.5f + rnd());
+    uint16_t* d_t = dev_up(trellis);
+    half* d_suh = dev_up(suh);
+    half* d_svh = dev_up(svh);
+    half *d_W = nullptr, *d_R = nullptr;
+    cudaMalloc(&d_W, size_t(rows) * cols * sizeof(half));
+    cudaMalloc(&d_R, size_t(rows) * cols * sizeof(half));
+    c->dequant_rows(d_W, cols, d_t, d_suh, d_svh, rows, cols, 0);
+    std::vector<uint16_t> W(size_t(rows) * cols);
+    cudaMemcpy(W.data(), d_W, W.size() * 2, cudaMemcpyDeviceToHost);
+    bool eq = true;
+    for (const auto& rg : std::vector<std::pair<int, int>>{{0, 128}, {128, 128}, {256, 128}, {128, 256}}) {
+        cudaMemset(d_R, 0x7b, size_t(rows) * cols * sizeof(half));   // sentinel outside the range
+        c->dequant_rows_range(d_R, cols, d_t, d_suh, d_svh, rows, cols, rg.first, rg.second, 0);
+        std::vector<uint16_t> R(size_t(rows) * cols);
+        cudaMemcpy(R.data(), d_R, R.size() * 2, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < R.size(); ++i) {
+            const size_t r = i / size_t(cols), k = i % size_t(cols);
+            eq &= R[i] == (r < size_t(rg.second) ? W[(r + size_t(rg.first)) * size_t(cols) + k] : uint16_t(0x7b7b));
+        }
+    }
+    check(eq, std::string(c->name) + ": dequant_rows_range == dequant_rows of the same rows (rows=" + std::to_string(rows) +
+              " cols=" + std::to_string(cols) + ")");
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W); cudaFree(d_R);
 }
 
@@ -201,6 +247,37 @@ void window_identity(const x3::X3Codec* c, int rows, int cols) {
     }
     check(eq, std::string(c->name) + ": window column bit-identical n=1..16 (rows=" + std::to_string(rows) +
               " cols=" + std::to_string(cols) + ")");
+
+    // The f32-output entry point (the format's matvec_f32): the bf16 path's values widened to f32, bit for bit, at
+    // every n - the out stage rounds to bf16 and stores that value as f32, so an engine dropping its own bf16 -> f32
+    // pass cannot move a number.
+    if (c->window_f32) {
+        float* d_yf = nullptr;
+        cudaMalloc(&d_yf, size_t(x3::XW_MAX_N) * rows * sizeof(float));
+        auto runf = [&](int n) {
+            cudaMemset(d_yf, 0x5c, size_t(n) * rows * sizeof(float));   // rows the kernel must write are overwritten
+            x3::XwList L;
+            x3::xw_begin(L, cols, n);
+            x3::xw_add(L, d_t, d_suh, d_svh, rows, 0, num_sms());
+            x3::xw_bind_scratch(L, d_ws);
+            c->window_f32(L, d_x, d_yf, rows, 0);
+            cudaError_t err = cudaDeviceSynchronize();
+            check(err == cudaSuccess, std::string(c->name) + ": window_f32 launch (" + cudaGetErrorString(err) + ")");
+            std::vector<float> yf(size_t(n) * rows);
+            cudaMemcpy(yf.data(), d_yf, yf.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            return yf;
+        };
+        bool eqf = true;
+        for (int n = 1; n <= x3::XW_MAX_N && eqf; ++n) {
+            const std::vector<__nv_bfloat16> yn = run(n);
+            const std::vector<float> yf = runf(n);
+            for (size_t i = 0; i < yn.size() && eqf; ++i)
+                if (yf[i] != __bfloat162float(yn[i])) eqf = false;
+        }
+        check(eqf, std::string(c->name) + ": window_f32 == f32(window) bit for bit n=1..16 (rows=" + std::to_string(rows) +
+                  " cols=" + std::to_string(cols) + ")");
+        cudaFree(d_yf);
+    }
 
     // accuracy against the dequantised matrix (dequant emits [in][out], row stride = rows)
     half* d_W = nullptr;
@@ -361,6 +438,102 @@ void test_row(const x3::X3Codec* c, int rows, int cols) {
     cudaFree(d_t); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_W);
 }
 
+// A dense two-part X3 tensor (unequal parts: not an expert bank) built in memory and loaded through the registry.
+Mat dense_x3(const WeightFormat* wf, const int* part_rows, int nparts, int cols) {
+    std::vector<char> raw;
+    auto put = [&](const void* p, size_t n) { const char* b = static_cast<const char*>(p); raw.insert(raw.end(), b, b + n); };
+    for (int p = 0; p < nparts; ++p) {
+        const X3Record rec = x3_record_make(part_rows[p], cols, 32, X3_CODEC_MUL1);
+        put(&rec, sizeof rec);
+        for (size_t i = 0; i < size_t(part_rows[p] / 16) * (cols / 16) * 32; ++i) { const uint16_t w = uint16_t(lcg() >> 16); put(&w, 2); }
+        for (int i = 0; i < cols + part_rows[p]; ++i) { const half h = __float2half(0.5f + rnd()); put(&h, 2); }
+    }
+    Upload up = [](const void* h, size_t bytes) -> const void* {
+        void* d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, h, bytes, cudaMemcpyDeviceToHost);
+        return d;
+    };
+    int rows = 0;
+    for (int p = 0; p < nparts; ++p) rows += part_rows[p];
+    return wf->load(raw, rows, cols, up, 0);
+}
+
+// The format seam the engine calls: a dense X3 matrix loaded through the weight-format registry must answer
+// matvec_f32 with its bf16 matvec's values widened, bit for bit (two row parts, so the out stage writes at an
+// out_off). If the override is not wired the base throws and every dense projection silently pays a bf16 scratch
+// and a conversion pass again.
+void format_matvec_f32() {
+    const WeightFormat* wf = weight_format(GGML_X3);
+    check(wf != nullptr, "x3 is in the weight-format registry");
+    if (!wf) return;
+    const int cols = 256, pr[2] = {256, 128};   // unequal parts: not an expert bank
+    const int rows = pr[0] + pr[1];
+    const Mat m = dense_x3(wf, pr, 2, cols);
+    check(m.fmt == wf, "x3 tensor keeps the x3 format");
+    for (int n : {1, 4}) {
+        std::vector<half> x(size_t(n) * cols);
+        for (auto& v : x) v = __float2half(rnd());
+        half* d_x = dev_up(x);
+        __nv_bfloat16* d_y = nullptr;
+        float* d_yf = nullptr;
+        cudaMalloc(&d_y, size_t(n) * rows * sizeof(__nv_bfloat16));
+        cudaMalloc(&d_yf, size_t(n) * rows * sizeof(float));
+        cudaMemset(d_yf, 0x5c, size_t(n) * rows * sizeof(float));
+        wf->matvec(m, d_x, d_y, n, 0);
+        bool threw = false;
+        try {
+            wf->matvec_f32(m, d_x, d_yf, n, 0);
+        } catch (const std::runtime_error& e) {
+            threw = true;
+            check(false, std::string("x3 matvec_f32 is wired (") + e.what() + ")");
+        }
+        cudaError_t err = cudaDeviceSynchronize();
+        check(err == cudaSuccess, std::string("x3 matvec_f32 launch (") + cudaGetErrorString(err) + ")");
+        if (!threw) {
+            const std::vector<__nv_bfloat16> y = down(d_y, size_t(n) * rows);
+            const std::vector<float> yf = down(d_yf, size_t(n) * rows);
+            bool eq = true;
+            for (size_t i = 0; i < y.size() && eq; ++i) eq = yf[i] == __bfloat162float(y[i]);
+            check(eq, "x3 matvec_f32 == f32(matvec) bit for bit, n=" + std::to_string(n));
+        }
+        cudaFree(d_x); cudaFree(d_y); cudaFree(d_yf);
+    }
+}
+
+// The other format seam the engine calls: a dense X3 matrix answers dequant_rows_h with exactly the rows dequant_h
+// writes, bit for bit, across a part boundary, and writes nothing outside the range. A format that does not implement
+// it says so (false) instead of silently handing back an unwritten buffer: the 4c head dump walks a 200K-row lm_head
+// in chunks because the engine has no whole-matrix FP16 scratch.
+void format_dequant_rows_h() {
+    const WeightFormat* wf = weight_format(GGML_X3);
+    if (!wf) return;
+    const int cols = 256, pr[2] = {256, 128};
+    const int rows = pr[0] + pr[1];
+    const Mat m = dense_x3(wf, pr, 2, cols);
+    half* d_all = nullptr;
+    cudaMalloc(&d_all, size_t(rows) * cols * sizeof(half));
+    wf->dequant_h(m, d_all, 0);
+    const std::vector<uint16_t> W = down(reinterpret_cast<uint16_t*>(d_all), size_t(rows) * cols);
+    bool wired = true, eq = true;
+    for (const auto& rg : std::vector<std::pair<int, int>>{{0, 128}, {128, 128}, {256, 128}}) {
+        half* d_p = nullptr;
+        cudaMalloc(&d_p, size_t(rg.second) * cols * sizeof(half));
+        cudaMemset(d_p, 0x7b, size_t(rg.second) * cols * sizeof(half));   // sentinel: nothing may be written outside
+        wired &= wf->dequant_rows_h(m, d_p, rg.first, rg.second, 0);
+        const std::vector<uint16_t> R = down(reinterpret_cast<uint16_t*>(d_p), size_t(rg.second) * cols);
+        for (size_t i = 0; i < R.size(); ++i) eq &= R[i] == W[size_t(rg.first + i / size_t(cols)) * size_t(cols) + i % size_t(cols)];
+        cudaFree(d_p);
+    }
+    check(wired, "x3 dequant_rows_h is wired");
+    check(eq, "x3 dequant_rows_h == the same rows of dequant_h bit for bit, across a part boundary");
+    half* d_p = nullptr;
+    cudaMalloc(&d_p, size_t(128) * cols * sizeof(half));
+    check(!wf->dequant_rows_h(m, d_p, 64, 128, 0), "x3 dequant_rows_h refuses a range off a 128-row tile");
+    check(!wf->dequant_rows_h(m, d_p, 256, 256, 0), "x3 dequant_rows_h refuses a range past the last row");
+    cudaFree(d_p); cudaFree(d_all);
+}
+
 }  // namespace
 
 int main() {
@@ -378,6 +551,8 @@ int main() {
         test_row(&table[i], 256, 256);
         rows_identity(&table[i], 256, 384, 392);
         rows_identity(&table[i], 384, 256, 256);
+        rows_range_identity(&table[i], 384, 256);
+        rows_range_identity(&table[i], 384, 6144);   // the head's column count
         i8_identity(&table[i], 256, 256);
         i8_identity(&table[i], 256, 384);
         i8_identity(&table[i], 384, 256);
@@ -385,6 +560,8 @@ int main() {
         window_identity(&table[i], 1024, 6144);   // kparts > 1
         if (table[i].has_x3v) col_identity(&table[i], 8448, 5120);  // size_n>8192 -> CFG1
     }
+    format_matvec_f32();
+    format_dequant_rows_h();
     if (g_ok) std::printf("x3_format: OK\n");
     return g_ok ? 0 : 1;
 }

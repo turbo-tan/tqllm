@@ -11,14 +11,15 @@ struct DecodeModel {
     MixedExpertCache & experts; MixedExpertCache * mtp_experts = nullptr;
     std::vector<RecurrentState> rec; std::vector<AttentionState> att; std::vector<std::unique_ptr<Device<float>>> ple_past;
     PleTokenHistory history; int position = 0;
-    bool prefetch_on = std::getenv("TQFN_NO_PREFETCH") == nullptr; cudaStream_t copy_stream = nullptr, miss_stream = nullptr;
+    bool prefetch_on = true; cudaStream_t copy_stream = nullptr, miss_stream = nullptr;
     // speculative decoding: per-token rollback state, final wide residual rows of the last step, MTP head state
     bool spec = false; int spec_pos0 = 0, spec_n = 0; size_t spec_hist0 = 0;
     std::vector<std::unique_ptr<Device<float>>> ple_saved, ple_old;
     std::unique_ptr<Device<float>> pingpong[2];  // prefill residual between layers (layer scratch is reset)
-    std::unique_ptr<Device<float>> res_keep;  // [n][width] of the last step, persistent (grows with the prefill chunk)
+    std::unique_ptr<Device<float>> res_keep;
+    std::unique_ptr<Device<__nv_bfloat16>> res_keep_b;  // the layer-major prefill's BF16 wide rows (prefill_wide_bf16)  // [n][width] of the last step, persistent (grows with the prefill chunk)
     AttentionState mtp_att; std::unique_ptr<Device<float>> mtp_h;  // MTP block KV and its last wide output
-    float draft_conf = 1.f;  // top probability of the last MTP draft (TQFN_DRAFT_TAU)
+    float draft_conf = 1.f;  // top probability of the last MTP draft (FnConfig::draft_tau)
     // After a long prompt: the trunk's K/V pages wholly below len - keep move to pinned host memory (same addresses);
     // returns the device bytes freed. TQFN_KV_HOST_KEEP: positions kept on the device (32768); TQFN_KV_HOST=0: off.
     size_t kv_to_host() {
@@ -26,7 +27,7 @@ struct DecodeModel {
         size_t freed = 0;
         for (auto & a : att) {
             if (!a.k || !a.k->vmm || a.len <= 2 * keep) continue;
-            const size_t row = a.k->bytes / size_t(g_kv_capacity), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
+            const size_t row = a.k->bytes / size_t(kv_cap(a, cp.rt.kv_capacity)), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
             for (size_t i = 0; i < cut; ++i) for (KvBuf * b : {a.k.get(), a.v.get()})
                 if (!b->on_host[i] && b->move(i, true)) freed += b->page;
         }
@@ -47,7 +48,13 @@ struct DecodeModel {
         ck(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
         ck(cudaStreamCreateWithFlags(&miss_stream, cudaStreamNonBlocking)); experts.set_miss_stream(miss_stream);
         PersistentAlloc keep; res_keep = std::make_unique<Device<float>>(size_t(64) * width); mtp_h = std::make_unique<Device<float>>(width);
+        // K/V and QSA state sized by this sequence's capacity (its request, or the slot context with the prompt cache), not
+        // the slot context of every sequence: np 2 on a 3090 mapped full-context K/V for each slot (11-03)
+        kv_capacity = int((capacity + 1023) / 1024 * 1024);
+        for (auto & a : att) a.cap = kv_capacity;
+        mtp_att.cap = kv_capacity;
     }
+    int kv_capacity = 0;
     ~DecodeModel() { if (copy_stream) { cudaStreamSynchronize(copy_stream); cudaStreamDestroy(copy_stream); }
                      if (miss_stream) { experts.set_miss_stream(nullptr); if (mtp_experts) mtp_experts->set_miss_stream(nullptr);
                                         cudaStreamSynchronize(miss_stream); cudaStreamDestroy(miss_stream); } }
@@ -59,7 +66,11 @@ struct DecodeModel {
     // Layer-major prefill: the dense part of a layer runs on sub-chunks and stops before the routed experts, leaving its
     // rows at `off` of these whole-chunk buffers (combined residual in place of the input rows, FFN inject, FP16 FFN
     // input, routing, shared expert output); the experts then run once for the whole chunk (prefill_layer)
-    struct PrefillSink { float * wide; float * inject; __half * xr; int * routed; float * weights, * shared_weights, * sd; int off; };
+    // wide_b: the wide rows in BF16 storage (wide null then; layer_forward_step)
+    struct PrefillSink { float * wide; float * inject; __half * xr; int * routed; float * weights, * shared_weights, * sd; int off;
+                         __nv_bfloat16 * wide_b = nullptr; };
+    int hc_path(const std::string & prefix, int n) const;
+    bool prefill_wide_bf16(int sub) const;
     void layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                        AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs = nullptr,
                        const PrefillSink * sink = nullptr);
@@ -108,7 +119,9 @@ struct DecodeModel {
     // One trunk layer for a whole prefill chunk (rows of `wide`, replaced in place): the dense part in sub-chunks of
     // --prefill-sub tokens (KV, recurrent and PLE state carried in order), then the routed experts once for every row:
     // the ones in the layer's cache bank run from it (nothing is evicted), the others from the staging banks.
-    void prefill_layer(int layer, float * wide, int n, const float * ple_rows, MixedExpertCache & cache, AttentionState * att_override = nullptr);
+    // wide_b: BF16 wide rows instead of `wide` (null then)
+    void prefill_layer(int layer, float * wide, int n, const float * ple_rows, MixedExpertCache & cache, AttentionState * att_override = nullptr,
+                       __nv_bfloat16 * wide_b = nullptr);
 
     // The host side of a chunk: token embeddings and per-layer embeddings gathered from the mapped files (the PLE history is
     // appended here, so chunks must be prepared in prompt order). A multi-chunk prefill prepares the next chunk on a thread
@@ -174,17 +187,16 @@ struct DecodeModel {
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
     return tqllm::expert_u4h_ids(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
 }
-inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id) {
+inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id, bool tiled) {
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
-                                g_tile_experts);
+                                tiled);
 }
 // The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
 inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
     const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
-    g_tile_experts = false;  // untiled, as in the file: the loader tiles both the same way
     uint64_t off = 0;
     for (int l = 0; l < c.layers; ++l) {
-        const auto parts = repack_expert(checkpoint, l, 0); uint64_t b = 0;
+        const auto parts = repack_expert(checkpoint, l, 0, false); uint64_t b = 0;
         for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
         pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
     }
@@ -193,7 +205,7 @@ inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
     for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
         for (int64_t i; (i = next++) < total;) {
             const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+            const auto parts = repack_expert(checkpoint, l, e, false); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
             for (int k = 0; k < 6; ++k) {
                 require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
                 std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();

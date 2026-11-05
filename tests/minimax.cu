@@ -1,10 +1,13 @@
 // MiniMax kernels against the same math on the CPU: swigluoai, partial NeoX RoPE, causal GQA attention.
 #include "minimax_kernels.cuh"
 #include <cuda_fp8.h>
+#include "common_kernels.cuh"
+#include "moe_common.cuh"
 #include "minimax_memory.hpp"
 #include "minimax_spec.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -66,6 +69,23 @@ int main() try {
         }
         require(worst < 2e-3, "swigluoai differs from the CPU math");
         require(std::fabs(__half2float(o[0]) - (-6.f * 7.f / (1.f + std::exp(-1.702f * 7.f)))) < 0.05f, "swigluoai clamps");
+
+        // the fused form reads gate | up out of one [rows][2 * ff] block: the same half values, the same output, bit for
+        // bit - the engine's shared expert no longer copies the two halves into their own buffers first
+        const int rows = 16, ff = 256;
+        std::vector<float> gu(size_t(rows) * 2 * ff);
+        for (int t = 0; t < rows; ++t)
+            for (int c = 0; c < ff; ++c) {
+                gu[size_t(t) * 2 * ff + c] = g[size_t(t) * ff + c];
+                gu[size_t(t) * 2 * ff + ff + c] = u[size_t(t) * ff + c];
+            }
+        __half * dpair = nullptr;
+        ck(cudaMalloc(&dpair, size_t(rows) * ff * 2));
+        tqllm_cuda::mm_swigluoai_f32_pair(dev(gu), dpair, rows, ff, 1.702f, 7.f, nullptr);
+        const auto op = host(dpair, size_t(rows) * ff);
+        for (size_t i = 0; i < gu.size() / 2; ++i)
+            require(__half_as_ushort(op[i]) == __half_as_ushort(o[i]), "swigluoai over a fused gate | up block differs");
+        cudaFree(dpair);
     }
     {  // RoPE: rotates dims [0, 64) of each 128-dim head in halves (j, j + 32); dims [64, 128) untouched
         const int T = 3, Hh = 2, D = 128, R = 64, pos0 = 5;
@@ -325,6 +345,97 @@ int main() try {
         }
         require(worst_s < 1e-4, "indexer block scores differ from the CPU math");
         require(worst_o < 1e-4, "sparse attention differs from the CPU math");
+    }
+    {  // the router matvec: one (two rows, column slice) block reads its slice once for every token of the verify block.
+       // The FP32 bits are the same as the (row, slice, token) grid it replaces - the experts a step routes must not move
+        const int cols = 6144, splits = std::max(1, std::min(64, cols / 512));
+        const int per = (cols + splits - 1) / splits;
+        std::vector<float> w(size_t(129) * cols), x(size_t(8) * cols);
+        for (auto & v : w) v = nd(rng);
+        for (auto & v : x) v = nd(rng);
+        const float * dw = dev(w), * dx = dev(x);
+        float * dy = nullptr, * dp = nullptr;
+        ck(cudaMalloc(&dy, size_t(129) * 8 * sizeof(float)));
+        ck(cudaMalloc(&dp, size_t(129) * 8 * splits * sizeof(float)));
+        // __shfl_xor_sync(16, 8, 4, 2, 1): every lane adds its partner's value from before the step
+        auto tree = [](std::array<float, 32> a) {
+            for (int o = 16; o; o >>= 1) {
+                const std::array<float, 32> b = a;
+                for (int l = 0; l < 32; ++l) a[l] = b[l] + b[l ^ o];
+            }
+            return a[0];
+        };
+        int bad = 0;
+        for (const int rows : {128, 129})   // 129: the last block owns one row, not two
+            for (const int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            ck(cudaMemset(dy, 0, size_t(rows) * 8 * sizeof(float)));
+            tqllm_cuda::mm_mv_f32_splitk(dw, dx, dy, dp, rows, cols, n, splits, nullptr);
+            const auto y = host(dy, size_t(rows) * n);
+            for (int t = 0; t < n; ++t) for (int r = 0; r < rows; ++r) {
+                float v = 0.f;
+                for (int sp = 0; sp < splits; ++sp) {  // one block: 8 warps of 32 lanes, each lane its strided column sum
+                    const int c0 = sp * per, c1 = std::min(cols, c0 + per);
+                    std::array<float, 32> red{};
+                    for (int wp = 0; wp < 8; ++wp) {
+                        std::array<float, 32> lane{};
+                        for (int l = 0; l < 32; ++l) {
+                            float acc = 0.f;
+                            for (int c = c0 + wp * 32 + l; c < c1; c += 256)
+                                acc = std::fma(w[size_t(r) * cols + c], x[size_t(t) * cols + c], acc);  // the GPU fuses the multiply-add (x86 gcc would not)
+                            lane[l] = acc;
+                        }
+                        red[wp] = tree(lane);
+                    }
+                    std::array<float, 32> lane{};
+                    for (int l = 0; l < 8; ++l) lane[l] = red[l];
+                    v += tree(lane);   // the splits in ascending order, as router_sum_k adds them
+                }
+                if (std::memcmp(&v, &y[size_t(t) * rows + r], 4) != 0) ++bad;
+            }
+        }
+        require(bad == 0, "the router matvec's bits moved with the verify block width");
+        // the router and its routing in two launches instead of three: the top-k walk runs over the split-k partials and
+        // sums each expert's splits the way router_sum_k did, so the logits, the ids and the weights are the bits of the
+        // matvec + moe_common::route path - the experts a step routes cannot move.
+        int fbad = 0;
+        for (const int rows : {128, 129})
+            for (const int n : {1, 2, 4, 6, 8}) {
+                std::vector<float> bs(static_cast<size_t>(rows));
+                for (auto & v : bs) v = 0.1f * nd(rng);
+                const float * dbs = dev(bs);
+                float * y1 = nullptr, * lg = nullptr, * w1 = nullptr, * w2 = nullptr;
+                int * i1 = nullptr, * i2 = nullptr;
+                ck(cudaMalloc(&y1, size_t(rows) * n * sizeof(float)));
+                ck(cudaMalloc(&lg, size_t(rows) * n * sizeof(float)));
+                ck(cudaMalloc(&w1, size_t(n) * 8 * sizeof(float)));
+                ck(cudaMalloc(&w2, size_t(n) * 8 * sizeof(float)));
+                ck(cudaMalloc(&i1, size_t(n) * 8 * sizeof(int)));
+                ck(cudaMalloc(&i2, size_t(n) * 8 * sizeof(int)));
+                tqllm_cuda::mm_mv_f32_splitk(dw, dx, y1, dp, rows, cols, n, splits, nullptr);
+                tqllm_cuda::moe_common::route(y1, dbs, i1, w1, rows, 8, true, 2.5f, nullptr, n);
+                tqllm_cuda::mm_mv_f32_splitk_route(dw, dx, lg, dp, rows, cols, n, splits, dbs, i2, w2, 8, true, 2.5f,
+                                                   nullptr);
+                const auto a = host(y1, size_t(rows) * n), b = host(lg, size_t(rows) * n);
+                const auto wa = host(w1, size_t(n) * 8), wb = host(w2, size_t(n) * 8);
+                const auto ia = host(i1, size_t(n) * 8), ib = host(i2, size_t(n) * 8);
+                for (size_t j = 0; j < a.size(); ++j)
+                    if (std::memcmp(&a[j], &b[j], 4) != 0) ++fbad;
+                if (ia != ib) ++fbad;
+                for (size_t j = 0; j < wa.size(); ++j)
+                    if (std::memcmp(&wa[j], &wb[j], 4) != 0) ++fbad;
+                for (int t = 0; t < n; ++t) {  // not a vacuous match: eight distinct experts, weights that sum to 2.5
+                    std::vector<int> id(ib.begin() + t * 8, ib.begin() + (t + 1) * 8);
+                    std::sort(id.begin(), id.end());
+                    bool distinct = true;
+                    for (int r = 1; r < 8; ++r) distinct = distinct && id[r] != id[r - 1];
+                    if (!distinct) ++fbad;
+                    float sum = 0.f;
+                    for (int r = 0; r < 8; ++r) sum += wb[size_t(t) * 8 + r];
+                    if (std::fabs(sum - 2.5f) > 1e-4f) ++fbad;
+                }
+                cudaFree(y1); cudaFree(lg); cudaFree(w1); cudaFree(w2); cudaFree(i1); cudaFree(i2);
+            }
+        require(fbad == 0, "the fused router route moved the logits, the ids or the weights");
     }
     std::printf("minimax kernels: PASS\n");
     return 0;

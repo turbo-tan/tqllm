@@ -8,9 +8,9 @@ The prebuilt image is public on the GitHub container registry and on Docker Hub.
 (RTX 30 / 40 / 50) and arm64 (GB10 / DGX Spark); `docker pull` picks the right one.
 
 ```sh
-docker pull ghcr.io/turbo-tan/tqllm:1.2.3
+docker pull ghcr.io/turbo-tan/tqllm:1.4.1
 # or
-docker pull ytan2000/tqllm:1.2.3
+docker pull ytan2000/tqllm:1.4.1
 ```
 
 `latest` always points to the newest release.
@@ -20,7 +20,7 @@ docker pull ytan2000/tqllm:1.2.3
 Requires Linux, an NVIDIA GPU, Docker Compose, and NVIDIA Container Toolkit.
 One image tag covers x86-64 PCs with RTX 30, 40 or 50 series GPUs (CUDA architectures 86, 89, 120) and arm64
 GB10 / DGX Spark systems (121); `docker pull` picks the right platform and the engine picks its kernels for your GPU at
-start. Apple Metal is not supported.
+start. The image does not cover Apple Silicon: on a Mac, build from source ([Mac guide](mac.md)).
 
 Place a supported model at `models/model.gguf` (the tokenizer is read from the GGUF). Supported: Qwen3.5 /
 Qwen3.8 dense models (hybrid attention + Gated DeltaNet) and qwen35moe mixture-of-experts models such as MiniCPM-V 4.7

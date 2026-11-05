@@ -440,9 +440,6 @@ void launch_sq(const float* A, const uint16_t* B, float* C, int size_k, int size
         maxb = 1;
     grid = std::min(maxb * sq_num_sms(), 1024);
     decomp(grid, ksplit, rows_per);
-    if (const char* e = getenv("GGML_PAW_SQ_GRID_MAX")) {
-        if (atoi(e) > 0 && grid > atoi(e)) { grid = atoi(e); decomp(grid, ksplit, rows_per); }
-    }
     const size_t smem = smem_for(rows_per);
     if (ksplit > X3_SQ_KSPLIT_CAP || nb256 > X3_SQ_COUNTERS_CAP)
         throw std::runtime_error("x3 sq: shape exceeds workspace caps");
