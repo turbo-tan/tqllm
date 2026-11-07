@@ -4,11 +4,27 @@
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
 #include "decode_rules.hpp"
+#if defined(TQLLM_WITH_HIP)
+#include <hipcub/hipcub.hpp>
+#else
 #include <cub/block/block_scan.cuh>
+#endif
+#if defined(TQLLM_WITH_HIP)
+#include <hipcub/hipcub.hpp>
+#else
 #include <cub/device/device_radix_sort.cuh>
+#endif
+#if defined(TQLLM_WITH_HIP)
+// hipcub.hpp already included
+#else
 #include <cub/device/device_scan.cuh>
+#endif
 #include <climits>
+#if defined(TQLLM_WITH_HIP)
+// hipcub.hpp already included
+#else
 #include <cub/device/device_segmented_radix_sort.cuh>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -417,7 +433,7 @@ __global__ void __launch_bounds__(32 * W) score_bits_k(const float * pooled_keys
 // (11, 11, 10 bits) find T and how many keys equal to T it takes (r); ties go by index, smallest first, as the key order does.
 __global__ void __launch_bounds__(1024) topk_bits_k(const uint32_t * scores, uint64_t * out, int blocks, int first_position,
                                                     int ratio, int need_cap) {
-    using Scan = cub::BlockScan<int, 1024>;
+    using Scan = hipcub::BlockScan<int, 1024>;
     __shared__ typename Scan::TempStorage scan;
     const int t = blockIdx.x, tid = threadIdx.x;
     const int complete = (first_position + t + 1) / ratio, need = min(complete, need_cap);
@@ -499,7 +515,7 @@ QsaBatchScratch::QsaBatchScratch(int max_queries_, int max_cells, int ratio, int
             ck(cudaMalloc(&keys, items * sizeof(uint64_t)));
             ck(cudaMalloc(&sorted, items * sizeof(uint64_t)));
             ck(cudaMalloc(&offsets, size_t(max_queries + 1) * sizeof(int)));
-            ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries,
+            ck(hipcub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries,
                                                                  offsets, offsets + 1));
             ck(cudaMalloc(&temp, temp_bytes));
         }
@@ -518,7 +534,7 @@ void QsaBatchScratch::full() {
     ck(cudaMalloc(&keys, items * sizeof(uint64_t)));
     ck(cudaMalloc(&sorted, items * sizeof(uint64_t)));
     ck(cudaMalloc(&offsets, size_t(max_queries + 1) * sizeof(int)));
-    ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries, offsets, offsets + 1));
+    ck(hipcub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, temp_bytes, keys, sorted, int(items), max_queries, offsets, offsets + 1));
     ck(cudaMalloc(&temp, temp_bytes));
     lean = false;
 }
@@ -653,7 +669,7 @@ QsaSelector::QsaSelector(int max_cells, int ratio, int top_k)
     try {
         ck(cudaMalloc(&keys_, size_t(blocks) * sizeof(uint64_t)));
         ck(cudaMalloc(&sorted_, size_t(blocks) * sizeof(uint64_t)));
-        ck(cub::DeviceRadixSort::SortKeysDescending(nullptr, temp_bytes_, keys_, sorted_, blocks));
+        ck(hipcub::DeviceRadixSort::SortKeysDescending(nullptr, temp_bytes_, keys_, sorted_, blocks));
         ck(cudaMalloc(&temp_, temp_bytes_));
     } catch (...) {
         cudaFree(temp_); cudaFree(sorted_); cudaFree(keys_);
@@ -679,10 +695,10 @@ int QsaSelector::select(const float * block_scores, int cells, int query_positio
         pack_scores<<<(complete + 255) / 256, 256, 0, stream>>>(block_scores, keys_, complete);
         ck(cudaPeekAtLastError());
         size_t needed = 0;
-        ck(cub::DeviceRadixSort::SortKeysDescending(nullptr, needed, keys_, sorted_, complete, 0, 64, stream));
+        ck(hipcub::DeviceRadixSort::SortKeysDescending(nullptr, needed, keys_, sorted_, complete, 0, 64, stream));
         if (needed > temp_bytes_) throw std::runtime_error("QSA selector: sort scratch is too small");
         size_t available = temp_bytes_;
-        ck(cub::DeviceRadixSort::SortKeysDescending(temp_, available, keys_, sorted_, complete, 0, 64, stream));
+        ck(hipcub::DeviceRadixSort::SortKeysDescending(temp_, available, keys_, sorted_, complete, 0, 64, stream));
     }
     expand_selection<<<(width + 255) / 256, 256, 0, stream>>>(sorted_, positions, valid,
                                                                width, complete, tail, ratio_, query_position);
@@ -805,7 +821,7 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
             qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);  // full keys for the reference sort
             segment_offsets<<<(tokens + 256) / 256, 256, 0, stream>>>(scratch.offsets, tokens, blocks);
             size_t available = scratch.temp_bytes;
-            ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(scratch.temp, available, scratch.keys, scratch.sorted, tokens * blocks,
+            ck(hipcub::DeviceSegmentedRadixSort::SortKeysDescending(scratch.temp, available, scratch.keys, scratch.sorted, tokens * blocks,
                                                                  tokens, scratch.offsets, scratch.offsets + 1, 0, 64, stream));
             std::vector<uint64_t> full(size_t(tokens) * blocks);
             ck(cudaMemcpyAsync(full.data(), scratch.sorted, full.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
@@ -825,11 +841,11 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
         segment_offsets<<<(tokens + 256) / 256, 256, 0, stream>>>(scratch.offsets, tokens, blocks);
         ck(cudaPeekAtLastError());
         size_t needed = 0;
-        ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, needed, scratch.keys, scratch.sorted, tokens * blocks, tokens,
+        ck(hipcub::DeviceSegmentedRadixSort::SortKeysDescending(nullptr, needed, scratch.keys, scratch.sorted, tokens * blocks, tokens,
                                                              scratch.offsets, scratch.offsets + 1, 0, 64, stream));
         if (needed > scratch.temp_bytes) throw std::runtime_error("QSA indexer: batch sort scratch is too small");
         size_t available = scratch.temp_bytes;
-        ck(cub::DeviceSegmentedRadixSort::SortKeysDescending(scratch.temp, available, scratch.keys, scratch.sorted, tokens * blocks,
+        ck(hipcub::DeviceSegmentedRadixSort::SortKeysDescending(scratch.temp, available, scratch.keys, scratch.sorted, tokens * blocks,
                                                              tokens, scratch.offsets, scratch.offsets + 1, 0, 64, stream));
     }
     expand_selection_batch<<<dim3((width + 255) / 256, tokens), 256, 0, stream>>>(
@@ -901,7 +917,7 @@ QsaGather::QsaGather(int max_cells, size_t row_bytes, int cache_rows, int max_ro
     }
     ck(cudaMalloc(&flags_, size_t(max_cells) * sizeof(int)));
     ck(cudaMalloc(&map_, size_t(max_cells) * sizeof(int)));
-    ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells));
+    ck(hipcub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells));
     ck(cudaMalloc(&temp_, temp_bytes_));
 }
 QsaGather::~QsaGather() { cudaFree(flags_); cudaFree(map_); cudaFree(temp_); cudaFree(k_); cudaFree(v_); cudaFree(pos_);
@@ -914,7 +930,7 @@ void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens
         ck(cudaStreamSynchronize(stream)); cudaFree(flags_); cudaFree(map_); cudaFree(temp_);
         max_cells_ = cells; temp_bytes_ = 0;
         ck(cudaMalloc(&flags_, size_t(max_cells_) * sizeof(int))); ck(cudaMalloc(&map_, size_t(max_cells_) * sizeof(int)));
-        ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells_)); ck(cudaMalloc(&temp_, temp_bytes_));
+        ck(hipcub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells_)); ck(cudaMalloc(&temp_, temp_bytes_));
     }
     if (tokens * width > max_rows_) {
         cudaFree(k_); cudaFree(v_); cudaFree(pos_);
@@ -925,7 +941,7 @@ void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens
     const int items = tokens * width;
     ck(cudaMemsetAsync(flags_, 0, size_t(cells) * sizeof(int), stream));
     gather_mark_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, flags_);
-    size_t tb = temp_bytes_; ck(cub::DeviceScan::ExclusiveSum(temp_, tb, flags_, map_, cells, stream));
+    size_t tb = temp_bytes_; ck(hipcub::DeviceScan::ExclusiveSum(temp_, tb, flags_, map_, cells, stream));
     const int rv = int(row_bytes_ / 16), cached = cache_rows_ ? std::min(host_cells, cells) : 0;
     // other K/V, or rows rewritten at or below a cell the cache may hold: start empty, never serve a stale row
     if (cache_rows_ && (keys != cached_keys_ || written_from < cached_below_)) {

@@ -58,6 +58,7 @@ constexpr auto cudaDevAttrComputeCapabilityMinor = hipDeviceAttributeComputeCapa
 constexpr auto cudaDevAttrMultiProcessorCount = hipDeviceAttributeMultiprocessorCount;
 constexpr auto cudaDevAttrL2CacheSize = hipDeviceAttributeL2CacheSize;
 constexpr auto cudaDevAttrIntegrated = hipDeviceAttributeIntegrated;
+constexpr auto cudaDevAttrPageableMemoryAccessUsesHostPageTables = hipDeviceAttributePageableMemoryAccessUsesHostPageTables;
 constexpr auto cudaFuncAttributeMaxDynamicSharedMemorySize = hipFuncAttributeMaxDynamicSharedMemorySize;
 
 constexpr auto cudaMemPoolAttrReleaseThreshold = hipMemPoolAttrReleaseThreshold;
@@ -126,6 +127,7 @@ inline hipError_t cudaGraphInstantiate(hipGraphExec_t * exec, hipGraph_t graph, 
 #define cudaProfilerStop hipProfilerStop
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaFuncGetAttributes hipFuncGetAttributes
 #define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaThreadExchangeStreamCaptureMode hipThreadExchangeStreamCaptureMode
@@ -141,7 +143,11 @@ inline hipError_t cudaGraphInstantiate(hipGraphExec_t * exec, hipGraph_t graph, 
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaLaunchKernel __hipLaunchKernel
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
-#define cudaGraphExecUpdate hipGraphExecUpdate
+// CUDA's (exec, graph, &info) form; HIP splits it into (exec, graph, node*, result*).
+inline hipError_t cudaGraphExecUpdate(hipGraphExec_t exec, hipGraph_t graph, cudaGraphExecUpdateResultInfo * info) {
+    hipGraphNode_t node{};
+    return hipGraphExecUpdate(exec, graph, &node, reinterpret_cast<hipGraphExecUpdateResult *>(info));
+}
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaDriverGetVersion hipDriverGetVersion
 #define cudaStreamAddCallback hipStreamAddCallback

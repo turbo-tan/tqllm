@@ -25,6 +25,7 @@ constexpr auto CUBLAS_OP_N = HIPBLAS_OP_N;
 constexpr auto CUBLAS_OP_T = HIPBLAS_OP_T;
 constexpr auto CUBLAS_OP_C = HIPBLAS_OP_C;
 constexpr auto CUBLAS_DEFAULT_MATH = HIPBLAS_DEFAULT_MATH;
+constexpr auto CUBLAS_PEDANTIC_MATH = HIPBLAS_PEDANTIC_MATH;
 constexpr auto CUBLAS_TENSOR_OP_MATH = HIPBLAS_TENSOR_OP_MATH;
 constexpr auto CUBLAS_TF32_TENSOR_OP_MATH = HIPBLAS_TF32_TENSOR_OP_MATH;
 constexpr auto cublasSetMathMode = hipblasSetMathMode;

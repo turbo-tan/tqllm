@@ -3,11 +3,30 @@
 // off (Flash-Next QSA KV, vision/multimodal input); nothing here silently changes results.
 #include "kv_qsa.cuh"
 #include "vision_kernels.cuh"
+#include "kv_qsa.cuh"
+#include <cuda_runtime.h>
+
+// MMQ expert GEMM is CUDA-only (third-party ggml_mmq). On HIP, mmq_supports returns false so the
+// dense u4h path is used instead. These stubs keep the Flash-Next engine linkable.
+namespace tqllm_cuda {
+size_t mmq_warm() { return 0; }
+int mmq_max_tiles(int, int) { return 0; }
+bool mmq_supports(int, int) { return false; }
+size_t mmq_act_bytes(int, int) { return 0; }
+void mmq_quantize_act(const __half *, int, int, void *, cudaStream_t, bool) {}
+void mmq_quantize_act_rows(const __half *, int, int, const int *, const int *, int, int, void *, cudaStream_t) {}
+bool mmq_expert_gemm(int, const uint8_t *, const void *, bool, int, int, const int *, const int *, const int *,
+                     int, int, int, const void *, int, __nv_bfloat16 *, int2 *, int, cudaStream_t,
+                     const __nv_bfloat16 *, __half *) { return false; }
+}  // namespace tqllm_cuda
+
 #include "engine.hpp"
 
 #include <stdexcept>
 
 namespace tqllm_cuda {
+
+void qsa_reserve_split_scratch() {}  // QSA split scratch: Flash-Next-only, not built on HIP
 
 static void hip_unsupported(const char * what) {
     throw std::runtime_error(std::string(what) + " is not supported by the AMD (HIP) backend yet: "
@@ -31,6 +50,18 @@ void qsa_attention_grouped(const float *, const __nv_bfloat16 *, const __nv_bflo
 
 void mm_scatter(__nv_bfloat16 *, const int *, int, const __nv_bfloat16 *, int, cudaStream_t) {
     hip_unsupported("multimodal image-token scatter");
+}
+
+void vis_f32_to_h(const float * x, __half * y, int64_t n, cudaStream_t) {
+    // Host-side fallback: Flash-Next is not runnable on this backend, but the symbol must exist.
+    // A real HIP kernel would go here if Flash-Next gets ported.
+    std::vector<float> buf(n);
+    cudaError_t e = cudaMemcpy(buf.data(), x, n * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+    std::vector<__half> h(n);
+    for (int64_t i = 0; i < n; ++i) h[i] = __float2half(buf[i]);
+    e = cudaMemcpy(y, h.data(), n * sizeof(__half), cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
 
 }  // namespace tqllm_cuda

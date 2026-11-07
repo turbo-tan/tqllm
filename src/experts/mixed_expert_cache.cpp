@@ -378,7 +378,11 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     std::vector<std::pair<int, int>> batch_commit;
     auto flush_batch = [&] {
         if (batch_dst.empty()) return;
+#if !defined(TQLLM_WITH_HIP)
         cudaMemcpyAttributes attr = {}; attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream; attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+#else
+        int attr = 0; (void)attr;
+#endif
         size_t first = 0;
 #if CUDART_VERSION >= 13000
         checked(cudaMemcpyBatchAsync(batch_dst.data(), batch_src.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, up));

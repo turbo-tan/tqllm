@@ -10,4 +10,4 @@
 #ifndef CUDART_INF
 #define CUDART_INF HIP_INF
 #endif
-#define CUDART_VERSION 13000  // CUDA 13.x parity for version checks (see hip build note in docs/guides/amd.md)
+#define CUDART_VERSION 12000  // HIP: pretend CUDA 12.0 so the CUDA-12.8 batch-copy path falls through to plain cudaMemcpyAsync (HIP lacks cudaMemcpyBatchAsync with these flags)

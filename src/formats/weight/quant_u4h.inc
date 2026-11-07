@@ -813,8 +813,7 @@ __global__ void quant_act_rows_k(const __half * x, const int * rows_of, const in
 }
 __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
 #if defined(TQLLM_WITH_HIP)
-    (void)d; (void)a0; (void)a1; (void)b0;  // NVIDIA sparse-IMMA prefill path: Int8Gemm::supported() is false on HIP
-    __builtin_trap();
+    (void)d; (void)a0; (void)a1; (void)b0;  // sparse IMMA is CUDA-only; dense path uses mma_s8_k32
 #else
     constexpr int M = 0x4B400000;
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"

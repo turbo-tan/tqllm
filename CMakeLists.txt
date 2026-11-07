@@ -84,13 +84,13 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
     src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp
     src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp
     src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu
-    src/models/qwen/qwen35/attention.cu src/experts/moe.cu
+    src/models/qwen/qwen35/attention.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/experts/moe.cu src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp
     src/core/common_kernels.cu src/experts/moe_common.cu src/core/gguf_mapped.cpp)
   target_include_directories(tqllm PRIVATE ${TQLLM_HIP_SHIM} ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
   # tqLLM's device files are .cu on every backend: tag them for hipcc under the HIP language
   set_source_files_properties(${TQLLM_HIP_CU_SOURCES} src/kv/kv_store_cuda.cpp src/models/qwen/qwen2/qwen2.cu
-    src/models/qwen/qwen35/qwen35.cu src/models/qwen/qwen35/attention.cu src/experts/moe.cu src/spec/dflash.cu
+    src/models/qwen/qwen35/qwen35.cu src/models/qwen/qwen35/attention.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/experts/moe.cu src/spec/dflash.cu
     src/core/common_kernels.cu src/experts/moe_common.cu PROPERTIES LANGUAGE HIP)
   target_link_libraries(tqllm PRIVATE hip::host hip::device hipblas)
   target_link_directories(tqllm PUBLIC ${TQLLM_ROCM_ROOT}/lib)  # hipblas exports -lhipblas; rocm lib is not a default path
@@ -105,10 +105,16 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
     endif()
   endif()
   message(STATUS "TQLLM engine commit: ${TQLLM_COMMIT}")
-  add_executable(tqserve tools/tqserve.cpp)
+  # the Flash-Next engine (src/models/qwen/qwen4exp/fn_*): served by tqserve; tqfn-pack writes its packed experts file
+  add_library(tqllm-flashnext OBJECT src/models/qwen/qwen4exp/fn_layer_forward.cpp src/models/qwen/qwen4exp/fn_prefill.cpp
+              src/models/qwen/qwen4exp/fn_step.cpp src/models/qwen/qwen4exp/fn_mtp.cpp)
+  target_include_directories(tqllm-flashnext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${TQLLM_HIP_SHIM})
+  target_link_libraries(tqllm-flashnext PRIVATE tqllm hip::host hip::device)
+  add_executable(tqserve tools/tqserve.cpp src/models/qwen/qwen4exp/tqserve_flashnext.cpp src/models/qwen/qwen4exp/fn_engine_load.cpp
+                 src/models/qwen/qwen4exp/fn_engine_prefill.cpp src/models/qwen/qwen4exp/fn_engine_decode.cpp $<TARGET_OBJECTS:tqllm-flashnext>)
   target_include_directories(tqserve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/hip/shim ${CMAKE_CURRENT_BINARY_DIR}/generated)
-  target_link_libraries(tqserve PRIVATE tqllm tqjinja)
+  target_link_libraries(tqserve PRIVATE tqllm tqjinja hip::host hip::device)
   target_compile_definitions(tqserve PRIVATE TQLLM_COMMIT="${TQLLM_COMMIT}")
   install(TARGETS tqserve RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
