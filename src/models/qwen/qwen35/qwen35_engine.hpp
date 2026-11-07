@@ -95,7 +95,9 @@ public:
             eos_ = tokenizer.eos_id();
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
+#if !defined(TQLLM_WITH_HIP)  // HIP has no tensor-op math-mode knob; hipBLAS uses FMA everywhere
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
+#endif
             auto memlog = [](const char * stage) {  // TQLLM_DEBUG=memlog: device memory in use after each load stage, seconds since the first load began
                 static const bool on = tqllm::debug_on("memlog");
                 static const auto t0 = std::chrono::steady_clock::now();

@@ -106,6 +106,17 @@ On the W7800 with ROCm 7.13 the full suite is green: `ctest --test-dir build-hip
 attention paths; `test-kv-turbo-group` checks that batched verify equals sequential decode for every
 KV codec.
 
+## Measured on the tested card
+
+Radeon Pro W7800 (gfx1100), ROCm 7.13, 24 GB, `Qwen3.8-27B` GGUF, `--context 1024`, `--max-tokens 8`:
+
+- prompt: 34.4 tok/s (15 tokens, 436 ms)
+- decode: 10.0 tok/s (8 tokens)
+
+Decode is memory-bound and runs the native GEMV kernels. Prefill runs the dequant + hipBLAS path; the
+custom `tq4_gemm_h` kernel (the CUDA fast path) is still CUDA-fragment code and is disabled on HIP,
+so prefill is the main performance item for a follow-up.
+
 ## Troubleshooting
 
 - `cannot find -lhipblas`: the hipBLAS CMake package exports `-lhipblas` without a path on some
