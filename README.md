@@ -14,11 +14,19 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New: Qwen3.8-Flash-Next (125B MoE, 6B active) on one RTX 3090.** Against Strata 0.2.2 on the same card, file and
-session: decode 1.63x after a 128K prompt (77.1 against 47.2 tok/s), 1.34x after 64K, first token sooner at every
-length, and up to 8 users at once with the same text as one. [Details](docs/BENCHMARKS.md#qwen38-flash-next-125b-6b-active-on-one-rtx-3090).
-Run it with image 1.4.2 or newer (RTX 30 or newer with 24 GB, or a GB10): [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
-GGUF plus a few small files; 24 GB GPU, 64 GB RAM or more).
+**New in [1.4.4](https://github.com/turbo-tan/tqllm/releases/tag/v1.4.4)** (same machine, same session for every comparison):
+
+- **DGX Spark, Qwen3.8-27B:** prompts up to 1.42x faster than TensorFold 1.2.3 in its own record setup (8 slots x 131,072),
+  faster at every length from 2K to 128K, also on TensorFold's own EXL3 file.
+- **RTX 3090, Qwen3.8-Flash-Next (125B MoE, 6B active):** with 2 to 12 users at once, up to 34 % more total output than
+  Strata 0.2.12; no more out-of-memory on long answers on 24 GB cards.
+- **Mac, Qwen3.8-27B 4-bit (48 GB M5 Pro):** answers 8-44 % faster than Splash 1.5.0 from 16K to 128K, and a 256K context
+  where TensorFold does not fit. Install with `brew install turbo-tan/tap/tqllm`.
+- **New files:** Unsloth Dynamic v3.1 Flash-Next GGUFs, NVIDIA's NVFP4 Flash-Next experts, Qwen3.8-27B EXL3 folders.
+
+Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
+[YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
+[Benchmarks](docs/BENCHMARKS.md).
 
 ## See what your model is doing
 
