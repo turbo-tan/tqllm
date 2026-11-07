@@ -6,7 +6,8 @@ organised** (for anyone changing the code).
 ## Setting tqLLM up for a user
 
 tqLLM is an OpenAI-compatible inference server for Qwen3.8 models on NVIDIA GPUs (RTX 30 / 40 / 50, GB10 / DGX
-Spark), Linux or Windows with WSL 2. Steps, in order:
+Spark), Linux or Windows with WSL 2, and on AMD GPUs through ROCm/HIP (see the AMD guide; single GPU only in this
+release). Steps, in order:
 
 1. **Check the hardware.** Run `nvidia-smi` and note the GPU and its memory. Docker needs the NVIDIA Container
    Toolkit (`docker run --rm --gpus all ubuntu nvidia-smi` must print the GPU).
@@ -67,7 +68,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
         v
   src/engine/                Model (opens a file, asks the registry for the engine, forwards every call): backend
                              neutral, no CUDA / Metal include; engine interface (engine.hpp) and registry (registry.hpp)
-  src/backends/<platform>/   one folder per platform: cuda/, metal/, android/. builtin_<platform>.cpp lists the engines
+  src/backends/<platform>/   one folder per platform: cuda/, hip/, metal/, android/. builtin_<platform>.cpp lists the engines
                              that platform serves (register_builtin_engines), beside its loaders and its engine code.
                              Engine level: may use models, components and core; no model includes a backend.
         |

@@ -5,7 +5,9 @@
 // scales (GB10's cuBLASLt has no per-row / per-token FP8 scale mode), and the two scale vectors are applied after it
 // (they factor out of every dot product): either by `run` (in place) or, with `gemm`, by the caller's next pass
 // (fp8_h_to_bf16_scaled), which saves a full read and write of the output.
-#include <cublasLt.h>
+#if !defined(TQLLM_WITH_HIP)
+#include <cublasLt.h>  // cuBLASLt is NVIDIA-only: the AMD build uses the BF16 hipBLAS prefill path
+#endif
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -16,6 +18,30 @@
 #include <tuple>
 
 namespace tqllm_cuda {
+
+#if defined(TQLLM_WITH_HIP)
+// AMD/HIP: the FP8 prefill GEMM is a cuBLASLt (sm_89+) feature and is not part of this build. The
+// engine asks supported() before creating one, so these inline no-ops are never executed; they keep
+// the shared forward code compiling and the library linkable. BF16 prefill (hipBLAS) runs instead.
+inline void fp8_quant_rows(const __half *, int, int, int, uint8_t *, float *, cudaStream_t) {}
+inline void fp8_scale_out(__half *, int, int, int, const float *, const float *, float, cudaStream_t) {}
+inline void fp8_h_to_bf16_scaled(const __half *, __nv_bfloat16 *, int, int, const float *, const float *, float,
+                                 cudaStream_t) {}
+class Fp8Gemm {
+public:
+    static constexpr float kMul = 448.f * 448.f;
+    static bool supported() { return false; }
+    static bool default_on() { return false; }
+    void init(size_t, size_t, int, int, size_t = 0) {}
+    ~Fp8Gemm() = default;
+    void run(const __half *, int, int, const __half *, int, int, __half *, int, cudaStream_t) {}
+    void quant_x(const __half *, int, int, int, cudaStream_t) {}
+    bool cached(const void *) const { return false; }
+    void gemm(const void *, const __half *, int, int, int, __half *, int, float *, cudaStream_t) {}
+    const float * sx() const { return nullptr; }
+    size_t resident_used() const { return 0; }
+};
+#else
 
 // out[r][c] = E4M3(in[r][c] / scale[r]), scale[r] = max_c |in[r][c]| / 448 (1 for an all-zero row)
 void fp8_quant_rows(const __half * in, int rows, int cols, int ld_in, uint8_t * out, float * scale, cudaStream_t s);
@@ -57,5 +83,7 @@ private:
     std::map<const void *, Resident> res_;
     std::map<std::tuple<int, int, int, int>, cublasLtMatmulAlgo_t> algos_;
 };
+
+#endif
 
 }  // namespace tqllm_cuda

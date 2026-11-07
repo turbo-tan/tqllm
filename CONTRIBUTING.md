@@ -37,6 +37,11 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build-cpu -DTQLLM_CUDA=OFF
 cmake --build build-cpu -j
 ctest --test-dir build-cpu --output-on-failure
+
+# AMD GPU build (ROCm/HIP): see docs/guides/amd.md for the flags and the tested hardware
+cmake -S . -B build-hip -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip -j
+ctest --test-dir build-hip --output-on-failure
 ```
 
 Run the server from the build: `./build/tqserve --model models/model.gguf --port 8086`. `tqserve --help` lists every

@@ -1,22 +1,21 @@
 // fap: prefill attention over the compressed (int8) cache. Included by attention.cu inside namespace tqllm_cuda (kernels and launchers; no includes here).
-// Prefill attention over a Turbo4 K+V cache (FA2 style). Block = 8 warps x 16 rows = 128 (query, head) rows of one KV
-// head; every 32-key tile is decoded once per block into shared memory (K int8 [key][256] + 2 scales, V FP16 [key][256]
-// in the rotated basis), double-buffered, one barrier per tile. Each warp keeps S, P and O for its 16 rows in registers.
+// Prefill attention over a Turbo4 K+V cache (FA2 style). Block = NW warps x 16 rows of one KV head; every 32-key tile is
+// decoded once per block into shared memory (K int8 [key][256] + 2 scales, V FP16 [key][256] in the rotated basis),
+// double-buffered on CUDA and single-buffered on HIP (64 KB dynamic shared memory limit). Each warp keeps S, P and O for
+// its 16 rows in registers.
 namespace fap {
-constexpr int NW = 8, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8;
+#if defined(TQLLM_WITH_HIP)
+constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8, NB = 1;
+#else
+constexpr int NW = 8, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8, NB = 2;
+#endif
 constexpr size_t smem() {
-    return size_t(ROWS) * QS + 2 * size_t(TILE) * KS + 2 * size_t(TILE) * VS * 2 + 2 * 2 * TILE * 4 + ROWS * 2 * 4;
+    return size_t(ROWS) * QS + NB * size_t(TILE) * KS + NB * size_t(TILE) * VS * 2 + NB * 2 * TILE * 4 + ROWS * 2 * 4;
 }
 }
 
-__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void * p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
-}
-__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
-}
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void * p) { tqllm_dev::ldsm_x4(r, p); }
+__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * p) { tqllm_dev::ldsm_x4_t(r, p); }
 
 __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __nv_bfloat16 * q, const uint8_t * kc,
                                                                        const uint8_t * vc, __nv_bfloat16 * y,
@@ -26,10 +25,10 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
     constexpr int RB = ctv::K4B;  // 132-byte Turbo4 record
     extern __shared__ __align__(16) unsigned char smem_raw[];
     int8_t * q8 = reinterpret_cast<int8_t *>(smem_raw);            // [ROWS][QS]
-    int8_t * k8 = q8 + ROWS * QS;                                   // [2][TILE][KS]
-    __half * vh = reinterpret_cast<__half *>(k8 + 2 * TILE * KS);   // [2][TILE][VS]
-    float * ksf = reinterpret_cast<float *>(vh + 2 * TILE * VS);    // [2][2 halves][TILE]
-    float * qsc = ksf + 2 * 2 * TILE;                               // [ROWS][2]
+    int8_t * k8 = q8 + ROWS * QS;                                   // [NB][TILE][KS]
+    __half * vh = reinterpret_cast<__half *>(k8 + NB * TILE * KS);  // [NB][TILE][VS]
+    float * ksf = reinterpret_cast<float *>(vh + NB * TILE * VS);   // [NB][2 halves][TILE]
+    float * qsc = ksf + NB * 2 * TILE;                              // [ROWS][2]
     const int kh = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32, gid = lane / 4, tig = lane % 4;
     const int g = heads / kvheads, rows = nq * g;
     const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;  // longest (latest) row blocks first
@@ -78,60 +77,84 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
         if (lane == 0) qsc[r * 2 + h] = sq;
     }
 
-    // tile loader: thread -> key t % 32, 32-dim chunk c = t / 32 (K words 4c..4c+3 = dims 32c..; V words 4c.. = chunk c);
+    // tile loader: thread -> key t % 32, 32-dim chunks c = t / 32 + w * NW (NW warps of loaders);
     // key-major lanes keep the 16-byte shared stores conflict-free (row strides are 4 banks apart)
-    const int lk = t % 32, lc = t / 32;
-    uint32_t kr[4], vr[4], ksw = 0, vsw = 0;
+    const int lk = t % 32, lc0 = t / 32;
+    constexpr int NCH = DIM / 32;   // 32-dim chunks per Turbo4 record
+    constexpr int NCPT = NCH / NW;  // chunks per loader thread
+    uint32_t kr[NCPT][4], vr[NCPT][4], ksw[NCPT], vsw[NCPT];
     auto load = [&](int t0) {
         const int p = t0 + lk;
         if (p < key_end) {
             const uint32_t * rk = reinterpret_cast<const uint32_t *>(kc + (int64_t(p) * kvheads + kh) * RB);
             const uint32_t * rv = reinterpret_cast<const uint32_t *>(vc + (int64_t(p) * kvheads + kh) * RB);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) kr[i] = __ldg(rk + 1 + 4 * lc + i), vr[i] = __ldg(rv + 1 + 4 * lc + i);
-            ksw = __ldg(rk), vsw = __ldg(rv);
+            for (int c = 0; c < NCPT; ++c) {
+                const int lc = lc0 + c * NW;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    kr[c][i] = __ldg(rk + 1 + 4 * lc + i);
+                    vr[c][i] = __ldg(rv + 1 + 4 * lc + i);
+                }
+                ksw[c] = __ldg(rk);
+                vsw[c] = __ldg(rv);
+            }
         } else {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) kr[i] = vr[i] = 0u;
-            ksw = vsw = 0u;
+            for (int c = 0; c < NCPT; ++c) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) kr[c][i] = vr[c][i] = 0u;
+                ksw[c] = vsw[c] = 0u;
+            }
         }
     };
     auto store = [&](int buf) {
-        uint4 lo, hi;
-        lo.x = t4k_expand(kr[0] & 0xFFFFu), hi.x = t4k_expand(kr[0] >> 16);
-        lo.y = t4k_expand(kr[1] & 0xFFFFu), hi.y = t4k_expand(kr[1] >> 16);
-        lo.z = t4k_expand(kr[2] & 0xFFFFu), hi.z = t4k_expand(kr[2] >> 16);
-        lo.w = t4k_expand(kr[3] & 0xFFFFu), hi.w = t4k_expand(kr[3] >> 16);
-        int8_t * kd = k8 + (buf * TILE + lk) * KS + lc * 32;
-        *reinterpret_cast<uint4 *>(kd) = lo;
-        *reinterpret_cast<uint4 *>(kd + 16) = hi;
-        if (lc < 2) {
-            const __half2 s2 = *reinterpret_cast<const __half2 *>(&ksw);
-            ksf[(buf * 2 + lc) * TILE + lk] = __half2float(lc ? __high2half(s2) : __low2half(s2));
-        }
-        // V: word i holds fields l = 2i, 2i + 1 (4 nibbles j each, dims 32c + 8j + l) -> half2 (l, l + 1) per j
-        const uint32_t sh = (lc < 4 ? vsw : vsw >> 16) & 0xFFFFu, s2 = sh | (sh << 16), NEG = 0xE480E480u;  // -1152
-        uint32_t out[4][4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint32_t la = t4k_expand(vr[i] & 0xFFFFu) ^ 0x80808080u, lb = t4k_expand(vr[i] >> 16) ^ 0x80808080u;
-            const uint32_t a01 = __byte_perm(la, 0x64646464u, 0x5140), a23 = __byte_perm(la, 0x64646464u, 0x5342);
-            const uint32_t b01 = __byte_perm(lb, 0x64646464u, 0x5140), b23 = __byte_perm(lb, 0x64646464u, 0x5342);
-            out[0][i] = hmul2_u(hadd2_u(__byte_perm(a01, b01, 0x5410), NEG), s2);
-            out[1][i] = hmul2_u(hadd2_u(__byte_perm(a01, b01, 0x7632), NEG), s2);
-            out[2][i] = hmul2_u(hadd2_u(__byte_perm(a23, b23, 0x5410), NEG), s2);
-            out[3][i] = hmul2_u(hadd2_u(__byte_perm(a23, b23, 0x7632), NEG), s2);
-        }
-        __half * vd = vh + (buf * TILE + lk) * VS + lc * 32;
+        for (int c = 0; c < NCPT; ++c) {
+            const int lc = lc0 + c * NW;
+            uint4 lo, hi;
+            lo.x = t4k_expand(kr[c][0] & 0xFFFFu), hi.x = t4k_expand(kr[c][0] >> 16);
+            lo.y = t4k_expand(kr[c][1] & 0xFFFFu), hi.y = t4k_expand(kr[c][1] >> 16);
+            lo.z = t4k_expand(kr[c][2] & 0xFFFFu), hi.z = t4k_expand(kr[c][2] >> 16);
+            lo.w = t4k_expand(kr[c][3] & 0xFFFFu), hi.w = t4k_expand(kr[c][3] >> 16);
+            int8_t * kd = k8 + (buf * TILE + lk) * KS + lc * 32;
+            *reinterpret_cast<uint4 *>(kd) = lo;
+            *reinterpret_cast<uint4 *>(kd + 16) = hi;
+            if (lc < 2) {
+                const __half2 s2 = *reinterpret_cast<const __half2 *>(&ksw[c]);
+                ksf[(buf * 2 + lc) * TILE + lk] = __half2float(lc ? __high2half(s2) : __low2half(s2));
+            }
+            // V: word i holds fields l = 2i, 2i + 1 (4 nibbles j each, dims 32c + 8j + l) -> half2 (l, l + 1) per j
+            const uint32_t sh = (lc < 4 ? vsw[c] : vsw[c] >> 16) & 0xFFFFu, s2 = sh | (sh << 16), NEG = 0xE480E480u;  // -1152
+            uint32_t out[4][4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4 *>(vd + 8 * j) = make_uint4(out[j][0], out[j][1], out[j][2], out[j][3]);
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t la = t4k_expand(vr[c][i] & 0xFFFFu) ^ 0x80808080u, lb = t4k_expand(vr[c][i] >> 16) ^ 0x80808080u;
+                const uint32_t a01 = __byte_perm(la, 0x64646464u, 0x5140), a23 = __byte_perm(la, 0x64646464u, 0x5342);
+                const uint32_t b01 = __byte_perm(lb, 0x64646464u, 0x5140), b23 = __byte_perm(lb, 0x64646464u, 0x5342);
+                out[0][i] = hmul2_u(hadd2_u(__byte_perm(a01, b01, 0x5410), NEG), s2);
+                out[1][i] = hmul2_u(hadd2_u(__byte_perm(a01, b01, 0x7632), NEG), s2);
+                out[2][i] = hmul2_u(hadd2_u(__byte_perm(a23, b23, 0x5410), NEG), s2);
+                out[3][i] = hmul2_u(hadd2_u(__byte_perm(a23, b23, 0x7632), NEG), s2);
+            }
+            __half * vd = vh + (buf * TILE + lk) * VS + lc * 32;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) *reinterpret_cast<uint4 *>(vd + 8 * j) = make_uint4(out[j][0], out[j][1], out[j][2], out[j][3]);
+        }
     };
 
+#if defined(TQLLM_WITH_HIP)
+    if (ntile > 0) {
+        load(0);
+        store(0);
+    }
+#else
     if (ntile > 0) {
         load(0);
         store(0);
         if (ntile > 1) load(TILE);
     }
+#endif
     __syncthreads();
 
     const int ra = warp * 16 + gid, rb = ra + 8;
@@ -145,7 +168,12 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
     const int8_t * qrow = q8 + (warp * 16 + (lane % 8) + ((lane / 8) & 1) * 8) * QS + (lane / 16) * 16;
 
     for (int u = 0; u < ntile; ++u) {
+#if defined(TQLLM_WITH_HIP)
+        const int buf = 0, t0 = u * TILE;
+        __syncthreads();  // the staged tile is ready and every warp finished reading the previous one
+#else
         const int buf = u & 1, t0 = u * TILE;
+#endif
         const int8_t * kt = k8 + buf * TILE * KS;
         const __half * vt = vh + buf * TILE * VS;
         float s[4][4];
@@ -229,9 +257,17 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
                 o[2 * np + n][0] += lo.x, o[2 * np + n][1] += lo.y, o[2 * np + n][2] += hi.x, o[2 * np + n][3] += hi.y;
             }
         }
+#if defined(TQLLM_WITH_HIP)
+        if (u + 1 < ntile) {  // single buffer: refill only after every warp has finished reading this tile
+            __syncthreads();
+            load(t0 + TILE);
+            store(0);
+        }
+#else
         if (u + 1 < ntile) store(buf ^ 1);
         if (u + 2 < ntile) load(t0 + 2 * TILE);
         __syncthreads();
+#endif
     }
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 1);
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 2);

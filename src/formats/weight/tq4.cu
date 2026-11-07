@@ -1078,8 +1078,12 @@ namespace tqg {
 constexpr int BM = 128, BN = 64, BK = 128, LDS = BK + 8;  // LDS: padded row (halves) -> conflict-free fragment loads
 constexpr size_t kSmem = size_t(BM + BN) * LDS * sizeof(__half);
 __device__ __forceinline__ void mma16816(uint32_t (&d)[2], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if defined(TQLLM_WITH_HIP)
+    tqllm_dev::mma_f16acc(d, a[0], a[1], a[2], a[3], b[0], b[1]);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 // 8 int8 levels (two expand() words) times the block scale -> 8 halves
 __device__ __forceinline__ uint4 levels_to_h(uint32_t lv0, uint32_t lv1, float s) {

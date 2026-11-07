@@ -1,3 +1,4 @@
+#include "common.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>

@@ -8,7 +8,7 @@
 #include <cfloat>
 
 namespace tqllm_cuda::common {
-#ifdef __CUDACC__  // device helpers for the shared kernels and the engines' own kernels
+#if defined(__CUDACC__) || defined(__HIP__)  // device helpers for the shared kernels and the engines' own kernels
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;

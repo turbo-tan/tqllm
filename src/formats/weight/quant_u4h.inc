@@ -812,9 +812,14 @@ __global__ void quant_act_rows_k(const __half * x, const int * rows_of, const in
     }
 }
 __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+#if defined(TQLLM_WITH_HIP)
+    (void)d; (void)a0; (void)a1; (void)b0;  // NVIDIA sparse-IMMA prefill path: Int8Gemm::supported() is false on HIP
+    __builtin_trap();
+#else
     constexpr int M = 0x4B400000;
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(M), "r"(M), "r"(M), "r"(M));
+#endif
 }
 __device__ __forceinline__ float h2lo(uint32_t v) { return __half2float(__ushort_as_half(uint16_t(v & 0xFFFFu))); }
 // 64 rows x 64 columns per CTA, 8 warps: warp w takes row tile w & 3 and k half w >> 2 (blocks 4 (w >> 2) .. + 3 of each
@@ -823,10 +828,14 @@ __device__ __forceinline__ float h2lo(uint32_t v) { return __half2float(__ushort
 // with a scale per 16 use two k16 MMAs. Where min = -OFF * scale exactly (power-of-two OFF, exact in half) the int8
 // operand is code - OFF and no min term is needed; the other formats use code - 128 and add (128 scale + min) * sum(q).
 __device__ __forceinline__ void mma_s8_k32(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if defined(TQLLM_WITH_HIP)
+    tqllm_dev::mma_s8(d, a0, a1, a2, a3, b0, b1);  // same fragment contract; native v_dot4
+#else
     constexpr int M = 0x4B400000;
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(M), "r"(M), "r"(M), "r"(M));
+#endif
 }
 template <int FMT> __host__ __device__ constexpr int i8_offset() {  // min == -offset * scale: 0 = generic (min term)
     // IQ4_NL / IQ4_XS: code - 128 is exact (verified against the fp16 kernel and an fp64 oracle). Every other format takes the
@@ -1013,12 +1022,24 @@ __global__ void __launch_bounds__(256) u4h_i8_gemm_k(const uint8_t * w4, const _
 // groups (32 rows = 2 m16) x 2 token groups (64 tokens = 8 n8): 16 tensor-core ops per warp per 32 k. Per-32-scale formats
 // use one m16n8k32 per block, per-16 formats two m16n8k16. Same exact int -> float trick as u4h_i8_gemm_k.
 __device__ __forceinline__ void cp_async16(void * smem, const void * gmem, bool pred) {
+#if defined(TQLLM_WITH_HIP)
+    if (pred) *reinterpret_cast<uint4 *>(smem) = __ldg(reinterpret_cast<const uint4 *>(gmem));
+#else
     const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     const int n = pred ? 16 : 0;
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(gmem), "r"(n));
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
+__device__ __forceinline__ void cp_async_commit() {
+#if !defined(TQLLM_WITH_HIP)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void cp_async_wait0() {
+#if !defined(TQLLM_WITH_HIP)
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
 template <int FMT, bool TOKEN>
 __global__ void __launch_bounds__(256) u4h_i8v3_gemm_k(const uint8_t * w4, const __half2 * sm, const int8_t * xq, const float * xs,
                                                        const int16_t * xsum, __nv_bfloat16 * y, int rows, int k,

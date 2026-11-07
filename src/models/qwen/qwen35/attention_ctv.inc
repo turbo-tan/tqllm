@@ -29,17 +29,9 @@ __device__ __forceinline__ uint32_t t4k_expand(uint32_t c) {
     return __vadd4(pm ^ (sg * 0xFFu), sg);               // two's-complement negate the flagged bytes
 }
 
-__device__ __forceinline__ uint32_t hmul2_u(uint32_t a, uint32_t b) {
-    uint32_t d;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
-    return d;
-}
+__device__ __forceinline__ uint32_t hmul2_u(uint32_t a, uint32_t b) { return tqllm_dev::hmul2u(a, b); }
 
-__device__ __forceinline__ uint32_t hadd2_u(uint32_t a, uint32_t b) {
-    uint32_t d;
-    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
-    return d;
-}
+__device__ __forceinline__ uint32_t hadd2_u(uint32_t a, uint32_t b) { return tqllm_dev::hadd2u(a, b); }
 
 __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
     const __half2 h = __floats2half2_rn(x, y);
@@ -48,16 +40,12 @@ __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
 
 __device__ __forceinline__ void mma_f16acc(uint32_t (&c)[2], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                            uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c[0]), "+r"(c[1])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    tqllm_dev::mma_f16acc(c, a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    tqllm_dev::mma_s8(c, a0, a1, a2, a3, b0, b1);
 }
 
 // T4K: Turbo4 K (Q rotated per 128 by the same transform, int8 per (row, 128); scores rescaled twice per head)
@@ -93,9 +81,8 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
             for (int i = t; i < TILE * (K4B / 4); i += blockDim.x) {
                 const int p = i / (K4B / 4), w = i % (K4B / 4);
                 if (p < n)
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
-                                     uint32_t(__cvta_generic_to_shared(k8 + (buf * TILE + p) * K4B + w * 4))),
-                                 "l"(k4g + (int64_t(t0 + p) * kvheads + kh) * K4B + w * 4));
+                    tqllm_dev::cp_async4(k8 + (buf * TILE + p) * K4B + w * 4,
+                                         k4g + (int64_t(t0 + p) * kvheads + kh) * K4B + w * 4);
             }
         } else {
             for (int i = t; i < TILE * (DIM / 16); i += blockDim.x) {
@@ -110,12 +97,11 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         for (int i = t; i < TILE * (VB / 4); i += blockDim.x) {
             const int p = i / (VB / 4), w = i % (VB / 4);
             if (p < n)
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
-                                 uint32_t(__cvta_generic_to_shared(v3s + (buf * TILE + p) * VB + w * 4))),
-                             "l"(v3 + (int64_t(t0 + p) * kvheads + kh) * VB + w * 4));
+                tqllm_dev::cp_async4(v3s + (buf * TILE + p) * VB + w * 4,
+                                     v3 + (int64_t(t0 + p) * kvheads + kh) * VB + w * 4);
         }
     };
-    auto commit = [] { asm volatile("cp.async.commit_group;\n" ::); };
+    auto commit = [] { tqllm_dev::cp_commit(); };
     const int ntile = beg < end ? (end - beg + stride - 1) / stride : 0;
     for (int u = 0; u < 2 && u < ntile; ++u) {
         stage_k(u, beg + u * stride);
@@ -397,7 +383,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
             }
     };
     if (ntile > 0) {
-        asm volatile("cp.async.wait_group 0;\n" ::);
+        tqllm_dev::cp_wait<0>();
         __syncthreads();
         qk_tile(0, beg, scb);
         __syncthreads();
@@ -414,7 +400,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         if (u + 2 < ntile) stage_v(cur, beg + (u + 2) * stride);
         commit();
         if (u + 1 < ntile) softmax_tile(scb + nxt * MAXR * SCS);
-        asm volatile("cp.async.wait_group 1;\n" ::);  // K(u + 2) landed; V(u + 2) may still be in flight
+        tqllm_dev::cp_wait<1>();  // K(u + 2) landed; V(u + 2) may still be in flight
         __syncthreads();
     }
     auto out = [&](int r) { return part + ((int64_t(r / g) * heads + kh * g + r % g) * nsplit + split) * (DIM + 2); };
