@@ -66,7 +66,7 @@ Recorded with a real model. The local hostname is hidden; telemetry is unmodifie
 On a Mac (Apple Silicon, macOS 15 or newer):
 
 ```sh
-brew install turbo-tan/tap/tqllm     # or: pip install "tqllm[mlx]"
+curl -fsSL https://tqllm.com/install.sh | bash   # or: brew install turbo-tan/tap/tqllm
 tqllm serve                          # first run downloads the model and drafter
 tqllm claude                         # Claude Code pointed at the local server (or: tqllm codex)
 ```

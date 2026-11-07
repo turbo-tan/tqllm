@@ -120,7 +120,7 @@ def hub_model(value, download, list_files=None):
             try:
                 from huggingface_hub import list_repo_files
             except ImportError:
-                raise SystemExit('huggingface_hub is missing: pip install "tqllm[mlx]"')
+                raise SystemExit('huggingface_hub is missing: pip install "huggingface_hub>=0.24"')
             list_files = list_repo_files
         ggufs = [x for x in list_files(repo) if x.endswith(".gguf") and "draft" not in x.lower()]
         if len(ggufs) != 1:
@@ -185,7 +185,7 @@ def fetch(files):
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:
-        raise SystemExit('huggingface_hub is missing: pip install "tqllm[mlx]"')
+        raise SystemExit('huggingface_hub is missing: pip install "huggingface_hub>=0.24"')
     d.mkdir(parents=True, exist_ok=True)
     for repo, f in missing:
         print(f"downloading {repo}/{f} -> {d} (first run only)", flush=True)
@@ -268,7 +268,7 @@ def server_command(args, mac, native=None):
     if mac:
         exe = server()
         if not exe.exists():
-            raise SystemExit(f"tqserve is missing from the package ({exe}): reinstall with pip install \"tqllm[mlx]\"")
+            raise SystemExit(f"tqserve is missing from the package ({exe}): reinstall: curl -fsSL https://tqllm.com/install.sh | bash")
         return [str(exe)] + serve_args(args)
     if sys.platform != "linux":
         raise SystemExit("tqllm serve runs on Apple Silicon Macs and on Linux with an NVIDIA card")

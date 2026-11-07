@@ -17,7 +17,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - `tqkld` scores Flash-Next manifests (`.tqfn`) against a llama.cpp `--kl-divergence-base` file.
 - Server: a request that runs out of device memory during its prompt while others decode waits in the queue and runs
   when one finishes, instead of failing.
-- macOS (Apple Silicon): `brew install turbo-tan/tap/tqllm` and `pip install "tqllm[mlx]"` build tqserve against the stock
+- macOS (Apple Silicon): `brew install turbo-tan/tap/tqllm` or `curl -fsSL https://tqllm.com/install.sh | bash` build tqserve against the stock
   MLX 0.32.4 wheel; the `tqllm` command: `tqllm serve` downloads the model and drafter on first run, the first of
   TQ_L-QSA, the mlx-community 4-bit file (40 GB+ Macs; `--qsa` its QSA file), TQ_L that is already downloaded or published
   on Hugging Face; `--model owner/repo` or `owner/repo/file.gguf` downloads that model.

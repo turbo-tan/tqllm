@@ -1,7 +1,7 @@
 # tqLLM on a Mac (Apple Silicon, Metal)
 
 `tqserve` builds natively for Apple Silicon on MLX and Metal. It serves Qwen3.8-27B with the DFlash2 drafter, the same
-OpenAI-compatible API and the same monitor as the CUDA build. The Docker image is CUDA only; on a Mac, install with Homebrew or pip, or build from source.
+OpenAI-compatible API and the same monitor as the CUDA build. The Docker image is CUDA only; on a Mac, install with the installer or Homebrew, or build from source.
 
 Measured on an M5 Pro with 48 GB unified memory. M-series chips without the M5 matrix unit run, but more slowly.
 
@@ -14,10 +14,11 @@ brew install turbo-tan/tap/tqllm
 tqllm serve          # first run downloads the model and drafter (~17 GB), then serves on 127.0.0.1:8086
 ```
 
-or pip (Python 3.12):
+or the one-line installer (tries Homebrew, then pip in a venv under `~/.tqllm`, then a source build; `--check` reports
+which route will work without installing; `--index-url URL` or `--wheels DIR` for networks that block PyPI):
 
 ```sh
-pip install "tqllm[mlx]"
+curl -fsSL https://tqllm.com/install.sh | bash
 tqllm serve
 ```
 
