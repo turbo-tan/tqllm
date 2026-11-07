@@ -42,6 +42,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <netdb.h>
 #include <netinet/in.h>
+#include <cstdlib>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -53,7 +54,14 @@ constexpr uint64_t MAX_BODY = 64 * 1024 * 1024;  // base64 images
 volatile std::sig_atomic_t running = 1;
 int listener = -1;
 
+// first INT / TERM: stop accepting, let the running request finish; a second one exits at once (a 64K prompt on a
+// 16 GB card can run for an hour and the server could not be stopped without SIGKILL)
 void stop_server(int) {
+    if (!running) {
+        static const char msg[] = "tqserve: second stop signal, exiting now\n";
+        (void) !::write(2, msg, sizeof msg - 1);
+        std::_Exit(130);
+    }
     running = 0;
     if (listener >= 0) ::close(listener);
 }
@@ -626,7 +634,11 @@ int main(int argc, char ** argv) {
                 ++inflight;
                 try { std::thread([handle, &inflight, client] {
                     try { handle(); }
-                    catch (...) { ::close(client); }
+                    catch (const std::exception & e) {  // never a silent empty reply: log it and answer 500
+                        std::fprintf(stderr, "tqserve: request failed: %s\n", e.what());
+                        send_all(client, response(500, tqserve::json_error(std::string("request failed: ") + e.what()))); ::close(client);
+                    }
+                    catch (...) { std::fputs("tqserve: request failed (unknown exception)\n", stderr); send_all(client, response(500, tqserve::json_error("request failed"))); ::close(client); }
                     --inflight;
                 }).detach(); }
                 catch (...) { --inflight; ::close(client); }

@@ -115,7 +115,8 @@ public:
     int grow_into(size_t keep_free, int max_slots);
     size_t device_staging_bytes() const;  // device staging held (only an unregistered prepacked pack needs it)
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
-    int regrow(size_t keep_free);  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
+    int regrow(size_t keep_free);
+    int shrink_to_free(size_t need, int floor_slots);  // gives back slots (largest banks first, never below floor_slots) until need bytes are free; banks rebuilt with their most-used experts  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;
     bool has_layout(int layer) const;  // a bank existed once: bank_layout / bank_mat answer without one (no device pointers)

@@ -236,15 +236,17 @@ struct Qwen35::Impl {
     mx::array norm_rows(const mx::array& x,const std::string& name) {
         const auto& w=plain.at(name);
         if(x.ndim()!=2 || x.shape(1)<=4096 || x.dtype()!=mx::float32 || rows_norm_fused==0)return norm(x,name);
-        auto pair=rms_norm_bf16_pair(x,w,eps);
+        // TQ4 models: the FP16 copy is the rotated matrix-unit input (tq4_rotate_half in the same launch)
+        const bool rot=!nax_tq4.empty();
+        auto pair=rms_norm_bf16_pair(x,w,eps,rot);
         if(rows_norm_fused<0) {
             auto ref=rms_norm_bf16_pair_reference(x,w,eps);
-            try {rows_norm_fused=same_bits(pair.first,ref.first) && same_bits(pair.second,ref.second);}
+            try {rows_norm_fused=same_bits(pair.first,ref.first) && same_bits(pair.second,rot?tq4_rotate_half(ref.first):ref.second);}
             catch(const std::exception& e) {rows_norm_fused=0;std::fprintf(stderr,"DECODE_FUSED rms_norm failed: %s\n",e.what());}
             std::fprintf(stderr,"DECODE_FUSED rms_norm bitwise=%d\n",rows_norm_fused);
             if(!rows_norm_fused)return norm(x,name);
         }
-        nax_input=std::pair{pair.first,pair.second};
+        (rot?nax_rotated_input:nax_input)=std::pair{pair.first,pair.second};
         return pair.first;
     }
     std::pair<mx::array,mx::array> add_norm_rows(const mx::array& x,const mx::array& r,const std::string& name) {
@@ -252,15 +254,17 @@ struct Qwen35::Impl {
         if(x.ndim()!=2 || x.shape(1)<=4096 || x.dtype()!=mx::float32 || r.dtype()!=mx::float32 || rows_add_norm_fused==0) {
             auto s=add_bf(x,r);return {s,norm(s,name)};
         }
-        auto got=rms_norm_bf16_pair_residual(x,r,w,eps);
+        const bool rot=!nax_tq4.empty();
+        auto got=rms_norm_bf16_pair_residual(x,r,w,eps,rot);
         if(rows_add_norm_fused<0) {
             auto ref=rms_norm_bf16_pair_residual_reference(x,r,w,eps);
-            try {rows_add_norm_fused=same_bits(std::get<0>(got),std::get<0>(ref)) && same_bits(std::get<1>(got),std::get<1>(ref)) && same_bits(std::get<2>(got),std::get<2>(ref));}
+            try {rows_add_norm_fused=same_bits(std::get<0>(got),std::get<0>(ref)) && same_bits(std::get<1>(got),std::get<1>(ref)) &&
+                                     same_bits(std::get<2>(got),rot?tq4_rotate_half(std::get<1>(ref)):std::get<2>(ref));}
             catch(const std::exception& e) {rows_add_norm_fused=0;std::fprintf(stderr,"DECODE_FUSED add_norm failed: %s\n",e.what());}
             std::fprintf(stderr,"DECODE_FUSED add_norm bitwise=%d\n",rows_add_norm_fused);
             if(!rows_add_norm_fused) {auto s=add_bf(x,r);return {s,norm(s,name)};}
         }
-        nax_input=std::pair{std::get<1>(got),std::get<2>(got)};
+        (rot?nax_rotated_input:nax_input)=std::pair{std::get<1>(got),std::get<2>(got)};
         return {std::get<0>(got),std::get<1>(got)};
     }
     mx::array norm_prefill(const mx::array& x,const std::string& name) {
@@ -481,10 +485,10 @@ struct Qwen35::Impl {
             auto w=mx::contiguous(mx::astype(mx::concatenate({std::get<mx::array>(a->second),std::get<mx::array>(b->second)},0),mx::float32));
             mx::eval(w);ab_proj.emplace(p,std::move(w));
         }
-        // QSA indexers when the file carries them (tools/qsa_indexer_gguf.py + gguf_add.py); not for a TQ4 file, whose
-        // activations are in the rotated basis the indexers were not trained on
+        // QSA indexers when the file carries them (tools/qsa_indexer_gguf.py + gguf_add.py). A TQ4 file rotates the input
+        // inside each of its matrix products, so the hidden state the indexer reads is in the original basis here too
         qsa.resize(layers);
-        for(int l=0;l<layers && !tq4_basis;++l) {
+        for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
             if((l+1)%interval!=0 || !file.tensors.contains(p+"qsa_q.weight"))continue;
             auto load=[&](const std::string& name,mx::Dtype type) {

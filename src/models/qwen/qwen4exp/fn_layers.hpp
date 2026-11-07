@@ -359,15 +359,13 @@ inline void mix_device_h(const Checkpoint & checkpoint, const std::string & pref
     Device<__half> logits(size_t(n) * width);  // the gate logits in FP16 (sigmoid input)
     const float * key = reinterpret_cast<const float *>(img);  // never read: project takes the shared FP16 rows
     // prefill blocks: down and inject in one GEMM over the image, then the up projection reads the split's FP16 rows
-    if (inject && n > 64 && checkpoint.takes_half_input(prefix + "up.weight")) {
+    if (inject && n > 64) {
         const int lr = c.hc_low_rank, ld = Checkpoint::stacked_ld(lr, streams);
         Device<float> stacked(size_t(n) * ld);
         if (checkpoint.project_stacked_h(prefix + "down.weight", prefix + "inject.weight", img, stacked.p, width, lr, streams, n)) {
             Device<__half> lowh(size_t(n) * lr);
             tqllm_cuda::hc_low_split_h(stacked.p, ld, lr, streams, lowh.p, inject, n, nullptr);
-            const float * lkey = reinterpret_cast<const float *>(lowh.p);
-            { const Checkpoint::SharedInput shared(checkpoint, lkey, lowh.count, lowh.p);
-              checkpoint.project(prefix + "up.weight", lkey, nullptr, lr, width, n, logits.p); }
+            checkpoint.project_hh(prefix + "up.weight", lowh.p, logits.p, lr, width, n);
             mix(logits.p);
             return;
         }

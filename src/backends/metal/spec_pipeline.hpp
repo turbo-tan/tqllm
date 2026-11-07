@@ -5,6 +5,7 @@
 // step k+1 runs while the GPU drafts, so the GPU does not idle between verify and the next draft. Exact: the same
 // verify and accept as the synchronous loop; only the draft's timing moves.
 #include "attention_decode.hpp"
+#include "attention_exact.hpp"
 #include "dflash.hpp"
 #include "qwen35.hpp"
 #include "sampling_topk.hpp"
@@ -202,7 +203,7 @@ private:
     // --exact on requests draft chains there, as does every request at that boundary.
     bool chain_at(int anchor_lo, int anchor_hi) const {
         if (options_.children <= 1) return true;
-        if (segmented_attention_available(256)) return false;
+        if (matrix_unit_available()) return false;
         return (temperature_ <= 0.f && engine_.exact()) || (anchor_lo < kAttentionSegment && anchor_hi + rows() > kAttentionSegment);
     }
     DeviceTree draft(const mlx::core::array& anchor, const mlx::core::array& position, bool chain) {

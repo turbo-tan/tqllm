@@ -3,6 +3,54 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.4.4 (2026-11-07)
+
+1.4.3 was not published; 1.4.4 carries everything below.
+
+### Added
+- Flash-Next: Unsloth Dynamic v3.1 GGUFs (UD-IQ1_M, UD-IQ3_XXS) load and serve, F32 projections included. RTX 3090, one
+  request, UD-IQ3_XXS: 144.5 / 93.5 tok/s (two rounds), prompts 2,409 / 2,547 / 2,586 tok/s at 8K / 16K / 32K.
+- Flash-Next: NVIDIA's NVFP4 experts (`nvidia/Qwen3.8-Flash-Next-NVFP4`) load as NVFP4 (no requantising) beside tqLLM's
+  dense layers in one manifest (`tools/fn_nvfp4_gguf.py` writes the GGUF). One DGX Spark: 121.8 / 59.3 tok/s, the same as
+  tqLLM's own file.
+- Qwen3.8-27B: EXL3 checkpoint folders (`Qwen3_5ForConditionalGeneration`) load directly.
+- `tqkld` scores Flash-Next manifests (`.tqfn`) against a llama.cpp `--kl-divergence-base` file.
+- Server: a request that runs out of device memory during its prompt while others decode waits in the queue and runs
+  when one finishes, instead of failing.
+- macOS (Apple Silicon): `brew install turbo-tan/tap/tqllm` and `pip install "tqllm[mlx]"` build tqserve against the stock
+  MLX 0.32.4 wheel; the `tqllm` command: `tqllm serve` downloads the model and drafter on first run, the first of
+  TQ_L-QSA, the mlx-community 4-bit file (40 GB+ Macs; `--qsa` its QSA file), TQ_L that is already downloaded or published
+  on Hugging Face; `--model owner/repo` or `owner/repo/file.gguf` downloads that model.
+- `tqllm claude` / `tqllm codex` / `tqllm opencode` start the coding agent pointed at the local server, and start the
+  server first when none answers on the port (it keeps running; `tqllm stop` ends it).
+- Metal: QSA indexers load on TQ4 files (TQ_L) too.
+
+### Changed
+- Flash-Next, `--exact off` with several requests: the CPU expert pool reads its pinned expert copy. RTX 3090, 8 requests:
+  78.5 / 79.0 tok/s total (was 68.2 / 69.9).
+- Flash-Next: a built-in per-layer expert slot profile when the manifest has none (UD files, RTX 3090 one request:
+  130.6 -> 144.5 tok/s).
+- Flash-Next: F32 router and projection weights decode through one GEMV kernel (UD files +3-10 %).
+- Flash-Next prompts on RTX 30-series cards: BF16-mixer and UD files take the FP16 row-scale path and the F32 projections
+  run as FP16 tensor-core GEMMs. RTX 3090, one request, 8K / 16K / 32K: tqLLM's IQ3_S file 2,548 / 2,764 / 2,804 tok/s
+  (1.4.2: 2,351 / 2,563 / 2,551), UD-IQ3_XXS 2,592 / 2,815 / 2,829 (2,409 / 2,547 / 2,586); GSM8K-200 unchanged.
+- DGX Spark / GB10: unified memory counts reclaimable page cache as free when sizing the context (27B, 8 x 131,072:
+  128K prompts 251 -> 786 tok/s); the 27B batched verify holds at most 24 columns (8 requests 104.5 -> 135.1 tok/s).
+- Metal, TQ4 files (TQ_L): decode / verify 2-3 % faster, same tokens: matrices split K 4 ways, the Q6 head reads FP16 d +
+  int8 sub-scales instead of an FP32 scale per 16 weights (head 2.93 -> 2.45 ms per step), and the decode RMS norm writes
+  the rotated FP16 copy in the same launch.
+
+### Fixed
+- Flash-Next, RTX 3090 and other 24 GB cards: with automatic expert slots and one request up to a 64K context, long
+  answers (thousands of tokens) could run out of device memory (HTTP 500). Automatic slots now keep a 1 GB decode reserve
+  for one request (GSM8K-200 at `--context 65536 --max-tokens 4096`: 31 failures -> 0).
+- Flash-Next, UD-IQ1_M: prompts no longer crash the server (the MTP layer's experts overran the prefill staging).
+- Flash-Next, UD files: F32 projection weights no longer break CUDA graph capture.
+- tqserve: a second Ctrl-C exits at once; an exception in a request thread returns a logged HTTP 500 instead of an empty
+  reply.
+- Metal: the exact attention kernel was switched off on stock MLX builds (it checked for the patched MLX instead of the
+  matrix unit).
+
 ## 1.4.2 (2026-11-05)
 
 ### Fixed

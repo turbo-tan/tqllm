@@ -121,6 +121,14 @@ inline size_t fit_margin(bool fit, long target_mb, bool wsl) {
 // Free device memory the fit judges a load by. Linux: the driver's figure. WSL / Windows (WDDM): the driver reads ~0 near
 // the budget whether or not the card has spilled into shared memory, so the free figure is our own accounting instead:
 // total minus what was in use before loading (context, desktop, other processes) minus the engine's allocations.
+// Integrated GPUs (GB10: one LPDDR5X pool): cudaMemGetInfo reports the OS's free RAM, not the page cache it reclaims on
+// demand (MemAvailable - MemFree, e.g. the model files just read). Counted as free, capped at the total (11-06: 8 slots x
+// 131K moved all 68.7 GB of KV to the slow host-mapped path at 1.62 GB "free"; 128K prompts 251 vs 791 tok/s).
+inline size_t unified_free(size_t driver_free, size_t total, size_t mem_available, size_t mem_free) {
+    const size_t reclaim = mem_available > mem_free ? mem_available - mem_free : 0;
+    const size_t f = driver_free + reclaim;
+    return f > total ? total : f;
+}
 inline size_t fit_free(bool wsl, size_t driver_free, size_t total, size_t used_before, size_t engine_bytes) {
     if (!wsl) return driver_free;
     const size_t slack = size_t(192) << 20;  // cuBLAS / cuBLASLt workspaces, CUDA graphs, allocator rounding

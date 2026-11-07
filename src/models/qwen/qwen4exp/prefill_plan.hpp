@@ -42,14 +42,35 @@ struct PrefillChunkBytes {
 };
 
 inline size_t align256(size_t b) { return (b + 255) / 256 * 256; }
+// Bytes one layer-major staging half needs for K experts of a bank whose six pieces (gate/up/down data + aux) are `piece`
+// (each piece's K copies 256-aligned, as DecodeModel::stage_offsets lays them out). The MTP layer's experts can be larger
+// than the trunk's (IQ4 MTP beside a UD-IQ1_M trunk), so every upload checks this, not only the routed path (11-06).
+inline size_t stage_need(const size_t piece[6], int K) { size_t o = 0; for (int i = 0; i < 6; ++i) o += align256(size_t(K) * piece[i]); return o; }
 // Hyper-connection norm of a chunk: more than 64 tokens keep only row scales and a BF16 image (the mix recomputes the
 // normalized rows), valid only when the mixer projections reading them (down, inject) are BF16 and so take that image;
 // a quantized down / inject reads the fp32 rows.
 inline bool hc_row_scales_only(int tokens, bool down_bf16, bool inject_bf16) { return tokens > 64 && down_bf16 && inject_bf16; }
-// the same for quantised down mixers (Q8_0): the norm writes an FP16 image (and a BF16 one when the inject weights are
-// BF16), which the projections read as their converted input (equal to converting the fp32 rows); resident GPU projections only
-inline bool hc_row_scales_h(int tokens, bool down_quant, bool inject_quant_or_bf16, bool gpu_projections) {
-    return tokens > 64 && down_quant && inject_quant_or_bf16 && gpu_projections;
+// the FP16 row-scale path: the norm writes an FP16 image the mixer's projections read through FP16 copies of their weights
+// (quantised, BF16 or F32 mixers alike: one stacked down + inject GEMM, an FP16 up); resident GPU projections only. It
+// takes BF16 mixers too (before the BF16 row-scale path above) and F32 inject (UD files)
+inline bool hc_row_scales_h(int tokens, bool mixers_have_fp16_copies, bool gpu_projections) {
+    return tokens > 64 && mixers_have_fp16_copies && gpu_projections;
+}
+// The layer-major expert passes' assignment lists: pass p holds W slots (slot_of[e] = the slot of expert e, -1 when the
+// expert is not in that pass); at out + at[p]: W counts, then W lists of up to cap assignment indices, each ascending.
+// One sweep over the A routed ids for all passes (an expert sits in at most one pass).
+struct PassSlots { int W, cap; size_t at; const int * slot_of; };
+inline void fill_pass_lists(const int * ids, int A, int E, const std::vector<PassSlots> & passes, int * out) {
+    std::vector<int> pass_of(size_t(E), -1);
+    for (size_t p = 0; p < passes.size(); ++p) {
+        const auto & ps = passes[p]; std::fill(out + ps.at, out + ps.at + ps.W, 0);
+        for (int e = 0; e < E; ++e) if (ps.slot_of[e] >= 0) pass_of[size_t(e)] = int(p);
+    }
+    for (int a = 0; a < A; ++a) {
+        const int e = ids[a], p = pass_of[size_t(e)]; if (p < 0) continue;
+        const auto & ps = passes[size_t(p)]; int * cn = out + ps.at, * gr = cn + ps.W; const int sl = ps.slot_of[e];
+        const int k = cn[sl]++; gr[size_t(sl) * ps.cap + size_t(k)] = a;
+    }
 }
 // the prefill scratch arena a chunk needs (per-layer temporaries of the dense sub-chunks and attention, without the QSA
 // block scores the caller adds; measured 10-17: 2880 MB high-water at 16384 tokens with 2048-query blocks, ~2340 MB

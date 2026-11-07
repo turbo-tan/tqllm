@@ -117,6 +117,24 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     static const size_t kv_keep = std::getenv("TQFN_KV_HOST_KEEP") ? size_t(std::atoi(std::getenv("TQFN_KV_HOST_KEEP"))) : 32768;
     const size_t state_rows = kv_host ? std::min(prompt.size() + count + 16, 2 * kv_keep) : prompt.size() + count + 16;
     if (slots_.size() == 1) f_.cache->regrow(regrow_keep_bytes(size_t(768) << 20, f_.state_full, f_.state_tokens, state_rows));
+    if (slots_.size() > 1) {
+        // several sequences: the request's K/V (prompt + max_tokens) and what the running requests will still grow into
+        // must fit beside the reserve; if not, the largest banks give slots back now, between steps (never below np x
+        // topk, the batching floor), instead of a running request failing for memory later (3090 np 12 x 8K, 11-05)
+        const size_t own = std::min(prompt.size() + count + 16, size_t(slot_context()));
+        size_t grow = 0;
+        for (const auto & sl : slots_) {
+            if (&sl == &S() || sl.done_ || !sl.model_) continue;
+            const size_t total = sl.plen_ + size_t(sl.generate_) + 16, at = size_t(std::max(0, sl.model_->position));
+            if (total > at) grow += tqllm::flashnext::sequence_kv_bytes(f_.mem_shape, int(total)) - tqllm::flashnext::sequence_kv_bytes(f_.mem_shape, int(at));
+        }
+        { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
+        const size_t fr = tqllm::device_free_bytes();
+        if (const size_t give = tqllm::flashnext::request_shrink_bytes(f_.mem_shape, own, fr > grow ? fr - grow : 0, size_t(256) << 20)) {
+            const int n = f_.cache->shrink_to_free(give, int(slots_.size()) * c.topk);
+            std::fprintf(stderr, "tqllm: a request needs %zu MB more for its K/V: %d expert banks gave slots back\n", give >> 20, n);
+        }
+    }
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));
         if (need != f_.cp->rt.kv_capacity) { if (f_.cp->rt.qsa_batch) { ck(cudaDeviceSynchronize()); f_.cp->rt.qsa_batch.reset(); } f_.cp->rt.kv_capacity = need; }

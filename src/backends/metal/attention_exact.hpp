@@ -231,10 +231,25 @@ inline mlx::core::array decode_attention_exact(const mlx::core::array& q, const 
                  consts, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+// the exact kernel runs on the GPU's matrix unit through Metal Performance Primitives tensor ops, our own kernels: it
+// needs no patched MLX. Probed once by compiling and running it on a tiny cache (false: the GPU has no tensor ops)
+inline bool matrix_unit_available() {
+    static const bool ok = [] {
+        namespace mx = mlx::core;
+        try {
+            auto q = mx::zeros({1, 6, 1, 256}, mx::float32);
+            auto k = mx::zeros({1, 1, 128, 256}, mx::bfloat16);
+            mx::eval(decode_attention_exact(q, k, k, 0.0625f, 100));
+            return true;
+        } catch (const std::exception&) {return false;}
+    }();
+    return ok;
+}
+
 // compile the exact-attention kernels once at load, so the first request does not pay the Metal compile
 inline void warm_exact_attention_kernels(int heads, int kvheads) {
     namespace mx = mlx::core;
-    if (heads != 6 * kvheads || !segmented_attention_available(256)) return;
+    if (heads != 6 * kvheads || !matrix_unit_available()) return;
     auto q = mx::astype(mx::astype(mx::random::normal({1, heads, 16, 256}), mx::bfloat16), mx::float32);
     auto k = mx::astype(mx::random::normal({1, kvheads, 1024, 256}), mx::bfloat16);
     mx::eval(decode_attention_exact(q, k, k, 0.0625f, 1000));

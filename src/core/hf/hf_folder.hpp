@@ -40,6 +40,9 @@ public:
 
     // A matrix of `module` (the tensor names without .weight / .trellis), in the encoding it is stored in.
     GgufTensor matrix(const std::string & module) const;
+    // The same with blocks of rows (or columns) in a new order (an exl3 matrix: blocks of 128 rows / columns, the Hadamard
+    // blocks, so the reordered matrix is exact; a stored BF16 / F16 / F32 matrix: any block).
+    GgufTensor matrix(const std::string & module, const HfBlockOrder & rows, const HfBlockOrder & cols) const;
     // Routed experts: one tensor [cols, rows, experts] with one part per module (every module the same shape).
     GgufTensor stack(const std::vector<std::string> & modules) const;
     // A 1-D weight as F32; plus_one stores 1 + w (the engine's norms are plain x * w).

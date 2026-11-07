@@ -343,7 +343,7 @@ inline const char * cpu_gguf_row(int fmt, const char * dev, const char * aux, in
 // runs the hits (full routing, CPU numerics: not bit-identical to the GPU path). Rows come from the GGUF bytes.
 class CpuMissPool {
 public:
-    struct Job { const char * w[3]; uint32_t type[3]; size_t row_bytes[3]; int cols_t[8]; int ncols = 0; int slot = 0;
+    struct Job { const char * w[3]; uint32_t type[3]; size_t row_bytes[3]; int cols_t[64]; int ncols = 0; int slot = 0;
                  const char * dev[3] = {nullptr, nullptr, nullptr}, * aux[3] = {nullptr, nullptr, nullptr}; int fmt[3] = {-1, -1, -1}; bool tiled = false; };
     CpuMissPool(int threads, int hidden, int ff) : hidden_(hidden), ff_(ff) {
         for (int i = 0; i < threads; ++i) workers_.emplace_back([this, i] { run(i); });
@@ -557,7 +557,7 @@ struct CpuPackedView { const char * map = nullptr; std::vector<uint64_t> base, b
 inline CpuPackedView * g_cpu_packed = nullptr;
 class CpuMissPool {
 public:
-    struct Job { const char * w[3]; uint32_t type[3]; size_t row_bytes[3]; int cols_t[8]; int ncols = 0; int slot = 0;
+    struct Job { const char * w[3]; uint32_t type[3]; size_t row_bytes[3]; int cols_t[64]; int ncols = 0; int slot = 0;
                  const char * dev[3] = {nullptr, nullptr, nullptr}, * aux[3] = {nullptr, nullptr, nullptr}; int fmt[3] = {-1, -1, -1}; bool tiled = false; };
     CpuMissPool(int, int, int) { throw std::runtime_error("TQFN_CPU_MISS needs an x86 CPU with AVX2"); }
     void start(const float *, int, std::vector<Job>, __nv_bfloat16 *) {}

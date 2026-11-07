@@ -1,6 +1,10 @@
 if(NOT APPLE)
   message(FATAL_ERROR "TQLLM_MLX requires Apple Metal")
 endif()
+# a pip wheel build (scikit-build-core) finds MLX in the mlx / mlx-metal wheels of its build environment
+if(SKBUILD AND NOT MLX_DIR)
+  execute_process(COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir OUTPUT_VARIABLE MLX_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
 find_package(MLX 0.32 CONFIG REQUIRED)
 enable_language(OBJCXX)
 add_library(tqmlx STATIC src/backends/metal/tq4.cpp src/backends/metal/tq3.cpp src/backends/metal/q6.cpp src/backends/metal/q8.cpp
@@ -75,3 +79,9 @@ add_executable(tqserve tools/tqserve.cpp src/engine/model.cpp src/engine/registr
 target_include_directories(tqserve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(tqserve PRIVATE tqmlx tqllm tqjinja Threads::Threads)
 target_compile_definitions(tqserve PRIVATE TQLLM_COMMIT="${TQLLM_COMMIT}")
+
+# pip wheel (pyproject.toml, scikit-build-core): tqserve inside the tqllm package, linked to the mlx package's libmlx
+if(SKBUILD)
+  set_target_properties(tqserve PROPERTIES INSTALL_RPATH "@loader_path/../../mlx/lib")
+  install(TARGETS tqserve RUNTIME DESTINATION tqllm/bin COMPONENT wheel)
+endif()

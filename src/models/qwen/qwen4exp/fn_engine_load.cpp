@@ -6,6 +6,7 @@
 #include "device_free.hpp"
 #include "fn_engine.hpp"
 #include "decode_rules.hpp"
+#include "memory_plan.hpp"
 #include <chrono>
 #include "hot_cold_policy.hpp"
 #include "gsq_q2_host.hpp"
@@ -22,9 +23,9 @@ std::array<ExpertPayload,3> mapped_cold_payload(FnServe & f,int layer,int expert
 
 
 FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options) : context_(context), slots_(size_t(std::max(1, nslots))) {
-    // above 8 concurrent slots some requests end after one token and np 16 fails (10-13, P8 build too): refuse until fixed
-    require(nslots <= 8,
-            "Flash-Next serves up to --np 8 for now (a bug above 8 slots is being fixed)");
+    // up to 16 sequences: each layer keeps np x topk slots and a request makes room for its K/V at its start (decode_rules.hpp
+    // lift_layer_floor, memory_plan.hpp request_shrink_bytes); 3090 np 10 / 12 exact, all texts == np 1 (11-05)
+    require(nslots <= 16, "Flash-Next serves up to --np 16");
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
@@ -246,7 +247,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     size_t device_total = 0; (void) tqllm::device_free_bytes(&device_total);
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
-    ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
+    ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots, slots_.size() > 1 ? int(slots_.size()) * c.topk : 0);
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
@@ -306,7 +307,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         f.packed.tiled = true;
     }
     if (f.packed.tiled) { tqllm_cuda::set_tiled_experts(true); run.tile_experts = true; }
-    if (std::getenv("TQFN_CPU_MISS") || (run.small_card && !run.exact)) {  // CPU pool reads the pinned copy; the GGUF expert pages would hold the experts twice
+    // the CPU pool reads the pinned copy whenever it runs (decode_rules.hpp); the GGUF expert pages would hold the experts twice
+    if (tqllm::flashnext::cpu_pool_reads_packed(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1, run.exact,
+                                                int(std::thread::hardware_concurrency()))) {
         static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
         pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
         for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
@@ -354,22 +357,22 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // the warm model's attention state is sized by the context capacity (8 GB at 262144): it must not hold that while
     // the banks are built, or the slots are capped by it; the warm-up only needs its 64 tokens
     const int kv_capacity_full = rt.kv_capacity; rt.kv_capacity = std::min(rt.kv_capacity, 4096);
-    // the device memory a full context keeps beside the banks: its attention state and the decode reserve
+    // the device memory a full context keeps beside the banks (memory_plan.hpp context_keep: attention state less the
+    // K/V that lives in host memory in decode, and the decode reserve)
+    auto mem_shape = [&] {
+        tqllm::flashnext::MemShape m;
+        for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++m.attention_layers;
+        m.kv_heads = checkpoint.attention_kvheads; m.head_dim = checkpoint.attention_dim; m.index_dim = c.index_dim;
+        m.experts = c.experts; m.topk = c.topk; return m;
+    };
+    auto mem_run = [&] {
+        tqllm::flashnext::MemRun r; r.context = int(context); r.kv_host = kv_host_enabled();
+        r.kv_host_keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
+        r.sequences = slots_.size(); r.small_card = run.small_card; r.caching = caching(); r.manifest_drafts = f.drafts; return r;
+    };
     auto context_keep = [&] {
-        int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
-        // in decode the K/V of positions older than TQFN_KV_HOST_KEEP live in host memory (kv_to_host); the indexer keys stay
-        const bool kv_host = kv_host_enabled();
-        const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
-        const size_t kv_row = size_t(2) * checkpoint.attention_kvheads * checkpoint.attention_dim * 2;  // K + V bf16 per position
-        const size_t moved = kv_host && int(context) > 2 * keep ? size_t(attn) * (size_t(context) - size_t(2 * keep)) * kv_row : 0;
-        const size_t state = tqllm::prefill_context_bytes(int(context), 16, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim) - moved;
-        // decode scratch, the MTP bank rebuilt after a multi-chunk prompt, the prefill staging halves, refill staging
-        // (2 GB for a long-context server: the 245K cells at 64 / 72 slots failed with 1 GB; a chat server at 33K runs
-        // 140 slots with 1.8 GB free, so short contexts keep 512 MB)
-        // (11-03 np 2 chat decode: 1.05-1.15 GB stayed free with both sequences decoding, so up to 64K keeps 256 MB; a long
-        // prompt's prefill borrows banks for its own needs)
-        const size_t reserve = size_t(context > 65536 ? 2048 : 256) << 20;
-        return std::pair<size_t, size_t>{state, reserve};
+        const auto k = tqllm::flashnext::context_keep(mem_shape(), mem_run());
+        return std::pair<size_t, size_t>{k.state, k.reserve};
     };
     // the warm-up's steps (64 and 512 tokens) need a fraction of the start-up arena and of the staging halves: hold only
     // that while the banks are built, so the slot count is not capped by buffers the warm-up does not use
@@ -428,7 +431,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           // several sequences: each one's own buffers, measured on a short sequence (the probe); a request's K/V is sized by
           // the request and a long prompt borrows banks like a single sequence, so the full-context estimate is not kept per slot
           // (the prompt cache keeps every slot at its full context: then the full estimate)
-          const size_t state = slots_.size() > 1 && measured_state && !caching() ? measured_state : std::max(state_est, measured_state);
+          const size_t state = tqllm::flashnext::keep_state(mem_shape(), mem_run(), state_est, measured_state);
           // every slot (--np) keeps its own full-context attention / recurrent / MTP state beside the banks: sized for one,
           // np 4 at 32K ran out of memory in the second request's state (F38)
           const size_t nseq = slots_.size();
@@ -440,7 +443,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
               const size_t fr = tqllm::device_free_bytes();
               f.slots = tqllm::auto_expert_slots(fr, need + extra, per, c.experts);
-              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots);
+              f.cache->set_layer_slots(std::vector<int>(size_t(c.layers), f.slots)); ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots, slots_.size() > 1 ? int(slots_.size()) * c.topk : 0);
               { auto again = warm.step(ids); ck(cudaDeviceSynchronize()); }  // the banks again, at the new size
               const size_t after = tqllm::device_free_bytes();
               std::fprintf(stderr, "tqllm: expert slots auto: %.0f MB free without banks, %.0f MB kept, %.1f MB per slot -> %d slots/layer, %.0f MB free after\n",
@@ -539,18 +542,17 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
         // cannot hold it (it would prefill for minutes and then fail in decode)
         const auto [state, reserve] = context_keep();
-        f.state_full = state; f.state_tokens = int(context);
+        f.state_full = state; f.state_tokens = int(context); f.mem_shape = mem_shape();
         const size_t fr = tqllm::device_free_bytes();
         // slots=auto keeps only the reserve (and each extra sequence's own buffers) on purpose (decode_rules.hpp
         // auto_keep_bytes): a request's K/V is sized by the request and a long prompt borrows banks, at any --np
         if (fr < state + reserve && (run.small_card || f.slots_auto)) {
             std::fprintf(stderr, "tqllm: %zu MB free < %zu MB for a full context; long prompts borrow expert banks\n", fr >> 20, (state + reserve) >> 20);
-        } else if (fr < state + reserve) {
-            const size_t per_slot = f.cache->stats().device_bytes / size_t(std::max(1, f.slots));
-            const int drop = per_slot ? int((state + reserve - fr + per_slot - 1) / per_slot) : f.slots;
+        } else if (const int most = tqllm::flashnext::fit_max_slots({state, reserve}, fr, f.slots_auto, run.small_card, f.slots,
+                                                                         f.cache->stats().device_bytes); most >= 0) {
             throw std::runtime_error("Flash-Next: " + std::to_string(f.slots) + " expert slots per layer leave " + std::to_string(fr >> 20) +
                                      " MB free, a full " + std::to_string(context) + "-token context needs " + std::to_string((state + reserve) >> 20) +
-                                     " MB (attention state + decode reserve): use at most " + std::to_string(std::max(0, f.slots - drop)) +
+                                     " MB (attention state + decode reserve): use at most " + std::to_string(most) +
                                      " slots (manifest slots=) or a smaller --context");
         }
     }

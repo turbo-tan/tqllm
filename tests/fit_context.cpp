@@ -33,6 +33,11 @@ int main() {
     {
         const size_t total = size_t(16311) * MB, before = size_t(900) * MB;
         expect("Linux: driver figure", tqllm::fit_free(false, 300 * MB, total, before, 14 * GB) == 300 * MB);
+        // GB10 (integrated): 1.62 GB driver free + 40 GB of page cache the OS would drop -> about 41.6 GB usable
+        expect("unified: reclaimable page cache counts as free",
+               tqllm::unified_free(size_t(1.62 * GB), 121 * GB, 50 * GB, 10 * GB) == size_t(1.62 * GB) + 40 * GB);
+        expect("unified: never above the total", tqllm::unified_free(100 * GB, 121 * GB, 60 * GB, 10 * GB) == 121 * GB);
+        expect("unified: no reclaimable memory, the driver figure", tqllm::unified_free(3 * GB, 121 * GB, 5 * GB, 5 * GB) == 3 * GB);
         expect("WSL, fits (driver says 0): accounted room left",
                tqllm::fit_free(true, 0, total, before, size_t(14.6 * GB)) > 400 * MB);
         expect("WSL, spilled (driver says 0.29 GB): accounted 0",

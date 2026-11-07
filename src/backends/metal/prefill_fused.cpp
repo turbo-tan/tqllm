@@ -18,10 +18,11 @@ std::pair<mx::array, mx::array> rms_norm_bf16_pair_reference(const mx::array& x,
     return {n, mx::astype(n, mx::float16)};
 }
 
-std::pair<mx::array, mx::array> rms_norm_bf16_pair(const mx::array& x, const mx::array& w, float eps) {
+std::pair<mx::array, mx::array> rms_norm_bf16_pair(const mx::array& x, const mx::array& w, float eps, bool rotate) {
     if (x.ndim() != 2 || x.dtype() != mx::float32 || w.ndim() != 1 || w.shape(0) != x.shape(1) || w.dtype() != mx::float32 ||
         x.shape(1) <= 4096)
         throw std::invalid_argument("rms_norm_bf16_pair: FP32 [rows, d > 4096] and FP32 weight [d]");
+    if (rotate && x.shape(1) % 128) throw std::invalid_argument("rms_norm_bf16_pair: the rotated copy needs 128-column blocks");
     // MLX rms_looped (kernels/rms_norm.metal) with T = float at 1024 threads, then the BF16 rounding and the FP16 copy
     static auto kernel = mx::fast::metal_kernel("tqllm_rms_norm_bf16_pair", {"x", "w", "eps"}, {"out", "out16"}, R"METAL(
     constexpr int N_READS = 4;
@@ -52,17 +53,38 @@ std::pair<mx::array, mx::array> rms_norm_bf16_pair(const mx::array& x, const mx:
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const size_t o0 = gid * size_t(axis_size) + lid * N_READS;
-    for (uint r = 0; r < axis_size; r += lsize * N_READS)
+    for (uint r0 = 0; r0 < axis_size; r0 += lsize * N_READS) {
+        if (r0 + lid * N_READS >= axis_size) continue;  // whole simdgroups when D % 128 == 0 (ROT needs that)
+        const size_t o = o0 + r0;
+        float v[N_READS];
         for (int i = 0; i < N_READS; i++)
-            if ((r + lid * N_READS + i) < axis_size) {
-                const float v = float(bfloat16_t(wr[i + r] * static_cast<float>(xr[r + i] * local_inv_mean[0])));
-                out[o0 + r + i] = v;
-                out16[o0 + r + i] = half(v);
+            if ((r0 + lid * N_READS + i) < axis_size) {
+                v[i] = float(bfloat16_t(wr[i + r0] * static_cast<float>(xr[r0 + i] * local_inv_mean[0])));
+                out[o + i] = v[i];
             }
+            if (ROT) {
+                // tq4_rotate_half on the row: this simdgroup holds one 128-column block, lane l columns 4l..4l+3 (the same
+                // layout, operations and order as tqllm_tq4_rotate_half, so the same bits)
+                constexpr uint W[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+                for (uint e = 0; e < 4u; ++e) {
+                    const uint i = simd_lane_id * 4u + e;
+                    v[e] *= ((W[i / 32u] >> (i % 32u)) & 1u) ? -1.0f : 1.0f;
+                }
+                float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+                v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+                for (uint m = 1u; m < 32u; m <<= 1u)
+                    for (uint e = 0; e < 4u; ++e) {
+                        const float other = simd_shuffle_xor(v[e], ushort(m));
+                        v[e] = (simd_lane_id & m) ? other - v[e] : v[e] + other;
+                    }
+                for (uint e = 0; e < 4u; ++e) out16[o + e] = half(v[e] * 0.08838834764831845f);
+            } else
+                for (int i = 0; i < N_READS; i++) if ((r0 + lid * N_READS + i) < axis_size) out16[o + i] = half(v[i]);
+    }
 )METAL");
     const int rows = x.shape(0), d = x.shape(1);
     auto o = kernel({mx::contiguous(x), mx::contiguous(w), mx::array(eps)}, {x.shape(), x.shape()}, {mx::float32, mx::float16},
-                    {rows * 1024, 1, 1}, {1024, 1, 1}, {{"D", d}}, std::nullopt, false, mx::Device(mx::Device::gpu));
+                    {rows * 1024, 1, 1}, {1024, 1, 1}, {{"D", d}, {"ROT", rotate}}, std::nullopt, false, mx::Device(mx::Device::gpu));
     return {o[0], o[1]};
 }
 
@@ -73,10 +95,11 @@ std::tuple<mx::array, mx::array, mx::array> rms_norm_bf16_pair_residual_referenc
     return {s, n.first, n.second};
 }
 
-std::tuple<mx::array, mx::array, mx::array> rms_norm_bf16_pair_residual(const mx::array& x, const mx::array& r, const mx::array& w, float eps) {
+std::tuple<mx::array, mx::array, mx::array> rms_norm_bf16_pair_residual(const mx::array& x, const mx::array& r, const mx::array& w, float eps, bool rotate) {
     if (x.ndim() != 2 || x.dtype() != mx::float32 || r.shape() != x.shape() || r.dtype() != mx::float32 || w.ndim() != 1 ||
         w.shape(0) != x.shape(1) || w.dtype() != mx::float32 || x.shape(1) <= 4096)
         throw std::invalid_argument("rms_norm_bf16_pair_residual: FP32 [rows, d > 4096] x and r, FP32 weight [d]");
+    if (rotate && x.shape(1) % 128) throw std::invalid_argument("rms_norm_bf16_pair_residual: the rotated copy needs 128-column blocks");
     // s = bf(x + r) computed twice per element (identical bits), the reduction and the output as rms_norm_bf16_pair
     static auto kernel = mx::fast::metal_kernel("tqllm_rms_norm_bf16_pair_res", {"x", "r", "w", "eps"}, {"sum", "out", "out16"}, R"METAL(
     constexpr int N_READS = 4;
@@ -108,18 +131,39 @@ std::tuple<mx::array, mx::array, mx::array> rms_norm_bf16_pair_residual(const mx
         if (simd_lane_id == 0) local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint r2 = 0; r2 < axis_size; r2 += lsize * N_READS)
+    for (uint r0 = 0; r0 < axis_size; r0 += lsize * N_READS) {
+        if (r0 + lid * N_READS >= axis_size) continue;
+        const size_t o = o0 + r0;
+        float v[N_READS];
         for (int i = 0; i < N_READS; i++)
-            if ((r2 + lid * N_READS + i) < axis_size) {
-                const float si = float(bfloat16_t(xr[r2 + i] + rr[r2 + i]));
-                const float v = float(bfloat16_t(wr[i + r2] * static_cast<float>(si * local_inv_mean[0])));
-                out[o0 + r2 + i] = v;
-                out16[o0 + r2 + i] = half(v);
+            if ((r0 + lid * N_READS + i) < axis_size) {
+                const float si = float(bfloat16_t(xr[r0 + i] + rr[r0 + i]));
+                v[i] = float(bfloat16_t(wr[i + r0] * static_cast<float>(si * local_inv_mean[0])));
+                out[o + i] = v[i];
             }
+            if (ROT) {
+                // tq4_rotate_half on the row: this simdgroup holds one 128-column block, lane l columns 4l..4l+3 (the same
+                // layout, operations and order as tqllm_tq4_rotate_half, so the same bits)
+                constexpr uint W[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+                for (uint e = 0; e < 4u; ++e) {
+                    const uint i = simd_lane_id * 4u + e;
+                    v[e] *= ((W[i / 32u] >> (i % 32u)) & 1u) ? -1.0f : 1.0f;
+                }
+                float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+                v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+                for (uint m = 1u; m < 32u; m <<= 1u)
+                    for (uint e = 0; e < 4u; ++e) {
+                        const float other = simd_shuffle_xor(v[e], ushort(m));
+                        v[e] = (simd_lane_id & m) ? other - v[e] : v[e] + other;
+                    }
+                for (uint e = 0; e < 4u; ++e) out16[o + e] = half(v[e] * 0.08838834764831845f);
+            } else
+                for (int i = 0; i < N_READS; i++) if ((r0 + lid * N_READS + i) < axis_size) out16[o + i] = half(v[i]);
+    }
 )METAL");
     const int rows = x.shape(0), d = x.shape(1);
     auto o = kernel({mx::contiguous(x), mx::contiguous(r), mx::contiguous(w), mx::array(eps)}, {x.shape(), x.shape(), x.shape()},
-                    {mx::float32, mx::float32, mx::float16}, {rows * 1024, 1, 1}, {1024, 1, 1}, {{"D", d}}, std::nullopt, false,
+                    {mx::float32, mx::float32, mx::float16}, {rows * 1024, 1, 1}, {1024, 1, 1}, {{"D", d}, {"ROT", rotate}}, std::nullopt, false,
                     mx::Device(mx::Device::gpu));
     return {o[0], o[1], o[2]};
 }

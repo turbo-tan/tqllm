@@ -1,11 +1,13 @@
 #pragma once
 // Multi-slot request scheduler (tqserve --np N): connection threads enqueue requests and wait; one engine thread
 // owns every model call, admits queued requests into free slots and round-robins one draft + verify step per slot.
+#include "admission.hpp"
 #include "session.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -149,6 +151,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             job->done = true;
+            ++finished_;
         }
         done_.notify_all();
         job.reset();
@@ -181,7 +184,7 @@ private:
                 for (const auto & j : active_) busy += j != nullptr;
                 // first come first served; each request takes the free slot that reuses most of its prompt (an agent's
                 // next turn goes back to the slot holding its conversation), else the free slot reused least recently
-                while (!queue_.empty() && busy < limit_) {
+                while (!queue_.empty() && busy < limit_ && admission_open(finished_, wait_until_)) {
                     int best = -1; uint32_t reuse = 0;
                     for (size_t s = 0; s < active_.size(); ++s) {
                         if (active_[s]) continue;
@@ -216,6 +219,17 @@ private:
                     // and the first batched step has run (8 prompts at once: each waited for all eight prefills)
                     if (job->stream) publish(*job, model_.spec_tokens(int(s)));
                 } catch (const std::exception & e) {
+                    int others = 0;
+                    for (size_t o = 0; o < active_.size(); ++o) others += o != s && active_[o] != nullptr;
+                    if (on_prefill_error(e.what(), others) == OnOom::Requeue) {  // queue, not stop: retried after one finishes
+                        std::fprintf(stderr, "tqserve: not enough memory for a %zu-token prompt beside %d running: queued until one finishes\n",
+                                     job->prompt.size(), others);
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        wait_until_ = finished_ + 1;
+                        queue_.push_front(job);
+                        job.reset();
+                        continue;
+                    }
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     complete(job);
                 }
@@ -266,6 +280,7 @@ private:
     std::vector<std::shared_ptr<Job>> active_;  // engine thread only
     std::vector<uint64_t> used_;  // admission clock per slot (least recently used free slot first)
     uint64_t clock_ = 0;
+    unsigned long long finished_ = 0, wait_until_ = 0;  // after an out-of-memory requeue, admission waits for one finish
     std::deque<std::shared_ptr<Job>> queue_;
     int limit_ = 1;  // admitted at once (POST /admin/slots)
     std::mutex mutex_;

@@ -55,7 +55,7 @@ inline mlx::core::array causal_attention_rows(const mlx::core::array& q, const m
     if (length < n || v.shape(2) != k.shape(2) || length > k.shape(2) || k.dtype() != mx::bfloat16 || v.dtype() != mx::bfloat16)
         throw std::invalid_argument("attention needs a BF16 KV buffer at least as long as the query block");
     // 1-16 rows on the matrix unit (M5): one kernel for AR, chain and token-tree rows, exact by construction
-    if (n <= 16 && exact_attention_fits(q, k) && segmented_attention_available(q.shape(3)))
+    if (n <= 16 && exact_attention_fits(q, k) && matrix_unit_available())
         return decode_attention_exact(q, k, v, scale, length, tree, qsa);
     if (n <= 16) return decode_attention_bf16(q, k, v, scale, length, tree, tree_parents);
     if (exact_rows && n <= 32) {

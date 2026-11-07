@@ -34,6 +34,7 @@ enum GgmlType : uint32_t {
     GGML_NAX_A4_G128 = 314, GGML_NAX_A6_G64 = 315, GGML_AFF8_G64 = 316, GGML_NAX_A4_G64 = 317,  // affine, M5 matrix-unit lane order (8-bit: row-major)
     GGML_GSQ_Q2_0 = 302,  // explicit GSQ-RCO dialect: external id42, not fork Q1_0
     GGML_I16 = 25,        // EXL3 trellis words, 1 elem / 2 B
+    GGML_NVFP4G = 323,    // NVFP4 (modelopt) per 128 weights: F32 global (weight_scale_2), 8 E4M3 group scales, 64 B E2M1 (low = even)
     GGML_MXFP8 = 321,     // OCP MXFP8: per row cols E4M3, then the row's cols / 32 E8M0 scales (32 weights in 33 B)
     GGML_X3 = 320,        // X3 (EXL3 mul1 trellis): X3Record row groups of trellis / suh / svh (303 / 304 are TQ4S / TQ3S)
 };

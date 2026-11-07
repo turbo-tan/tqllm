@@ -32,7 +32,7 @@ int tof(int x) {return x - 15 > 0 ? (x - 15) / 64 * 64 : 0;}
 }  // namespace
 
 int main() {
-    if (!segmented_attention_available(256)) {std::printf("ATTENTION_QSA_SKIP (needs the matrix unit)\n"); return 0;}
+    if (!matrix_unit_available()) {std::printf("ATTENTION_QSA_SKIP (needs the matrix unit)\n"); return 0;}
     const int heads = 24, kvh = 4, dim = 256, cap = kQsaFrom + 8192;
     const float scale = 0.0625f;
     mx::random::seed(5);

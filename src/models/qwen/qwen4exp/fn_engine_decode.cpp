@@ -3,6 +3,22 @@
 
 namespace tqllm::flashnext {
 
+void FlashNextEngine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
+    auto & checkpoint = *f_.cp;
+    require(n > 0 && pos + uint32_t(n) <= slot_context(), "Flash-Next verify: block past the slot context");
+    if (pos == 0 || !S().model_) {
+        S().model_ = std::make_unique<DecodeModel>(checkpoint, *f_.fixtures, *f_.cache, size_t(slot_context()));
+        S().model_->mtp_experts = f_.mtp_cache.get(); bind();
+    }
+    require(S().model_->position == int(pos), "Flash-Next verify: blocks must follow each other");
+    if (g_arena) g_arena->used = 0;
+    auto rows = S().model_->step(std::vector<int>(tokens, tokens + n));
+    const auto lg = checkpoint.head_logits_device(rows->p, n); const size_t V = lg.size() / size_t(n);
+    { PersistentAlloc keep; if (!verify_logits_ || verify_logits_->count < lg.size()) verify_logits_ = std::make_unique<Device<float>>(lg.size()); }
+    ck(cudaMemcpy(verify_logits_->p, lg.data(), lg.size() * sizeof(float), cudaMemcpyHostToDevice));
+    if (next) for (int i = 0; i < n; ++i) next[i] = uint32_t(std::max_element(lg.begin() + long(size_t(i) * V), lg.begin() + long(size_t(i + 1) * V)) - lg.begin() - long(size_t(i) * V));
+}
+
 std::vector<int> FlashNextEngine::pick(const float * rows, int n) {
     auto & checkpoint = *f_.cp;
     if (S().temp_ <= 0.f) return checkpoint.head_argmax_rows(rows, n);

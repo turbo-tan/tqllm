@@ -107,6 +107,11 @@ void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows,
 // tokens columns at once ([tokens][cols] -> [tokens][rows]); per-token sums as fn_gemv_bf16. rows_per_block: rows of one
 // weight block per CUDA block (x read once per block); 0 = the dispatch's rule, 1 = one row per block.
 void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
+// F32 weights (Unsloth keeps the router, ssm_alpha / ssm_beta and hc_*_inject in F32): [tokens][cols] -> [tokens][rows], one
+// warp per row with up to 8 tokens per weight read, F32 sums; capturable in a CUDA graph (the cuBLAS SGEMM on the legacy stream is not)
+void fn_gemv_f32_tokens(const float * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t);
+// the same with output row t at y + t * ldy (the router writes straight into its [n][experts + 1] logits)
+void fn_gemv_f32_tokens_ld(const float * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);
 // Prefill chunks on the block-per-row layout (rows <= 16, or rows <= 1024 with cols >= 1024): sums bit-identical to
 // fn_gemv_bf16_tokens, x read once per 8 rows; output row t at y + t * ldy.
 void fn_gemv_bf16_chunk(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t);

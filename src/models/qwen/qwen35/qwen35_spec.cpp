@@ -1,4 +1,5 @@
 // qwen35 engine: speculative decoding (DFlash, MTP, verify, slots). The class is declared in qwen35_engine.hpp.
+#include "qwen35_rules.hpp"
 #include "qwen35_engine.hpp"
 
 namespace tqllm {
@@ -341,16 +342,14 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     segs.clear();
     batch_topk = false;
     int col = 0;
-    // Column budget: past ~8-12 columns the verify matmuls turn tensor-core bound, so with many slots each drafts
-    // fewer tokens (the greedy output does not depend on the draft length).
-    // Blackwell (GB10 LPDDR5X, 5060 Ti) stays memory-bound up to the full NB columns; GA10x GeForce FP32-accumulate
-    // tensor rate caps useful width near 16 (3090, c=4 mixed code / essays: budget 16 -> 283 / 198, 24 -> 281 / 173,
-    // 32 -> 249 / 138 tok/s; four identical prime prompts favour 24: 300 / 341 / 314).
+    // Column budget per device class (qwen35_rules.hpp): past it the verify matmuls cost per column, so with many slots
+    // each drafts fewer tokens.
     static const int budget = [this] {
-        int dev = 0, major = 0;
+        int dev = 0, major = 0, integrated = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        return major >= 10 ? NB : 16;
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+        return tqllm::qwen35::verify_column_budget(major, integrated != 0, NB);
     }();
     int live = 0;
     for (int i = 0; i < ns; ++i) {

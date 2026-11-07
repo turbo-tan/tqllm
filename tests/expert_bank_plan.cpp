@@ -188,6 +188,16 @@ int main() {
         ok(ledger.state() == BankLedger::State::Refilled, "the request is closed");
     }
 
+    {   // shrink_caps (11-05): slots come back from the largest layers, never below the floor, until enough is free
+        const std::vector<int> caps = {150, 120, 160, 100}; const std::vector<int> floor(4, 120); const std::vector<size_t> sb(4, 100);
+        const auto a = tqllm::shrink_caps(caps, floor, sb, 2500);
+        int freed = 0; for (size_t l = 0; l < 4; ++l) freed += (caps[l] - a[l]) * 100;
+        ok(freed >= 2500 && a[1] == 120 && a[3] == 100, "shrink: enough freed, floors and small layers untouched");
+        ok(a[0] <= 150 && a[2] < 160 && std::abs(a[0] - a[2]) <= 1, "shrink: the largest layers give first, evenly");
+        const auto b = tqllm::shrink_caps(caps, floor, sb, 1000000);
+        ok(b[0] == 120 && b[2] == 120, "shrink: stops at the floor when not enough can be freed");
+        ok(tqllm::shrink_caps(caps, floor, sb, 0) == caps, "shrink: nothing needed, nothing changed");
+    }
     std::printf(fails ? "EXPERT_BANK_PLAN FAIL\n" : "EXPERT_BANK_PLAN PASS\n");
     return fails ? 1 : 0;
 }

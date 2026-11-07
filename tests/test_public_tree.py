@@ -19,7 +19,7 @@ SELF = "tests/test_public_tree.py"
 TOP_LEVEL = {
     ".dockerignore", ".gitattributes", ".github", ".gitignore", "AGENTS.md", "CHANGELOG.md", "CMakeLists.txt",
     "CONTRIBUTING.md", "Dockerfile", "LICENSE", "NOTICE", "README.md", "archive", "bench", "cmake", "compose.yaml",
-    "config", "docker", "docs", "include", "licenses", "quant", "src", "tests", "third_party", "tools",
+    "config", "docker", "docs", "include", "licenses", "pyproject.toml", "python", "quant", "src", "tests", "third_party", "tools",
 }
 # path parts that mark working material, not product
 FORBIDDEN_PARTS = {"results", "scratch", "tmp", "logs", "handover", "handovers", "inbox", "wip"}

@@ -46,6 +46,7 @@ int main() {
     check(predicts(32, 4, 8), "np 8: eight 4-row blocks prefetch");
     check(!predicts(1024, 4, 1), "a prompt chunk does not");
     check(prefetch_ranks(1).last == 6 && prefetch_ranks(2).last == 3 && prefetch_ranks(4).last == 3, "np > 1 prefetches each token's 3 best only");
+    check(next_cpu_budget(4, true, 0, 4 * 2) == 5 && next_cpu_budget(4, true, 0) == 4, "np 2: the CPU miss budget may grow past one sequence's 4");
 
     // K/V mapping (3090 np 2, 11-03): np sequences at context C / np must map no more K/V than one sequence at C (the
     // same positions); a fixed 32 MB page made every sequence map 26 x 32 MB whatever its context (832 MB at 4K)
@@ -93,10 +94,13 @@ int main() {
         check(!runs_on_cpu(3, e_not, false, false, true), "no pool for this call: never the CPU");
     }
     // adaptive CPU miss budget: the pool takes only what it finishes inside the GPU's work for the call
-    check(next_cpu_budget(4, 210.0, 0) == 3, "the host waited 0.21 ms: one expert fewer");
-    check(next_cpu_budget(3, 2.0, 0) == 4 && next_cpu_budget(4, 2.0, 0) == 4, "finished in time: one more, capped");
-    check(next_cpu_budget(1, 50.0, 0) == 0, "still waiting at one: every miss over PCIe");
-    check(next_cpu_budget(0, 0.0, 10) == 0 && next_cpu_budget(0, 0.0, 64) == 1, "at zero: a probe call every 64 tries one again");
+    check(next_cpu_budget(4, false, 0) == 3, "the GPU was idle when the pool finished: one expert fewer");
+    check(next_cpu_budget(3, true, 0) == 4 && next_cpu_budget(4, true, 0) == 4, "the GPU still busy: one more, capped");
+    check(next_cpu_budget(1, false, 0) == 0, "still late at one: every miss over PCIe");
+    check(next_cpu_budget(0, false, 10) == 0 && next_cpu_budget(0, false, 64) == 1, "at zero: a probe call every 64 tries one again");
+    // np 8 (11-05): ~16 misses per layer call; while the GPU stays busy the share climbs to the batch cap (4 per sequence)
+    { int b = 4; for (int k = 0; k < 40; ++k) b = next_cpu_budget(b, true, 0, 4 * 8); check(b == 32, "np 8: the share reaches the batch cap while the GPU stays busy"); }
+    { int b = 32; for (int k = 0; k < 40; ++k) b = next_cpu_budget(b, k % 2 == 0, 0, 32); check(b >= 31 && b <= 32, "alternating busy / idle holds the share"); }
     // slot tiers: the floor scales with the slot total, never exceeds the target, never drops below 64 (F39: a 6-row verify
     // routes to at most 60 distinct experts, so the split path holds at every bank size)
     check(slot_floor(157, 144, 157) == 144 && slot_floor(247, 144, 157) == 226, "floor scales each layer's target like the total");
@@ -208,6 +212,8 @@ int main() {
     check(qsa_key_ring_cells(true, 32768) == 32768 && qsa_key_ring_cells(false, 32768) == 0, "QSA key ring + host mirror on discrete GPUs only (GB10: the full array, no mirror)");
     check(keep_prefill_buffers(true, size_t(26) << 30) && !keep_prefill_buffers(false, size_t(26) << 30), "GB10 keeps the engine's prefill buffers between requests; discrete cards hand them to the banks");
     check(!keep_prefill_buffers(true, size_t(16) << 30), "GB10 below its 20 GB margin hands them back too");
+    check(dense_pool_for(size_t(600) << 20, 256, 2048) == (size_t(600) << 20) && dense_pool_for(size_t(600) << 20, 256, 120) == 0 &&
+          dense_pool_for(size_t(600) << 20, 0, 4096) == 0, "the dense FP16 pool only from --dense-min tokens (a short prompt keeps decode's memory)");
     check(layer_graphs(true, 12) && layer_graphs(true, 11), "unified memory (GB10) keeps the decode graphs");
     check(preload_all_experts(512, 512) && preload_all_experts(600, 512) && !preload_all_experts(168, 512) && !preload_all_experts(512, 0),
           "banks that hold every expert are filled at start-up; smaller banks keep the first-use fill");
@@ -241,6 +247,31 @@ int main() {
         const auto eight = tail_skip_targets(big, topk, 3, [](int e) { return e % topk == 0; });
         check(std::count(eight.begin(), eight.end(), -1) == 8 * topk - 16, "an 8-token verify block skips too (the old rule stopped at 4 tokens)");
         check(tail_skip_targets(routed, topk, 0, resident) == std::vector<int>(routed.size(), -1), "R = 0: off");
+    }
+    // np 10 / 12 with pinned per-layer slots: every layer at least sequences x topk, total unchanged (11-05)
+    {
+        std::vector<int> caps = {60, 80, 200, 180, 90, 150};  // total 760, avg 126
+        const auto lifted = lift_layer_floor(caps, 100, 512);
+        int tot = 0, lo = 1 << 30; for (int c : lifted) { tot += c; lo = std::min(lo, c); }
+        check(tot == 760 && lo >= 100, "np 10: every layer at least 100 slots, total kept");
+        check(batch_drafts(10, 3, 10, 60, 512) == -1 && batch_drafts(10, 3, 10, lo, 512) == 0, "np 10 batches one row per slot instead of stepping one slot at a time");
+        check(lift_layer_floor(caps, 200, 512) == std::vector<int>(6, 126) || [&] { auto x = lift_layer_floor(caps, 200, 512); int t = 0; for (int c : x) t += c; return t == 760; }(), "floor above the average: uniform split");
+        check(lift_layer_floor(caps, 0, 512) == caps, "one sequence: caps unchanged");
+        const auto big = lift_layer_floor({300, 20, 300}, 40, 512);
+        check(big[1] == 40 && big[0] + big[2] == 580, "the slots come from the largest layers");
+    }
+    {   // CPU miss pool: --exact off alone starts it, and then it must read the pinned copy (11-06 np 8: 68 / 70 vs 76 / 77)
+        check(cpu_miss_threads(-1, false, 32) == 15 && cpu_miss_threads(-1, true, 32) == 0 && cpu_miss_threads(14, true, 32) == 14,
+              "pool threads: env wins, --exact off min(15, cores / 2 - 1), --exact on none");
+        check(cpu_pool_reads_packed(-1, false, 32), "--exact off without TQFN_CPU_MISS: the pool reads the pinned packed experts");
+        check(!cpu_pool_reads_packed(-1, true, 32) && !cpu_pool_reads_packed(0, false, 32), "no pool, no packed view");
+        check(cpu_miss_threads(-1, false, 4) == 1, "small CPU: at least one thread");
+    }
+    {   // the built-in Flash-Next routing profile (manifests without layer_slots, e.g. Unsloth files)
+        const std::string prof = flashnext_layer_profile(48, 512);
+        int n = prof.empty() ? 0 : 1; for (char ch : prof) n += ch == ',';
+        check(n == 48, "Flash-Next profile: one entry per layer");
+        check(std::string(flashnext_layer_profile(40, 512)).empty() && std::string(flashnext_layer_profile(48, 256)).empty(), "only for 48 layers x 512 experts");
     }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

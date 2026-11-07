@@ -292,10 +292,11 @@ public:
     // A BF16 projection on an FP16 input image (the rows its quantised neighbours read): the weight's FP16 copy (made once,
     // __float2half_rn of each BF16 value) and one FP16 tensor-core GEMM, fp32 accumulate and output
     // the layer's FP16 copy of a dense-path weight in the dense cache pool (filled once per layer per prompt chunk), or in
-    // `fallback` when the pool is full
-    const __half * dense_half(const std::string & name, const void * key, size_t elems, const std::function<void(__half *)> & fill,
+    // `fallback` when the pool is full or the block is below --dense-min tokens: a short prompt never allocates the pool
+    // (it is released only after a long prefill, and kept through decode it took the memory decode needs: 3090 UD OOM)
+    const __half * dense_half(const std::string & name, const void * key, size_t elems, int tokens, const std::function<void(__half *)> & fill,
                               std::unique_ptr<Device<__half>> & fallback) const {
-        if (const size_t pool = dense_half_pool_bytes(run.tune)) {
+        if (const size_t pool = tqllm::flashnext::dense_pool_for(dense_half_pool_bytes(run.tune), run.tune.dense_min, tokens)) {
             int layer = -1; std::sscanf(name.c_str(), "blk.%d.", &layer);
             if (layer != rt.dhc.layer) { rt.dhc.used = 0; rt.dhc.map.clear(); rt.dhc.layer = layer; }
             if (auto it = rt.dhc.map.find(key); it != rt.dhc.map.end()) return it->second;
@@ -309,25 +310,68 @@ public:
         }
         fallback = std::make_unique<Device<__half>>(elems); fill(fallback->p); return fallback->p;
     }
+    // a native (quantised) weight's matrix in `slot`, uploaded on first use
+    void load_native(Resident & slot, const std::string & name, int rows, int cols) const {
+        if (slot.m.fmt) return;
+        const auto & f = file(name); const auto * format = weight_format(f.file().tensors.at(name).type);
+        require(format && format->basis() == Basis::Plain, "native stage projection format unsupported: " + name);
+        PersistentAlloc keep_resident;
+        Upload upload = [&](const void * data, size_t bytes) {
+            auto buffer = std::make_unique<Device<char>>(bytes);
+            ck(cudaMemcpy(buffer->p, data, bytes, cudaMemcpyHostToDevice));
+            const void * ptr = buffer->p; slot.mem.push_back(std::move(buffer)); return ptr;
+        };
+        const auto raw = f.tensor(name);
+        slot.m = format->load(std::vector<char>(raw.data, raw.data + raw.size), rows, cols, upload, nullptr);
+    }
+    // a resident weight the FP16 prefill GEMMs read through an FP16 copy: quantised (dequantised), BF16 or F32 (rounded
+    // to nearest; mixer weights sit far inside FP16's range)
+    bool half_copy_ok(const std::string & name) const {
+        const int ty = int(file(name).file().tensors.at(name).type);
+        if (ty == GGML_BF16 || ty == GGML_F32) return resident && !cpu_q8_projection && !exact_f32();
+        return takes_half_input(name);
+    }
+    // the weight's device data (the dense pool's key for its FP16 copy) and the copy itself, [rows][cols]
+    const void * half_key(const std::string & name, int rows, int cols) const {
+        const int ty = int(file(name).file().tensors.at(name).type);
+        if (ty == GGML_BF16) return bf16_device(name);
+        if (ty == GGML_F32) return dense_device(name);
+        auto & r = resident_[name]; if (!r) r = std::make_unique<Resident>(); load_native(*r, name, rows, cols); return r->m.p;
+    }
+    void fill_half(const std::string & name, int rows, int cols, __half * d) const {
+        const int ty = int(file(name).file().tensors.at(name).type);
+        if (ty == GGML_BF16) tqllm_cuda::bf16_to_h(bf16_device(name), d, rows * cols, nullptr);
+        else if (ty == GGML_F32) tqllm_cuda::vis_f32_to_h(dense_device(name), d, int64_t(rows) * cols, nullptr);
+        else { half_key(name, rows, cols); const Mat & m = resident_.at(name)->m; m.fmt->dequant_h(m, d, nullptr); }
+    }
+    // the weight's FP16 copy for a block of `tokens` rows (dense pool from --dense-min tokens, else `wh`)
+    const __half * half_weight(const std::string & name, int rows, int cols, int tokens, std::unique_ptr<Device<__half>> & wh) const {
+        return dense_half(name, half_key(name, rows, cols), size_t(rows) * cols, tokens, [&](__half * d) { fill_half(name, rows, cols, d); }, wh);
+    }
+    // an FP16 image times the weight's FP16 copy, FP16 out (fp32 accumulate, one rounding): the HC mixer's up projection
+    void project_hh(const std::string & name, const __half * x, __half * y, int cols, int rows, int tokens) const {
+        const auto & t = file(name).file().tensors.at(name);
+        require(t.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(rows)} && half_copy_ok(name), "FP16 projection: " + name);
+        std::unique_ptr<Device<__half>> wh;
+        const __half * w = dense_half(name, half_key(name, rows, cols), size_t(rows) * cols, tokens, [&](__half * d) { fill_half(name, rows, cols, d); }, wh);
+        const float alpha = 1.f, beta = 0.f;
+        require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha, w, CUDA_R_16F, cols, x, CUDA_R_16F, cols, &beta,
+                             y, CUDA_R_16F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS, "fp16 GEMM failed: " + name);
+    }
     // two projections of one FP16 image (the HC mixer's down and inject) in one dense FP16 GEMM over the stacked weight
     // [a rows | b rows | zero rows to a multiple of 8]: y is [tokens][ld], ld = (ra + rb) rounded up to 8. The image is
-    // read once and the GEMM keeps aligned shapes (inject's 4 rows alone took a slow unaligned kernel). False when `a` is
-    // not on the dense FP16 path; the caller then runs the two projections.
+    // read once and the GEMM keeps aligned shapes (inject's 4 rows alone took a slow unaligned kernel). Any weights with
+    // an FP16 copy (half_copy_ok); false otherwise (the caller then runs the two projections).
     static int stacked_ld(int ra, int rb) { return (ra + rb + 7) / 8 * 8; }
     bool project_stacked_h(const std::string & a, const std::string & b, const __half * x, float * y, int cols, int ra, int rb, int tokens) const {
         const auto & ta = file(a).file().tensors.at(a), & tb = file(b).file().tensors.at(b);
         require(ta.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(ra)} && tb.ne == std::vector<uint64_t>{uint64_t(cols), uint64_t(rb)},
                 "stacked projection shape differs: " + a + " / " + b);
-        if (!takes_half_input(a) || dense_int8_mode() || f32_q6_projection || run.tune.dense_cache_mb <= 0 || run.tune.dense_min <= 0 ||
-            tokens < run.tune.dense_min || tb.type != GGML_BF16) return false;
-        const auto ia = resident_.find(a);
-        if (ia == resident_.end() || !ia->second->m.fmt) return false;  // loaded by its first plain projection (load warm-up)
-        const Mat & ma = ia->second->m; const __nv_bfloat16 * wb = bf16_device(b);
+        if (!half_copy_ok(a) || !half_copy_ok(b) || dense_int8_mode() || f32_q6_projection) return false;
         const int ld = stacked_ld(ra, rb);
         std::unique_ptr<Device<__half>> wh;
-        const __half * w = dense_half(a, reinterpret_cast<const char *>(ma.p) + 1, size_t(ld) * cols, [&](__half * d) {
-            ma.fmt->dequant_h(ma, d, nullptr);
-            tqllm_cuda::bf16_to_h(wb, d + size_t(ra) * cols, rb * cols, nullptr);
+        const __half * w = dense_half(a, static_cast<const char *>(half_key(a, ra, cols)) + 1, size_t(ld) * cols, tokens, [&](__half * d) {
+            fill_half(a, ra, cols, d); fill_half(b, rb, cols, d + size_t(ra) * cols);
             if (ld > ra + rb) ck(cudaMemsetAsync(d + size_t(ra + rb) * cols, 0, size_t(ld - ra - rb) * cols * sizeof(__half), nullptr));
         }, wh);
         const float alpha = 1.f, beta = 0.f;
@@ -572,16 +616,7 @@ public:
             require(format && format->basis() == Basis::Plain, "native stage projection format unsupported: " + name);
             Resident local; Resident * slot = &local;
             if (resident) { auto & r = resident_[name]; if (!r) r = std::make_unique<Resident>(); slot = r.get(); }
-            if (!slot->m.fmt) {
-                PersistentAlloc keep_resident;
-                Upload upload = [&](const void * data, size_t bytes) {
-                    auto buffer = std::make_unique<Device<char>>(bytes);
-                    ck(cudaMemcpy(buffer->p, data, bytes, cudaMemcpyHostToDevice));
-                    const void * ptr = buffer->p; slot->mem.push_back(std::move(buffer)); return ptr;
-                };
-                const auto raw = f.tensor(name);
-                slot->m = format->load(std::vector<char>(raw.data, raw.data + raw.size), rows, cols, upload, nullptr);
-            }
+            load_native(*slot, name, rows, cols);
             const Mat & matrix = slot->m;
             require(matrix.fmt && matrix.fmt->basis() == Basis::Plain, "stage loader changed basis");
             const bool shared = half_src_ == input && half_count_ == size_t(cols) * tokens;
@@ -616,7 +651,7 @@ public:
             const int dense_deq = run.tune.dense_cache_mb > 0 ? run.tune.dense_min : 0;
             if (dense_deq > 0 && tokens >= dense_deq) {
                 std::unique_ptr<Device<__half>> wh;
-                const __half * whp = dense_half(name, matrix.p, size_t(rows) * cols, [&](__half * w) { matrix.fmt->dequant_h(matrix, w, nullptr); }, wh);
+                const __half * whp = dense_half(name, matrix.p, size_t(rows) * cols, tokens, [&](__half * w) { matrix.fmt->dequant_h(matrix, w, nullptr); }, wh);
                 const float alpha = 1.f, beta = 0.f;
                 require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha, whp, CUDA_R_16F, cols,
                                      xp, CUDA_R_16F, cols, &beta, output_h ? static_cast<void *>(output_h) : static_cast<void *>(output),
@@ -679,6 +714,24 @@ public:
                 rounded_input = std::make_unique<Device<float>>(size_t(cols) * tokens);
                 ck(cudaMemcpy(rounded_input->p, input, size_t(cols) * tokens * sizeof(float), cudaMemcpyDeviceToDevice));
                 round_bf16_device(rounded_input->p, rounded_input->count); input = rounded_input->p;
+            }
+            if (resident && tokens <= 64 && !rounded_input && t.type != GGML_BF16) {  // F32 / F16 file weights, decode and verify blocks: no cuBLAS on the legacy stream (breaks graph capture)
+                tqllm_cuda::fn_gemv_f32_tokens(matrix, input, output, rows, cols, tokens, nullptr);
+                return;
+            }
+            // prefill blocks: F32 file weights (UD's GDN alpha / beta) as an FP16 tensor-core GEMM on their FP16 copy and the
+            // input's FP16 image (fp32 accumulate) instead of a SIMT fp32 GEMM (numeric)
+            if (resident && t.type == GGML_F32 && !rounded_input && half_copy_ok(name) && !dense_int8_mode() &&
+                tqllm::flashnext::dense_pool_for(1, run.tune.dense_min, tokens)) {
+                const bool shared = half_src_ == input && half_count_ == size_t(cols) * tokens;
+                Device<__half> xh(shared ? 1 : size_t(cols) * tokens);
+                if (!shared) tqllm_cuda::vis_f32_to_h(input, xh.p, int64_t(xh.count), nullptr);
+                std::unique_ptr<Device<__half>> wh;
+                const __half * w = dense_half(name, matrix, size_t(rows) * cols, tokens, [&](__half * d) { tqllm_cuda::vis_f32_to_h(matrix, d, int64_t(rows) * cols, nullptr); }, wh);
+                const float alpha = 1.f, beta = 0.f;
+                require(cublasGemmEx(blas(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha, w, CUDA_R_16F, cols, shared ? half_ : xh.p, CUDA_R_16F, cols,
+                                     &beta, output, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS, "F32 weight fp16 GEMM failed: " + name);
+                return;
             }
             cublasHandle_t handle = blas_;
             if (!handle) require(cublasCreate(&handle) == CUBLAS_STATUS_SUCCESS, "cannot create F32 projection handle");

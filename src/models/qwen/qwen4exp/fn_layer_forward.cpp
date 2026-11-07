@@ -26,18 +26,16 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
     }
 }
 
-// the layer's hyper-connection path for a block of n rows: 1 row scales + BF16 image (BF16 mixers), 2 row scales + FP16
-// image (quantised mixers, hc_row_scales_h), 0 the plain normalized rows
+// the layer's hyper-connection path for a block of n rows: 2 row scales + FP16 image (mixers through FP16 weight copies,
+// hc_row_scales_h), 1 row scales + BF16 image (BF16 mixers), 0 the plain normalized rows
 int DecodeModel::hc_path(const std::string & prefix, int n) const {
-    if (tqllm::hc_row_scales_only(n, cp.is_bf16(prefix + "hc_attn_down.weight") && cp.is_bf16(prefix + "hc_ffn_down.weight"),
-                                  cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight"))) return 1;
-    // quantised mixers (Q8_0) take the same row-scale path with an FP16 image instead (hc_row_scales_h)
-    auto quant = [&](const std::string & w) { const int ty = int(cp.file(prefix + w).file().tensors.at(prefix + w).type);
-                                              return ty != GGML_TQ3_4S && ty != GGML_F32 && ty != GGML_BF16 && ty != GGML_F16; };
-    const bool inj_bf16 = cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight");
-    return tqllm::hc_row_scales_h(n, quant("hc_attn_down.weight") && quant("hc_ffn_down.weight"),
-                                  inj_bf16 || (quant("hc_attn_inject.weight") && quant("hc_ffn_inject.weight")),
-                                  cp.resident && !cp.cpu_q8_projection && !exact_f32() && !bf16_act()) ? 2 : 0;
+    bool copies = true;
+    for (const char * w : {"hc_attn_down.weight", "hc_ffn_down.weight", "hc_attn_up.weight", "hc_ffn_up.weight", "hc_attn_inject.weight", "hc_ffn_inject.weight"})
+        copies = copies && cp.half_copy_ok(prefix + w);
+    if (tqllm::hc_row_scales_h(n, copies, cp.resident && !cp.cpu_q8_projection && !exact_f32() && !bf16_act() &&
+                                             !Checkpoint::dense_int8_mode() && !cp.f32_q6_projection)) return 2;
+    return tqllm::hc_row_scales_only(n, cp.is_bf16(prefix + "hc_attn_down.weight") && cp.is_bf16(prefix + "hc_ffn_down.weight"),
+                                     cp.is_bf16(prefix + "hc_attn_inject.weight") && cp.is_bf16(prefix + "hc_ffn_inject.weight")) ? 1 : 0;
 }
 // the layer-major prefill keeps its wide rows in BF16 when every trunk layer's sub-chunks take the FP16 row-scale path
 // (the kernels of that path read and write BF16 rows; fp32 math in registers)
@@ -439,18 +437,19 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         ck(cudaMemcpyAsync(ids_host.p, routed.p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         if (predict) ck(cudaMemcpyAsync(ids_host.p + A, next_ids->p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         static cudaEvent_t ids_ready = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
-        static const int cpu_miss = std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS"))  // explicit wins over --exact on
-                                   : cp.run.exact ? 0 : cp.run.small_card ? std::max(1, std::min(15, int(std::thread::hardware_concurrency()) / 2 - 1)) : 0;
+        static const int cpu_miss = tqllm::flashnext::cpu_miss_threads(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
+                                                                       cp.run.exact, int(std::thread::hardware_concurrency()));  // decode_rules.hpp
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
         const bool miss_driven = cpu_pool && !cp.run.small_card;  // decode_rules.hpp runs_on_cpu
         static int cpu_budget = tqllm::flashnext::kCpuMissBudget, calls_at_zero = 0;  // decode_rules.hpp next_cpu_budget
         cp.rt.cpu_owned = cpu_pool && !miss_driven;
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
-        if (miss_driven && trunk && cpu_budget <= 0) { ++calls_at_zero; if ((cpu_budget = tqllm::flashnext::next_cpu_budget(0, 0, calls_at_zero)) > 0) calls_at_zero = 0; }
-        const bool use_cpu = cpu_pool && trunk && n <= tqllm::flashnext::kCpuPoolRows && (!miss_driven || cpu_budget > 0);
+        if (miss_driven && trunk && cpu_budget <= 0) { ++calls_at_zero; if ((cpu_budget = tqllm::flashnext::next_cpu_budget(0, false, calls_at_zero)) > 0) calls_at_zero = 0; }
+        const int pool_rows = cp.run.small_card ? tqllm::flashnext::kCpuPoolRows : tqllm::flashnext::kCpuPoolMaxRows;
+        const bool use_cpu = cpu_pool && trunk && n <= pool_rows && (!miss_driven || cpu_budget > 0);
         if (use_cpu) {
-            if (!x_host) { ck(cudaMallocHost(reinterpret_cast<void **>(&x_host), size_t(tqllm::flashnext::kCpuPoolRows) * h * 4));
-                           ck(cudaMallocHost(reinterpret_cast<void **>(&cpu_out), size_t(tqllm::flashnext::kCpuPoolRows) * c.topk * h * 2)); }
+            if (!x_host) { ck(cudaMallocHost(reinterpret_cast<void **>(&x_host), size_t(pool_rows) * h * 4));
+                           ck(cudaMallocHost(reinterpret_cast<void **>(&cpu_out), size_t(pool_rows) * c.topk * h * 2)); }
             ck(cudaMemcpyAsync(x_host, mixed.p, size_t(n) * h * 4, cudaMemcpyDeviceToHost, cs));
         }
         ck(cudaEventRecord(ids_ready, cs));
@@ -624,11 +623,14 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         else if (dedup_dn) m.fmt->expert_matvec_dedup(m, ax.p, ed.p, h, dmap[2], groups[2], nullptr);
         else m.fmt->expert_matvec(m, ax.p, ed.p, h, slots_p, n, c.topk, true, nullptr);
         if (!cpu_rows.empty()) {
-            const auto w0 = std::chrono::steady_clock::now();
+            static cudaEvent_t gpu_done = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
+            ck(cudaEventRecord(gpu_done, nullptr));  // after the hits and the miss copies' kernels are queued
             cpu_pool->wait();
             if (miss_driven) {
-                const double waited = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - w0).count();
-                cpu_budget = tqllm::flashnext::next_cpu_budget(cpu_budget, waited, 0);
+                const cudaError_t q = cudaEventQuery(gpu_done);
+                const bool gpu_busy = q == cudaErrorNotReady;
+                if (q != cudaSuccess && !gpu_busy) ck(q);
+                cpu_budget = tqllm::flashnext::next_cpu_budget(cpu_budget, gpu_busy, 0, tqllm::flashnext::kCpuMissBudget * std::max(1, cp.rt.block_seqs));  // a batched step has more GPU work to hide the CPU behind
             }
             std::vector<tqllm_cuda::ScatterItem> items;
             for (auto [a, r] : cpu_rows) items.push_back({reinterpret_cast<const char *>(cpu_out + size_t(r) * h), reinterpret_cast<char *>(ed.p + size_t(a) * h), size_t(h) * 2});
@@ -753,11 +755,24 @@ void DecodeModel::router(const std::string & prefix, const float * x, float * lo
     } else if (n > 64) {
         // f32 router (the MTP layer): one cuBLAS fp32 GEMM for a prefill chunk instead of the per-token kernel (127 ms per 32K
         // tokens in the catch-up); fp32 sums in another order, and the MTP's routing only shapes the drafts, never the output
+        // trunk F32 routers (UD files) from --dense-min tokens: the FP16 copy and x's FP16 image on the tensor cores into packed
+        // [n][experts] rows (numeric: near-tie top-k picks can move)
         const float one = 1.f, zero = 0.f; const int ld = c.experts + 1;
+        if (cp.half_copy_ok(prefix + "ffn_gate_inp.weight") && tqllm::flashnext::dense_pool_for(1, cp.run.tune.dense_min, n)) {
+            Device<__half> xh(size_t(n) * h); tqllm_cuda::vis_f32_to_h(x, xh.p, int64_t(xh.count), nullptr);
+            std::unique_ptr<Device<__half>> wh; const __half * w = cp.half_weight(prefix + "ffn_gate_inp.weight", c.experts, h, n, wh);
+            Device<float> packed(size_t(n) * c.experts);
+            require(cublasGemmEx(cp.blas(), CUBLAS_OP_T, CUBLAS_OP_N, c.experts, n, h, &one, w, CUDA_R_16F, h, xh.p, CUDA_R_16F, h, &zero,
+                                 packed.p, CUDA_R_32F, c.experts, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS, "fp16 router GEMM failed: " + prefix);
+            ck(cudaMemcpy2DAsync(logits, size_t(ld) * sizeof(float), packed.p, size_t(c.experts) * sizeof(float), size_t(c.experts) * sizeof(float), n,
+                                 cudaMemcpyDeviceToDevice, nullptr));
+        } else
         require(cublasSgemm(cp.blas(), CUBLAS_OP_T, CUBLAS_OP_N, c.experts, n, h, &one, cp.dense_device(prefix + "ffn_gate_inp.weight"), h,
                             x, h, &zero, logits, ld) == CUBLAS_STATUS_SUCCESS, "f32 router GEMM failed: " + prefix);
         require(cublasSgemm(cp.blas(), CUBLAS_OP_T, CUBLAS_OP_N, 1, n, h, &one, cp.dense_device(prefix + "ffn_gate_inp_shexp.weight"), h,
                             x, h, &zero, logits + c.experts, ld) == CUBLAS_STATUS_SUCCESS, "f32 shared-gate GEMM failed: " + prefix);
-    } else tqllm_cuda::moe_router_f32(cp.dense_device(prefix + "ffn_gate_inp.weight"), cp.dense_device(prefix + "ffn_gate_inp_shexp.weight"),
-                                      x, logits, h, c.experts, n, nullptr);
+    } else {  // decode / verify: the F32 router and shared gate read once per call, all tokens in registers
+        tqllm_cuda::fn_gemv_f32_tokens_ld(cp.dense_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);
+        tqllm_cuda::fn_gemv_f32_tokens_ld(cp.dense_device(prefix + "ffn_gate_inp_shexp.weight"), x, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
+    }
 }

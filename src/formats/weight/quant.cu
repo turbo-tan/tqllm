@@ -57,7 +57,7 @@ void k_expert_matvec(int fmt, const uint8_t * w, const void * aux, const __half 
                      __nv_bfloat16 * y, int rows, int cols, const int * ids, int n, int topk,
                      bool per_expert_input, cudaStream_t stream) {
     if (!w || !aux || !x || !y || !ids || rows <= 0 || cols <= 0 ||
-        cols % (fmt == 14 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
+        cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
         throw std::invalid_argument("k_expert_matvec: invalid shape");
     const dim3 grid(unsigned((rows + 15) / 16), unsigned(n * topk));
     const auto * scales = static_cast<const __half2 *>(aux);
@@ -95,6 +95,8 @@ void k_expert_matvec(int fmt, const uint8_t * w, const void * aux, const __half 
             w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
     case 15: u4h_matvec_k<1, __nv_bfloat16, 1, 15, 0, true><<<grid, 256, 0, stream>>>(
             w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
+    case 16: u4h_matvec_k<1, __nv_bfloat16, 1, 16, 0, true><<<grid, 256, 0, stream>>>(
+            w, scales, x, y, rows, cols, 1, nullptr, 0, ids, topk, per_expert_input); break;
     default: throw std::invalid_argument("k_expert_matvec: unsupported format");
     }
 }
@@ -102,7 +104,7 @@ void k_expert_matvec(int fmt, const uint8_t * w, const void * aux, const __half 
 
 void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
                            int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
-    if (!w || !aux || !x || !y || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
+    if (!w || !aux || !x || !y || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
         throw std::invalid_argument("k_expert_matvec_dedup: invalid shape");
     // Two 16-row tiles per block (MT 2: per row the same k split and MMA order, bit-identical; GB10 down IQ4_NL 100
     // groups 371 -> 330 us, the paired gate / up launch below stays at MT 1: IQ3_XXS 572 -> 611 us with MT 2)
@@ -121,6 +123,7 @@ void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const _
         case 13: TQ_DEDUP(13); break;
         case 14: TQ_DEDUP(14); break;
         case 15: TQ_DEDUP(15); break;
+        case 16: TQ_DEDUP(16); break;
         default: throw std::invalid_argument("k_expert_matvec_dedup: unsupported format");
     }
 #undef TQ_DEDUP
@@ -140,7 +143,7 @@ void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb) {
 void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
                       __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * ids, int n, int topk, cudaStream_t stream) {
     if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !ids || rows <= 0 || cols <= 0 ||
-        cols % (fmt == 14 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
+        cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || n <= 0 || topk <= 0 || int64_t(n) * topk > 65535)
         throw std::invalid_argument("k_expert_matvec2: invalid shape");
     const dim3 grid(unsigned((rows + 15) / 16), unsigned(n * topk), 2u);
     const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
@@ -161,6 +164,7 @@ void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint
         case 13: TQ_PAIR(13); break;
         case 14: TQ_PAIR(14); break;
         case 15: TQ_PAIR(15); break;
+        case 16: TQ_PAIR(16); break;
         default: throw std::invalid_argument("k_expert_matvec2: unsupported format");
     }
 #undef TQ_PAIR
@@ -168,7 +172,7 @@ void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint
 
 void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
                             __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
-    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
+    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
         throw std::invalid_argument("k_expert_matvec_dedup2: invalid shape");
     const dim3 grid(unsigned((rows + 15) / 16), unsigned(std::min(groups, kDedupGridGroups)), 2u);
     const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
@@ -187,6 +191,7 @@ void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, cons
         case 13: TQ_DEDUP2(13); break;
         case 14: TQ_DEDUP2(14); break;
         case 15: TQ_DEDUP2(15); break;
+        case 16: TQ_DEDUP2(16); break;
         default: throw std::invalid_argument("k_expert_matvec_dedup2: unsupported format");
     }
 #undef TQ_DEDUP2
@@ -196,7 +201,7 @@ void k_expert_gemm(int fmt, const uint8_t * w, const void * aux, const __half * 
                    __nv_bfloat16 * y, int rows, int cols, const int * counts, const int * groups,
                    int capacity, int experts, int topk, bool per_expert_input, cudaStream_t stream) {
     if (!w || !aux || !x || !y || !counts || !groups || rows <= 0 || cols <= 0 ||
-        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
+        cols % (fmt == 14 || fmt == 16 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
         experts <= 0 || experts > 65535 || topk <= 0)
         throw std::invalid_argument("k_expert_gemm: invalid shape");
     const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
@@ -220,6 +225,7 @@ void k_expert_gemm(int fmt, const uint8_t * w, const void * aux, const __half * 
     case 13: u4h_gemm_k<13, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
     case 14: u4h_gemm_k<14, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
     case 15: u4h_gemm_k<15, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
+    case 16: u4h_gemm_k<16, true><<<grid, 256, 0, stream>>>(w, scales, x, y, rows, cols, capacity, rows, counts, groups, capacity, topk, per_expert_input); break;
     default: throw std::invalid_argument("k_expert_gemm: unsupported format");
     }
 }
@@ -229,7 +235,7 @@ void k_expert_gemm_i8(int fmt, const uint8_t * w, const void * aux, const int8_t
                       __nv_bfloat16 * y, int rows, int cols, const int * counts, const int * groups,
                       int capacity, int experts, int topk, bool per_expert_input, cudaStream_t stream, int mode) {
     if (!w || !aux || !xq || !xs || !xsum || !y || !counts || !groups || rows <= 0 || cols <= 0 ||
-        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
+        cols % (fmt == 14 || fmt == 16 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 ||
         experts <= 0 || experts > 65535 || topk <= 0)
         throw std::invalid_argument("k_expert_gemm_i8: invalid shape");
     const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
@@ -293,7 +299,7 @@ void k_expert_gemm_gateup(int fmt, const uint8_t * wg, const void * auxg, const 
                           __half * yh, int rows, int cols, const int * counts, const int * groups,
                           int capacity, int experts, int topk, cudaStream_t stream) {
     if (!wg || !auxg || !wu || !auxu || !x || !yh || !counts || !groups || rows <= 0 || cols <= 0 ||
-        cols % (fmt == 14 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 || experts <= 0 || experts > 65535 || topk <= 0)
+        cols % (fmt == 14 || fmt == 16 ? 128 : 256) || capacity <= 0 || capacity > 65535 * 64 || experts <= 0 || experts > 65535 || topk <= 0)
         throw std::invalid_argument("k_expert_gemm_gateup: invalid shape");
     const dim3 grid(unsigned((rows + 63) / 64), unsigned((capacity + 63) / 64), unsigned(experts));
     const auto * sg = static_cast<const __half2 *>(auxg); const auto * su = static_cast<const __half2 *>(auxu);
@@ -330,6 +336,7 @@ void u4h_family_gemm(int fmt, const uint8_t * w, const void * aux, const __half 
         case 13: u4h_gemm_launch<13>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         case 14: u4h_gemm_launch<14>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         case 15: u4h_gemm_launch<15>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 16: u4h_gemm_launch<16>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         default: throw std::invalid_argument("u4h_family_gemm: unknown format");
     }
 }
@@ -352,6 +359,7 @@ bool u4h_family_gemm_f32(int fmt, const uint8_t * w, const void * aux, const __h
         case 13: u4h_gemm_launch<13, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         case 14: u4h_gemm_launch<14, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         case 15: u4h_gemm_launch<15, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 16: u4h_gemm_launch<16, float>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
         default: return false;
     }
     return true;
@@ -445,7 +453,6 @@ void q6k_matvec(const void * w, const float * x, float * y, int rows, int k, int
         case 13: return q6k_launch<13>(w, x, y, rows, k, s);
         case 14: return q6k_launch<14>(w, x, y, rows, k, s);
         case 15: return q6k_launch<15>(w, x, y, rows, k, s);
-        case 16: return q6k_launch<16>(w, x, y, rows, k, s);
         default: throw std::invalid_argument("q6k_matvec: 1..16 columns");
     }
 }
@@ -647,6 +654,10 @@ __global__ void k4_dequant_h_k(const uint8_t * w4, const uint8_t * kh, __half * 
     reinterpret_cast<uint4 *>(out)[g * 2 + 1] = reinterpret_cast<const uint4 *>(v)[1];
 }
 
+__global__ void embed_multi_bf16_k(const __nv_bfloat16 * w, const uint32_t * dtok, __nv_bfloat16 * y, int k) {
+    const int n = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < k) y[int64_t(n) * k + i] = w[int64_t(dtok[n]) * k + i];
+}
 __global__ void embed_multi_q8_0_k(const uint8_t * w, const uint32_t * dtok, __nv_bfloat16 * y, int k) {
     const int n = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= k) return;
@@ -848,6 +859,9 @@ void u4h_dequant_h(const uint8_t * w4, const __half2 * sm, __half * out, int row
     u4h_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w4, sm, out, ng);
 }
 
+void embed_multi_bf16(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    embed_multi_bf16_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const __nv_bfloat16 *>(w), dtok, y, k);
+}
 void embed_multi_q8_0(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
     embed_multi_q8_0_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
 }
@@ -1103,7 +1117,6 @@ void i8h_matvec(const int8_t * w8, const __half * sc, const __half * xh, float *
         case 13: i8h_matvec_k<13><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k); break;
         case 14: i8h_matvec_k<14><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k); break;
         case 15: i8h_matvec_k<15><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k); break;
-        case 16: i8h_matvec_k<16><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k); break;
         default: throw std::invalid_argument("i8h_matvec: 1..16 columns");
     }
 }
@@ -1161,7 +1174,6 @@ void i8h_matvec_bf16(const int8_t * w8, const __half * sc, const __half * xh, __
         case 13: i8h_matvec_k<13, __nv_bfloat16><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k, ldy); break;
         case 14: i8h_matvec_k<14, __nv_bfloat16><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k, ldy); break;
         case 15: i8h_matvec_k<15, __nv_bfloat16><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k, ldy); break;
-        case 16: i8h_matvec_k<16, __nv_bfloat16><<<grid, 256, 0, s>>>(w8, sc, xh, y, rows, k, ldy); break;
         default: throw std::invalid_argument("i8h_matvec_bf16: 1..16 columns");
     }
 }
@@ -1362,6 +1374,7 @@ void u4h_family_matvec_f32(int fmt, const uint8_t * w, const void * aux, const _
         case 13: u4h_launch<float, 13>(w, a, xh, y, rows, k, ncols, s); break;
         case 14: u4h_launch<float, 14>(w, a, xh, y, rows, k, ncols, s); break;
         case 15: u4h_launch<float, 15>(w, a, xh, y, rows, k, ncols, s); break;
+        case 16: u4h_launch<float, 16>(w, a, xh, y, rows, k, ncols, s); break;
         default: throw std::invalid_argument("u4h_family_matvec_f32: fmt not wired");
     }
 }
@@ -1371,6 +1384,7 @@ void u4h_family_tune(int fmt, const uint8_t * w, const void * aux, int rows, int
         case 13: tune_impl<13>(w, a, rows, k, s); break;
         case 14: tune_impl<14>(w, a, rows, k, s); break;
         case 15: tune_impl<15>(w, a, rows, k, s); break;
+        case 16: tune_impl<16>(w, a, rows, k, s); break;
         default: throw std::invalid_argument("u4h_family_tune: fmt not wired");
     }
 }
@@ -1381,6 +1395,7 @@ void u4h_family_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const 
         case 13: u4h_launch<__nv_bfloat16, 13>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
         case 14: u4h_launch<__nv_bfloat16, 14>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
         case 15: u4h_launch<__nv_bfloat16, 15>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
+        case 16: u4h_launch<__nv_bfloat16, 16>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
         case 6: u4h_launch<__nv_bfloat16, 6>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
         default: throw std::invalid_argument("u4h_family_matvec: fmt not wired");
     }

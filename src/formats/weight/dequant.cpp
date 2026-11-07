@@ -383,10 +383,29 @@ namespace {
 std::map<uint32_t, HostDequant> & host_dequants() { static std::map<uint32_t, HostDequant> m; return m; }
 }  // namespace
 
+float e4m3_to_float(uint8_t b) {
+    const int sg = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    const float v = e == 15 && m == 7 ? NAN : e == 0 ? m / 8.0f * std::ldexp(1.0f, -6) : (1 + m / 8.0f) * std::ldexp(1.0f, e - 7);
+    return sg ? -v : v;
+}
+
 void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
     const auto * s = static_cast<const uint8_t *>(src);
     switch (type) {
         case GGML_MXFP8: throw std::runtime_error("dequantize_host: MXFP8 rows carry their scales; use dequantize_host_rows");
+        case GGML_NVFP4G: {  // per 128: F32 global, 8 E4M3 group scales, 64 bytes of E2M1 (low nibble = even weight)
+            if (n < 0 || n % 128) break;
+            static const float e2m1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+            for (int64_t b = 0; b < n / 128; ++b) {
+                const uint8_t * blk = s + b * 76; float g; std::memcpy(&g, blk, 4);
+                for (int grp = 0; grp < 8; ++grp) {
+                    const float d = e4m3_to_float(blk[4 + grp]) * g;
+                    for (int i = 0; i < 8; ++i) { const uint8_t q = blk[12 + grp * 8 + i]; float * o = dst + b * 128 + grp * 16 + 2 * i;
+                                                  o[0] = e2m1[q & 15] * d; o[1] = e2m1[q >> 4] * d; }
+                }
+            }
+            return;
+        }
         case GGML_GSQ_Q2_0:
             if (n < 0 || n % 64) break;
             for (int64_t b = 0; b < n / 64; ++b) {

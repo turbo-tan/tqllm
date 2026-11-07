@@ -11,6 +11,7 @@
 #include <array>
 #include "engine.hpp"
 #include "decode_rules.hpp"
+#include "memory_plan.hpp"
 #include "cold_expert_store.hpp"
 #include "cold_expert_memo.hpp"
 #include "expert_read_pool.hpp"
@@ -35,6 +36,7 @@ struct FnServe {
     std::unique_ptr<Fixtures> fixtures; std::unique_ptr<Checkpoint> cp;
     std::unique_ptr<MixedExpertCache> cache, mtp_cache; PackedExperts packed; char * mtp_packed = nullptr; size_t mtp_block = 0;
     ScratchArena arena; size_t arena_prefill = 0, arena_decode = 0; int kv_capacity_full = 0;
+    tqllm::flashnext::MemShape mem_shape;  // the attention shape, for a request's K/V bytes at its start (several sequences)
     size_t state_full = 0; int state_tokens = 0;  // one sequence's full-context state (context_keep) and its token count
     size_t plan_budget = 0;  // free + bank bytes after the warm-up (pool trimmed, 256 MB steps): a prompt length always plans the same chunk / block
     float * res_host = nullptr; size_t res_host_cap = 0;  // pinned prompt residuals of a multi-chunk prefill (one prefill at a time)
@@ -83,6 +85,7 @@ class FlashNextEngine final : public tqllm::Engine {
     SlotState & S() { return slots_[size_t(cur_)]; }
     uint32_t slot_context() const { return context_; }  // Model passes the per-slot context (tqserve: --context / --np)
     // the shared caches copy misses on the active slot's stream
+    std::unique_ptr<Device<float>> verify_logits_;
     void bind() { if (S().model_ && S().model_->miss_stream) { f_.cache->set_miss_stream(S().model_->miss_stream); f_.mtp_cache->set_miss_stream(S().model_->miss_stream); } }
     static bool is_eos(int t) { return t == 248046 || t == 248044; }
     // T > 0: sample each verify position from the target's own distribution; a draft is accepted only if it equals that
@@ -157,8 +160,11 @@ public:
         S().temp_ = temperature; S().top_p_ = top_p > 0.f && top_p <= 1.f ? top_p : 1.f; S().top_k_ = top_k; S().rng_.seed(seed ? seed : 0x9e3779b97f4a7c15ull);
     }
     uint32_t step(uint32_t, uint32_t, bool, float *) override { throw std::runtime_error("Flash-Next serves through spec_begin / spec_advance"); }
-    void verify(const uint32_t *, int, uint32_t, uint32_t *) override { throw std::runtime_error("Flash-Next: verify is internal"); }
-    void commit(int) override { throw std::runtime_error("Flash-Next: commit is internal"); }
+    // teacher-forced scoring (tqkld): n tokens at positions pos.. through the trunk, every position's logits kept on the
+    // device; pos 0 starts a fresh sequence. Serving decodes through spec_begin / spec_advance, never through this.
+    void verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) override;
+    void commit(int) override {}
+    const float * verify_logits() const override { return verify_logits_ ? verify_logits_->p : nullptr; }
     const float * logits() const override { return nullptr; }
     void synchronize() override { ck(cudaDeviceSynchronize()); }
     uint32_t layers() const override { return uint32_t(f_.cp->config.layers); }

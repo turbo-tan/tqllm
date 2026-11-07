@@ -10,6 +10,8 @@ namespace tqllm {
 float half_to_float(uint16_t h);
 // FP32 -> FP16 bits, round to nearest even (no _Float16: GCC 12 has none in C++ on x86)
 uint16_t float_to_half(float f);
+// OCP E4M3 byte -> float (0x7F / 0xFF = NaN)
+float e4m3_to_float(uint8_t b);
 // Q4_K / Q5_K 6-bit scale and min of sub-block j (0..7) from the 12-byte scales field.
 void scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m);
 // Q3_K: 12-byte packed scales -> 16 signed scales (6-bit value - 32).

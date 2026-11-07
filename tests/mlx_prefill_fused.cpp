@@ -1,5 +1,6 @@
 #include <mlx/mlx.h>
 #include "prefill_fused.hpp"
+#include "tq4.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -46,6 +47,13 @@ int main() {
                        h_ok = same(std::get<2>(got_r), std::get<2>(want_r));
             std::printf("DECODE_FUSED rows=%d add_norm sum_exact=%d fp32_exact=%d fp16_exact=%d\n", rows, int(s_ok), int(n_ok), int(h_ok));
             ok = ok && s_ok && n_ok && h_ok;
+            // TQ4 models: the FP16 copy is tq4_rotate_half of the FP32 norm, in the same launch, bit for bit
+            auto gr = rms_norm_bf16_pair(x, w, 1e-6f, true);
+            auto gr_r = rms_norm_bf16_pair_residual(x, r, w, 1e-6f, true);
+            const bool rn = same(gr.first, want.first) && same(gr.second, tq4_rotate_half(want.first)),
+                       rr = same(std::get<1>(gr_r), std::get<1>(want_r)) && same(std::get<2>(gr_r), tq4_rotate_half(std::get<1>(want_r)));
+            std::printf("DECODE_FUSED rows=%d rotated norm_exact=%d add_norm_exact=%d\n", rows, int(rn), int(rr));
+            ok = ok && rn && rr;
         }
         ok = ok && n32 && n16 && sw;
     }

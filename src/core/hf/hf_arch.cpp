@@ -7,6 +7,7 @@ constexpr HfArch kArches[] = {
     {"MiniMaxM3SparseForConditionalGeneration", "minimax-m3", hf_map_minimax_m3},
     {"DSparkMiniMaxDraftModel", "minimax-m3", hf_map_minimax_m3_dspark},
     {"Qwen4ExpForConditionalGeneration", "qwen4exp", hf_map_qwen4_exp},
+    {"Qwen3_5ForConditionalGeneration", "qwen35", hf_map_qwen35},
 };
 }  // namespace
 

@@ -1772,6 +1772,48 @@ void fn_gemv_bf16_chunk_bx(const __nv_bfloat16 * w, const __nv_bfloat16 * x, flo
     if (rows >= 8) fn_gemv_bf16x_tiles_k<8, T><<<dim3(unsigned((rows + 7) / 8), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
     else fn_gemv_bf16x_tiles_k<1, T><<<dim3(unsigned(rows), tiles), thr, 0, s>>>(w, x, y, rows, cols, tokens, ldy);
 }
+// block per row (as many blocks as rows: the whole GPU busy at 512 router rows), every token of the call in registers, so
+// each weight is read once per call (the block-per-(row, token) kernel read the matrix once per token; a warp-per-row
+// version left the 3090 at 64 blocks: UD decode 125.6 -> 99.4 tok/s)
+template <int T>
+__global__ void __launch_bounds__(256) fn_gemv_f32_k(const float * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy) {
+    __shared__ float red[8][T];
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float * wr = w + int64_t(r) * cols;
+    float acc[T] = {};
+    for (int c = tid; c < cols; c += 256) {
+        const float wv = wr[c];
+#pragma unroll
+        for (int t = 0; t < T; ++t) if (t < tokens) acc[t] += wv * x[int64_t(t) * cols + c];
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        float v = acc[t];
+        for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+        if (lane == 0) red[warp][t] = v;
+    }
+    __syncthreads();
+    if (tid < T && tid < tokens) {
+        float v = 0.f;
+        for (int k = 0; k < 8; ++k) v += red[k][tid];
+        y[int64_t(tid) * ldy + r] = v;
+    }
+}
+void fn_gemv_f32_tokens_ld(const float * w, const float * x, float * y, int rows, int cols, int tokens, int64_t ldy, cudaStream_t s) {
+    if (rows <= 0 || cols <= 0 || tokens <= 0 || ldy < rows || !w || !x || !y) throw std::invalid_argument("Flash-Next f32 gemv: invalid shape or pointer");
+    const unsigned blocks = unsigned(rows);
+    for (int t0 = 0; t0 < tokens; t0 += 8) {
+        const int n = std::min(8, tokens - t0);
+        const float * xt = x + int64_t(t0) * cols; float * yt = y + int64_t(t0) * ldy;
+        if (n <= 1) fn_gemv_f32_k<1><<<blocks, 256, 0, s>>>(w, xt, yt, rows, cols, n, ldy);
+        else if (n <= 2) fn_gemv_f32_k<2><<<blocks, 256, 0, s>>>(w, xt, yt, rows, cols, n, ldy);
+        else if (n <= 4) fn_gemv_f32_k<4><<<blocks, 256, 0, s>>>(w, xt, yt, rows, cols, n, ldy);
+        else fn_gemv_f32_k<8><<<blocks, 256, 0, s>>>(w, xt, yt, rows, cols, n, ldy);
+    }
+}
+void fn_gemv_f32_tokens(const float * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s) {
+    fn_gemv_f32_tokens_ld(w, x, y, rows, cols, tokens, rows, s);
+}
 void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t s, int rpb) {
     if (rows <= 0 || cols <= 0 || cols % 8 || tokens <= 0 || !w || !x || !y) throw std::invalid_argument("Flash-Next bf16 gemv: invalid shape or pointer");
     const int warps = 8, blocks = (rows + warps - 1) / warps;

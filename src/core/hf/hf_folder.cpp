@@ -133,6 +133,58 @@ const SafeTensor & HfFolder::at(const std::string & n) const {
     return it->second;
 }
 
+// exl3 matrix with blocks of 128-aligned rows (outputs: n tiles + svh) or columns (inputs: k tiles + suh) moved: the trellis
+// is [k/16][n/16][words] after the record, then suh [k], svh [n]; y = svh H128(W H128(suh x)) keeps whole 128-blocks apart
+GgufTensor HfFolder::matrix(const std::string & m, const HfBlockOrder & rows, const HfBlockOrder & cols) const {
+    GgufTensor base = matrix(m);
+    if (rows.order.empty() && cols.order.empty()) return base;
+    if (base.type != GGML_X3) {
+        if (!cols.order.empty()) throw std::runtime_error("hf: column order on a stored matrix is not supported: " + m);
+        const auto & w = at(m + ".weight");
+        return values(m + ".weight", type_of(w), {w.shape[0], w.shape[1]}, nullptr, rows);
+    }
+    for (const HfBlockOrder * o : {&rows, &cols})
+        if (!o->order.empty() && (o->block % 128 || o->offset % 128))
+            throw std::runtime_error("hf: exl3 " + m + ": reordered blocks must be whole 128-blocks (the Hadamard blocks)");
+    const uint64_t cols_n = base.ne[0], rows_n = base.ne[1];
+    const auto & tr = at(m + ".trellis");
+    const uint64_t kt = cols_n / 16, nt = rows_n / 16, words = tr.shape[2], tile = words * 2;
+    GgufTensor t = base;
+    t.parts.clear(); t.header.clear();
+    const GgufTensor parts = base;
+    t.make = [parts, rows, cols, kt, nt, tile, cols_n, rows_n] {
+        std::vector<char> buf(parts.header);
+        for (const GgufTensor & p : parts.parts) {
+            buf.insert(buf.end(), p.header.begin(), p.header.end());
+            if (!p.bytes) continue;
+            std::ifstream in(p.file, std::ios::binary);
+            const size_t at = buf.size(); buf.resize(at + p.bytes);
+            in.seekg(std::streamoff(p.offset)); in.read(buf.data() + at, std::streamsize(p.bytes));
+            if (!in) throw std::runtime_error("hf: exl3 read failed");
+        }
+        const size_t hdr = sizeof(X3Record), trb = size_t(kt * nt * tile);
+        std::vector<char> out(buf);
+        char * T = out.data() + hdr, * U = T + trb, * V = U + cols_n * 2;
+        const char * t0 = buf.data() + hdr, * u0 = t0 + trb, * v0 = u0 + cols_n * 2;
+        auto src_index = [](const HfBlockOrder & o, uint64_t i) -> uint64_t {  // element i of the result reads stored element
+            if (o.order.empty() || i < o.offset) return i;
+            const uint64_t j = (i - o.offset) / o.block, r = (i - o.offset) % o.block;
+            return j < o.order.size() ? o.offset + uint64_t(o.order[j]) * o.block + r : i;
+        };
+        for (uint64_t k = 0; k < kt; ++k) {
+            const uint64_t ks = src_index(cols, k * 16) / 16;
+            for (uint64_t n = 0; n < nt; ++n) {
+                const uint64_t ns = src_index(rows, n * 16) / 16;
+                std::memcpy(T + (k * nt + n) * tile, t0 + (ks * nt + ns) * tile, tile);
+            }
+        }
+        for (uint64_t c = 0; c < cols_n; ++c) std::memcpy(U + c * 2, u0 + src_index(cols, c) * 2, 2);
+        for (uint64_t r = 0; r < rows_n; ++r) std::memcpy(V + r * 2, v0 + src_index(rows, r) * 2, 2);
+        return out;
+    };
+    return t;
+}
+
 GgufTensor HfFolder::matrix(const std::string & m) const {
     if (has(m + ".trellis")) {
         const auto & tr = at(m + ".trellis");

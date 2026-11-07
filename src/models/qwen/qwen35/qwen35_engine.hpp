@@ -1,4 +1,5 @@
 #pragma once
+#include "hf_folder.hpp"
 // The qwen35 engine class (declarations; small and template methods inline). Definitions: qwen35.cpp (factory),
 // qwen35_load.cpp, qwen35_forward.cpp, qwen35_spec.cpp. Internal to src/models/qwen/qwen35/.
 #include "prefill_observer_cuda.hpp"
@@ -71,14 +72,15 @@ namespace qwen35_detail {
 
 class Qwen35Engine final : public Engine {
 public:
-    // `path`: a checkpoint directory (safetensors, BF16) or a .gguf file (TQ3_4S / Q6_K / F32).
+    // `path`: a checkpoint directory (safetensors, BF16), a .gguf file (TQ3_4S / Q6_K / F32), or a mapped folder (exl3).
     Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o)
         : opt(o), context_(ctx) {
         glru.set_cap(size_t(std::max(1, opt.graph_cache)));
         graph_keep = size_t(std::max(0L, opt.graph_keep_mb)) << 20;
         if (slots < 1 || slots > 64) throw std::invalid_argument("slots must be in 1..64");
         if (!context_) throw std::invalid_argument("context must be positive");
-        const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
+        // a .gguf file, or a checkpoint folder hf_arch.cpp maps (exl3 as published): both read through gguf_open
+        const bool gguf = (path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0) || hf_folder_arch(path) == "qwen35";
         std::unique_ptr<GgufFile> gf;
         if (gguf) {
             gf = std::make_unique<GgufFile>(gguf_open(path));

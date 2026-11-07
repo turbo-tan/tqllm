@@ -53,7 +53,7 @@ inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); r
 // prompts). Counts fitted for another --slots are scaled to keep the same total; without either, every layer gets --slots.
 // A manifest's layer_slots= line (the same counts) is used when there is no experts file beside it.
 inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string & experts_path, int slots,
-                              const std::string & manifest_slots = "") {
+                              const std::string & manifest_slots = "", int min_slots = 0) {
     std::string text, from;
     if (const char * v = std::getenv("TQFN_LAYER_SLOTS"); v && *v) { text = v; from = "TQFN_LAYER_SLOTS"; }
     else if (!manifest_slots.empty()) { text = manifest_slots; from = "manifest layer_slots"; }
@@ -61,10 +61,11 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
         std::ifstream f(experts_path + ".slots");
         if (f && std::getline(f, text)) from = experts_path + ".slots";
     }
+    if (text.empty()) { text = tqllm::flashnext::flashnext_layer_profile(cache.layers(), cache.experts()); from = "the Flash-Next routing profile"; }
     if (text.empty()) return;
     std::vector<int> caps; size_t at = 0;
     while (at <= text.size()) { const size_t e = std::min(text.find(',', at), text.size()); caps.push_back(std::stoi(text.substr(at, e - at))); at = e + 1; }
-    caps = tqllm::flashnext::scale_layer_slots(caps, slots, cache.experts());
+    caps = tqllm::flashnext::lift_layer_floor(tqllm::flashnext::scale_layer_slots(caps, slots, cache.experts()), min_slots, cache.experts());
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }

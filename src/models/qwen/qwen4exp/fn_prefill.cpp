@@ -51,7 +51,10 @@ void DecodeModel::stage_begin(PrefillStage & st, const MixedExpertCache & cache,
     if (st.layer == layer && st.cache == &cache) return;
     st.cache = &cache; st.layer = layer; st.issued = 0;
     // no prepacked file (a GB10 keeps every expert in its bank): nothing to stage, prefill_layer fills the bank instead
-    if (!cache.bank_layout(layer).src0) { st.plan.clear(); return; }
+    const auto lay = cache.bank_layout(layer);
+    if (!lay.src0) { st.plan.clear(); return; }
+    const size_t need = tqllm::stage_need(lay.piece, st.K);
+    if (need > st.half_bytes) { stage_alloc(st, need, st.K); st.cache = &cache; st.layer = layer; st.issued = 0; }  // before any upload
     st.plan = stage_plan(cache, layer);
     const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
     for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
@@ -125,11 +128,12 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     ck(cudaMemcpyAsync(st.ids_host, pf_routed->p, size_t(A) * 4, cudaMemcpyDeviceToHost, nullptr)); ck(cudaStreamSynchronize(nullptr));
     ck(cudaGetLastError());  // a launch that failed (full device) leaves stale routing behind: stop before it is used
     const int * ids = st.ids_host;
-    { int bad = 0, first = -1; for (int a = 0; a < A; ++a) if (ids[a] < 0 || ids[a] >= E) { if (!bad) first = a; ++bad; }
+    std::vector<int> cnt(size_t(E), 0);
+    { int bad = 0, first = -1;
+      for (int a = 0; a < A; ++a) { const int e = ids[a]; if (e < 0 || e >= E) { if (!bad) first = a; ++bad; } else ++cnt[size_t(e)]; }
       require(!bad, "layer-major prefill: layer " + std::to_string(layer) + " routed " + std::to_string(bad) + " of " + std::to_string(A) +
                     " assignments to an expert outside 0.." + std::to_string(E - 1) + " (first at " + std::to_string(first) + ": " +
                     std::to_string(bad ? ids[first] : 0) + ")"); }
-    std::vector<int> cnt(size_t(E), 0); for (int a = 0; a < A; ++a) ++cnt[size_t(ids[a])];
     const bool borrowed = size_t(layer) < pf_borrowed.size() && pf_borrowed[size_t(layer)] && cache.has_layout(layer);
     if (!cache.bank_ready(layer) && borrowed) {  // every routed expert from staging; refilled right after the prompt
         pf_refill[layer] = tqllm::flashnext::bank_experts(cnt, layer, size_t(cache.slots(layer)), cp.rt.cpu_owned);  // most routed first: the refill keeps what its bank holds
@@ -175,10 +179,8 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     }
     if (st.idx_cap < total) { if (st.idx_host) ck(cudaFreeHost(st.idx_host)); st.idx_cap = std::max({total, 2 * st.idx_cap, size_t(4) << 20});
                               ck(cudaMallocHost(reinterpret_cast<void **>(&st.idx_host), st.idx_cap * 4)); }
-    for (const auto & ps : passes) {
-        int * cn = st.idx_host + ps.at, * gr = cn + ps.W; std::fill(cn, cn + ps.W, 0);
-        for (int a = 0; a < A; ++a) { const int sl = ps.slot_of[size_t(ids[a])]; if (sl >= 0) gr[size_t(sl) * ps.cap + size_t(cn[sl]++)] = a; }
-    }
+    {   std::vector<tqllm::PassSlots> ps; for (const auto & p : passes) ps.push_back({p.W, p.cap, p.at, p.slot_of.data()});
+        tqllm::fill_pass_lists(ids, A, E, ps, st.idx_host); }
     grow(pf_idx, total);
     ck(cudaMemcpyAsync(pf_idx->p, st.idx_host, total * 4, cudaMemcpyHostToDevice, nullptr));
     lmark(1);

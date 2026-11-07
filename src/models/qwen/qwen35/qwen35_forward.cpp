@@ -1068,7 +1068,8 @@ void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     else if (embed.type == GGML_Q3_K) tqllm_cuda::embed_multi_q3k(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_IQ3_S) tqllm_cuda::embed_multi_iq3s(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_Q5_K) tqllm_cuda::embed_multi_q5k(embed.p, dtok, n, Y, H, stream);
-    else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K, Q3_K, Q5_K or IQ3_S embedding table");
+    else if (embed.type == GGML_BF16) tqllm_cuda::embed_multi_bf16(embed.p, dtok, n, Y, H, stream);
+    else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K, Q3_K, Q5_K, IQ3_S or BF16 embedding table");
 }
 
 void Qwen35Engine::capture_feature(uint32_t l, const bf16 * x, bf16 * feats, int n) {

@@ -4,6 +4,7 @@
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -30,7 +31,7 @@ inline void expert_matvec_u4h(int fmt, const Mat & m, const __half * x, __nv_bfl
 }
 constexpr uint32_t ID_U4H = 1001, ID_W4S = 1002, ID_K4 = 1003, ID_K3 = 1004, /* 1005: retired IQ4 */ ID_IQ3 = 1006, ID_IQ3X = 1007,
                    ID_IQ4N = 1008, ID_IQ4L = 1009, ID_K5 = 1010, ID_K6 = 1011, ID_UDQ = 1012 /* 1012..1016: UD types, see Udq */,
- ID_U4HR = 1017;
+ ID_U4HR = 1017, ID_NVF4 = 1018;
 
 // u4h (engine id 1001): 4-bit codes in 16-groups (element 4u + j -> byte (u / 2) * 4 + j, nibble u % 2),
 // FP16 (scale, min) per 32. Produced from Q4_K (drafter) or non-uniform Q4_0.
@@ -421,6 +422,90 @@ struct Iq4l final : WeightFormat {
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::iq4l_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), out, m.rows,
                                    m.cols, s);
+    }
+};
+// NVF4 (engine id 1018, u4h FMT 16): NVFP4 E2M1 nibbles in IQ4L's 32-weight blocks (16 B, low nibble = even weight); aux per
+// row: the cols / 16 E4M3 group scales, then the row's F32 global scale (NVIDIA's bytes: 4.5 bits per weight with the codes).
+// Experts only (no dense dequant).
+struct Nvf4 final : WeightFormat {
+    int max_exact_cols() const override { return 32; }
+    int u4h_id() const override { return 16; }
+    bool has_expert_matvec() const override { return true; }
+    void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_matvec(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols, ids, n, topk, per_expert_input, stream);
+    }
+    bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
+                     const int * counts, const int * groups, int capacity, int experts,
+                     int topk, bool per_expert_input, cudaStream_t stream) const override {
+        tqllm_cuda::k_expert_gemm(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols, counts, groups, capacity, experts,
+                                  topk, per_expert_input, stream);
+        return true;
+    }
+    const char * name() const override { return "NVF4"; }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override { return gemm_ld(m, x, y, n, m.rows, s); }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_gemm(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    int max_batch_cols() const override { return 16; }
+    Basis basis() const override { return Basis::Plain; }
+    size_t row_bytes(int cols) const override { return size_t(cols) / 2; }
+    size_t aux_row_bytes(int cols) const override { return size_t(cols) / 16 + 4; }
+    Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
+        throw std::runtime_error("NVF4 is produced by the NVFP4G loader");
+    }
+    void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_bf16(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    bool has_matvec_ld() const override { return true; }
+    bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_bf16(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_family_matvec_f32(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error("NVF4: no dense dequant (expert weights run on the u4h kernels)");
+    }
+};
+// NVFP4G (GGUF 323) loader -> NVF4: per 128 weights F32 global, 8 E4M3 group scales, 64 bytes of codes. The codes go as they are
+// (four 32-weight blocks); the scales and the row's global (one per matrix in modelopt files) go to the aux row.
+struct NVFP4G final : WeightFormat {
+    const WeightFormat * nvf4;
+    explicit NVFP4G(const WeightFormat * f) : nvf4(f) {}
+    const char * name() const override { return "NVFP4G"; }
+    Basis basis() const override { return Basis::Plain; }
+    Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
+        if (cols % 128) throw std::runtime_error("NVFP4G needs a multiple of 128 columns");
+        const int nb = cols / 128;
+        if (int64_t(raw.size()) != int64_t(rows) * nb * 76) throw std::runtime_error("NVFP4G: tensor size does not match its shape");
+        const size_t ab = size_t(cols) / 16 + 4;
+        std::vector<uint8_t> w(size_t(rows) * cols / 2), a(size_t(rows) * ab);
+        std::atomic<bool> mixed{false};
+        tqllm::parallel_blocks(rows, [&](int64_t r) {
+            const auto * row = reinterpret_cast<const uint8_t *>(raw.data()) + r * int64_t(nb) * 76;
+            uint8_t * ar = a.data() + size_t(r) * ab;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t * blk = row + b * 76;
+                if (b && std::memcmp(blk, row, 4) != 0) mixed = true;
+                std::memcpy(ar + b * 8, blk + 4, 8);
+                std::memcpy(w.data() + (size_t(r) * nb + b) * 64, blk + 12, 64);
+            }
+            std::memcpy(ar + cols / 16, row, 4);
+        });
+        if (mixed) throw std::runtime_error("NVFP4G: a row has more than one global scale");
+        const void * p = up(w.data(), w.size());
+        const void * x = up(a.data(), a.size());
+        tqllm_cuda::u4h_family_tune(16, static_cast<const uint8_t *>(p), x, rows, cols, s);
+        return {p, ID_NVF4, rows, cols, x, nvf4};
+    }
+    void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
+        throw std::runtime_error("NVFP4G is a loader; matrices run as NVF4");
+    }
+    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
+        throw std::runtime_error("NVFP4G is a loader; matrices run as NVF4");
     }
 };
 // IQ4_NL (GGUF 20) loader -> IQ4L: block d, qs[16] (weight j low nibble of qs[j], weight 16 + j high nibble).
@@ -1051,6 +1136,8 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     auto iq4xs = std::make_unique<IQ4_XS>(iq4n.get());
     auto iq4l = std::make_unique<Iq4l>();
     auto iq4nl = std::make_unique<IQ4_NL>(iq4l.get());
+    auto nvf4 = std::make_unique<Nvf4>();
+    auto nvfp4g = std::make_unique<NVFP4G>(nvf4.get());
     auto q3k = std::make_unique<Q3_K>(k3.get());
     auto q4k = std::make_unique<Q4_K>(k4.get());
     auto k5 = std::make_unique<K5>();
@@ -1064,6 +1151,8 @@ void register_q4() {  // no weight_format() lookups here: registration runs insi
     register_weight_format(ID_K3, std::move(k3));
     register_weight_format(ID_IQ4N, std::move(iq4n));
     register_weight_format(ID_IQ4L, std::move(iq4l));
+    register_weight_format(ID_NVF4, std::move(nvf4));
+    register_weight_format(323 /* GGML_NVFP4G */, std::move(nvfp4g));
     register_weight_format(ID_IQ3, std::move(iq3));
     register_weight_format(ID_IQ3X, std::move(iq3x));
     register_weight_format(18, std::move(iq3xxs));

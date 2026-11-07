@@ -78,15 +78,20 @@ const char* kSource = R"METAL(
 #endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
     const device uint* hp = (const device uint*)H + (BITS == 6 ? ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane : 0);
-    const device ushort* sp = S + (Q6 ? 2 : 1) * (((size_t)blk * (K / GS) + split * (KS / GS)) * 32);
+    const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    // Q6: int8 sub-block scales [blocks, groups, 32] in S, the FP16 super-block scale d [blocks, K / 256, 32] in Bz
+    const device char* sq = (const device char*)S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device ushort* dq = Bz + (size_t)blk * (K / 256) * 32;
+    const int g0 = split * (KS / GS);  // this split's first group: d is indexed by the absolute group (a split may be < 256 wide)
     const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
     const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
     for (int g = 0; g < KS / GS; g++) {
         // Q6: FP32 scales (Q6_K d * sub-block scale, exact), codes 0..63 with the implied bias -32 * scale
-        const float4 s0 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + fn))
+        // Q6 scale = d x sub-scale, exact in FP32 (11-bit x 8-bit): the same value the packer used to store
+        const float4 s0 = Q6 ? float4(as_type<half4>(*(const device ushort4*)(dq + ((g0 + g) / 16) * 32 + fn))) * float4(*(const device char4*)(sq + g * 32 + fn))
                         : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn)))
                               : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
-        const float4 s1 = Q6 ? *(const device float4*)(sp + 2 * (g * 32 + 16 + fn))
+        const float4 s1 = Q6 ? float4(as_type<half4>(*(const device ushort4*)(dq + ((g0 + g) / 16) * 32 + 16 + fn))) * float4(*(const device char4*)(sq + g * 32 + 16 + fn))
                         : TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn)))
                               : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
         const float4 b0 = Q6 ? -32.0f * s0 : TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
@@ -582,6 +587,9 @@ int nax_affine_splits(const NaxAffine& w) {
     constexpr int cap = 8, target = 512;  // at most 8-way split-K, aiming for 512 simdgroups per matrix
     int split = 1;
     while (split < cap && (w.rows / 32) * split < target && (w.columns / w.group) % (split * 2) == 0) split *= 2;
+    // TQ4 (one scale per 128 columns, no bias): a 4-way split keeps more weight bytes in flight (j1938: 64-layer FFN chain
+    // at 16 rows 34.4 ms with gate|up 4 / down 4 vs 35.2 ms by shape; 2-way and 8-way are slower)
+    if (w.tq4 && split < 4 && (w.columns / w.group) % 4 == 0) split = 4;
     return split;
 }
 
@@ -793,28 +801,33 @@ NaxAffine nax_from_q6(const Q6Weights& q) {
     mx::eval(blocks);
     const uint8_t* b = blocks.data<uint8_t>();
     std::vector<uint8_t> codes(size_t(rows) * columns);
-    std::vector<float> scale(size_t(rows) * gpr);
+    std::vector<int8_t> sub(size_t(rows) * gpr);
+    std::vector<uint16_t> dsc(size_t(rows) * (columns / 256));
     for (size_t r = 0; r < size_t(rows); ++r)
         for (int sb = 0; sb < columns / 256; ++sb) {
             const uint8_t* p = b + (r * (columns / 256) + sb) * 210;
-            uint16_t dbits = uint16_t(p[208] | (p[209] << 8));
-            const float d = float(mx::float16_t(*reinterpret_cast<const mx::float16_t*>(&dbits)));
+            dsc[r * (columns / 256) + sb] = uint16_t(p[208] | (p[209] << 8));
             for (int w = 0; w < 256; ++w) {
                 const int h = w / 128, l = w % 32, c = (w % 128) / 32;
                 const uint8_t lo = p[h * 64 + (c & 1) * 32 + l], hi = p[128 + h * 32 + l];
                 codes[r * columns + sb * 256 + w] = uint8_t((c < 2 ? lo & 15u : lo >> 4) | (((hi >> (2 * c)) & 3u) << 4));
             }
-            for (int j = 0; j < 16; ++j) scale[r * gpr + sb * 16 + j] = d * float(int8_t(p[192 + j]));
+            for (int j = 0; j < 16; ++j) sub[r * gpr + sb * 16 + j] = int8_t(p[192 + j]);
         }
     std::vector<uint16_t> zero(size_t(rows) * gpr, 0);
     auto out = nax_affine_load(nax_affine_pack(codes, zero, zero, rows, columns, 6, 16), rows, columns, 6, 16);
-    // scales in the kernel's [blocks, groups, 32] order, FP32 (two uint16 words each)
-    std::vector<float> ordered(scale.size());
+    // the kernel's [blocks, groups, 32] order: int8 sub-scales (two per uint16 word) and FP16 d per 256 columns; the
+    // kernel multiplies them in FP32, the exact product (6.6 instead of 8 bits per weight read)
+    const int spr = columns / 256;
+    std::vector<int8_t> osub(sub.size());
+    std::vector<uint16_t> od(dsc.size());
     for (int blk = 0; blk < rows / 32; ++blk)
-        for (int g = 0; g < gpr; ++g)
-            for (int j = 0; j < 32; ++j) ordered[(size_t(blk) * gpr + g) * 32 + j] = scale[size_t(blk * 32 + j) * gpr + g];
-    out.scales = mx::array(reinterpret_cast<const uint16_t*>(ordered.data()), {rows / 32, gpr, 64}, mx::uint16);
-    out.biases = mx::zeros({64}, mx::uint16);
+        for (int j = 0; j < 32; ++j) {
+            for (int g = 0; g < gpr; ++g) osub[(size_t(blk) * gpr + g) * 32 + j] = sub[size_t(blk * 32 + j) * gpr + g];
+            for (int sb = 0; sb < spr; ++sb) od[(size_t(blk) * spr + sb) * 32 + j] = dsc[size_t(blk * 32 + j) * spr + sb];
+        }
+    out.scales = mx::array(reinterpret_cast<const uint16_t*>(osub.data()), {rows / 32, gpr, 16}, mx::uint16);
+    out.biases = mx::array(od.data(), {rows / 32, spr, 32}, mx::uint16);
     mx::eval(out.scales, out.biases);
     out.q6 = true;
     return out;

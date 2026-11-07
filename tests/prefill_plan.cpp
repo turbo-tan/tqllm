@@ -150,10 +150,10 @@ int main() {
     expect(hc_row_scales_only(512, true, true), "BF16 mixer, long chunk: row scales only");
     expect(!hc_row_scales_only(64, true, true), "short chunk keeps the fp32 rows");
     expect(!hc_row_scales_only(512, false, true), "IQ4_XS hc down needs the fp32 rows");
-    expect(hc_row_scales_h(512, true, true, true), "Q8_0 mixers, long chunk: row scales + FP16 image");
-    expect(!hc_row_scales_h(64, true, true, true) && !hc_row_scales_h(512, true, false, true), "short chunk, or an inject that is neither quantised nor BF16, keeps the plain path");
-    expect(!hc_row_scales_h(512, false, true, true), "BF16 down mixers take the BF16 row-scale path instead");
-    expect(!hc_row_scales_h(512, true, true, false), "CPU-side projections need the fp32 rows");
+    expect(hc_row_scales_h(512, true, true), "mixers with FP16 copies (Q8_0, BF16, F32 inject), long chunk: row scales + FP16 image");
+    expect(!hc_row_scales_h(64, true, true), "a short chunk keeps the plain path");
+    expect(!hc_row_scales_h(512, false, true), "a mixer without an FP16 copy (TQ3_4S) keeps the other paths");
+    expect(!hc_row_scales_h(512, true, false), "CPU-side projections need the fp32 rows");
     expect(!hc_row_scales_only(512, true, false), "non-BF16 inject needs the fp32 rows");
 
     // 8. expert slots from free memory (manifest slots=auto). RTX 3090, Flash-Next IQ4_XS on 10-18: one slot of every
@@ -174,6 +174,27 @@ int main() {
         s.wide_bf16 = true; const auto b16 = prefill_chunk_bytes(s, tuning(16384), 16384);
         expect(plain.residual == size_t(16384) * 2560 * 4 * 4 && b16.residual == plain.residual / 2 * 3, "wide_bf16 residual bytes");
         expect(b16.total() == plain.total() + plain.residual / 2, "wide_bf16 adds only the BF16 rows");
+    }
+    {   // UD-IQ1_M trunk + our IQ4 MTP on GB10 (11-06): the MTP layer's experts (6 pieces below) need 511 MB of staging for
+        // K = 192, the trunk had sized it 383 MB, and the early stage_begin copied past the end (host SIGSEGV)
+        const size_t mtp[6] = {819200, 51200, 819200, 51200, 819200, 102400};
+        expect(stage_need(mtp, 192) == size_t(511180800), "MTP staging bytes for K = 192");
+        expect(stage_need(mtp, 192) > size_t(383385600), "the trunk-sized staging half is too small for the MTP layer");
+        const size_t one[6] = {1, 0, 0, 0, 0, 0};
+        expect(stage_need(one, 3) == 256, "each piece is 256-aligned");
+    }
+    {   // fill_pass_lists (one sweep) == one sweep per pass, ascending order per slot
+        const int E = 64, A = 5000; std::vector<int> ids(A); unsigned x = 7; for (auto & v : ids) { x = x * 1103515245u + 12345u; v = int((x >> 8) % E); }
+        std::vector<std::vector<int>> so(3, std::vector<int>(E, -1)); std::vector<PassSlots> ps; size_t at = 0;
+        std::vector<int> cnt(E, 0); for (int v : ids) ++cnt[size_t(v)];
+        for (int e = 0; e < 60; ++e) so[size_t(e % 3)][size_t(e)] = e / 3;  // experts 60-63 in no pass
+        for (int p = 0; p < 3; ++p) { int cap = 1; for (int e = 0; e < E; ++e) if (so[p][e] >= 0) cap = std::max(cap, cnt[size_t(e)]);
+                                      ps.push_back({20, cap, at, so[p].data()}); at += size_t(20) * (1 + cap); }
+        std::vector<int> a1(at, -7), a2(at, -7);
+        fill_pass_lists(ids.data(), A, E, ps, a1.data());
+        for (const auto & p : ps) { int * cn = a2.data() + p.at, * gr = cn + p.W; std::fill(cn, cn + p.W, 0);
+            for (int a = 0; a < A; ++a) { const int sl = p.slot_of[ids[a]]; if (sl >= 0) gr[size_t(sl) * p.cap + size_t(cn[sl]++)] = a; } }
+        expect(a1 == a2, "fill_pass_lists equals one sweep per pass");
     }
     std::printf(fails ? "PREFILL_PLAN FAIL\n" : "PREFILL_PLAN PASS\n");
     return fails ? 1 : 0;

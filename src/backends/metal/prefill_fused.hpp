@@ -8,11 +8,13 @@ namespace tqllm::mlx_backend {
 // engine checks that once on device and falls back otherwise, prefill_fused_exact).
 // rms_norm(x, w, eps) rounded to BF16 values: {FP32, the same values as FP16}, x FP32 [rows, d] with d > 4096 (MLX's
 // looped reduction: 1024 threads, 4 reads per thread per step)
-std::pair<mlx::core::array, mlx::core::array> rms_norm_bf16_pair(const mlx::core::array& x, const mlx::core::array& w, float eps);
+std::pair<mlx::core::array, mlx::core::array> rms_norm_bf16_pair(const mlx::core::array& x, const mlx::core::array& w, float eps,
+                                                                        bool rotate = false);  // rotate: out16 = tq4_rotate_half(out)
 // residual add first: s = bf(x + r) (FP32), then rms_norm(s, w, eps) as above -> {s, FP32 norm, FP16 norm}; the decode
 // / verify layer's add_bf + norm + FP16 matmul copy in one launch (j1038: ~4 dispatches per residual)
 std::tuple<mlx::core::array, mlx::core::array, mlx::core::array> rms_norm_bf16_pair_residual(const mlx::core::array& x, const mlx::core::array& r,
-                                                                                            const mlx::core::array& w, float eps);
+                                                                                            const mlx::core::array& w, float eps,
+                                                                                            bool rotate = false);
 std::tuple<mlx::core::array, mlx::core::array, mlx::core::array> rms_norm_bf16_pair_residual_reference(const mlx::core::array& x, const mlx::core::array& r,
                                                                                                       const mlx::core::array& w, float eps);
 // SwiGLU of a gate | up product [rows, 2F] FP16: f16(bf(bf(g * sigmoid(g)) * u)) with g, u the BF16 roundings of the

@@ -29,6 +29,22 @@ inline int auto_expert_slots(size_t free_bytes, size_t keep_bytes, size_t slot_b
     return int(std::clamp<size_t>((free_bytes - keep_bytes) / slot_bytes_all_layers, 1, size_t(experts)));
 }
 
+// Slots to give back so `need` bytes become free: one slot at a time from the layer with the most slots above its floor
+// (ties: the lowest layer), until enough is freed or every layer sits at its floor. Several sequences: a request starting
+// with less free memory than its K/V needs shrinks the banks first instead of failing (3090 np 12 x 8K ran out of memory
+// with 84 MB free; keeping every request's 8K K/V up front instead cost np 8 19 slots per layer and 10 % decode, 11-05).
+inline std::vector<int> shrink_caps(std::vector<int> caps, const std::vector<int> & floor, const std::vector<size_t> & slot_bytes, size_t need) {
+    size_t freed = 0;
+    while (freed < need) {
+        int big = -1;
+        for (size_t l = 0; l < caps.size(); ++l)
+            if (caps[l] > floor[l] && slot_bytes[l] && (big < 0 || caps[l] > caps[size_t(big)])) big = int(l);
+        if (big < 0) break;
+        --caps[size_t(big)]; freed += slot_bytes[size_t(big)];
+    }
+    return caps;
+}
+
 // Per-layer caps written for one model (TQFN_LAYER_SLOTS, or a "<experts>.slots" file next to the packed experts: one line
 // of comma-separated counts, fitted on a routing trace of other prompts). Counts fitted for another slot count are scaled
 // to keep the same total. Empty result: no override.

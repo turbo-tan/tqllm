@@ -121,6 +121,37 @@ int main() try {
     check(f.kv.at("tokenizer.ggml.tokens").strs.at(2) == "ab" && f.kv.at("tokenizer.ggml.merges").strs.at(0) == "a b" &&
           uint32_t(f.num("tokenizer.ggml.eos_token_id")) == 3, "tokenizer keys");
 
+    {   // an exl3 matrix with 128-blocks of rows and columns reordered (the Qwen3.8-27B GDN value heads): trellis tiles, suh and
+        // svh move with their blocks; a block that is not a whole Hadamard block (128) is refused
+        const fs::path rd = dir / "reorder";
+        fs::create_directories(rd);
+        std::ofstream(rd / "config.json") << R"({"architectures":["SomethingElse"]})";
+        std::map<std::string, T> ts; trellis(ts, "m", 256, 384, 77);
+        write_safetensors(rd / "model.safetensors", ts);
+        const HfFolder h(rd.string());
+        HfBlockOrder rows; rows.block = 128; rows.offset = 128; rows.order = {1, 0};  // output rows 128..383: halves swapped
+        HfBlockOrder cols; cols.block = 128; cols.offset = 0; cols.order = {1, 0};    // input cols: halves swapped
+        GgufFile g; g.path = (rd / "model.safetensors").string();
+        const auto out = g.read(h.matrix("m", rows, cols));
+        const auto & tr = ts.at("m.trellis").data; const auto & su = ts.at("m.suh").data; const auto & sv = ts.at("m.svh").data;
+        const size_t hdr = sizeof(X3Record), tile = 64, kt = 16, nt = 24;
+        auto src_n = [](size_t n) { return n < 8 ? n : n < 16 ? n + 8 : n - 8; };
+        auto src_k = [](size_t k) { return k < 8 ? k + 8 : k - 8; };
+        bool same = out.size() == hdr + tr.size() + su.size() + sv.size();
+        for (size_t k = 0; same && k < kt; ++k)
+            for (size_t n = 0; n < nt; ++n)
+                same = same && std::memcmp(out.data() + hdr + (k * nt + n) * tile, tr.data() + (src_k(k) * nt + src_n(n)) * tile, tile) == 0;
+        for (size_t c = 0; same && c < 256; ++c) same = std::memcmp(out.data() + hdr + tr.size() + 2 * c, su.data() + 2 * (c < 128 ? c + 128 : c - 128), 2) == 0;
+        for (size_t r = 0; same && r < 384; ++r) {
+            const size_t sr = r < 128 ? r : r < 256 ? r + 128 : r - 128;
+            same = std::memcmp(out.data() + hdr + tr.size() + su.size() + 2 * r, sv.data() + 2 * sr, 2) == 0;
+        }
+        check(same, "exl3 block reorder moves trellis tiles, suh and svh with their 128-blocks");
+        HfBlockOrder bad; bad.block = 64; bad.order = {1, 0};
+        bool refused = false;
+        try { (void) h.matrix("m", bad, {}); } catch (const std::exception &) { refused = true; }
+        check(refused, "exl3 blocks smaller than a Hadamard block are refused");
+    }
     {   // an architecture with no map is not a checkpoint folder
         const fs::path other = dir / "other";
         fs::create_directories(other);
