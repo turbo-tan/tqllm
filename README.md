@@ -28,6 +28,21 @@ Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
 [Benchmarks](docs/BENCHMARKS.md).
 
+## Supported models
+
+Checked on the release build: the model loads and answers a fixed question correctly (1.4.4: RTX 3090, M5 Pro Mac).
+
+| Model | Files tqLLM loads | Hardware | 1.4.4 check |
+|---|---|---|---|
+| Qwen3.8-27B and fine-tunes (e.g. Qwopus3.8) | TQ3_4S, TQ_L / TQ4, K-quant and IQ GGUFs; EXL3 folders; DFlash2 and MTP drafters | NVIDIA, 16 GB and up; DGX Spark / GB10 | passed |
+| Qwen3.8-27B on a Mac | mlx-community 4-bit, TQ_L, QSA files ([Mac guide](docs/guides/mac.md)) | Apple Silicon (48 GB tested) | passed |
+| Qwen3.8-Flash-Next (125B MoE, 6B active) | `.tqfn` manifest over the public IQ3_S GGUF, tqLLM's own file, Unsloth Dynamic v3.1 GGUFs, NVIDIA NVFP4 experts | 24 GB GPU + 64 GB RAM; DGX Spark / GB10 | passed |
+| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.4.4 |
+| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.4.4 |
+
+Not supported yet: Qwen3.5 sizes with tied embeddings (4B and smaller: the file has no `output.weight`), and
+Qwen3.5 / 3.6 mixture-of-experts GGUFs (`qwen35moe`, such as Qwen3.6-35B-A3B) are not verified on 1.4.4.
+
 ## See what your model is doing
 
 Watch prefill, output rates and hardware use in one view. Both rates stay in the
@@ -68,9 +83,14 @@ cmake --build build --target tqserve -j4
 Open **[localhost:8086](http://localhost:8086/)** for the monitor. Applications use
 the same server at `http://localhost:8086/v1`.
 
-Prefer Docker? With the model in place, run `docker compose up --build`.
-The walkthrough uses the source build; released images may predate these monitor
-updates. See [installation and requirements](docs/guides/quickstart.md).
+Prefer Docker? The prebuilt image (x86-64 and arm64) runs the same server:
+
+```sh
+docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" --entrypoint tqserve \
+  ghcr.io/turbo-tan/tqllm:1.4.4 --model /models/model.gguf --host 0.0.0.0 --port 8086
+```
+
+or build it locally with `docker compose up --build`. See [installation and requirements](docs/guides/quickstart.md).
 
 ## Choose your next step
 
