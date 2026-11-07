@@ -1,0 +1,46 @@
+name: windows-native
+
+# Native Windows build of tqserve (MSVC + CUDA, no WSL): compile only, the runners have no GPU.
+on:
+  push:
+    branches: [ci/windows-native]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "nvrtc", "nvrtc_dev", "nvvm", "cublas", "cublas_dev", "cusolver", "cusolver_dev", "nvtx", "visual_studio_integration"]'
+      - name: Ninja
+        run: choco install ninja -y
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+      - name: Build tqserve
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake --build build --target tqserve -j 4 -- -k 0 > build.log 2>&1
+          set RC=%ERRORLEVEL%
+          findstr /R /C:"error" build.log > errors.txt
+          type errors.txt
+          exit /b %RC%
+      - name: Build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: |
+            build.log
+            errors.txt
