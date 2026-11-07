@@ -14,19 +14,42 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: '12.8.1'
-          method: network
-          sub-packages: '["nvcc", "cudart", "crt", "nvrtc", "nvrtc_dev", "nvvm", "cublas", "cublas_dev", "cusolver", "cusolver_dev", "nvtx", "visual_studio_integration"]'
+      - name: CUDA toolkit 13.1 (NVIDIA redistributable archives, as llama.cpp's Windows CI)
+        shell: pwsh
+        run: |
+          $root = "C:\cuda"; New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $parts = @(
+            "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.1.80-archive.zip",
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.1.80-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.1.80-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.1.80-archive.zip",
+            "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.1.80-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.1.78-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.2.0.9-archive.zip",
+            "libcusolver/windows-x86_64/libcusolver-windows-x86_64-12.0.7.41-archive.zip",
+            "libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.7.2.19-archive.zip",
+            "libnvjitlink/windows-x86_64/libnvjitlink-windows-x86_64-13.1.80-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.1.68-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.1.80-archive.zip")
+          foreach ($p in $parts) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $p -Leaf)
+            Invoke-WebRequest -Uri "$base/$p" -OutFile $zip
+            $tmp = Join-Path $env:RUNNER_TEMP "x"; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+            Expand-Archive $zip -DestinationPath $tmp
+            Copy-Item -Recurse -Force (Join-Path (Get-ChildItem $tmp)[0].FullName "*") $root
+          }
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDAToolkit_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$root\bin\nvcc.exe" --version
       - name: Ninja
         run: choco install ninja -y
       - name: Configure
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=C:/cuda/bin/nvcc.exe > configure.log 2>&1 & type configure.log
       - name: Build tqserve
         shell: cmd
         run: |
@@ -42,5 +65,6 @@ jobs:
         with:
           name: windows-build-log
           path: |
+            configure.log
             build.log
             errors.txt
