@@ -47,9 +47,11 @@ Not built on HIP in this PR, each with an explicit error instead of a silent fal
 
 - Flash-Next (`qwen4exp`) engine: now compiles on HIP (qwen4exp.cu, qwen4exp_qsa.cu, fn_*.cpp
   all build). The expert GEMM uses sparse MMAs (`mma.sp.sync`) which have no RDNA3 equivalent;
-  on HIP `mmq_supports` returns false so the dense u4h path runs, but `mma_s8_k16` is a no-op
-  (sparse→dense rewrite is the next step). The model needs 64 GB RAM + 24 GB VRAM to load and
-  cannot be validated on this box (30 GB RAM).
+  on HIP `mmq_supports` returns false so the dense u4h path runs (which uses `mma_s8_k32`, already
+  ported). `mma_s8_k16` (per-16-scale formats) is a no-op on HIP. QSA attention is stubbed to
+  throw (the dense attention path is used instead). The model needs 64 GB RAM + 24 GB VRAM to
+  load and cannot be validated on this box (30 GB RAM); a machine with 64+ GB RAM is required
+  for end-to-end testing.
 - GLM-5.3-Flash and MiniMax-M3 engines (no AMD kernels yet; model probes return no match).
 - Vision / multimodal input (`--mmproj`).
 - FP8 and INT8 prefill GEMM (`Fp8Gemm` / `Int8Gemm` report `supported() == false`; prefill uses
