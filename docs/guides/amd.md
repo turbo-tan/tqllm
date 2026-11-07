@@ -45,8 +45,11 @@ Run the same way as the CUDA build:
 
 Not built on HIP in this PR, each with an explicit error instead of a silent fallback:
 
-- Flash-Next (`qwen4exp`) and its QSA KV cache: the CMake build does not compile the `fn_*`
-  engine, and the QSA entry points throw `not supported by the AMD (HIP) backend`.
+- Flash-Next (`qwen4exp`) engine: now compiles on HIP (qwen4exp.cu, qwen4exp_qsa.cu, fn_*.cpp
+  all build). The expert GEMM uses sparse MMAs (`mma.sp.sync`) which have no RDNA3 equivalent;
+  on HIP `mmq_supports` returns false so the dense u4h path runs, but `mma_s8_k16` is a no-op
+  (sparse→dense rewrite is the next step). The model needs 64 GB RAM + 24 GB VRAM to load and
+  cannot be validated on this box (30 GB RAM).
 - GLM-5.3-Flash and MiniMax-M3 engines (no AMD kernels yet; model probes return no match).
 - Vision / multimodal input (`--mmproj`).
 - FP8 and INT8 prefill GEMM (`Fp8Gemm` / `Int8Gemm` report `supported() == false`; prefill uses
