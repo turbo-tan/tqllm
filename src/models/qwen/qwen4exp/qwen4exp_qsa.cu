@@ -4,15 +4,7 @@
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
 #include "decode_rules.hpp"
-#if defined(TQLLM_WITH_HIP)
-#include <hipcub/hipcub.hpp>
-namespace cub = hipcub;  // hipCUB mirrors the CUB API; the call sites keep the CUDA spelling
-#else
-#include <cub/block/block_scan.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_radix_sort.cuh>
-#endif
+#include "cub_compat.hpp"  // CUB on NVIDIA, hipCUB on AMD (src/core): one name for the call sites
 #include <climits>
 #include <algorithm>
 #include <cmath>

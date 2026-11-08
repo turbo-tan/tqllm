@@ -34,6 +34,25 @@ target_compile_options(tqllm PRIVATE -Wall -Wextra -Wpedantic)
 if(TQLLM_MLX)
   include(cmake/mlx.cmake)
 endif()
+
+# Engine sources that every GPU backend compiles (AGENTS.md rule: a backend folder holds the platform's registration
+# file and its own kernels, never a copy of the loader or of the engine glue). Platform-only sources are added inside
+# the backend block below; the AMD build subtracts the PTX-only files it cannot compile yet.
+set(TQLLM_ENGINE_SOURCES
+  src/engine/model.cpp src/engine/registry.cpp src/engine/load_fitted.cpp src/engine/model_capture.cpp
+  src/kv/kv_store_cuda.cpp
+  src/engine/qwen2_engine.cpp src/models/qwen/qwen2/qwen2.cu
+  src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp
+  src/models/qwen/qwen35/qwen35_spec.cpp src/models/qwen/qwen35/qwen35.cu src/models/qwen/qwen35/attention.cu
+  src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu
+  src/experts/moe.cu src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp
+  src/core/common_kernels.cu src/experts/moe_common.cu src/core/gguf_mapped.cpp
+  src/spec/dflash.cu)
+# Engine tests every GPU backend builds: they are the architecture invariants, so a backend that cannot pass them is not
+# a supported platform (docs/guides/adding-a-backend.md). tree.cu is synthetic and runs in ctest; the other two need a
+# model on the command line and stay manual on both backends.
+set(TQLLM_ENGINE_TESTS_SYNTHETIC tree)
+set(TQLLM_ENGINE_TESTS_MANUAL dflash_exact native_mtp)
 if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels (AGENTS: one folder per platform)
   if(CMAKE_VERSION VERSION_LESS 3.24)
     message(FATAL_ERROR "HIP builds need CMake 3.24 or newer (this is ${CMAKE_VERSION}); python3 -m pip install cmake")
@@ -76,16 +95,10 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3/dispatch.cu)
   set(TQLLM_HIP_CU_SOURCES ${TQLLM_HIP_SOURCES})
   list(FILTER TQLLM_HIP_CU_SOURCES INCLUDE REGEX "\\.cu$")  # only device files go through hipcc
-  target_sources(tqllm PRIVATE ${TQLLM_HIP_SOURCES}
-    src/kv/kv_store_cuda.cpp src/engine/model.cpp src/engine/registry.cpp
-    src/backends/hip/builtin_hip.cpp src/backends/hip/qwen2_engine.cpp
-    src/backends/hip/load_fitted.cpp src/backends/hip/model_capture.cpp
-    src/backends/hip/unsupported_hip.cpp src/spec/dflash.cu
-    src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp
-    src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp
-    src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu
-    src/models/qwen/qwen35/attention.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/experts/moe.cu src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp
-    src/core/common_kernels.cu src/experts/moe_common.cu src/core/gguf_mapped.cpp)
+  # the AMD platform adds only its registration file and the stubs for what it does not implement; everything else is
+  # the shared list above, so a new engine file is added in one place for both backends
+  target_sources(tqllm PRIVATE ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES}
+    src/backends/hip/builtin_hip.cpp src/backends/hip/unsupported_hip.cpp)
   target_include_directories(tqllm PRIVATE ${TQLLM_HIP_SHIM} ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
   # tqLLM's device files are .cu on every backend: tag them for hipcc under the HIP language
@@ -217,11 +230,8 @@ if(TQLLM_CUDA)
   file(GLOB_RECURSE TQLLM_FORMAT_SOURCES CONFIGURE_DEPENDS src/formats/*.cpp src/formats/*.cu)
   target_sources(tqllm PRIVATE ${TQLLM_FORMAT_SOURCES})
   target_include_directories(tqllm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
-  target_sources(tqllm PRIVATE src/kv/kv_store_cuda.cpp src/engine/model.cpp src/engine/registry.cpp src/backends/cuda/builtin_cuda.cpp
-    src/backends/cuda/qwen2_engine.cpp src/backends/cuda/load_fitted.cpp src/backends/cuda/model_capture.cpp src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp
-    src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp
-    src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu src/experts/moe.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/models/qwen/qwen35/attention.cu
-    src/spec/dflash.cu src/vision/vision.cpp src/vision/vision.cu
+  target_sources(tqllm PRIVATE ${TQLLM_ENGINE_SOURCES} src/backends/cuda/builtin_cuda.cpp
+    src/vision/vision.cpp src/vision/vision.cu
     src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu)
   # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
   # weights through MappedGguf, which moves here from the per-tool source lists (tqserve, tqfn-stage).
@@ -690,9 +700,11 @@ endif()
 if(TQLLM_HIP AND BUILD_TESTING)
   # Device tests in scope for the AMD backend. They are added after the CUDA block so the GPU label
   # logic below sees them; each is compiled as HIP against the shim and the real RDNA3 kernels.
+  # ${TQLLM_ENGINE_TESTS_SYNTHETIC} carries the architecture invariants (tests/tree.cu: every tree node must give
+  # bit for bit what its root-to-node path gives as a chain) - a backend that cannot pass these is not supported.
   set(TQLLM_HIP_DEVICE_TESTS format_contract kernels tq_gemm tq3_rows moe_device dflash graph_capture
       kv_mem_count kv_host fp_formats quant matvec_wide kv_turbo_group kv_tcq dflash_retrieve
-      )
+      ${TQLLM_ENGINE_TESTS_SYNTHETIC})
   foreach(t ${TQLLM_HIP_DEVICE_TESTS})
     set(tq_test_src ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cu)
     add_executable(test-${t} ${tq_test_src})
@@ -701,6 +713,13 @@ if(TQLLM_HIP AND BUILD_TESTING)
                                    ${TQLLM_HIP_SHIM})
     target_link_libraries(test-${t} PRIVATE tqllm hip::host hip::device)
     add_test(NAME ${t} COMMAND test-${t})
+  endforeach()
+  # the manual exactness gates: greedy output must equal plain decoding with the drafter on (one attention arithmetic).
+  # Same target names as the CUDA block, so a backend run is the same commands.
+  foreach(t ${TQLLM_ENGINE_TESTS_MANUAL})
+    add_executable(test-${t} ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)
+    target_include_directories(test-${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${TQLLM_HIP_SHIM})
+    target_link_libraries(test-${t} PRIVATE tqllm hip::host hip::device)
   endforeach()
 endif()
 get_property(tqllm_gpu_tests DIRECTORY PROPERTY TESTS)

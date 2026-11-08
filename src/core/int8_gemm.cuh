@@ -11,6 +11,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -19,20 +21,28 @@
 namespace tqllm_cuda {
 
 #if defined(TQLLM_WITH_HIP)
-// AMD/HIP: the INT8 prefill GEMM is a cuBLASLt IMMA feature (sm_80+) and is not part of this build.
-// supported() is false so the engine never creates one; BF16 prefill (hipBLAS) runs instead.
-inline void int8_quant_rows(const __half *, int, int, int, int8_t *, float *, cudaStream_t) {}
-inline void int8_i32_to_bf16_scaled(const int32_t *, __nv_bfloat16 *, int, int, const float *, const float *, cudaStream_t) {}
-inline void int8_i32_to_h_scaled(const int32_t *, __half *, int, int, const float *, const float *, cudaStream_t) {}
+// AMD/HIP: the INT8 prefill GEMM is a cuBLASLt IMMA feature (sm_80+) and is not part of this build; BF16 prefill
+// (hipBLAS) runs instead, chosen by supported() == false. These stubs exist to keep the shared forward code compiling,
+// so they must FAIL LOUDLY if a call site ever reaches one: a silent no-op here would return unscaled or unwritten
+// activations, i.e. wrong numbers with no error (AGENTS.md: "fail with a clear message, never fall back silently").
+namespace int8_hip_detail {
+[[noreturn]] inline void unavailable() {
+    throw std::runtime_error("INT8 prefill GEMM is not built on the AMD (HIP) backend: it needs cuBLASLt IMMA (sm_80+). "
+                             "The engine asks Int8Gemm::supported() and uses BF16 prefill (hipBLAS) instead.");
+}
+}  // namespace int8_hip_detail
+inline void int8_quant_rows(const __half *, int, int, int, int8_t *, float *, cudaStream_t) { int8_hip_detail::unavailable(); }
+inline void int8_i32_to_bf16_scaled(const int32_t *, __nv_bfloat16 *, int, int, const float *, const float *, cudaStream_t) { int8_hip_detail::unavailable(); }
+inline void int8_i32_to_h_scaled(const int32_t *, __half *, int, int, const float *, const float *, cudaStream_t) { int8_hip_detail::unavailable(); }
 class Int8Gemm {
 public:
     static bool supported() { return false; }
     static bool default_on() { return false; }
     void init(size_t, size_t, int, int) {}
     ~Int8Gemm() = default;
-    void quant_x(const __half *, int, int, int, cudaStream_t) {}
-    void gemm(const __half *, int, int, int, int32_t *, int, float *, cudaStream_t) {}
-    void gemm_prequant(int, int, int, int32_t *, int, cudaStream_t) {}
+    void quant_x(const __half *, int, int, int, cudaStream_t) { int8_hip_detail::unavailable(); }
+    void gemm(const __half *, int, int, int, int32_t *, int, float *, cudaStream_t) { int8_hip_detail::unavailable(); }
+    void gemm_prequant(int, int, int, int32_t *, int, cudaStream_t) { int8_hip_detail::unavailable(); }
     int8_t * w8() const { return nullptr; }
     const float * sx() const { return nullptr; }
 };

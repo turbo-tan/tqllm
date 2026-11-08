@@ -1,7 +1,9 @@
-// The engines a CUDA build serves, in match order (first match wins). Flash-Next (.tqfn) registers itself from
-// src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which only tqserve links.
-#include "../../engine/registry.hpp"
-#include "hip_engines.hpp"
+// The engines an AMD (HIP) build serves, in match order (first match wins). Flash-Next (.tqfn) registers itself from
+// src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which only tqserve links. The loaders are shared with the CUDA
+// backend (src/engine/loader_api.hpp); this file only lists engines, and src/backends/hip/unsupported_hip.cpp
+// supplies the factories the AMD kernels do not implement yet.
+#include "registry.hpp"
+#include "loader_api.hpp"
 #include "hf_folder.hpp"
 #include "nlohmann/json.hpp"
 

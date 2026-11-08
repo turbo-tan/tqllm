@@ -1,7 +1,7 @@
 // The engines a CUDA build serves, in match order (first match wins). Flash-Next (.tqfn) registers itself from
 // src/models/qwen/qwen4exp/tqserve_flashnext.cpp, which only tqserve links.
-#include "../../engine/registry.hpp"
-#include "cuda_engines.hpp"
+#include "registry.hpp"
+#include "loader_api.hpp"
 #include "hf_folder.hpp"
 #include "nlohmann/json.hpp"
 

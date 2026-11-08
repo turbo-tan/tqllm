@@ -20,6 +20,7 @@ bool mmq_expert_gemm(int, const uint8_t *, const void *, bool, int, int, const i
 }  // namespace tqllm_cuda
 
 #include "engine.hpp"
+#include "gguf.hpp"
 
 #include <stdexcept>
 
@@ -51,25 +52,21 @@ void mm_scatter(__nv_bfloat16 *, const int *, int, const __nv_bfloat16 *, int, c
     hip_unsupported("multimodal image-token scatter");
 }
 
-void vis_f32_to_h(const float * x, __half * y, int64_t n, cudaStream_t) {
-    // Host-side fallback: Flash-Next is not runnable on this backend, but the symbol must exist.
-    // A real HIP kernel would go here if Flash-Next gets ported.
-    std::vector<float> buf(n);
-    cudaError_t e = cudaMemcpy(buf.data(), x, n * sizeof(float), cudaMemcpyDeviceToHost);
-    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
-    std::vector<__half> h(n);
-    for (int64_t i = 0; i < n; ++i) h[i] = __float2half(buf[i]);
-    e = cudaMemcpy(y, h.data(), n * sizeof(__half), cudaMemcpyHostToDevice);
-    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+void vis_f32_to_h(const float *, __half *, int64_t, cudaStream_t) {
+    throw std::runtime_error("vision input is not supported by the AMD (HIP) backend yet: --mmproj needs the CUDA build");
 }
 
 }  // namespace tqllm_cuda
 
-// The GLM-5next and MiniMax-M3 engines are not part of the AMD build in this PR: the server still probes
-// model files, and a file for one of them gets a clear error instead of a missing symbol.
+// The GLM-5next and MiniMax-M3 engines are not part of the AMD build in this PR. The *detection* is host-only GGUF
+// metadata (src/core/gguf.cpp), so it stays exact here: a file for one of them must be recognised and refused by name,
+// not fall through to the qwen35 loader (which would report a confusing tensor error instead of the truth).
 namespace tqllm {
-bool is_glm5next_gguf(const std::string &) { return false; }
-bool is_minimax_gguf(const std::string &) { return false; }
+bool is_glm5next_gguf(const std::string & path) {
+    const std::string a = gguf_architecture(path);
+    return a == "glm5-next" || a == "glm5next";
+}
+bool is_minimax_gguf(const std::string & path) { return gguf_architecture(path) == "minimax-m3"; }
 std::unique_ptr<Engine> make_glm5next_engine(const std::string &, uint32_t) {
     throw std::runtime_error("GLM-5next is not supported by the AMD (HIP) backend yet");
 }

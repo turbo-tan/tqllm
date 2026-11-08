@@ -16,7 +16,8 @@ from repo_files import repo_files  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 ALLOW = REPO / "tests" / "layering_allowlist.txt"
 SRC_EXT = (".cpp", ".cu", ".cuh", ".hpp", ".h", ".inc")
-INTERFACE = {"src/engine/engine.hpp", "src/engine/registry.hpp"}  # the interface every engine implements and registers through: it sits with core
+INTERFACE = {"src/engine/engine.hpp", "src/engine/registry.hpp",
+             "src/engine/loader_api.hpp"}  # the interface every engine implements, registers and is loaded through: it sits with core
 
 
 def layer(path):

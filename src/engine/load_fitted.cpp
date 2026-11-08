@@ -1,11 +1,12 @@
-// The memory fit for the qwen35 GGUF engine (see load_fitted in cuda_engines.hpp).
+// The memory fit for the qwen35 GGUF engine. Compiled by both GPU backends: nothing here is platform specific
+// (the device calls go through the shim on AMD), so the fit has one implementation and one set of tests.
 #include "dev_alloc.cuh"
 #include "tqllm/model.hpp"
 #include "debug.hpp"
-#include "../../engine/fit_context.hpp"
+#include "fit_context.hpp"
 #include "dev_alloc.cuh"
 #include "qwen2_kernels.cuh"
-#include "hip_engines.hpp"
+#include "loader_api.hpp"
 #include "nlohmann/json.hpp"
 #include "gguf.hpp"
 #include "hf_folder.hpp"
@@ -59,10 +60,20 @@ std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::st
     if (wsl && opt.fit)
         std::fprintf(stderr, "tqllm: fit: WSL - judging free memory by the engine's own allocations (%.2f GB in use before load)\n",
                      double(used_before) / 1e9);
+    static const bool integrated = [] { int dev = 0, v = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, dev); return v != 0; }();
     auto measure = [&](size_t & fr, size_t & tot) {
         size_t df = 0;
         if (cudaMemGetInfo(&df, &tot) != cudaSuccess) return false;
         fr = fit_free(wsl, df, tot, used_before, tqllm_cuda::dev_bytes());
+        if (integrated) {  // unified memory: the page cache the OS reclaims on demand is free for the device too
+            size_t avail = 0, mfree = 0;
+            std::ifstream mi("/proc/meminfo");
+            for (std::string k; mi >> k;) {
+                size_t v = 0; std::string unit; mi >> v >> unit;
+                if (k == "MemAvailable:") avail = v << 10; else if (k == "MemFree:") mfree = v << 10;
+            }
+            fr = tqllm::unified_free(fr, tot, avail, mfree);
+        }
         if (tqllm::debug_on("memlog"))
             std::fprintf(stderr, "tqllm: fit measure: engine %.2f GB, driver free %.2f GB, total %.2f GB, before %.2f GB -> free %.2f GB\n",
                          double(tqllm_cuda::dev_bytes()) / 1e9, double(df) / 1e9, double(tot) / 1e9, double(used_before) / 1e9,

@@ -12,6 +12,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -20,13 +22,20 @@
 namespace tqllm_cuda {
 
 #if defined(TQLLM_WITH_HIP)
-// AMD/HIP: the FP8 prefill GEMM is a cuBLASLt (sm_89+) feature and is not part of this build. The
-// engine asks supported() before creating one, so these inline no-ops are never executed; they keep
-// the shared forward code compiling and the library linkable. BF16 prefill (hipBLAS) runs instead.
-inline void fp8_quant_rows(const __half *, int, int, int, uint8_t *, float *, cudaStream_t) {}
-inline void fp8_scale_out(__half *, int, int, int, const float *, const float *, float, cudaStream_t) {}
+// AMD/HIP: the FP8 prefill GEMM is a cuBLASLt (sm_89+) feature and is not part of this build; BF16 prefill (hipBLAS)
+// runs instead, chosen by supported() == false. The stubs keep the shared forward code compiling, so they must FAIL
+// LOUDLY if a call site ever reaches one: fp8_scale_out as a no-op would return unscaled output, i.e. wrong numbers
+// with no error (AGENTS.md: "fail with a clear message, never fall back silently").
+namespace fp8_hip_detail {
+[[noreturn]] inline void unavailable() {
+    throw std::runtime_error("FP8 prefill GEMM is not built on the AMD (HIP) backend: it needs cuBLASLt FP8 (sm_89+). "
+                             "The engine asks Fp8Gemm::supported() and uses BF16 prefill (hipBLAS) instead.");
+}
+}  // namespace fp8_hip_detail
+inline void fp8_quant_rows(const __half *, int, int, int, uint8_t *, float *, cudaStream_t) { fp8_hip_detail::unavailable(); }
+inline void fp8_scale_out(__half *, int, int, int, const float *, const float *, float, cudaStream_t) { fp8_hip_detail::unavailable(); }
 inline void fp8_h_to_bf16_scaled(const __half *, __nv_bfloat16 *, int, int, const float *, const float *, float,
-                                 cudaStream_t) {}
+                                 cudaStream_t) { fp8_hip_detail::unavailable(); }
 class Fp8Gemm {
 public:
     static constexpr float kMul = 448.f * 448.f;
@@ -34,10 +43,10 @@ public:
     static bool default_on() { return false; }
     void init(size_t, size_t, int, int, size_t = 0) {}
     ~Fp8Gemm() = default;
-    void run(const __half *, int, int, const __half *, int, int, __half *, int, cudaStream_t) {}
-    void quant_x(const __half *, int, int, int, cudaStream_t) {}
+    void run(const __half *, int, int, const __half *, int, int, __half *, int, cudaStream_t) { fp8_hip_detail::unavailable(); }
+    void quant_x(const __half *, int, int, int, cudaStream_t) { fp8_hip_detail::unavailable(); }
     bool cached(const void *) const { return false; }
-    void gemm(const void *, const __half *, int, int, int, __half *, int, float *, cudaStream_t) {}
+    void gemm(const void *, const __half *, int, int, int, __half *, int, float *, cudaStream_t) { fp8_hip_detail::unavailable(); }
     const float * sx() const { return nullptr; }
     size_t resident_used() const { return 0; }
 };
