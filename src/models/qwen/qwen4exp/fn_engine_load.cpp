@@ -27,7 +27,6 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // lift_layer_floor, memory_plan.hpp request_shrink_bytes); 3090 np 10 / 12 exact, all texts == np 1 (11-05)
     require(nslots <= 16, "Flash-Next serves up to --np 16");
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
-    std::fflush(stderr);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
     bool slots_given = false;

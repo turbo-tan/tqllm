@@ -307,7 +307,7 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
         }
         t.type_header_offset = uint64_t(r.in.tellg());
         t.type = r.get<uint32_t>();
-        if (t.type == 42) t.type = GGML_GSQ_Q2_0;  // Flash-Next dialect: external id 42 -> GSQ_Q2_0
+        if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
         t.offset = r.get<uint64_t>();
         if (t.type == GGML_X3) {  // self-describing X3Record groups (the K can differ per expert): size from x3.bytes.<name>
             t.bytes = uint64_t(f.num("x3.bytes." + name, 0));

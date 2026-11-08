@@ -3,7 +3,6 @@
 // off (Flash-Next QSA KV, vision/multimodal input); nothing here silently changes results.
 #include "kv_qsa.cuh"
 #include "vision_kernels.cuh"
-#include "kv_qsa.cuh"
 #include <cuda_runtime.h>
 
 // MMQ expert GEMM is CUDA-only (third-party ggml_mmq). On HIP, mmq_supports returns false so the
