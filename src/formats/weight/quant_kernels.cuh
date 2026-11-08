@@ -77,6 +77,7 @@ void tq3_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
 // y[k] = dequant(W[row]) as BF16 (embedding lookup from a Q6_K table).
 void q6k_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
 void iq3s_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
+void iq4xs_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t);
 // Q6_K: y[n][r] = sum_k W[r][k] x[n][k]; x FP32 [n][k]; y FP32 (used for the LM head -> logits).
 void q6k_matvec(const void * w, const float * x, float * y, int rows, int k, int ncols, cudaStream_t);
 // ---- int8 fast path (single column) ----
@@ -259,6 +260,7 @@ void tq4_sigmoid_gate_rot_h(__nv_bfloat16 * o, const __nv_bfloat16 * qg0, int ts
 void tq4_norm_rotate_h(const __nv_bfloat16 * x, const float * w, const float * partial, float eps, __half * xh, int k,
                        int ncols, cudaStream_t);
 void embed_multi_q8_0(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
+void embed_multi_iq4xs(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void embed_multi_bf16(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);  // rows as stored (exl3 folders)
 void embed_multi_q4k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);
 void embed_multi_q3k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t);

@@ -515,6 +515,38 @@ void iq3s_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t s)
     iq3s_row_k<<<(k + 255) / 256, 256, 0, s>>>(static_cast<const uint8_t *>(w), row, y, k);
 }
 
+// One thread per element of one IQ4_XS row (raw GGUF layout: 136 bytes per 256 weights), for token-embedding
+// lookups of llama.cpp IQ4_XS GGUFs. Block: d(FP16,0:2) | scales_h(u16,2:4) | scales_l[4](4:8) | qs[128](8:136).
+// Mirrors dequantize_host iq4xs (formats/weight/dequant.cpp): element e of sub-block ib = e / 32 is
+// d * (ls - 32) * kvalues_iq4nl[nibble], low nibble of qs[16 * ib + e % 16] for e % 32 < 16, high nibble otherwise.
+// Dual-mode like iq3s_row_k: dtok == nullptr -> single row; else multi-token, blockIdx.y selects the token.
+__constant__ int8_t iq4xs_embed_kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+__global__ void iq4xs_row_k(const uint8_t * w, int row, __nv_bfloat16 * y, int k, const uint32_t * dtok = nullptr) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    if (dtok) {
+        row = int(dtok[blockIdx.y]);
+        y += int64_t(blockIdx.y) * k;
+    }
+    const int nblk = k / 256;
+    const int b = i / 256, e = i % 256, ib = e / 32, l = e % 32;
+    const uint8_t * blk = w + (int64_t(row) * nblk + b) * 136;  // 136 % 2 == 0: the FP16 / u16 loads below are aligned
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk));
+    const uint32_t sh = uint32_t(blk[2]) | (uint32_t(blk[3]) << 8);
+    const int ls = ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | int(((sh >> (2 * ib)) & 3u) << 4);
+    const uint8_t q = blk[8 + ib * 16 + (l % 16)];
+    const int nib = l < 16 ? (q & 0xf) : (q >> 4);
+    y[i] = __float2bfloat16_rn(d * float(ls - 32) * float(iq4xs_embed_kv[nib]));
+}
+
+void iq4xs_row(const void * w, int row, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    iq4xs_row_k<<<(k + 255) / 256, 256, 0, s>>>(static_cast<const uint8_t *>(w), row, y, k);
+}
+
+void embed_multi_iq4xs(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
+    iq4xs_row_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), 0, y, k, dtok);
+}
+
 void tq3_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t s) {
     const int blocks = k / 32 * ncols;
     tq3_rotate_h_k<<<(blocks * 32 + 255) / 256, 256, 0, s>>>(x, xh, blocks);

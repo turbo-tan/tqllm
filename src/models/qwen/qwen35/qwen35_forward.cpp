@@ -60,6 +60,7 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::tq3_row(embed.p, int(id), xp, H, stream);
     else if (embed.type == GGML_Q6_K) tqllm_cuda::q6k_row(embed.p, int(id), xp, H, stream);
     else if (embed.type == GGML_IQ3_S) tqllm_cuda::iq3s_row(embed.p, int(id), xp, H, stream);
+    else if (embed.type == GGML_IQ4_XS) tqllm_cuda::iq4xs_row(embed.p, int(id), xp, H, stream);
     else tqllm_cuda::gather(static_cast<const bf16 *>(embed.p), xp, int(id), H, stream);
     if (quantized) tqllm_cuda::sumsq(xp, part_x.as<float>(), H, stream);
     uint32_t attn_i = 0, lin_i = 0;
@@ -1067,9 +1068,10 @@ void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     else if (embed.type == GGML_Q4_K) tqllm_cuda::embed_multi_q4k(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_Q3_K) tqllm_cuda::embed_multi_q3k(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_IQ3_S) tqllm_cuda::embed_multi_iq3s(embed.p, dtok, n, Y, H, stream);
+    else if (embed.type == GGML_IQ4_XS) tqllm_cuda::embed_multi_iq4xs(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_Q5_K) tqllm_cuda::embed_multi_q5k(embed.p, dtok, n, Y, H, stream);
     else if (embed.type == GGML_BF16) tqllm_cuda::embed_multi_bf16(embed.p, dtok, n, Y, H, stream);
-    else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K, Q3_K, Q5_K, IQ3_S or BF16 embedding table");
+    else throw std::runtime_error("multi-token path needs a TQ3_4S, Q6_K, Q8_0, Q4_K, Q3_K, Q5_K, IQ3_S, IQ4_XS or BF16 embedding table");
 }
 
 void Qwen35Engine::capture_feature(uint32_t l, const bf16 * x, bf16 * feats, int n) {

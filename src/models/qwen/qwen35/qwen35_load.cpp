@@ -1,5 +1,7 @@
 // qwen35 engine: loading and allocation. The class is declared in qwen35_engine.hpp.
 #include "qwen35_engine.hpp"
+#include <cstdio>
+#include <cstring>
 
 namespace tqllm {
 namespace qwen35_detail {
@@ -50,7 +52,39 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     const int H = int(cfg.hidden), F = int(cfg.ffn), hd = int(cfg.head_dim);
     const int lk = int(cfg.lin_kheads * cfg.lin_dk), lv = int(cfg.lin_vheads * cfg.lin_dv);
     const int vh = int(cfg.lin_vheads), qkvd = 2 * lk + lv;
-    embed = g_mat(f, "token_embd.weight", int(cfg.vocab), H, false);
+    {
+        // Token-embedding lookups have kernels for TQ3_4S / Q6_K / Q8_0 / Q4_K / Q3_K / Q5_K / IQ3_S / IQ4_XS / BF16.
+        // Any other GGUF type is dequantized on the host to BF16 once at load;
+        // the BF16 table works on both the single-token (gather) and multi-token paths and can go to host memory.
+        const auto & et = gt(f, "token_embd.weight");
+        const auto ty = et.type;
+        const bool lookup_ok = ty == GGML_TQ3_4S || ty == GGML_Q6_K || ty == GGML_Q8_0 || ty == GGML_Q4_K ||
+                               ty == GGML_Q3_K || ty == GGML_Q5_K || ty == GGML_IQ3_S || ty == GGML_BF16 ||
+                               ty == GGML_F32 || ty == GGML_F16;
+        if (lookup_ok) embed = g_mat(f, "token_embd.weight", int(cfg.vocab), H, false);
+        else if (ty == GGML_IQ4_XS && !cfg.tied) {
+            // raw IQ4_XS rows, read by iq4xs_row / embed_multi_iq4xs (no conversion, same size as on disk)
+            if (et.ne.size() != 2 || et.ne[0] != uint64_t(H) || et.ne[1] != uint64_t(cfg.vocab) || H % 256)
+                throw std::runtime_error("unexpected shape for token_embd.weight");
+            const auto raw = f.read(et);
+            embed = {put(raw.data(), raw.size()), GGML_IQ4_XS, int(cfg.vocab), H};
+        } else {
+            if (et.ne.size() != 2 || et.ne[0] != uint64_t(H) || et.ne[1] != uint64_t(cfg.vocab))
+                throw std::runtime_error("unexpected shape for token_embd.weight");
+            const auto raw = f.read(et);
+            const int64_t n = int64_t(cfg.vocab) * H;
+            std::vector<float> emb_f32(static_cast<size_t>(n));
+            dequantize_host(ty, raw.data(), emb_f32.data(), n);
+            std::vector<char> b(size_t(n) * 2);
+            for (int64_t i = 0; i < n; ++i) {
+                const __nv_bfloat16 v = __float2bfloat16_rn(emb_f32[size_t(i)]);
+                std::memcpy(b.data() + 2 * i, &v, 2);
+            }
+            std::fprintf(stderr, "tqserve: token_embd.weight type %u has no lookup kernel; dequantized to BF16 (%.2f GB)\n",
+                         unsigned(ty), double(b.size()) / 1e9);
+            embed = {put(b.data(), b.size()), GGML_BF16, int(cfg.vocab), H};
+        }
+    }
     out_norm = g_f32(f, "output_norm.weight", H);
     const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
     lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
@@ -489,6 +523,8 @@ void Qwen35Engine::allocate() {
         else if (embed.type == GGML_Q3_K) bytes = n / 256 * 110;
         else if (embed.type == GGML_Q5_K) bytes = n / 256 * 176;
         else if (embed.type == GGML_IQ3_S) bytes = n / 256 * 110;
+        else if (embed.type == GGML_BF16) bytes = n * 2;
+        else if (embed.type == GGML_IQ4_XS) bytes = n / 256 * 136;
         if (bytes) {
             const void * old = embed.p;
             embed.p = const_cast<void *>(to_mapped_host(old, bytes));
