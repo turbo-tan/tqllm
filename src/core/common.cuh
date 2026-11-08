@@ -26,8 +26,11 @@ __device__ __forceinline__ __half2 u2h(uint32_t x) {
     __builtin_memcpy(&h, &x, 4);
     return h;
 }
+// ext_vector_type is a typedef attribute: on a declaration clang rejects it ("only applies to typedefs"), and the
+// ROCm clang in CI is stricter here than a hand-built toolchain. Name the type once.
+typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float fdot2(uint32_t a, uint32_t b, float c) {
-    _Float16 __attribute__((ext_vector_type(2))) va, vb;
+    f16x2 va, vb;
     __builtin_memcpy(&va, &a, 4);
     __builtin_memcpy(&vb, &b, 4);
     return __builtin_amdgcn_fdot2(va, vb, c, false);
