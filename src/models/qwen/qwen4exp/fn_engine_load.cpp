@@ -27,6 +27,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // lift_layer_floor, memory_plan.hpp request_shrink_bytes); 3090 np 10 / 12 exact, all texts == np 1 (11-05)
     require(nslots <= 16, "Flash-Next serves up to --np 16");
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
+    std::fflush(stderr);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
     bool slots_given = false;
@@ -113,7 +114,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.arg_store.push_back("--mtp"); f.arg_store.push_back(f.mtp); if (f.gsq_rco) f.arg_store.push_back("--gsq-rco");
     for (auto & a : f.arg_store) f.argv.push_back(a.data());
     f.fixtures = std::make_unique<Fixtures>();
-    f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data()); f.cp->resident = true; f.cp->reclaim_expert_pages=f.cold_reclaim_hot; f.cp->run = options;
+    f.cp = std::make_unique<Checkpoint>(int(f.argv.size()), f.argv.data());
+    f.cp->resident = true; f.cp->reclaim_expert_pages=f.cold_reclaim_hot; f.cp->run = options;
     { int dev = 0, um = 0; cudaGetDevice(&dev);
       f.cp->run.unified_memory = cudaDeviceGetAttribute(&um, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && um; }
     const auto & c = f.cp->config; auto & checkpoint = *f.cp; FnConfig & run = checkpoint.run; FnRuntime & rt = checkpoint.rt;
