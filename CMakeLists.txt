@@ -66,7 +66,10 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
   # (src/backends/hip/shim/cuda_runtime.h) with the 32-bit overload set + the exact intrin semantics.
   add_compile_definitions(HIP_DISABLE_WARP_SYNC_BUILTINS=1)
   enable_language(HIP)
-  set(CMAKE_HIP_STANDARD 17)
+  # one compiler for host and device code: the ROCm compatibility headers (hip_bf16.h, hip_runtime.h) are clang
+  # only, so a HIP build cannot compile host .cpp that include them with g++ (that is what failed first in CI).
+  # C++20 matches CMAKE_CXX_STANDARD, so host code is compiled at the standard it is written for.
+  set(CMAKE_HIP_STANDARD 20)
   set(CMAKE_HIP_STANDARD_REQUIRED ON)
   # the ROCm CMake packages (hip, hipblas) ship in the rocm root's lib/cmake, not CMake's default search
   execute_process(COMMAND hipconfig --rocmpath OUTPUT_VARIABLE TQLLM_ROCM_ROOT
@@ -93,18 +96,16 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
   list(REMOVE_ITEM TQLLM_HIP_SOURCES
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv/kv_qsa.cu
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3/dispatch.cu)
-  set(TQLLM_HIP_CU_SOURCES ${TQLLM_HIP_SOURCES})
-  list(FILTER TQLLM_HIP_CU_SOURCES INCLUDE REGEX "\\.cu$")  # only device files go through hipcc
   # the AMD platform adds only its registration file and the stubs for what it does not implement; everything else is
   # the shared list above, so a new engine file is added in one place for both backends
   target_sources(tqllm PRIVATE ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES}
     src/backends/hip/builtin_hip.cpp src/backends/hip/unsupported_hip.cpp)
   target_include_directories(tqllm PRIVATE ${TQLLM_HIP_SHIM} ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
-  # tqLLM's device files are .cu on every backend: tag them for hipcc under the HIP language
-  set_source_files_properties(${TQLLM_HIP_CU_SOURCES} src/kv/kv_store_cuda.cpp src/models/qwen/qwen2/qwen2.cu
-    src/models/qwen/qwen35/qwen35.cu src/models/qwen/qwen35/attention.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/experts/moe.cu src/spec/dflash.cu
-    src/core/common_kernels.cu src/experts/moe_common.cu PROPERTIES LANGUAGE HIP)
+  # every source that sees a GPU header is compiled by hipcc, host code included (see the CMAKE_HIP_STANDARD note)
+  set(TQLLM_HIP_COMPILED ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES}
+      src/backends/hip/builtin_hip.cpp src/backends/hip/unsupported_hip.cpp)
+  set_source_files_properties(${TQLLM_HIP_COMPILED} PROPERTIES LANGUAGE HIP)
   target_link_libraries(tqllm PRIVATE hip::host hip::device hipblas)
   target_link_directories(tqllm PUBLIC ${TQLLM_ROCM_ROOT}/lib)  # hipblas exports -lhipblas; rocm lib is not a default path
   set(CUDAToolkit_INCLUDE_DIRS ${TQLLM_HIP_SHIM})  # test targets add this variable like on CUDA (session.hpp -> cuda headers)
@@ -124,7 +125,14 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
   target_include_directories(tqllm-flashnext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${TQLLM_HIP_SHIM})
   target_link_libraries(tqllm-flashnext PRIVATE tqllm hip::host hip::device)
   add_executable(tqserve tools/tqserve.cpp src/models/qwen/qwen4exp/tqserve_flashnext.cpp src/models/qwen/qwen4exp/fn_engine_load.cpp
-                 src/models/qwen/qwen4exp/fn_engine_prefill.cpp src/models/qwen/qwen4exp/fn_engine_decode.cpp $<TARGET_OBJECTS:tqllm-flashnext>)
+                 src/models/qwen/qwen4exp/fn_engine_prefill.cpp src/models/qwen/qwen4exp/fn_engine_decode.cpp
+                 $<TARGET_OBJECTS:tqllm-flashnext>)
+  # the Flash-Next sources and the server touch GPU headers too: hipcc for them, like every other GPU translation unit
+  set_source_files_properties(tools/tqserve.cpp src/models/qwen/qwen4exp/tqserve_flashnext.cpp
+      src/models/qwen/qwen4exp/fn_engine_load.cpp src/models/qwen/qwen4exp/fn_engine_prefill.cpp
+      src/models/qwen/qwen4exp/fn_engine_decode.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(src/models/qwen/qwen4exp/fn_layer_forward.cpp src/models/qwen/qwen4exp/fn_prefill.cpp
+      src/models/qwen/qwen4exp/fn_step.cpp src/models/qwen/qwen4exp/fn_mtp.cpp PROPERTIES LANGUAGE HIP)
   target_include_directories(tqserve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/hip/shim ${CMAKE_CURRENT_BINARY_DIR}/generated)
   target_link_libraries(tqserve PRIVATE tqllm tqjinja hip::host hip::device)
@@ -135,6 +143,8 @@ add_executable(tqrun tools/tqrun.cpp)
 target_link_libraries(tqrun PRIVATE tqllm)
 if(TQLLM_HIP)
   target_compile_definitions(tqrun PRIVATE TQLLM_HAS_HIP=1)
+  target_link_libraries(tqrun PRIVATE hip::host hip::device)
+  set_source_files_properties(tools/tqrun.cpp PROPERTIES LANGUAGE HIP)
 endif()
 add_executable(tqtokenize tools/tqtokenize.cpp)
 target_link_libraries(tqtokenize PRIVATE tqllm)

@@ -25,7 +25,7 @@ jobs:
   cuda-compile:
     name: cuda build (compile only, sm_86)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90   # ~390 device TUs on a 4-core runner; ccache makes re-runs cheap
     container: nvidia/cuda:13.0.0-devel-ubuntu24.04
     steps:
       - name: Build tools
@@ -51,7 +51,7 @@ jobs:
   hip-compile:
     name: hip build (compile only, gfx1100)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120  # ~390 device TUs through hipcc on a 4-core runner (no ccache on the first run)
     container:
       # pin: bump together with docs/guides/amd.md
       image: rocm/dev-ubuntu-24.04:7.1.1-complete
