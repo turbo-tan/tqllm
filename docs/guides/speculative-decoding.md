@@ -43,8 +43,12 @@ Long prompts: `--draft-retrieve 32` lets the drafter also read 32 far passages o
 31K / 40K / 51K-token prompts 158 / 143 / 137 -> 176 / 156 / 148 tok/s, short prompts -2 %). It keeps the drafter's
 cache for the whole context (about 20 KB per token), so it is off by default.
 
-No drafter file: `--mtp` drafts with the model's own prediction head (one user, greedy; same output as plain decoding):
-155 tok/s at 1.6K and 125 tok/s at 51K tokens on an RTX 3090, against 57 and 47 without drafting.
+No drafter file: `--mtp` drafts with the model's own prediction head (one user; greedy output identical to plain decoding):
+155 tok/s at 1.6K and 125 tok/s at 51K tokens on an RTX 3090, against 57 and 47 without drafting. Sampled requests
+(temperature > 0) draft too: the MTP drafts are argmax tokens, so the same speculative sampling as the DFlash2 path
+keeps exact samples of the model's distribution (`test-native-mtp` checks the token distribution against plain sampled
+decoding). RTX 3090, Qwen3.8-27B IQ4_XS GGUF, 32K context, q8_0 KV, 512-token code answer, temperature 0.7: 104-117 tok/s
+against 50 without drafting.
 
 ### Recommended settings
 
