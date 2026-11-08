@@ -137,6 +137,13 @@ component live in the same folder. Dependencies point down only, and `tests/test
     `is_<model>_gguf()` / matchers are shared, not stubbed: an engine a backend cannot run must still be *recognised*
     and refused by name, never fall through to another architecture's loader. Keep the list in
     `docs/guides/adding-a-backend.md` ("what a backend must implement") current.
+16. **Report your own mistakes, in the same message.** If you get something wrong - a push to the wrong repo, a number
+    taken from a stale tree, a claim you did not verify, an action taken in someone else's repository - say what happened,
+    what it did to shared state (what was pushed where, what was reverted, what is still dirty) and what you did about it.
+    Do not quietly re-edit and let the reader believe it never happened: silent self-correction destroys the evidence the
+    next person needs, and that is worse than the error. Unsure whether an action is allowed? Ask *before*, not after;
+    writes to a contributor's repository, force-pushes, deletes and public pushes are ask-first, always. Wording shared
+    with the fleet: `agent.md` rule 3.
 
 ## Tests a pull request must bring
 
@@ -191,6 +198,10 @@ that keep tqLLM out of it:
    that is CONFLICTING is not reviewable, and the reviewer says so instead of reading the old diff.
 6. **No long-lived platform branches.** A backend lands in one PR against `main`; further platform work is small PRs on
    top. We do not carry an "amd" branch that is rebased forever.
+7. **Prefer a branch in this repo over a fork for work we drive.** A pull request from a fork needs a maintainer to
+   approve *every* workflow run before it starts (`action_required`), and approvals do not survive a push, so the checks
+   stop being a gate and become a queue. A branch in `turbo-tan/tqllm` runs the same checks with no approval step. Fork
+   pull requests stay welcome; work that we own and keep pushing goes in-repo.
 
 ## Known exceptions
 
