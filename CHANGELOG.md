@@ -3,6 +3,20 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- `--mtp` drafts for sampled requests (temperature > 0) as well, with exact speculative sampling (the MTP drafts are
+  argmax tokens, accepted with the model's probability, else resampled). RTX 3090, Qwen3.8-27B IQ4_XS GGUF, 32K context,
+  temperature 0.7: 104-117 tok/s against 50 when sampled requests decoded without drafting.
+- llama.cpp IQ4_XS GGUFs of Qwen3.8 load: their IQ4_XS token embeddings are read in place by new `iq4xs_row` /
+  `embed_multi_iq4xs` lookups (0.67 GB, bitwise equal to the host IQ4_XS dequantiser in BF16). Any other embedding type
+  without a lookup kernel is dequantized to BF16 once at load instead of failing with "unsupported matrix type".
+
+### Fixed
+- With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
+  at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
+
 ## 1.4.4 (2026-11-07)
 
 1.4.3 was not published; 1.4.4 carries everything below.

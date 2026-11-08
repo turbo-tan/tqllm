@@ -1294,6 +1294,43 @@ int main() {
         cudaFree(yr);
         cudaFree(ye);
     }
+    {  // IQ4_XS embedding rows (llama.cpp IQ4_XS GGUFs keep token_embd in IQ4_XS): GPU iq4xs_row / embed_multi_iq4xs
+       // vs the host iq4xs reference, bitwise in bf16
+        const int qc = 1024, nr = 12;
+        int bad = 0;
+        std::vector<char> q4x(size_t(nr) * qc / 256 * 136);
+        for (size_t b = 0; b < q4x.size() / 136; ++b) {
+            for (int i = 2; i < 136; ++i) q4x[b * 136 + i] = char(byte(g));  // scales_h, scales_l, qs: every bit pattern
+            const __half d = __float2half(0.0005f * (1 + byte(g) % 40));
+            std::memcpy(q4x.data() + b * 136, &d, 2);
+        }
+        std::vector<float> r4x(size_t(nr) * qc);
+        tqllm::dequantize_host(23, q4x.data(), r4x.data(), int64_t(r4x.size()));
+        auto * d4x = dev(q4x);
+        bf16 * yr = nullptr;
+        cudaMalloc(&yr, qc * 2);
+        tqllm_cuda::iq4xs_row(d4x, 9, yr, qc, nullptr);
+        const auto hr = host(yr, qc);
+        for (int i = 0; i < qc; ++i)
+            if (__bfloat162float(hr[i]) != __bfloat162float(__float2bfloat16_rn(r4x[size_t(9) * qc + i]))) ++bad;
+        const std::vector<uint32_t> toks = {9, 0, 11, 4, 9};
+        auto * dt = dev(toks);
+        bf16 * ye = nullptr;
+        cudaMalloc(&ye, toks.size() * qc * 2);
+        tqllm_cuda::embed_multi_iq4xs(d4x, dt, int(toks.size()), ye, qc, nullptr);
+        const auto he = host(ye, toks.size() * qc);
+        for (size_t n = 0; n < toks.size(); ++n)
+            for (int i = 0; i < qc; ++i) {
+                const float want = __bfloat162float(__float2bfloat16_rn(r4x[size_t(toks[n]) * qc + i]));
+                if (__bfloat162float(he[n * qc + i]) != want) ++bad;
+            }
+        std::printf("%s iq4xs_embed (single-row + multi-token, %d failures)\n", bad ? "FAIL" : "ok  ", bad);
+        failures += bad;
+        cudaFree(d4x);
+        cudaFree(dt);
+        cudaFree(yr);
+        cudaFree(ye);
+    }
     {  // interleaved M-RoPE: t = h = w = p bitwise equal to the 1-D rotation; image positions vs a host reference
         const int n = 5, heads = 3, dim = 256, rot = 64, ts = heads * dim;
         const int3 sec = {11, 11, 10};

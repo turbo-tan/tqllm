@@ -132,6 +132,46 @@ void test_jinja_images() {
     check(!bad.ok, "jinja path refuses images outside user messages");
 }
 
+// Jinja path: the template must receive the resolved reasoning effort. A request that sets none gets the server's
+// --reasoning-effort; the request's own value (top level or chat_template_kwargs) wins, with high/max -> xhigh and
+// minimal -> low. (regression: with a Jinja template the server default never reached the template, so its own default,
+// xhigh, ran for every request without an effort although tqserve was started with --reasoning-effort medium)
+void test_jinja_reasoning_effort() {
+    std::string seen;
+    const tqserve::PromptRenderer stub = [&seen](const tqllm::Json &, const tqllm::Json *, const tqllm::Json & kw) {
+        const auto * e = kw.get("reasoning_effort");
+        seen = e && e->kind == tqllm::Json::String ? e->str : "<unset>";
+        return std::string("<|im_start|>assistant\n");
+    };
+    auto effort_for = [&](const std::string & body, const std::string & server_default) {
+        seen.clear();
+        const auto r = tqserve::parse_request(body, 512, "", true, true, server_default, &stub);
+        check(r.ok, "jinja effort request parses: " + r.error);
+        return seen;
+    };
+    const std::string plain = R"({"messages":[{"role":"user","content":"Hi"}]})";
+    check(effort_for(plain, "medium") == "medium", "jinja: server --reasoning-effort medium reaches the template");
+    check(effort_for(plain, "low") == "low", "jinja: server --reasoning-effort low reaches the template");
+    check(effort_for(R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"xhigh"})", "medium") == "xhigh",
+          "jinja: top-level request effort overrides the server default");
+    check(effort_for(R"({"messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"reasoning_effort":"low"}})",
+                     "medium") == "low",
+          "jinja: chat_template_kwargs effort overrides the server default");
+    check(effort_for(R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"high"})", "medium") == "xhigh",
+          "jinja: high maps to xhigh for the template");
+    // server --chat-template-kwargs '{"reasoning_effort":...}' still beats --reasoning-effort, and the request beats both
+    const tqllm::Json server_kw = tqllm::parse_json(R"({"reasoning_effort":"low"})");
+    auto effort_kw = [&](const std::string & body) {
+        seen.clear();
+        const auto r = tqserve::parse_request(body, 512, "", true, true, "medium", &stub, &server_kw);
+        check(r.ok, "jinja effort request parses: " + r.error);
+        return seen;
+    };
+    check(effort_kw(plain) == "low", "jinja: server chat_template_kwargs effort beats --reasoning-effort");
+    check(effort_kw(R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"xhigh"})") == "xhigh",
+          "jinja: request effort beats the server chat_template_kwargs");
+}
+
 void test_default_max_tokens() {
     const auto none = tqserve::parse_request(R"({"messages":[{"role":"user","content":"Hi"}]})", 8192, "", true);
     check(none.ok && none.max_tokens == 8192, "a request without max_tokens gets the server default (--max-tokens)");
@@ -298,6 +338,7 @@ int main(int argc, char ** argv) {
     test_tool_stream_limit();
     (void) argc; (void) argv;
     test_jinja_images();
+    test_jinja_reasoning_effort();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
     test_jinja_images();
     std::cout << "PASS\n";

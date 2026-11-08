@@ -330,7 +330,21 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                     for (const auto & [k, v] : default_kwargs->obj) put(k, v);
                 if (const auto * rk = root.get("chat_template_kwargs"); rk && rk->kind == tqllm::Json::Object)
                     for (const auto & [k, v] : rk->obj) put(k, v);
-                if (const auto * e = root.get("reasoning_effort"); e && e->kind == tqllm::Json::String) put("reasoning_effort", *e);
+                // the resolved effort (minimal/high/max mapped as above): the request's (top level or kwargs) first, then
+                // the server's --chat-template-kwargs, then --reasoning-effort. Without the last step the template's own
+                // default (xhigh) won whenever neither the request nor the server kwargs set one, ignoring
+                // --reasoning-effort.
+                const auto * rkw = root.get("chat_template_kwargs");
+                const bool request_effort = root.get("reasoning_effort") ||
+                                            (rkw && rkw->kind == tqllm::Json::Object && rkw->get("reasoning_effort"));
+                const bool server_kwargs_effort = default_kwargs && default_kwargs->kind == tqllm::Json::Object &&
+                                                  default_kwargs->get("reasoning_effort");
+                if (request_effort || !server_kwargs_effort) {
+                    tqllm::Json ev;
+                    ev.kind = tqllm::Json::String;
+                    ev.str = effort;
+                    put("reasoning_effort", ev);
+                }
                 tqllm::Json th;
                 th.kind = tqllm::Json::Bool;
                 th.num = req.thinking ? 1 : 0;
