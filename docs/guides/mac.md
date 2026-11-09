@@ -113,5 +113,16 @@ Decode tokens per second, one request, greedy, 256 output tokens after long-docu
 Every tqLLM text equals plain one-token-at-a-time decoding (`--exact on`). The QSA file (`Qwen3.8-27B-MLX-4bit-QSA.gguf`)
 reads only the 2,048 keys its indexers pick once a step is past 48K keys (`--qsa-from`), which changes the text.
 
+Prompt (prefill) tokens per second, 1.5.0, M5 Pro 48 GB, Qwen3.8-27B TQ_L-QSA: long prompts run part of every FFN on the
+Neural Engine beside the GPU (planned from costs measured once per Mac and cached; nothing to set).
+
+| Prompt | 8K | 16K | 32K |
+|---|---|---|---|
+| tqLLM 1.5.0 | **685-704** | **659-671** | **598-605** |
+| tqLLM 1.4.4 | 477-484 | 456-460 | 429-430 |
+
+Outputs stay exact (server == plain decoding); the split changes numbers slightly (KL 0.006 at 16K against the GPU-only
+prompt), so a text can differ from 1.4.4. A Mac without a Neural Engine runs prompts on the GPU alone.
+
 Short prompts are mixed: tqLLM leads on some (99.6 vs TensorFold 91.1 on a 2K document) and trails on others (80.6 vs
 97.0 on a chat prompt); see [Benchmarks](../BENCHMARKS.md).
