@@ -76,10 +76,10 @@ jobs:
         # the device layer assumes wave32 (rule 13); a CDNA arch must fail here, not miscompile
         run: |
           if cmake -S . -B build-hip-w64 -G Ninja -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON \
-               -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake > w64.log 2>&1; then
+               -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake > "$RUNNER_TEMP/w64.log" 2>&1; then
             echo "gfx90a configured but must be refused"; exit 1
           fi
-          grep -q "wave32" w64.log
+          grep -q "wave32" "$RUNNER_TEMP/w64.log"
           rm -rf build-hip-w64
       - name: Configure
         # explicit archs: `native` needs a GPU to resolve, and this runner has none. Two archs (RDNA3 + RDNA4)
