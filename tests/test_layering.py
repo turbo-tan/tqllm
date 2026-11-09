@@ -96,6 +96,20 @@ class Layering(unittest.TestCase):
                          "\n".join("  %s -> %s" % p for p in stale))
 
 
+class BackendNames(unittest.TestCase):
+    def test_no_backend_name_in_models_or_components(self):
+        """AGENTS.md rule 13: models and components branch on capabilities (common.cuh's TQLLM_DEV_*, backend_caps.hpp,
+        the *_compat.hpp helpers), never on TQLLM_WITH_<backend>. The backend is chosen in src/backends/ and src/core only,
+        so a new backend adds a folder and touches no model or component."""
+        hits = []
+        for f in repo_files(REPO):
+            if f.startswith(("src/models/", "src/formats/", "src/kv/", "src/experts/", "src/spec/", "src/vision/")) and f.endswith(SRC_EXT):
+                for n, line in enumerate((REPO / f).read_text(errors="replace").splitlines(), 1):
+                    if re.search(r"\bTQLLM_WITH_[A-Z]+", line):
+                        hits.append("%s:%d: %s" % (f, n, line.strip()))
+        self.assertEqual(hits, [], "backend names in models / components:\n" + "\n".join(hits))
+
+
 class UniqueHeaders(unittest.TestCase):
     def test_header_names_unique(self):
         """Includes name the file only (AGENTS.md rule 8), so two headers with one name make an include resolve to

@@ -3,7 +3,7 @@
 // in shared memory (double-buffered on CUDA; single-buffered on HIP, where the dynamic shared memory limit is 64 KB and
 // cp_async16 is a plain synchronous copy), S, P (BF16) and O in registers.
 namespace fab {
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
 constexpr int NW = 2, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8, NB = 1;
 #else
 constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8, NB = 2;
@@ -42,7 +42,7 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
         }
         cp_commit();
     };
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     if (ntile > 0) stage(0, 0);
 #else
     if (ntile > 0) stage(0, 0);
@@ -64,7 +64,7 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
     const __nv_bfloat16 * qrow = qs + (warp * 16 + (lane % 8) + ((lane / 8) & 1) * 8) * LS + (lane / 16) * 8;
 
     for (int u = 0; u < ntile; ++u) {
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         const int buf = 0, t0 = u * TILE;
         __syncthreads();  // the staged tile is ready and the previous tile's reads are done
 #else
@@ -134,7 +134,7 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
                 mma_bf16(o[2 * np], pf[kk][0], pf[kk][1], pf[kk][2], pf[kk][3], vb[0], vb[1]);
                 mma_bf16(o[2 * np + 1], pf[kk][0], pf[kk][1], pf[kk][2], pf[kk][3], vb[2], vb[3]);
             }
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         if (u + 1 < ntile) {  // single buffer: refill only after every warp has finished reading this tile
             __syncthreads();
             stage(0, t0 + TILE);
@@ -235,7 +235,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
     if (h <= 0 || kh <= 0 || h % kh || h / kh > MQ_MAXROWS || nq <= 0)
         throw std::invalid_argument("attention_mq256: invalid head or query count");
     constexpr int DIM = 256, KS = DIM + 8;
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     // one BF16 K and one BF16 V tile (no double buffering; Q8/Q8V records are decoded straight from global)
     const size_t smem = (size_t(MQ_MAXROWS) + 2 * size_t(MQ_TILE)) * KS * 2 +
                         size_t(MQ_MAXROWS) * (MQ_TILE + 4) * 4;
@@ -258,7 +258,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
         const int qmax = MQ_MAXROWS / (h / kh);  // queries per tiled launch; each query's rows are independent
         for (int z0 = 0; z0 < nq; z0 += qmax) {
             const int nz = std::min(qmax, nq - z0);
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
             const int qbase = z0;  // dep == null is a chain: carry the chunk offset instead of node depths
 #else
             if (dep == nullptr && z0) throw std::invalid_argument("tree attention: > 8 queries need node depths");
@@ -266,7 +266,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
             attn_mq_k<DIM, Q8, TURBO3V><<<dim3(kh, nsplit), DIM, smem, s>>>(
                 q + int64_t(z0) * h * DIM, kc, vc, ksc, vsc, part + int64_t(z0) * h * (nsplit + 1) * (DIM + 2), dseq0, nz, h,
                 kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
                 , qbase
 #endif
                 );

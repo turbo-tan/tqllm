@@ -1136,11 +1136,6 @@ private:
 
 }  // namespace
 
-bool is_glm5next_gguf(const std::string & path) {
-    const std::string a = gguf_architecture(path);
-    return a == "glm5-next" || a == "glm5next";
-}
-
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context) {
     return std::make_unique<Glm5NextEngine>(path, context);
 }

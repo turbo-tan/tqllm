@@ -28,7 +28,7 @@ constexpr uint32_t LUT_LO = 0xF0D1AE81u, LUT_HI = 0x7F512E0Fu;  // bytes: -127 -
 // 1 = single buffered (45.5 KB at NW 4, so two blocks share an SM and hide each other's latency).
 // RDNA3 allows 64 KB of dynamic shared memory per workgroup: NW 8 with NB 2 needs ~87 KB there, so HIP single-buffers
 // (61 KB) and stages the next tile into registers before the barrier instead. CUDA keeps the double buffer.
-#if defined(TQLLM_WITH_HIP)
+#if !TQLLM_DEV_CP_ASYNC  // no async copies: one tile buffer
 constexpr int TQ3_NB = 1;
 #else
 constexpr int TQ3_NB = 2;
@@ -990,15 +990,7 @@ __global__ void cache_write_multi_tq2v_v(const __nv_bfloat16 * x0, int ts, Tq2V2
     const uint32_t code = r < -0.9816f ? 0u : r < 0.f ? 1u : r < 0.9816f ? 2u : 3u;
     Tq2V256 * rec = c + int64_t(*dpos0 + tkn) * kvheads + kh;
     const int word = lane / 16, shift = (lane % 16) * 2;
-#if defined(TQLLM_WITH_HIP)
-    // HIP: reduce within each 16-lane half directly (the record packs two halves per word).
-    uint32_t packed = code << shift;
-#pragma unroll
-    for (int o = 8; o; o >>= 1) packed |= __shfl_xor_sync(0xffffffffu, packed, o, 16);
-#else
-    const unsigned mask = lane < 16 ? 0x0000ffffu : 0xffff0000u;
-    const uint32_t packed = __reduce_or_sync(mask, code << shift);
-#endif
+    const uint32_t packed = tqllm_dev::or_half16(code << shift);  // each 16-lane half packs one word
     if ((lane & 15) == 0) rec->w[2 * blk + word] = packed;
     if (lane == 0) rec->rms[blk] = rh;
 }

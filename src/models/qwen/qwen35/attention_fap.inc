@@ -4,7 +4,7 @@
 // double-buffered on CUDA and single-buffered on HIP (64 KB dynamic shared memory limit). Each warp keeps S, P and O for
 // its 16 rows in registers.
 namespace fap {
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
 constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8, NB = 1;
 #else
 constexpr int NW = 8, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8, NB = 2;
@@ -143,7 +143,7 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
         }
     };
 
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     if (ntile > 0) {
         load(0);
         store(0);
@@ -168,7 +168,7 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
     const int8_t * qrow = q8 + (warp * 16 + (lane % 8) + ((lane / 8) & 1) * 8) * QS + (lane / 16) * 16;
 
     for (int u = 0; u < ntile; ++u) {
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         const int buf = 0, t0 = u * TILE;
         __syncthreads();  // the staged tile is ready and every warp finished reading the previous one
 #else
@@ -257,7 +257,7 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
                 o[2 * np + n][0] += lo.x, o[2 * np + n][1] += lo.y, o[2 * np + n][2] += hi.x, o[2 * np + n][3] += hi.y;
             }
         }
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         if (u + 1 < ntile) {  // single buffer: refill only after every warp has finished reading this tile
             __syncthreads();
             load(t0 + TILE);

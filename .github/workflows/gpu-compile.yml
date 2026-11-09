@@ -49,7 +49,7 @@ jobs:
         run: cmake --build build -j 4 --target test-tree test-dflash-exact test-native-mtp tqserve
 
   hip-compile:
-    name: hip build (compile only, gfx1100)
+    name: hip build (compile only, gfx1100 + gfx1201)
     runs-on: ubuntu-24.04
     timeout-minutes: 120  # ~390 device TUs through hipcc on a 4-core runner (no ccache on the first run)
     container:
@@ -72,11 +72,21 @@ jobs:
         run: |
           hipconfig --version
           hipconfig --rocmpath
+      - name: Wave64 targets are refused at configure time
+        # the device layer assumes wave32 (rule 13); a CDNA arch must fail here, not miscompile
+        run: |
+          if cmake -S . -B build-hip-w64 -G Ninja -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON \
+               -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake > w64.log 2>&1; then
+            echo "gfx90a configured but must be refused"; exit 1
+          fi
+          grep -q "wave32" w64.log
+          rm -rf build-hip-w64
       - name: Configure
-        # explicit arch: `native` needs a GPU to resolve, and this runner has none
+        # explicit archs: `native` needs a GPU to resolve, and this runner has none. Two archs (RDNA3 + RDNA4)
+        # so a fat binary and the per-arch flags are exercised on every PR.
         run: |
           cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+            -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201" \
             -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
       - name: Build

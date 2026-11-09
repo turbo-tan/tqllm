@@ -68,12 +68,12 @@ Not built on HIP in this PR, each with an explicit error instead of a silent fal
 - `shim/`: compile-time name mapping for the CUDA host API (`cuda_runtime.h`, `cuda.h`,
   `cublas_v2.h`, bf16/fp16/fp8 headers, math constants) and the 32-bit-mask warp-sync set. Nothing
   here changes arithmetic.
-- `builtin_hip.cpp`, `load_fitted.cpp`, `qwen2_engine.cpp`, `model_capture.cpp`: engine glue,
+- `load_fitted.cpp`, `qwen2_engine.cpp`, `model_capture.cpp`, `builtin_engines.cpp` (src/engine/, shared): engine glue,
   mirrored from `src/backends/cuda/` with the vendor checks adjusted (no `sm_XX` test on AMD).
 
 Device primitives live next to the kernels they serve:
 
-- `src/core/common.cuh` keeps the CUDA `mma`/`ldmatrix` contract and supplies native AMD versions:
+- `src/core/platform/hip_device.cuh` keeps the CUDA `mma`/`ldmatrix` contract (`src/core/platform/cuda_device.cuh`) and supplies native AMD versions:
   `v_dot4` (`__dp4a`) for the int8 dot products, `v_dot2_f32_f16` / `_bf16` for the 16-bit dots,
   packed `v_pk_*` f16 arithmetic for the half2 helpers, and native LDS reads with the ldmatrix lane
   mapping. Kernels that keep the CUDA register layout therefore run the same math on RDNA3's packed

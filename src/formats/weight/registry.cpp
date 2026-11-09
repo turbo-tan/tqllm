@@ -43,9 +43,7 @@ void register_tq4();
 void register_tq3();
 void register_i8h();
 void register_gsq_q2();
-#if !defined(TQLLM_WITH_HIP)
-void register_x3();  // X3 (PAW-27B trellis) device code is raw PTX; not part of the AMD build yet
-#endif
+void register_x3();  // X3 (PAW-27B trellis): raw PTX kernels; src/backends/hip/unsupported_hip.cpp registers nothing
 void register_fp();
 void register_mxfp8();
 }
@@ -64,9 +62,7 @@ void builtins() {
         formats::register_tq3();
         formats::register_i8h();
         formats::register_gsq_q2();
-#if !defined(TQLLM_WITH_HIP)
         formats::register_x3();
-#endif
         formats::register_fp();
         formats::register_mxfp8();
     });

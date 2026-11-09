@@ -119,16 +119,20 @@ component live in the same folder. Dependencies point down only, and `tests/test
     `CMakeLists.txt`.
 11. No new top-level folder, component or layer without the maintainers' agreement.
 12. **A backend is a registration + its own kernels, never a copy of shared code.** `src/backends/<platform>/` holds
-    `builtin_<platform>.cpp` (the engine list), the platform shim or compatibility headers, that platform's device
-    kernels, and stubs for what it does not implement. Anything that is not platform specific (the memory fit, engine
+    the platform shim or compatibility headers, that platform's own kernels, and stubs for what it does not implement
+    (factories that refuse by name). The engine list is shared (`src/engine/builtin_engines.cpp`), and so are the
+    device primitives' names: each platform implements them in `src/core/platform/<platform>_device.cuh` with its
+    capability macros (`TQLLM_DEV_*`), selected in one place, `src/core/common.cuh`. Anything that is not platform specific (the memory fit, engine
     assembly, `Model` methods) is compiled for every backend from one file: `src/engine/load_fitted.cpp`,
     `src/engine/qwen2_engine.cpp`, `src/engine/model_capture.cpp`. A `git diff` between two `src/backends/*` folders
     must not show a near-identical `.cpp`. `CMakeLists.txt` has one `TQLLM_ENGINE_SOURCES` list; a backend block adds
     only its registration and its exclusions, so a new engine file is added once.
 13. **Model and component code does not branch on the backend.** Platform differences go into a helper next to the
-    thing that differs: `src/core/common.cuh` (device math), `src/core/cub_compat.hpp` (CUB / hipCUB),
-    `src/core/blas_compat.hpp` (cuBLAS / hipBLAS). A `#if defined(TQLLM_WITH_<backend>)` in `src/models/` or in a
-    component is a review blocker; the same holds for `#if` in a tool when a single `TQLLM_WITH_GPU` would do.
+    thing that differs and branch on capabilities: `TQLLM_DEV_PTX` / `TQLLM_DEV_CP_ASYNC` / `TQLLM_DEV_LDS_64K` (device,
+    `src/core/platform/`), `src/core/backend_caps.hpp` (host), `src/core/cub_compat.hpp` (CUB / hipCUB),
+    `src/core/blas_compat.hpp` (cuBLAS / hipBLAS), `src/core/copy_compat.hpp` (batched copies). A
+    `#if defined(TQLLM_WITH_<backend>)` in `src/models/` or in a component is a review blocker, and
+    `tests/test_layering.py` (BackendNames) fails on one; the same holds for `#if` in a tool when a single `TQLLM_WITH_GPU` would do.
 14. **Unsupported means an error, not a fallback.** A stub for a path a backend does not implement throws with the
     reason (and a device-side `__trap`/assert where a throw is not possible); it never returns silently, never returns
     zeros, and never switches the caller to a different code path behind its back. Capability questions are answered by

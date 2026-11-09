@@ -33,12 +33,16 @@ branch within hours of the rebase).
 
 | Difference | Helper |
 |---|---|
-| Device math (tensor-core MMA, `ldmatrix`, `cp.async`, packed f16, dot products) | `src/core/common.cuh` |
+| Device math (tensor-core MMA, `ldmatrix`, `cp.async`, packed f16, dot products) | a new `src/core/platform/<platform>_device.cuh` with the same `tqllm_dev` names and the `TQLLM_DEV_*` capability macros; one `#include` line in `src/core/common.cuh` selects it |
+| What the platform can do, for host code (fragment GEMMs, dense solver, batched copies) | `src/core/backend_caps.hpp` |
+| Batched host-to-device copies | `src/core/copy_compat.hpp` |
 | CUB vs hipCUB | `src/core/cub_compat.hpp` |
 | cuBLAS vs hipBLAS (math mode, device capability checks) | `src/core/blas_compat.hpp` |
 | A device API name that only differs in spelling | your platform's shim |
 
-A `#if defined(TQLLM_WITH_<platform>)` inside `src/models/` or `src/formats/` is a review blocker (rule 13).
+A `#if defined(TQLLM_WITH_<platform>)` inside `src/models/` or a component is a review blocker (rule 13), enforced by
+`tests/test_layering.py`. Kernels test capabilities instead (`#if TQLLM_DEV_LDS_64K`, `if constexpr (tqllm::caps::...)`),
+so a third platform with the same capability takes the same path without touching the kernel.
 
 ## What a backend must pass before it is called supported
 

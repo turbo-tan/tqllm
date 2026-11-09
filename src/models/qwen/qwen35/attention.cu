@@ -334,7 +334,7 @@ template <int DIM> __global__ void attn_gen_merge_k(const float * part, __nv_bfl
 // its key range in tiles of MQ_TILE, staging K and V once in shared memory for all nq * g query rows, with an online
 // softmax per row; each thread owns one head dimension d and keeps the rows' accumulators in registers.
 constexpr int MQ_TILE = 32;
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
 constexpr int MQ_MAXROWS = 32;  // two m-tiles: gfx1100 caps dynamic shared memory at 64 KB per workgroup
 #else
 constexpr int MQ_MAXROWS = 48;
@@ -378,13 +378,7 @@ __global__ void turbo3_inverse_multi_k(__nv_bfloat16 * data, int heads, int dim)
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
-#if defined(TQLLM_WITH_HIP)
     tqllm_dev::mma_bf16(c, a0, a1, a2, a3, b0, b1);
-#else
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#endif
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float x, float y) {
@@ -417,13 +411,13 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
                                                  const int * dseq0, int nq, int heads, int kvheads, float scale,
                                                  int nsplit, int query_offset, int pstride, int blk,
                                                  const int * dep = nullptr
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
                                                  // first query index of this launch when dep is null (chain verify
                                                  // split over several row-limited launches)
                                                  , int qbase = 0
 #endif
                                                  ) {
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     static_assert(DIM == 256 && MQ_TILE == 32 && MQ_MAXROWS == 32, "warp layout assumes 8 warps, 2 m-tiles, 4 n-tiles");
 #else
     static_assert(DIM == 256 && MQ_TILE == 32 && MQ_MAXROWS == 48, "warp layout assumes 8 warps, 3 m-tiles, 4 n-tiles");
@@ -435,7 +429,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
     __nv_bfloat16 * qs = reinterpret_cast<__nv_bfloat16 *>(smem_raw);            // [MAXROWS][KS]
     static_assert(!TURBO3V, "Turbo3 V is served by attn_ctv_k");
     constexpr bool Q8V = Q8 && !TURBO3V;                                         // int8 V (else Turbo3 V)
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     // single-buffered BF16 K/V tiles; Q8/Q8V records are decoded straight from global memory (no int8 staging)
     constexpr int NB = 1;
     __nv_bfloat16 * kbuf = qs + MQ_MAXROWS * KS;                                 // [TILE][KS]
@@ -474,14 +468,14 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
     __shared__ int lim[MQ_MAXROWS];
     if (t < MQ_MAXROWS) {
         const int z = t / g;
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         // a null dep is a chain: local query z is query qbase + z of it
         lim[t] = blk ? tq_split_point(seq0 - 1 + (dep ? dep[min(z, nq - 1)] : qbase + z)) : seq0 + z;
 #else
         lim[t] = blk ? tq_split_point(seq0 - 1 + (dep ? dep[min(z, nq - 1)] : z)) : seq0 + z;
 #endif
     }
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     // One synchronous copy (cp_async16 is a plain global->shared copy on HIP and cp_wait is a no-op): stage the tile
     // just before it is used. Q8/Q8V cache records are decoded straight from global memory in the conv step instead.
     auto stage = [&](int, int t0) {
@@ -557,7 +551,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
 #pragma unroll
         for (int j = 0; j < 4; ++j) o[m][j][0] = o[m][j][1] = o[m][j][2] = o[m][j][3] = 0.f;
 
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
     constexpr int buf = 0;  // one K/V tile buffer: each tile is staged right before it is used
     for (int t0 = beg; t0 < end; t0 += stride) {
         const int n = min(MQ_TILE, end - t0);
@@ -575,7 +569,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
         }
         __syncthreads();
 #endif
-#if defined(TQLLM_WITH_HIP)
+#if TQLLM_DEV_LDS_64K
         if constexpr (Q8) {  // int8 x per-32 scale -> BF16 tiles, decoded straight from global (zero tail rows)
             auto conv = [&](const int8_t * g8, const __half * gss, __nv_bfloat16 * dstbuf) {
                 for (int i = t; i < MQ_TILE * (DIM / 16); i += blockDim.x) {

@@ -58,15 +58,9 @@ void vis_f32_to_h(const float *, __half *, int64_t, cudaStream_t) {
 
 }  // namespace tqllm_cuda
 
-// The GLM-5next and MiniMax-M3 engines are not part of the AMD build in this PR. The *detection* is host-only GGUF
-// metadata (src/core/gguf.cpp), so it stays exact here: a file for one of them must be recognised and refused by name,
-// not fall through to the qwen35 loader (which would report a confusing tensor error instead of the truth).
+// The GLM-5next and MiniMax-M3 engines are not part of the AMD build yet. Their detection is shared (src/engine/engine_detect.cpp),
+// so such a file is recognised and refused here by name instead of falling through to the qwen35 loader.
 namespace tqllm {
-bool is_glm5next_gguf(const std::string & path) {
-    const std::string a = gguf_architecture(path);
-    return a == "glm5-next" || a == "glm5next";
-}
-bool is_minimax_gguf(const std::string & path) { return gguf_architecture(path) == "minimax-m3"; }
 std::unique_ptr<Engine> make_glm5next_engine(const std::string &, uint32_t) {
     throw std::runtime_error("GLM-5next is not supported by the AMD (HIP) backend yet");
 }
@@ -75,3 +69,7 @@ std::unique_ptr<Engine> make_minimax_engine(const std::string &, uint32_t, const
     throw std::runtime_error("MiniMax-M3 is not supported by the AMD (HIP) backend yet");
 }
 }  // namespace tqllm
+
+// X3 (PAW-27B trellis) kernels are raw PTX and are not built for AMD: the format registers nothing, so an X3 file is
+// refused as an unknown weight type instead of loading.
+namespace tqllm::formats { void register_x3() {} }

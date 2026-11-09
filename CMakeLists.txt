@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)  # before project(), as if given on the command line
   set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures (default: the GPUs in this machine; e.g. 86;120 to build for others)")
 endif()
-if(TQLLM_HIP AND NOT DEFINED CMAKE_HIP_ARCHITECTURES)  # AMD GPUs: e.g. gfx1100 (RDNA3), gfx90a/942/950 (CDNA)
+if(TQLLM_HIP AND NOT DEFINED CMAKE_HIP_ARCHITECTURES)  # AMD GPUs: wave32 RDNA3 / RDNA4 (gfx11xx, gfx12xx)
   set(CMAKE_HIP_ARCHITECTURES native CACHE STRING "HIP architectures (default: the GPUs in this machine; e.g. gfx1100)")
 endif()
 project(TQLLM VERSION 0.1.0 LANGUAGES C CXX)
@@ -40,6 +40,7 @@ endif()
 # the backend block below; the AMD build subtracts the PTX-only files it cannot compile yet.
 set(TQLLM_ENGINE_SOURCES
   src/engine/model.cpp src/engine/registry.cpp src/engine/load_fitted.cpp src/engine/model_capture.cpp
+  src/engine/builtin_engines.cpp src/engine/engine_detect.cpp
   src/kv/kv_store_cuda.cpp
   src/engine/qwen2_engine.cpp src/models/qwen/qwen2/qwen2.cu
   src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp
@@ -81,9 +82,17 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
   find_package(hipblas REQUIRED PATHS ${TQLLM_ROCM_ROOT}/lib/cmake)
   # hip-config exports compile options (-x hip, --offload-arch) that also hit C/CXX files; narrow them to
   # the HIP language (CMake adds -x hip for HIP rules itself, so only the arch flags remain here)
-  list(JOIN CMAKE_HIP_ARCHITECTURES ",--offload-arch=" TQ_HIP_OFFLOADS)
-  set_target_properties(hip::device PROPERTIES INTERFACE_COMPILE_OPTIONS
-    "$<$<COMPILE_LANGUAGE:HIP>:--offload-arch=${TQ_HIP_OFFLOADS}>")
+  foreach(arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+    if(NOT arch STREQUAL "native" AND NOT arch MATCHES "^gfx1[12][0-9a-f][0-9a-f]")
+      message(FATAL_ERROR "tqLLM's AMD backend targets wave32 RDNA3 / RDNA4 (gfx11xx, gfx12xx); ${arch} is not one "
+                          "(CDNA gfx9xx runs 64-lane waves, which the device code does not support yet)")
+    endif()
+  endforeach()
+  set(TQ_HIP_OFFLOADS)
+  foreach(arch IN LISTS CMAKE_HIP_ARCHITECTURES)  # one --offload-arch per target (a joined list became one bad flag)
+    list(APPEND TQ_HIP_OFFLOADS "$<$<COMPILE_LANGUAGE:HIP>:--offload-arch=${arch}>")
+  endforeach()
+  set_target_properties(hip::device PROPERTIES INTERFACE_COMPILE_OPTIONS "${TQ_HIP_OFFLOADS}")
   find_package(Threads)
   # include shim: names <cuda_runtime.h> and friends on HIP (src/backends/hip/shim). Device math is NOT
   # shimmed -- every PTX kernel gets a native AMD implementation next to the CUDA one.
@@ -98,13 +107,11 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3/dispatch.cu)
   # the AMD platform adds only its registration file and the stubs for what it does not implement; everything else is
   # the shared list above, so a new engine file is added in one place for both backends
-  target_sources(tqllm PRIVATE ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES}
-    src/backends/hip/builtin_hip.cpp src/backends/hip/unsupported_hip.cpp)
+  target_sources(tqllm PRIVATE ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES} src/backends/hip/unsupported_hip.cpp)
   target_include_directories(tqllm PRIVATE ${TQLLM_HIP_SHIM} ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
   # every source that sees a GPU header is compiled by hipcc, host code included (see the CMAKE_HIP_STANDARD note)
-  set(TQLLM_HIP_COMPILED ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES}
-      src/backends/hip/builtin_hip.cpp src/backends/hip/unsupported_hip.cpp)
+  set(TQLLM_HIP_COMPILED ${TQLLM_HIP_SOURCES} ${TQLLM_ENGINE_SOURCES} src/backends/hip/unsupported_hip.cpp)
   set_source_files_properties(${TQLLM_HIP_COMPILED} PROPERTIES LANGUAGE HIP)
   # hipBLAS through its imported target: a bare -lhipblas needs the ROCm lib dir on every consumer's link line, which
   # broke tqtokenize / test-gguf-validation in CI (they link tqllm, not the ROCm paths)
@@ -246,7 +253,7 @@ if(TQLLM_CUDA)
   file(GLOB_RECURSE TQLLM_FORMAT_SOURCES CONFIGURE_DEPENDS src/formats/*.cpp src/formats/*.cu)
   target_sources(tqllm PRIVATE ${TQLLM_FORMAT_SOURCES})
   target_include_directories(tqllm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
-  target_sources(tqllm PRIVATE ${TQLLM_ENGINE_SOURCES} src/backends/cuda/builtin_cuda.cpp
+  target_sources(tqllm PRIVATE ${TQLLM_ENGINE_SOURCES}
     src/vision/vision.cpp src/vision/vision.cu
     src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu)
   # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads

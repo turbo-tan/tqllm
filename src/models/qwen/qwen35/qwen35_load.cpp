@@ -1,4 +1,5 @@
 // qwen35 engine: loading and allocation. The class is declared in qwen35_engine.hpp.
+#include "backend_caps.hpp"
 #include "qwen35_engine.hpp"
 #include <cstdio>
 #include <cstring>
@@ -266,12 +267,10 @@ void Qwen35Engine::alloc_seq_state() {
         kv_cmp = (kv_staged || cmp_dev) && opt.kv_compact > 0 && kvf->compact_ok();
         if (opt.kv_compact > 0 && !kv_cmp)
             std::fprintf(stderr, "tqllm: --kv-compact needs one slot (all KV on the GPU or the staged host tail) and tq3 or tcq3/tcq2 KV; off\n");
-#if defined(TQLLM_WITH_HIP)
-        if (kv_cmp) {  // the stand-in solve is cuSOLVER Spotrf/Spotrs; hipsolver is not linked in this PR
+        if (!tqllm::caps::kDenseSolver && kv_cmp) {  // the stand-in solve is cuSOLVER Spotrf/Spotrs; hipsolver is not linked in this PR
             std::fprintf(stderr, "tqllm: --kv-compact (TqCache) is not supported on the AMD backend yet (no cuSOLVER); off\n");
             kv_cmp = false;
         }
-#endif
         const int64_t cmp_span = kv_staged ? host : std::max<int64_t>(0, int64_t(context_) - kCmpWindow);
         if (kv_cmp) {
             // middle layers [A/4, 5A/8) at half the ratio: attention-output error at 8x on Qwen3.5-9B was +29..49 %

@@ -1,3 +1,4 @@
+#include "backend_caps.hpp"
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 #include "debug.hpp"
@@ -45,9 +46,7 @@ struct Tq3 final : WeightFormat {
     }
     // TQLLM_DEBUG=tq_gemm:off: no native GEMM (the pre-GEMM dequant + cuBLAS path, for A/B and the KLD reference)
     static bool gemm_off() {
-#if defined(TQLLM_WITH_HIP)
-        return true;  // AMD prefill uses dequant + hipBLAS BF16 (matrix cores); the custom kernel is CUDA-fragment
-#endif
+        if constexpr (!tqllm::caps::kFragmentPrefillGemm) return true;  // dequant + BLAS BF16 prefill (matrix cores)
         const std::string * v = tqllm::debug_value("tq_gemm");
         return v && *v == "off";
     }
