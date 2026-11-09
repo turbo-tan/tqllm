@@ -10,7 +10,25 @@ namespace tqserve {
 
 inline void jstr(std::string & out, const std::string & value) {
     out.push_back('"');
-    for (unsigned char c : value) {
+    for (size_t i = 0; i < value.size();) {
+        const auto c = static_cast<unsigned char>(value[i++]);
+        if (c >= 0x80) {
+            // Token decoding can produce invalid or incomplete UTF-8. Keep the JSON valid
+            // and consume only the valid prefix of a malformed sequence.
+            const size_t start = i - 1;
+            const size_t extra = c < 0xC2 ? 0 : c < 0xE0 ? 1 : c < 0xF0 ? 2 : c < 0xF5 ? 3 : 0;
+            while (i < value.size() && i < start + 1 + extra) {
+                const auto next = static_cast<unsigned char>(value[i]);
+                if (next < 0x80 || next > 0xBF) break;
+                if (i == start + 1 &&
+                    ((c == 0xE0 && next < 0xA0) || (c == 0xED && next > 0x9F) ||
+                     (c == 0xF0 && next < 0x90) || (c == 0xF4 && next > 0x8F))) break;
+                ++i;
+            }
+            if (extra && i == start + 1 + extra) out.append(value, start, i - start);
+            else out += "\\ufffd";
+            continue;
+        }
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
