@@ -1,6 +1,8 @@
 #include "weight_format.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
 
@@ -32,12 +34,56 @@ struct Composite final : WeightFormat {
         return c;
     }
     bool has_matvec_ld() const override { return true; }
-    bool matvec_ld(const Mat &, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
-        int r0 = 0;
-        for (const auto & m : ps) {
-            m.fmt->matvec_ld(m, x, y + r0, n, ldy, s);
-            r0 += m.rows;
+    // Parts 1.. run on side streams forked from s and joined back (graph-capturable fork / join): every part reads the
+    // same input and writes its own row block, so results are those of the sequential order, bit for bit. Small parts
+    // (e.g. a Q5_K qkv block beside an IQ4_XS gate block) then overlap instead of each paying its own ramp-up / tail.
+    // TQLLM_COMPOSITE_SERIAL=1 restores one stream.
+    // one small pool of side streams / events shared by every composite (they run one at a time on the main stream)
+    struct Pool {
+        cudaEvent_t fork = nullptr;
+        std::vector<cudaStream_t> side;
+        std::vector<cudaEvent_t> joins;
+    };
+    static Pool & pool(size_t n) {
+        static Pool p;
+        if (!p.fork) cudaEventCreateWithFlags(&p.fork, cudaEventDisableTiming);
+        while (p.side.size() < n) {
+            cudaStream_t st;
+            cudaEvent_t ev;
+            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            p.side.push_back(st);
+            p.joins.push_back(ev);
         }
+        return p;
+    }
+    static bool serial() {
+        static const bool v = [] { const char * e = std::getenv("TQLLM_COMPOSITE_SERIAL"); return e && *e == '1'; }();
+        return v;
+    }
+    bool matvec_ld(const Mat &, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        if (serial() || ps.size() < 2) {
+            int r0 = 0;
+            for (const auto & m : ps) {
+                m.fmt->matvec_ld(m, x, y + r0, n, ldy, s);
+                r0 += m.rows;
+            }
+            return true;
+        }
+        auto & P = pool(ps.size() - 1);
+        const cudaEvent_t fork = P.fork;
+        const auto & side = P.side;
+        auto & joins = P.joins;
+        cudaEventRecord(fork, s);
+        int r0 = ps[0].rows;
+        for (size_t i = 1; i < ps.size(); ++i) {
+            cudaStreamWaitEvent(side[i - 1], fork, 0);
+            ps[i].fmt->matvec_ld(ps[i], x, y + r0, n, ldy, side[i - 1]);
+            cudaEventRecord(joins[i - 1], side[i - 1]);
+            r0 += ps[i].rows;
+        }
+        ps[0].fmt->matvec_ld(ps[0], x, y, n, ldy, s);
+        for (size_t i = 0; i + 1 < ps.size(); ++i) cudaStreamWaitEvent(s, joins[i], 0);
         return true;
     }
     void matvec(const Mat & c, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
