@@ -76,21 +76,28 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
             if (L.w_mix.p) {
                 mm(L.w_mix, np, t_in.as<bf16>());
                 qg = t_in.as<bf16>();
-                k = qg + 2 * nh * hd;
+                k = qg + (cfg.gated_attention ? 2 : 1) * nh * hd;
                 v = k + kvh * hd;
             } else {
                 mm(L.wq, np, qg);
                 mm(L.wk, np, k);
                 mm(L.wv, np, v);
             }
-            tqllm_cuda::rms_f(qg, 2 * hd, L.q_norm, q, hd, hd, nh, cfg.eps, stream);
+            tqllm_cuda::rms_f(qg, (cfg.gated_attention ? 2 : 1) * hd, L.q_norm, q, hd, hd, nh, cfg.eps, stream);
             tqllm_cuda::rms_f(k, hd, L.k_norm, k, hd, hd, kvh, cfg.eps, stream);
             tqllm_cuda::rope_partial(q, nh, hd, int(cfg.rot_dim), int(pos), cfg.theta, stream);
             tqllm_cuda::rope_partial(k, kvh, hd, int(cfg.rot_dim), int(pos), cfg.theta, stream);
             tqllm_cuda::cache_write(k, v, kc, vc, int(pos), kvh, hd, stream);
+            if (!cfg.gated_attention) {
+                h_pos[0] = int(pos); h_pos[1] = int(pos) + 1;
+                ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+                tqllm_cuda::attention_gen128(q, kc, vc, o, part.as<float>(), v_pos.as<int>(), 1, int(context_), nh, kvh,
+                                            1.f / std::sqrt(float(hd)), true, 0, stream);
+            } else {
             tqllm_cuda::attention_decode(q, kc, vc, o, part.as<float>(), int(pos + 1), nh, kvh, hd,
                                          1.f / std::sqrt(float(hd)), stream);
-            tqllm_cuda::sigmoid_gate(o, qg, nh, hd, stream);
+            }
+            if (cfg.gated_attention) tqllm_cuda::sigmoid_gate(o, qg, nh, hd, stream);
             prep(o, nh * hd);
             mm(L.wo, o, mp);
             ++attn_i;
@@ -589,13 +596,14 @@ void Qwen35Engine::calibrate_prefill() {
 }
 
 PrefillPath Qwen35Engine::path_of(const Mat & m, int n) const {
+    const bool verify_width = n <= NVER || !segs.empty() || wide_mm;
     if (const std::string * v = tqllm::debug_value("prefill_path"); v && *v == "old") {  // A/B against the old rule
         if (n <= m.fmt->max_matvec_cols()) return PrefillPath::matvec;
-        if (!segs.empty() || wide_mm) return PrefillPath::batched;
+        if (verify_width) return PrefillPath::batched;
         if ((n < NGEMM_BLAS || !gemm_w.p) && m.fmt->has_gemm()) return PrefillPath::native;
         return PrefillPath::dequant;
     }
-    return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, !segs.empty() || wide_mm);
+    return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, verify_width);
 }
 
 void Qwen35Engine::gemm_rows(const Mat & m, bf16 * out, int n, int ldo) {
@@ -812,7 +820,7 @@ void Qwen35Engine::attn_mixer(const Layer & L, bf16 * kc, bf16 * vc, int n, int 
     const int nh = int(cfg.heads), hd = int(cfg.head_dim);
     auto *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *M = v_m.as<bf16>();
     auto * XH = v_xh.as<__half>();
-    const bool fuse = basis_ == Basis::Tq3Rot32 || basis_ == Basis::Tq4Rot128;  // gate + wo input rotation in one kernel
+    const bool fuse = cfg.gated_attention && (basis_ == Basis::Tq3Rot32 || basis_ == Basis::Tq4Rot128);  // gate + wo input rotation in one kernel
     if (!L.w_mix.p) throw std::runtime_error("multi-token path needs fused attention weights");
     const int rows = L.w_mix.rows;
     mm_h(L.w_mix, T, n);
@@ -1032,7 +1040,7 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
     }
     if (!k_head()) throw std::runtime_error("multi-token path needs a Q6_K / Q5_K LM head");
     const bool two_stage = !full_logits;
-    if (two_stage && head4.p && has_head8() && (n <= 8 || !segs.empty())) {  // 4-bit head -> top-16 -> exact int8 re-score
+    if (two_stage && head4.p && has_head8() && (n <= NVER || !segs.empty())) {  // same head path for decode and verify
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
         for (int c0 = 0; c0 < n; c0 += 32)  // batched verify: every slot's columns in one pass per 32
             tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>() + size_t(c0) * H,

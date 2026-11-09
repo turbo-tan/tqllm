@@ -104,6 +104,13 @@ public:
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) override;
     bool spec_advance() override;
     void remember_copy(SlotState & sl);
+    void spec_abort(int s) override {  // a failed request: the slot no longer counts as running, its state is dropped
+        if (s < 0 || size_t(s) >= slots_.size()) return;
+        auto & sl = slots_[size_t(s)];
+        sl.done_ = true;
+        try { if (sl.model_) { cudaDeviceSynchronize(); cudaGetLastError(); sl.model_.reset(); } } catch (...) {}
+        sl.snap_ = 0;
+    }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
         bind();
         while (spec_advance()) {}

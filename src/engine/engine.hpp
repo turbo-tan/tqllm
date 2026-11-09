@@ -66,6 +66,9 @@ struct Engine {
         throw std::runtime_error("incremental speculative decoding not supported for this model");
     }
     virtual bool spec_advance() { return false; }
+    // a request in slot s failed (no spec_finish will follow): the slot stops counting as running; engines with
+    // per-slot state drop it, since a failed step may have left it half written
+    virtual void spec_abort(int s) { (void) s; }
     // Image embeddings for the next spec_begin on the active slot: prompt tokens [at, at + nx * ny) are the image's
     // placeholders; emb: device FP32 [nx * ny][hidden], row-major over the nx x ny grid, complete when called.
     using PromptImage = Model::PromptImage;

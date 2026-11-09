@@ -158,7 +158,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     }
     // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
     if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
-    D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
+    D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : std::min(NVER - 1, dfl.block - 1)) : use_mtp ? D : 0;
     const int reserve = use_mtp ? D + 1 : dfl.block + 1;
     if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
         throw std::runtime_error("request exceeds context capacity");

@@ -30,6 +30,8 @@
 #include "safetensors.hpp"
 #include "dequant.hpp"
 #include "dflash_kernels.cuh"
+#include "dspine.hpp"
+#include "dspine_kernels.cuh"
 #include "kv_format.hpp"
 #include "kv_store.hpp"
 #include "tqllm/rope_scaling.hpp"
@@ -452,6 +454,7 @@ private:
     const int8_t * h8_dev_w = nullptr;
     const __half * h8_dev_s = nullptr;
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
+    Buf sp_norm, sp_codes, sp_packed, sp_message, sp_delta, sp_raw, sp_rms, sp_predcodes, sp_predpv, sp_refmsg, sp_refdelta, sp_refined, sp_part;
     Buf head4, head4s;  // draft-only 4-bit copy of head8 (DFlash2 full-vocabulary draft head)
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
     // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (token_sampling.hpp)
@@ -645,7 +648,7 @@ public:
         vdep = !vpar ? nullptr : tree_mode && tree_step ? d_tdep.as<int>() : d_cdep.as<int>();
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
-        bucket = std::min(bucket, context_);
+        bucket = dfl.dspine ? context_ : std::min(bucket, context_);
         if (tokens) ck(cudaMemcpyAsync(v_tokens.p, tokens, size_t(n) * 4, cudaMemcpyHostToDevice, stream));  // else on the device
         ck(cudaMemcpyAsync(v_pos.p, pos_host, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
         if (gen.rdelta == 0) {  // prefill chunks are queued unsynchronised: copy from the caller's staged positions
@@ -723,6 +726,10 @@ public:
     // Concurrent segments each take an equal share of v_part; it must hold one verify launch (<= 8 queries).
     void ensure_mq_split();
     bool segs_fit_part() {
+        if (!cfg.gated_attention) {
+            int largest = 1; for (const auto& segment : segs) largest = std::max(largest, segment.n);
+            return size_t(tqllm_cuda::attention_gen_partial_floats(int(cfg.heads), int(context_), largest)) <= part_floats / segs.size();
+        }
         ensure_mq_split();
         return size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), 8, mq_split)) <= part_floats / segs.size();
     }
@@ -743,9 +750,10 @@ public:
         const int nh = int(cfg.heads), kvh = int(cfg.kvheads), hd = int(cfg.head_dim);
         const int * rp = rpos ? rpos : dpos;
         const int3 sec = {cfg.msec[0], cfg.msec[1], cfg.msec[2]};
-        bf16 * K0 = T + 2 * nh * hd;
+        const int qstride = (cfg.gated_attention ? 2 : 1) * hd;
+        bf16 * K0 = T + nh * qstride;
         // q / k RMSNorm per head, then RoPE on the first rot_dim dims
-        tqllm_cuda::rms_rope_multi(T, rows, 2 * hd, L.q_norm, Q, nh * hd, hd, hd, nh, n, cfg.eps, int(cfg.rot_dim), rp,
+        tqllm_cuda::rms_rope_multi(T, rows, qstride, L.q_norm, Q, nh * hd, hd, hd, nh, n, cfg.eps, int(cfg.rot_dim), rp,
                                    cfg.theta, stream, dep, mpos, sec);
         tqllm_cuda::rms_rope_multi(K0, rows, hd, L.k_norm, K0, rows, hd, hd, kvh, n, cfg.eps, int(cfg.rot_dim), rp,
                                    cfg.theta, stream, dep, mpos, sec);
@@ -757,6 +765,7 @@ public:
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
         kvf->write_and_attend({K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
                                1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr});
+        if (!cfg.gated_attention) return;
         if (xh && basis_ == Basis::Tq4Rot128) tqllm_cuda::tq4_sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);
         else if (xh) tqllm_cuda::sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);  // + the wo input rotation
         else tqllm_cuda::sigmoid_gate_multi(O, T, rows, n, nh, hd, stream);
@@ -799,12 +808,15 @@ public:
 
     // Drafter kernel grids independent of the position (sliding-window ring, no retrieval): drafts and commits can be
     // captured once as CUDA graphs. Retrieval sizes its launches by the position, so it runs eagerly.
-    bool dfl_fixed_grids() const { return dfl.ring > 0 && !dfl.retr; }
+    bool dfl_fixed_grids() const { return (dfl.ring > 0 || dfl.dspine) && !dfl.retr; }
 
     // Drafter K/V of the active slot: the sliding-window (or retrieval) ring, else the full context.
     void alloc_dfl_state();
 
     void load_dflash(const std::string & path);
+    void load_dspine(const GgufFile & f);
+    void dspine_write(size_t layer, int rows);
+    void dspine_lattice(int rows);
     // 4-bit copy of head8: the two-stage verify head's first pass and the DFlash2 full-vocabulary draft head
     // logits of the draft-vocabulary rows (dsub_ids order) for n FP16 inputs
     void dsub_matvec(const __half * x, float * y, int n);
@@ -861,6 +873,9 @@ public:
             return false;
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
         const int ns = int(rq.size()), DB = ns * B;
+        if (dfl.dspine && std::any_of(rq.begin(), rq.end(), [&](const DraftReq& r) {
+                return uint64_t(r.pos) + B > context_;
+            })) return false;
         std::vector<uint32_t> blk(size_t(DB), dfl.mask_id);
         std::vector<int> pos(2 * size_t(ns));
         for (int i = 0; i < ns; ++i) {
@@ -878,6 +893,7 @@ public:
             embed_multi(d_tok.as<uint32_t>(), DB, X);
             const int cr = L_conv_rows();
             auto conv = [&](const bf16 * in, const bf16 * dyn, const float * base, int side, bf16 * y) {
+                if (dfl.dspine) { ck(cudaMemcpyAsync(y, in, size_t(DB) * H * 2, cudaMemcpyDeviceToDevice, stream)); return; }
                 for (int i = 0; i < ns; ++i)
                     tqllm_cuda::dflash_conv(in + size_t(i) * B * H, dyn + size_t(i) * B * cr, cr, base, side,
                                             y + size_t(i) * B * H, B, H, dfl.group, stream);
@@ -886,7 +902,7 @@ public:
                 const auto & L = dfl.L[l];
                 ck(cudaMemcpyAsync(R, X, size_t(DB) * H * 2, cudaMemcpyDeviceToDevice, stream));
                 tqllm_cuda::rms_f_multi(X, H, 0, L.attn_norm, A, H, 0, H, 1, DB, cfg.eps, stream);
-                mmx(L.conv_attn, A, DYN, DB);
+                if (!dfl.dspine) mmx(L.conv_attn, A, DYN, DB);
                 conv(A, DYN, L.attn_conv_base, 0, Bb);
                 mmx(L.w_qkv, Bb, T, DB);
                 const int rows = L.w_qkv.rows;
@@ -902,21 +918,22 @@ public:
                     bf16 *kc = dkc_of(sl)[l].as<bf16>(), *vc = dvc_of(sl)[l].as<bf16>();
                     tqllm_cuda::cache_write_multi(Ki, Ki + kd, rows, B, kc, vc, dp + 2 * i, dfl.kvheads, dfl.hd, stream,
                                                   dfl.ring);
-                    tqllm_cuda::attention_gen128(Qi, kc, vc, Oi, v_part.as<float>(), dp + 2 * i, B, int(context_),
-                                                 dfl.heads, dfl.kvheads, 1.f / std::sqrt(float(dfl.hd)), false,
+                    tqllm_cuda::attention_gen128(Qi, kc, vc, Oi, dfl.dspine ? sp_part.as<float>() : v_part.as<float>(), dp + 2 * i, B, int(context_),
+                                                 dfl.heads, dfl.kvheads, 1.f / std::sqrt(float(dfl.hd)), dfl.dspine,
                                                  dfl.window, stream, dfl.ring);
                 }
                 mmx(L.wo, O, A, DB);
                 conv(A, DYN, L.attn_conv_base, 1, Bb);
                 tqllm_cuda::residual(Bb, R, DB * H, stream);
                 tqllm_cuda::rms_f_multi(Bb, H, 0, L.ffn_norm, A, H, 0, H, 1, DB, cfg.eps, stream);
-                mmx(L.conv_ffn, A, DYNF, DB);
+                if (!dfl.dspine) mmx(L.conv_ffn, A, DYNF, DB);
                 conv(A, DYNF, L.ffn_conv_base, 0, X);
                 mmx(L.w_gu, X, T, DB);
                 tqllm_cuda::swiglu_multi(T, DB, int(cfg.ffn), ACT, stream);
                 mmx(L.down, ACT, A, DB);
                 conv(A, DYNF, L.ffn_conv_base, 1, X);
                 tqllm_cuda::residual(X, Bb, DB * H, stream);
+                if (dfl.dspine) dspine_write(l, DB);
             }
             auto * TE = d_te.as<bf16>();
             tqllm_cuda::rms_f_multi(X, H, 0, dfl.out_norm, TE, H, 0, H, 1, DB, cfg.eps, stream);
@@ -942,6 +959,7 @@ public:
             tqllm_cuda::topk16_big(v_logits.as<float>(), head_rows, DB, d_vals.as<float>(), d_idx.as<uint32_t>(),
                                    d_topk.p, stream);
             if (dsub_rows) tqllm_cuda::map_ids(d_idx.as<uint32_t>(), dsub_ids.as<uint32_t>(), DB * 16, stream);
+            if (dfl.dspine) { dspine_lattice(DB); return; }
             mmx(dfl.sel_hidden, TE, d_gate.as<bf16>(), DB);
             for (int i = 0; i < ns; ++i)
                 tqllm_cuda::dflash_lattice(d_idx.as<uint32_t>() + size_t(i) * B * 16, d_vals.as<float>() + size_t(i) * B * 16,
@@ -998,6 +1016,7 @@ public:
     std::vector<uint32_t> dflash_draft(uint32_t anchor, uint32_t pos, int want, std::vector<uint32_t> * idx_out = nullptr,
                                        std::vector<float> * score_out = nullptr, bool launch_only = false) {
         const int H = int(cfg.hidden), B = dfl.block, qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
+        if (dfl.dspine && uint64_t(pos) + B > context_) return {};
         set_dpos(pos);
         const int NT = dfl.dspark ? dfl.nb : B;  // drafter tokens in the block
         std::vector<uint32_t> blk(size_t(NT), dfl.mask_id);
@@ -1018,14 +1037,15 @@ public:
         embed_multi(d_tok.as<uint32_t>(), B, X);
         uint32_t bucket = 256;
         while (bucket < pos + B) bucket *= 2;
-        bucket = std::min(bucket, context_);
+        bucket = dfl.dspine ? context_ : std::min(bucket, context_);
         const int cr = L_conv_rows();
         for (size_t l = 0; l < dfl.L.size(); ++l) {
             const auto & L = dfl.L[l];
             ck(cudaMemcpyAsync(R, X, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
             tqllm_cuda::rms_f_multi(X, H, 0, L.attn_norm, A, H, 0, H, 1, B, cfg.eps, stream);
-            mmx(L.conv_attn, A, DYN, B);
-            tqllm_cuda::dflash_conv(A, DYN, cr, L.attn_conv_base, 0, Bb, B, H, dfl.group, stream);
+            if (!dfl.dspine) mmx(L.conv_attn, A, DYN, B);
+            if (dfl.dspine) ck(cudaMemcpyAsync(Bb, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
+            else tqllm_cuda::dflash_conv(A, DYN, cr, L.attn_conv_base, 0, Bb, B, H, dfl.group, stream);
             mmx(L.w_qkv, Bb, T, B);
             const int rows = L.w_qkv.rows;
             bf16 * K0 = T + qd;
@@ -1051,21 +1071,25 @@ public:
                                              (rows + 63) / 64 * 64, dfl.heads, dfl.kvheads, 1.f / std::sqrt(float(dfl.hd)),
                                              false, rows, stream, 0);
             } else {
-                tqllm_cuda::attention_gen128(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), O, v_part.as<float>(),
+                tqllm_cuda::attention_gen128(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), O, dfl.dspine ? sp_part.as<float>() : v_part.as<float>(),
                                              d_pos.as<int>(), B, int(bucket), dfl.heads, dfl.kvheads,
-                                             1.f / std::sqrt(float(dfl.hd)), false, dfl.window, stream, dfl.ring);
+                                             1.f / std::sqrt(float(dfl.hd)), dfl.dspine, dfl.window, stream, dfl.ring);
             }
             mmx(L.wo, O, A, B);
-            tqllm_cuda::dflash_conv(A, DYN, cr, L.attn_conv_base, 1, Bb, B, H, dfl.group, stream);
+            if (dfl.dspine) ck(cudaMemcpyAsync(Bb, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
+            else tqllm_cuda::dflash_conv(A, DYN, cr, L.attn_conv_base, 1, Bb, B, H, dfl.group, stream);
             tqllm_cuda::residual(Bb, R, B * H, stream);  // Bb = ffn_inp
             tqllm_cuda::rms_f_multi(Bb, H, 0, L.ffn_norm, A, H, 0, H, 1, B, cfg.eps, stream);
-            mmx(L.conv_ffn, A, DYNF, B);
-            tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 0, X, B, H, dfl.group, stream);
+            if (!dfl.dspine) mmx(L.conv_ffn, A, DYNF, B);
+            if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
+            else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 0, X, B, H, dfl.group, stream);
             mmx(L.w_gu, X, T, B);
             tqllm_cuda::swiglu_multi(T, B, int(cfg.ffn), ACT, stream);
             mmx(L.down, ACT, A, B);
-            tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 1, X, B, H, dfl.group, stream);
+            if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
+            else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 1, X, B, H, dfl.group, stream);
             tqllm_cuda::residual(X, Bb, B * H, stream);
+            if (dfl.dspine) dspine_write(l, B);
         }
         auto * TE = d_te.as<bf16>();
         tqllm_cuda::rms_f_multi(X, H, 0, dfl.out_norm, TE, H, 0, H, 1, B, cfg.eps, stream);
@@ -1098,6 +1122,7 @@ public:
         tqllm_cuda::topk16_big(v_logits.as<float>(), head_rows, B, d_vals.as<float>(), d_idx.as<uint32_t>(), d_topk.p,
                                stream);
         if (dsub_rows) tqllm_cuda::map_ids(d_idx.as<uint32_t>(), dsub_ids.as<uint32_t>(), B * 16, stream);
+        if (dfl.dspine) { dspine_lattice(B); return; }
         mmx(dfl.sel_hidden, TE, d_gate.as<bf16>(), B);
         if (!subset)  // candidates are vocabulary ids already: score the lattice on the device
             tqllm_cuda::dflash_lattice(d_idx.as<uint32_t>(), d_vals.as<float>(), d_gate.as<bf16>(), dfl.rank, dfl.sel_next,

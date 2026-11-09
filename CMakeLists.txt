@@ -95,6 +95,12 @@ add_executable(test-tree-columns tests/tree_columns.cpp)
 add_test(NAME tree-columns COMMAND test-tree-columns)
 add_executable(test-draft-tree tests/draft_tree.cpp src/spec/draft_tree.cpp)  # tree selectors (chain / best-first), no CUDA
 add_test(NAME draft-tree COMMAND test-draft-tree)
+add_executable(test-dspine tests/dspine.cpp)
+add_test(NAME dspine COMMAND test-dspine)
+add_executable(test-dspine-schema tests/dspine_schema.cpp)
+target_link_libraries(test-dspine-schema PRIVATE tqllm)
+add_test(NAME dspine-schema COMMAND test-dspine-schema)
+add_test(NAME dspine-converter COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dspine_converter.py)
 add_executable(test-draft-tree-8k tests/draft_tree_8k.cpp src/spec/draft_tree.cpp)  # the 8K release lattice fixture: baselines (ctest) and the policy gate (--gate)
 add_test(NAME draft-tree-8k COMMAND test-draft-tree-8k)
 set_tests_properties(draft-tree-8k PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -172,11 +178,11 @@ if(TQLLM_CUDA)
   target_sources(tqllm PRIVATE ${TQLLM_FORMAT_SOURCES})
   target_include_directories(tqllm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3)
   target_sources(tqllm PRIVATE src/kv/kv_store_cuda.cpp src/engine/model.cpp src/engine/registry.cpp src/backends/cuda/builtin_cuda.cpp
-    src/backends/cuda/qwen2_engine.cpp src/backends/cuda/load_fitted.cpp src/backends/cuda/model_capture.cpp src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp
+    src/backends/cuda/qwen2_engine.cpp src/backends/cuda/load_fitted.cpp src/backends/cuda/model_capture.cpp src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp src/models/qwen/qwen35/qwen35_dspine.cpp
     src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp
     src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu src/experts/moe.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/models/qwen/qwen35/attention.cu
-    src/spec/dflash.cu src/vision/vision.cpp src/vision/vision.cu
-    src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu)
+    src/spec/dflash.cu src/spec/dspine.cu src/vision/vision.cpp src/vision/vision.cu
+    src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu src/experts/mmq_runtime.cpp)
   # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
   # weights through MappedGguf, which moves here from the per-tool source lists (tqserve, tqfn-stage).
   target_sources(tqllm PRIVATE src/core/common_kernels.cu src/experts/moe_common.cu src/core/gguf_mapped.cpp)
@@ -513,14 +519,8 @@ if(TQLLM_CUDA)
   target_include_directories(test-kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-kernels PRIVATE tqllm CUDA::cudart)
   add_test(NAME kernels COMMAND test-kernels)
-  # kernels runs the full CUDA kernel oracle suite and measured 83.70 s on an RTX 3090,
-  # so the release suite's default --timeout 60 cut it off and reported a false Timeout
-  # failure even though the test itself passes (all kernel oracles OK). Give it its own
-  # headroom instead of raising the suite-wide default, which would silently let genuinely
-  # hung tests run 3x longer everywhere else. Reviewer decision (2026-10-11): 180 s
-  # for kernels, suite default stays 60 s. On a slower CI GPU than a 3090 this margin
-  # shrinks (~2.1x here); raise it further if CI hardware is weaker.
-  set_tests_properties(kernels PROPERTIES TIMEOUT 180)
+  # The FP64 CPU attention oracles exceed 180 s on .231; keep the longer limit local to this test.
+  set_tests_properties(kernels PROPERTIES TIMEOUT 600)
   add_executable(test-fp8-gemm tests/fp8_gemm.cu)
   target_include_directories(test-fp8-gemm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-fp8-gemm PRIVATE tqllm CUDA::cudart CUDA::cublas CUDA::cublasLt)
@@ -646,6 +646,15 @@ if(TQLLM_CUDA)
   target_include_directories(test-dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-dflash PRIVATE tqllm CUDA::cudart)
   add_test(NAME dflash COMMAND test-dflash)
+  add_executable(test-dspine-cuda tests/dspine.cu)
+  target_link_libraries(test-dspine-cuda PRIVATE tqllm CUDA::cudart CUDA::cublas)
+  add_test(NAME dspine-cuda COMMAND test-dspine-cuda)
+  set_tests_properties(dspine-cuda PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(test-attention128-exact tests/attention128_exact.cu)
+  target_link_libraries(test-attention128-exact PRIVATE tqllm CUDA::cudart)
+  add_test(NAME attention128-exact COMMAND test-attention128-exact)
+  set_tests_properties(attention128-exact PROPERTIES SKIP_RETURN_CODE 77)
+
   add_executable(tqdevice tools/tqdevice.cu)
   target_link_libraries(tqdevice PRIVATE CUDA::cudart)
   install(TARGETS tqdevice RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

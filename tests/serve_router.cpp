@@ -66,6 +66,23 @@ int main() {
         const int k = tqserve::pick_box(b, 200, 384);
         check(k == 0 || k == 1, "both full -> a box");
     }
+    // a busy peer answers its status late (16 requests at once): it stays a candidate with its last answer + the
+    // front door's in-flight count, instead of being skipped while the front door queues past its slots (11-09)
+    {
+        tqserve::PeerMemory mem;
+        BoxStatus seen = box(8, 0); seen.ok = true;
+        (void) tqserve::remembered_status(seen, mem);           // an earlier answer: 8 free
+        BoxStatus late; late.ok = false; late.inflight = 3;      // this query timed out; 3 sent there, not finished
+        const BoxStatus used = tqserve::remembered_status(late, mem);
+        check(used.ok && used.inflight == 3 && used.free == 8, "late answer: last status, current in-flight");
+        BoxStatus front = box(0, 8, 0, 0, 8); front.ok = true;   // the front door is full
+        check(tqserve::pick_box({front, used}, 200, 384) == 1, "full front door, late peer with room -> peer");
+        (void) tqserve::remembered_status(late, mem);
+        const BoxStatus down = tqserve::remembered_status(late, mem);  // third miss in a row
+        check(!down.ok, "three misses in a row -> skipped");
+        tqserve::PeerMemory fresh;
+        check(!tqserve::remembered_status(late, fresh).ok, "never answered -> skipped");
+    }
     if (failures) return 1;
     std::puts("serve_router: ok");
     return 0;

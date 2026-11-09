@@ -5,6 +5,10 @@
 #include <utility>
 #include <vector>
 namespace tqllm::mlx_backend {
+struct DSpineBridgeResult { mlx::core::array output,raw,rms,packed; };
+DSpineBridgeResult dspine_bridge(const mlx::core::array& raw,const mlx::core::array& anchor,
+    const mlx::core::array& read,const mlx::core::array& write,const mlx::core::array& codebook,
+    const mlx::core::array& packed_weights,const mlx::core::array& bias,float epsilon);
 // side 0: input taps of the block, side 1: output taps; with a residual, returns bf(residual + conv)
 mlx::core::array dflash_conv(const mlx::core::array& input,const mlx::core::array& dynamic,
                             const mlx::core::array& base,int group,int side,
@@ -24,6 +28,7 @@ public:
     DFlash2(const std::string& path,Qwen35& target,int block_rows=16);
     ~DFlash2();
     const std::vector<int>& feature_layers() const;
+    bool dspine() const;
     void reset();
     void inject(const mlx::core::array& features,int position);
     std::vector<uint32_t> draft(uint32_t anchor,int position,int count);
@@ -33,7 +38,7 @@ public:
     struct HostLattice {
         int positions=0,topk=0,rank=0;
         std::vector<uint32_t> tokens,predecessor_tokens;
-        std::vector<float> unary,gate,successor,predecessor;
+        std::vector<float> unary,gate,successor,predecessor,dense_scores;
         const float* predecessor_row(uint32_t token) const;
     };
     HostLattice draft_lattice(uint32_t anchor,int position,int count);

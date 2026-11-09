@@ -11,8 +11,9 @@ constexpr int kMaxTopK = 16;  // the drafter's top-16 head
 constexpr int kMaxNodes = 63; // TensorFold's own ceiling for one tree
 
 void check(const DraftLattice& lattice, const DraftTreeOptions& options) {
-    if (lattice.positions < 1 || lattice.topk < 1 || lattice.topk > kMaxTopK || lattice.rank < 1 || !lattice.tokens ||
-        !lattice.unary || !lattice.gate || !lattice.successor || !lattice.predecessor)
+    if (lattice.positions < 1 || lattice.topk < 1 || lattice.topk > kMaxTopK || !lattice.tokens ||
+        (!lattice.dense_scores && (lattice.rank < 1 || !lattice.unary || !lattice.gate ||
+                                  !lattice.successor || !lattice.predecessor)))
         throw std::invalid_argument("invalid draft lattice");
     if (options.nodes < 1 || options.nodes > kMaxNodes || options.children < 1 || options.children > lattice.topk ||
         !std::isfinite(options.tau) || options.tau <= 0 || !std::isfinite(options.edge) ||
@@ -59,14 +60,22 @@ DraftTree best_first_tree(const DraftLattice& lattice, uint32_t anchor, const Dr
     // probability of its whole path), then offer the best `children` of them to the frontier.
     auto expand = [&](uint32_t parent_token, int parent, int depth, float cumulative) {
         if (depth >= lattice.positions) return;
-        const float* predecessor = lattice.predecessor(lattice.context, parent_token);
-        const float* gate = lattice.gate + size_t(depth) * lattice.rank;
-        const float* unary = lattice.unary + size_t(depth) * lattice.topk;
-        const float* successor = lattice.successor + size_t(depth) * lattice.topk * lattice.rank;
+        const float* predecessor = lattice.dense_scores ? nullptr : lattice.predecessor(lattice.context, parent_token);
+        const float* gate = lattice.dense_scores ? nullptr : lattice.gate + size_t(depth) * lattice.rank;
+        const float* unary = lattice.dense_scores ? nullptr : lattice.unary + size_t(depth) * lattice.topk;
+        const float* successor = lattice.dense_scores ? nullptr : lattice.successor + size_t(depth) * lattice.topk * lattice.rank;
+        int previous = 0;
+        if (lattice.dense_scores && depth) {
+            const auto* begin = lattice.tokens + size_t(depth - 1) * lattice.topk;
+            const auto* found = std::find(begin, begin + lattice.topk, parent_token);
+            if (found == begin + lattice.topk) throw std::invalid_argument("DSpine predecessor outside previous candidates");
+            previous = int(found - begin);
+        }
         float maximum = -INFINITY;
         for (int c = 0; c < lattice.topk; ++c) {
-            score[c] = candidate_score(options, predecessor, gate, successor + size_t(c) * lattice.rank, lattice.rank,
-                                       unary[c]);
+            score[c] = lattice.dense_scores
+                ? lattice.dense_scores[(size_t(depth) * lattice.topk + previous) * lattice.topk + c] / options.tau
+                : candidate_score(options, predecessor, gate, successor + size_t(c) * lattice.rank, lattice.rank, unary[c]);
             maximum = std::max(maximum, score[c]);
         }
         double total = 0;

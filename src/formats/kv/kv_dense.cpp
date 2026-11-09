@@ -30,6 +30,12 @@ struct KvBf16 final : KvFormat {
         auto * kc = static_cast<__nv_bfloat16 *>(a.kc), * vc = static_cast<__nv_bfloat16 *>(a.vc);
         tqllm_cuda::cache_write_multi(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, kc, vc, a.dpos, a.kvheads,
                                       a.head_dim, a.stream);
+        if (a.head_dim == 128) {
+            if (a.par) throw std::invalid_argument("128-dimensional BF16 KV does not support tree masks");
+            tqllm_cuda::attention_gen128(a.q, kc, vc, a.o, a.part, a.dpos, a.n, int(a.context), a.heads, a.kvheads,
+                                        a.scale, true, 0, a.stream);
+            return;
+        }
         if (a.par) {  // tree / chain verify block: cache part + in-block ancestors (n <= 8)
             tqllm_cuda::attention_mq256(a.q, kc, vc, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.split,
                                         a.stream, 0, a.par, a.dep);

@@ -65,6 +65,7 @@ public:
     bool spec_advance();  // one draft + verify step; false once done
     // Batched step: one verify pass over all listed slots (weights read once); done[i] = slot slots[i] finished.
     void spec_step(const std::vector<int> & slots, std::vector<char> & done);
+    void spec_abort(int slot);  // a failed request: free the slot (Engine::spec_abort)
     std::vector<uint32_t> spec_finish(uint64_t * stats = nullptr);
     // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
     const std::vector<uint32_t> & spec_tokens(int slot = 0) const;

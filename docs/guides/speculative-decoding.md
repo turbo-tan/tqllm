@@ -2,6 +2,10 @@
 
 [Documentation](../README.md) / [Project home](../../README.md)
 
+The experimental [DSpine variant](../models/dspine.md) has a separate checkpoint contract
+and release gate, with checkpoints for Qwen3-8B and Qwen3.8-27B. On the 27B it currently
+measures slower than the DFlash2 drafter below; neither checkpoint replaces it.
+
 ## Fast decoding: about 250 tok/s on an RTX 3090
 
 tqLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,

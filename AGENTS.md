@@ -73,7 +73,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
         |
         v
   src/models/<family>/<arch>/      one folder per architecture
-        qwen/qwen35          Qwen3.5 / Qwen3.8 dense and qwen35moe: one engine, MoE is a block type
+        qwen/qwen35          Qwen3.5 / Qwen3.8 dense and qwen35moe; experimental ungated Qwen3 target variant
         qwen/qwen4exp        Flash-Next
         qwen/qwen2           the draft-model forward
         glm/glm5next         GLM-5.3-Flash (DSA attention, MoE)
@@ -85,7 +85,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
   src/formats/kv/            KV-cache formats: record layout + attention + registry (KvFormat)
   src/kv/                    KV store: device / host tiers (KvMemory, CUDA virtual memory), TqCache
   src/experts/               routing, grouped expert GEMM, expert caches (VRAM / host / mixed): every MoE model
-  src/spec/                  drafting and verify: DFlash, token trees
+  src/spec/                  drafting and verify: DFlash, DSpine bridge/schema, token trees
   src/vision/                vision encoders (--mmproj)
         |
         v

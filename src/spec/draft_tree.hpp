@@ -19,6 +19,9 @@ struct DraftLattice {
     // bf16 for DFlash2) never comes to the host.
     const float* (*predecessor)(void* context, uint32_t token) = nullptr;
     void* context = nullptr;
+    // Optional DSpine scores [positions][topk predecessors][topk candidates].
+    // Position 0 uses predecessor row 0 (the anchor); later rows index the preceding position's candidate list.
+    const float* dense_scores = nullptr;
 };
 
 // A draft tree: row i is the token tokens[i] whose parent row is parents[i] (-1 for the anchor root row, which is not

@@ -399,13 +399,15 @@ struct Qwen35::Impl {
         stages[std::string(name)+"_calls"]+=1;
     }
     std::pair<double,double> times={0,0};
+    bool gated_attention=true;
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         build_split=tqllm::debug_cstr("build_split")!=nullptr;
         stream_layers=tqllm::debug_cstr("nostream")==nullptr;
         if(const int g=tqllm::debug_int("stream_group");g>0)stream_group=g;
         const auto arch=file.kv.at("general.architecture").str;
-        if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
-        const std::string a="qwen35.";
+        if(arch!="qwen35" && arch!="qwen3") throw std::invalid_argument("MLX dense forward requires qwen3 or qwen35 architecture");
+        gated_attention=arch!="qwen3";
+        const std::string a=arch+".";
         auto integer=[&](const std::string& key) {
             const double x=file.num(a+key);
             if(!std::isfinite(x)||x<=0||x>std::numeric_limits<int>::max()||x!=std::floor(x))
@@ -415,10 +417,14 @@ struct Qwen35::Impl {
         layers=integer("block_count")-int(file.num(a+"nextn_predict_layers",0));
         hidden=integer("embedding_length");heads=integer("attention.head_count");
         kvheads=integer("attention.head_count_kv");hd=integer("attention.key_length");
-        rot=integer("rope.dimension_count");kh=integer("ssm.group_count");
+        rot=file.has(a+"rope.dimension_count")?integer("rope.dimension_count"):hd;
+        if(gated_attention) {
+        kh=integer("ssm.group_count");
         vh=integer("ssm.time_step_rank");dk=integer("ssm.state_size");
         dv=integer("ssm.inner_size")/vh;conv=integer("ssm.conv_kernel");
-        interval=integer("full_attention_interval");eps=float(file.num(a+"attention.layer_norm_rms_epsilon"));
+        interval=integer("full_attention_interval");
+        } else {kh=vh=1;dk=dv=32;conv=4;interval=1;}
+        eps=float(file.num(a+"attention.layer_norm_rms_epsilon"));
         theta=float(file.num(a+"rope.freq_base"));
         if(ctx<=0||layers<=0||conv!=4||vh%kh||heads%kvheads||rot>hd||rot%2||dv<=0||dk<32||dk%32)
             throw std::invalid_argument("unsupported qwen35 dimensions");
@@ -463,7 +469,9 @@ struct Qwen35::Impl {
             matrices.emplace(name,std::move(w));
         };
         auto scalar=[&](const std::string& name) {
-            const auto& t=file.tensors.at(name);auto raw=file.read(t);
+            auto source=name;
+            if(!gated_attention && name.ends_with("post_attention_norm.weight"))source=name.substr(0,name.size()-std::string("post_attention_norm.weight").size())+"ffn_norm.weight";
+            const auto& t=file.tensors.at(source);auto raw=file.read(t);
             auto w=mx::astype(load_plain_tensor(t,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()}),mx::float32);
             mx::eval(w);plain.emplace(name,std::move(w));
         };
@@ -895,7 +903,7 @@ struct Qwen35::Impl {
         auto in=pack_product16(p+"attn_in",x);
         if(!in.empty())stage("attn_in_gemm",{in[0]});
         // fused q/k norm + RoPE: read the packed FP16 products in place, one kernel for q (with gate) and k, v unchanged
-        if(!in.empty() && attn_qk_fused_on() && attn_qk_fused!=0) {
+        if(gated_attention && !in.empty() && attn_qk_fused_on() && attn_qk_fused!=0) {
             auto f=attn_qk_norm_rope(in[0],in[1],in[2],
                                      plain.at(p+"attn_q_norm.weight"),plain.at(p+"attn_k_norm.weight"),
                                      heads,kvheads,hd,rot,theta,eps,offset,tree?&tree->depth:nullptr);
@@ -910,8 +918,8 @@ struct Qwen35::Impl {
             if(attn_qk_fused) {stage("attn_qk_norm_rope",{f.q,f.k,f.v,f.gate});return attn_core(p,f.q,f.k,f.v,f.gate,c,offset,layer,m,&x);}
         }
         auto proj=[&](int i,const char* name) {return in.empty()?mat(p+name,x):round_product(in[i]);};
-        auto qg=mx::reshape(proj(0,"attn_q.weight"),{m,heads,2*hd});
-        auto q=tail_slice(qg,2,0,hd),gate=tail_slice(qg,2,hd,2*hd);
+        auto qg=mx::reshape(proj(0,"attn_q.weight"),{m,heads,(gated_attention?2:1)*hd});
+        auto q=tail_slice(qg,2,0,hd),gate=gated_attention?tail_slice(qg,2,hd,2*hd):mx::ones({m,heads,hd},mx::float32);
         q=mx::transpose(mx::reshape(norm(q,p+"attn_q_norm.weight"),{1,m,heads,hd}),{0,2,1,3});
         auto k=mx::reshape(proj(1,"attn_k.weight"),{1,m,kvheads,hd});
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
@@ -1688,6 +1696,7 @@ mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {
 }
 void Qwen35::reserve_kv(int rows) {impl_->kv_reserve=std::max(0,rows);}
 void Qwen35::kv_format(KvTier tier) {
+    if(!impl_->gated_attention && tier!=KvTier::Bf16)throw std::invalid_argument("Qwen3 currently requires BF16 KV");
     if(impl_->pos!=0)throw std::invalid_argument("the KV format is chosen per request, before its prefill");
     if(tier!=impl_->kv_tier)for(auto* kv:{&impl_->kv_keys,&impl_->kv_values,&impl_->kv_kscale,&impl_->kv_vscale,&impl_->kv_index,&impl_->kv_blocks})for(auto& a:*kv)a.reset();
     impl_->kv_tier=tier;
@@ -1720,12 +1729,18 @@ KvBudget Qwen35::kv_budget(int prefill_chunk) const {
     return b;
 }
 KvTier Qwen35::choose_kv_format(int rows,int prefill_chunk,size_t other_row_bytes) const {
+    if(!impl_->gated_attention)return KvTier::Bf16;
     KvBudget b=kv_budget(prefill_chunk);
     b.in_use+=size_t(rows)*(other_row_bytes+impl_->qsa_row_bytes());  // + what other caches (drafter, QSA) will hold
     return choose_kv_tier(rows,attention_layers(),impl_->kvheads,impl_->hd,b);
 }
 KvPlan Qwen35::plan_kv_format(int prompt_rows,int answer_rows,int prefill_chunk,size_t far_row_bytes) const {
     const int rows=prompt_rows+answer_rows+16;
+    if(!impl_->gated_attention) {
+        if(!kv_fits(KvTier::Bf16,rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk)))
+            throw std::invalid_argument("Qwen3 request does not fit BF16 KV; reduce context or output length");
+        return {KvTier::Bf16,false,true};
+    }
     const size_t lean=(size_t(512)<<20)+size_t(prefill_chunk)*size_t(impl_->hidden)*40;  // the decode-time cache limit
     return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes+impl_->qsa_row_bytes(),lean,request_kv_first(prompt_rows,answer_rows,impl_->exact));
 }
@@ -1741,6 +1756,10 @@ int Qwen35::attention_layers() const {return impl_->layers/impl_->interval;}
 int Qwen35::kv_heads() const {return impl_->kvheads;}
 int Qwen35::q_heads() const {return impl_->heads;}
 int Qwen35::head_dim() const {return impl_->hd;}
+int Qwen35::context() const {return impl_->context;}
+int Qwen35::hidden_size() const {return impl_->hidden;}
+int Qwen35::layer_count() const {return impl_->layers;}
+std::string Qwen35::architecture() const {return impl_->file.str("general.architecture");}
 void Qwen35::reset() {
     ++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};
     impl_->last_hidden.reset();impl_->mtp_cache=Cache{};impl_->mtp_pos=1;

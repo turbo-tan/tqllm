@@ -44,6 +44,19 @@ inline double route_cost(const BoxStatus & b, double prompt, double gen) {
     return wait + fresh + decode + stall;
 }
 
+// A peer whose status query was late is busy, not gone (16 requests at once: a box that is prefilling answered after
+// the 100 ms timeout, was skipped, and its share queued on the full front door, 11-09 NVFP4 16 users 217 vs 2 x 136):
+// keep using its last answer with the front door's own in-flight count; skip it only after `kMissesDown` misses in a row.
+constexpr int kMissesDown = 3;
+struct PeerMemory { BoxStatus last; int misses = 0; };
+inline BoxStatus remembered_status(const BoxStatus & now, PeerMemory & m) {
+    if (now.ok) { m.last = now; m.misses = 0; return now; }
+    if (++m.misses >= kMissesDown || !m.last.ok) return now;
+    BoxStatus b = m.last;
+    b.reuse = 0;                // which slot holds what is not known now
+    b.inflight = now.inflight;  // the front door's count is current
+    return b;
+}
 // Index of the box to serve the request; box 0 is the front door (no network hop). Boxes that did not answer are
 // skipped; near-equal costs (within 2 %) go to the less loaded box, then the front door.
 inline int pick_box(const std::vector<BoxStatus> & boxes, double prompt, double gen) {

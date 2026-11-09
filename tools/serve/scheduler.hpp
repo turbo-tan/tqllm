@@ -184,6 +184,9 @@ private:
         complete(job);
     }
 
+    // the engine forgets a failed request's slot (Engine::spec_abort): otherwise it still counts it as running, refuses
+    // the next request for memory while the scheduler sees nothing to wait for, and that refusal becomes another 500
+    void abort_slot(int s) { try { model_.spec_abort(s); } catch (...) {} }
     void complete(std::shared_ptr<Job> & job) {
         if (!job->result.error.empty()) std::fprintf(stderr, "tqserve: request failed (HTTP 500): %s\n", job->result.error.c_str());
         {
@@ -270,6 +273,7 @@ private:
                         continue;
                     }
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
+                    abort_slot(int(s));
                     complete(job);
                 }
             }
@@ -291,6 +295,7 @@ private:
                     if (!model_.spec_advance() || step_done(*job, ids[0])) finish_slot(ids[0]);
                 } catch (const std::exception & e) {
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
+                    abort_slot(ids[0]);
                     complete(job);
                 }
             } else if (!ids.empty()) {  // batched: one verify pass over all slots
@@ -306,6 +311,7 @@ private:
                         auto & job = active_[size_t(id)];
                         if (!job) continue;
                         job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
+                        abort_slot(id);
                         complete(job);
                     }
                 }

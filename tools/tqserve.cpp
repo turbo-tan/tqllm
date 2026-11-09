@@ -524,11 +524,15 @@ int main(int argc, char ** argv) {
                     const double prompt = double(parsed.prompt_text.size()) / scheduler->chars_per_token();
                     const double gen = std::min<double>(parsed.max_tokens, 512);
                     static std::vector<std::atomic<int>> inflight(peers.size() + 1);  // routed here, not finished
+                    static std::vector<tqserve::PeerMemory> memory(peers.size() + 1);  // last answer per peer (router.hpp)
                     static std::mutex route_mutex;
                     int pick = 0;
                     {
                         std::lock_guard<std::mutex> lk(route_mutex);
-                        for (size_t i = 0; i < boxes.size(); ++i) boxes[i].inflight = inflight[i].load();
+                        for (size_t i = 0; i < boxes.size(); ++i) {
+                            boxes[i].inflight = inflight[i].load();
+                            if (i > 0) boxes[i] = tqserve::remembered_status(boxes[i], memory[i]);
+                        }
                         pick = tqserve::pick_box(boxes, prompt, gen);
                         ++inflight[size_t(pick)];
                     }

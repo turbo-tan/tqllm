@@ -1,6 +1,7 @@
 #include <sstream>
 #include "debug.hpp"
 #include "dflash.hpp"
+#include "dspine.hpp"
 #include "dflash_retrieve.hpp"
 #include "nax_affine.hpp"
 #include "dequant.hpp"
@@ -148,6 +149,48 @@ for(uint step=1;step<=COUNT;++step) {
         {{count}},{mx::uint32},{32,1,1},{32,1,1},
         {{"COUNT",count},{"VOCAB",predecessors.shape(0)}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
+DSpineBridgeResult dspine_bridge(const mx::array& raw,const mx::array& anchor,const mx::array& read,
+    const mx::array& write,const mx::array& codebook,const mx::array& packed_weights,const mx::array& bias,float epsilon) {
+    if(raw.ndim()!=2 || raw.shape(0)<2 || read.ndim()!=2 || write.ndim()!=2 ||
+       read.shape(1)!=raw.shape(1) || write.shape(0)!=raw.shape(1) || write.shape(1)!=bias.size() ||
+       codebook.ndim()!=2 || codebook.shape(1)!=read.shape(0) ||
+       packed_weights.shape()!=mx::Shape{int(3*bias.size()),read.shape(0)} || !(epsilon>0))
+    throw std::invalid_argument("invalid DSpine bridge dimensions");
+    auto project=[](const mx::array& w,const mx::array& x) {
+    return bf(mx::matmul(mx::astype(x,mx::bfloat16),mx::transpose(mx::astype(w,mx::bfloat16))));
+    };
+    const int n=raw.shape(0),C=read.shape(0),R=bias.size();
+    auto rms=mx::sqrt(mx::maximum(mx::mean(mx::square(raw),-1,true),mx::array(std::numeric_limits<float>::min())));
+    auto normalized=bf(mx::divide(raw,mx::add(rms,mx::array(epsilon))));
+    auto projected=project(read,normalized);
+    auto length=mx::sqrt(mx::sum(mx::square(projected),-1,true));
+    auto codes=bf(mx::divide(mx::multiply(projected,mx::array(std::sqrt(float(C)))),mx::add(length,mx::array(epsilon))));
+    auto exact=bf(mx::multiply(mx::reshape(mx::take(codebook,mx::reshape(anchor,{1}),0),{1,C}),mx::array(std::sqrt(float(C)))));
+    codes=mx::concatenate({exact,rows(codes,1,n)},0);
+    auto packed=bf(mx::matmul(mx::astype(codes,mx::bfloat16),mx::transpose(mx::astype(packed_weights,mx::bfloat16))));
+    auto q=mx::slice(packed,{1,0},{n,R}),s=mx::slice(packed,{0,R},{n-1,2*R}),v=mx::slice(packed,{0,2*R},{n-1,3*R});
+    auto gate=mx::sigmoid(mx::add(mx::add(q,s),bias));
+    auto msg=bf(mx::concatenate({mx::zeros({1,R}),mx::multiply(gate,v)},0));
+    auto delta=project(write,msg);
+    return {mx::concatenate({rows(raw,0,1),rows(bf(mx::add(raw,mx::multiply(rms,delta))),1,n)},0),raw,rms,packed};
+}
+
+namespace {
+mx::array dspine_select(const mx::array& mapped,const mx::array& scores,int count) {
+    if(scores.shape()!=mx::Shape{mapped.shape(0),16,16} || count<1 || count>=mapped.shape(0))
+        throw std::invalid_argument("invalid DSpine score lattice");
+    auto previous=mx::array(0,mx::int32);
+    std::vector<mx::array> chosen;
+    for(int row=1;row<=count;++row) {
+        auto table=mx::reshape(mx::slice(scores,{row,0,0},{row+1,16,16}),{16,16});
+        auto logits=mx::reshape(mx::take(table,mx::reshape(previous,{1}),0),{16});
+        previous=mx::astype(mx::argmax(logits),mx::int32);
+        auto tokens=mx::reshape(mx::slice(mapped,{row,0},{row+1,16}),{16});
+        chosen.push_back(mx::reshape(mx::take(tokens,mx::reshape(previous,{1}),0),{}));
+    }
+    return mx::stack(chosen,0);
+}
+}
 struct DFlash2::Impl {
     Qwen35& target;
     GgufFile file;
@@ -160,6 +203,9 @@ struct DFlash2::Impl {
     std::map<std::string,Matrix> matrices;
     std::map<std::string,NaxAffine> nax;
     std::vector<std::vector<uint32_t>> candidates;
+    bool spine=false;
+    spec::DSpineConfig spine_cfg;
+    std::optional<mx::array> spine_raw,spine_rms,spine_packed;
     bool device_only=false;                 // draft_device: leave the chosen ids on the GPU
     std::optional<mx::array> last_chosen;
     std::map<std::string,mx::array> plain;
@@ -239,25 +285,31 @@ struct DFlash2::Impl {
     std::vector<Kv> caches;
     Impl(const std::string& path,Qwen35& engine,int block_rows):target(engine),file(gguf_open(path)) {
         if(file.kv.at("general.architecture").str!="dflash")throw std::invalid_argument("DFlash GGUF required");
+        spine=spec::is_dspine(file);
+        if(spine)spine_cfg=spec::dspine_config(file,target.hidden_size(),target.vocabulary(),target.layer_count(),target.architecture());
         hidden=int(file.num("dflash.embedding_length"));heads=int(file.num("dflash.attention.head_count"));
         kvheads=int(file.num("dflash.attention.head_count_kv"));hd=int(file.num("dflash.attention.key_length"));
         block=int(file.num("dflash.block_size"));
         // block_rows: draft blocks of up to that many rows (16 served: block-16 pricing with a block-8 drafter, own block-16
         // drafters); a draft of fewer than the file's native block rows runs at the native block (j924: its 7 drafts beat the
         // head of a 16-draft)
-        block=block_rows;native=std::min(block,int(file.num("dflash.block_size")));group=int(file.num("dflash.conv_group_size"));
+        block=block_rows;native=std::min(block,int(file.num("dflash.block_size")));group=spine?0:int(file.num("dflash.conv_group_size"));
         fill_bound=block;
-        window=int(file.num("dflash.attention.sliding_window"));rank=int(file.num("dflash.selector_rank"));
+        window=int(file.num("dflash.attention.sliding_window"));rank=spine?spine_cfg.rank:int(file.num("dflash.selector_rank"));
+        if(spine) {window=target.context();far_enabled=false;}
         mask=uint32_t(file.num("tokenizer.ggml.mask_token_id"));
         eps=float(file.num("dflash.attention.layer_norm_rms_epsilon"));theta=float(file.num("dflash.rope.freq_base"));
         vocab=target.vocabulary();
         for(double id:file.kv.at("dflash.target_layers").arr)features.push_back(int(id));
         const int layers=int(file.num("dflash.block_count"));
-        if(hidden!=5120 || hd!=128 || heads!=32 || kvheads!=8 || (block!=8 && block!=16) || group!=16 || rank!=256 ||
-           layers!=5 || mask>=uint32_t(vocab) || file.num("dflash.conv_kernel_size")!=2)
+        if(hd!=128 || (block!=8 && block!=16) || mask>=uint32_t(vocab) || (!spine &&
+           (hidden!=5120 || heads!=32 || kvheads!=8 || group!=16 || rank!=256 || layers!=5 || file.num("dflash.conv_kernel_size")!=2)))
             throw std::invalid_argument("unsupported DFlash2 dimensions");
         for(const auto& [name,tensor]:file.tensors) {
-            if(name=="selector_predecessor.weight" || name=="selector_successor.weight") {
+            if(name.find("dspine_")!=std::string::npos) {
+                auto raw=file.read(tensor);auto value=load_plain_tensor(tensor,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()});
+                value=mx::astype(value,mx::float32);mx::eval(value);plain.emplace(name,std::move(value));
+            } else if(name=="selector_predecessor.weight" || name=="selector_successor.weight") {
                 if(tensor.ne!=std::vector<uint64_t>{uint64_t(rank),uint64_t(vocab)})
                     throw std::invalid_argument("DFlash selector vocabulary mismatch");
                 auto raw=file.read(tensor);std::vector<float> table(size_t(rank)*vocab);
@@ -289,6 +341,33 @@ struct DFlash2::Impl {
         caches.resize(layers);target.feature_layers(features);
         ring=window>0;
     }
+    mx::array bridge_mm(const std::string& name,const mx::array& x) {
+        return bf(mx::matmul(mx::astype(x,mx::bfloat16),mx::transpose(mx::astype(plain.at(name),mx::bfloat16))));
+    }
+    mx::array bridge(const std::string& p,const mx::array& raw,const mx::array& anchor,bool last) {
+        auto weights=mx::concatenate({plain.at("dspine_gate.weight"),plain.at("dspine_pred_gate.weight"),plain.at("dspine_prev.weight")},0);
+        auto result=dspine_bridge(raw,anchor,plain.at(p+"dspine_read.weight"),plain.at(p+"dspine_write.weight"),
+                                  plain.at("dspine_codebook.weight"),weights,plain.at("dspine_gate.bias"),spine_cfg.epsilon);
+        if(last) {spine_raw=result.raw;spine_rms=result.rms;spine_packed=result.packed;}
+        return result.output;
+    }
+    mx::array refine(const mx::array& selected,const mx::array& anchor) {
+        const int n=selected.shape(0),P=n-1,C=spine_cfg.code,R=spine_cfg.rank;
+        auto mapped=mx::take(target.draft_ids(),selected,0);
+        auto previous=mx::concatenate({mx::broadcast_to(mx::reshape(anchor,{1,1}),{1,16}),rows(mapped,1,n-1)},0);
+        auto codes=bf(mx::multiply(mx::take(plain.at("dspine_codebook.weight"),mx::reshape(previous,{-1}),0),mx::array(std::sqrt(float(C)))));
+        auto sv=mx::reshape(bf(mx::matmul(mx::astype(codes,mx::bfloat16),mx::transpose(mx::astype(mx::concatenate({plain.at("dspine_pred_gate.weight"),plain.at("dspine_prev.weight")},0),mx::bfloat16)))),{P,16,2*R});
+        auto own=mx::reshape(mx::slice(*spine_packed,{1,0},{n,R}),{P,1,R});
+        auto gate=mx::sigmoid(mx::add(mx::add(own,mx::slice(sv,{0,0,0},{P,16,R})),plain.at("dspine_gate.bias")));
+        auto msg=bf(mx::multiply(gate,mx::slice(sv,{0,0,R},{P,16,2*R})));
+        auto delta=mx::reshape(bridge_mm("blk."+std::to_string(caches.size()-1)+".dspine_write.weight",mx::reshape(msg,{P*16,R})),{P,16,hidden});
+        auto raw=mx::reshape(rows(*spine_raw,1,n),{P,1,hidden}),rms=mx::reshape(rows(*spine_rms,1,n),{P,1,1});
+        auto refined=norm("output_norm.weight",mx::reshape(bf(mx::add(raw,mx::multiply(rms,delta))),{P*16,hidden}));
+        auto logits=target.shared_draft_head(refined);
+        auto ids=mx::broadcast_to(mx::reshape(rows(selected,1,n),{P,1,16}),{P,16,16});
+        auto table=mx::take_along_axis(mx::reshape(logits,{P,16,logits.shape(1)}),mx::astype(ids,mx::int32),2);
+        return mx::concatenate({mx::zeros({1,16,16}),table},0);
+    }
     mx::array mat(const std::string& name,const mx::array& x) {
         if(auto found=nax.find(name);found!=nax.end())return nax_affine_matmul(found->second,x,true);
         return bf(linear(matrices.at(name),x));
@@ -313,7 +392,7 @@ struct DFlash2::Impl {
     }
     // in: x [block, hidden], position (int32 scalar), [mask over the span], then k, v per layer; attention reads the
     // leading `span` rows (block + filled); out: x, then the updated k, v
-    std::vector<mx::array> ring_layers(const std::vector<mx::array>& in,int span,bool masked,bool retr=false,int scored=0,bool ahead=false,int rows=0) {
+    std::vector<mx::array> ring_layers(const std::vector<mx::array>& in,int span,bool masked,bool retr=false,int scored=0,bool ahead=false,int rows=0,const std::optional<mx::array>& spine_anchor=std::nullopt) {
         auto x=in[0];const auto& position=in[1];size_t at=2;
         // retr_split (TQLLM_DEBUG): the retrieval's parts, one draft's worth; retr_share selects the far chunks once off
         // the first layer's queries and gathers every layer's keys at those positions
@@ -346,8 +425,8 @@ struct DFlash2::Impl {
             const bool mark=dsp && l==0;
             if(mark)rt=std::chrono::steady_clock::now();
             auto kc=in[at+per*l],vc=in[at+per*l+1];
-            auto residual=x,n=norm(p+"attn_norm.weight",x),dynamic=mat(p+"attn_conv_proj.weight",n);
-            auto input=dflash_conv(n,dynamic,plain.at(p+"attn_conv_base"),group,0);
+            auto residual=x,n=norm(p+"attn_norm.weight",x),dynamic=spine?mx::zeros({1}):mat(p+"attn_conv_proj.weight",n);
+            auto input=spine?n:dflash_conv(n,dynamic,plain.at(p+"attn_conv_base"),group,0);
             auto q=mx::reshape(mat(p+"attn_q.weight",input),{1,rows,heads,hd});
             q=mx::transpose(norm(p+"attn_q_norm.weight",q),{0,2,1,3});
             // BF16 straight from RoPE (the BF16 rounding of the FP32 values, one cast); the FP32 q only for retrieval
@@ -384,17 +463,23 @@ struct DFlash2::Impl {
                 // attention off the unmasked kernel at every retrieving draft)
                 if(mask)amask=mx::concatenate({mx::full({1,1,1,r.retrieved},true,mx::bool_),*mask},3);
             }
+            if(spine) {
+                auto causal=mx::less_equal(mx::reshape(mx::arange(rows,mx::int32),{1,rows}),mx::reshape(mx::arange(rows,mx::int32),{rows,1}));
+                auto visible=mx::concatenate({causal,mx::ones({rows,ks.shape(2)-rows},mx::bool_)},1);
+                amask=amask?mx::logical_and(*amask,visible):visible;
+            }
             // BF16 K / V / q; the FP32 kernel read twice the bytes (j1118)
             auto attention=amask?mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)),"array",*amask):
                 mx::fast::scaled_dot_product_attention(q16,ks,vs,1.0f/std::sqrt(float(hd)));
             if(dsp && l==0)rlap("attn",&attention);
             auto flattened=mx::reshape(bf(mx::transpose(attention,{0,2,1,3})),{rows,heads*hd});  // the cast does the transpose's copy
-            x=dflash_conv(mat(p+"attn_output.weight",flattened),dynamic,plain.at(p+"attn_conv_base"),group,1,residual);
+            x=spine?bf(mx::add(mat(p+"attn_output.weight",flattened),residual)):dflash_conv(mat(p+"attn_output.weight",flattened),dynamic,plain.at(p+"attn_conv_base"),group,1,residual);
             if(dsp && l==0)rlap("out",&x);
-            residual=x;n=norm(p+"ffn_norm.weight",x);dynamic=mat(p+"ffn_conv_proj.weight",n);
-            input=dflash_conv(n,dynamic,plain.at(p+"ffn_conv_base"),group,0);
+            residual=x;n=norm(p+"ffn_norm.weight",x);dynamic=spine?mx::zeros({1}):mat(p+"ffn_conv_proj.weight",n);
+            input=spine?n:dflash_conv(n,dynamic,plain.at(p+"ffn_conv_base"),group,0);
             auto ff=mat(p+"ffn_down.weight",swiglu(p,input));
-            x=dflash_conv(ff,dynamic,plain.at(p+"ffn_conv_base"),group,1,residual);
+            x=spine?bf(mx::add(ff,residual)):dflash_conv(ff,dynamic,plain.at(p+"ffn_conv_base"),group,1,residual);
+            if(spine)x=bridge(p,x,*spine_anchor,l+1==int(caches.size()));
             if(dsp && l==0)rlap("ffn",&x);
             out.push_back(kc);out.push_back(vc);
         }
@@ -403,7 +488,7 @@ struct DFlash2::Impl {
         return out;
     }
     // the ring layers over the leading `span` rows
-    mx::array run_ring_layers(const mx::array& x,const mx::array& position,int span,const std::optional<mx::array>& mask,int far_rows=0) {
+    mx::array run_ring_layers(const mx::array& x,const mx::array& position,int span,const std::optional<mx::array>& mask,int far_rows=0,const std::optional<mx::array>& spine_anchor=std::nullopt) {
         std::vector<mx::array> in{x,position};
         if(mask)in.push_back(*mask);
         // retrieval needs kRetrieve whole chunks below the window (far_rows: the host's lower bound of the position);
@@ -418,7 +503,7 @@ struct DFlash2::Impl {
             else if(retr) {in.push_back(*c.kfull);in.push_back(*c.vfull);in.push_back(*c.kfs);in.push_back(*c.vfs);in.push_back(*c.ksum);}
         }
         const int rows=x.shape(0);
-        auto out=ring_layers(in,span,mask.has_value(),retr,scored,ahead,rows);
+        auto out=ring_layers(in,span,mask.has_value(),retr,scored,ahead,rows,spine_anchor);
         const int L=int(caches.size());
         for(int l=0;l<L;++l) {caches[l].k=out[1+2*l];caches[l].v=out[2+2*l];}
         if(retr) {
@@ -445,6 +530,7 @@ void DFlash2::time_stages(bool on) {impl_->stages=on;}
 DFlash2::~DFlash2() {if(impl_)impl_->drop_selections();}
 const std::vector<std::vector<uint32_t>>& DFlash2::candidates() const {return impl_->candidates;}
 const std::vector<int>& DFlash2::feature_layers() const {return impl_->features;}
+bool DFlash2::dspine() const {return impl_->spine;}
 void DFlash2::reset() {
     impl_->end=0;for(auto& c:impl_->caches)c=Impl::Kv{};impl_->far_cap=0;impl_->drop_selections();
     impl_->head_dev.reset();impl_->filled_dev.reset();impl_->fill_settled=impl_->fill_unsettled=0;
@@ -591,7 +677,7 @@ void DFlash2::inject_device(const mx::array& features,const mx::array& count,con
     }
     ++i.fill_unsettled;
 }
-void DFlash2::far_context(bool enabled) {impl_->far_enabled=enabled;}
+void DFlash2::far_context(bool enabled) {impl_->far_enabled=enabled && !impl_->spine;}
 void DFlash2::native_block(bool on) {impl_->native_on=on;}
 size_t DFlash2::far_row_bytes() const {
     const auto& i=*impl_;
@@ -610,6 +696,15 @@ DFlash2::HostLattice DFlash2::draft_lattice(uint32_t anchor,int position,int cou
     // rows 1 .. count are the drafted positions (row 0 is the anchor's)
     auto ids=mx::contiguous(mx::astype(mx::slice(mapped,{1,0},{count+1,mapped.shape(1)}),mx::uint32));
     auto un=mx::contiguous(mx::slice(unary,{1,0},{count+1,unary.shape(1)}));
+    if(i.spine) {
+        auto table=mx::contiguous(mx::slice(gate,{1,0,0},{count+1,16,16}));
+        mx::eval(ids,un,table);
+        HostLattice out;out.positions=count;out.topk=16;out.rank=0;
+        out.tokens.assign(ids.data<uint32_t>(),ids.data<uint32_t>()+ids.size());
+        out.unary.assign(un.data<float>(),un.data<float>()+un.size());
+        out.dense_scores.assign(table.data<float>(),table.data<float>()+table.size());
+        return out;
+    }
     auto ga=mx::contiguous(mx::astype(mx::slice(gate,{1,0},{count+1,gate.shape(1)}),mx::float32));
     auto su=mx::contiguous(mx::slice(successors,{1,0,0},{count+1,successors.shape(1),successors.shape(2)}));
     // the predecessor rows of every candidate and of the anchor (the selector reads only these), gathered on the GPU so
@@ -703,7 +798,7 @@ DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx:
         std::fprintf(stderr,"LATTICE_SPLIT %s %.2f\n",name,std::chrono::duration<double,std::milli>(now-t_ls).count());t_ls=now;
     };
     lap_ls("before");
-    x=i.run_ring_layers(x,position,span,mask,i.far_on()?i.target.position():0);
+    x=i.run_ring_layers(x,position,span,mask,i.far_on()?i.target.position():0,anchor);
     lap_ls("layers");
     lap(0,{x});
     auto normalized=i.norm("output_norm.weight",x);
@@ -714,6 +809,7 @@ DFlash2::LatticeArrays DFlash2::device_lattice(const mx::array& anchor,const mx:
     auto mapped=mx::take(i.target.draft_ids(),selected,0);
     lap_ls("top16");
     lap(2,{selected,unary,mapped});
+    if(i.spine)return {mapped,mx::astype(unary,mx::float32),i.refine(selected,mx::array(anchor)),mx::zeros({1})};
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
     lap_ls("selector");
@@ -724,7 +820,7 @@ mx::array DFlash2::draft_device_at(const mx::array& anchor,const mx::array& posi
     auto [mapped,unary,gate,successors]=device_lattice(anchor,position,count);
     if(i.stages)mx::eval({mapped,unary,gate,successors});  // stage 3: the selector alone
     auto tick=std::chrono::steady_clock::now();
-    auto chosen=dflash_select(mapped,unary,gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
+    auto chosen=i.spine?dspine_select(mapped,gate,count):dflash_select(mapped,unary,gate,successors,i.plain.at("selector_predecessor.weight"),anchor,count);
     if(i.stages) {
         mx::eval(chosen);
         i.stage_ms[3]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
@@ -736,13 +832,13 @@ DFlash2::LatticeArrays DFlash2::draft_lattice_device(const mx::array& anchor,con
     if(impl_->stages)throw std::logic_error("DFlash stage timing covers chain drafts only");
     return device_lattice(anchor,position,count);
 }
-const mx::array& DFlash2::selector_predecessor() const {return impl_->plain.at("selector_predecessor.weight");}
+const mx::array& DFlash2::selector_predecessor() const {return impl_->plain.at(impl_->spine?"dspine_codebook.weight":"selector_predecessor.weight");}
 DFlash2::LatticeArrays DFlash2::lattice_arrays(uint32_t anchor,int position,int count) {
     auto& i=*impl_;
     const int rows=i.draft_rows(count);
     std::vector<uint32_t> tokens(rows,i.mask);tokens[0]=anchor;
     auto x=i.target.embed_tokens(tokens);
-    if(i.ring && i.caches[0].k)x=i.run_ring_layers(x,mx::array(position,mx::int32),rows+i.caches[0].filled,std::nullopt);
+    if(i.ring && i.caches[0].k)x=i.run_ring_layers(x,mx::array(position,mx::int32),rows+i.caches[0].filled,std::nullopt,0,mx::array(anchor));
     else
     for(int l=0;l<int(i.caches.size());++l) {
         const std::string p="blk."+std::to_string(l)+".";
@@ -776,6 +872,7 @@ DFlash2::LatticeArrays DFlash2::lattice_arrays(uint32_t anchor,int position,int 
             for(int j:order)i.candidates[n-1].push_back(ids.data<uint32_t>()[n*16+j]);
         }
     }
+    if(i.spine)return {mapped,mx::astype(unary,mx::float32),i.refine(selected,mx::array(anchor)),mx::zeros({1})};
     auto gate=i.mat("selector_hidden.weight",normalized);
     auto successors=mx::astype(mx::take(i.plain.at("selector_successor.weight"),mapped,0),mx::float32);
     return {mapped,mx::astype(unary,mx::float32),gate,successors};
@@ -786,7 +883,7 @@ std::vector<uint32_t> DFlash2::draft(uint32_t anchor,int position,int count) {
     if(position!=i.end || count<1 || count>=i.block || anchor>=uint32_t(i.vocab))
         throw std::invalid_argument("invalid DFlash draft request");
     auto [mapped,unary,gate,successors]=lattice_arrays(anchor,position,count);
-    auto chosen=dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
+    auto chosen=i.spine?dspine_select(mapped,gate,count):dflash_select(mapped,mx::astype(unary,mx::float32),gate,successors,
         i.plain.at("selector_predecessor.weight"),anchor,count);
     if(i.device_only) {i.last_chosen=chosen;return {};}
     mx::eval(chosen);

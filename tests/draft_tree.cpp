@@ -247,7 +247,20 @@ void test_selector_registry() {
 }
 }  // namespace
 
+void test_dspine_dense_lattice() {
+    const uint32_t tokens[]={10,11,20,21};
+    const float scores[]={5,-5,5,-5,0,8,7,0};
+    tqllm::DraftLattice l;l.positions=2;l.topk=2;l.tokens=tokens;l.dense_scores=scores;
+    tqllm::DraftTreeOptions o;o.nodes=3;o.children=2;o.edge=0;o.unary_weight=0;
+    const auto chain=tqllm::chain_tree(l,99,o);
+    expect(chain.tokens==std::vector<uint32_t>{10,21},"DSpine chain follows conditional predecessor scores");
+    const auto tree=tqllm::best_first_tree(l,99,o);
+    expect(tree.tokens==std::vector<uint32_t>{10,21,20},"DSpine tree ranks complete conditional logits");
+    expect(tree.parents==std::vector<int32_t>{-1,0,0},"DSpine tree preserves parent links");
+}
+
 int main() {
+    test_dspine_dense_lattice();
     test_chain_follows_the_unary_argmax();
     test_best_first_builds_the_expected_tree();
     test_best_first_with_one_child_is_the_chain();
