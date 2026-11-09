@@ -25,6 +25,33 @@ Speed with the drafter follows how often its guesses are accepted. Summaries of 
 of the drafted tokens; reasoning text accepts more, and the LocalMaxxing reasoning prompt runs at 256 tok/s (median of
 3) on the RTX 3090 with the same files.
 
+### Qwen3.8-27B-TQ_L on NVIDIA DRIVE Thor (sm_110a, cross-compiled)
+
+tqLLM has no official Thor target; this is a cross-compiled build (nvcc 13.1,
+aarch64 host toolchain, `CMAKE_CUDA_ARCHITECTURES=110a`, zero source changes)
+running on a DRIVE Thor board (Tegra264, compute capability 10.1, ~60 GB
+unified memory). Model `Qwen3.8-27B-TQ_L.gguf` (14.7 GB) +
+`Qwen3.8-27B-DFlash2-TQ3.gguf` drafter, tq3 KV cache, greedy, server timings.
+
+200K context (`--context 200000`, prompt 197,913 tokens, 205 output tokens):
+
+| | Prefill tok/s | Decode, no drafter | Decode, DFlash2 drafter |
+|---|---:|---:|---:|
+| 200K | 350.8 | 6.28 | 15.50 (2.47x, 30.1% draft acceptance) |
+
+Short context, median of 3 runs:
+
+| Prompt | Prefill tok/s | Decode, no drafter | Decode, DFlash2 drafter |
+|---|---:|---:|---:|
+| 2K (1,374) | 780 | 12.1 | 38.6 (3.2x) |
+| 8K (5,109) | 920 | 11.9 | 39.3 (3.3x) |
+
+Outputs with and without the drafter are token-identical (greedy). The 200K
+decode drop versus short context is the per-token attention cost of the long
+KV cache; the drafter recovers most of it (15.5 tok/s is ~84% of the board's
+theoretical memory-bandwidth limit). Draft acceptance falls from 35-40% at
+short context to 30.1% at 200K, so the speedup drops from ~3.2x to 2.47x.
+
 ### Qwen3.8-Flash-Next (125B, 6B active) on one RTX 3090
 
 The routed experts live in system RAM; the GPU keeps a cache of expert slots, misses go over PCIe by the copy engine and
