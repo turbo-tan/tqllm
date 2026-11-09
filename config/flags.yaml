@@ -22,7 +22,19 @@ flags:
   - name: TQLLM_DEBUG
     kind: debug
     default: "off"
-    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, stagemap (MiniMax verify-step stage map), accept (MiniMax acceptance per draft depth), dump_feats:DIR / replay_feats:DIR (DSpark drafter training rows), glm_dump, glm_no_graph; Metal: ane_serial, ane_timing, count_nodes, dflash_rankstats, stream_group:N (a draft-ahead verify submits every N layers, default 4), nostream (one submission per forward), tree_rows:N (token-tree verify rows, 16 or 32), no_far (drafter ring window only), retr_split, retr_share, lattice_split, build_split, dump_ffn:DIR, dump_ffn_slice:N, wired_mib:N; Metal bench tools: dflash_spec_only, dflash_warm_tokens:N, draft_stages, draft_bench:N, kl_rows:K, kl_slice:N"
+    doc: "comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, stagemap (MiniMax verify-step stage map), accept (MiniMax acceptance per draft depth), dump_feats:DIR / replay_feats:DIR (DSpark drafter training rows), glm_dump, glm_no_graph, graphs (each CUDA graph cache miss with the cache size, evictions and free device memory); Metal: ane_serial, ane_timing, count_nodes, dflash_rankstats, stream_group:N (a draft-ahead verify submits every N layers, default 4), nostream (one submission per forward), tree_rows:N (token-tree verify rows, 16 or 32), no_far (drafter ring window only), retr_split, retr_share, lattice_split, build_split, dump_ffn:DIR, dump_ffn_slice:N, wired_mib:N; Metal bench tools: dflash_spec_only, dflash_warm_tokens:N, draft_stages, draft_bench:N, kl_rows:K, kl_slice:N"
+  - name: TQLLM_COMPOSITE_SERIAL
+    kind: user
+    default: "0"
+    doc: "1: run the parts of a composite (mixed-format) matrix one after another on the main stream instead of on side streams joined back (same results either way; A/B switch)"
+  - name: TQLLM_MTP_GRAPH
+    kind: user
+    default: "1"
+    doc: "0: run the one-token MTP draft passes eagerly instead of as captured CUDA graphs (same kernels, same results; A/B switch)"
+  - name: TQLLM_COMMIT_OVERLAP
+    kind: user
+    default: "0"
+    doc: "1: --mtp commit replay (accepted prefix shorter than the verify block) runs as a graph on a side stream, overlapping the MTP draft passes; the next verify and every stream sync wait for it (same results)"
   - name: TQLLM_MATVEC_RULE
     kind: user
     default: "-"

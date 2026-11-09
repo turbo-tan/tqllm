@@ -743,23 +743,67 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
     uint32_t bucket = 256;
     while (bucket < pos + n) bucket *= 2;
     bucket = std::min(bucket, context_);
-    embed_multi(v_tokens.as<uint32_t>(), n, E);
-    tqllm_cuda::rms_f_multi(E, H, 0, mtp.enorm, CAT, 2 * H, 0, H, 1, n, cfg.eps, stream);
-    tqllm_cuda::rms_f_multi(hidden ? hidden : mtp_h.as<bf16>(), H, 0, mtp.hnorm, CAT + H, 2 * H, 0, H, 1, n, cfg.eps,
-                            stream);
-    rot_h(CAT, XH, 2 * H, n);
-    mm_h(mtp.eh_proj, X, n);
-    tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
-    ck(cudaMemcpyAsync(R, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
-    nrot_h(X, mtp.layer.in_norm, v_px.as<float>(), XH, H, n);
     vpar = chain2 && n <= NVER ? d_chain.as<int>() : nullptr;  // the MTP layer's attention: two-part chain like the verify
     vdep = vpar ? d_cdep.as<int>() : nullptr;                   // (> 8 queries need depths; tree mode crashed here)
-    attn_mixer(mtp.layer, mtp_kc.as<bf16>(), mtp_vc.as<bf16>(), n, int(bucket));
-    ffn_block(mtp.layer, n);
-    ck(cudaMemcpyAsync(mtp_h.p, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+    auto layer_kernels = [&] {
+        embed_multi(v_tokens.as<uint32_t>(), n, E);
+        tqllm_cuda::rms_f_multi(E, H, 0, mtp.enorm, CAT, 2 * H, 0, H, 1, n, cfg.eps, stream);
+        tqllm_cuda::rms_f_multi(hidden ? hidden : mtp_h.as<bf16>(), H, 0, mtp.hnorm, CAT + H, 2 * H, 0, H, 1, n, cfg.eps,
+                                stream);
+        rot_h(CAT, XH, 2 * H, n);
+        mm_h(mtp.eh_proj, X, n);
+        tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
+        ck(cudaMemcpyAsync(R, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
+        nrot_h(X, mtp.layer.in_norm, v_px.as<float>(), XH, H, n);
+        attn_mixer(mtp.layer, mtp_kc.as<bf16>(), mtp_vc.as<bf16>(), n, int(bucket));
+        ffn_block(mtp.layer, n);
+        ck(cudaMemcpyAsync(mtp_h.p, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+    };
+    auto subset_head_kernels = [&] {  // draft-vocabulary rows of the 4-bit head, then the int8 re-score of its top 16
+        auto * NP = v_np.as<bf16>();
+        tqllm_cuda::rms_f(X + size_t(n - 1) * H, H, mtp.shared_norm, NP, H, H, 1, cfg.eps, stream);
+        tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), H, stream);
+        dsub_matvec(v_xh.as<__half>(), v_logits.as<float>(), 1);
+        tqllm_cuda::topk16_big(v_logits.as<float>(), dsub_rows, 1, h2_vals.as<float>(), h2_idx.as<uint32_t>(), h2_scr.p,
+                               stream);
+        tqllm_cuda::map_ids(h2_idx.as<uint32_t>(), dsub_ids.as<uint32_t>(), 16, stream);
+        tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(), h2_idx.as<uint32_t>(), H, 1, v_tok.as<uint32_t>(),
+                                       stream);
+    };
+    // one-token draft passes (the chain after the first draft) as one captured graph per KV bucket: the same kernels
+    // in the same order, without ~25 launches and their host gaps per draft. TQLLM_MTP_GRAPH=0 disables.
+    static const bool draft_graph = [] { const char * e = std::getenv("TQLLM_MTP_GRAPH"); return !(e && *e == '0'); }();
+    if (draft_graph && sample && n == 1 && !hidden && mtp_head4_sub && has_head8() && segs.empty()) {
+        const uint64_t key = (uint64_t(1) << 41) | uint64_t(bucket) | (uint64_t(active) << 32);
+        ck(cudaGraphLaunch(cached_graph(kGraphDraft, key, [&] { layer_kernels(); subset_head_kernels(); }), stream));
+        ck(cudaMemcpyAsync(h_tok, v_tok.p, 4, cudaMemcpyDeviceToHost, stream));
+        sync_main();
+        return h_tok[0];
+    }
+    layer_kernels();
     if (!sample) {
-        sync_ck();
+        sync_main();
         return 0;
+    }
+    if (mtp_head4_sub) {  // draft vocabulary rows of the 4-bit head (dsub_ids), FP16 tensor-core matvec
+        auto * NP = v_np.as<bf16>();
+        tqllm_cuda::rms_f(X + size_t(n - 1) * H, H, mtp.shared_norm, NP, H, H, 1, cfg.eps, stream);
+        tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), H, stream);
+        dsub_matvec(v_xh.as<__half>(), v_logits.as<float>(), 1);
+        if (has_head8()) {  // as the verify head: 4-bit top-16 of the subset, then the int8 head re-scores those rows
+            tqllm_cuda::topk16_big(v_logits.as<float>(), dsub_rows, 1, h2_vals.as<float>(), h2_idx.as<uint32_t>(), h2_scr.p,
+                                   stream);
+            tqllm_cuda::map_ids(h2_idx.as<uint32_t>(), dsub_ids.as<uint32_t>(), 16, stream);
+            tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(), h2_idx.as<uint32_t>(), H, 1,
+                                           v_tok.as<uint32_t>(), stream);
+            ck(cudaMemcpyAsync(h_tok, v_tok.p, 4, cudaMemcpyDeviceToHost, stream));
+            sync_main();
+            return h_tok[0];  // a full-vocabulary id
+        }
+        tqllm_cuda::argmax_cols(v_logits.as<float>(), dsub_rows, 1, v_tok.as<uint32_t>(), v_amax.p, stream);
+        ck(cudaMemcpyAsync(h_tok, v_tok.p, 4, cudaMemcpyDeviceToHost, stream));
+        sync_main();
+        return mtp.draft_ids[h_tok[0]];
     }
     if (mtp.draft_head.p) {  // argmax over the draft vocabulary only (the verifier still sees the full vocab)
         auto * NP = v_np.as<bf16>();
@@ -769,13 +813,13 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
                                stream);
         tqllm_cuda::argmax_cols(v_logits.as<float>(), mtp.draft_head.rows, 1, v_tok.as<uint32_t>(), v_amax.p, stream);
         ck(cudaMemcpyAsync(h_tok, v_tok.p, 4, cudaMemcpyDeviceToHost, stream));
-        sync_ck();
+        sync_main();
         return mtp.draft_ids[h_tok[0]];
     }
     // Only the final repaired hidden state proposes the next draft token.
     head_argmax(mtp.shared_norm, 1, n - 1);
     ck(cudaMemcpyAsync(h_tok, v_tok.as<uint32_t>() + (n - 1), 4, cudaMemcpyDeviceToHost, stream));
-    sync_ck();
+    sync_main();
     return h_tok[0];
 }
 
