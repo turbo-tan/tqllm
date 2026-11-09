@@ -101,9 +101,11 @@ if(TQLLM_HIP)  # AMD GPUs: the AMD(hip) device code is one shim + native kernels
   # Excluded from the AMD build (each is registered off in its registry too, so a model that needs
   # one fails with "unknown format" rather than running a path that was never ported):
   #   kv_qsa.cu      Flash-Next QSA KV codec (raw PTX; Flash-Next is CUDA-only in this PR)
-  #   x3/dispatch.cu PAW-27B X3 trellis codec (raw PTX funnel shifts + m16n8k16 asm)
+  #   x3.cpp, x3/dispatch.cu PAW-27B X3 trellis codec (raw PTX funnel shifts + m16n8k16 asm); unsupported_hip.cpp
+  #                  defines the empty register_x3()
   list(REMOVE_ITEM TQLLM_HIP_SOURCES
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv/kv_qsa.cu
+       ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3.cpp
        ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight/x3/dispatch.cu)
   # the AMD platform adds only its registration file and the stubs for what it does not implement; everything else is
   # the shared list above, so a new engine file is added in one place for both backends
