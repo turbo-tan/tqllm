@@ -69,7 +69,8 @@ On a Mac (Apple Silicon, macOS 15 or newer):
 
 ```sh
 curl -fsSL https://tqllm.com/install.sh | bash   # or: brew install turbo-tan/tap/tqllm
-tqllm serve                          # first run downloads the model and drafter
+tqllm                                # starts the server in the background; the first run downloads the model and drafter
+tqllm stop                           # stops it (log: ~/.cache/tqllm/server.log)
 tqllm claude                         # Claude Code pointed at the local server (or: tqllm codex)
 ```
 

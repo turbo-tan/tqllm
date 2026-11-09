@@ -11,7 +11,8 @@ Homebrew (macOS 15 or newer):
 
 ```sh
 brew install turbo-tan/tap/tqllm
-tqllm serve          # first run downloads the model and drafter (~17 GB), then serves on 127.0.0.1:8086
+tqllm                # first run downloads the model and drafter (~17 GB), then serves on 127.0.0.1:8086 in the background
+tqllm stop           # stops the server
 ```
 
 or the one-line installer (tries Homebrew, then pip in a venv under `~/.tqllm`, then a source build; `--check` reports
@@ -22,7 +23,9 @@ curl -fsSL https://tqllm.com/install.sh | bash
 tqllm serve
 ```
 
-Both build `tqserve` against the stock MLX 0.32.4 wheel. `tqllm serve` downloads the best model file that is already
+Both build `tqserve` against the stock MLX 0.32.4 wheel. `tqllm` (the same as `tqllm serve`) starts the server in the
+background, returns once it answers, and writes its output to `~/.cache/tqllm/server.log`; `tqllm serve --foreground`
+stays attached instead. Models are kept in `~/.cache/tqllm/models` (`TQLLM_HOME` moves it). `tqllm serve` downloads the best model file that is already
 downloaded or published (TQ_L-QSA, else the mlx-community 4-bit file on Macs with 40 GB or more, else TQ_L) plus the
 drafter; `--qsa` takes the QSA file for long contexts, `--context` sets the context (64K by default), and `--model` takes a
 path or a Hugging Face `owner/repo` / `owner/repo/file.gguf`. `tqllm claude`, `tqllm codex` and `tqllm opencode` start
