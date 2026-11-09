@@ -14,6 +14,8 @@
 #include "plugin_format.hpp"
 #endif
 #include "kv_store.hpp"
+#include "load_guard.hpp"
+#include "device_free.hpp"
 
 #if TQLLM_WITH_CUDA
 #include <cuda_runtime.h>
@@ -320,6 +322,20 @@ int main(int argc, char ** argv) {
         // blocks for reuse while loading, then hand the heap back
         mallopt(M_MMAP_THRESHOLD, 1 << 30);
         mallopt(M_TRIM_THRESHOLD, 1 << 30);
+#endif
+#if TQLLM_WITH_CUDA
+        {  // GPU memory shared with the CPU (GB10): refuse a load that cannot fit beside another model process (.44, 11-08)
+            int dev = 0, integrated = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+            std::ifstream mi("/proc/meminfo");
+            const std::string meminfo((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
+            if (integrated && !meminfo.empty()) {
+                const uint64_t need = tqllm::model_files_bytes(model_path) + tqllm::model_files_bytes(engine.draft_model);
+                const std::string why = tqllm::unified_memory_refusal(tqllm::meminfo_available(meminfo), need);
+                if (!why.empty()) throw std::runtime_error(why);
+            }
+        }
 #endif
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
 #if defined(__GLIBC__)
