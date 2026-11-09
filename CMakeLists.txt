@@ -123,6 +123,7 @@ add_executable(test-memory-plan tests/memory_plan.cpp)  # Flash-Next start-up me
 target_include_directories(test-memory-plan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME memory-plan COMMAND test-memory-plan)
 add_test(NAME rc-gate-verdict COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/rc_gate_verdict.py)
+add_test(NAME relbench COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_relbench.py)
 add_executable(test-serve-admission tests/serve_admission.cpp)
 add_test(NAME serve_admission COMMAND test-serve-admission)
 add_executable(test-serve-router tests/serve_router.cpp)

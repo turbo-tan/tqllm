@@ -9,7 +9,8 @@ Usage: relbench.py --bin TQSERVE --gpu LABEL --out RESULTS.jsonl --wiki wiki.tes
        relbench.py --url http://localhost:8086 --gpu LABEL --out RESULTS.jsonl --wiki wiki.test.raw --model LABEL=PATH
          --mode dflash2 (or nospec: name what the server was started with)
 """
-import argparse, atexit, json, os, re, shlex, signal, statistics, subprocess, sys, time, urllib.request
+import argparse, atexit, json, os, re, shlex, signal, statistics, subprocess, sys, tempfile, time, urllib.request
+from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--bin"); ap.add_argument("--url"); ap.add_argument("--mode"); ap.add_argument("--gpu", required=True); ap.add_argument("--out", required=True)
@@ -22,7 +23,7 @@ a = ap.parse_args()
 if not a.bin and not (a.url and a.mode):
     sys.exit("give --bin, or --url with --mode")
 URL = a.url.rstrip("/") if a.url else "http://127.0.0.1:%d" % a.port
-wiki = re.sub(r" @(.)@ ", r"\1", open(a.wiki, errors="ignore").read()).replace(" = = ", "\n## ").replace(" = ", "\n# ")
+wiki = re.sub(r" @(.)@ ", r"\1", Path(a.wiki).read_text(encoding="utf-8", errors="ignore")).replace(" = = ", "\n## ").replace(" = ", "\n# ")
 
 
 def get(path, timeout=5):
@@ -43,6 +44,15 @@ def gpu_name():
         return "unknown"
 
 
+def stop_server(server):
+    if server.poll() is None:
+        if os.name == "nt":
+            server.terminate()
+        else:
+            os.killpg(server.pid, signal.SIGTERM)
+        server.wait(timeout=60)
+
+
 modes = [("nospec", [])]
 if a.url:
     modes = [(a.mode, ["--draft"] if a.mode != "nospec" else [])]
@@ -54,12 +64,13 @@ out = open(a.out, "a")
 for spec in a.model:
     label, path = spec.split("=", 1)
     for mode, margs in modes:
-        log = "/tmp/relbench_%s_%s.log" % (label, mode)
+        log = os.path.join(tempfile.gettempdir(), "relbench_%s_%s.log" % (label, mode))
         cmd = [a.bin, "--model", path, "--host", "127.0.0.1", "--port", str(a.port), "--context", str(a.context), "--np", "1",
                "--reasoning", "on", "--max-tokens", "4096"] + shlex.split(a.extra) + margs
-        srv = None if a.url else subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-        if a.url: open(log, "w").close()
-        if srv: atexit.register(lambda p=srv: p.poll() is None and os.killpg(p.pid, signal.SIGTERM))  # never leave a server behind
+        with open(log, "w") as logfile:
+            srv = None if a.url else subprocess.Popen(cmd, stdout=logfile, stderr=subprocess.STDOUT,
+                                                      stdin=subprocess.DEVNULL, start_new_session=os.name != "nt")
+        if srv: atexit.register(stop_server, srv)  # never leave a server behind
         engine = None
         for _ in range(400):
             if srv and srv.poll() is not None:
@@ -68,7 +79,7 @@ for spec in a.model:
                 h = get("/health"); engine = h.get("engine", "unstamped"); break
             except Exception:
                 time.sleep(2)
-        logtxt = open(log, errors="ignore").read()
+        logtxt = Path(log).read_text(errors="ignore")
         ctx = re.findall(r"context=(\d+)", logtxt)
         base = {"gpu": a.gpu, "gpu_name": gpu_name(), "model": label, "file": os.path.basename(path),
                 "file_bytes": os.path.getsize(path) if os.path.exists(path) else None, "mode": mode,
@@ -77,8 +88,10 @@ for spec in a.model:
                 "settings": ("server as started" if a.url else " ".join(shlex.split(a.extra))) + ", greedy, %d tokens" % a.max_tokens,
                 "time": time.strftime("%Y-%m-%d %H:%M:%S")}
         if engine is None:
-            out.write(json.dumps(dict(base, error="server did not start: " + logtxt.strip().splitlines()[-1][:200])) + "\n"); out.flush()
+            last_line = (logtxt.strip().splitlines() or ["no server output"])[-1]
+            out.write(json.dumps(dict(base, error="server did not start: " + last_line[:200])) + "\n"); out.flush()
             print("%s %s: does not start" % (label, mode), flush=True)
+            if srv: stop_server(srv)
             continue
         for n in lengths:
             runs, err = [], None
@@ -99,5 +112,5 @@ for spec in a.model:
                 row["error"] = err
             out.write(json.dumps(row) + "\n"); out.flush()
             print("%s %s %6s: %s" % (label, mode, n, ("prefill %.1f decode %.1f" % (row["prefill_tps"], row["decode_tps"])) if runs else "FAILED " + err), flush=True)
-        if srv: os.killpg(srv.pid, signal.SIGTERM); srv.wait(timeout=60); time.sleep(5)
+        if srv: stop_server(srv); time.sleep(5)
 print("RELBENCH_DONE", flush=True)
