@@ -1150,11 +1150,18 @@ private:
         return 0;
     }
     // emit() for a growing view: what was sent is a prefix by construction, so no prefix compare
+    // a cut inside a multi-byte character (the stop-string hold is a byte count) moves back to its first byte: a piece
+    // never ends mid-character, so the JSON sanitiser (json_out.hpp) never sees half of a valid character
+    static size_t char_boundary(std::string_view t, size_t end) {
+        while (end > 0 && end < t.size() && (static_cast<unsigned char>(t[end]) & 0xC0) == 0x80) --end;
+        return end;
+    }
     bool emit_view(std::string_view full, std::string & sent, bool reasoning) {
         if (full.size() <= sent.size()) return true;
         size_t end = full.size() - std::min(full.size(), unstable_tail_view(full));
         if (!reasoning) end = end > hold_ ? end - hold_ : 0;
         if (!reasoning && req_.tools) end = rstrip(full, end);
+        end = char_boundary(full, end);
         if (end <= sent.size()) return true;
         return send_piece(std::string(full.substr(sent.size(), end - sent.size())), sent, reasoning);
     }
@@ -1165,6 +1172,7 @@ private:
             end -= std::min(end, unstable_tail(full));
             if (!reasoning) end = end > hold_ ? end - hold_ : 0;
             if (!reasoning && req_.tools) end = rstrip(full, end);
+            end = char_boundary(full, end);
         }
         if (end <= sent.size()) return true;
         return send_piece(full.substr(sent.size(), end - sent.size()), sent, reasoning);
