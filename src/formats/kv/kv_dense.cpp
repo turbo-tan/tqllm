@@ -4,6 +4,7 @@
 #include "qwen35_kernels.cuh"
 
 #include <algorithm>
+#include <stdexcept>
 #include <cstdlib>
 
 namespace tqllm::formats {

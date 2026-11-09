@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 namespace tqllm {
 void WeightFormat::expert_matvec(const Mat &, const __half *, __nv_bfloat16 *, int,
