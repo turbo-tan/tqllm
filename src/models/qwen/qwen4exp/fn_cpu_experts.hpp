@@ -1,6 +1,7 @@
 #pragma once
 // Flash-Next CPU expert-miss pool (x86 AVX2): missed experts computed on the CPU from the pinned packed copy.
 #include "debug.hpp"
+#include <bit>
 #include "fn_checkpoint.hpp"
 #if defined(__x86_64__)
 inline const int8_t kCpuIq4nl[16] = {
@@ -120,7 +121,7 @@ __attribute__((target("avx2,fma"))) static void cpu_dot_iq3xxs_q8(const uint8_t 
         for (int ib = 0; ib < 8; ++ib, ++sb) {
             uint32_t a; std::memcpy(&a, w + 66 + 4 * ib, 4);
             uint32_t sbits = 0;
-            for (int l = 0; l < 4; ++l) { const uint32_t i7 = (a >> 7 * l) & 127; sbits |= (i7 | ((__builtin_popcount(i7) & 1) << 7)) << (8 * l); }
+            for (int l = 0; l < 4; ++l) { const uint32_t i7 = (a >> 7 * l) & 127; sbits |= (i7 | ((uint32_t(std::popcount(i7)) & 1) << 7)) << (8 * l); }
             const uint8_t * q = qs + ib * 8;
             const __m256i mag = _mm256_set_epi32(int(kCpuIq3xxs[q[7]]), int(kCpuIq3xxs[q[6]]), int(kCpuIq3xxs[q[5]]), int(kCpuIq3xxs[q[4]]),
                                                  int(kCpuIq3xxs[q[3]]), int(kCpuIq3xxs[q[2]]), int(kCpuIq3xxs[q[1]]), int(kCpuIq3xxs[q[0]]));
@@ -215,7 +216,7 @@ __attribute__((target("avx2,fma"))) static void cpu_dot_iq3xxs_dev_q8(const char
             const uint8_t * q = reinterpret_cast<const uint8_t *>(dev + cpu_block_off(r, sb, nb, 12, tiled));
             uint32_t a; std::memcpy(&a, q + 8, 4);
             uint32_t sbits = 0;
-            for (int l = 0; l < 4; ++l) { const uint32_t i7 = (a >> 7 * l) & 127; sbits |= (i7 | ((__builtin_popcount(i7) & 1) << 7)) << (8 * l); }
+            for (int l = 0; l < 4; ++l) { const uint32_t i7 = (a >> 7 * l) & 127; sbits |= (i7 | ((uint32_t(std::popcount(i7)) & 1) << 7)) << (8 * l); }
             const __m256i mag = _mm256_set_epi32(int(kCpuIq3xxs[q[7]]), int(kCpuIq3xxs[q[6]]), int(kCpuIq3xxs[q[5]]), int(kCpuIq3xxs[q[4]]),
                                                  int(kCpuIq3xxs[q[3]]), int(kCpuIq3xxs[q[2]]), int(kCpuIq3xxs[q[1]]), int(kCpuIq3xxs[q[0]]));
             const float db = d * (0.5f + float(a >> 28)) * 0.5f; const __m256i neg = cpu_sign_mask(sbits);

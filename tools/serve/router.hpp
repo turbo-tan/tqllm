@@ -55,9 +55,9 @@ inline int pick_box(const std::vector<BoxStatus> & boxes, double prompt, double 
         const double c = route_cost(b, prompt, gen);
         if (best < 0) { best = i; best_cost = c; continue; }
         const auto & o = boxes[size_t(best)];
-        const bool near = std::fabs(c - best_cost) <= 0.02 * std::max(c, best_cost);
+        const bool tie = std::fabs(c - best_cost) <= 0.02 * std::max(c, best_cost);
         const int load = route_load(b), oload = route_load(o);
-        if ((!near && c < best_cost) || (near && load < oload)) { best = i; best_cost = c; }
+        if ((!tie && c < best_cost) || (tie && load < oload)) { best = i; best_cost = c; }
     }
     return best < 0 ? 0 : best;
 }

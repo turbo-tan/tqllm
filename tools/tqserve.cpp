@@ -3,6 +3,7 @@
 #include "serve/monitor_server.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/peer.hpp"
+#include "serve/net.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
@@ -41,14 +42,7 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__) || defined(__APPLE__)
-#include <netdb.h>
-#include <netinet/in.h>
 #include <cstdlib>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 namespace {
 constexpr uint64_t MAX_HEADER = 64 * 1024;
@@ -61,20 +55,20 @@ int listener = -1;
 void stop_server(int) {
     if (!running) {
         static const char msg[] = "tqserve: second stop signal, exiting now\n";
-        (void) !::write(2, msg, sizeof msg - 1);
+        std::fwrite(msg, 1, sizeof msg - 1, stderr);
         std::_Exit(130);
     }
     running = 0;
-    if (listener >= 0) ::close(listener);
+    if (listener >= 0) tqnet::close(listener);
 }
 
 bool receive_request(int fd, tqserve::Request & request, std::string & error, int & status) {
     tqserve::RequestReader reader(MAX_BODY, MAX_HEADER);
     uint8_t chunk[8192];
     while (!reader.complete() && !reader.failed()) {
-        const ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
+        const ssize_t n = tqnet::recv(fd, chunk, sizeof(chunk), 0);
         if (n <= 0) {
-            error = n == 0 ? "incomplete request" : std::strerror(errno);
+            error = n == 0 ? "incomplete request" : "receive failed (error " + std::to_string(tqnet::last_error()) + ")";
             status = 400;
             return false;
         }
@@ -93,7 +87,7 @@ bool receive_request(int fd, tqserve::Request & request, std::string & error, in
 bool send_all(int fd, const std::string & data) {
     size_t sent = 0;
     while (sent < data.size()) {
-        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        const ssize_t n = tqnet::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
@@ -115,18 +109,18 @@ int bind_socket(const std::string & host, uint16_t port) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     addrinfo * result = nullptr;
+    tqnet::startup();
     const int gai = ::getaddrinfo(host.c_str(), nullptr, &hints, &result);
     if (gai != 0) throw std::runtime_error(std::string("invalid bind host: ") + gai_strerror(gai));
     int fd = -1;
     for (auto * it = result; it; it = it->ai_next) {
-        fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        fd = tqnet::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) continue;
-        int one = 1;
-        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        tqnet::set_reuse_address(fd);
         auto address = *reinterpret_cast<sockaddr_in *>(it->ai_addr);
         address.sin_port = htons(port);
-        if (::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 && ::listen(fd, 16) == 0) break;
-        ::close(fd);
+        if (::bind(tqnet::raw(fd), reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 && ::listen(tqnet::raw(fd), 16) == 0) break;
+        tqnet::close(fd);
         fd = -1;
     }
     ::freeaddrinfo(result);
@@ -352,10 +346,12 @@ int main(int argc, char ** argv) {
         std::atomic<int> inflight{0};
         std::mutex generation_mutex;
         listener = bind_socket(host, static_cast<uint16_t>(port));
-        if (listener < 0) throw std::runtime_error("socket bind/listen failed: " + std::string(std::strerror(errno)));
+        if (listener < 0) throw std::runtime_error("socket bind/listen failed (error " + std::to_string(tqnet::last_error()) + ")");
         std::signal(SIGINT, stop_server);
         std::signal(SIGTERM, stop_server);
+#ifdef SIGPIPE
         std::signal(SIGPIPE, SIG_IGN);
+#endif
     tqserve::PromptRenderer renderer;
     tqllm::Json default_kwargs;
     if (use_jinja || !template_file.empty()) {
@@ -408,37 +404,37 @@ int main(int argc, char ** argv) {
 
         while (running) {
             if (!scheduler && inflight == 0 && model.kv_idle_pending()) {  // idle: compact one old block, unless a client is waiting
-                pollfd pf{listener, POLLIN, 0};
-                if (::poll(&pf, 1, 20) == 0) {
+                auto pf = tqnet::poll_entry(listener, POLLIN);
+                if (tqnet::poll(&pf, 1, 20) == 0) {
                     model.kv_idle_step();
                     continue;
                 }
             }
-            const int client = ::accept(listener, nullptr, nullptr);
+            const int client = tqnet::accept(listener);
             if (client < 0) {
-                if (!running || errno == EINTR || errno == EBADF) break;
-                std::cerr << "tqserve: accept failed: " << std::strerror(errno) << "\n";
+                const int e = tqnet::last_error();
+                if (!running || tqnet::interrupted(e)) break;
+                std::cerr << "tqserve: accept failed (error " << e << ")\n";
                 continue;
             }
             auto handle = [&, client] {
-            timeval timeout{30, 0};
-            ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            tqnet::set_recv_timeout(client, 30);
             tqserve::Request request;
             std::string error;
             int status = 400;
             if (!receive_request(client, request, error, status)) {
                 send_all(client, response(status, tqserve::json_error(error)));
-                ::close(client);
+                tqnet::close(client);
                 return;
             }
             if (request.path == "/" || request.path == "/monitor" || request.path == "/monitor/" ||
                 request.path == "/api/monitor/v1/snapshot" || request.path == "/api/monitor/v1/chat/completions") {
-                if (!monitor_server->serve(client, request)) ::close(client);
+                if (!monitor_server->serve(client, request)) tqnet::close(client);
                 return;
             }
             if (!api_key.empty() && request.authorization != "Bearer " + api_key) {
                 send_all(client, response(401, tqserve::json_error("invalid or missing API key")));
-                ::close(client);
+                tqnet::close(client);
                 return;
             }
 
@@ -524,7 +520,7 @@ int main(int argc, char ** argv) {
                         const auto & peer = peers[size_t(pick - 1)];
                         const bool sent = tqserve::peer_proxy(peer, tqserve::forward_bytes(request, peer), client);
                         --inflight[size_t(pick)];
-                        if (sent) { ::close(client); return; }
+                        if (sent) { tqnet::close(client); return; }
                         std::fprintf(stderr, "tqserve: peer %s:%u did not take the request; serving it here\n", peer.host.c_str(), unsigned(peer.port));
                         ++inflight[0];
                     }
@@ -615,7 +611,7 @@ int main(int argc, char ** argv) {
                     }
                     if (!scheduler) model.set_continuation(0);  // a thinking budget's held phase 1 state, if phase 2 did not run
                     if (parsed.observation) parsed.observation->finish();
-                    ::close(client);
+                    tqnet::close(client);
                     return;
                 } else {
                     auto run = [&](const tqserve::ChatRequest & r) {
@@ -675,41 +671,35 @@ int main(int argc, char ** argv) {
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");
             }
             send_all(client, response(status, body));
-            ::close(client);
+            tqnet::close(client);
             };
             if (scheduler || monitor) {
                 if (inflight >= 64) {
-                    send_all(client,response(503,tqserve::json_error("too many connections"))); ::close(client); continue;
+                    send_all(client,response(503,tqserve::json_error("too many connections"))); tqnet::close(client); continue;
                 }
                 ++inflight;
                 try { std::thread([handle, &inflight, client] {
                     try { handle(); }
                     catch (const std::exception & e) {  // never a silent empty reply: log it and answer 500
                         std::fprintf(stderr, "tqserve: request failed: %s\n", e.what());
-                        send_all(client, response(500, tqserve::json_error(std::string("request failed: ") + e.what()))); ::close(client);
+                        send_all(client, response(500, tqserve::json_error(std::string("request failed: ") + e.what()))); tqnet::close(client);
                     }
-                    catch (...) { std::fputs("tqserve: request failed (unknown exception)\n", stderr); send_all(client, response(500, tqserve::json_error("request failed"))); ::close(client); }
+                    catch (...) { std::fputs("tqserve: request failed (unknown exception)\n", stderr); send_all(client, response(500, tqserve::json_error("request failed"))); tqnet::close(client); }
                     --inflight;
                 }).detach(); }
-                catch (...) { --inflight; ::close(client); }
+                catch (...) { --inflight; tqnet::close(client); }
             } else {
                 handle();
             }
         }
         scheduler.reset();  // fails queued and running requests so their connection threads can answer
         for (; inflight > 0;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (listener >= 0) ::close(listener);
+        if (listener >= 0) tqnet::close(listener);
         listener = -1;
         return 0;
     } catch (const std::exception & e) {
-        if (listener >= 0) ::close(listener);
+        if (listener >= 0) tqnet::close(listener);
         std::cerr << "tqserve: " << e.what() << "\n";
         return 1;
     }
 }
-#else
-int main() {
-    std::cerr << "tqserve requires Linux or macOS (POSIX sockets)\n";
-    return 1;
-}
-#endif

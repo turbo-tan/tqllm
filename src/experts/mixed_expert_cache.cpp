@@ -384,7 +384,8 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
         checked(cudaMemcpyBatchAsync(batch_dst.data(), batch_src.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, up));
 #elif CUDART_VERSION >= 12080
         // 12.8 / 12.9: 9 arguments, non-const void ** src/dst and an extra size_t * failIdx before the stream
-        std::vector<void *> src_mut(batch_src.begin(), batch_src.end()); size_t fail_idx = 0;
+        std::vector<void *> src_mut(batch_src.size()); size_t fail_idx = 0;
+        for (size_t i = 0; i < batch_src.size(); ++i) src_mut[i] = const_cast<void *>(batch_src[i]);
         checked(cudaMemcpyBatchAsync(batch_dst.data(), src_mut.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, &fail_idx, up));
 #else
         for (size_t i = 0; i < batch_dst.size(); ++i) checked(cudaMemcpyAsync(batch_dst[i], batch_src[i], batch_bytes[i], cudaMemcpyHostToDevice, up));

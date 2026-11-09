@@ -1,3 +1,4 @@
+#include <bit>
 #include "dequant.hpp"
 #include "gguf.hpp"
 
@@ -163,7 +164,7 @@ void iq3xxs(const uint8_t * b, float * y) {
         std::memcpy(&a, b + 66 + 4 * ib, 4);
         const float db = d * (0.5f + float(a >> 28)) * 0.5f;
         for (int l = 0; l < 4; ++l) {
-            const uint32_t i7 = (a >> 7 * l) & 127, sg = i7 | ((__builtin_popcount(i7) & 1) << 7);
+            const uint32_t i7 = (a >> 7 * l) & 127, sg = i7 | ((uint32_t(std::popcount(i7)) & 1) << 7);
             for (int h = 0; h < 2; ++h, y += 4) {
                 const uint32_t g = iq3xxs_grid[qs[ib * 8 + 2 * l + h]];
                 for (int j = 0; j < 4; ++j) y[j] = db * float((g >> (8 * j)) & 0xff) * ((sg >> (4 * h + j)) & 1 ? -1.f : 1.f);

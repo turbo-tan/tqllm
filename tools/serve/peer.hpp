@@ -5,15 +5,11 @@
 #include "router.hpp"
 #include <third_party/nlohmann/json.hpp>
 
-#include <cerrno>
+#include "net.hpp"
+
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
 #include <string>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #ifndef POLLRDHUP
 #define POLLRDHUP 0  // macOS: POLLHUP reports the client going away
@@ -45,21 +41,20 @@ inline int peer_connect(const Peer & p, int timeout_ms) {
     addrinfo hints{}, * res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    tqnet::startup();
     if (::getaddrinfo(p.host.c_str(), std::to_string(p.port).c_str(), &hints, &res) != 0 || !res) return -1;
     int fd = -1;
     for (auto * a = res; a && fd < 0; a = a->ai_next) {
-        fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        fd = tqnet::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) continue;
-        const int fl = ::fcntl(fd, F_GETFL, 0);
-        ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        int rc = ::connect(fd, a->ai_addr, a->ai_addrlen);
-        if (rc != 0 && errno == EINPROGRESS) {
-            pollfd pf{fd, POLLOUT, 0};
-            int err = 0; socklen_t len = sizeof err;
-            rc = ::poll(&pf, 1, timeout_ms) == 1 && ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0 ? 0 : -1;
+        tqnet::set_nonblocking(fd, true);
+        int rc = ::connect(tqnet::raw(fd), a->ai_addr, int(a->ai_addrlen));
+        if (rc != 0 && tqnet::connect_pending(tqnet::last_error())) {
+            auto pf = tqnet::poll_entry(fd, POLLOUT);
+            rc = tqnet::poll(&pf, 1, timeout_ms) == 1 && tqnet::socket_error(fd) == 0 ? 0 : -1;
         }
-        if (rc != 0) { ::close(fd); fd = -1; continue; }
-        ::fcntl(fd, F_SETFL, fl);
+        if (rc != 0) { tqnet::close(fd); fd = -1; continue; }
+        tqnet::set_nonblocking(fd, false);
     }
     ::freeaddrinfo(res);
     return fd;
@@ -67,7 +62,7 @@ inline int peer_connect(const Peer & p, int timeout_ms) {
 
 inline bool peer_send(int fd, const std::string & d) {
     for (size_t sent = 0; sent < d.size();) {
-        const ssize_t n = ::send(fd, d.data() + sent, d.size() - sent, MSG_NOSIGNAL);
+        const ssize_t n = tqnet::send(fd, d.data() + sent, d.size() - sent, MSG_NOSIGNAL);
         if (n <= 0) return false;
         sent += size_t(n);
     }
@@ -104,14 +99,14 @@ inline BoxStatus peer_status(const Peer & p, const std::string & prompt_text, co
     if (peer_send(fd, req)) {
         char buf[4096];
         for (;;) {
-            pollfd pf{fd, POLLIN, 0};
-            if (::poll(&pf, 1, timeout_ms) != 1) { in.clear(); break; }
-            const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+            auto pf = tqnet::poll_entry(fd, POLLIN);
+            if (tqnet::poll(&pf, 1, timeout_ms) != 1) { in.clear(); break; }
+            const ssize_t n = tqnet::recv(fd, buf, sizeof buf, 0);
             if (n <= 0) break;
             in.append(buf, size_t(n));
         }
     }
-    ::close(fd);
+    tqnet::close(fd);
     const size_t body = in.find("\r\n\r\n");
     if (in.rfind("HTTP/1.1 200", 0) != 0 || body == std::string::npos) return b;
     try {
@@ -129,20 +124,20 @@ inline BoxStatus peer_status(const Peer & p, const std::string & prompt_text, co
 inline bool peer_proxy(const Peer & p, const std::string & bytes, int client) {
     const int fd = peer_connect(p, 1000);
     if (fd < 0) return false;
-    if (!peer_send(fd, bytes)) { ::close(fd); return false; }
+    if (!peer_send(fd, bytes)) { tqnet::close(fd); return false; }
     char buf[16384];
     bool any = false;
     for (;;) {
-        pollfd pf[2] = {{fd, POLLIN, 0}, {client, POLLRDHUP, 0}};
-        if (::poll(pf, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        tqnet::pollfd_t pf[2] = {tqnet::poll_entry(fd, POLLIN), tqnet::poll_entry(client, POLLRDHUP)};
+        if (tqnet::poll(pf, 2, -1) < 0) { if (tqnet::interrupted(tqnet::last_error())) continue; break; }
         if (pf[1].revents & (POLLRDHUP | POLLHUP | POLLERR)) break;  // client gone: closing the peer side cancels there
         if (!(pf[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-        const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+        const ssize_t n = tqnet::recv(fd, buf, sizeof buf, 0);
         if (n <= 0) break;
         any = true;
         if (!peer_send(client, std::string(buf, size_t(n)))) break;
     }
-    ::close(fd);
+    tqnet::close(fd);
     return any;
 }
 

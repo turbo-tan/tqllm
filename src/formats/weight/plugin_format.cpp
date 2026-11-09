@@ -5,7 +5,7 @@
 #include "weight_format.hpp"
 #include "tqllm/plugin.h"
 #include <cuda_runtime.h>
-#include <dlfcn.h>
+#include "../../core/platform/os_file.hpp"
 #include <cstring>
 #include <memory>
 #include <random>
@@ -118,9 +118,9 @@ std::vector<PluginInfo> & plugins() { static std::vector<PluginInfo> p; return p
 }  // namespace
 
 PluginInfo load_plugin(const std::string & path) {
-    void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);  // never closed: formats keep its callbacks
-    if (!h) throw std::runtime_error("plugin " + path + ": " + dlerror());
-    auto init = reinterpret_cast<tq_plugin_init_v2_fn>(dlsym(h, "tq_plugin_init_v2"));
+    void * h = tqllm::os::load_library(path);  // never closed: formats keep its callbacks
+    if (!h) throw std::runtime_error("plugin " + path + ": " + tqllm::os::library_error());
+    auto init = reinterpret_cast<tq_plugin_init_v2_fn>(tqllm::os::library_symbol(h, "tq_plugin_init_v2"));
     if (!init) throw std::runtime_error("plugin " + path + ": no tq_plugin_init_v2 (ABI 2)");
     std::vector<tq_format_v2> descs;
     tq_host_v2 host{sizeof(tq_host_v2), TQ_ABI_VERSION_2, &descs, [](void * ctx, const tq_format_v2 * f, tq_error * err) -> int32_t {
