@@ -8,6 +8,7 @@
 | Observe prefill, decode and hardware on the API port | [Runtime monitor](MONITOR.md) |
 | Follow a recorded monitor walkthrough | [Monitor demo](demos/monitor/README.md) |
 | Run on a Mac (Apple Silicon, Metal) | [Mac](guides/mac.md) |
+| Run natively on Windows (no WSL) | [Windows](guides/windows.md) |
 | Connect coding agents | [Agent setup](guides/coding-agents.md) |
 | Add DFlash2 or native MTP drafting | [Speculative decoding](guides/speculative-decoding.md) |
 | Fit a long context into GPU and host memory | [TqCache](guides/long-context.md) |
