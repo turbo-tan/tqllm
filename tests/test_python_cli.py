@@ -64,8 +64,15 @@ class Cli(unittest.TestCase):
         e = cli.agent_env("claude", 9000, env={"ANTHROPIC_MODEL": "qwen3.5-4b-instruct"}, model="tqllm")
         for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
             self.assertEqual(e[k], "tqllm")
-        self.assertEqual(cli.agent_args("claude", ["-p", "hi"], "tqllm"), ["--model", "tqllm", "-p", "hi"])
-        self.assertEqual(cli.agent_args("claude", ["--model", "x"], "tqllm"), ["--model", "x"])
+        # ~/.claude/settings.json's env block outranks the process env: tqllm passes its values with --settings
+        args = cli.agent_args("claude", ["-p", "hi"], "tqllm", 8086)
+        self.assertEqual(args[0], "--settings")
+        st = json.loads(args[1])
+        self.assertEqual(st["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8086")
+        self.assertEqual(st["env"]["ANTHROPIC_MODEL"], "tqllm")
+        self.assertEqual(st["model"], "tqllm")
+        self.assertEqual(args[2:], ["--model", "tqllm", "-p", "hi"])
+        self.assertEqual(cli.agent_args("claude", ["--model", "x", "--settings", "s.json"], "tqllm", 8086), ["--model", "x", "--settings", "s.json"])
 
     def test_foreign_server_on_the_port(self):
         self.assertEqual(cli.tqllm_model(8086, "claude", served=lambda p: ("tqllm", "tqllm")), "tqllm")

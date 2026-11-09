@@ -253,12 +253,35 @@ def agent_env(name, port, env=None, model=None):
     return e
 
 
-def agent_args(name, args, model=None):
-    """OpenCode starts on the tqLLM model, Claude Code on the served model, unless a model is given."""
+def claude_settings(port, model):
+    """Claude Code settings that point it at the local server. Passed with --settings: command-line settings rank above
+    ~/.claude/settings.json, whose env block (e.g. another gateway's ANTHROPIC_BASE_URL / ANTHROPIC_MODEL) would otherwise
+    override the environment tqllm sets."""
+    env = {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}", "ANTHROPIC_AUTH_TOKEN": "tqllm", "ANTHROPIC_API_KEY": "tqllm"}
+    if model:
+        env.update({k: model for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                       "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")})
+    out = {"env": env}
+    if model:
+        out["model"] = model
+    return json.dumps(out, separators=(",", ":"))
+
+
+def agent_args(name, args, model=None, port=PORT):
+    """OpenCode starts on the tqLLM model; Claude Code on the served model with settings that point it at the local
+    server (unless the user passes their own --model / --settings)."""
     if name == "opencode" and not has_option(args, "-m", "--model"):
         return ["-m", OPENCODE_MODEL] + list(args)
-    if name == "claude" and model and not has_option(args, "--model"):
-        return ["--model", model] + list(args)
+    if name == "claude":
+        out = list(args)
+        if model and not has_option(args, "--model"):
+            out = ["--model", model] + out
+        if not has_option(args, "--settings"):
+            out = ["--settings", claude_settings(port, model)] + out
+        else:
+            print("tqllm: your --settings is used as given; it must point Claude Code at "
+                  f"http://127.0.0.1:{port}", file=sys.stderr)
+        return out
     return list(args)
 
 
@@ -387,7 +410,7 @@ def main(argv=None):
             raise SystemExit(f"{cmd} is not installed (it is a separate tool); install it, then run tqllm {cmd}")
         ensure_server(port, lambda p: start_background(p, mac, native))
         model = tqllm_model(port, cmd)
-        os.execve(exe, [exe] + agent_args(cmd, args, model), agent_env(cmd, port, model=model))
+        os.execve(exe, [exe] + agent_args(cmd, args, model, port), agent_env(cmd, port, model=model))
     raise SystemExit(f"unknown command {cmd!r}: tqllm serve | pull | stop | " + " | ".join(AGENTS))
 
 
