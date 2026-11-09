@@ -99,8 +99,7 @@ class TestDSpineConverter(unittest.TestCase):
             raw_header = json.dumps(header).encode()
             (root / "model.safetensors").write_bytes(struct.pack("<Q", len(raw_header)) + raw_header + payload)
             converter.convert(root, root / "draft.gguf", "qwen35")
-            result = gguf.GGUFReader(str(root / "draft.gguf"))
-            self.assertEqual(result.fields["dflash.target_architecture"].contents(), "qwen35")
+            self.assertEqual(gguf.GGUFReader(str(root / "draft.gguf")).fields["dflash.target_architecture"].contents(), "qwen35")
 
     def test_reject_missing_shape_and_unknown_tensors(self):
         config, header, _, _ = fixture()
@@ -129,6 +128,8 @@ class TestDSpineConverter(unittest.TestCase):
             for tensor in tensors.values():
                 self.assertEqual(tensor.tensor_type, gguf.GGMLQuantizationType.BF16)
                 np.testing.assert_array_equal(np.asarray(tensor.data).view(np.uint16), 0x3f80)
+            # Release the mapped views before Windows removes the temporary file.
+            del tensor, tensors, result
 
     def test_version_and_nonzero_terminal_fail_before_output(self):
         for key in ("draft_block_causal_version", "selected_prefix_bridge.out.weight"):

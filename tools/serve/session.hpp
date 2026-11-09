@@ -1071,7 +1071,7 @@ private:
         return out;
     }
     // bytes at the end of `t` that may still change: an incomplete UTF-8 sequence or a replacement character
-    static size_t unstable_tail(const std::string & t) {
+    static size_t unstable_tail(std::string_view t) {
         if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
         for (size_t k = 1; k <= 3 && k <= t.size(); ++k) {
             const auto c = static_cast<unsigned char>(t[t.size() - k]);
@@ -1139,33 +1139,26 @@ private:
                 if (t.compare(end - k, k, m, 0, k) == 0) {end -= k; break;}
         return orphan_tool_tail(t.substr(0, end), true);
     }
-    static size_t unstable_tail_view(std::string_view t) {
-        if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
-        for (size_t k = 1; k <= 3 && k <= t.size(); ++k) {
-            const auto c = static_cast<unsigned char>(t[t.size() - k]);
-            if ((c & 0xC0) == 0x80) continue;
-            const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-            return need > k ? k : 0;
+    size_t stable_end(std::string_view full, bool reasoning) const {
+        size_t end = full.size() - unstable_tail(full);
+        if (!reasoning && hold_) {
+            end = end > hold_ ? end - hold_ : 0;
+            // Holding back a possible stop string can move the boundary into a UTF-8 character.
+            end -= unstable_tail(full.substr(0, end));
         }
-        return 0;
+        if (!reasoning && req_.tools) end = rstrip(full, end);
+        return end;
     }
     // emit() for a growing view: what was sent is a prefix by construction, so no prefix compare
     bool emit_view(std::string_view full, std::string & sent, bool reasoning) {
         if (full.size() <= sent.size()) return true;
-        size_t end = full.size() - std::min(full.size(), unstable_tail_view(full));
-        if (!reasoning) end = end > hold_ ? end - hold_ : 0;
-        if (!reasoning && req_.tools) end = rstrip(full, end);
+        const size_t end = stable_end(full, reasoning);
         if (end <= sent.size()) return true;
         return send_piece(std::string(full.substr(sent.size(), end - sent.size())), sent, reasoning);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
-        size_t end = full.size();
-        if (!final) {
-            end -= std::min(end, unstable_tail(full));
-            if (!reasoning) end = end > hold_ ? end - hold_ : 0;
-            if (!reasoning && req_.tools) end = rstrip(full, end);
-        }
+        const size_t end = final ? full.size() : stable_end(full, reasoning);
         if (end <= sent.size()) return true;
         return send_piece(full.substr(sent.size(), end - sent.size()), sent, reasoning);
     }
