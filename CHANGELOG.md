@@ -13,6 +13,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   `embed_multi_iq4xs` lookups (0.67 GB, bitwise equal to the host IQ4_XS dequantiser in BF16). Any other embedding type
   without a lookup kernel is dequantized to BF16 once at load instead of failing with "unsupported matrix type".
 
+- `--mtp --draft-vocab`: the MTP draft head scores the draft-vocabulary rows of the 4-bit head with the int8 re-score of
+  its top 16 (the Q6_K subset copy is no longer uploaded), and one-token draft passes run as captured CUDA graphs.
+  `TQLLM_COMMIT_OVERLAP=1` overlaps the commit replay with the draft passes. RTX 3090, mixed IQ4_XS / Q5_K Qwen3.8-27B
+  GGUF, 64K context, temperature 0.7, `--draft-vocab atx_65536.txt`: 119.7 -> 124.0 tok/s.
+- Composite (mixed-format) matrices run their parts concurrently on side streams (same results); DFlash2 on the same
+  GGUF, 128K context, q8/q4 KV: 140.1 -> 143.6 tok/s at temperature 0.7.
+- `--graph-keep-mb N`: the free-memory floor below which a CUDA graph miss also evicts (was fixed at 384 MB; a full card
+  could re-capture its verify graph every step).
+
 ### Fixed
 - With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
   at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
