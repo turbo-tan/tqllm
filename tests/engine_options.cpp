@@ -64,6 +64,9 @@ int main() {
     tqllm::warn_exact_conflicts(tqllm::exact_conflicts(parse({"--prefill-int8", "on"}), false, false, no_env), err);
     expect(err.str().find("WARN --exact on with --prefill-int8 on") != std::string::npos &&
            err.str().find("the asked option wins") != std::string::npos, "the warning names the option and who wins");
+    expect(d.graph_keep_mb == 384 && parse({"--graph-keep-mb", "128"}).graph_keep_mb == 128 &&
+           parse({"--graph-keep-mb", "0"}).graph_keep_mb == 0, "--graph-keep-mb (384 default, 0 = by count only)");
+    expect(throws({"--graph-keep-mb", "-1"}), "negative --graph-keep-mb rejected");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");
     std::printf(fail ? "ENGINE_OPTIONS FAIL\n" : "ENGINE_OPTIONS PASS\n");
