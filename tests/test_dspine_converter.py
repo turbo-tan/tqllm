@@ -8,6 +8,13 @@ import unittest
 
 import numpy as np
 
+try:
+    import gguf  # noqa: F401  (the converter writes through gguf-py; CPU CI may not have it)
+    HAVE_GGUF = True
+except ImportError:
+    HAVE_GGUF = False
+NEEDS_GGUF = unittest.skipUnless(HAVE_GGUF, "gguf-py not installed")
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("dspine_converter", ROOT / "tools/convert/dflash/dspine_hf_to_gguf.py")
 converter = importlib.util.module_from_spec(SPEC)
@@ -90,6 +97,7 @@ class TestDSpineConverter(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 converter.parameters(broken)
 
+    @NEEDS_GGUF
     def test_target_arch_override(self):
         import gguf
         config, header, _, payload = fixture()
@@ -111,6 +119,7 @@ class TestDSpineConverter(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 converter.tensor_plan(broken, config)
 
+    @NEEDS_GGUF
     def test_round_trip_bf16_and_layer_slices(self):
         import gguf
         config, header, _, payload = fixture()
@@ -131,6 +140,7 @@ class TestDSpineConverter(unittest.TestCase):
             # Release the mapped views before Windows removes the temporary file.
             del tensor, tensors, result
 
+    @NEEDS_GGUF
     def test_version_and_nonzero_terminal_fail_before_output(self):
         for key in ("draft_block_causal_version", "selected_prefix_bridge.out.weight"):
             config, header, _, payload = fixture()

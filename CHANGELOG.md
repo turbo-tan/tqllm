@@ -20,6 +20,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - llama.cpp IQ4_XS GGUFs of Qwen3.8 load: their IQ4_XS token embeddings are read in place by new `iq4xs_row` /
   `embed_multi_iq4xs` lookups (0.67 GB, bitwise equal to the host IQ4_XS dequantiser in BF16). Any other embedding type
   without a lookup kernel is dequantized to BF16 once at load instead of failing with "unsupported matrix type".
+- Native Windows build (MSVC + CUDA, no WSL or Docker): `tqserve` serves Qwen3.8 GGUFs. One file per OS for file mapping,
+  positioned reads and shared libraries (`src/core/platform/os_*.cpp`) and one socket layer (`tools/serve/net.hpp`). RTX
+  5060 Ti 16 GB, Windows 11, CUDA 12.8, Qwen3.8-27B TQ3_XS: prompt 1,186-1,228 tok/s at 2K / 6K, decode 33.8 tok/s, with
+  DFlash2-TQ3 160 / 116 / 102 tok/s (chat / 2K / 6K). The MoE engines (Flash-Next, GLM-5.3-Flash, MiniMax) are left out on
+  Windows for now and say so (`TQLLM_MOE_ENGINES`, OFF on Windows); run them under WSL 2. CUDA 13.3 builds too (#35).
+- DSpine drafter (opt-in, `-md` with a DSpine GGUF; `tools/convert/dflash/dspine_hf_to_gguf.py` converts Tencent's
+  checkpoint) for Qwen3.8-27B and Qwen3-8B targets. Exact (greedy text equal to plain decoding, 20/20). DFlash2 stays the
+  default: on the same targets it is faster on an RTX 3090 (162 vs 133 tok/s, code + math 227 vs 209), a GB10 (61 vs 50)
+  and an RTX 5060 Ti (130 vs 85).
 
 ### Changed
 - Flash-Next with more than 32 rows in a verify block (np 16 x 4 rows): dense and head projections read their weights
@@ -38,6 +47,18 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   variables (TQLLM_MLX_ANE_FFN, TQLLM_MLX_ANE_WAVE) are removed.
 
 ### Fixed
+- GB10 (memory shared with the CPU): a model loaded while another model process held most of the memory exhausted it and
+  hung the machine until the watchdog panicked. tqserve now refuses that load and says which memory it found.
+- Several users on a small card (np > 1, 16 / 12 GB): a request whose K/V could not fit beside the running ones failed
+  the running requests' next step with HTTP 500. It now waits in the queue, the admission counts a new sequence's own
+  state (284 MB at 8K), and a request that does fail frees its slot instead of turning the next request into a 500.
+  RTX 3090 limited to 16 GB, Flash-Next, 4 users: 12 rounds with no failure. tqserve logs the cause of every HTTP 500.
+- Router: a box that answered its status late (busy prefilling a burst of requests) was skipped, and its share queued on
+  the full front door; it now keeps its last answer and is skipped only after three misses in a row.
+- Streaming: a piece could end inside a multi-byte character (the stop-string hold is a byte count); pieces now end on a
+  character boundary, and invalid UTF-8 in a reply becomes U+FFFD instead of invalid JSON (#35).
+- macOS 27: the Metal kernels and the MLX CMake package build again (#24); the wrong-output report on macOS 27 is still
+  under investigation.
 - With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
   at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
 

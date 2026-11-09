@@ -1071,7 +1071,7 @@ private:
         return out;
     }
     // bytes at the end of `t` that may still change: an incomplete UTF-8 sequence or a replacement character
-    static size_t unstable_tail(std::string_view t) {
+    static size_t unstable_tail(const std::string & t) {
         if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
         for (size_t k = 1; k <= 3 && k <= t.size(); ++k) {
             const auto c = static_cast<unsigned char>(t[t.size() - k]);
@@ -1139,26 +1139,41 @@ private:
                 if (t.compare(end - k, k, m, 0, k) == 0) {end -= k; break;}
         return orphan_tool_tail(t.substr(0, end), true);
     }
-    size_t stable_end(std::string_view full, bool reasoning) const {
-        size_t end = full.size() - unstable_tail(full);
-        if (!reasoning && hold_) {
-            end = end > hold_ ? end - hold_ : 0;
-            // Holding back a possible stop string can move the boundary into a UTF-8 character.
-            end -= unstable_tail(full.substr(0, end));
+    static size_t unstable_tail_view(std::string_view t) {
+        if (t.size() >= 3 && t.compare(t.size() - 3, 3, "\xEF\xBF\xBD") == 0) return 3;
+        for (size_t k = 1; k <= 3 && k <= t.size(); ++k) {
+            const auto c = static_cast<unsigned char>(t[t.size() - k]);
+            if ((c & 0xC0) == 0x80) continue;
+            const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            return need > k ? k : 0;
         }
-        if (!reasoning && req_.tools) end = rstrip(full, end);
-        return end;
+        return 0;
     }
     // emit() for a growing view: what was sent is a prefix by construction, so no prefix compare
+    // a cut inside a multi-byte character (the stop-string hold is a byte count) moves back to its first byte: a piece
+    // never ends mid-character, so the JSON sanitiser (json_out.hpp) never sees half of a valid character
+    static size_t char_boundary(std::string_view t, size_t end) {
+        while (end > 0 && end < t.size() && (static_cast<unsigned char>(t[end]) & 0xC0) == 0x80) --end;
+        return end;
+    }
     bool emit_view(std::string_view full, std::string & sent, bool reasoning) {
         if (full.size() <= sent.size()) return true;
-        const size_t end = stable_end(full, reasoning);
+        size_t end = full.size() - std::min(full.size(), unstable_tail_view(full));
+        if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+        if (!reasoning && req_.tools) end = rstrip(full, end);
+        end = char_boundary(full, end);
         if (end <= sent.size()) return true;
         return send_piece(std::string(full.substr(sent.size(), end - sent.size())), sent, reasoning);
     }
     bool emit(const std::string & full, std::string & sent, bool reasoning, bool final) {
         if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) return true;  // nothing new / not a prefix
-        const size_t end = final ? full.size() : stable_end(full, reasoning);
+        size_t end = full.size();
+        if (!final) {
+            end -= std::min(end, unstable_tail(full));
+            if (!reasoning) end = end > hold_ ? end - hold_ : 0;
+            if (!reasoning && req_.tools) end = rstrip(full, end);
+            end = char_boundary(full, end);
+        }
         if (end <= sent.size()) return true;
         return send_piece(full.substr(sent.size(), end - sent.size()), sent, reasoning);
     }
