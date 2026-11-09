@@ -71,6 +71,9 @@ class Cli(unittest.TestCase):
         self.assertEqual(st["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8086")
         self.assertEqual(st["env"]["ANTHROPIC_MODEL"], "tqllm")
         self.assertEqual(st["model"], "tqllm")
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", st["env"])
+        st = json.loads(cli.agent_args("claude", [], "tqllm", 8086, 65536)[1])
+        self.assertEqual(st["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "65536")
         self.assertEqual(args[2:], ["--model", "tqllm", "-p", "hi"])
         self.assertEqual(cli.agent_args("claude", ["--model", "x", "--settings", "s.json"], "tqllm", 8086), ["--model", "x", "--settings", "s.json"])
 

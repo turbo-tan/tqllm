@@ -465,7 +465,8 @@ int main(int argc, char ** argv) {
             if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
-                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"fit\":\"" + fit + "\"" +
+                body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"context\":" + std::to_string(model.context()) +
+                       ",\"fit\":\"" + fit + "\"" +
                        (plugins_json.empty() ? std::string() : ",\"plugins\":[" + plugins_json + "]") + "}";
             } else if (request.path == "/admin/slots" && (request.method == "GET" || request.method == "POST")) {
                 // live parallelism: POST {"slots": k} admits at most k requests at once (1 .. --np), no reload
