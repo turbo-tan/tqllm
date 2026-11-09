@@ -231,13 +231,16 @@ def opencode_config(port):
                                    "models": {"qwen3.8-27b": {"name": "Qwen3.8-27B (tqLLM)"}}}}}
 
 
-def agent_env(name, port, env=None):
+def agent_env(name, port, env=None, model=None):
     """The environment that points a coding agent at the local server: Claude Code at /v1/messages, Codex at
     /v1/responses, OpenCode at /v1/chat/completions through a generated config (all served by tqserve)."""
     e = dict(os.environ if env is None else env)
     base = f"http://127.0.0.1:{port}"
     if name == "claude":
         e.update(ANTHROPIC_BASE_URL=base, ANTHROPIC_AUTH_TOKEN="tqllm")
+        if model:  # the served model for every Claude Code role, over a model name left in the shell or its settings
+            e.update({k: model for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")})
     elif name == "codex":
         e.update(OPENAI_BASE_URL=base + "/v1", OPENAI_API_KEY="tqllm")
     elif name == "opencode":
@@ -250,11 +253,32 @@ def agent_env(name, port, env=None):
     return e
 
 
-def agent_args(name, args):
-    """OpenCode starts on the tqLLM model unless a model is given."""
+def agent_args(name, args, model=None):
+    """OpenCode starts on the tqLLM model, Claude Code on the served model, unless a model is given."""
     if name == "opencode" and not has_option(args, "-m", "--model"):
         return ["-m", OPENCODE_MODEL] + list(args)
+    if name == "claude" and model and not has_option(args, "--model"):
+        return ["--model", model] + list(args)
     return list(args)
+
+
+def served_model(port, timeout=3.0):
+    """(model id, owner) that the server on the port reports at /v1/models, or None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=timeout) as r:
+            first = json.load(r)["data"][0]
+        return str(first.get("id", "")), str(first.get("owned_by", ""))
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def tqllm_model(port, cmd, served=served_model):
+    """The model id of tqLLM's server on the port; stops when another program answers there."""
+    info = served(port)
+    if info is None or info[1] != "tqllm":
+        what = f"it serves {info[0]!r}" if info else "it does not answer /v1/models"
+        raise SystemExit(f"tqllm: port {port} is not tqLLM's server ({what}); stop that server, or run tqllm {cmd} --port N")
+    return info[0]
 
 
 def healthy(port, timeout=2.0):
@@ -362,7 +386,8 @@ def main(argv=None):
         if not exe:
             raise SystemExit(f"{cmd} is not installed (it is a separate tool); install it, then run tqllm {cmd}")
         ensure_server(port, lambda p: start_background(p, mac, native))
-        os.execve(exe, [exe] + agent_args(cmd, args), agent_env(cmd, port))
+        model = tqllm_model(port, cmd)
+        os.execve(exe, [exe] + agent_args(cmd, args, model), agent_env(cmd, port, model=model))
     raise SystemExit(f"unknown command {cmd!r}: tqllm serve | pull | stop | " + " | ".join(AGENTS))
 
 

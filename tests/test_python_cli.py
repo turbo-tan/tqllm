@@ -59,6 +59,23 @@ class Cli(unittest.TestCase):
         for f in (cli.MODEL, cli.DRAFTER): (d / f).write_bytes(b"x")
         cli.fetch([(cli.MLX_REPO, cli.MODEL), (cli.MLX_REPO, cli.DRAFTER)])  # no network, no import needed
 
+    def test_claude_gets_the_served_model(self):
+        # a model name left in the shell (e.g. ANTHROPIC_MODEL=qwen3.5-4b) must not reach tqLLM's server
+        e = cli.agent_env("claude", 9000, env={"ANTHROPIC_MODEL": "qwen3.5-4b-instruct"}, model="tqllm")
+        for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            self.assertEqual(e[k], "tqllm")
+        self.assertEqual(cli.agent_args("claude", ["-p", "hi"], "tqllm"), ["--model", "tqllm", "-p", "hi"])
+        self.assertEqual(cli.agent_args("claude", ["--model", "x"], "tqllm"), ["--model", "x"])
+
+    def test_foreign_server_on_the_port(self):
+        self.assertEqual(cli.tqllm_model(8086, "claude", served=lambda p: ("tqllm", "tqllm")), "tqllm")
+        with self.assertRaises(SystemExit) as c:
+            cli.tqllm_model(8086, "claude", served=lambda p: ("qwen3.5-4b-instruct", "llamacpp"))
+        self.assertIn("not tqLLM's server", str(c.exception))
+        self.assertIn("qwen3.5-4b-instruct", str(c.exception))
+        with self.assertRaises(SystemExit):
+            cli.tqllm_model(8086, "claude", served=lambda p: None)
+
     def test_agent_env(self):
         e = cli.agent_env("claude", 9000, env={})
         self.assertEqual(e["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9000")
