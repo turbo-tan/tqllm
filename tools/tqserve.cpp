@@ -2,6 +2,7 @@
 #include "serve/http.hpp"
 #include "serve/monitor_server.hpp"
 #include "serve/scheduler.hpp"
+#include "serve/peer.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <memory>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -134,10 +136,12 @@ int bind_socket(const std::string & host, uint16_t port) {
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X --repeat-penalty R --frequency-penalty F (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--list-kv] [--list-flags]\n"
+                 "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--peer http://HOST:PORT ...] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
-                 "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n";
+                 "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n"
+                 "  --peer URL (repeatable, needs --np > 1): other tqserve boxes with the same model; each chat request goes to the box expected to\n"
+                 "    answer first (free slots, decoding load, the K/V a slot already holds for the prompt); POST /admin/route reports a box's status\n";
 }
 // A generation that throws (e.g. a kernel launch that fails on a nearly full device) fails its own request only: the next
 // request starts at position 0 and resets the sequence state.
@@ -164,16 +168,17 @@ void observe_result(const std::shared_ptr<tqserve::Monitor::Request> & observati
 
 int main(int argc, char ** argv) {
     tqllm::check_env_flags("tqserve");
-    tqserve::free_mb_probe() = [] {
-        size_t free = 0, total = 0;
 #if TQLLM_WITH_CUDA
+    tqserve::free_mb_probe() = [] {  // CUDA only: Metal has no free-memory query, and a fake "0 MB" misled (issue #24)
+        size_t free = 0, total = 0;
         cudaMemGetInfo(&free, &total);
-#endif
         return free >> 20;
     };
+#endif
     std::string model_dir, model_path, tokenizer_path, host = "127.0.0.1", name = "tqllm";
     std::string system;  // none by default, like the Qwen3.5/3.8 chat template (--system sets one)
     std::string api_key;
+    std::vector<tqserve::Peer> peers;  // --peer: other boxes this front door routes requests to
     uint32_t monitor_port = 0;
     bool reasoning = false;
     std::string effort = "xhigh";  // default reasoning_effort when a request does not set one
@@ -253,6 +258,11 @@ int main(int argc, char ** argv) {
                 if (!v || v > 65535 || consumed != input.size()) throw std::invalid_argument("monitor port must be 1..65535");
                 monitor_port = static_cast<uint32_t>(v);
             }
+            else if (arg == "--peer") {
+                tqserve::Peer p;
+                if (!tqserve::parse_peer(value(), p)) throw std::invalid_argument("--peer takes http://HOST:PORT");
+                peers.push_back(p);
+            }
             else if (arg == "--api-key") api_key = value();
             else if (arg == "--api-key-file") {
                 std::ifstream key_file(value());
@@ -270,6 +280,7 @@ int main(int argc, char ** argv) {
             usage();
             return 2;
         }
+        if (!peers.empty() && np < 2) throw std::invalid_argument("--peer needs --np N (N > 1): the router reads the slot scheduler");
 
         std::cerr << "tqserve: loading model from " << model_path << "\n";
         tqllm::Tokenizer tokenizer;
@@ -462,6 +473,14 @@ int main(int argc, char ** argv) {
                     }
                     if (status == 200) body = scheduler->status_json();
                 }
+            } else if (request.method == "POST" && request.path == "/admin/route") {
+                // a front door's status query (tqserve --peer): the body is the rendered prompt
+                if (!scheduler) {
+                    status = 400;
+                    body = tqserve::json_error("routing needs --np N (N > 1)");
+                } else {
+                    body = tqserve::status_json(scheduler->route_status(std::string(request.body.begin(), request.body.end())));
+                }
             } else if (request.method == "GET" && (request.path == "/v1/models" || request.path == "/v1/models/" + name)) {
                 body = "{\"object\":\"list\",\"data\":[{\"id\":";
                 tqserve::jstr(body, name);
@@ -480,6 +499,37 @@ int main(int argc, char ** argv) {
                 auto parsed = adapt_error.empty()
                     ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
                     : tqserve::ChatRequest{};
+                std::atomic<int> * local_routed = nullptr;  // the router's count for this box, released when the request ends
+                struct RoutedDone { std::atomic<int> *& n; ~RoutedDone() { if (n) --*n; } } routed_done{local_routed};
+                if (parsed.ok && adapt_error.empty() && scheduler && !peers.empty() && !request.routed) {
+                    // multi-box: query every box at once, pick the one expected to answer first (serve/router.hpp)
+                    std::vector<tqserve::BoxStatus> boxes(peers.size() + 1);
+                    std::vector<std::thread> asks;
+                    for (size_t i = 0; i < peers.size(); ++i)
+                        asks.emplace_back([&, i] { boxes[i + 1] = tqserve::peer_status(peers[i], parsed.prompt_text, request.authorization, 100); });
+                    boxes[0] = scheduler->route_status(parsed.prompt_text);
+                    for (auto & t : asks) t.join();
+                    const double prompt = double(parsed.prompt_text.size()) / scheduler->chars_per_token();
+                    const double gen = std::min<double>(parsed.max_tokens, 512);
+                    static std::vector<std::atomic<int>> inflight(peers.size() + 1);  // routed here, not finished
+                    static std::mutex route_mutex;
+                    int pick = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(route_mutex);
+                        for (size_t i = 0; i < boxes.size(); ++i) boxes[i].inflight = inflight[i].load();
+                        pick = tqserve::pick_box(boxes, prompt, gen);
+                        ++inflight[size_t(pick)];
+                    }
+                    if (pick > 0) {
+                        const auto & peer = peers[size_t(pick - 1)];
+                        const bool sent = tqserve::peer_proxy(peer, tqserve::forward_bytes(request, peer), client);
+                        --inflight[size_t(pick)];
+                        if (sent) { ::close(client); return; }
+                        std::fprintf(stderr, "tqserve: peer %s:%u did not take the request; serving it here\n", peer.host.c_str(), unsigned(peer.port));
+                        ++inflight[0];
+                    }
+                    local_routed = &inflight[0];
+                }
                 if (monitor && parsed.ok) parsed.observation = monitor->begin();
                 if (!adapt_error.empty()) { parsed.ok = false; parsed.error = adapt_error; }
                 if (parsed.ok && parsed.thinking) {
@@ -619,7 +669,7 @@ int main(int argc, char ** argv) {
                 if (parsed.observation) parsed.observation->finish(status == 200 ? "complete" : "failed");
                 if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
-                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" ||
+                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" || request.path == "/admin/route" ||
                     request.path == "/v1/models/" + name || tqserve::api_for_path(request.path) != tqserve::Api::None;
                 status = known_path ? 405 : 404;
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");

@@ -215,10 +215,10 @@ inline mlx::core::array decode_attention_trellis(const mlx::core::array& q, cons
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto acc0 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc1 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc3 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto acc0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc3 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (ushort i = 0; i < 16; ++i) {acc0[i] = 0.0f; acc1[i] = 0.0f; acc2[i] = 0.0f; acc3[i] = 0.0f;}
     short dn[16], dm[16];
     for (ushort i = 0; i < 16; ++i) {
@@ -255,7 +255,7 @@ inline mlx::core::array decode_attention_trellis(const mlx::core::array& q, cons
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
             // partial S [16 rows x 32 keys] over this half = trellis group half_d: codebook values, the norm applied on S
-            auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+            auto sacc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
             for (ushort i = 0; i < 16; ++i) sacc[i] = 0.0f;
             for (int ks = 0; ks < 8; ++ks) {
                 for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];

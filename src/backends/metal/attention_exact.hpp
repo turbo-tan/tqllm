@@ -111,14 +111,14 @@ inline mlx::core::array decode_attention_exact(const mlx::core::array& q, const 
     matmul2d<dS, execution_simdgroup> opS;
     matmul2d<dO, execution_simdgroup> opO;
     auto v0 = tV.slice(0, 0);
-    auto Oa = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(v0), float>();
-    auto Ob = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(v0), float>();
+    auto Oa = opO.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tP)>, metal::remove_addrspace_t<decltype(v0)>, float>();
+    auto Ob = opO.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tP)>, metal::remove_addrspace_t<decltype(v0)>, float>();
     for (int i = 0; i < 64; i++) {Oa[i] = 0.0f; Ob[i] = 0.0f;}
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
     const int kbeg = c * CH, kend = min(kbeg + CH, BOUND);
     for (int kt = kbeg; kt < kend; kt += 64) {
         auto kslice = tK.slice(0, kt);
-        auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(kslice), float>();
+        auto S = opS.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tQ)>, metal::remove_addrspace_t<decltype(kslice)>, float>();
         opS.run(tQ, kslice, S);
         float s[32];
         for (int i = 0; i < 32; i++) {
@@ -131,7 +131,7 @@ inline mlx::core::array decode_attention_exact(const mlx::core::array& q, const 
         x1 = max(x1, simd_shuffle_xor(x1, 1)); x1 = max(x1, simd_shuffle_xor(x1, 8));
         const float n0 = max(m0, x0), n1 = max(m1, x1);
         const float f0 = x0 == -INFINITY ? 1.0f : fast::exp(m0 - n0), f1 = x1 == -INFINITY ? 1.0f : fast::exp(m1 - n1);
-        auto Pc = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(kslice), half>();
+        auto Pc = opS.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tQ)>, metal::remove_addrspace_t<decltype(kslice)>, half>();
         float y0 = 0.0f, y1 = 0.0f;
         for (int i = 0; i < 32; i++) {
             const float p = s[i] == -INFINITY ? 0.0f : fast::exp(s[i] - ((i & 4) ? n1 : n0));

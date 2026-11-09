@@ -86,8 +86,11 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         }
     }
     out_norm = g_f32(f, "output_norm.weight", H);
-    const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
-    lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
+    if (cfg.tied) lm_head = embed;  // tied embeddings (Qwen3.5 4B and smaller): no output.weight in the file
+    else {
+        const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
+        lm_head = g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
+    }
     if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
     // routed + shared experts of one MoE block (the trunk's layers and the MTP block): router, VRAM / host / split
     // expert matrices, the shared expert fused into the routed launches where its type and shape allow

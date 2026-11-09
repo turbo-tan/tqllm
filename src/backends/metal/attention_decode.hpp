@@ -330,10 +330,10 @@ inline mlx::core::array decode_attention_int8_reference(const mlx::core::array& 
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto acc0 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc1 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
-    auto acc3 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto acc0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    auto acc3 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (ushort i = 0; i < 16; ++i) {acc0[i] = 0.0f; acc1[i] = 0.0f; acc2[i] = 0.0f; acc3[i] = 0.0f;}
     // destination element -> (n, m) once; the same layout for S (m = row, n = key) and O (m = row, n = dim)
     short dn[16], dm[16];
@@ -358,7 +358,7 @@ inline mlx::core::array decode_attention_int8_reference(const mlx::core::array& 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
             // partial S tile [16 rows x 32 keys] over this half of the head dim; K^T fragment: 4 consecutive keys per load
-            auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+            auto sacc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
             for (ushort i = 0; i < 16; ++i) sacc[i] = 0.0f;
             for (int ks = 0; ks < 8; ++ks) {
                 for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];
@@ -554,10 +554,10 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
 
     auto pa = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto pb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto acc0 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
-    auto acc1 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
-    auto acc2 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
-    auto acc3 = op.template get_destination_cooperative_tensor<decltype(pa), decltype(pb), float>();
+    auto acc0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto acc1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto acc2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto acc3 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
     for (ushort i = 0; i < 16; ++i) {acc0[i] = 0.0f; acc1[i] = 0.0f; acc2[i] = 0.0f; acc3[i] = 0.0f;}
 
     short dn[16], dm[16];
@@ -588,7 +588,7 @@ inline mlx::core::array decode_attention_int8(const mlx::core::array& q, const m
 
         {
             // partial S tile [16 rows x 32 keys] over this half of the head dim, int32
-            auto sacc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), int32_t>();
+            auto sacc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, int32_t>();
             for (ushort i = 0; i < 16; ++i) sacc[i] = 0;
             for (int ks = 0; ks < 8; ++ks) {
                 for (short i = 0; i < 8; ++i) ca[i] = qa[ks][i];

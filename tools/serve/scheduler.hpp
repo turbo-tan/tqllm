@@ -2,11 +2,13 @@
 // Multi-slot request scheduler (tqserve --np N): connection threads enqueue requests and wait; one engine thread
 // owns every model call, admits queued requests into free slots and round-robins one draft + verify step per slot.
 #include "admission.hpp"
+#include "router.hpp"
 #include "session.hpp"
 #include "tqllm/model.hpp"
 #include "tqllm/tokenizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <condition_variable>
 #include <deque>
@@ -23,6 +25,7 @@ public:
     Scheduler(const tqllm::Tokenizer & tokenizer, tqllm::Model & model, uint32_t slot_context)
         : tokenizer_(tokenizer), model_(model), context_(slot_context), active_(size_t(model.slots())), used_(size_t(model.slots()), 0),
           limit_(model.slots()) {
+        slot_text_.resize(active_.size());
         thread_ = std::thread([this] { run(); });
     }
     ~Scheduler() {
@@ -38,6 +41,7 @@ public:
     DecodeResult submit(const ChatRequest & req) {
         auto job = std::make_shared<Job>();
         job->req = req;
+        job->start = std::chrono::steady_clock::now();
         job->prompt = prepare(tokenizer_, req, context_, job->result, job->count, &job->images);
         if (!job->result.error.empty()) return job->result;
         {
@@ -63,6 +67,25 @@ public:
         wake_.notify_all();
         return limit_;
     }
+    // What the front door's router needs from this box (tqserve --peer, POST /admin/route): slots, load, measured rates and
+    // the prompt tokens a free slot already holds for this rendered prompt (its last conversation's prefix).
+    BoxStatus route_status(const std::string & prompt_text) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        BoxStatus b;
+        b.ok = true;
+        for (size_t s = 0; s < active_.size(); ++s) {
+            if (active_[s]) { ++b.busy; continue; }
+            b.reuse = std::max(b.reuse, reuse_tokens(slot_text_[s], prompt_text, cpt_.set ? cpt_.v : 4.0));
+        }
+        b.free = std::max(0, limit_ - b.busy);
+        b.queued = int(queue_.size());
+        b.prefill_tps = prefill_tps_.v; b.decode_tps = decode_tps_.v; b.hold_s = hold_s_.v;
+        return b;
+    }
+    double chars_per_token() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cpt_.set ? cpt_.v : 4.0;
+    }
     std::string status_json() {
         std::lock_guard<std::mutex> lock(mutex_);
         int busy = 0;
@@ -76,6 +99,7 @@ public:
     DecodeResult submit_stream(const ChatRequest & req, const std::function<bool(const std::vector<uint32_t> &)> & on_tokens) {
         auto job = std::make_shared<Job>();
         job->req = req;
+        job->start = std::chrono::steady_clock::now();
         job->stream = true;
         job->prompt = prepare(tokenizer_, req, context_, job->result, job->count, &job->images);
         if (!job->result.error.empty()) return job->result;
@@ -115,6 +139,7 @@ private:
         DecodeResult result;
         bool done = false;
         bool stream = false, cancel = false;  // stream: partial / version updated after every step
+        std::chrono::steady_clock::time_point start;
         std::vector<uint32_t> partial;
         uint64_t version = 0;
         RepeatGuard repeat;
@@ -144,17 +169,30 @@ private:
         uint64_t st[5] = {};
         finish(tokenizer_, job->req, model_.spec_finish(st), job->result);
         set_timings(job->result, st);
+        {  // what the router reads: this slot now holds the conversation; measured rates for the cost model
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto & r = job->result;
+            slot_text_[size_t(s)] = job->req.prompt_text + r.reasoning + r.text;
+            if (r.prompt_tokens > 0) cpt_.add(double(job->req.prompt_text.size()) / r.prompt_tokens);
+            if (r.prompt_tokens >= 512 && r.prefill_ms > 0) prefill_tps_.add(r.prompt_tokens * 1000.0 / r.prefill_ms);
+            int running = 0;
+            for (const auto & j : active_) running += j != nullptr;
+            if (r.completion_tokens >= 32 && r.decode_ms > 0)  // back to one sequence alone (router.hpp kBatchSlowdown)
+                decode_tps_.add(r.completion_tokens * 1000.0 / r.decode_ms * (1.0 + kBatchSlowdown * (running - 1)));
+            hold_s_.add(std::chrono::duration<double>(std::chrono::steady_clock::now() - job->start).count());
+        }
         complete(job);
     }
 
     void complete(std::shared_ptr<Job> & job) {
+        if (!job->result.error.empty()) std::fprintf(stderr, "tqserve: request failed (HTTP 500): %s\n", job->result.error.c_str());
         {
             std::lock_guard<std::mutex> lock(mutex_);
             job->done = true;
             ++finished_;
+            job.reset();  // under the lock: status_json / route_status read active_ from connection threads
         }
         done_.notify_all();
-        job.reset();
     }
 
     void run() {
@@ -194,6 +232,7 @@ private:
                     if (best < 0) break;
                     ++busy;
                     used_[size_t(best)] = ++clock_;
+                    slot_text_[size_t(best)].clear();  // its K/V is about to be overwritten
                     active_[size_t(best)] = queue_.front();
                     queue_.pop_front();
                     admitted.push_back(active_[size_t(best)]);
@@ -282,6 +321,8 @@ private:
     uint64_t clock_ = 0;
     unsigned long long finished_ = 0, wait_until_ = 0;  // after an out-of-memory requeue, admission waits for one finish
     std::deque<std::shared_ptr<Job>> queue_;
+    std::vector<std::string> slot_text_;  // per slot: the conversation its K/V holds (rendered prompt + answer), for routing
+    Ema cpt_, prefill_tps_, decode_tps_, hold_s_;  // chars per token, prompt tok/s, one-sequence decode tok/s, request seconds
     int limit_ = 1;  // admitted at once (POST /admin/slots)
     std::mutex mutex_;
     std::condition_variable wake_, done_;

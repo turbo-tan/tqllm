@@ -68,8 +68,9 @@ struct RepeatGuard {
             else tok = ids[seen], run = 1;
             if (run >= limit) {
                 const auto & probe = free_mb_probe();
-                fprintf(stderr, "tqserve: repeat guard: token %u repeated %u times after %zu generated (device free %zu MB)\n",
-                        tok, run, ids.size(), probe ? probe() : size_t(0));
+                if (probe) fprintf(stderr, "tqserve: repeat guard: token %u repeated %u times after %zu generated (device free %zu MB)\n",
+                                   tok, run, ids.size(), probe());
+                else fprintf(stderr, "tqserve: repeat guard: token %u repeated %u times after %zu generated\n", tok, run, ids.size());
                 return true;
             }
         }

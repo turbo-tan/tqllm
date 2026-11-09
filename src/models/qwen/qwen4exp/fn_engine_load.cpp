@@ -422,7 +422,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           }
           if (warm.miss_stream) f.cache->set_miss_stream(warm.miss_stream);
           rt.kv_capacity = std::min(kv_capacity_full, 4096);
-          std::fprintf(stderr, "tqllm: one sequence holds %.0f MB of device memory beside its request-sized K/V (measured; slot context %d)\n",
+          // the probe's K/V is lazily sized (26 of 284 MB at 8K, 11-09), not the full-context formula: count all of it
+          f.seq_fixed = measured_state;
+          std::fprintf(stderr, "tqllm: one sequence holds %.0f MB of device memory beside its request-sized K/V (measured; slot context %d; counted at each new request)\n",
                        measured_state / 1048576.0, kv_capacity_full);
       }
       if (f.slots_auto) {  // slots=auto: every other buffer is in place; the banks get what the context does not keep

@@ -333,6 +333,7 @@ int main() {
                     }
                 } catch (const std::exception& e) {std::printf("VEC_BENCH mlx_vector length=%d n=%d EXCEPTION %s\n", length, n, e.what());}
             }
+#ifdef MLX_HAS_SDPA_LSE
             // bf16_segmented (our matrix path) at 8 rows and 1 row for the same cache, same units
             for (int n : {1, 8}) {
                 auto qn = mx::astype(mx::contiguous(mx::slice(q, {0, 0, 0, 0}, {1, H, n, D})), mx::float32);
@@ -347,6 +348,7 @@ int main() {
                     std::printf("VEC_BENCH bf16_segmented        length=%d n=%d %.1f us per call\n", length, n, us);
                 } catch (const std::exception& e) {std::printf("VEC_BENCH bf16_segmented length=%d n=%d EXCEPTION %s\n", length, n, e.what());}
             }
+#endif
         }
         std::printf(inv_ok ? "VEC_INVARIANT_PASS\n" : "VEC_INVARIANT_FAIL\n");
         return 0;

@@ -24,7 +24,7 @@ TQ_L = "Qwen3.8-27B-TQ_L.gguf"  # 14.7 GB: the file for Macs below LARGE_MAC_GB
 TQ_L_QSA = "Qwen3.8-27B-TQ_L-QSA.gguf"  # 14.8 GB: TQ_L with the QSA indexers (preferred when published)
 LARGE_MAC_GB = 40
 PORT = 8086  # tqserve's default
-IMAGE = "ghcr.io/turbo-tan/tqllm:1.4.4"
+IMAGE = "ghcr.io/turbo-tan/tqllm:1.5.0"
 # Linux / NVIDIA: (repo, file) per model; files keep their repo subfolder under the models folder
 TQ34S_REPO, TQ34S = "YTan2000/Qwen3.8-27B-TQ3_4S", "Qwen3.8-27B-TQ3_4S-v2.gguf"  # 24 GB cards
 TQ_S = "Qwen3.8-27B-TQ_S.gguf"  # 16 GB cards

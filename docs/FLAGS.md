@@ -8,8 +8,6 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
-| `TQLLM_MLX_ANE_FFN` | - | DIR: Neural Engine share of the prefill FFN from per-layer Core ML models (opt-in fast prefill; quality changes, see docs/MLX_BACKEND.md) |  |
-| `TQLLM_MLX_ANE_WAVE` | - | 1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN) |  |
 | `TQLLM_MLX_CACHE_LIMIT_MIB` | - | MiB: MLX buffer-cache limit for the Mac tools (default 512) |  |
 | `TQLLM_MLX_PREFILL_CHUNK` | - | N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best) |  |
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |
@@ -32,7 +30,7 @@ command-line options (`docs/CONFIG.md`).
 
 | Flag | Default | What it does | Use instead |
 |---|---|---|---|
-| `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, stagemap (MiniMax verify-step stage map), accept (MiniMax acceptance per draft depth), dump_feats:DIR / replay_feats:DIR (DSpark drafter training rows), glm_dump, glm_no_graph; Metal: ane_serial, ane_timing, count_nodes, dflash_rankstats, stream_group:N (a draft-ahead verify submits every N layers, default 4), nostream (one submission per forward), tree_rows:N (token-tree verify rows, 16 or 32), no_far (drafter ring window only), retr_split, retr_share, lattice_split, build_split, dump_ffn:DIR, dump_ffn_slice:N, wired_mib:N; Metal bench tools: dflash_spec_only, dflash_warm_tokens:N, draft_stages, draft_bench:N, kl_rows:K, kl_slice:N |  |
+| `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits); Flash-Next / MoE diagnostics: arena, fn_prefill_log, cpu_check, qsa_check, pf_mmq_check:N, profile_req:N, profile_decode, route_dump:FILE, pred_dump:FILE, dump_gdn:FILE, expert_profile:FILE, keep_map:FILE, moe_profile:FILE, minimax_dump:FILE, minimax_routes:FILE, stagemap (MiniMax verify-step stage map), accept (MiniMax acceptance per draft depth), dump_feats:DIR / replay_feats:DIR (DSpark drafter training rows), glm_dump, glm_no_graph; Metal: count_nodes, dflash_rankstats, stream_group:N (a draft-ahead verify submits every N layers, default 4), nostream (one submission per forward), tree_rows:N (token-tree verify rows, 16 or 32), no_far (drafter ring window only), retr_split, retr_share, lattice_split, build_split, wired_mib:N; Metal bench tools: dflash_spec_only, dflash_warm_tokens:N, draft_stages, draft_bench:N, kl_rows:K, kl_slice:N |  |
 
 ## Retired (the tool stops; use the replacement)
 
@@ -73,6 +71,13 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_TREE` | - | removed | tree verify is on with -md; --no-tree turns it off |
 | `TQLLM_TREE_CHAIN` | - | removed | TQLLM_DEBUG=tree_chain |
 | `TQLLM_VRAM_MARGIN_MB` | - | removed | -fitt MiB (-fit on|off) |
+
+## Removed in 1.5.0 (no effect; use the replacement)
+
+| Flag | Use instead |
+|---|---|
+| `TQLLM_MLX_ANE_FFN` | none: the Neural Engine prefill split is the default (no Core ML models needed) |
+| `TQLLM_MLX_ANE_WAVE` | none: the Neural Engine prefill split is the default |
 
 ## Removed in 1.4.0 (no effect; use the replacement)
 
@@ -174,9 +179,9 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_ANE_CHECK` | none: Metal release default built in |
 | `TQLLM_MLX_ANE_FULL_DEQUANT` | none: Metal release default built in |
 | `TQLLM_MLX_ANE_NOISE` | none: Metal release default built in |
-| `TQLLM_MLX_ANE_SERIAL` | TQLLM_DEBUG=ane_serial |
+| `TQLLM_MLX_ANE_SERIAL` | none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default) |
 | `TQLLM_MLX_ANE_SKIP_PREDICT` | none: Metal release default built in |
-| `TQLLM_MLX_ANE_TIMING` | TQLLM_DEBUG=ane_timing |
+| `TQLLM_MLX_ANE_TIMING` | none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default) |
 | `TQLLM_MLX_ATTENTION_KV_VIEWS` | none: Metal release default built in |
 | `TQLLM_MLX_ATTN_DECODE_ROWS` | none: Metal release default built in |
 | `TQLLM_MLX_ATTN_DECODE_SDPA` | none: always on (fused SDPA decode attention) |
@@ -205,8 +210,8 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_MLX_DRAFT_HEAD4` | none: Metal release default built in |
 | `TQLLM_MLX_DRAFT_HEAD_UNPAD` | none: Metal release default built in |
 | `TQLLM_MLX_DROP_TILED_ORIGINALS` | none: Metal release default built in |
-| `TQLLM_MLX_DUMP_FFN` | TQLLM_DEBUG=dump_ffn:DIR |
-| `TQLLM_MLX_DUMP_FFN_SLICE` | TQLLM_DEBUG=dump_ffn_slice:N |
+| `TQLLM_MLX_DUMP_FFN` | none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default) |
+| `TQLLM_MLX_DUMP_FFN_SLICE` | none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default) |
 | `TQLLM_MLX_DUMP_KV` | none: Metal release default built in |
 | `TQLLM_MLX_EAGER_ACCEPT` | none: Metal release default built in |
 | `TQLLM_MLX_EAGER_COMMIT` | none: Metal release default built in |

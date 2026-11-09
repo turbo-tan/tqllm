@@ -128,12 +128,22 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             const size_t total = sl.plen_ + size_t(sl.generate_) + 16, at = size_t(std::max(0, sl.model_->position));
             if (total > at) grow += tqllm::flashnext::sequence_kv_bytes(f_.mem_shape, int(total)) - tqllm::flashnext::sequence_kv_bytes(f_.mem_shape, int(at));
         }
+        // a slot that starts a new sequence allocates its PLE histories / GDN state on the first forward (11-09)
+        const size_t fixed = S().model_ ? 0 : f_.seq_fixed;
         { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
         const size_t fr = tqllm::device_free_bytes();
-        if (const size_t give = tqllm::flashnext::request_shrink_bytes(f_.mem_shape, own, fr > grow ? fr - grow : 0, size_t(256) << 20)) {
+        if (const size_t give = tqllm::flashnext::request_shrink_bytes(f_.mem_shape, own, fr > grow ? fr - grow : 0, size_t(256) << 20, fixed)) {
             const int n = f_.cache->shrink_to_free(give, int(slots_.size()) * c.topk);
             std::fprintf(stderr, "tqllm: a request needs %zu MB more for its K/V: %d expert banks gave slots back\n", give >> 20, n);
         }
+        // still short after the banks gave what they could (small cards: 12 / 16 GB, np 4, 11-08: the step then failed for
+        // memory and every running request answered HTTP 500): refuse it now, before any of its state exists, so the server
+        // queues it until a running request finishes ("out of memory" -> tqserve's admission requeue, admission.hpp)
+        bool others = false;
+        for (const auto & sl : slots_) others = others || (&sl != &S() && !sl.done_ && sl.model_);
+        const size_t fr2 = tqllm::device_free_bytes();
+        if (others && tqllm::flashnext::request_shrink_bytes(f_.mem_shape, own, fr2 > grow ? fr2 - grow : 0, size_t(256) << 20, fixed))
+            throw std::runtime_error("out of memory: this request's K/V does not fit beside the running requests; it waits for one to finish");
     }
     if (slots_.size() == 1 && f_.kv_capacity_full) {  // one sequence: its attention state is sized by the request, not the slot context
         const int need = int(std::min<size_t>(size_t(f_.kv_capacity_full), (prompt.size() + count + 16 + 1023) / 1024 * 1024));

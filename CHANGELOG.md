@@ -3,9 +3,17 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.5.0 (2026-11-08)
 
 ### Added
+- Several boxes behind one address: `tqserve --np N --peer http://HOST:PORT` (repeatable) makes this server the front door
+  for other tqserve boxes running the same model. Each chat request goes to the box expected to answer first: free slots,
+  the users already decoding there, and the part of the prompt that box's K/V does not already hold, so a conversation's
+  next turn goes back to the box that has it. Requests are forwarded byte for byte (streaming included); a box that does
+  not answer is skipped. `POST /admin/route` reports a box's state. Two DGX Sparks (GB10), Flash-Next IQ3_S, 384-token
+  answers, total tok/s (two rounds): 4 users 156.7 / 129.4 (one box 111.5 / 93.0), 8 users 208.0 / 182.9 (134.8 / 130.9),
+  16 users 220.6 / 214.2 (one box 125.3 / 134.3). Texts are the same as one box.
+
 - `--mtp` drafts for sampled requests (temperature > 0) as well, with exact speculative sampling (the MTP drafts are
   argmax tokens, accepted with the model's probability, else resampled). RTX 3090, Qwen3.8-27B IQ4_XS GGUF, 32K context,
   temperature 0.7: 104-117 tok/s against 50 when sampled requests decoded without drafting.
@@ -13,9 +21,26 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   `embed_multi_iq4xs` lookups (0.67 GB, bitwise equal to the host IQ4_XS dequantiser in BF16). Any other embedding type
   without a lookup kernel is dequantized to BF16 once at load instead of failing with "unsupported matrix type".
 
+### Changed
+- Flash-Next with more than 32 rows in a verify block (np 16 x 4 rows): dense and head projections read their weights
+  once per 32 rows instead of once per 8. One GB10, 16 users: 116.3 / 123.8 -> 125.3 / 134.3 tok/s; texts unchanged.
+- Qwen3.5 4B and smaller (tied embeddings, no `output.weight`) load again (they failed with "missing GGUF tensor:
+  output.weight"). RTX 3090, Qwen3.5-4B Q4_K_M: 106-185 tok/s.
+- macOS (Apple Silicon): long prompts run part of every FFN on the Neural Engine beside the GPU (an int8 program for the
+  last 12,800 of the 17,408 FFN channels, planned from costs measured once per Mac and cached). M5 Pro, Qwen3.8-27B
+  TQ_L-QSA: prompts 685-704 / 659-671 / 598-605 tok/s at 8K / 16K / 32K (1.4.4: 477-484 / 456-460 / 429-430). Outputs stay
+  exact (server == plain decoding); the split changes numbers slightly (KL vs the GPU-only prompt 0.006 at 16K), so texts
+  can differ from 1.4.4. Without a Neural Engine prompts run on the GPU alone.
+- macOS: shorter first token for prompts of 17-1,000 tokens (a 64-row prompt tile up to 1,024 rows, one 32-row matrix op
+  for 17-32-row prompts): mlx-community 4-bit 114-123 ms at 19-29 tokens (1.4.4: 120-132), 165-172 ms at 35-60
+  (193-219), ~400 ms at 129-161 (522-532).
+- macOS: builds on the stock MLX 0.32.4 wheel (pip / Homebrew) with the Neural Engine path; the opt-in Core ML path and its
+  variables (TQLLM_MLX_ANE_FFN, TQLLM_MLX_ANE_WAVE) are removed.
+
 ### Fixed
 - With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
   at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
+
 
 ## 1.4.4 (2026-11-07)
 

@@ -37,6 +37,7 @@ struct FnServe {
     std::unique_ptr<MixedExpertCache> cache, mtp_cache; PackedExperts packed; char * mtp_packed = nullptr; size_t mtp_block = 0;
     ScratchArena arena; size_t arena_prefill = 0, arena_decode = 0; int kv_capacity_full = 0;
     tqllm::flashnext::MemShape mem_shape;  // the attention shape, for a request's K/V bytes at its start (several sequences)
+    size_t seq_fixed = 0;  // several sequences: one sequence's state beside its K/V (measured at load, sequence_fixed_bytes)
     size_t state_full = 0; int state_tokens = 0;  // one sequence's full-context state (context_keep) and its token count
     size_t plan_budget = 0;  // free + bank bytes after the warm-up (pool trimmed, 256 MB steps): a prompt length always plans the same chunk / block
     float * res_host = nullptr; size_t res_host_cap = 0;  // pinned prompt residuals of a multi-chunk prefill (one prefill at a time)

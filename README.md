@@ -87,10 +87,18 @@ Prefer Docker? The prebuilt image (x86-64 and arm64) runs the same server:
 
 ```sh
 docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" --entrypoint tqserve \
-  ghcr.io/turbo-tan/tqllm:1.4.4 --model /models/model.gguf --host 0.0.0.0 --port 8086
+  ghcr.io/turbo-tan/tqllm:1.5.0 --model /models/model.gguf --host 0.0.0.0 --port 8086
 ```
 
 or build it locally with `docker compose up --build`. See [installation and requirements](docs/guides/quickstart.md).
+
+Two or more machines with the same model? Start a normal server on each, then point one at the others; it becomes the
+single address and sends each request to the box that will answer first (and a conversation back to the box that holds it):
+
+```sh
+./build/tqserve --model models/model.gguf --np 8 --port 8086 --host 0.0.0.0                 # box 2
+./build/tqserve --model models/model.gguf --np 8 --port 8086 --peer http://box2:8086         # box 1: use this one
+```
 
 ## Choose your next step
 

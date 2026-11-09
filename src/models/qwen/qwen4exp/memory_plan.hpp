@@ -65,9 +65,10 @@ inline size_t keep_state(const MemShape & s, const MemRun & r, size_t state_esti
 }
 
 // Several sequences: the bytes the banks must give back before a request of `tokens` positions (prompt + max_tokens)
-// starts, so its K/V fits beside the reserve; 0 when free memory already holds it.
-inline size_t request_shrink_bytes(const MemShape & s, size_t tokens, size_t free, size_t reserve) {
-    const size_t need = sequence_kv_bytes(s, int(tokens)) + reserve;
+// starts, so its K/V and `state` (what a new sequence holds beside its K/V: PLE histories, GDN state, MTP; 0 when the
+// slot keeps its sequence) fit beside the reserve; 0 when free memory already holds it.
+inline size_t request_shrink_bytes(const MemShape & s, size_t tokens, size_t free, size_t reserve, size_t state = 0) {
+    const size_t need = sequence_kv_bytes(s, int(tokens)) + state + reserve;
     return free >= need ? 0 : need - free;
 }
 struct SlotPlan {
