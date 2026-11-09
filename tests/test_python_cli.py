@@ -71,6 +71,22 @@ class Cli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(["frobnicate"])
 
+    def test_no_command_serves(self):  # owner 11-09: plain `tqllm` starts the server; options without a command go to serve
+        seen = []
+        orig_cmd, orig_exec = cli.server_command, cli.os.execvp
+        cli.server_command = lambda rest, mac, native: seen.append(list(rest)) or ["true"]
+        class Exec(Exception): pass
+        def execvp(f, a): raise Exec()  # the real one never returns
+        cli.os.execvp = execvp
+        try:
+            for argv in ([], ["--qsa"]):
+                with self.assertRaises(Exec): cli.main(argv)
+        finally:
+            cli.server_command, cli.os.execvp = orig_cmd, orig_exec
+        self.assertEqual(seen, [[], ["--qsa"]])
+        with self.assertRaises(SystemExit):
+            cli.main(["frobnicate"])
+
 
     # Linux / NVIDIA (11-06): the model by the card's memory, Flash-Next on request, Docker or a native server
     def test_linux_24gb_gets_tq3_4s_drafter_and_vocab(self):

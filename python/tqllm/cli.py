@@ -1,4 +1,4 @@
-"""tqllm serve [--qsa | --flash-next] [--native PATH] [tqserve options]   serve; the first run downloads the model and drafter
+"""tqllm [serve] [--qsa | --flash-next] [--native PATH] [tqserve options]   serve (also with no command); the first run downloads the model and drafter
     Apple Silicon: the packaged Metal server. Linux + NVIDIA: the Docker image (or --native PATH/tqserve), the model picked
     by the card's memory (Qwen3.8-27B TQ3_4S-v2 on 20 GB+, TQ_S below), or Qwen3.8 Flash-Next with --flash-next.
 tqllm pull [--qsa | --flash-next]       download them only
@@ -327,9 +327,11 @@ def without(args, name):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or argv[0] in ("-h", "--help"):
+    if argv and argv[0] in ("-h", "--help"):
         print(__doc__ + f"\nmodels: {models_dir()} (TQLLM_HOME overrides)")
         return 0
+    if not argv or argv[0].startswith("-"):  # no command: serve, options included (tqllm --qsa)
+        argv = ["serve"] + argv
     cmd, rest = argv[0], argv[1:]
     mac = sys.platform == "darwin" and platform.machine() == "arm64"
     if cmd == "pull":

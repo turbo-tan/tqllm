@@ -10,7 +10,8 @@
   tqllm.py --list                                  (the model catalog: models.json, local copies marked)
 
 --model takes a file, a catalog name (`--list`: qwen3.8-27b, -s, -xs, -l) or nothing (the catalog default for this GPU). Catalog
-files are looked up in ./models, ~/models and $TQLLM_MODELS; missing ones are offered for download from Hugging Face
+files are looked up in $TQLLM_MODELS, ./models, ~/models and ~/.cache/tqllm/models; missing ones are offered for download into
+~/.cache/tqllm/models (shared with the tqllm command) from Hugging Face
 (size and sha256 checked), --yes downloads without asking. The server runs --exact on (its default); the speed paths:
 --server-arg=--exact --server-arg=off (one --server-arg per word).
 
@@ -103,7 +104,7 @@ def resolve_model(a):
     missing = [(k, e) for k, e in need if not local[k]]
     if missing:
         gb = sum(e.get("size", 0) for _, e in missing) / 1e9
-        dest = a.models_dir or (os.environ.get("TQLLM_MODELS") or os.path.abspath("models"))
+        dest = a.models_dir or (os.environ.get("TQLLM_MODELS") or os.path.expanduser("~/.cache/tqllm/models"))
         print(f"tqllm: {name} ({m['description']}) needs {gb:.1f} GB from Hugging Face into {dest}:", file=sys.stderr)
         for _, e in missing: print(f"  {e['repo']}/{e['path']} ({e.get('size', 0) / 1e9:.2f} GB)", file=sys.stderr)
         if not a.yes and any(k == "file" for k, _ in missing):  # the drafter alone (< 1 GB) downloads without asking
@@ -269,7 +270,7 @@ def main():
     p.add_argument("command", choices=["launch", "serve"])
     p.add_argument("agent", nargs="?", choices=["opencode", "codex", "claude", "pi", "dsh"])
     p.add_argument("--model", help="GGUF file or catalog name (models.json); default: the catalog default for this GPU")
-    p.add_argument("--models-dir", help="where downloads go (default ./models, or $TQLLM_MODELS)")
+    p.add_argument("--models-dir", help="where downloads go (default ~/.cache/tqllm/models, the tqllm command's folder, or $TQLLM_MODELS)")
     p.add_argument("--yes", action="store_true", help="download missing catalog files without asking")
     p.add_argument("--list", action="store_true", help="print the model catalog and exit")
     p.add_argument("--drafter"); p.add_argument("--draft-vocab")
