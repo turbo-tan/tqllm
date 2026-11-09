@@ -1,11 +1,13 @@
-"""tqllm [serve] [--qsa | --flash-next] [--native PATH] [tqserve options]   serve (also with no command); the first run downloads the model and drafter
+"""tqllm [serve] [--qsa | --flash-next] [--native PATH] [--foreground] [tqserve options]
+                                         start the server in the background (also with no command) and return once it
+                                         answers; the first run downloads the model and drafter. --foreground: stay attached
     Apple Silicon: the packaged Metal server. Linux + NVIDIA: the Docker image (or --native PATH/tqserve), the model picked
     by the card's memory (Qwen3.8-27B TQ3_4S-v2 on 20 GB+, TQ_S below), or Qwen3.8 Flash-Next with --flash-next.
 tqllm pull [--qsa | --flash-next]       download them only
 tqllm claude | codex | opencode [--port N] [--native PATH] [args]
                                          start a coding agent pointed at the server; starts the server first when none
                                          answers on the port (it keeps running: tqllm stop)
-tqllm stop                               stop a server tqllm started"""
+tqllm stop                               stop a server tqllm started (its log: ~/.cache/tqllm/server.log)"""
 import json
 import os
 import platform
@@ -295,9 +297,9 @@ def ensure_server(port, start, is_up=healthy, wait=1800.0, poll=2.0, out=sys.std
     return True
 
 
-def start_background(port, mac, native=None):
+def start_background(port, mac, native=None, args=()):
     """Launch the server detached, output to state_dir()/server.log, pid in server.pid."""
-    cmd = server_command(["--port", str(port)], mac, native)
+    cmd = server_command(list(args) + ["--port", str(port)], mac, native)
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "server.log", "ab")
@@ -342,8 +344,16 @@ def main(argv=None):
         return stop_server()
     if cmd == "serve":
         native = None if mac else option(rest, "--native")
-        line = server_command(without(rest, "--native"), mac, native)
-        os.execvp(line[0], line)
+        args = without(rest, "--native")
+        if "--foreground" in args:  # attached: the server's own output, Ctrl+C stops it
+            line = server_command([a for a in args if a != "--foreground"], mac, native)
+            os.execvp(line[0], line)
+        port = int(option(args, "--port", PORT))
+        extra = without(args, "--port")
+        if not ensure_server(port, lambda p: start_background(p, mac, native, extra)):
+            print(f"tqllm: a server already answers on port {port} (tqllm stop ends one tqllm started)")
+        print(f"tqllm: serving http://127.0.0.1:{port}/v1 (monitor: http://127.0.0.1:{port}/); stop: tqllm stop; log: {state_dir() / 'server.log'}")
+        return 0
     if cmd in AGENTS:
         port = int(option(rest, "--port", PORT))
         native = None if mac else option(rest, "--native")

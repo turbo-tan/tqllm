@@ -71,19 +71,22 @@ class Cli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(["frobnicate"])
 
-    def test_no_command_serves(self):  # owner 11-09: plain `tqllm` starts the server; options without a command go to serve
-        seen = []
-        orig_cmd, orig_exec = cli.server_command, cli.os.execvp
-        cli.server_command = lambda rest, mac, native: seen.append(list(rest)) or ["true"]
+    def test_no_command_serves_in_the_background(self):  # owner 11-09: plain `tqllm` serves, detached; --foreground stays
+        started, execs = [], []
+        orig = cli.ensure_server, cli.server_command, cli.os.execvp
+        cli.ensure_server = lambda port, start: started.append(port) or True
+        cli.server_command = lambda rest, mac, native: execs.append(list(rest)) or ["true"]
         class Exec(Exception): pass
         def execvp(f, a): raise Exec()  # the real one never returns
         cli.os.execvp = execvp
         try:
-            for argv in ([], ["--qsa"]):
-                with self.assertRaises(Exec): cli.main(argv)
+            self.assertEqual(cli.main([]), 0)
+            self.assertEqual(cli.main(["--qsa", "--port", "9001"]), 0)
+            with self.assertRaises(Exec): cli.main(["serve", "--foreground", "--qsa"])
         finally:
-            cli.server_command, cli.os.execvp = orig_cmd, orig_exec
-        self.assertEqual(seen, [[], ["--qsa"]])
+            cli.ensure_server, cli.server_command, cli.os.execvp = orig
+        self.assertEqual(started, [cli.PORT, 9001])
+        self.assertEqual(execs, [["--qsa"]])  # only the foreground run built its line here; background ones build it in start
         with self.assertRaises(SystemExit):
             cli.main(["frobnicate"])
 
@@ -127,6 +130,17 @@ class Cli(unittest.TestCase):
         self.assertEqual(cfg["provider"]["tqllm"]["options"]["baseURL"], "http://127.0.0.1:8099/v1")
         self.assertEqual(cli.agent_args("opencode", ["run", "hi"]), ["-m", cli.OPENCODE_MODEL, "run", "hi"])
         self.assertEqual(cli.agent_args("opencode", ["-m", "x/y"]), ["-m", "x/y"])
+
+    def test_background_start_passes_the_options(self):
+        seen = []
+        orig = cli.server_command, cli.subprocess.Popen
+        cli.server_command = lambda rest, mac, native: seen.append(list(rest)) or ["true"]
+        cli.subprocess.Popen = lambda *a, **k: type("P", (), {"pid": 1})()
+        try:
+            cli.start_background(9001, True, None, ["--qsa", "--context", "131072"])
+        finally:
+            cli.server_command, cli.subprocess.Popen = orig
+        self.assertEqual(seen, [["--qsa", "--context", "131072", "--port", "9001"]])
 
     def test_running_server_is_reused(self):
         started = []
