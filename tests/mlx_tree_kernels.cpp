@@ -1,8 +1,8 @@
 // Token-tree verify kernels, bit for bit against the chain they must reproduce (no model needed):
 // (1) the fused GDN step with parents: every tree row's output, delta and decay equal running that row's own path
 //     (anchor .. row) as a chain;
-// (2) the BF16 verify attention with the ancestor mask: every tree row equals the same row computed with its path keys
-//     stored contiguously after the prefix (the layout an AR step sees).
+// (2) the BF16 verify attention with the ancestor mask: every tree row equals its AR step (one row through
+//     causal_attention_rows) with its path keys stored contiguously after the prefix, in cache-shaped buffers.
 // Both for a 10-row tree and for 32 rows (the 17-32 row verify: the GDN step's device-scratch path, attention as two
 // 16-row calls through causal_attention_rows): a 32-row tree and a 32-row chain.
 #include "attention_rows.hpp"
@@ -23,6 +23,18 @@ static mx::array randn(std::mt19937& rng, mx::Shape shape, float scale) {
 }
 static mx::array bf(const mx::array& x) {return mx::astype(mx::astype(x, mx::bfloat16), mx::float32);}
 
+// The engine's KV cache holds a multiple of 1024 keys (zeros past the filled ones) and its AR step is one row through
+// causal_attention_rows, so the tree and its reference use those buffers and that call: on an M5 both take the exact
+// kernel, as served, instead of a fallback the engine does not run for this shape.
+static mx::array cache_shaped(const mx::array& x, int length) {
+    const int cap = (length + 1023) / 1024 * 1024;
+    if (x.shape(2) >= cap) return x;
+    return mx::concatenate({x, mx::zeros({x.shape(0), x.shape(1), cap - x.shape(2), x.shape(3)}, x.dtype())}, 2);
+}
+static mx::array ar_step(const mx::array& q1, const mx::array& k, const mx::array& v, int length) {
+    return causal_attention_rows(q1, cache_shaped(k, length), cache_shaped(v, length), 0.0625f, length);
+}
+
 // A failing row is only actionable with its index and depth: the halves of a 17-32 row verify fail differently
 static void print_bad_rows(const char* tag, int start, int n, const std::vector<int>& bad,
                            const std::vector<std::vector<int>>& paths) {
@@ -42,7 +54,7 @@ static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<in
     std::vector<uint8_t> vis(size_t(n) * n, 0);
     for (int t = 0; t < n; ++t) for (int a : path_of(t)) vis[size_t(t) * n + a] = 1;
     auto visible = mx::astype(mx::array(vis.data(), {n, n}, mx::uint8), mx::bool_);
-    auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
+    auto tree = causal_attention_rows(q, cache_shaped(k, length), cache_shaped(v, length), 0.0625f, length, &visible, &parents, true);
     mx::eval(tree);
     int equal = 0;
     std::vector<int> bad;
@@ -55,7 +67,7 @@ static int attention_rows_matching_paths(std::mt19937& rng, const std::vector<in
         for (int a : p) order.push_back(start + a);
         const auto idx = mx::array(order.data(), {int(order.size())}, mx::int32);
         auto kk = mx::take(k, idx, 2), vv = mx::take(v, idx, 2);
-        auto one = decode_attention_bf16(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, 0.0625f, int(order.size()));
+        auto one = ar_step(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, int(order.size()));
         const bool ok = mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
         equal += ok;
         if (!ok) bad.push_back(t);
@@ -125,7 +137,7 @@ int main() {
             std::vector<uint8_t> vis(size_t(n) * n, 0);
             for (int t = 0; t < n; ++t) for (int a : path_of(t)) vis[size_t(t) * n + a] = 1;
             auto visible = mx::astype(mx::array(vis.data(), {n, n}, mx::uint8), mx::bool_);
-            auto tree = causal_attention_rows(q, k, v, 0.0625f, length, &visible, &parents, true);
+            auto tree = causal_attention_rows(q, cache_shaped(k, length), cache_shaped(v, length), 0.0625f, length, &visible, &parents, true);
             mx::eval(tree);
             int equal = 0;
             std::vector<int> bad;
@@ -138,7 +150,7 @@ int main() {
                 for (int a : p) order.push_back(start + a);
                 const auto idx = mx::array(order.data(), {int(order.size())}, mx::int32);
                 auto kk = mx::take(k, idx, 2), vv = mx::take(v, idx, 2);
-                auto one = decode_attention_bf16(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, 0.0625f, int(order.size()));
+                auto one = ar_step(mx::slice(q, {0, 0, t, 0}, {1, heads, t + 1, dim}), kk, vv, int(order.size()));
                 const bool ok = mx::array_equal(one, mx::slice(tree, {0, 0, t, 0}, {1, heads, t + 1, dim})).item<bool>();
                 equal += ok;
                 if (!ok) bad.push_back(t);
