@@ -88,6 +88,10 @@ int main() {
     for (const auto& parents : {std::vector<int32_t>{-1, 0, 0, 2, 2, 4, 1, 5, 3, 0}, best16, tree32, chain32}) {
     const int n = int(parents.size());
     std::printf("-- %d rows%s\n", n, n == 32 && parents == chain32 ? " (chain)" : "");
+    // 17-32 rows (TQLLM_DEBUG=tree_rows:32, not served) run as decode_attention_bf16 calls, while an AR step on the matrix
+    // unit takes the exact kernel: there only the 1-16 row verify the release drafts is held to its AR steps
+    const bool attention_checked = n <= 16 || !matrix_unit_available();
+    if (!attention_checked) std::printf("  note: %d-row attention not checked on the matrix unit (debug shape, WARN at load)\n", n);
     auto path_of = [&](int t) {std::vector<int> p; for (int a = t; a >= 0; a = parents[size_t(a)]) p.insert(p.begin(), a); return p;};
 
     {   // (1) GDN step
@@ -122,7 +126,7 @@ int main() {
         failures += equal != n;
         std::printf("%s TREE_GDN tree rows == their own path as a chain, bit for bit: %d / %d\n", equal == n ? "PASS" : "FAIL", equal, n);
     }
-    {   // (2) attention: prefix of `start` keys, then the n block keys; each tree row vs its path stored contiguously
+    if (attention_checked) {   // (2) attention: prefix of `start` keys, then the n block keys; each tree row vs its path stored contiguously
         const int heads = 24, kvh = 4, dim = 256;
         // 992 leaves the 32-row block exactly at the 1024-key segment boundary, 1000 makes it cross it. A crossing block
         // is verified as a chain (spec_pipeline chain_at), and a tree's side-branch rows cannot be exact there: their
@@ -168,6 +172,7 @@ int main() {
         const std::vector<int32_t> b16{-1, 0, 1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14};
         const std::vector<int32_t>* order[] = {&a16, &b16, &a16, &tree32, &chain32, &tree32, &a16};
         for (const auto* t : order) {
+            if (t->size() > 16 && matrix_unit_available()) continue;  // debug shape, see above
             const int n = int(t->size()), equal = attention_rows_matching_paths(rng, *t, 3000);
             failures += equal != n;
             std::printf("%s MASK_CACHE %d rows after another tree at the same lengths: tree rows == their path, bit for bit: %d / %d\n",

@@ -275,6 +275,9 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
         if (const char* rows = tqllm::debug_cstr("tree_rows")) {
             const int n = std::atoi(rows);
             if (n != 16 && n != 32) throw std::invalid_argument("TQLLM_DEBUG tree_rows takes 16 or 32");
+            if (n == 32 && i.engine->exact() && mlx_backend::matrix_unit_available())
+                std::fprintf(stderr, "tqserve: WARN TQLLM_DEBUG=tree_rows:32 under --exact on: on the matrix unit a 17-32 row verify "
+                                     "does not run the exact attention kernel its AR steps use, so output can differ from plain decoding\n");
             tree_options.nodes = n - 1;
         }
         if (const char* k = tqllm::debug_cstr("tree_children")) tree_options.children = std::atoi(k);
