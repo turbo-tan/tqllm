@@ -45,6 +45,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   (193-219), ~400 ms at 129-161 (522-532).
 - macOS: builds on the stock MLX 0.32.4 wheel (pip / Homebrew) with the Neural Engine path; the opt-in Core ML path and its
   variables (TQLLM_MLX_ANE_FFN, TQLLM_MLX_ANE_WAVE) are removed.
+- `--mtp --draft-vocab`: the MTP draft head scores the draft-vocabulary rows of the 4-bit head with the int8 re-score of
+  its top 16 (the Q6_K subset copy is no longer uploaded), and one-token draft passes run as captured CUDA graphs.
+  `TQLLM_DEBUG=commit_overlap` (opt-in diagnostic) overlaps the commit replay with the draft passes. RTX 3090, mixed
+  IQ4_XS / Q5_K Qwen3.8-27B GGUF, 64K context, temperature 0.7, `--draft-vocab atx_65536.txt`: 119.7 -> 124.0 tok/s.
+- Composite (mixed-format) matrices run their parts concurrently on side streams (same results); DFlash2 on the same
+  GGUF, 128K context, q8/q4 KV: 140.1 -> 143.6 tok/s at temperature 0.7.
+- `--graph-keep-mb N`: the free-memory floor below which a CUDA graph miss also evicts (was fixed at 384 MB; a full card
+  could re-capture its verify graph every step).
 
 ### Fixed
 - GB10 (memory shared with the CPU): a model loaded while another model process held most of the memory exhausted it and
