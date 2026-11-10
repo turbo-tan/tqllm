@@ -1,11 +1,12 @@
-// The memory fit for the qwen35 GGUF engine (see load_fitted in cuda_engines.hpp).
+// The memory fit for the qwen35 GGUF engine. Compiled by both GPU backends: nothing here is platform specific
+// (the device calls go through the shim on AMD), so the fit has one implementation and one set of tests.
 #include "dev_alloc.cuh"
 #include "tqllm/model.hpp"
 #include "debug.hpp"
-#include "../../engine/fit_context.hpp"
+#include "fit_context.hpp"
 #include "dev_alloc.cuh"
 #include "qwen2_kernels.cuh"
-#include "cuda_engines.hpp"
+#include "loader_api.hpp"
 #include "nlohmann/json.hpp"
 #include "gguf.hpp"
 #include "hf_folder.hpp"

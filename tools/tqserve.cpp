@@ -13,8 +13,8 @@
 #endif
 #include "kv_store.hpp"
 
-#if TQLLM_WITH_CUDA
-#include <cuda_runtime.h>
+#if TQLLM_WITH_CUDA || TQLLM_WITH_HIP
+#include <cuda_runtime.h>  // CUDA build: the toolkit; HIP build: src/backends/hip/shim
 #endif
 
 #include <algorithm>
@@ -166,7 +166,7 @@ int main(int argc, char ** argv) {
     tqllm::check_env_flags("tqserve");
     tqserve::free_mb_probe() = [] {
         size_t free = 0, total = 0;
-#if TQLLM_WITH_CUDA
+#if TQLLM_WITH_CUDA || TQLLM_WITH_HIP
         cudaMemGetInfo(&free, &total);
 #endif
         return free >> 20;
@@ -327,7 +327,7 @@ int main(int argc, char ** argv) {
         {
             char hostname[256]{}, pci[32]{}; ::gethostname(hostname, sizeof(hostname) - 1);
             int device = 0;
-#if TQLLM_WITH_CUDA
+#if TQLLM_WITH_CUDA || TQLLM_WITH_HIP
             if (cudaGetDevice(&device) == cudaSuccess) cudaDeviceGetPCIBusId(pci, sizeof(pci), device);
 #else
             (void)device;

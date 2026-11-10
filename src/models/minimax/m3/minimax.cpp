@@ -1676,8 +1676,6 @@ private:
 
 }  // namespace
 
-bool is_minimax_gguf(const std::string & path) { return gguf_architecture(path) == "minimax-m3"; }
-
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft,
                                             const std::string & tokenizer, const TpConfig & tp, const std::string & hot_map,
                                             const std::string & draft_vocab) {

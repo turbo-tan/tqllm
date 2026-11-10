@@ -4,6 +4,7 @@
 // qwen35_load.cpp, qwen35_forward.cpp, qwen35_spec.cpp. Internal to src/models/qwen/qwen35/.
 #include "prefill_observer_cuda.hpp"
 // Qwen3.5 dense hybrid decode engine (text path): Gated DeltaNet + gated full attention, BF16 weights.
+#include "blas_compat.hpp"
 #include "dev_alloc.cuh"
 #include "debug.hpp"
 #include "batch_graph_key.hpp"
@@ -95,7 +96,7 @@ public:
             eos_ = tokenizer.eos_id();
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
-            cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
+            cb(tqllm_blas::enable_tensor_ops(blas));
             auto memlog = [](const char * stage) {  // TQLLM_DEBUG=memlog: device memory in use after each load stage, seconds since the first load began
                 static const bool on = tqllm::debug_on("memlog");
                 static const auto t0 = std::chrono::steady_clock::now();

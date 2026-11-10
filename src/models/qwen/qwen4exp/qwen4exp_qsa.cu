@@ -4,11 +4,8 @@
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
 #include "decode_rules.hpp"
-#include <cub/block/block_scan.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_scan.cuh>
+#include "cub_compat.hpp"  // CUB on NVIDIA, hipCUB on AMD (src/core): one name for the call sites
 #include <climits>
-#include <cub/device/device_segmented_radix_sort.cuh>
 #include <algorithm>
 #include <cmath>
 #include <limits>

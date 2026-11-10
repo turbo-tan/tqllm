@@ -1,3 +1,4 @@
+#include "backend_caps.hpp"
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 #include "debug.hpp"
@@ -44,7 +45,11 @@ struct Tq3 final : WeightFormat {
                                n, s);
     }
     // TQLLM_DEBUG=tq_gemm:off: no native GEMM (the pre-GEMM dequant + cuBLAS path, for A/B and the KLD reference)
-    static bool gemm_off() { const std::string * v = tqllm::debug_value("tq_gemm"); return v && *v == "off"; }
+    static bool gemm_off() {
+        if constexpr (!tqllm::caps::kFragmentPrefillGemm) return true;  // dequant + BLAS BF16 prefill (matrix cores)
+        const std::string * v = tqllm::debug_value("tq_gemm");
+        return v && *v == "off";
+    }
     bool has_gemm() const override { return !gemm_off(); }
     bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
         if (m.cols % 128 || gemm_off()) return false;

@@ -43,7 +43,7 @@ void register_tq4();
 void register_tq3();
 void register_i8h();
 void register_gsq_q2();
-void register_x3();
+void register_x3();  // X3 (PAW-27B trellis): raw PTX kernels; src/backends/hip/unsupported_hip.cpp registers nothing
 void register_fp();
 void register_mxfp8();
 }

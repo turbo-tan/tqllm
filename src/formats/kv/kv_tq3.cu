@@ -26,7 +26,14 @@ constexpr float F = 127.f / 1.996684f;
 constexpr uint32_t LUT_LO = 0xF0D1AE81u, LUT_HI = 0x7F512E0Fu;  // bytes: -127 -82 -47 -16 | 15 46 81 127
 // NB K/V tile buffers: 2 = double buffered (decode of the next tile overlaps nothing else in the block, 71 KB at NW 4);
 // 1 = single buffered (45.5 KB at NW 4, so two blocks share an SM and hide each other's latency).
-template <int NW, int NB = 2> constexpr size_t smem() {
+// RDNA3 allows 64 KB of dynamic shared memory per workgroup: NW 8 with NB 2 needs ~87 KB there, so HIP single-buffers
+// (61 KB) and stages the next tile into registers before the barrier instead. CUDA keeps the double buffer.
+#if !TQLLM_DEV_CP_ASYNC  // no async copies: one tile buffer
+constexpr int TQ3_NB = 1;
+#else
+constexpr int TQ3_NB = 2;
+#endif
+template <int NW, int NB = TQ3_NB> constexpr size_t smem() {
     return size_t(NW * 16) * QS + NB * size_t(TILE) * KS + NB * size_t(TILE) * VS * 2 + NB * 8 * TILE * 4 + NW * 16 * 2 * 4;
 }
 __device__ __forceinline__ uint32_t levels4(const uint32_t (&w)[3], int g) {  // codes 4g .. 4g + 3 -> 4 int8 levels
@@ -620,7 +627,7 @@ template <class VC> static void inverse_v(__nv_bfloat16 * y, int nq, int h, cuda
 }
 
 // pstride > 0: tree verify cache part only (partials, no merge / inverse; see attn_blk_codec_k)
-template <int NW, class KC, class VC, int NB = 2>
+template <int NW, class KC, class VC, int NB = tq3a::TQ3_NB>
 static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc, __nv_bfloat16 * y,
                        float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit, cudaStream_t s,
                        const int * dep = nullptr, int pstride = 0, int zoff = 0, const int * dstart = nullptr,
@@ -983,8 +990,7 @@ __global__ void cache_write_multi_tq2v_v(const __nv_bfloat16 * x0, int ts, Tq2V2
     const uint32_t code = r < -0.9816f ? 0u : r < 0.f ? 1u : r < 0.9816f ? 2u : 3u;
     Tq2V256 * rec = c + int64_t(*dpos0 + tkn) * kvheads + kh;
     const int word = lane / 16, shift = (lane % 16) * 2;
-    const unsigned mask = lane < 16 ? 0x0000ffffu : 0xffff0000u;
-    const uint32_t packed = __reduce_or_sync(mask, code << shift);
+    const uint32_t packed = tqllm_dev::or_half16(code << shift);  // each 16-lane half packs one word
     if ((lane & 15) == 0) rec->w[2 * blk + word] = packed;
     if (lane == 0) rec->rms[blk] = rh;
 }

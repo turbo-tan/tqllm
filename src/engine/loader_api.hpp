@@ -1,6 +1,9 @@
 #pragma once
-// CUDA builds: the loaders src/engine/builtin_cuda.cpp registers.
-#include "../../engine/engine.hpp"
+// The engine assembly both GPU backends compile (AGENTS.md: a backend folder holds the registration list and
+// the platform's own kernels, not a copy of the loader). Implementation: src/engine/load_fitted.cpp and
+// src/models/qwen/qwen2/qwen2_engine.cpp.
+#include "engine.hpp"
+
 #include <memory>
 #include <string>
 

@@ -1,0 +1,111 @@
+name: gpu-compile
+
+# Compiles both GPU backends on every PR. `checks.yml` builds with -DTQLLM_CUDA=OFF, so no device file is compiled
+# there: a change to shared device code can pass it and still break the CUDA (or HIP) build. That is how PR #30 reached
+# review with ~12 `hipcub::` call sites that no CUDA build could accept.
+#
+# No GPU is needed for either job (a compiler does not need a card), so both run on GitHub-hosted runners. The device
+# tests stay a local gate - `ctest` on a real 3090 / gfx1100 before merge, per CONTRIBUTING "GPU tests run locally".
+# A self-hosted AMD runner, if we ever put one in the fleet, replaces the HIP compile job below with build + ctest.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-compile:
+    name: cuda build (compile only, sm_86)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90   # ~390 device TUs on a 4-core runner; ccache makes re-runs cheap
+    container: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build g++ python3 python3-numpy git ccache
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-cuda-${{ github.sha }}
+          restore-keys: ccache-cuda-
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DTQLLM_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Build the engine tests (they are the invariants)
+        run: cmake --build build -j 4 --target test-tree test-dflash-exact test-native-mtp tqserve
+
+  hip-compile:
+    name: hip build (compile only, gfx1100 + gfx1201)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120  # ~390 device TUs through hipcc on a 4-core runner (no ccache on the first run)
+    container:
+      # pin: bump together with docs/guides/amd.md
+      image: rocm/dev-ubuntu-24.04:7.1.1-complete
+    env:
+      ROCM_PATH: /opt/rocm
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build g++ python3 python3-numpy git ccache
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-hip-${{ github.sha }}
+          restore-keys: ccache-hip-
+      - name: Toolchain
+        run: |
+          hipconfig --version
+          hipconfig --rocmpath
+      - name: Wave64 targets are refused at configure time
+        # the device layer assumes wave32 (rule 13); a CDNA arch must fail here, not miscompile
+        run: |
+          if cmake -S . -B build-hip-w64 -G Ninja -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON \
+               -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake > "$RUNNER_TEMP/w64.log" 2>&1; then
+            echo "gfx90a configured but must be refused"; exit 1
+          fi
+          grep -q "wave32" "$RUNNER_TEMP/w64.log"
+          rm -rf build-hip-w64
+      - name: Configure
+        # explicit archs: `native` needs a GPU to resolve, and this runner has none. Two archs (RDNA3 + RDNA4)
+        # so a fat binary and the per-arch flags are exercised on every PR.
+        run: |
+          cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DTQLLM_CUDA=OFF -DTQLLM_HIP=ON "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201" \
+            -DCMAKE_PREFIX_PATH=/opt/rocm/lib/cmake \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build-hip -j 4
+      - name: Build the engine tests (they are the invariants)
+        run: cmake --build build-hip -j 4 --target test-tree test-dflash-exact test-native-mtp
+      - name: Host and CPU tests
+        # the HIP device tests skip without a card; their targets are built above, so they at least compile
+        run: ctest --test-dir build-hip --output-on-failure -j 4 -LE gpu
+
+  integrity:
+    name: layering, public tree, flags, docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # test_no_private_paths.py reads git ls-files
+      - run: |
+          python3 -m unittest tests/test_layering.py tests/test_public_tree.py \
+            tests/test_no_private_paths.py tests/test_docs_map.py -v
+          python3 tools/gen_flags.py --check

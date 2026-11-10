@@ -407,32 +407,21 @@ __global__ void norm_rotate_h_k(const __nv_bfloat16 * x, const float * w, const 
 
 __device__ __forceinline__ void mma_f16(float * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    tqllm_dev::mma_f16(c, a0, a1, a2, a3, b0, b1);
 }
 __device__ __forceinline__ void mma_f16h(uint32_t * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {  // FP16 accumulate: twice the GA10x tensor rate
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c[0]), "+r"(c[1])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    tqllm_dev::mma_f16acc(*reinterpret_cast<uint32_t(*)[2]>(c), a0, a1, a2, a3, b0, b1);
 }
 __device__ __forceinline__ uint32_t hmul2u(uint32_t a, uint32_t b) {
-    uint32_t r;
-    asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
-    return r;
+    return tqllm_dev::hmul2u(a, b);
 }
 __device__ __forceinline__ uint32_t hadd2u(uint32_t a, uint32_t b) {
-    uint32_t r;
-    asm("add.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
-    return r;
+    return tqllm_dev::hadd2u(a, b);
 }
 
 __device__ __forceinline__ uint32_t hfma2u(uint32_t a, uint32_t b, uint32_t c) {
-    uint32_t r;
-    asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(c));
-    return r;
+    return tqllm_dev::hfma2u(a, b, c);
 }
 
 // FP16 tensor-core matvec over the repacked TQ3_4S layout. CTA = 8 warps on one 16-row tile, split-K across warps.

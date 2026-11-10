@@ -1,6 +1,8 @@
 // Dense BF16 / F16 matrices: one warp per row, FP32 accumulation, up to 16 input columns per launch. Each column keeps
 // its own accumulator, the same per-lane walk and the same warp tree, so a column's bits do not depend on how many
 // columns the launch holds - which is what lets a batched verify run wider than the matvec dispatch cap.
+// The multiply-add is written as __fmaf_rn: on HIP, contraction of `acc += w * x` differs between the narrow and wide
+// instantiations for __half (RDNA3 schedules the conversion pair differently), which broke the per-column bit invariant.
 #include "quant_kernels.cuh"
 
 #include <algorithm>
@@ -26,14 +28,14 @@ __global__ void fp_matvec_k(const T * __restrict__ w, const __half * __restrict_
                 const uint4 xv = __ldg(reinterpret_cast<const uint4 *>(x + size_t(c) * k + i));
                 const __half * xe = reinterpret_cast<const __half *>(&xv);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) acc[c] += to_f(we[j]) * __half2float(xe[j]);
+                for (int j = 0; j < 8; ++j) acc[c] = __fmaf_rn(to_f(we[j]), __half2float(xe[j]), acc[c]);
             }
         }
     } else {
         for (int i = lane; i < k; i += 32) {
             const float wv = to_f(wr[i]);
 #pragma unroll
-            for (int c = 0; c < N; ++c) acc[c] += wv * __half2float(x[size_t(c) * k + i]);
+            for (int c = 0; c < N; ++c) acc[c] = __fmaf_rn(wv, __half2float(x[size_t(c) * k + i]), acc[c]);
         }
     }
 #pragma unroll

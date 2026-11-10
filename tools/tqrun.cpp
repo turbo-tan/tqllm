@@ -1,6 +1,6 @@
 #include "tqllm/options.hpp"
 #include "tqllm/runtime.hpp"
-#ifdef TQLLM_HAS_CUDA
+#if defined(TQLLM_HAS_CUDA) || defined(TQLLM_HAS_HIP)
 #include "tqllm/model.hpp"
 #endif
 #include <filesystem>
@@ -46,7 +46,7 @@ int main(int argc, char ** argv) {
             std::cout << "plugin proof: PASS\n";
             return 0;
         }
-#ifdef TQLLM_HAS_CUDA
+#if defined(TQLLM_HAS_CUDA) || defined(TQLLM_HAS_HIP)
         if (model_dir.empty() || prompt.empty()) { usage(); return 2; }
         const std::filesystem::path dir(model_dir);
         tqllm::Tokenizer tokenizer;

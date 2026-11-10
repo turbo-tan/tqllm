@@ -1,9 +1,14 @@
 // fab: prefill attention over a BF16 cache (FA2 style). Included by attention.cu inside namespace tqllm_cuda (kernels and launchers; no includes here).
-// Prefill attention over a BF16 cache (FA2 style). Block = 4 warps x 16 rows = 64 (query, head) rows of one KV head;
-// Q and double-buffered 32-key K / V tiles in shared memory (99 KB: one block per SM), S, P (BF16) and O in registers.
+// Prefill attention over a BF16 cache (FA2 style). Block = NW warps x 16 rows of one KV head; Q and 32-key K / V tiles
+// in shared memory (double-buffered on CUDA; single-buffered on HIP, where the dynamic shared memory limit is 64 KB and
+// cp_async16 is a plain synchronous copy), S, P (BF16) and O in registers.
 namespace fab {
-constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8;
-constexpr size_t smem() { return (size_t(ROWS) + 4 * TILE) * LS * 2; }
+#if TQLLM_DEV_LDS_64K
+constexpr int NW = 2, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8, NB = 1;
+#else
+constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8, NB = 2;
+#endif
+constexpr size_t smem() { return (size_t(ROWS) + size_t(NB) * 2 * TILE) * LS * 2; }
 }
 
 __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __nv_bfloat16 * q, const __nv_bfloat16 * kc,
@@ -13,8 +18,8 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
     using namespace fab;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16 * qs = reinterpret_cast<__nv_bfloat16 *>(smem_raw);  // [ROWS][LS]
-    __nv_bfloat16 * ks = qs + ROWS * LS;                                 // [2][TILE][LS]
-    __nv_bfloat16 * vs = ks + 2 * TILE * LS;                             // [2][TILE][LS]
+    __nv_bfloat16 * ks = qs + ROWS * LS;                                 // [NB][TILE][LS]
+    __nv_bfloat16 * vs = ks + NB * TILE * LS;                            // [NB][TILE][LS]
     const int kh = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32, gid = lane / 4, tig = lane % 4;
     const int g = heads / kvheads, rows = nq * g;
     const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;  // longest (latest) row blocks first
@@ -35,10 +40,14 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
                 *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        cp_commit();
     };
+#if TQLLM_DEV_LDS_64K
+    if (ntile > 0) stage(0, 0);
+#else
     if (ntile > 0) stage(0, 0);
     if (ntile > 1) stage(1, TILE);
+#endif
     for (int i = t; i < ROWS * (DIM / 8); i += NW * 32) {  // rows past the end repeat the last row
         const int r = i / (DIM / 8), c = i % (DIM / 8), rr = min(r0 + r, rows - 1);
         *reinterpret_cast<uint4 *>(qs + r * LS + c * 8) =
@@ -55,10 +64,15 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
     const __nv_bfloat16 * qrow = qs + (warp * 16 + (lane % 8) + ((lane / 8) & 1) * 8) * LS + (lane / 16) * 8;
 
     for (int u = 0; u < ntile; ++u) {
+#if TQLLM_DEV_LDS_64K
+        const int buf = 0, t0 = u * TILE;
+        __syncthreads();  // the staged tile is ready and the previous tile's reads are done
+#else
         const int buf = u & 1, t0 = u * TILE;
-        if (u + 1 < ntile) asm volatile("cp.async.wait_group 1;\n" ::);
-        else asm volatile("cp.async.wait_group 0;\n" ::);
+        if (u + 1 < ntile) cp_wait<1>();
+        else cp_wait<0>();
         __syncthreads();
+#endif
         const __nv_bfloat16 * kt = ks + buf * TILE * LS;
         const __nv_bfloat16 * vt = vs + buf * TILE * LS;
         float s[4][4];
@@ -120,8 +134,15 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
                 mma_bf16(o[2 * np], pf[kk][0], pf[kk][1], pf[kk][2], pf[kk][3], vb[0], vb[1]);
                 mma_bf16(o[2 * np + 1], pf[kk][0], pf[kk][1], pf[kk][2], pf[kk][3], vb[2], vb[3]);
             }
+#if TQLLM_DEV_LDS_64K
+        if (u + 1 < ntile) {  // single buffer: refill only after every warp has finished reading this tile
+            __syncthreads();
+            stage(0, t0 + TILE);
+        }
+#else
         __syncthreads();  // buffer buf is refilled below
         if (u + 2 < ntile) stage(buf, t0 + 2 * TILE);
+#endif
     }
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 1);
     l_a += __shfl_xor_sync(0xffffffffu, l_a, 2);
@@ -214,6 +235,11 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
     if (h <= 0 || kh <= 0 || h % kh || h / kh > MQ_MAXROWS || nq <= 0)
         throw std::invalid_argument("attention_mq256: invalid head or query count");
     constexpr int DIM = 256, KS = DIM + 8;
+#if TQLLM_DEV_LDS_64K
+    // one BF16 K and one BF16 V tile (no double buffering; Q8/Q8V records are decoded straight from global)
+    const size_t smem = (size_t(MQ_MAXROWS) + 2 * size_t(MQ_TILE)) * KS * 2 +
+                        size_t(MQ_MAXROWS) * (MQ_TILE + 4) * 4;
+#else
     constexpr bool Q8V = Q8 && !TURBO3V;
     constexpr size_t V3B = (DIM / 128) * 50;
     const size_t smem = (size_t(MQ_MAXROWS) + (Q8 ? 2 : 4) * MQ_TILE) * KS * 2 +
@@ -221,6 +247,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
                         (Q8 ? (Q8V ? 4 : 2) * size_t(MQ_TILE) * (DIM / 32) * 2 : 0) +  // their scales
                         (TURBO3V ? (2 * MQ_TILE * V3B + 15) / 16 * 16 + 8 * 4 : 0) + // Turbo3 V stages + LUT
                         size_t(MQ_MAXROWS) * (MQ_TILE + 4) * 4;
+#endif
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(attn_mq_k<DIM, Q8, TURBO3V>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
@@ -231,10 +258,18 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
         const int qmax = MQ_MAXROWS / (h / kh);  // queries per tiled launch; each query's rows are independent
         for (int z0 = 0; z0 < nq; z0 += qmax) {
             const int nz = std::min(qmax, nq - z0);
+#if TQLLM_DEV_LDS_64K
+            const int qbase = z0;  // dep == null is a chain: carry the chunk offset instead of node depths
+#else
             if (dep == nullptr && z0) throw std::invalid_argument("tree attention: > 8 queries need node depths");
+#endif
             attn_mq_k<DIM, Q8, TURBO3V><<<dim3(kh, nsplit), DIM, smem, s>>>(
                 q + int64_t(z0) * h * DIM, kc, vc, ksc, vsc, part + int64_t(z0) * h * (nsplit + 1) * (DIM + 2), dseq0, nz, h,
-                kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr);
+                kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr
+#if TQLLM_DEV_LDS_64K
+                , qbase
+#endif
+                );
         }
         attn_blk_k<DIM><<<dim3(h, nq), DIM, 0, s>>>(q, static_cast<const __nv_bfloat16 *>(kc),
                                                     static_cast<const __nv_bfloat16 *>(vc), part, dseq0, par, dep, h, kh,
@@ -265,7 +300,7 @@ void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, 
     if (!configured) {
         if (cudaFuncSetAttribute(attn_bf16_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
             cudaSuccess)
-            throw std::runtime_error("attention_mq256_prefill: 99 KB of shared memory per block unavailable");
+            throw std::runtime_error("attention_mq256_prefill: shared memory per block unavailable");
         configured = true;
     }
     const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;

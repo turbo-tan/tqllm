@@ -2,15 +2,15 @@
 #include "dev_alloc.cuh"
 #include "tqllm/model.hpp"
 #include "debug.hpp"
-#include "../../engine/fit_context.hpp"
+#include "fit_context.hpp"
 #include "dev_alloc.cuh"
 #include "qwen2_kernels.cuh"
-#include "cuda_engines.hpp"
+#include "loader_api.hpp"
 #include "nlohmann/json.hpp"
 #include "gguf.hpp"
 #include "hf_folder.hpp"
 
-#include <cublas_v2.h>
+#include "blas_compat.hpp"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -164,14 +164,15 @@ struct Qwen2Engine final : Engine {
         int dev = 0;
         ck(cudaGetDevice(&dev));
         ck(cudaGetDeviceProperties(&prop, dev));
-        if (prop.major < 8) throw std::runtime_error("Qwen BF16 execution requires compute capability 8.0 or newer");
+        if (!tqllm_blas::bf16_device_ok(prop, 8))
+            throw std::runtime_error("Qwen BF16 execution requires compute capability 8.0 or newer");
         ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         try {
             tokenizer.load(tokpath);
             eos_ = tokenizer.eos_id();
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
-            cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
+            cb(tqllm_blas::enable_tensor_ops(blas));
             load_weights(path);
             resolve_weights();
             allocate();

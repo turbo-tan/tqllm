@@ -18,12 +18,30 @@ struct Json {
     std::vector<Json> arr;
     std::vector<std::pair<std::string, Json>> obj;
 
+    // Declared here, defined after the struct: the members above instantiate std::vector<std::pair<std::string, Json>>,
+    // which needs Json to be complete. clang (ROCm's hipcc, and clang in general) instantiates the implicit special
+    // members at the closing brace and rejects the incomplete type; g++ defers and accepts it. Same behaviour, both
+    // compilers.
+    Json();
+    Json(const Json &);
+    Json & operator=(const Json &);
+    Json(Json &&);
+    Json & operator=(Json &&);
+    ~Json();
+
     const Json * get(const std::string & k) const {
         for (const auto & [key, v] : obj)
             if (key == k) return &v;
         return nullptr;
     }
 };
+
+inline Json::Json() = default;
+inline Json::Json(const Json &) = default;
+inline Json & Json::operator=(const Json &) = default;
+inline Json::Json(Json &&) = default;
+inline Json & Json::operator=(Json &&) = default;
+inline Json::~Json() = default;
 
 class Parser {
 public:

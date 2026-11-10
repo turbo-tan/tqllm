@@ -6,6 +6,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Added
+- AMD GPU backend (ROCm / HIP), built with `-DTQLLM_HIP=ON`: Qwen3.8 dense and MoE, TQ4/TQ3 weight
+  formats, TQ3 KV cache, Qwen2 drafter and DFlash speculative decoding on RDNA3 (tested on a Radeon
+  Pro W7800, gfx1100). The compatibility layer maps CUDA host API names at compile time; device math
+  gets native AMD implementations (`v_dot4`, `v_dot2_f32_f16`/`_bf16`, packed f16 arithmetic, LDS
+  ldmatrix-equivalent loads). BF16 prefill runs on hipBLAS. Flash-Next, GLM-5next, MiniMax, vision,
+  FP8/INT8 prefill, `--kv-compact` and tensor parallelism are not part of this backend yet and fail
+  with an explicit message. See [docs/guides/amd.md](docs/guides/amd.md).
 - `--mtp` drafts for sampled requests (temperature > 0) as well, with exact speculative sampling (the MTP drafts are
   argmax tokens, accepted with the model's probability, else resampled). RTX 3090, Qwen3.8-27B IQ4_XS GGUF, 32K context,
   temperature 0.7: 104-117 tok/s against 50 when sampled requests decoded without drafting.

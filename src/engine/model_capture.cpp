@@ -1,5 +1,5 @@
-// Model::capture reads the engine's device logits: CUDA builds only.
-#include "../../engine/model_impl.hpp"
+// Model::capture reads the engine's device logits: GPU builds (CUDA and AMD) only.
+#include "model_impl.hpp"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>

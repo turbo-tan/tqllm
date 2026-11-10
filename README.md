@@ -9,8 +9,8 @@
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000) [![GoFundMe](https://img.shields.io/badge/GoFundMe-support%20TQLLM-00B964?logo=gofundme&logoColor=white)](https://gofund.me/0f79d4274)
 
-C++ inference for supported Qwen models and TurboQuant GGUF weights on NVIDIA GPUs (CUDA) and Apple Silicon (Metal),
-with an OpenAI-compatible HTTP server.
+C++ inference for supported Qwen models and TurboQuant GGUF weights on NVIDIA GPUs (CUDA), AMD GPUs
+(ROCm/HIP) and Apple Silicon (Metal), with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
@@ -71,7 +71,8 @@ tqllm serve                          # first run downloads the model and drafter
 tqllm claude                         # Claude Code pointed at the local server (or: tqllm codex)
 ```
 
-More in the [Mac guide](docs/guides/mac.md). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
+More in the [Mac guide](docs/guides/mac.md); on an AMD GPU, the [AMD guide](docs/guides/amd.md) has the
+CMake flags (`-DTQLLM_CUDA=OFF -DTQLLM_HIP=ON`). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
 `models/model.gguf`, then build from source:
 
 ```sh
