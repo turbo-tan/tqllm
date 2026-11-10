@@ -771,8 +771,8 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
                                        stream);
     };
     // one-token draft passes (the chain after the first draft) as one captured graph per KV bucket: the same kernels
-    // in the same order, without ~25 launches and their host gaps per draft. TQLLM_MTP_GRAPH=0 disables.
-    static const bool draft_graph = [] { const char * e = std::getenv("TQLLM_MTP_GRAPH"); return !(e && *e == '0'); }();
+    // in the same order, without ~25 launches and their host gaps per draft. TQLLM_DEBUG=mtp_eager runs them eagerly (A/B).
+    static const bool draft_graph = !tqllm::debug_on("mtp_eager");
     if (draft_graph && sample && n == 1 && !hidden && mtp_head4_sub && has_head8() && segs.empty()) {
         const uint64_t key = (uint64_t(1) << 41) | uint64_t(bucket) | (uint64_t(active) << 32);
         ck(cudaGraphLaunch(cached_graph(kGraphDraft, key, [&] { layer_kernels(); subset_head_kernels(); }), stream));

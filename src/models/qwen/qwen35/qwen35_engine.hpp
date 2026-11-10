@@ -515,7 +515,7 @@ private:
     int dsub_rows = 0;
     bool dsub_in_head4 = false;  // draft vocabulary read from head4 rows through dsub_ids
     bool mtp_head4_sub = false;  // --mtp --draft-vocab: the MTP draft head scores dsub_ids rows of head4
-    cudaStream_t commit_side = nullptr;  // TQLLM_COMMIT_OVERLAP: commit replay stream
+    cudaStream_t commit_side = nullptr;  // TQLLM_DEBUG=commit_overlap: commit replay stream
     cudaEvent_t commit_fork = nullptr, commit_done = nullptr;
     bool commit_inflight = false;
     void join_commit() {
@@ -1442,9 +1442,9 @@ private:
     void commit(int k) override {
         if (k < 1 || k > last_n) throw std::runtime_error("commit: accepted count out of range");
         if (k < last_n) {
-            // TQLLM_COMMIT_OVERLAP=1: replay on a side stream so it overlaps the MTP repair pass that follows (that pass
+            // TQLLM_DEBUG=commit_overlap (opt-in until test-native-mtp covers --np > 1): replay on a side stream so it overlaps the MTP repair pass that follows (that pass
             // reads neither the recurrent states nor the replay's scratch); the next verify waits for it (join_commit)
-            static const bool overlap = [] { const char * e = std::getenv("TQLLM_COMMIT_OVERLAP"); return e && *e == '1'; }();
+            static const bool overlap = tqllm::debug_on("commit_overlap");
             if (overlap) {
                 if (!commit_side) {
                     ck(cudaStreamCreateWithFlags(&commit_side, cudaStreamNonBlocking));

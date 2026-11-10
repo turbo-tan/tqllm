@@ -1,7 +1,7 @@
 #include "weight_format.hpp"
+#include "debug.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -9,6 +9,10 @@
 namespace tqllm {
 namespace {
 constexpr uint32_t ID_COMPOSITE = 1100;
+
+void ck(cudaError_t e, const char * what) {  // a failed fork / join (e.g. during graph capture) stops here, not later
+    if (e != cudaSuccess) throw std::runtime_error(std::string("composite: ") + what + ": " + cudaGetErrorString(e));
+}
 
 // Each part writes its own row block of y through matvec_ld (no scratch, no copies); per-row results are those of the
 // part's format alone.
@@ -37,7 +41,7 @@ struct Composite final : WeightFormat {
     // Parts 1.. run on side streams forked from s and joined back (graph-capturable fork / join): every part reads the
     // same input and writes its own row block, so results are those of the sequential order, bit for bit. Small parts
     // (e.g. a Q5_K qkv block beside an IQ4_XS gate block) then overlap instead of each paying its own ramp-up / tail.
-    // TQLLM_COMPOSITE_SERIAL=1 restores one stream.
+    // TQLLM_DEBUG=composite_serial runs the parts one after another on the main stream (A/B).
     // one small pool of side streams / events shared by every composite (they run one at a time on the main stream)
     struct Pool {
         cudaEvent_t fork = nullptr;
@@ -46,19 +50,19 @@ struct Composite final : WeightFormat {
     };
     static Pool & pool(size_t n) {
         static Pool p;
-        if (!p.fork) cudaEventCreateWithFlags(&p.fork, cudaEventDisableTiming);
+        if (!p.fork) ck(cudaEventCreateWithFlags(&p.fork, cudaEventDisableTiming), "fork event");
         while (p.side.size() < n) {
             cudaStream_t st;
             cudaEvent_t ev;
-            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
-            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "side stream");
+            ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "join event");
             p.side.push_back(st);
             p.joins.push_back(ev);
         }
         return p;
     }
     static bool serial() {
-        static const bool v = [] { const char * e = std::getenv("TQLLM_COMPOSITE_SERIAL"); return e && *e == '1'; }();
+        static const bool v = tqllm::debug_on("composite_serial");
         return v;
     }
     bool matvec_ld(const Mat &, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
@@ -74,16 +78,16 @@ struct Composite final : WeightFormat {
         const cudaEvent_t fork = P.fork;
         const auto & side = P.side;
         auto & joins = P.joins;
-        cudaEventRecord(fork, s);
+        ck(cudaEventRecord(fork, s), "record fork");
         int r0 = ps[0].rows;
         for (size_t i = 1; i < ps.size(); ++i) {
-            cudaStreamWaitEvent(side[i - 1], fork, 0);
+            ck(cudaStreamWaitEvent(side[i - 1], fork, 0), "side waits for fork");
             ps[i].fmt->matvec_ld(ps[i], x, y + r0, n, ldy, side[i - 1]);
-            cudaEventRecord(joins[i - 1], side[i - 1]);
+            ck(cudaEventRecord(joins[i - 1], side[i - 1]), "record join");
             r0 += ps[i].rows;
         }
         ps[0].fmt->matvec_ld(ps[0], x, y, n, ldy, s);
-        for (size_t i = 0; i + 1 < ps.size(); ++i) cudaStreamWaitEvent(s, joins[i], 0);
+        for (size_t i = 0; i + 1 < ps.size(); ++i) ck(cudaStreamWaitEvent(s, joins[i], 0), "main waits for join");
         return true;
     }
     void matvec(const Mat & c, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
