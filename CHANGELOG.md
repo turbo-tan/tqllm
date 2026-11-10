@@ -3,7 +3,7 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## 1.5.0 (2026-11-08)
+## 1.5.0 (2026-11-10)
 
 ### Added
 - Several boxes behind one address: `tqserve --np N --peer http://HOST:PORT` (repeatable) makes this server the front door
@@ -62,6 +62,10 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
   at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
 
+### Known issues
+- Flash-Next on a 12 GB card with several users (`--np` > 1) under constant load can stop after several minutes with a
+  GPU fault (Xid 31 / 32 in the kernel log). One user on a 12 GB card and four users on a 16 GB card ran clean. Use
+  `--np 1` on 12 GB cards for now; a fix is planned for 1.6.0.
 
 ## 1.4.4 (2026-11-07)
 

@@ -1,9 +1,8 @@
 # DSpine drafter (experimental)
 
-This branch adds Tencent's independent-write DSpine variant to the DFlash loader, CUDA and
-Metal paths. The local CUDA exactness and performance gates passed on an RTX 3090 on
-2026-11-08 (results below). The Metal runtime gate and independent review are still pending.
-The 1.5.0 candidate is not changed until those checks and review pass.
+tqLLM 1.5.0 loads Tencent's independent-write DSpine variant as an opt-in drafter (`-md` with a DSpine
+GGUF). On CUDA it is exact and was checked on an RTX 3090 on 2026-11-08 (results below). The Metal (Mac) path
+builds but has not been checked for exactness or speed yet. DFlash2 stays the default drafter because it is faster.
 
 The published [Qwen3-8B-DSpine-b16 checkpoint](https://huggingface.co/tencent/Qwen3-8B-DSpine-b16)
 is a drafter for **Qwen/Qwen3-8B**, not a standalone language model or a Qwen3.8-27B drafter.
