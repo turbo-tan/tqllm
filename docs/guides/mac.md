@@ -36,9 +36,10 @@ follow the steps below.
 
 - macOS on Apple Silicon, Xcode command line tools, CMake 3.25 or newer.
 - MLX 0.32.3 built from source with the patch in [`third_party/mlx`](../../third_party/mlx/README.md). The patch adds
-  one call (`scaled_dot_product_attention_lse`) that tqLLM uses for attention over long contexts. The code also compiles
-  against a stock MLX 0.32 or newer (it then uses a slower attention path at long context), but that build has not been
-  tested yet, and the numbers below were measured with the patch.
+  one call (`scaled_dot_product_attention_lse`) that tqLLM uses for attention over long contexts. The code also builds
+  against a stock MLX 0.32 or newer, which is what the installer uses: on an M5 (matrix unit) token-tree verify runs
+  tqLLM's own exact attention kernel, so `--exact on` output is unchanged; elsewhere greedy `--exact on` drafts chains.
+  The numbers below were measured with the patch. Stock MLX 0.32.4 on an M5 Pro: ctest 114 / 114 (tqLLM 1.5.0).
 - About 20 GB for the model files.
 
 ## 1. Build MLX with the patch
