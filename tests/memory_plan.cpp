@@ -72,6 +72,10 @@ int main() {
         const size_t kv = sequence_kv_bytes(fn, 3300);
         check(request_shrink_bytes(fn, 3300, kv + 256 * kMiB, 256 * kMiB) == 0, "room for the request's K/V: nothing to give back");
         check(request_shrink_bytes(fn, 3300, 84 * kMiB, 256 * kMiB) == kv + 256 * kMiB - 84 * kMiB, "84 MB free: the banks give back the rest");
+        // 16 GB np 4 (11-09): a new sequence's PLE histories (~280 MB) were not counted, the reserve went to them and the
+        // running requests' next step failed for memory (HTTP 500)
+        const size_t fixed = 284 * kMiB;
+        check(request_shrink_bytes(fn, 3300, kv + 256 * kMiB, 256 * kMiB, fixed) == fixed, "a new sequence's fixed state is given back too");
         check(sequence_kv_bytes(fn, 8192) == size_t(fn.attention_layers) * (2 * 8192 * 2 * 256 * 2 + 8192 * 128 * 4 + 2048 * 4), "K/V bytes per sequence");
     }
     // small card (12 GB): the keep is 512 MB, drafts limited to the CPU pool's block

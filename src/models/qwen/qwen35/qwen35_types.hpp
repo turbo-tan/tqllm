@@ -57,6 +57,8 @@ struct Config {
     std::string rope_type = "none";  // GGUF rope.scaling.*; CLI options override
     float rope_factor = 1.f;
     uint32_t rope_orig_ctx = 0;
+    std::string architecture = "qwen35";
+    bool gated_attention = true;
     bool tied;
     bool tiled = false;      // GGUF stores Gated DeltaNet value heads in tiled order
     int msec[3] = {0, 0, 0};  // interleaved M-RoPE sections (t, h, w rotary pairs) for image tokens
@@ -162,6 +164,7 @@ struct MtpHead {
 struct DFlashLayer {
     const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *ffn_norm = nullptr;
     const float *attn_conv_base = nullptr, *ffn_conv_base = nullptr;  // [2 sides][2 taps][C]
+    Mat dspine_read, dspine_write;
     Mat conv_attn, conv_ffn, w_qkv, wo, w_gu, down;                  // TQ3_4S (re-quantised at load)
 };
 
@@ -171,7 +174,11 @@ struct DFlash {
     bool present = false;
     // DSpark (DFlash + Markov head, anchor-first): nb tokens [anchor, MASK x (nb - 1)] predict positions pos + 1 ..
     // pos + nb, laid out as lattice rows 1 .. nb (block = nb + 1); sel_prev / sel_next = markov_w1 / markov_w2, gate 1
-    bool dspark = false;
+    bool dspark = false, dspine = false;
+    spec::DSpineConfig spine;
+    Mat spine_packed, spine_pred;
+    const bf16 *spine_codebook = nullptr;
+    const float *spine_bias = nullptr;
     int nb = 0, ffn = 0;
     float theta = 0.f;
     int heads = 0, kvheads = 0, hd = 0, block = 0, group = 0, window = 0, topk = 0, rank = 0, ring = 0;
@@ -188,7 +195,7 @@ struct DFlash {
 // Arch strings this engine can parse. `qwen35` is the dense hybrid; `qwen35moe` is the same
 // hybrid with a mixture-of-experts FFN in every block. Anything else must be rejected here: a
 // silently mis-parsed arch produces a model that loads, runs, and emits fluent wrong text.
-inline bool arch_supported(const std::string & a) { return a == "qwen35" || a == "qwen35moe"; }
+inline bool arch_supported(const std::string & a) { return a == "qwen35" || a == "qwen35moe" || a == "qwen3"; }
 
 inline Config config_from_gguf(const GgufFile & f) {
     // The metadata namespace comes from the file, not from a hardcoded prefix. The dense and MoE
@@ -199,10 +206,12 @@ inline Config config_from_gguf(const GgufFile & f) {
     if (f.has("general.architecture")) arch = f.str("general.architecture");
     if (arch.empty() || !arch_supported(arch))
         throw std::runtime_error("unsupported GGUF architecture '" + arch +
-                                 "' (this engine parses qwen35 and qwen35moe only)");
+                                 "' (this engine parses qwen3, qwen35 and qwen35moe)");
     const std::string A = arch + ".";
     Config c{};
     c.moe = arch == "qwen35moe";
+    c.architecture = arch;
+    c.gated_attention = arch != "qwen3";
     const uint32_t blocks = uint32_t(f.num(A + "block_count"));
     const uint32_t nextn = uint32_t(f.num(A + "nextn_predict_layers", 0));
     if (nextn > blocks) throw std::runtime_error("nextn_predict_layers exceeds block_count");
@@ -210,8 +219,8 @@ inline Config config_from_gguf(const GgufFile & f) {
     c.hidden = uint32_t(f.num(A + "embedding_length"));
     c.heads = uint32_t(f.num(A + "attention.head_count"));
     c.kvheads = uint32_t(f.num(A + "attention.head_count_kv"));
-    c.head_dim = uint32_t(f.num(A + "attention.key_length"));
-    c.rot_dim = uint32_t(f.num(A + "rope.dimension_count"));
+    c.head_dim = uint32_t(f.num(A + "attention.key_length", c.hidden / c.heads));
+    c.rot_dim = uint32_t(f.num(A + "rope.dimension_count", c.head_dim));
     c.theta = float(f.num(A + "rope.freq_base"));
     c.ctx_train = uint32_t(f.num(A + "context_length", 0));
     if (const auto it = f.kv.find(A + "rope.scaling.type"); it != f.kv.end()) c.rope_type = it->second.str;
@@ -220,12 +229,18 @@ inline Config config_from_gguf(const GgufFile & f) {
     if (const auto it = f.kv.find(A + "rope.dimension_sections"); it != f.kv.end() && it->second.arr.size() >= 3)
         for (int i = 0; i < 3; ++i) c.msec[i] = int(it->second.arr[size_t(i)]);
     c.eps = float(f.num(A + "attention.layer_norm_rms_epsilon"));
+    if (c.gated_attention) {
     c.lin_kheads = uint32_t(f.num(A + "ssm.group_count"));
     c.lin_vheads = uint32_t(f.num(A + "ssm.time_step_rank"));
     c.lin_dk = uint32_t(f.num(A + "ssm.state_size"));
     c.lin_dv = uint32_t(f.num(A + "ssm.inner_size")) / c.lin_vheads;
     c.conv_k = uint32_t(f.num(A + "ssm.conv_kernel"));
     c.full_interval = uint32_t(f.num(A + "full_attention_interval"));
+    } else {
+        c.lin_kheads = c.lin_vheads = 1; c.lin_dk = c.lin_dv = 32; c.conv_k = 4;
+        c.full_interval = 1;
+        if (c.head_dim != 128) throw std::runtime_error("Qwen3 currently requires head_dim 128");
+    }
 
     if (!c.moe) {
         c.ffn = uint32_t(f.num(A + "feed_forward_length"));

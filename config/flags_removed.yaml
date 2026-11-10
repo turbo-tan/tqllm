@@ -1,6 +1,12 @@
 # Environment variables removed in a release: tools/gen_flags.py lists them in docs/FLAGS.md ("Removed") and checks that
 # none is registered or read again. A removed name has no effect; `use` says what replaces it.
 removed:
+  - name: TQLLM_MLX_ANE_FFN
+    since: 1.5.0
+    use: "none: the Neural Engine prefill split is the default (no Core ML models needed)"
+  - name: TQLLM_MLX_ANE_WAVE
+    since: 1.5.0
+    use: "none: the Neural Engine prefill split is the default"
   - name: TQFN_ALLOW_NP_ABOVE_8
     since: 1.4.0
     use: "none: fixed at its measured default"
@@ -291,13 +297,13 @@ removed:
     use: "none: Metal release default built in"
   - name: TQLLM_MLX_ANE_SERIAL
     since: 1.4.0
-    use: "TQLLM_DEBUG=ane_serial"
+    use: "none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default)"
   - name: TQLLM_MLX_ANE_SKIP_PREDICT
     since: 1.4.0
     use: "none: Metal release default built in"
   - name: TQLLM_MLX_ANE_TIMING
     since: 1.4.0
-    use: "TQLLM_DEBUG=ane_timing"
+    use: "none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default)"
   - name: TQLLM_MLX_ATTENTION_KV_VIEWS
     since: 1.4.0
     use: "none: Metal release default built in"
@@ -384,10 +390,10 @@ removed:
     use: "none: Metal release default built in"
   - name: TQLLM_MLX_DUMP_FFN
     since: 1.4.0
-    use: "TQLLM_DEBUG=dump_ffn:DIR"
+    use: "none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default)"
   - name: TQLLM_MLX_DUMP_FFN_SLICE
     since: 1.4.0
-    use: "TQLLM_DEBUG=dump_ffn_slice:N"
+    use: "none: the Core ML Neural Engine path was removed in 1.5.0 (the Neural Engine prefill split is the default)"
   - name: TQLLM_MLX_DUMP_KV
     since: 1.4.0
     use: "none: Metal release default built in"

@@ -211,7 +211,7 @@ private:
         DeviceTreeOptions shape = options_;
         if (chain) shape.children = 1;
         auto tree = device_tree(lattice.mapped, lattice.unary, lattice.gate, lattice.successors, drafter_.selector_predecessor(),
-                                anchor, kPositions, shape);
+                                anchor, kPositions, shape, drafter_.dspine()?&lattice.gate:nullptr);
         mlx::core::async_eval({tree.ids, tree.parents, tree.depth, tree.visible});
         return tree;
     }

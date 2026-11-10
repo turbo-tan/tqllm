@@ -2,6 +2,8 @@
 #include "weight_format.hpp"
 #include "gguf.hpp"
 
+#include <stdexcept>
+
 namespace tqllm::formats {
 namespace {
 // MXFP8 (GGML_MXFP8): rows of cols E4M3 then the row's cols / 32 E8M0 scales; run as stored, prefill through dequant_h.

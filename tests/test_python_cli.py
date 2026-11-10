@@ -59,6 +59,33 @@ class Cli(unittest.TestCase):
         for f in (cli.MODEL, cli.DRAFTER): (d / f).write_bytes(b"x")
         cli.fetch([(cli.MLX_REPO, cli.MODEL), (cli.MLX_REPO, cli.DRAFTER)])  # no network, no import needed
 
+    def test_claude_gets_the_served_model(self):
+        # a model name left in the shell (e.g. ANTHROPIC_MODEL=qwen3.5-4b) must not reach tqLLM's server
+        e = cli.agent_env("claude", 9000, env={"ANTHROPIC_MODEL": "qwen3.5-4b-instruct"}, model="tqllm")
+        for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            self.assertEqual(e[k], "tqllm")
+        # ~/.claude/settings.json's env block outranks the process env: tqllm passes its values with --settings
+        args = cli.agent_args("claude", ["-p", "hi"], "tqllm", 8086)
+        self.assertEqual(args[0], "--settings")
+        st = json.loads(args[1])
+        self.assertEqual(st["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8086")
+        self.assertEqual(st["env"]["ANTHROPIC_MODEL"], "tqllm")
+        self.assertEqual(st["model"], "tqllm")
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", st["env"])
+        st = json.loads(cli.agent_args("claude", [], "tqllm", 8086, 65536)[1])
+        self.assertEqual(st["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "65536")
+        self.assertEqual(args[2:], ["--model", "tqllm", "-p", "hi"])
+        self.assertEqual(cli.agent_args("claude", ["--model", "x", "--settings", "s.json"], "tqllm", 8086), ["--model", "x", "--settings", "s.json"])
+
+    def test_foreign_server_on_the_port(self):
+        self.assertEqual(cli.tqllm_model(8086, "claude", served=lambda p: ("tqllm", "tqllm")), "tqllm")
+        with self.assertRaises(SystemExit) as c:
+            cli.tqllm_model(8086, "claude", served=lambda p: ("qwen3.5-4b-instruct", "llamacpp"))
+        self.assertIn("not tqLLM's server", str(c.exception))
+        self.assertIn("qwen3.5-4b-instruct", str(c.exception))
+        with self.assertRaises(SystemExit):
+            cli.tqllm_model(8086, "claude", served=lambda p: None)
+
     def test_agent_env(self):
         e = cli.agent_env("claude", 9000, env={})
         self.assertEqual(e["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9000")
@@ -68,6 +95,25 @@ class Cli(unittest.TestCase):
             cli.agent_env("vim", 9000, env={})
 
     def test_unknown_command(self):
+        with self.assertRaises(SystemExit):
+            cli.main(["frobnicate"])
+
+    def test_no_command_serves_in_the_background(self):  # owner 11-09: plain `tqllm` serves, detached; --foreground stays
+        started, execs = [], []
+        orig = cli.ensure_server, cli.server_command, cli.os.execvp
+        cli.ensure_server = lambda port, start: started.append(port) or True
+        cli.server_command = lambda rest, mac, native: execs.append(list(rest)) or ["true"]
+        class Exec(Exception): pass
+        def execvp(f, a): raise Exec()  # the real one never returns
+        cli.os.execvp = execvp
+        try:
+            self.assertEqual(cli.main([]), 0)
+            self.assertEqual(cli.main(["--qsa", "--port", "9001"]), 0)
+            with self.assertRaises(Exec): cli.main(["serve", "--foreground", "--qsa"])
+        finally:
+            cli.ensure_server, cli.server_command, cli.os.execvp = orig
+        self.assertEqual(started, [cli.PORT, 9001])
+        self.assertEqual(execs, [["--qsa"]])  # only the foreground run built its line here; background ones build it in start
         with self.assertRaises(SystemExit):
             cli.main(["frobnicate"])
 
@@ -111,6 +157,17 @@ class Cli(unittest.TestCase):
         self.assertEqual(cfg["provider"]["tqllm"]["options"]["baseURL"], "http://127.0.0.1:8099/v1")
         self.assertEqual(cli.agent_args("opencode", ["run", "hi"]), ["-m", cli.OPENCODE_MODEL, "run", "hi"])
         self.assertEqual(cli.agent_args("opencode", ["-m", "x/y"]), ["-m", "x/y"])
+
+    def test_background_start_passes_the_options(self):
+        seen = []
+        orig = cli.server_command, cli.subprocess.Popen
+        cli.server_command = lambda rest, mac, native: seen.append(list(rest)) or ["true"]
+        cli.subprocess.Popen = lambda *a, **k: type("P", (), {"pid": 1})()
+        try:
+            cli.start_background(9001, True, None, ["--qsa", "--context", "131072"])
+        finally:
+            cli.server_command, cli.subprocess.Popen = orig
+        self.assertEqual(seen, [["--qsa", "--context", "131072", "--port", "9001"]])
 
     def test_running_server_is_reused(self):
         started = []

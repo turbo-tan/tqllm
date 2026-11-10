@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "tqllm"
-version = "1.4.4"
+version = "1.5.0"
 description = "tqLLM: fast exact LLM serving (Apple Silicon build of tqserve)"
 readme = "README.md"
 license = {text = "Apache-2.0"}

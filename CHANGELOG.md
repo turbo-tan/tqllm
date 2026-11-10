@@ -3,15 +3,56 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.5.0 (2026-11-10)
 
 ### Added
+- Several boxes behind one address: `tqserve --np N --peer http://HOST:PORT` (repeatable) makes this server the front door
+  for other tqserve boxes running the same model. Each chat request goes to the box expected to answer first: free slots,
+  the users already decoding there, and the part of the prompt that box's K/V does not already hold, so a conversation's
+  next turn goes back to the box that has it. Requests are forwarded byte for byte (streaming included); a box that does
+  not answer is skipped. `POST /admin/route` reports a box's state. Two DGX Sparks (GB10), Flash-Next IQ3_S, 384-token
+  answers, total tok/s (two rounds): 4 users 156.7 / 129.4 (one box 111.5 / 93.0), 8 users 208.0 / 182.9 (134.8 / 130.9),
+  16 users 220.6 / 214.2 (one box 125.3 / 134.3). Texts are the same as one box.
+
 - `--mtp` drafts for sampled requests (temperature > 0) as well, with exact speculative sampling (the MTP drafts are
   argmax tokens, accepted with the model's probability, else resampled). RTX 3090, Qwen3.8-27B IQ4_XS GGUF, 32K context,
   temperature 0.7: 104-117 tok/s against 50 when sampled requests decoded without drafting.
 - llama.cpp IQ4_XS GGUFs of Qwen3.8 load: their IQ4_XS token embeddings are read in place by new `iq4xs_row` /
   `embed_multi_iq4xs` lookups (0.67 GB, bitwise equal to the host IQ4_XS dequantiser in BF16). Any other embedding type
   without a lookup kernel is dequantized to BF16 once at load instead of failing with "unsupported matrix type".
+- Native Windows build (MSVC + CUDA, no WSL or Docker): `tqserve` serves Qwen3.8 GGUFs. One file per OS for file mapping,
+  positioned reads and shared libraries (`src/core/platform/os_*.cpp`) and one socket layer (`tools/serve/net.hpp`). RTX
+  5060 Ti 16 GB, Windows 11, CUDA 12.8, Qwen3.8-27B TQ3_XS: prompt 1,186-1,228 tok/s at 2K / 6K, decode 33.8 tok/s, with
+  DFlash2-TQ3 160 / 116 / 102 tok/s (chat / 2K / 6K). The MoE engines (Flash-Next, GLM-5.3-Flash, MiniMax) are left out on
+  Windows for now and say so (`TQLLM_MOE_ENGINES`, OFF on Windows); run them under WSL 2. CUDA 13.3 builds too (#35).
+- DSpine drafter (opt-in, `-md` with a DSpine GGUF; `tools/convert/dflash/dspine_hf_to_gguf.py` converts Tencent's
+  checkpoint) for Qwen3.8-27B and Qwen3-8B targets. Exact (greedy text equal to plain decoding, 20/20). DFlash2 stays the
+  default: on the same targets it is faster on an RTX 3090 (162 vs 133 tok/s, code + math 227 vs 209), a GB10 (61 vs 50)
+  and an RTX 5060 Ti (130 vs 85).
+
+### Changed
+- Flash-Next with more than 32 rows in a verify block (np 16 x 4 rows): dense and head projections read their weights
+  once per 32 rows instead of once per 8. One GB10, 16 users: 116.3 / 123.8 -> 125.3 / 134.3 tok/s; texts unchanged.
+- Qwen3.5 4B and smaller (tied embeddings, no `output.weight`) load again (they failed with "missing GGUF tensor:
+  output.weight"). RTX 3090, Qwen3.5-4B Q4_K_M: 106-185 tok/s.
+- macOS (Apple Silicon): long prompts run part of every FFN on the Neural Engine beside the GPU (an int8 program for the
+  last 12,800 of the 17,408 FFN channels, planned from costs measured once per Mac and cached). M5 Pro, Qwen3.8-27B
+  TQ_L-QSA: prompts 685-704 / 659-671 / 598-605 tok/s at 8K / 16K / 32K (1.4.4: 477-484 / 456-460 / 429-430). Outputs stay
+  exact (server == plain decoding); the split changes numbers slightly (KL vs the GPU-only prompt 0.006 at 16K), so texts
+  can differ from 1.4.4. Without a Neural Engine prompts run on the GPU alone.
+- macOS: shorter first token for prompts of 17-1,000 tokens (a 64-row prompt tile up to 1,024 rows, one 32-row matrix op
+  for 17-32-row prompts): mlx-community 4-bit 114-123 ms at 19-29 tokens (1.4.4: 120-132), 165-172 ms at 35-60
+  (193-219), ~400 ms at 129-161 (522-532).
+- macOS: builds on the stock MLX 0.32.4 wheel (pip / Homebrew) with the Neural Engine path; the opt-in Core ML path and its
+  variables (TQLLM_MLX_ANE_FFN, TQLLM_MLX_ANE_WAVE) are removed.
+- `--mtp --draft-vocab`: the MTP draft head scores the draft-vocabulary rows of the 4-bit head with the int8 re-score of
+  its top 16 (the Q6_K subset copy is no longer uploaded), and one-token draft passes run as captured CUDA graphs.
+  `TQLLM_DEBUG=commit_overlap` (opt-in diagnostic) overlaps the commit replay with the draft passes. RTX 3090, mixed
+  IQ4_XS / Q5_K Qwen3.8-27B GGUF, 64K context, temperature 0.7, `--draft-vocab atx_65536.txt`: 119.7 -> 124.0 tok/s.
+- Composite (mixed-format) matrices run their parts concurrently on side streams (same results); DFlash2 on the same
+  GGUF, 128K context, q8/q4 KV: 140.1 -> 143.6 tok/s at temperature 0.7.
+- `--graph-keep-mb N`: the free-memory floor below which a CUDA graph miss also evicts (was fixed at 384 MB; a full card
+  could re-capture its verify graph every step).
 
 - `--mtp --draft-vocab`: the MTP draft head scores the draft-vocabulary rows of the 4-bit head with the int8 re-score of
   its top 16 (the Q6_K subset copy is no longer uploaded), and one-token draft passes run as captured CUDA graphs.
@@ -23,8 +64,25 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   could re-capture its verify graph every step).
 
 ### Fixed
+- GB10 (memory shared with the CPU): a model loaded while another model process held most of the memory exhausted it and
+  hung the machine until the watchdog panicked. tqserve now refuses that load and says which memory it found.
+- Several users on a small card (np > 1, 16 / 12 GB): a request whose K/V could not fit beside the running ones failed
+  the running requests' next step with HTTP 500. It now waits in the queue, the admission counts a new sequence's own
+  state (284 MB at 8K), and a request that does fail frees its slot instead of turning the next request into a 500.
+  RTX 3090 limited to 16 GB, Flash-Next, 4 users: 12 rounds with no failure. tqserve logs the cause of every HTTP 500.
+- Router: a box that answered its status late (busy prefilling a burst of requests) was skipped, and its share queued on
+  the full front door; it now keeps its last answer and is skipped only after three misses in a row.
+- Streaming: a piece could end inside a multi-byte character (the stop-string hold is a byte count); pieces now end on a
+  character boundary, and invalid UTF-8 in a reply becomes U+FFFD instead of invalid JSON (#35).
+- macOS 27: the Metal kernels and the MLX CMake package build again (#24); the wrong-output report on macOS 27 is still
+  under investigation.
 - With a Jinja chat template, `--reasoning-effort` never reached the template, so every request that set no effort ran
   at the template's default (xhigh). The resolved effort (the request's, else the server's) is now passed to the template.
+
+### Known issues
+- Flash-Next on a 12 GB card with several users (`--np` > 1) under constant load can stop after several minutes with a
+  GPU fault (Xid 31 / 32 in the kernel log). One user on a 12 GB card and four users on a 16 GB card ran clean. Use
+  `--np 1` on 12 GB cards for now; a fix is planned for 1.6.0.
 
 ## 1.4.4 (2026-11-07)
 

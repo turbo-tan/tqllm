@@ -696,7 +696,8 @@ void attention_gen128(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const _
     if (ring && (window <= 0 || ring % CH || ring < window + nq + CH))
         throw std::invalid_argument("attention_gen128: ring needs a window, ring % 64 == 0, ring >= window + nq + 64");
     const int nsplit = ring ? (window + nq + CH - 1) / CH + 1 : (max_seq + CH - 1) / CH;
-    if ((h / kh) * nq <= 32)
+    // Causal target decoding and verification must use the same reduction at every batch width.
+    if (!causal && (h / kh) * nq <= 32)
         attn_gen_mq_k<128><<<dim3(kh, nsplit), 128, 0, s>>>(q, kc, vc, part, dpos, nq, h, kh, scale, nsplit,
                                                             causal ? 1 : 0, window, ring);
     else

@@ -77,6 +77,7 @@ void Model::verify(const std::vector<uint32_t> & tokens, uint32_t pos, std::vect
     impl_->e->verify(tokens.data(), int(tokens.size()), pos, next.data());
 }
 void Model::commit(int accepted) { impl_->e->commit(accepted); }
+void Model::spec_abort(int slot) { impl_->e->spec_abort(slot); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
 void Model::set_ignore_eos(bool on) { impl_->e->set_ignore_eos(on); }

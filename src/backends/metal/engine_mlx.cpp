@@ -131,6 +131,7 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
     mx::set_cache_limit(size_t(512) * 1024 * 1024);
     i.residency = std::make_unique<ScopedWiredLimitHolder>();
     i.engine = std::make_unique<Qwen35>(weights, int(context));
+    i.layers_ = uint32_t(i.engine->layer_count()); i.hidden_ = uint32_t(i.engine->hidden_size());
     i.drafter = std::make_unique<DFlash2>(options.draft_model, *i.engine);
     i.engine->enable_draft_head4();  // 4-bit proposal head, matrix-unit layout (gated j892)
     i.exact = options.exact;
@@ -140,9 +141,11 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
     if (i.exact && options.prompt_cache)
         tqllm::warn_exact_conflicts({"--prompt-cache on: a prompt that extends the previous request's text prefills only its tail, "
                                      "so the text can differ from a fresh prefill"}, std::cerr);
+    if (i.engine->head_dim() == 256) {
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
     mlx_backend::warm_split_attention_kernels(i.engine->q_heads(), i.engine->kv_heads());
     mlx_backend::warm_exact_attention_kernels(i.engine->q_heads(), i.engine->kv_heads());
+    }
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
@@ -272,6 +275,9 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
         if (const char* rows = tqllm::debug_cstr("tree_rows")) {
             const int n = std::atoi(rows);
             if (n != 16 && n != 32) throw std::invalid_argument("TQLLM_DEBUG tree_rows takes 16 or 32");
+            if (n == 32 && i.engine->exact() && mlx_backend::matrix_unit_available())
+                std::fprintf(stderr, "tqserve: WARN TQLLM_DEBUG=tree_rows:32 under --exact on: on the matrix unit a 17-32 row verify "
+                                     "does not run the exact attention kernel its AR steps use, so output can differ from plain decoding\n");
             tree_options.nodes = n - 1;
         }
         if (const char* k = tqllm::debug_cstr("tree_children")) tree_options.children = std::atoi(k);

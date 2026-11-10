@@ -1,4 +1,5 @@
 #include "hf_folder.hpp"
+#include "../platform/os_file.hpp"
 #include "hf_arch.hpp"
 #include "x3_record.hpp"
 
@@ -9,10 +10,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -392,22 +389,13 @@ std::vector<char> reorder(std::vector<char> src, const HfFolder::BlockOrder & o,
 // read-only mappings of shard files, shared by the gather / warm hooks of one tensor
 struct ShardMaps {
     std::mutex lock;  // the bank build's workers slice experts concurrently
-    std::map<std::string, std::pair<const char *, size_t>> maps;
+    std::map<std::string, std::unique_ptr<tqllm::os::MappedFile>> maps;
     const char * at(const SafeTensor & t) {
         std::lock_guard<std::mutex> hold(lock);
-        auto it = maps.find(t.file);
-        if (it == maps.end()) {
-            const int fd = open(t.file.c_str(), O_RDONLY | O_CLOEXEC);
-            if (fd < 0) throw std::runtime_error("hf: cannot open " + t.file);
-            struct stat st{}; fstat(fd, &st);
-            void * p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0); close(fd);
-            if (p == MAP_FAILED) throw std::runtime_error("hf: cannot map " + t.file);
-            madvise(p, size_t(st.st_size), MADV_RANDOM);
-            it = maps.emplace(t.file, std::make_pair(static_cast<const char *>(p), size_t(st.st_size))).first;
-        }
-        return it->second.first + t.begin;
+        auto & m = maps[t.file];
+        if (!m) { m = std::make_unique<tqllm::os::MappedFile>(t.file); m->advise_random(); }
+        return m->data() + t.begin;
     }
-    ~ShardMaps() { for (auto & [f, m] : maps) munmap(const_cast<char *>(m.first), m.second); }
 };
 
 }  // namespace
@@ -491,12 +479,11 @@ GgufTensor HfFolder::q4_rows(const std::vector<std::string> & ms) const {
         for (int i = 0; i < std::max(1, threads); ++i) pool.emplace_back([&] {
             std::vector<char> buf(size_t(1) << 24);
             for (size_t j; (j = next++) < parts.size();) {
-                const SafeTensor & p = *parts[j]; const int fd = open(p.file.c_str(), O_RDONLY | O_CLOEXEC); if (fd < 0) continue;
+                const SafeTensor & p = *parts[j]; const tqllm::os::ReadFile f(p.file); if (!f.ok()) continue;
                 for (uint64_t at = 0; at < p.bytes; at += buf.size()) {
-                    const ssize_t r = pread(fd, buf.data(), size_t(std::min<uint64_t>(buf.size(), p.bytes - at)), off_t(p.begin + at));
+                    const int64_t r = f.read_at(buf.data(), size_t(std::min<uint64_t>(buf.size(), p.bytes - at)), p.begin + at);
                     if (r <= 0) break; done += size_t(r);
                 }
-                close(fd);
             }
         });
         for (auto & th : pool) th.join();

@@ -6,7 +6,8 @@ organised** (for anyone changing the code).
 ## Setting tqLLM up for a user
 
 tqLLM is an OpenAI-compatible inference server for Qwen3.8 models on NVIDIA GPUs (RTX 30 / 40 / 50, GB10 / DGX
-Spark), Linux or Windows with WSL 2. Steps, in order:
+Spark), Linux, or Windows (natively for Qwen3.8-27B, [Windows guide](docs/guides/windows.md); WSL 2 for the MoE
+models). Steps, in order:
 
 1. **Check the hardware.** Run `nvidia-smi` and note the GPU and its memory. Docker needs the NVIDIA Container
    Toolkit (`docker run --rm --gpus all ubuntu nvidia-smi` must print the GPU).
@@ -30,7 +31,7 @@ Spark), Linux or Windows with WSL 2. Steps, in order:
      -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
      -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
      -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-     ytan2000/tqllm:1.4.2
+     ytan2000/tqllm:latest
    ```
    The server fits the KV cache and context to the free memory by itself and prints what it chose. On a 16 GB GPU
    use `-e CONTEXT=16384 -e KV_FORMAT=tq3`. Without Docker: build `tqserve` from source (README, "Build").
@@ -48,7 +49,7 @@ If it fails: no GPU in the container -> install the NVIDIA Container Toolkit; ou
 smaller `CONTEXT`; a GPU older than RTX 30 is not supported.
 
 Qwen3.8 Flash-Next (125B MoE) on one 24 GB GPU (RTX 30 or newer) or a GB10: needs 64 GB of system RAM or more (tested
-with 128 GB) and image 1.4.2 or newer. Follow the run steps on https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM exactly: the ISTA-DASLab
+with 128 GB) and the `latest` image (1.4.2 or newer). Follow the run steps on https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM exactly: the ISTA-DASLab
 IQ3_S GGUF plus the small files there in one folder, then `tqserve --model <folder>/flashnext.tqfn`. Start-up takes
 about two minutes (the experts are arranged in RAM for the GPU cache); wait for `/health` before the first request.
 
@@ -73,7 +74,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
         |
         v
   src/models/<family>/<arch>/      one folder per architecture
-        qwen/qwen35          Qwen3.5 / Qwen3.8 dense and qwen35moe: one engine, MoE is a block type
+        qwen/qwen35          Qwen3.5 / Qwen3.8 dense and qwen35moe; experimental ungated Qwen3 target variant
         qwen/qwen4exp        Flash-Next
         qwen/qwen2           the draft-model forward
         glm/glm5next         GLM-5.3-Flash (DSA attention, MoE)
@@ -85,7 +86,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
   src/formats/kv/            KV-cache formats: record layout + attention + registry (KvFormat)
   src/kv/                    KV store: device / host tiers (KvMemory, CUDA virtual memory), TqCache
   src/experts/               routing, grouped expert GEMM, expert caches (VRAM / host / mixed): every MoE model
-  src/spec/                  drafting and verify: DFlash, token trees
+  src/spec/                  drafting and verify: DFlash, DSpine bridge/schema, token trees
   src/vision/                vision encoders (--mmproj)
         |
         v

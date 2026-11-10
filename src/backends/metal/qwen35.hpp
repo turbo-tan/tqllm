@@ -84,6 +84,10 @@ public:
     int kv_heads() const;
     int q_heads() const;
     int head_dim() const;
+    int context() const;
+    int hidden_size() const;
+    int layer_count() const;
+    std::string architecture() const;
     int position() const;
     int vocabulary() const;
     void profile(bool enabled);

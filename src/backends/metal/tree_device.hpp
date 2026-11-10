@@ -54,11 +54,13 @@ inline std::pair<mlx::core::array, mlx::core::array> tree_ancestors(const mlx::c
 // the selector's table (read only for the anchor and the candidates); anchor uint32 scalar
 inline DeviceTree device_tree(const mlx::core::array& mapped, const mlx::core::array& unary, const mlx::core::array& gate,
                               const mlx::core::array& successors, const mlx::core::array& predecessor,
-                              const mlx::core::array& anchor, int positions, const DeviceTreeOptions& o = {}) {
+                              const mlx::core::array& anchor, int positions, const DeviceTreeOptions& o = {},
+                              const mlx::core::array* dense_scores = nullptr) {
     namespace mx = mlx::core;
     const int topk = mapped.shape(1), rank = gate.shape(1);
     if (positions < 1 || mapped.shape(0) < positions + 1 || unary.shape(0) < positions + 1 || topk > 16 ||
-        successors.shape(1) != topk || successors.shape(2) != rank || predecessor.shape(1) != rank)
+        (!dense_scores && (successors.shape(1) != topk || successors.shape(2) != rank || predecessor.shape(1) != rank)) ||
+        (dense_scores && dense_scores->shape()!=mx::Shape{mapped.shape(0),topk,topk}))
         throw std::invalid_argument("device tree: invalid lattice");
     if (o.nodes < 1 || o.nodes > 63 || o.children < 1 || o.children > topk || !(o.tau > 0))
         throw std::invalid_argument("device tree: invalid options");
@@ -68,6 +70,16 @@ inline DeviceTree device_tree(const mlx::core::array& mapped, const mlx::core::a
     const int P = positions, k = o.children, N = std::min(o.nodes, avail), n = N + 1;
     auto tok = mx::astype(mx::slice(mapped, {1, 0}, {P + 1, topk}), mx::uint32);
     auto un = mx::astype(mx::slice(unary, {1, 0}, {P + 1, topk}), mx::float32);
+    auto normalize=[&](const mx::array& logits) {
+        auto score=mx::divide(logits,mx::array(o.tau));
+        return mx::minimum(mx::subtract(score,mx::logsumexp(score,-1,true)),mx::array(-1e-6f));
+    };
+    mx::array first=mx::zeros({topk});
+    std::optional<mx::array> later;
+    if(dense_scores) {
+        first=normalize(mx::reshape(mx::slice(*dense_scores,{1,0,0},{2,1,topk}),{topk}));
+        if(P>1)later=normalize(mx::slice(*dense_scores,{2,0,0},{P+1,topk,topk}));
+    } else {
     auto ga = mx::astype(mx::slice(gate, {1, 0}, {P + 1, rank}), mx::float32);
     auto weighted = mx::multiply(mx::astype(mx::slice(successors, {1, 0, 0}, {P + 1, topk, rank}), mx::float32),
                                  mx::reshape(ga, {P, 1, rank}));  // [P, topk, rank]: gate x successor
@@ -80,13 +92,13 @@ inline DeviceTree device_tree(const mlx::core::array& mapped, const mlx::core::a
         // log-softmax per expansion; a child is kept strictly below its parent so the top nodes stay ancestor-closed
         return mx::minimum(mx::subtract(s, mx::logsumexp(s, -1, true)), mx::array(-1e-6f));
     };
-    auto first = scaled(mx::reshape(mx::slice(un, {0, 0}, {1, topk}), {topk}), edge0);  // [topk]
-    std::optional<mx::array> later;  // [P - 1, topk parents, topk children]
+    first = scaled(mx::reshape(mx::slice(un, {0, 0}, {1, topk}), {topk}), edge0);  // [topk]
     if (P > 1) {
         auto parent_rows = mx::astype(mx::take(predecessor, mx::reshape(mx::slice(tok, {0, 0}, {P - 1, topk}), {-1}), 0), mx::float32);
         auto edges = mx::matmul(mx::reshape(parent_rows, {P - 1, topk, rank}),
                                 mx::transpose(mx::slice(weighted, {1, 0, 0}, {P, topk, rank}), {0, 2, 1}));
         later = scaled(mx::reshape(mx::slice(un, {1, 0}, {P, topk}), {P - 1, 1, topk}), edges);
+    }
     }
     // keys: a node's path of child ranks in base (k + 1), the root's digit first, so sorting keys is a depth-first walk
     std::vector<int64_t> place(size_t(P), 1);

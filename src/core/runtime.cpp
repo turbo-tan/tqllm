@@ -1,5 +1,5 @@
 #include "tqllm/runtime.hpp"
-#include <dlfcn.h>
+#include "platform/os_file.hpp"
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -12,10 +12,10 @@ void Plan::run(const float * a, const float * b, float * out) const {
     if (invoke(&call, &error)) throw std::runtime_error(std::string(error.message, strnlen(error.message, sizeof(error.message))));
 }
 void Runtime::load(const std::string & path) {
-    void * raw = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!raw) throw std::runtime_error(dlerror());
-    std::shared_ptr<void> owner(raw, [](void * h) { dlclose(h); });
-    auto init = reinterpret_cast<tq_plugin_init_fn>(dlsym(raw, "tq_plugin_init_v1"));
+    void * raw = os::load_library(path);
+    if (!raw) throw std::runtime_error(path + ": " + os::library_error());
+    std::shared_ptr<void> owner(raw, [](void * h) { os::close_library(h); });
+    auto init = reinterpret_cast<tq_plugin_init_fn>(os::library_symbol(raw, "tq_plugin_init_v1"));
     if (!init) throw std::runtime_error("plugin missing tq_plugin_init_v1");
     struct Pending { std::vector<Entry> entries; std::shared_ptr<void> owner; } pending{{}, owner};
     tq_registry registry{sizeof(tq_registry), TQ_ABI_VERSION, &pending,

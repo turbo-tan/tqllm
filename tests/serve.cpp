@@ -29,6 +29,20 @@ void check(bool b, const std::string & what) {
     check(b, what.c_str());
 }
 
+void test_json_utf8() {
+    const auto quote = [](const std::string & text) {
+        std::string out;
+        tqserve::jstr(out, text);
+        return out;
+    };
+    check(quote("\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\n") ==
+          "\"\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\\n\"", "valid UTF-8 and JSON escapes are preserved");
+    check(quote("a\xC7" "z") == "\"a\\ufffdz\"", "invalid continuation keeps following ASCII");
+    check(quote("\xE2\x82") == "\"\\ufffd\"", "incomplete UTF-8 is replaced once");
+    check(quote("\xED\xA0\x80") == "\"\\ufffd\\ufffd\\ufffd\"", "UTF-8 surrogate encodings are rejected");
+    check(quote("\xF4\x90\x80\x80") == "\"\\ufffd\\ufffd\\ufffd\\ufffd\"", "code points above U+10FFFF are rejected");
+}
+
 void test_split() {
     { // happy path: GET with a body
         auto h = tqserve::split_request(raw("GET /health?x=1 HTTP/1.1\r\nA: b\r\n\r\n"),
@@ -329,6 +343,7 @@ int main(int argc, char ** argv) {
     }
 
     tqserve::serve_options().repeat_limit = 6;
+    test_json_utf8();
     test_sampling_numbers();
     test_repeat_guard();
     test_split();

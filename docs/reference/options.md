@@ -20,6 +20,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--context N` | 2048 | context per server, split evenly across `--np` slots; the memory fit may lower it |
 | `--max-tokens N` | 16384 | default output cap per request (also the cap for requests that ask for more; thinking counts against it) |
 | `--np N` | 1 | requests served at once (batched verify); `GET`/`POST /admin/slots` reads or changes the live limit |
+| `--peer URL` | none | repeatable, needs `--np` > 1: other tqserve boxes serving the same model; each chat request goes to the box expected to answer first (free slots, cached prompt prefix, measured rates; `POST /admin/route`), so N boxes serve as one endpoint |
 | `--name NAME`, `--system TEXT` | | model name in the API; a default system prompt |
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |

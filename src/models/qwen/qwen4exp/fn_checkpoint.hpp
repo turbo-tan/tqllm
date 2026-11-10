@@ -435,7 +435,7 @@ public:
     // columns per head launch: a several-sequence verify block (up to 32 rows) reads the head once when the format's
     // wide matvec equals its 8-column launches (max_exact_cols, tests/matvec_wide.cu at the head's shape)
     static int head_step(const Mat & m, int count) {
-        return std::max(1, count <= m.fmt->max_exact_cols() ? count : m.fmt->max_matvec_cols());
+        return std::max(1, std::min(count, m.fmt->max_exact_cols()));
     }
     // Device argmax per row (ties -> lowest index, as std::max_element): only the ids leave the GPU.
     static std::vector<int> argmax_rows(const float * logits, int V, int count) {
@@ -664,10 +664,10 @@ public:
                 if (!resident) ck(cudaDeviceSynchronize());
                 return;
             }
-            // a several-sequence verify block (9..32 tokens) in one matvec: the weights read once, not once per 8 tokens
-            // (each column's result is the same, tests/matvec_wide.cu)
-            const int wide = matrix.fmt->max_exact_cols();
-            const int step = tokens <= wide ? tokens : matrix.fmt->max_matvec_cols(); require(step > 0, "invalid native matvec width");
+            // a several-sequence verify block in launches of max_exact_cols() columns: the weights read once per 32 tokens, not
+            // once per 8 (each column's result is the same, tests/matvec_wide.cu); np 16 x 4 rows took 8-column launches: dense
+            // projections 32 ms of a 210 ms step on GB10 vs 9 ms for 32 rows (11-07)
+            const int step = std::min(tokens, matrix.fmt->max_exact_cols()); require(step > 0, "invalid native matvec width");
             for (int base = 0; base < tokens; base += step)
                 matrix.fmt->matvec_f32(matrix, xp + size_t(base) * cols, output + size_t(base) * rows, std::min(step, tokens - base), nullptr);
             if (!resident) ck(cudaDeviceSynchronize());

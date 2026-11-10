@@ -1,11 +1,13 @@
-"""tqllm serve [--qsa | --flash-next] [--native PATH] [tqserve options]   serve; the first run downloads the model and drafter
+"""tqllm [serve] [--qsa | --flash-next] [--native PATH] [--foreground] [tqserve options]
+                                         start the server in the background (also with no command) and return once it
+                                         answers; the first run downloads the model and drafter. --foreground: stay attached
     Apple Silicon: the packaged Metal server. Linux + NVIDIA: the Docker image (or --native PATH/tqserve), the model picked
     by the card's memory (Qwen3.8-27B TQ3_4S-v2 on 20 GB+, TQ_S below), or Qwen3.8 Flash-Next with --flash-next.
 tqllm pull [--qsa | --flash-next]       download them only
 tqllm claude | codex | opencode [--port N] [--native PATH] [args]
                                          start a coding agent pointed at the server; starts the server first when none
                                          answers on the port (it keeps running: tqllm stop)
-tqllm stop                               stop a server tqllm started"""
+tqllm stop                               stop a server tqllm started (its log: ~/.cache/tqllm/server.log)"""
 import json
 import os
 import platform
@@ -24,7 +26,7 @@ TQ_L = "Qwen3.8-27B-TQ_L.gguf"  # 14.7 GB: the file for Macs below LARGE_MAC_GB
 TQ_L_QSA = "Qwen3.8-27B-TQ_L-QSA.gguf"  # 14.8 GB: TQ_L with the QSA indexers (preferred when published)
 LARGE_MAC_GB = 40
 PORT = 8086  # tqserve's default
-IMAGE = "ghcr.io/turbo-tan/tqllm:1.4.4"
+IMAGE = "ghcr.io/turbo-tan/tqllm:1.5.0"
 # Linux / NVIDIA: (repo, file) per model; files keep their repo subfolder under the models folder
 TQ34S_REPO, TQ34S = "YTan2000/Qwen3.8-27B-TQ3_4S", "Qwen3.8-27B-TQ3_4S-v2.gguf"  # 24 GB cards
 TQ_S = "Qwen3.8-27B-TQ_S.gguf"  # 16 GB cards
@@ -229,13 +231,16 @@ def opencode_config(port):
                                    "models": {"qwen3.8-27b": {"name": "Qwen3.8-27B (tqLLM)"}}}}}
 
 
-def agent_env(name, port, env=None):
+def agent_env(name, port, env=None, model=None):
     """The environment that points a coding agent at the local server: Claude Code at /v1/messages, Codex at
     /v1/responses, OpenCode at /v1/chat/completions through a generated config (all served by tqserve)."""
     e = dict(os.environ if env is None else env)
     base = f"http://127.0.0.1:{port}"
     if name == "claude":
         e.update(ANTHROPIC_BASE_URL=base, ANTHROPIC_AUTH_TOKEN="tqllm")
+        if model:  # the served model for every Claude Code role, over a model name left in the shell or its settings
+            e.update({k: model for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")})
     elif name == "codex":
         e.update(OPENAI_BASE_URL=base + "/v1", OPENAI_API_KEY="tqllm")
     elif name == "opencode":
@@ -248,11 +253,67 @@ def agent_env(name, port, env=None):
     return e
 
 
-def agent_args(name, args):
-    """OpenCode starts on the tqLLM model unless a model is given."""
+def server_context(port, timeout=3.0):
+    """Positions per request that the server on the port reports at /health (tqserve 1.5.0+), or None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
+            n = json.load(r).get("context")
+        return int(n) if n else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def claude_settings(port, model, context=None):
+    """Claude Code settings that point it at the local server. Passed with --settings: command-line settings rank above
+    ~/.claude/settings.json, whose env block (e.g. another gateway's ANTHROPIC_BASE_URL / ANTHROPIC_MODEL) would otherwise
+    override the environment tqllm sets."""
+    env = {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}", "ANTHROPIC_AUTH_TOKEN": "tqllm", "ANTHROPIC_API_KEY": "tqllm"}
+    if model:
+        env.update({k: model for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                       "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")})
+    if context:  # Claude Code does not know the served model's window (it would assume 200K): compact at the server's
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context)
+    out = {"env": env}
+    if model:
+        out["model"] = model
+    return json.dumps(out, separators=(",", ":"))
+
+
+def agent_args(name, args, model=None, port=PORT, context=None):
+    """OpenCode starts on the tqLLM model; Claude Code on the served model with settings that point it at the local
+    server (unless the user passes their own --model / --settings)."""
     if name == "opencode" and not has_option(args, "-m", "--model"):
         return ["-m", OPENCODE_MODEL] + list(args)
+    if name == "claude":
+        out = list(args)
+        if model and not has_option(args, "--model"):
+            out = ["--model", model] + out
+        if not has_option(args, "--settings"):
+            out = ["--settings", claude_settings(port, model, context)] + out
+        else:
+            print("tqllm: your --settings is used as given; it must point Claude Code at "
+                  f"http://127.0.0.1:{port}", file=sys.stderr)
+        return out
     return list(args)
+
+
+def served_model(port, timeout=3.0):
+    """(model id, owner) that the server on the port reports at /v1/models, or None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=timeout) as r:
+            first = json.load(r)["data"][0]
+        return str(first.get("id", "")), str(first.get("owned_by", ""))
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def tqllm_model(port, cmd, served=served_model):
+    """The model id of tqLLM's server on the port; stops when another program answers there."""
+    info = served(port)
+    if info is None or info[1] != "tqllm":
+        what = f"it serves {info[0]!r}" if info else "it does not answer /v1/models"
+        raise SystemExit(f"tqllm: port {port} is not tqLLM's server ({what}); stop that server, or run tqllm {cmd} --port N")
+    return info[0]
 
 
 def healthy(port, timeout=2.0):
@@ -295,9 +356,9 @@ def ensure_server(port, start, is_up=healthy, wait=1800.0, poll=2.0, out=sys.std
     return True
 
 
-def start_background(port, mac, native=None):
+def start_background(port, mac, native=None, args=()):
     """Launch the server detached, output to state_dir()/server.log, pid in server.pid."""
-    cmd = server_command(["--port", str(port)], mac, native)
+    cmd = server_command(list(args) + ["--port", str(port)], mac, native)
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
     log = open(d / "server.log", "ab")
@@ -327,9 +388,11 @@ def without(args, name):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or argv[0] in ("-h", "--help"):
+    if argv and argv[0] in ("-h", "--help"):
         print(__doc__ + f"\nmodels: {models_dir()} (TQLLM_HOME overrides)")
         return 0
+    if not argv or argv[0].startswith("-"):  # no command: serve, options included (tqllm --qsa)
+        argv = ["serve"] + argv
     cmd, rest = argv[0], argv[1:]
     mac = sys.platform == "darwin" and platform.machine() == "arm64"
     if cmd == "pull":
@@ -340,8 +403,16 @@ def main(argv=None):
         return stop_server()
     if cmd == "serve":
         native = None if mac else option(rest, "--native")
-        line = server_command(without(rest, "--native"), mac, native)
-        os.execvp(line[0], line)
+        args = without(rest, "--native")
+        if "--foreground" in args:  # attached: the server's own output, Ctrl+C stops it
+            line = server_command([a for a in args if a != "--foreground"], mac, native)
+            os.execvp(line[0], line)
+        port = int(option(args, "--port", PORT))
+        extra = without(args, "--port")
+        if not ensure_server(port, lambda p: start_background(p, mac, native, extra)):
+            print(f"tqllm: a server already answers on port {port} (tqllm stop ends one tqllm started)")
+        print(f"tqllm: serving http://127.0.0.1:{port}/v1 (monitor: http://127.0.0.1:{port}/); stop: tqllm stop; log: {state_dir() / 'server.log'}")
+        return 0
     if cmd in AGENTS:
         port = int(option(rest, "--port", PORT))
         native = None if mac else option(rest, "--native")
@@ -350,7 +421,9 @@ def main(argv=None):
         if not exe:
             raise SystemExit(f"{cmd} is not installed (it is a separate tool); install it, then run tqllm {cmd}")
         ensure_server(port, lambda p: start_background(p, mac, native))
-        os.execve(exe, [exe] + agent_args(cmd, args), agent_env(cmd, port))
+        model = tqllm_model(port, cmd)
+        context = server_context(port) if cmd == "claude" else None
+        os.execve(exe, [exe] + agent_args(cmd, args, model, port, context), agent_env(cmd, port, model=model))
     raise SystemExit(f"unknown command {cmd!r}: tqllm serve | pull | stop | " + " | ".join(AGENTS))
 
 

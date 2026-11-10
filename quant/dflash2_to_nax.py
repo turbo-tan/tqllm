@@ -35,7 +35,7 @@ def main():
     payloads, packed, kept, worst = [], 0, 0, 0.0
     for t in reader.tensors:
         ne = [int(x) for x in t.shape]
-        quantize = (len(ne) == 2 and t.name.endswith(".weight") and t.name not in KEEP and ne[0] > 128 and ne[1] > 128
+        quantize = (len(ne) == 2 and t.name.endswith(".weight") and t.name not in KEEP and "dspine_" not in t.name and ne[0] > 128 and ne[1] > 128
                     and ne[1] % 128 == 0 and ne[0] % 64 == 0
                     and t.tensor_type in (gguf.GGMLQuantizationType.BF16, gguf.GGMLQuantizationType.F32))
         if not quantize:

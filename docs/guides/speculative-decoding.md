@@ -2,6 +2,10 @@
 
 [Documentation](../README.md) / [Project home](../../README.md)
 
+The experimental [DSpine variant](../models/dspine.md) has a separate checkpoint contract
+and release gate, with checkpoints for Qwen3-8B and Qwen3.8-27B. On the 27B it currently
+measures slower than the DFlash2 drafter below; neither checkpoint replaces it.
+
 ## Fast decoding: about 250 tok/s on an RTX 3090
 
 tqLLM speculates with a DFlash2 draft model: the drafter proposes several tokens, the 27B model checks them in one pass,
@@ -28,7 +32,7 @@ docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" \
   -e DRAFT_MODEL_FILE=/models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf \
   -e DRAFT_VOCAB_FILE=/models/mtp-vocab/atx_65536.txt \
   -e CONTEXT=32768 -e REASONING=on -e MAX_TOKENS=4096 \
-  ghcr.io/turbo-tan/tqllm:1.4.2
+  ghcr.io/turbo-tan/tqllm:latest
 ```
 
 With Compose, set the same names: `DRAFT_NAME=drafters/Qwen3.8-27B-DFlash2-TQ3.gguf

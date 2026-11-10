@@ -6,7 +6,8 @@
 #include "dense_rows.hpp"
 #include "gdn.hpp"
 #include "prefill_fused.hpp"
-#include "ane_ffn.hpp"
+#include "ane_plan.hpp"
+#include "ane_program.hpp"
 #include "draft_head.hpp"
 #include "attention_rows.hpp"
 #include "kv_capacity.hpp"
@@ -31,6 +32,13 @@
 #include <optional>
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <pwd.h>
+#include <unistd.h>
+#include <array>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #endif
 #include <stdexcept>
 #include <type_traits>
@@ -181,11 +189,17 @@ struct Qwen35::Impl {
     }
     // FP16 product of a 4-bit matrix on a prefill chunk. One-pass chunks run the 4-bit staged kernel on the stored codes
     // (j911: no per-chunk FP16 weight copy, 512 rows 15-17 % faster per matrix); layer-major chunks share one dequant
-    // across their slices and run the MLX GEMM on it
+    // across their slices and run the MLX GEMM on it, except in a Neural Engine split layer, where the staged kernel slows
+    // far less beside the ANE (j838) and the layer's FP16 copies are not made at all
+    // prompts below kSmallTileMax rows run a 64-row tile (kSmallRs x kSmallSgs) instead of the 128-row one (j2055, j2066, j2067:
+    // first token 35-60 tokens 165 vs 205 ms, 129-161 tokens 398-409 vs 522-532, 414 tokens 937 vs 1061, 556 tokens 1208-1229 vs
+    // 1377-1397 at a 512-row ceiling; from 714 tokens equal; the 2048-row slices of long prompts keep the 128-row tile)
+    static constexpr int kSmallRs=16,kSmallSgs=4,kSmallTileMax=1024;
     mx::array gemm4(const NaxAffine& w,const mx::array& x16) {
         const bool staged_ok=w.bits==4 && !w.q6 && w.rows%64==0 && w.columns%64==0 && w.group%64==0;
-        if(staged_ok && !share_dequant)
-            return nax_affine_prefill(w,x16,0,std::nullopt,32,64,4,1,1,1);
+        if(staged_ok && (!share_dequant || ane_layer.layer>=0))
+            return x16.shape(0)<kSmallTileMax ? nax_affine_prefill(w,x16,0,std::nullopt,kSmallRs,64,kSmallSgs,1,1,1)
+                                                : nax_affine_prefill(w,x16,0,std::nullopt,32,64,4,1,1,1);
         return mx::matmul(x16,mx::transpose(dequant(w)));
     }
     // a prefill pack's FP16 product [m, pack rows] (rows >= 64); nullopt without the pack
@@ -345,6 +359,7 @@ struct Qwen35::Impl {
     std::optional<std::pair<mx::array,mx::array>> dense_rotated_input;
     // layer-major prefill (forward_layer_major): one FP16 dequant per matrix shared by the batch's slices, dropped per layer
     bool share_dequant=false;
+    bool prompt_pass=false;  // a prompt forward (Qwen35::forward), not a verify: 17-32-row products may leave the row-invariant kernel
     bool defer_eval=false;  // draft-ahead: submit this forward without waiting, the caller chains the next draft behind it
     int stream_group=4,stream_layers=1;  // submit a group of layers' ops as they are built (nostream: one submission)
     std::map<const NaxAffine*,mx::array> dequant_cache;
@@ -361,7 +376,6 @@ struct Qwen35::Impl {
         auto y=gemm4(w,x);
         return round?round_product(y):mx::astype(y,mx::float32);
     }
-    std::unique_ptr<AneFfn> ane;bool ane_tried=false;
 
     std::map<std::string,double> stages;
     std::chrono::steady_clock::time_point stage_tick;
@@ -385,13 +399,15 @@ struct Qwen35::Impl {
         stages[std::string(name)+"_calls"]+=1;
     }
     std::pair<double,double> times={0,0};
+    bool gated_attention=true;
     explicit Impl(const std::string& path,int ctx):file(gguf_open(path)),context(ctx),key_indices(mx::array(0)) {
         build_split=tqllm::debug_cstr("build_split")!=nullptr;
         stream_layers=tqllm::debug_cstr("nostream")==nullptr;
         if(const int g=tqllm::debug_int("stream_group");g>0)stream_group=g;
         const auto arch=file.kv.at("general.architecture").str;
-        if(arch!="qwen35") throw std::invalid_argument("MLX dense forward requires qwen35 architecture");
-        const std::string a="qwen35.";
+        if(arch!="qwen35" && arch!="qwen3") throw std::invalid_argument("MLX dense forward requires qwen3 or qwen35 architecture");
+        gated_attention=arch!="qwen3";
+        const std::string a=arch+".";
         auto integer=[&](const std::string& key) {
             const double x=file.num(a+key);
             if(!std::isfinite(x)||x<=0||x>std::numeric_limits<int>::max()||x!=std::floor(x))
@@ -401,10 +417,14 @@ struct Qwen35::Impl {
         layers=integer("block_count")-int(file.num(a+"nextn_predict_layers",0));
         hidden=integer("embedding_length");heads=integer("attention.head_count");
         kvheads=integer("attention.head_count_kv");hd=integer("attention.key_length");
-        rot=integer("rope.dimension_count");kh=integer("ssm.group_count");
+        rot=file.has(a+"rope.dimension_count")?integer("rope.dimension_count"):hd;
+        if(gated_attention) {
+        kh=integer("ssm.group_count");
         vh=integer("ssm.time_step_rank");dk=integer("ssm.state_size");
         dv=integer("ssm.inner_size")/vh;conv=integer("ssm.conv_kernel");
-        interval=integer("full_attention_interval");eps=float(file.num(a+"attention.layer_norm_rms_epsilon"));
+        interval=integer("full_attention_interval");
+        } else {kh=vh=1;dk=dv=32;conv=4;interval=1;}
+        eps=float(file.num(a+"attention.layer_norm_rms_epsilon"));
         theta=float(file.num(a+"rope.freq_base"));
         if(ctx<=0||layers<=0||conv!=4||vh%kh||heads%kvheads||rot>hd||rot%2||dv<=0||dk<32||dk%32)
             throw std::invalid_argument("unsupported qwen35 dimensions");
@@ -449,7 +469,9 @@ struct Qwen35::Impl {
             matrices.emplace(name,std::move(w));
         };
         auto scalar=[&](const std::string& name) {
-            const auto& t=file.tensors.at(name);auto raw=file.read(t);
+            auto source=name;
+            if(!gated_attention && name.ends_with("post_attention_norm.weight"))source=name.substr(0,name.size()-std::string("post_attention_norm.weight").size())+"ffn_norm.weight";
+            const auto& t=file.tensors.at(source);auto raw=file.read(t);
             auto w=mx::astype(load_plain_tensor(t,{reinterpret_cast<const uint8_t*>(raw.data()),raw.size()}),mx::float32);
             mx::eval(w);plain.emplace(name,std::move(w));
         };
@@ -505,6 +527,7 @@ struct Qwen35::Impl {
         kv_keys.resize(layers);kv_values.resize(layers);kv_kscale.resize(layers);kv_vscale.resize(layers);
         kv_index.resize(layers);kv_blocks.resize(layers);qsa_keyed.assign(size_t(layers),0);
         tapes.resize(layers);
+        anep_warmup();
     }
     std::optional<mx::array> device_ids;  // set by verify_device: the batch's ids stay on the GPU (draft -> verify, no readback)
     mx::array embed(std::span<const uint32_t> tokens) const {
@@ -512,7 +535,7 @@ struct Qwen35::Impl {
         return embedding8?affine8_embedding(*embedding8,tokens):q4_embedding(*embedding,tokens);
     }
     // from this many rows a product dequantizes the matrix to FP16 once and runs a GEMM (below: the 4-bit kernels)
-    static constexpr int kDequantRows=64;
+    static constexpr int kDequantRows=33;
     // nax_affine_prefill's row tile (rs 32 x sgs 4): split slices are whole tiles (j906: doc8k slices of 1969 rows 635
     // tok/s, 1984 = 31 x 64 638, 2048 = 16 x 128 703)
     static constexpr int kPrefillRowTile=128;
@@ -530,11 +553,11 @@ struct Qwen35::Impl {
         }
         if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
             if(!nax_rotated_input || nax_rotated_input->first.id()!=x.id())nax_rotated_input=std::pair{x,tq4_rotate_half(x)};
-            return nax_affine_matmul(found->second,nax_rotated_input->second,true);
+            return nax_affine_matmul(found->second,nax_rotated_input->second,true,prompt_pass);
         }
         if(auto found=nax.find(name);found!=nax.end()) {
             if(!nax_input || nax_input->first.id()!=x.id())nax_input=std::pair{x,mx::contiguous(mx::astype(x,mx::float16))};
-            return nax_affine_matmul(found->second,nax_input->second,true);
+            return nax_affine_matmul(found->second,nax_input->second,true,prompt_pass);
         }
         auto it=matrices.find(name);
         if(it==matrices.end())throw std::invalid_argument("matrix has no weights: "+name);
@@ -579,11 +602,6 @@ struct Qwen35::Impl {
     // Prefill FFN on MLX's FP16 GEMM (j601: 31 TFLOPS at 2048 rows vs ~22 for the row kernel): the three matrices are
     // dequantized to FP16 once per chunk, swiglu runs in one compiled kernel with the BF16 roundings of the row path,
     // and its FP16 result feeds the down GEMM directly (prefill chunks of 64+ rows).
-    void ensure_ane() {
-        static const char* ane_dir=std::getenv("TQLLM_MLX_ANE_FFN");
-        if(ane_dir && !ane_tried) {ane_tried=true;const auto t0=std::chrono::steady_clock::now();ane=AneFfn::open(ane_dir,layers);
-            std::fprintf(stderr,"ANE_FFN open %.0f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());}
-    }
     // GPU share of the split FFN (intermediate channels [0, F - C)) for an evaluated, dense fp16 input; fp32 [rows, hidden]
     struct ShareWeights {mx::array wg,wu,wd;};
     // fp16 weights of the GPU share, dequantized once per layer and chunk (both wavefront halves use them); down's column
@@ -620,81 +638,238 @@ struct Qwen35::Impl {
         auto hg=tq4_down?tq4_rotate_half(hs):hs;
         return mx::astype(mx::matmul(hg,mx::transpose(w.wd)),mx::float32);
     }
-    // TQLLM_MLX_ANE_WAVE=1: a prefill chunk of 2R rows runs as two halves of R rows, layer by layer; while the GPU runs one
-    // half's mixer and its FFN share, the Neural Engine runs the other half's FFN share on a worker thread, so the ANE call
-    // no longer waits for the GPU's next mixer (the per-layer split is lockstep, j672). Without an ANE share the halves run
-    // exactly as two chunks of R rows. Returns the [2R, hidden] output of the last layer; features as forward().
-    mx::array wave_layers(std::span<const uint32_t> tokens,std::vector<mx::array>& features) {
-        const int R=int(tokens.size())/2;
-        struct Half {mx::array x;int offset;std::vector<mx::array> feats;std::optional<mx::array> y_gpu,y_ane,xc;};
-        Half h[2]={{bf(embed(tokens.subspan(0,R))),pos,{},{},{},{}},{bf(embed(tokens.subspan(R,R))),pos+R,{},{},{},{}}};
-        std::future<void> job;int job_half=-1;
-        static const bool timing=tqllm::debug_cstr("ane_timing")!=nullptr;
-        // direct evidence: ANE calls made, time inside the predict call (worker thread), layers that fell back to the GPU
-        std::atomic<double> ane_ms{0},ane_cpu_ms{0};int ane_calls=0,gpu_layers=0;long gpu_share_cols=0;
-        double t_eval=0,t_join=0,t_build=0;auto tick=std::chrono::steady_clock::now();
-        auto lap=[&]() {auto now=std::chrono::steady_clock::now();double d=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;return d;};
-        auto join=[&]() {
-            if(!job.valid())return;
-            if(timing)t_build+=lap();
-            job.get();
-            if(timing)t_join+=lap();
-            auto& j=h[job_half];
-            j.x=add_bf(j.x,bf_raw(mx::add(*j.y_gpu,mx::astype(*j.y_ane,mx::float32))));
-            j.y_gpu.reset();j.y_ane.reset();j.xc.reset();job_half=-1;
-        };
-        for(int l=0;l<layers;++l) {
-            const std::string p="blk."+std::to_string(l)+".";
-            const bool is_attn=(l+1)%interval==0;
-            std::optional<ShareWeights> share;
-            for(int k=0;k<2;++k) {
-                auto& c=h[k];
-                if(std::binary_search(feature_ids.begin(),feature_ids.end(),l))c.feats.push_back(c.x);
-                auto n=norm(c.x,p+"attn_norm.weight");
-                auto attn=is_attn?full_attention(p,n,caches[l],c.offset,l):gdn(p,n,caches[l],tapes[l]);
-                c.x=add_bf(c.x,attn);n=norm(c.x,p+"post_attention_norm.weight");
-                auto find=[&](const std::string& name)->const NaxAffine* {
-                    if(auto f=nax_tq4.find(name);f!=nax_tq4.end())return &f->second;
-                    if(auto f=nax.find(name);f!=nax.end())return &f->second;
-                    return nullptr;
-                };
-                const auto *g=find(p+"ffn_gate.weight"),*u=find(p+"ffn_up.weight"),*d=find(p+"ffn_down.weight");
-                if(!(ane && ane->has(l) && ane->rows()==R && g && u && d && !g->q6 && !u->q6 && !d->q6 &&
-                     g->tq4==u->tq4)) {
-                    ++gpu_layers;
-                    c.x=add_bf(c.x,*ffn_gemm(p,n));
-                    continue;
-                }
-                auto xc=mx::contiguous(g->tq4?tq4_rotate_half(n):mx::astype(n,mx::float16));
-                auto y_ane=mx::contiguous(mx::zeros({R,g->columns},mx::float16));
-                if(timing)t_build+=lap();
-                mx::eval(xc,y_ane);   // this half's mixer; the other half's ANE share runs meanwhile
-                if(timing)t_eval+=lap();
-                join();               // the other half's ANE share -> its residual (lazy)
-                if(!share)share=share_weights(*g,*u,*d,ane->columns());
-                c.y_gpu=ffn_gpu_share(*share,d->tq4,xc);
-                mx::async_eval(*c.y_gpu);
-                c.xc=xc;c.y_ane=y_ane;
-                const void* xp=xc.data<mx::float16_t>();void* yp=y_ane.data<mx::float16_t>();
-                const int hidden=g->columns;AneFfn* a=ane.get();
-                ++ane_calls;gpu_share_cols+=share->wg.shape(0);
-                std::atomic<double>* acc=&ane_ms;
-                std::atomic<double>* cpu_acc=&ane_cpu_ms;
-                job=std::async(std::launch::async,[a,l,xp,yp,hidden,acc,cpu_acc]{
-                    auto thread_ms=[]{timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec*1e3+t.tv_nsec*1e-6;};
-                    const auto t0=std::chrono::steady_clock::now();const double c0=thread_ms();a->predict(l,xp,yp,hidden);
-                    const double d=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),c=thread_ms()-c0;
-                    double cur=acc->load();while(!acc->compare_exchange_weak(cur,cur+d)) {}
-                    cur=cpu_acc->load();while(!cpu_acc->compare_exchange_weak(cur,cur+c)) {}
-                });job_half=k;
-            }
+    // Prefill FFN split with the Neural Engine (ane_program.mm, own private-API W8A8 program): in layer-major prefill the
+    // last kAneChannels intermediate channels of each 4-bit FFN (affine or TQ4) run on the ANE while the GPU runs the
+    // other channels and the next slice's mixer. Slices alternate between two ANE surface sets; the GPU waits for the
+    // ANE on its own stream and a layer's last slice is joined in the next layer. Whether a prompt splits, and into how
+    // many slices, is ane_plan's choice from this machine's measured costs. Not bitwise (int8 ANE share): KL-gated.
+    // Without the program (other OS, open failure) or for layers it cannot take, prefill runs on the GPU alone.
+    static constexpr int kAneChannels=12800;
+    std::unique_ptr<AneProgram> anep;bool anep_tried=false;
+    AneCost ane_cost;
+    AnePlan ane_plan_now;
+    struct AneLayer {int layer=-1;std::optional<NaxAffine> g4,u4,d4;};
+    AneLayer ane_layer;
+    struct AnePending {mx::array tok,y_gpu,residual;mx::array* target;int rows=2048;int parity=0;};
+    std::optional<AnePending> ane_pending;
+    int ane_parity=0;
+    std::array<bool,2> ane_uncollected{false,false};  // requests the GPU waited for, not yet collected on the CPU
+    std::optional<mx::array> ane_requant;  // the layer's weight requantize, the packs' input
+    std::optional<std::pair<int,mx::array>> ane_prefetched;
+    void ane_collect(int parity) {
+        if(!ane_uncollected[parity])return;
+        ane_uncollected[parity]=false;
+        anep->wait(parity);
+    }
+    // the layer's gate / up / down when all three are 4-bit affine or all TQ4 (the ANE program's input formats)
+    bool ffn_affine(const std::string& p,const NaxAffine*& g,const NaxAffine*& u,const NaxAffine*& d) {
+        auto f=[&](const char* n)->const NaxAffine* {
+            if(auto t=nax_tq4.find(p+n);t!=nax_tq4.end())return &t->second;
+            auto it=nax.find(p+n);return it==nax.end()?nullptr:&it->second;};
+        g=f("ffn_gate.weight");u=f("ffn_up.weight");d=f("ffn_down.weight");
+        return g && u && d && g->bits==4 && u->bits==4 && d->bits==4 && !g->q6 && !u->q6 && !d->q6 &&
+               g->tq4==u->tq4 && g->tq4==d->tq4 && g->rows>kAneChannels && (g->rows-kAneChannels)%128==0;
+    }
+    bool anep_ready() {
+        if(!anep_tried) {
+            anep_tried=true;
+            const NaxAffine *g,*u,*d;
+            if(!ffn_affine("blk.0.",g,u,d))return false;
+            try {
+                const auto t0=std::chrono::steady_clock::now();
+                anep=AneProgram::open(kAneChannels,2048,hidden,1);anep->reserve_slots(2);
+                std::fprintf(stderr,"ANE_PROGRAM C=%d rows 2048 open %.0f ms\n",kAneChannels,ms_since(t0));
+            } catch(const std::exception& e) {anep.reset();std::fprintf(stderr,"ANE_PROGRAM unavailable, prefill on the GPU: %s\n",e.what());}
         }
-        join();
-        if(timing)std::fprintf(stderr,"ANE_WAVE chunk %d rows: host graph build %.0f ms, GPU sync waits %.0f ms, ANE join waits %.0f ms | ANE calls %d (inside predict %.0f ms wall, %.0f ms CPU), GPU-only FFN layers %d, GPU share rows per call %ld of %d\n",
-            2*R,t_build,t_eval,t_join,ane_calls,ane_ms.load(),ane_cpu_ms.load(),gpu_layers,ane_calls?gpu_share_cols/ane_calls:0L,layers?int(nax_tq4.count("blk.0.ffn_gate.weight")?nax_tq4.at("blk.0.ffn_gate.weight").rows:nax.count("blk.0.ffn_gate.weight")?nax.at("blk.0.ffn_gate.weight").rows:0):0);
-        for(int k=0;k<2;++k)if(!h[k].feats.empty())features.push_back(mx::concatenate(h[k].feats,1));
-        if(features.size()==2) {auto both=mx::concatenate({features[0],features[1]},0);features={both};}
-        return mx::concatenate({h[0].x,h[1].x},0);
+        return anep!=nullptr;
+    }
+    static double ms_since(std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
+    }
+    // requantize layer l's ANE weights into slot l & 1 while the GPU would otherwise wait for the ANE (called once layer
+    // l-1's first split slice is queued: the slot's previous request has been waited for on the GPU stream)
+    void ane_prefetch(int l) {
+        if(l>=layers || !anep || ane_prefetched)return;
+        const NaxAffine *g,*u,*d;
+        if(!ffn_affine("blk."+std::to_string(l)+".",g,u,d))return;
+        auto staged=anep->requantize_weights_gpu(l&1,*g,*u,*d,kAneChannels);
+        mx::async_eval({staged});
+        ane_prefetched=std::pair<int,mx::array>{l,staged};
+    }
+    // layer start (layer-major): the ANE share's int8 weights into slot l & 1 (no CPU wait: the packs take the requantize
+    // as an input), the GPU share as views of the leading 4-bit rows on the staged prefill kernel
+    void ane_layer_begin(int l) {
+        ane_layer={};
+        if(!anep_ready())return;
+        const NaxAffine *g,*u,*d;
+        if(!ffn_affine("blk."+std::to_string(l)+".",g,u,d))return;
+        std::optional<mx::array> pre;
+        if(ane_prefetched && ane_prefetched->first==l){pre=ane_prefetched->second;ane_prefetched.reset();}
+        auto staged=pre?*pre:anep->requantize_weights_gpu(l&1,*g,*u,*d,kAneChannels);
+        if(!pre)mx::async_eval({staged});
+        ane_requant=staged;
+        stage("ane_requantize",{staged});
+        ane_layer.layer=l;
+        const int G=g->rows-kAneChannels;
+        auto rows=[](const NaxAffine& w,int n) {  // the leading n rows: a view of whole 32-row blocks
+            NaxAffine v=w;
+            auto cut=[&](const mx::array& a) {mx::Shape b(a.ndim(),0),e=a.shape();e[0]=n/32;return mx::slice(a,b,e);};
+            v.words=cut(w.words);v.scales=cut(w.scales);if(w.biases.ndim()==3)v.biases=cut(w.biases);v.rows=n;
+            return v;
+        };
+        ane_layer.g4=rows(*g,G);ane_layer.u4=rows(*u,G);ane_layer.d4=nax_leading(*d,d->rows,G);
+        mx::eval({ane_layer.d4->words,ane_layer.d4->scales,ane_layer.d4->biases});
+    }
+    // At load: compile the requantize kernels (MLX's first-use JIT, ~100 ms per kernel) and read or measure the costs
+    // the split plan needs. Failure never breaks load; the prefill then stays on the GPU.
+    void anep_warmup() {
+        if(!anep_ready())return;
+        const NaxAffine *g,*u,*d;
+        ffn_affine("blk.0.",g,u,d);
+        try {
+            const auto t0=std::chrono::steady_clock::now();
+            mx::eval({anep->requantize_weights_gpu(0,*g,*u,*d,kAneChannels)});
+            std::fprintf(stderr,"ANE_PROGRAM warmup C=%d requantize kernels compiled %.0f ms\n",kAneChannels,ms_since(t0));
+            ane_cost=ane_calibration();
+        } catch(const std::exception& e) {ane_cost={};std::fprintf(stderr,"ANE_PLAN calibration failed, prefill on the GPU: %s\n",e.what());}
+    }
+    // The split plan's per-layer costs, measured once per machine and model shape and cached on disk, so every later load
+    // plans the same slices for the same prompt. Timed on layer 0's real weights with zero activations at the smallest
+    // and largest ANE function size; each figure the median of 3 synced runs after a warm-up, fitted linear in the rows.
+    // Nothing here touches the KV / GDN state of the model.
+    static constexpr int kAneCostVersion=5;
+    static std::string sysctl_string(const char* name) {
+        char buf[256]={};size_t n=sizeof(buf)-1;
+        if(sysctlbyname(name,buf,&n,nullptr,0)==0)return std::string(buf);
+        return "unknown";
+    }
+    std::string ane_cost_path(const NaxAffine& g) const {
+        std::string key=sysctl_string("machdep.cpu.brand_string")+"_"+sysctl_string("kern.osproductversion")+"_C"+
+            std::to_string(kAneChannels)+"_H"+std::to_string(hidden)+"_F"+std::to_string(g.rows)+(g.tq4?"_tq4":"_affine")+
+            "_v"+std::to_string(kAneCostVersion);
+        for(char& ch:key)if(!std::isalnum(static_cast<unsigned char>(ch)) && ch!='.' && ch!='_')ch='-';
+        const passwd* pw=getpwuid(getuid());
+        return std::string(pw && pw->pw_dir?pw->pw_dir:".")+"/Library/Caches/tqllm/ane_cost_"+key+".txt";
+    }
+    AneCost ane_calibration() {
+        const NaxAffine *g,*u,*d;
+        if(!ffn_affine("blk.0.",g,u,d) || interval<2)return {};
+        const std::string path=ane_cost_path(*g);
+        AneCost c;
+        if(std::ifstream in(path);in && (in>>c.k1>>c.d1>>c.u>>c.u_split>>c.f>>c.d>>c.s>>c.g0>>c.p>>c.a>>c.o>>c.r) && c.valid()) {
+            std::fprintf(stderr,"ANE_PLAN costs from %s\n",path.c_str());
+        } else {
+            const auto t0=std::chrono::steady_clock::now();
+            c=ane_measure_costs();
+            if(!c.valid())throw std::runtime_error("non-positive cost");
+            std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+            std::ofstream out(path);
+            out.precision(9);
+            out<<c.k1<<' '<<c.d1<<' '<<c.u<<' '<<c.u_split<<' '<<c.f<<' '<<c.d<<' '<<c.s<<' '<<c.g0<<' '<<c.p<<' '<<c.a<<' '<<c.o<<' '<<c.r<<'\n';
+            std::fprintf(stderr,"ANE_PLAN costs measured in %.0f ms, saved %s\n",ms_since(t0),path.c_str());
+        }
+        return c;
+    }
+    AneCost ane_measure_costs() {
+        const std::string p="blk.0.";
+        const NaxAffine *g,*u,*d;
+        ffn_affine(p,g,u,d);
+        const auto sizes=anep->row_counts();
+        const int r1=sizes.front(),r2=sizes.back();
+        auto median3=[&](const std::function<std::vector<mx::array>()>& run) {
+            mx::eval(run());
+            double t[3];
+            for(double& v:t) {const auto t0=std::chrono::steady_clock::now();mx::eval(run());v=ms_since(t0);}
+            std::sort(t,t+3);return t[1];
+        };
+        auto fit=[&](double y1,double y2) {const double k=std::max(1e-7,(y2-y1)/(r2-r1));return std::pair{k,std::max(0.0,y1-k*r1)};};
+        auto input=[&](int r){return mx::zeros({r,hidden},mx::bfloat16);};
+        auto mixer=[&](int r) {Cache tc;PrefixTape tt;auto x=input(r);return std::vector<mx::array>{gdn(p,norm(x,p+"attn_norm.weight"),tc,tt)};};
+        auto ffn=[&](int r) {auto y=ffn_gemm(p,input(r));if(!y)throw std::runtime_error("layer 0 has no FFN GEMM");return std::vector<mx::array>{*y};};
+        AneCost c;
+        share_dequant=false;dequant_cache.clear();
+        auto layer=[&](int r){auto v=mixer(r);auto w=ffn(r);v.insert(v.end(),w.begin(),w.end());return v;};
+        const double l1=median3([&]{return layer(r1);}),l2=median3([&]{return layer(r2);});
+        const auto [k1,d1]=fit(l1,l2);c.k1=k1;c.d1=d1;
+        share_dequant=true;dequant_cache.clear();mx::eval(layer(r1));
+        const double m1=median3([&]{return mixer(r1);}),m2=median3([&]{return mixer(r2);});
+        const double f1=median3([&]{return ffn(r1);}),f2=median3([&]{return ffn(r2);});
+        share_dequant=false;dequant_cache.clear();
+        const auto [ku,bu]=fit(m1,m2);const auto [kf,bf_]=fit(f1,f2);
+        c.u=ku;c.f=kf;c.d=std::max(0.0,l2-m2-f2)+bu+bf_;
+        ane_layer_begin(0);
+        if(ane_layer.layer!=0)throw std::runtime_error("layer 0 does not split");
+        if(ane_requant){mx::eval({*ane_requant});ane_requant.reset();}
+        const double s1=median3([&]{return std::vector<mx::array>{ane_gpu_share(mx::zeros({r1,hidden},mx::float16))};});
+        const double s2=median3([&]{return std::vector<mx::array>{ane_gpu_share(mx::zeros({r2,hidden},mx::float16))};});
+        const double us1=median3([&]{return mixer(r1);}),us2=median3([&]{return mixer(r2);});
+        const double p1=median3([&]{return std::vector<mx::array>{anep->pack_input_gpu(mx::zeros({r1,hidden},mx::float16),0,nullptr)};});
+        const double p2=median3([&]{return std::vector<mx::array>{anep->pack_input_gpu(mx::zeros({r2,hidden},mx::float16),0,nullptr)};});
+        auto ane_eval=[&](int r) {
+            double t[3];
+            for(int i=-1;i<3;++i) {
+                auto tok=anep->pack_input_gpu(mx::zeros({r,hidden},mx::float16),0,nullptr);mx::eval({tok});
+                const auto t0=std::chrono::steady_clock::now();
+                anep->enqueue(0,false);anep->wait(0);
+                auto y=anep->join_output_gpu(tok,0);mx::eval({y});
+                if(i>=0)t[i]=ms_since(t0);
+            }
+            std::sort(t,t+3);return t[1];
+        };
+        const double a1=ane_eval(r1),a2=ane_eval(r2);
+        const double rq=median3([&]{return std::vector<mx::array>{anep->requantize_weights_gpu(0,*g,*u,*d,kAneChannels)};});
+        ane_layer={};
+        const auto [ks,bs]=fit(s1,s2);const auto [kus,bus]=fit(us1,us2);const auto [kp,bp]=fit(p1,p2);const auto [ka,ba]=fit(a1,a2);
+        c.s=ks;c.u_split=kus;c.p=kp;c.g0=bs+bus+bp;c.a=ka;c.o=ba;c.r=rq;
+        return c;
+    }
+    // the previous slice's ANE share: the GPU waits for it on its stream, then residual + GPU share + ANE share
+    void ane_finalize() {
+        if(!ane_pending)return;
+        auto pend=std::move(*ane_pending);ane_pending.reset();
+        anep->wait_gpu(pend.parity);ane_uncollected[pend.parity]=true;
+        auto ane_part=anep->join_output_gpu(pend.tok,pend.parity);
+        if(pend.rows<ane_part.shape(0))ane_part=mx::slice(ane_part,{0,0},{pend.rows,ane_part.shape(1)});  // drop padding
+        *pend.target=add_bf(pend.residual,bf_raw(mx::add(pend.y_gpu,ane_part)));
+        mx::async_eval({*pend.target});
+    }
+    // one slice's FFN split; x is the layer's residual on entry and is replaced by ane_finalize. The slice runs on the
+    // smallest compiled ANE function with at least `rows` rows (512..2048 in steps of 256), zero-padded: the program is
+    // per token (per-token int8 scales), so the real rows equal a full function's and the padding is dropped at the join.
+    // No CPU wait between the pack and the ANE: the ANE waits on the event MLX signals after the pack's command buffer,
+    // and the previous slice is joined only after this slice's request and GPU share are queued.
+    bool ane_split_slice(int l,const mx::array& n,mx::array& x) {
+        const int rows=n.shape(0);
+        if(ane_layer.layer!=l || capture_prefix)return false;
+        const int fit=anep->fit_rows(rows);
+        if(fit<0)return false;
+        auto x16=gemm_input && gemm_input->first.id()==n.id()?gemm_input->second:mx::astype(n,mx::float16);
+        auto xa=rows==fit?x16:mx::concatenate({x16,mx::zeros({fit-rows,x16.shape(1)},mx::float16)},0);
+        const int parity=ane_parity;
+        auto tok=anep->pack_input_gpu(xa,parity,ane_requant?&*ane_requant:nullptr);
+        ane_collect(parity);  // the request this parity held finished long ago (its join is queued behind it)
+        mx::async_eval({tok});
+        anep->ready_after(tok);
+        anep->enqueue(l&1,/*after_pack=*/true,parity);
+        auto y_gpu=ane_gpu_share(x16);
+        mx::async_eval({y_gpu});
+        ane_finalize();ane_parity^=1;
+        // the plan prefetches only when the GPU would otherwise wait for the ANE at least as long as the requantize
+        if(ane_plan_now.prefetch && !ane_prefetched)ane_prefetch(l+1);
+        ane_pending=AnePending{tok,y_gpu,x,&x};
+        ane_pending->rows=rows;ane_pending->parity=parity;
+        stage("ffn_ane_split",{y_gpu});
+        return true;
+    }
+    // the GPU's FP32 share [rows, hidden] of the split layer's FFN (the leading F - C channels). TQ4 weights are stored
+    // rotated: the share reads the rotated input and rotates the intermediate before down (the ANE rotates in its pack)
+    mx::array ane_gpu_share(const mx::array& x16) {
+        const bool tq4=ane_layer.g4->tq4;
+        auto xg=tq4?tq4_rotate_half(x16):x16;
+        auto g16=nax_affine_prefill(*ane_layer.g4,xg,0,std::nullopt,32,64,4,1,1,1);
+        auto h16=nax_affine_prefill(*ane_layer.u4,xg,1,g16,32,64,4,1,1,1);
+        if(tq4)h16=tq4_rotate_half(h16);
+        return mx::astype(nax_affine_prefill(*ane_layer.d4,h16,0,std::nullopt,32,64,4,0,0,1),mx::float32);
     }
     // residual: the down product's rounding and the residual add in one pass; the result is then the layer output
     std::optional<mx::array> ffn_gemm(const std::string& p,const mx::array& n,const mx::array* residual=nullptr) {
@@ -707,79 +882,6 @@ struct Qwen35::Impl {
         const auto *g=find(p+"ffn_gate.weight"),*u=find(p+"ffn_up.weight"),*d=find(p+"ffn_down.weight");
         if(!g || !u || !d || g->q6 || u->q6 || d->q6)return std::nullopt;
         auto x16=g->tq4?tq4_rotate_half(n):(gemm_input && gemm_input->first.id()==n.id()?gemm_input->second:mx::astype(n,mx::float16));
-        // TQLLM_DEBUG=dump_ffn:dir:layer,layer,...: save this layer's FFN input (FP16, rotated for TQ4) per chunk and
-        // its dequantized FP16 weights once, as .npy (Neural Engine split calibration and quality checks)
-        static const std::string dump=tqllm::debug_cstr("dump_ffn")?tqllm::debug_cstr("dump_ffn"):"";
-        if(!dump.empty()) {
-            const auto colon=dump.find(':');const std::string dir=dump.substr(0,colon),layers=","+dump.substr(colon+1)+",";
-            const std::string layer=p.substr(4,p.size()-5);
-            if(layers.find(","+layer+",")!=std::string::npos) {
-                static std::map<std::string,int> chunk;
-                const int c=chunk[layer]++;
-                mx::save(dir+"/x_l"+layer+"_c"+std::to_string(c)+".npy",x16);
-                if(c==0) {
-                    mx::save(dir+"/wg_l"+layer+".npy",nax_affine_dequant(*g));
-                    mx::save(dir+"/wu_l"+layer+".npy",nax_affine_dequant(*u));
-                    mx::save(dir+"/wd_l"+layer+".npy",nax_affine_dequant(*d));
-                }
-            }
-        }
-        // TQLLM_DEBUG=dump_ffn_slice:dir:C: per layer, the last C intermediate channels' FP16 weights (gate/up rows, down
-        // columns, TQ4 basis) and the first chunk's FFN input, for the Neural Engine model builder (ane_build.py)
-        static const std::string slice_dump=tqllm::debug_cstr("dump_ffn_slice")?tqllm::debug_cstr("dump_ffn_slice"):"";
-        if(!slice_dump.empty()) {
-            const auto colon=slice_dump.find(':');const std::string dir=slice_dump.substr(0,colon);
-            const int C=std::stoi(slice_dump.substr(colon+1)),F=g->rows;
-            const std::string layer=p.substr(4,p.size()-5);
-            static std::set<std::string> done;
-            if(!done.count(layer) && C>0 && C<F) {
-                done.insert(layer);
-                mx::save(dir+"/x_l"+layer+".npy",x16);
-                mx::save(dir+"/wg_l"+layer+".npy",mx::slice(nax_affine_dequant(*g),{F-C,0},{F,g->columns}));
-                mx::save(dir+"/wu_l"+layer+".npy",mx::slice(nax_affine_dequant(*u),{F-C,0},{F,u->columns}));
-                mx::save(dir+"/wd_l"+layer+".npy",mx::contiguous(mx::slice(nax_affine_dequant(*d),{0,F-C},{d->rows,F})));
-            }
-        }
-        // TQLLM_MLX_ANE_FFN=dir: the last C intermediate channels of each layer with a model in dir run on the Neural
-        // Engine (Core ML, ane_ffn.mm) while the GPU computes the rest; chunks of the model's row count only.
-        // Opt-in fast prefill: the ANE's arithmetic is not exact (j662/j664). TQLLM_DEBUG=ane_serial:1 runs it after the GPU.
-        ensure_ane();
-        const int layer_index=std::stoi(p.substr(4,p.size()-5));
-        if(ane && ane->has(layer_index) && n.shape(0)==ane->rows() && g->tq4 && u->tq4 && d->tq4) {
-            const int C=ane->columns(),F=g->rows,G=F-C,hidden=g->columns;
-            // TQLLM_DEBUG=ane_timing:1: per-chunk sums of the input sync, the ANE call and the join wait (ms)
-            static const bool timing=tqllm::debug_cstr("ane_timing")!=nullptr;
-            static double t_sync=0,t_pred=0,t_join=0;static int t_layers=0;
-            auto tick=std::chrono::steady_clock::now();
-            auto lap=[&]() {auto now=std::chrono::steady_clock::now();double d=std::chrono::duration<double,std::milli>(now-tick).count();tick=now;return d;};
-            auto xc=mx::contiguous(x16);
-            auto y_ane=mx::contiguous(mx::zeros({n.shape(0),hidden},mx::float16));
-            mx::eval(xc,y_ane);
-            if(timing)t_sync+=lap();
-            if(!y_ane.flags().row_contiguous || y_ane.data_size()!=y_ane.size() || !xc.flags().row_contiguous)
-                throw std::runtime_error("ANE FFN: buffers are not dense");
-            auto gv=mx::matmul(xc,mx::transpose(mx::slice(nax_affine_dequant(*g),{0,0},{G,hidden})));
-            auto uv=mx::matmul(xc,mx::transpose(mx::slice(nax_affine_dequant(*u),{0,0},{G,hidden})));
-            static auto swiglu_a=mx::compile([](const std::vector<mx::array>& a) {
-                auto gate=bf_raw(mx::astype(a[0],mx::float32)),up=bf_raw(mx::astype(a[1],mx::float32));
-                return std::vector<mx::array>{mx::astype(bf_raw(mx::multiply(bf_raw(mx::multiply(gate,mx::sigmoid(gate))),up)),mx::float16)};
-            },true);
-            auto hg=tq4_rotate_half(swiglu_a({gv,uv})[0]);
-            auto y_gpu=mx::astype(mx::matmul(hg,mx::transpose(mx::slice(nax_affine_dequant(*d),{0,0},{d->rows,G}))),mx::float32);
-            static const bool serial=tqllm::debug_cstr("ane_serial")!=nullptr;
-            if(serial)mx::eval(y_gpu);else mx::async_eval(y_gpu);
-            if(timing)lap();
-            ane->predict(layer_index,xc.data<mx::float16_t>(),y_ane.data<mx::float16_t>(),hidden);
-            if(timing) {
-                t_pred+=lap();mx::eval(y_gpu);t_join+=lap();
-                if(++t_layers%64==0) {
-                    std::fprintf(stderr,"ANE_TIMING 64 layers: input sync %.1f ms, ANE predict %.1f ms, GPU share wait after predict %.1f ms\n",t_sync,t_pred,t_join);
-                    t_sync=t_pred=t_join=0;
-                }
-            }
-            auto y=bf_raw(mx::add(y_gpu,mx::astype(y_ane,mx::float32)));
-            return residual?add_bf(*residual,y):y;
-        }
         std::optional<mx::array> gv,uv,hp;
         if(auto it=packs.find(p+"ffn_gu");it!=packs.end()) {  // gate | up: equal halves
             auto gu=gemm4(it->second,x16);
@@ -801,7 +903,7 @@ struct Qwen35::Impl {
         auto in=pack_product16(p+"attn_in",x);
         if(!in.empty())stage("attn_in_gemm",{in[0]});
         // fused q/k norm + RoPE: read the packed FP16 products in place, one kernel for q (with gate) and k, v unchanged
-        if(!in.empty() && attn_qk_fused_on() && attn_qk_fused!=0) {
+        if(gated_attention && !in.empty() && attn_qk_fused_on() && attn_qk_fused!=0) {
             auto f=attn_qk_norm_rope(in[0],in[1],in[2],
                                      plain.at(p+"attn_q_norm.weight"),plain.at(p+"attn_k_norm.weight"),
                                      heads,kvheads,hd,rot,theta,eps,offset,tree?&tree->depth:nullptr);
@@ -816,8 +918,8 @@ struct Qwen35::Impl {
             if(attn_qk_fused) {stage("attn_qk_norm_rope",{f.q,f.k,f.v,f.gate});return attn_core(p,f.q,f.k,f.v,f.gate,c,offset,layer,m,&x);}
         }
         auto proj=[&](int i,const char* name) {return in.empty()?mat(p+name,x):round_product(in[i]);};
-        auto qg=mx::reshape(proj(0,"attn_q.weight"),{m,heads,2*hd});
-        auto q=tail_slice(qg,2,0,hd),gate=tail_slice(qg,2,hd,2*hd);
+        auto qg=mx::reshape(proj(0,"attn_q.weight"),{m,heads,(gated_attention?2:1)*hd});
+        auto q=tail_slice(qg,2,0,hd),gate=gated_attention?tail_slice(qg,2,hd,2*hd):mx::ones({m,heads,hd},mx::float32);
         q=mx::transpose(mx::reshape(norm(q,p+"attn_q_norm.weight"),{1,m,heads,hd}),{0,2,1,3});
         auto k=mx::reshape(proj(1,"attn_k.weight"),{1,m,kvheads,hd});
         k=mx::transpose(norm(k,p+"attn_k_norm.weight"),{0,2,1,3});
@@ -1109,12 +1211,8 @@ struct Qwen35::Impl {
         auto record=[&](const char* name,const std::vector<mx::array>& arrays) {stage(name,arrays);};
         const int m=int(tokens.size());
         std::vector<mx::array> features;
-        static const bool wave=std::getenv("TQLLM_MLX_ANE_WAVE")!=nullptr;
-        if(wave)ensure_ane();
-        const int wave_rows=wave?(ane?ane->rows():std::atoi(std::getenv("TQLLM_MLX_ANE_WAVE"))):0;
-        const bool use_wave=wave && wave_rows>0 && m==2*wave_rows && !capture_prefix && !stage_profiling;
-        auto x=use_wave?wave_layers(tokens,features):bf(embed(tokens));
-        bool wave_features=use_wave;
+        auto x=bf(embed(tokens));
+        bool features_joined=false;
         if(stage_profiling)record("embedding",{x});
         build_mark("embed");
         std::optional<DispatchCount> dispatches;
@@ -1150,7 +1248,8 @@ struct Qwen35::Impl {
             if(!mixer_added && rows16) {auto an=add_norm_rows(x,attn,p+"post_attention_norm.weight");x=an.first;n=an.second;}
             else {x=mixer_added?attn:add_bf(x,attn);n=fuse?norm_prefill(x,p+"post_attention_norm.weight"):norm(x,p+"post_attention_norm.weight");}
             stage("norm_post",{n});build_mark("norm_post");
-            if(auto down=ffn_gemm(p,n,fuse?&x:nullptr)) x=fuse?*down:add_bf(x,*down);
+            if(ane_layer.layer==l && ane_split_slice(l,n,x)) {}
+            else if(auto down=ffn_gemm(p,n,fuse?&x:nullptr)) x=fuse?*down:add_bf(x,*down);
             else if(auto fused=swiglu_rows(p,n)) {
                 if(stage_profiling)record("ffn_gate_up",{*fused});
                 x=add_bf(x,mat(p+"ffn_down.weight",*fused));
@@ -1176,9 +1275,15 @@ struct Qwen35::Impl {
         // the next so one layer's FP16 weights are live at a time
         // 2048 since j769 (bitwise equal to 2048-row chunks; prefill +3-6 %: mlxc doc8k 453 -> 480)
         constexpr int group_rows=2048;
-        const bool layer_major=group_rows>16 && m>group_rows && !use_wave && !capture_prefix && !dispatches;  // stage profiles sync per stage inside it
+        // the Neural Engine split runs where the cost model predicts it faster than the GPU alone, in the slicing it
+        // predicts fastest; any such prompt goes layer-major, however short
+        ane_plan_now={};
+        if(!capture_prefix && !dispatches && anep && ane_cost.valid())
+            ane_plan_now=ane_plan(ane_cost,m,anep->row_counts(),kPrefillRowTile,kDequantRows,group_rows);
+        const bool ane_wanted=ane_plan_now.split;
+        const bool layer_major=group_rows>16 && (m>group_rows || ane_wanted) && !capture_prefix && !dispatches;  // stage profiles sync per stage inside it
         if(layer_major) {
-            const int slice_rows=group_rows;
+            const int slice_rows=ane_wanted?ane_plan_now.rows:group_rows;
             const int slices=(m+slice_rows-1)/slice_rows;
             std::vector<mx::array> xs;std::vector<std::vector<mx::array>> feats(slices);
             for(int s=0;s<slices;++s) {
@@ -1188,30 +1293,40 @@ struct Qwen35::Impl {
             share_dequant=true;
             try {
                 for(int l=0;l<layers;++l) {
+                    if(ane_wanted)ane_layer_begin(l);
+                    if(ane_layer.layer!=l)ane_finalize();  // a carried slice must not outlive a layer without a split
                     for(int s=0;s<slices;++s)layer_step(l,xs[s],pos+s*slice_rows,feats[s]);
+                    // the layer's last split slice stays pending into the next layer, whose first slice's mixer runs
+                    // on the GPU while the ANE finishes it (its residual is only read by the next layer's last slice)
+                    const bool keep=slices>=2 && ane_pending && l+1<layers;
+                    if(!keep)ane_finalize();
                     std::vector<mx::array> done;
-                    for(int s=0;s<slices;++s)done.push_back(xs[s]);
+                    for(int s=0;s<slices;++s)if(!(keep && ane_pending->target==&xs[s]))done.push_back(xs[s]);
                     for(const auto& c:caches)for(const std::optional<mx::array>* a:{&c.conv,&c.state})if(*a)done.push_back(**a);
                     for(const auto* kv:{&kv_keys,&kv_values,&kv_kscale,&kv_vscale,&kv_index,&kv_blocks})if((*kv)[l])done.push_back(*(*kv)[l]);
                     for(const auto& f:feats)for(const auto& a:f)done.push_back(a);
-                    mx::eval(done);
+                    if(keep)mx::async_eval(done);else mx::eval(done);
                     dequant_cache.clear();
                     static const bool memlog=tqllm::debug_on("memlog");
                     if(memlog && m!=8192)std::fprintf(stderr,"MEMLOG layer %d m %d slices %d active %.2f GB peak %.2f GB\n",l,m,slices,mx::get_active_memory()/1e9,mx::get_peak_memory()/1e9);
                 }
-            } catch(...) {share_dequant=false;dequant_cache.clear();throw;}
-            share_dequant=false;
+                if(anep){ane_collect(0);ane_collect(1);}
+                ane_parity=0;
+            } catch(...) {share_dequant=false;dequant_cache.clear();ane_pending.reset();ane_layer={};ane_parity=0;ane_prefetched.reset();ane_requant.reset();
+                if(anep)try{ane_collect(0);ane_collect(1);}catch(...){}
+                ane_uncollected={false,false};throw;}
+            share_dequant=false;ane_layer={};ane_prefetched.reset();ane_requant.reset();
             x=mx::concatenate(xs,0);
             if(!feature_ids.empty()) {
                 std::vector<mx::array> rows;
                 for(auto& f:feats)rows.push_back(mx::concatenate(f,1));
                 features={mx::concatenate(rows,0)};
-                wave_features=true;  // already joined: features[0] is the [m, layers x hidden] block
+                features_joined=true;  // already joined: features[0] is the [m, layers x hidden] block
             }
         } else
-        for(int l=0;l<(use_wave?0:layers);++l)layer_step(l,x,pos,features);
+        for(int l=0;l<layers;++l)layer_step(l,x,pos,features);
         last_hidden=x;
-        if(!features.empty())last_features=wave_features?features[0]:mx::concatenate(features,1);
+        if(!features.empty())last_features=features_joined?features[0]:mx::concatenate(features,1);
         x=norm(x,"output_norm.weight");
         build_mark("norm_out");
         if(!all_logits) x=tail_slice(x,0,m-1,m);
@@ -1575,9 +1690,13 @@ namespace {
 }
 Qwen35::Qwen35(const std::string& path,int context):impl_((apply_release_defaults(),std::make_unique<Impl>(path,context))) {}
 Qwen35::~Qwen35()=default;
-mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {return impl_->forward(tokens,all_logits);}
+mx::array Qwen35::forward(std::span<const uint32_t> tokens,bool all_logits) {
+    struct Prompt {Impl& i;explicit Prompt(Impl& x):i(x){i.prompt_pass=true;} ~Prompt(){i.prompt_pass=false;}} scope(*impl_);
+    return impl_->forward(tokens,all_logits);
+}
 void Qwen35::reserve_kv(int rows) {impl_->kv_reserve=std::max(0,rows);}
 void Qwen35::kv_format(KvTier tier) {
+    if(!impl_->gated_attention && tier!=KvTier::Bf16)throw std::invalid_argument("Qwen3 currently requires BF16 KV");
     if(impl_->pos!=0)throw std::invalid_argument("the KV format is chosen per request, before its prefill");
     if(tier!=impl_->kv_tier)for(auto* kv:{&impl_->kv_keys,&impl_->kv_values,&impl_->kv_kscale,&impl_->kv_vscale,&impl_->kv_index,&impl_->kv_blocks})for(auto& a:*kv)a.reset();
     impl_->kv_tier=tier;
@@ -1610,12 +1729,18 @@ KvBudget Qwen35::kv_budget(int prefill_chunk) const {
     return b;
 }
 KvTier Qwen35::choose_kv_format(int rows,int prefill_chunk,size_t other_row_bytes) const {
+    if(!impl_->gated_attention)return KvTier::Bf16;
     KvBudget b=kv_budget(prefill_chunk);
     b.in_use+=size_t(rows)*(other_row_bytes+impl_->qsa_row_bytes());  // + what other caches (drafter, QSA) will hold
     return choose_kv_tier(rows,attention_layers(),impl_->kvheads,impl_->hd,b);
 }
 KvPlan Qwen35::plan_kv_format(int prompt_rows,int answer_rows,int prefill_chunk,size_t far_row_bytes) const {
     const int rows=prompt_rows+answer_rows+16;
+    if(!impl_->gated_attention) {
+        if(!kv_fits(KvTier::Bf16,rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk)))
+            throw std::invalid_argument("Qwen3 request does not fit BF16 KV; reduce context or output length");
+        return {KvTier::Bf16,false,true};
+    }
     const size_t lean=(size_t(512)<<20)+size_t(prefill_chunk)*size_t(impl_->hidden)*40;  // the decode-time cache limit
     return plan_kv(rows,attention_layers(),impl_->kvheads,impl_->hd,kv_budget(prefill_chunk),far_row_bytes+impl_->qsa_row_bytes(),lean,request_kv_first(prompt_rows,answer_rows,impl_->exact));
 }
@@ -1631,6 +1756,10 @@ int Qwen35::attention_layers() const {return impl_->layers/impl_->interval;}
 int Qwen35::kv_heads() const {return impl_->kvheads;}
 int Qwen35::q_heads() const {return impl_->heads;}
 int Qwen35::head_dim() const {return impl_->hd;}
+int Qwen35::context() const {return impl_->context;}
+int Qwen35::hidden_size() const {return impl_->hidden;}
+int Qwen35::layer_count() const {return impl_->layers;}
+std::string Qwen35::architecture() const {return impl_->file.str("general.architecture");}
 void Qwen35::reset() {
     ++impl_->epoch;++impl_->revision;impl_->pos=0;for(auto& c:impl_->caches)c=Cache{};
     impl_->last_hidden.reset();impl_->mtp_cache=Cache{};impl_->mtp_pos=1;

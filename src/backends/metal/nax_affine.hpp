@@ -31,7 +31,9 @@ std::vector<uint8_t> nax_affine_pack(std::span<const uint8_t> codes, std::span<c
 // [m, columns] input (any float dtype, rounded to FP16; m >= 1) times the stored matrix, FP32 [m, rows], optionally
 // rounded to BF16 values in the kernel epilogue. Every output row depends only on its own input
 // row, so one row and a verify batch give bitwise equal results.
-mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false);
+// prompt: rows of a prompt pass (not a verify): 17-32 rows may take the 32-row matrix op (not row-invariant with the
+// 16-row kernel; verify rows must stay on it)
+mlx::core::array nax_affine_matmul(const NaxAffine& weights, const mlx::core::array& input, bool round_bf16 = false, bool prompt = false);
 int nax_affine_splits(const NaxAffine& weights);
 // Verify / decode FFN: h = bf16(bf16(silu(bf16(x Wg^T))) x bf16(x Wu^T)), FP32 [m, rows] for m <= 16 rows, gate and up
 // in one launch (4-bit affine or TQ4, matching shapes). Row-invariant like nax_affine_matmul.

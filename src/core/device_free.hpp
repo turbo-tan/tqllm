@@ -6,7 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
-#include <unistd.h>
+#include "platform/os_file.hpp"
 
 namespace tqllm {
 // MemAvailable from /proc/meminfo text, in bytes (0 if absent).
@@ -35,7 +35,7 @@ inline std::string cgroup_v2_path(const std::string & proc_self_cgroup) {
 // with its own cgroup namespace sees "/"), else the v1 limit
 inline size_t host_ram_bytes() {
     const auto read = [](const std::string & f) { std::ifstream in(f); return in ? std::string(std::istreambuf_iterator<char>(in), {}) : std::string(); };
-    size_t ram = size_t(sysconf(_SC_PHYS_PAGES)) * size_t(sysconf(_SC_PAGESIZE));
+    size_t ram = tqllm::os::physical_ram_bytes();
     std::string path = cgroup_v2_path(read("/proc/self/cgroup"));
     for (;;) {
         ram = host_ram_limit(ram, read("/sys/fs/cgroup" + (path == "/" ? std::string() : path) + "/memory.max"));

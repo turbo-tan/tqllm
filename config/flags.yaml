@@ -3,14 +3,6 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
-  - name: TQLLM_MLX_ANE_FFN
-    kind: user
-    default: "-"
-    doc: "DIR: Neural Engine share of the prefill FFN from per-layer Core ML models (opt-in fast prefill; quality changes, see docs/MLX_BACKEND.md)"
-  - name: TQLLM_MLX_ANE_WAVE
-    kind: user
-    default: "-"
-    doc: "1 / N: two-half wavefront prefill that overlaps the ANE share with the GPU (opt-in with TQLLM_MLX_ANE_FFN)"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"

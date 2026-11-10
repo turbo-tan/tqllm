@@ -47,6 +47,11 @@ void register_builtin_engines() {
                          return make_glm5next_engine(m, c);
                      },
                      false});
+    register_engine({"qwen3-gguf", [](const std::filesystem::path& p) {
+                         return p.extension() == ".gguf" && gguf_architecture(p.string()) == "qwen3";
+                     }, [](const std::string& m, const std::string& t, uint32_t c, int slots, const EngineOptions& o) {
+                         return make_qwen35_engine(m, t, c, slots, o);
+                     }, false});  // exactness gate pending for the 128-wide Qwen3 target
     // llama.cpp-tq3 GGUF, or a Qwen3.8-27B folder hf_arch.cpp maps (exl3 / BF16 as published), before the old checkpoint path
     register_engine({"qwen35-gguf", [](const std::filesystem::path & p) { return p.extension() == ".gguf" || hf_folder_arch(p.string()) == "qwen35"; },
                      [](const std::string & m, const std::string & t, uint32_t c, int slots, const EngineOptions & o) {

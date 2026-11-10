@@ -720,7 +720,8 @@ void qsa_set_tc(int on) { g_qsa_tc = on; }
 static int qsa_tc_mode() { return g_qsa_tc; }
 static void qsa_tc_attr() {
     static bool attr = false;
-    if (!attr) { for (auto * k : {qsa_prefill_tc_k<4>, qsa_prefill_tc_k<8>}) cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
+    if (!attr) { cudaFuncSetAttribute(qsa_prefill_tc_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
+                 cudaFuncSetAttribute(qsa_prefill_tc_k<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
                  cudaFuncSetAttribute(qsa_prefill_tc_pipe_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_pipe_bytes())); attr = true; }
 }
 bool qsa_attention_dense_tc(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values, float * output,

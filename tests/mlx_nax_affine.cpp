@@ -501,6 +501,40 @@ bool run_row_invariance(int rows, int k, bool tq4, std::mt19937& rng) {
     return mismatches == 0;
 }
 
+// prompt rows 17-32 (nax_affine_matmul prompt = true): one 32-row matrix op per weight fragment; equal to the row-invariant
+// kernel within FP rounding (a different sum order), affine 4-bit and TQ4
+bool run_rows32(int rows, int k, bool tq4, std::mt19937& rng) {
+    NaxAffine w = [&]() -> NaxAffine {
+        if (tq4) {
+            std::vector<uint8_t> codes(size_t(rows) * (k / 2));
+            for (auto& c : codes) c = uint8_t(rng());
+            std::vector<mx::float16_t> scales(size_t(rows) * (k / 128));
+            for (auto& v : scales) v = mx::float16_t(0.01f + float(rng() % 100) * 4e-4f);
+            return nax_from_tq4(Tq4Weights{mx::array(codes.data(), {rows, k / 2}, mx::uint8), mx::array(scales.data(), {rows, k / 128}, mx::float16), true});
+        }
+        std::vector<uint8_t> codes(size_t(rows) * k);
+        for (auto& c : codes) c = uint8_t(rng() & 15u);
+        std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+        std::vector<uint16_t> sc(size_t(rows) * (k / 64)), b(sc.size());
+        for (size_t i = 0; i < sc.size(); ++i) {sc[i] = bf16_bits(sd(rng)); b[i] = bf16_bits(bd(rng));}
+        return nax_affine_load(nax_affine_pack(codes, sc, b, rows, k, 4, 64), rows, k, 4, 64);
+    }();
+    std::uniform_real_distribution<float> xd(-2.0f, 2.0f);
+    double worst_all = 0;
+    for (int m : {17, 24, 32}) {
+        std::vector<float> x(size_t(m) * k);
+        for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+        auto X = mx::array(x.data(), {m, k}, mx::float32);
+        auto ref = rows_of(nax_affine_matmul(w, X, false, false)), got = rows_of(nax_affine_matmul(w, X, false, true));
+        double worst = 0, peak = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {peak = std::max(peak, double(std::abs(ref[i]))); worst = std::max(worst, double(std::abs(ref[i] - got[i])));}
+        worst_all = std::max(worst_all, worst / peak);
+    }
+    const bool ok = worst_all < 1e-3;
+    std::printf("%s NAX_ROWS32 rows=%d k=%d tq4=%d: 32-row op (prompt) vs row kernel, m 17 / 24 / 32, rel_err %.3e\n", ok ? "PASS" : "FAIL", rows, k, int(tq4), worst_all);
+    return ok;
+}
+
 // The 17-32 row verify runs gate / up and SwiGLU as separate launches where AR (1-16 rows) runs the fused kernel.
 // nax_affine_swiglu itself refuses more than 16 rows, so at 17-32 rows the reference is the fused kernel applied to
 // each row on its own: every cell of the composed fallback must equal it bit for bit.
@@ -561,7 +595,8 @@ int main() {
     std::mt19937 rng(7);
     bool ok = run(256, 512, 4, 128, rng) && run(128, 256, 4, 64, rng) && run(256, 512, 6, 64, rng) && run_invariance(5120, 17408, rng) && run_invariance(1024, 5120, rng) && run_select(6, 64, rng) && run_select(4, 128, rng) && run_tq4(256, 512, rng) && run_tq4(5120, 2048, rng) && run_rotate(rng) && run_q6(256, 512, rng) && run_q6(2048, 5120, rng) && run_gemm(256, 512, 4, 128, rng) && run_gemm(256, 512, 6, 64, rng) && run_gemm(1024, 5120, 4, 128, rng) && run_embedding(rng) && run_from_quantized(256, 512, rng) && run_from_quantized(16384 + 512, 1024, rng) && run_to_mlx(256, 512, 64, rng) && run_to_mlx(256, 512, 128, rng) && run_to_mlx(5120, 2048, 64, rng) && run_prefill(256, 512, 64, false, 1910, rng) && run_prefill(5120, 2048, 64, false, 300, rng) && run_prefill(256, 512, 128, true, 77, rng) && run_prefill(256, 512, 64, false, 2048, rng) && run_prefill(256, 512, 128, true, 256, rng) && run_swiglu(256, 512, false, rng) && run_swiglu(256, 512, true, rng) && run_swiglu(17408, 5120, false, rng) && run_swiglu(17408, 5120, true, rng) &&
         run_row_invariance(5120, 17408, false, rng) && run_row_invariance(5120, 17408, true, rng) &&
-        run_ffn_fallback(5120, 17408, false, rng) && run_ffn_fallback(5120, 17408, true, rng);
+        run_ffn_fallback(5120, 17408, false, rng) && run_ffn_fallback(5120, 17408, true, rng) &&
+        run_rows32(17408, 5120, false, rng) && run_rows32(5120, 17408, false, rng) && run_rows32(17408, 5120, true, rng) && run_rows32(5120, 17408, true, rng);
     bench_gemm(17408, 5120, rng);
     bench_gemm(5120, 17408, rng);
     bench_rows(17408, 5120, rng);

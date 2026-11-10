@@ -33,7 +33,7 @@ inline void nax_mma(thread float* c, thread const half* a, thread const half* b)
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (short i = 0; i < 8; i++) ca[i] = a[i];
     for (short i = 0; i < 16; i++) {cb[i] = b[i]; cc[i] = c[i];}
     op.run(ca, cb, cc);
@@ -61,19 +61,19 @@ const char* kSource = R"METAL(
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (short i = 0; i < 16; i++) cc[i] = 0.0f;
 #if NAX_WIDE
     auto ca2 = op.template get_left_input_cooperative_tensor<half, half, float>();
-    auto cc2 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto cc2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (short i = 0; i < 16; i++) cc2[i] = 0.0f;
 #endif
 #if NAX_WIDE > 1
     // 64-row prefill tile: four row tiles share every decoded weight fragment
     auto ca3 = op.template get_left_input_cooperative_tensor<half, half, float>();
-    auto cc3 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto cc3 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     auto ca4 = op.template get_left_input_cooperative_tensor<half, half, float>();
-    auto cc4 = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+    auto cc4 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
     for (short i = 0; i < 16; i++) {cc3[i] = 0.0f; cc4[i] = 0.0f;}
 #endif
     const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
@@ -195,6 +195,88 @@ const char* kSource = R"METAL(
     }
 )METAL";
 
+
+// 17-32-row products (short prompts) with one 32 x 32 x 16 matrix op per weight fragment instead of two 16-row ops
+// (the 16-row kernel is issue-bound). A and C are placed through the cooperative tensors' own index maps; the weight
+// fragment (B, same N x K as the 16-row op) is decoded exactly as in kSource. 4-bit affine and TQ4. Not row-invariant
+// with the 16-row kernel (like the prompt kernel); used for prompt rows only.
+const char* kRows32 = R"METAL(
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    constexpr int BPT = SPLIT >= 4 ? 1 : 4 / SPLIT, KS = K / SPLIT;
+    const uint local = sg / SPLIT;
+    const int split = int(sg % SPLIT);
+    const uint blk = threadgroup_position_in_grid.x * BPT + local;
+    const int row0 = int(threadgroup_position_in_grid.y) * 32;
+    const int rows = min(int(R[0]) - row0, 32);
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+    for (ushort i = 0; i < cc.get_capacity(); i++) cc[i] = 0.0f;
+    threadgroup float part[SPLIT > 1 ? BPT * SPLIT * 32 * 32 : 1];
+    const device uint2* wp = (const device uint2*)W + ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
+    const device ushort* sp = S + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device ushort* bp = Bz + ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
+    const device half* xs = X + (size_t)(row0 + fm) * K + fn + split * KS;
+    for (int g = 0; g < KS / GS; g++) {
+        const float4 s0 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + fn))) : bf16x4(*(const device ushort4*)(sp + g * 32 + fn));
+        const float4 s1 = TQ4 ? float4(as_type<half4>(*(const device ushort4*)(sp + g * 32 + 16 + fn))) : bf16x4(*(const device ushort4*)(sp + g * 32 + 16 + fn));
+        const float4 b0 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + fn));
+        const float4 b1 = TQ4 ? float4(0.0f) : bf16x4(*(const device ushort4*)(bp + g * 32 + 16 + fn));
+        for (short t = 0; t < GS / 16; t++) {
+            const int ks = g * (GS / 16) + t;
+            // rows fm, fm + 8, fm + 16, fm + 24 x inputs fn .. fn + 3 (the 16-row op's layout, two more row groups)
+            for (short q = 0; q < 4; q++) {
+                const half4 v = fm + 8 * q < rows ? *(const device half4*)(xs + (size_t)(8 * q) * K + ks * 16) : half4(0.0h);
+                for (short i = 0; i < 4; i++) ca[4 * q + i] = v[i];
+            }
+            const uint2 w = wp[ks * 32];
+            if (TQ4) {
+                for (short i = 0; i < 8; i++) {
+                    const uint qa = (w.x >> (4 * i)) & 15u, qb = (w.y >> (4 * i)) & 15u;
+                    const float la = float(((qa & 4u ? 0x7F604B3Au : 0x2C1F1206u) >> (8u * (qa & 3u))) & 0xFFu);
+                    const float lb = float(((qb & 4u ? 0x7F604B3Au : 0x2C1F1206u) >> (8u * (qb & 3u))) & 0xFFu);
+                    cb[i] = half((qa & 8u ? -la : la) * s0[i & 3]);
+                    cb[8 + i] = half((qb & 8u ? -lb : lb) * s1[i & 3]);
+                }
+            } else
+            for (short p = 0; p < 4; p++) {
+                const uint l0 = (w.x >> (4 * p)) & 0x000F000Fu, l1 = (w.y >> (4 * p)) & 0x000F000Fu;
+                const float2 q0 = float2(as_type<half2>(l0 | 0x64006400u)) - 1024.0f;
+                const float2 q1 = float2(as_type<half2>(l1 | 0x64006400u)) - 1024.0f;
+                const half2 v0 = half2(fma(q0, float2(s0[p]), float2(b0[p])));
+                const half2 v1 = half2(fma(q1, float2(s1[p]), float2(b1[p])));
+                cb[p] = v0.x; cb[p + 4] = v0.y; cb[8 + p] = v1.x; cb[12 + p] = v1.y;
+            }
+            op.run(ca, cb, cc);
+        }
+    }
+    if (SPLIT > 1) {
+        threadgroup float* mine = part + ((local * SPLIT + split) * 32 + lane) * 32;
+        for (ushort i = 0; i < cc.get_capacity(); i++) mine[i] = cc[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (split != 0) return;
+        for (int p = 1; p < SPLIT; p++) {
+            const threadgroup float* other = part + ((local * SPLIT + p) * 32 + lane) * 32;
+            for (ushort i = 0; i < cc.get_capacity(); i++) cc[i] = cc[i] + other[i];
+        }
+    }
+    for (ushort i = 0; i < cc.get_capacity(); i++) {
+        if (!cc.is_valid_element(i)) continue;
+        const auto idx = cc.get_multidimensional_index(i);   // (column, row)
+        const int r = int(idx[1]);
+        if (r >= rows) continue;
+        const float v = BF ? float(bfloat16_t(float(cc[i]))) : float(cc[i]);
+        Y[(size_t)(row0 + r) * N + blk * 32 + uint(idx[0])] = v;
+    }
+)METAL";
+
 // Verify / decode FFN gate and up in one launch with SwiGLU in the epilogue (16-row kernel, 4-bit affine or TQ4): each
 // simdgroup decodes the same 32-row block of the gate and of the up matrix, both matmuls share the input fragment, and
 // since both accumulators have the same lane layout every thread holds gate and up of the same (row, column), so it
@@ -219,8 +301,8 @@ const char* kSwiglu = R"METAL(
     auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
     auto cg = op.template get_right_input_cooperative_tensor<half, half, float>();
     auto cu = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto ag = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cg), float>();
-    auto au = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cu), float>();
+    auto ag = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cg)>, float>();
+    auto au = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cu)>, float>();
     for (short i = 0; i < 16; i++) {ag[i] = 0.0f; au[i] = 0.0f;}
     const size_t wofs = ((size_t)blk * (K / 16) + split * (KS / 16)) * 32 + lane;
     const size_t sofs = ((size_t)blk * (K / GS) + split * (KS / GS)) * 32;
@@ -374,7 +456,7 @@ const char* kPrefill = R"METAL(
     metal::tensor<threadgroup half, metal::dextents<int, 2>, metal::tensor_inline> bt1(stage + KS * TN, metal::dextents<int, 2>{E0, E1},
                                                                                    metal::array<int, 2>{1, E0});
     auto b0 = bt0.template slice<E0, E1>(0, 0), b1 = bt1.template slice<E0, E1>(0, 0);
-    auto acc = op.template get_destination_cooperative_tensor<decltype(a.template slice<KS, RS>(0, 0)), decltype(b0), float>();
+    auto acc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a.template slice<KS, RS>(0, 0))>, metal::remove_addrspace_t<decltype(b0)>, float>();
     for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
     // TQ4 signed levels in a threadgroup table (Splash's codebook stage, kernels/common/gguf_staged.h): a table read
     // beats the shift/select chain when every step decodes K / 16 groups of TN columns.
@@ -593,7 +675,7 @@ int nax_affine_splits(const NaxAffine& w) {
     return split;
 }
 
-mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool round_bf16) {
+mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool round_bf16, bool prompt) {
     if (input.ndim() != 2 || input.shape(1) != w.columns || input.shape(0) < 1)
         throw std::invalid_argument("nax affine matmul: input must be [m, columns]");
     // the 16-row kernel does not declare the second row tile, so it holds fewer registers per simdgroup
@@ -603,6 +685,18 @@ mx::array nax_affine_matmul(const NaxAffine& w, const mx::array& input, bool rou
                                                   std::string("#define NAX_WIDE 1\n") + kSource, kHeader);
     const int m = input.shape(0), mr = m <= 16 ? 16 : 32;
     const int split = nax_affine_splits(w);
+    // 17-32 rows of 4-bit affine / TQ4 (prompts): one 32-row matrix op per fragment (kRows32)
+    if (prompt && mr == 32 && w.bits == 4 && !w.q6) {
+        static auto kernel = mx::fast::metal_kernel("tqllm_nax_rows32", {"W", "S", "Bz", "X", "R"}, {"Y"}, kRows32, kHeader);
+        auto x = mx::contiguous(mx::astype(input, mx::float16));
+        const uint32_t m32 = uint32_t(m);
+        auto count = mx::array(&m32, {1}, mx::uint32);
+        const int bpt = split >= 4 ? 1 : 4 / split, threads = 32 * bpt * split;
+        return kernel({w.words, w.scales, w.biases, x, count}, {{m, w.rows}}, {mx::float32},
+                      {w.rows / 32 / bpt * threads, 1, 1}, {threads, 1, 1},
+                      {{"K", w.columns}, {"N", w.rows}, {"GS", w.group}, {"SPLIT", split}, {"BF", round_bf16}, {"TQ4", w.tq4}},
+                      std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    }
     auto& kernel = mr == 16 ? kernel16 : kernel32;
     auto x = mx::contiguous(mx::astype(input, mx::float16));
     const uint32_t m32 = uint32_t(m);

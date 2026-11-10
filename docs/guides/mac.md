@@ -11,7 +11,8 @@ Homebrew (macOS 15 or newer):
 
 ```sh
 brew install turbo-tan/tap/tqllm
-tqllm serve          # first run downloads the model and drafter (~17 GB), then serves on 127.0.0.1:8086
+tqllm                # first run downloads the model and drafter (~17 GB), then serves on 127.0.0.1:8086 in the background
+tqllm stop           # stops the server
 ```
 
 or the one-line installer (tries Homebrew, then pip in a venv under `~/.tqllm`, then a source build; `--check` reports
@@ -22,7 +23,9 @@ curl -fsSL https://tqllm.com/install.sh | bash
 tqllm serve
 ```
 
-Both build `tqserve` against the stock MLX 0.32.4 wheel. `tqllm serve` downloads the best model file that is already
+Both build `tqserve` against the stock MLX 0.32.4 wheel. `tqllm` (the same as `tqllm serve`) starts the server in the
+background, returns once it answers, and writes its output to `~/.cache/tqllm/server.log`; `tqllm serve --foreground`
+stays attached instead. Models are kept in `~/.cache/tqllm/models` (`TQLLM_HOME` moves it). `tqllm serve` downloads the best model file that is already
 downloaded or published (TQ_L-QSA, else the mlx-community 4-bit file on Macs with 40 GB or more, else TQ_L) plus the
 drafter; `--qsa` takes the QSA file for long contexts, `--context` sets the context (64K by default), and `--model` takes a
 path or a Hugging Face `owner/repo` / `owner/repo/file.gguf`. `tqllm claude`, `tqllm codex` and `tqllm opencode` start
@@ -33,9 +36,10 @@ follow the steps below.
 
 - macOS on Apple Silicon, Xcode command line tools, CMake 3.25 or newer.
 - MLX 0.32.3 built from source with the patch in [`third_party/mlx`](../../third_party/mlx/README.md). The patch adds
-  one call (`scaled_dot_product_attention_lse`) that tqLLM uses for attention over long contexts. The code also compiles
-  against a stock MLX 0.32 or newer (it then uses a slower attention path at long context), but that build has not been
-  tested yet, and the numbers below were measured with the patch.
+  one call (`scaled_dot_product_attention_lse`) that tqLLM uses for attention over long contexts. The code also builds
+  against a stock MLX 0.32 or newer, which is what the installer uses: on an M5 (matrix unit) token-tree verify runs
+  tqLLM's own exact attention kernel, so `--exact on` output is unchanged; elsewhere greedy `--exact on` drafts chains.
+  The numbers below were measured with the patch. Stock MLX 0.32.4 on an M5 Pro: ctest 114 / 114 (tqLLM 1.5.0).
 - About 20 GB for the model files.
 
 ## 1. Build MLX with the patch
@@ -112,6 +116,17 @@ Decode tokens per second, one request, greedy, 256 output tokens after long-docu
 
 Every tqLLM text equals plain one-token-at-a-time decoding (`--exact on`). The QSA file (`Qwen3.8-27B-MLX-4bit-QSA.gguf`)
 reads only the 2,048 keys its indexers pick once a step is past 48K keys (`--qsa-from`), which changes the text.
+
+Prompt (prefill) tokens per second, 1.5.0, M5 Pro 48 GB, Qwen3.8-27B TQ_L-QSA: long prompts run part of every FFN on the
+Neural Engine beside the GPU (planned from costs measured once per Mac and cached; nothing to set).
+
+| Prompt | 8K | 16K | 32K |
+|---|---|---|---|
+| tqLLM 1.5.0 | **685-704** | **659-671** | **598-605** |
+| tqLLM 1.4.4 | 477-484 | 456-460 | 429-430 |
+
+Outputs stay exact (server == plain decoding); the split changes numbers slightly (KL 0.006 at 16K against the GPU-only
+prompt), so a text can differ from 1.4.4. A Mac without a Neural Engine runs prompts on the GPU alone.
 
 Short prompts are mixed: tqLLM leads on some (99.6 vs TensorFold 91.1 on a 2K document) and trails on others (80.6 vs
 97.0 on a chat prompt); see [Benchmarks](../BENCHMARKS.md).

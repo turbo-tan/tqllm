@@ -5,15 +5,9 @@
 #include <atomic>
 #include <stdexcept>
 #include <thread>
-#if defined(__linux__) || defined(__APPLE__)
-#include <arpa/inet.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
+#include "net.hpp"
 
 namespace tqserve {
-#if defined(__linux__) || defined(__APPLE__)
 // Independent telemetry listener and bounded same-instance chat bridge; no engine locks.
 class MonitorServer {
 public:
@@ -21,37 +15,37 @@ public:
                   std::string key, std::string pci = {}, uint16_t inference_port = 0, bool listen = true)
         : monitor_(monitor), key_(std::move(key)), pci_(std::move(pci)), inference_host_(host == "0.0.0.0" ? "127.0.0.1" : host), inference_port_(inference_port) {
         if (listen) {
-        socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        socket_ = tqnet::socket(AF_INET, SOCK_STREAM, 0);
         if (socket_ < 0) throw std::runtime_error("monitor socket failed");
-        int one = 1; ::setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        tqnet::set_reuse_address(socket_);
         sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1 ||
-            ::bind(socket_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0 || ::listen(socket_, 16) < 0) {
-            ::close(socket_); throw std::runtime_error("monitor bind/listen failed (use an IPv4 bind address)");
+            ::bind(tqnet::raw(socket_), reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0 || ::listen(tqnet::raw(socket_), 16) < 0) {
+            tqnet::close(socket_); throw std::runtime_error("monitor bind/listen failed (use an IPv4 bind address)");
         }
-        socklen_t size = sizeof(address); ::getsockname(socket_, reinterpret_cast<sockaddr *>(&address), &size);
+        socklen_t size = sizeof(address); ::getsockname(tqnet::raw(socket_), reinterpret_cast<sockaddr *>(&address), &size);
         port_ = ntohs(address.sin_port);
         }
         try { thread_ = std::thread([this] {
             try { run(); } catch (...) { stop_ = true; std::fputs("tqserve: monitor listener stopped\n", stderr); }
         }); }
-        catch (...) { ::close(socket_); throw; }
+        catch (...) { tqnet::close(socket_); throw; }
     }
     ~MonitorServer() {
         stop_ = true;
-        if (socket_ >= 0) ::shutdown(socket_, SHUT_RDWR);
+        if (socket_ >= 0) tqnet::shutdown_both(socket_);
         thread_.join();
         {
             std::lock_guard<std::mutex> lock(chat_mutex_);
-            if (chat_client_ >= 0) ::shutdown(chat_client_, SHUT_RDWR);
-            if (chat_upstream_ >= 0) ::shutdown(chat_upstream_, SHUT_RDWR);
+            if (chat_client_ >= 0) tqnet::shutdown_both(chat_client_);
+            if (chat_upstream_ >= 0) tqnet::shutdown_both(chat_upstream_);
         }
         if (chat_.joinable()) chat_.join();
-        ::close(socket_);
+        tqnet::close(socket_);
     }
     uint16_t port() const { return port_; }
     bool serve(int fd, const Request & req) {
-        timeval timeout{1,0}; ::setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+        tqnet::set_send_timeout(fd, 1);
         return handle_request(fd,req);
     }
     MonitorServer(const MonitorServer &) = delete;
@@ -65,19 +59,18 @@ private:
         data += "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
         size_t offset = 0;
         while (offset < data.size()) {
-            const auto n = ::send(fd, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
+            const auto n = tqnet::send(fd, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
             if (n <= 0) break;
             offset += size_t(n);
         }
     }
     bool handle(int fd) {
-        timeval timeout{1, 0};
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        tqnet::set_recv_timeout(fd, 1);
+        tqnet::set_send_timeout(fd, 1);
         RequestReader reader(1024 * 1024, 8192); uint8_t buffer[2048];
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (!reader.complete() && !reader.failed() && !stop_ && std::chrono::steady_clock::now() < deadline) {
-            const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
+            const auto n = tqnet::recv(fd, buffer, sizeof(buffer), 0);
             if (n <= 0) return false;
             reader.append(buffer, size_t(n));
         }
@@ -114,7 +107,7 @@ private:
     }
     static bool write_bytes(int fd, const char * bytes, size_t size) {
         while (size) {
-            const auto n = ::send(fd, bytes, size, MSG_NOSIGNAL);
+            const auto n = tqnet::send(fd, bytes, size, MSG_NOSIGNAL);
             if (n <= 0) return false;
             bytes += n; size -= size_t(n);
         }
@@ -125,15 +118,14 @@ private:
         { std::lock_guard<std::mutex> lock(chat_mutex_); client = chat_client_; }
         bool started = false;
         try {
-            upstream = ::socket(AF_INET, SOCK_STREAM, 0);
+            upstream = tqnet::socket(AF_INET, SOCK_STREAM, 0);
             if (upstream < 0) throw std::runtime_error("socket");
             { std::lock_guard<std::mutex> lock(chat_mutex_); chat_upstream_ = upstream; }
-            timeval timeout{1, 0};
-            ::setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            ::setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            tqnet::set_recv_timeout(upstream, 1);
+            tqnet::set_send_timeout(upstream, 1);
             sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(inference_port_);
             ::inet_pton(AF_INET, inference_host_.c_str(), &address.sin_addr);
-            if (::connect(upstream, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) throw std::runtime_error("connect");
+            if (::connect(tqnet::raw(upstream), reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) throw std::runtime_error("connect");
             std::string request = "POST /v1/chat/completions HTTP/1.1\r\nHost: " + inference_host_ + ":" + std::to_string(inference_port_) + "\r\nContent-Type: application/json\r\n";
             if (!key_.empty()) request += "Authorization: Bearer " + key_ + "\r\n";
             request += "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
@@ -141,20 +133,20 @@ private:
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
             char buffer[8192];
             while (!stop_ && std::chrono::steady_clock::now() < deadline) {
-                pollfd ready[2]{{client, POLLIN, 0}, {upstream, POLLIN, 0}};
-                const auto available = ::poll(ready, 2, 200);
-                if (available < 0) { if (errno == EINTR) continue; break; }
+                tqnet::pollfd_t ready[2]{tqnet::poll_entry(client, POLLIN), tqnet::poll_entry(upstream, POLLIN)};
+                const auto available = tqnet::poll(ready, 2, 200);
+                if (available < 0) { if (tqnet::interrupted(tqnet::last_error())) continue; break; }
                 if (!available) continue;
                 if (ready[0].revents) {
                     char probe;
                     if (ready[0].revents & (POLLHUP | POLLERR | POLLNVAL)) break;
-                    if ((ready[0].revents & POLLIN) && ::recv(client, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
+                    if ((ready[0].revents & POLLIN) && tqnet::recv(client, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) break;
                 }
                 if (ready[1].revents & (POLLERR | POLLNVAL)) break;
                 if (!(ready[1].revents & (POLLIN | POLLHUP))) continue;
-                const auto n = ::recv(upstream, buffer, sizeof(buffer), 0);
+                const auto n = tqnet::recv(upstream, buffer, sizeof(buffer), 0);
                 if (n == 0) break;
-                if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; break; }
+                if (n < 0) { const int e = tqnet::last_error(); if (tqnet::would_block(e) || tqnet::interrupted(e)) continue; break; }
                 started = true;
                 if (!write_bytes(client, buffer, size_t(n))) break;
             }
@@ -163,8 +155,8 @@ private:
         }
         {
             std::lock_guard<std::mutex> lock(chat_mutex_);
-            if (upstream >= 0) ::close(upstream);
-            ::close(client); chat_client_ = chat_upstream_ = -1;
+            if (upstream >= 0) tqnet::close(upstream);
+            tqnet::close(client); chat_client_ = chat_upstream_ = -1;
         }
         chat_active_ = false;
     }
@@ -176,12 +168,12 @@ private:
             const auto now = std::chrono::steady_clock::now();
             if (now - sampled >= hardware_interval) { monitor_.hardware(collector.sample()); sampled = now; }
             if (socket_ < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-            pollfd p{socket_, POLLIN, 0};
-            if (::poll(&p, 1, 200) <= 0 || !(p.revents & POLLIN)) continue;
-            const int fd = ::accept(socket_, nullptr, nullptr);
+            auto p = tqnet::poll_entry(socket_, POLLIN);
+            if (tqnet::poll(&p, 1, 200) <= 0 || !(p.revents & POLLIN)) continue;
+            const int fd = tqnet::accept(socket_);
             if (fd >= 0) {
-                try { if (!handle(fd)) ::close(fd); }
-                catch (...) { ::close(fd); }
+                try { if (!handle(fd)) tqnet::close(fd); }
+                catch (...) { tqnet::close(fd); }
             }
         }
     }
@@ -197,5 +189,4 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
-#endif
 } // namespace tqserve

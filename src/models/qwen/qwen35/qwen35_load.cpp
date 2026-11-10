@@ -86,8 +86,11 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         }
     }
     out_norm = g_f32(f, "output_norm.weight", H);
-    const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
-    lm_head = cfg.tied ? embed : g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
+    if (cfg.tied) lm_head = embed;  // tied embeddings (Qwen3.5 4B and smaller): no output.weight in the file
+    else {
+        const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
+        lm_head = g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
+    }
     if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
     // routed + shared experts of one MoE block (the trunk's layers and the MTP block): router, VRAM / host / split
     // expert matrices, the shared expert fused into the routed launches where its type and shape allow
@@ -144,7 +147,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         auto & L = mtp.layer;
         L.in_norm = g_f32(f, mp + "attn_norm.weight", H);
         L.post_norm = g_f32(f, mp + "post_attention_norm.weight", H);
-        L.w_mix = g_cat(f, {{mp + "attn_q.weight", 2 * int(cfg.heads) * hd}, {mp + "attn_k.weight", int(cfg.kvheads) * hd},
+        L.w_mix = g_cat(f, {{mp + "attn_q.weight", (cfg.gated_attention ? 2 : 1) * int(cfg.heads) * hd}, {mp + "attn_k.weight", int(cfg.kvheads) * hd},
                             {mp + "attn_v.weight", int(cfg.kvheads) * hd}}, H);
         L.wo = g_mat(f, mp + "attn_output.weight", H, int(cfg.heads) * hd);
         L.q_norm = g_f32(f, mp + "attn_q_norm.weight", hd);
@@ -185,7 +188,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         auto & L = layer[l];
         L = {};
         L.in_norm = g_f32(f, p + "attn_norm.weight", H);
-        L.post_norm = g_f32(f, p + "post_attention_norm.weight", H);
+        L.post_norm = g_f32(f, p + (cfg.gated_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), H);
         if (cfg.moe) {
             load_moe(L, p, cold_of[l], int(l) < opt.n_cpu_moe);
         } else {
@@ -197,11 +200,11 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             L.w_down = g_mat(f, p + "ffn_down.weight", H, F);
         }
         if (cfg.full[l]) {
-            L.w_mix = g_cat(f, {{p + "attn_q.weight", 2 * int(cfg.heads) * hd}, {p + "attn_k.weight", int(cfg.kvheads) * hd},
+            L.w_mix = g_cat(f, {{p + "attn_q.weight", (cfg.gated_attention ? 2 : 1) * int(cfg.heads) * hd}, {p + "attn_k.weight", int(cfg.kvheads) * hd},
                                 {p + "attn_v.weight", int(cfg.kvheads) * hd}}, H);
         }
         if (cfg.full[l] && !L.w_mix.p) {
-            L.wq = g_mat(f, p + "attn_q.weight", 2 * int(cfg.heads) * hd, H);
+            L.wq = g_mat(f, p + "attn_q.weight", (cfg.gated_attention ? 2 : 1) * int(cfg.heads) * hd, H);
             L.wk = g_mat(f, p + "attn_k.weight", int(cfg.kvheads) * hd, H);
             L.wv = g_mat(f, p + "attn_v.weight", int(cfg.kvheads) * hd, H);
         }
@@ -346,6 +349,8 @@ void Qwen35Engine::allocate() {
         prefill_room = fr > kv_dev ? fr - kv_dev : 0;
     }
     if (opt.ubatch) NPF = NBUF = std::max(NVER, opt.ubatch);
+    // A trained draft block can be wider than the requested prefill micro-batch or verify capacity.
+    if (!opt.draft_model.empty()) NBUF = std::max(NBUF, 16 * nslots);
     x = Buf(H * 2);
     norm = Buf(H * 2);
     resid = Buf(H * 2);
@@ -361,7 +366,8 @@ void Qwen35Engine::allocate() {
     amax = Buf(2048 * 4);
     logits_buf = Buf(size_t(cfg.vocab) * 4);
     token = Buf(sizeof(uint32_t));
-    part = Buf(size_t(tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd))) * 4);
+    part = Buf(size_t(cfg.gated_attention ? tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd))
+                                         : tqllm_cuda::attention_gen_partial_floats(int(cfg.heads), int(context_), 1)) * 4);
     t_in = Buf(std::max({2 * lk + 2 * lv + 2 * size_t(cfg.lin_vheads), 2 * size_t(cfg.heads) * hd + 2 * size_t(cfg.kvheads) * hd, 2 * F}) * 2);
     t_qg = Buf(2 * cfg.heads * hd * 2);
     t_q = Buf(cfg.heads * hd * 2);
@@ -439,6 +445,10 @@ void Qwen35Engine::allocate() {
     part_floats = std::max({!kvf->needs_context_scratch() ? size_t(0) : size_t(NVER) * tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd)),
                             size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NVER, kv_cmp ? 257 : 256)),
                             size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NBUF, kv_cmp ? 2 : 1))});  // + stand-in slot
+    if (!cfg.gated_attention) {
+        if (std::string(kvf->name()) != "bf16") throw std::invalid_argument("Qwen3 currently requires --kv bf16");
+        part_floats = std::max(part_floats, size_t(tqllm_cuda::attention_gen_partial_floats(int(cfg.heads), int(context_), NBUF)));
+    }
     v_part = Buf(part_floats * 4);
     for (uint32_t l = 0; l < cfg.layers; ++l)
         if (!cfg.full[l])
@@ -471,9 +481,9 @@ void Qwen35Engine::allocate() {
     }
     if (opt.native_mtp && nslots != 1)  // refused at start-up, not per request
         throw std::runtime_error("--mtp drafts for one slot only for now: use --np 1 (or -md for --np > 1)");
-    chain2 = kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
+    chain2 = cfg.gated_attention && kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
     // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
-    if (opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
+    if (cfg.gated_attention && opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
         if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)
             throw std::runtime_error("tree verify: KV rows must be a multiple of 16 bytes");
         tree_mode = true;
@@ -730,7 +740,9 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     const std::string A = "dflash.";
     const int H = int(cfg.hidden);
     if (int(f.num(A + "embedding_length")) != H) throw std::runtime_error("DFlash drafter hidden size mismatch");
+    dfl.dspine = spec::is_dspine(f);
     dfl.dspark = f.tensors.count("markov_w1.weight") > 0;
+    if (dfl.dspine) dfl.spine = spec::dspine_config(f, H, int(cfg.vocab), int(cfg.layers), cfg.architecture);
     dfl.ffn = int(f.num(A + "feed_forward_length"));
     dfl.theta = dfl.dspark ? float(f.num(A + "rope.freq_base", cfg.theta)) : cfg.theta;  // DFlash2: the target's, as before
     const int F = dfl.ffn;
@@ -744,7 +756,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
         dfl.nb = std::min(dfl.nb, NVER - 1);  // a runtime block may be shorter than the trained one; lattice <= verify width
         dfl.block = dfl.nb + 1;
     }
-    dfl.group = dfl.dspark ? 0 : int(f.num(A + "conv_group_size"));
+    dfl.group = (dfl.dspark || dfl.dspine) ? 0 : int(f.num(A + "conv_group_size"));
     dfl.window = int(f.num(A + "attention.sliding_window", 0));
     if (opt.draft_window >= 0) {
         std::fprintf(stderr, "tqllm: drafter window %d -> %d (--draft-window)\n", dfl.window, opt.draft_window);
@@ -757,12 +769,12 @@ void Qwen35Engine::load_dflash(const std::string & path) {
                      dfl.retr, dfl.recent);
     }
     dfl.topk = dfl.dspark ? 16 : int(f.num(A + "selector_top_k"));
-    dfl.rank = dfl.dspark ? int(gt(f, "markov_w1.weight").ne[0]) : int(f.num(A + "selector_rank"));
+    dfl.rank = dfl.dspine ? dfl.spine.rank : dfl.dspark ? int(gt(f, "markov_w1.weight").ne[0]) : int(f.num(A + "selector_rank"));
     dfl.mask_id = uint32_t(f.num("tokenizer.ggml.mask_token_id"));
     for (double v : f.kv.at(A + "target_layers").arr) dfl.target_ids.push_back(int(v));
     const int nl = int(f.num(A + "block_count"));
     if (dfl.dspark ? dfl.hd != 256 || dfl.rank != 256 || dfl.heads / dfl.kvheads > 8
-                   : dfl.hd != 128 || dfl.topk != 16 || int(f.num(A + "conv_kernel_size")) != 2 || F != int(cfg.ffn))
+                   : dfl.hd != 128 || dfl.topk != 16 || (!dfl.dspine && int(f.num(A + "conv_kernel_size")) != 2) || F != int(cfg.ffn))
         throw std::runtime_error(dfl.dspark ? "unsupported DSpark drafter shape" : "unsupported DFlash2 drafter shape");
     const int nf = int(dfl.target_ids.size()), qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
     dfl.fc = to_tq3(f, {"fc.weight"}, nf * H);
@@ -771,7 +783,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     if (dfl.dspark) {
         dfl.sel_prev = vocab_table(f, "markov_w1.weight", dfl.rank);
         dfl.sel_next = vocab_table(f, "markov_w2.weight", dfl.rank);
-    } else {
+    } else if (!dfl.dspine) {
         dfl.sel_hidden = to_tq3(f, {"selector_hidden.weight"}, H);
         dfl.sel_prev = bf16_table(f, "selector_predecessor.weight", uint64_t(cfg.vocab) * dfl.rank);
         dfl.sel_next = bf16_table(f, "selector_successor.weight", uint64_t(cfg.vocab) * dfl.rank);
@@ -784,7 +796,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
         L.q_norm = f32_of(f, p + "attn_q_norm.weight", dfl.hd);
         L.k_norm = f32_of(f, p + "attn_k_norm.weight", dfl.hd);
         L.ffn_norm = f32_of(f, p + "ffn_norm.weight", H);
-        if (!dfl.dspark) {
+        if (!dfl.dspark && !dfl.dspine) {
             L.attn_conv_base = f32_of(f, p + "attn_conv_base", uint64_t(H) * 4);
             L.ffn_conv_base = f32_of(f, p + "ffn_conv_base", uint64_t(H) * 4);
             L.conv_attn = to_tq3(f, {p + "attn_conv_proj.weight"}, H);
@@ -843,6 +855,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     d_inj_g = Buf(size_t(DFlash::injBatch) * H * 2);
     d_inj_kv = Buf(size_t(DFlash::injBatch) * nl * 2 * kd * 2);
     d_topk = Buf(B * 64 * 16 * 8);
+    if (dfl.dspine) load_dspine(f);
     if (const char * dv = opt.draft_vocab.c_str(); *dv && has_head8()) {
         // draft vocabulary (llama.cpp map format): those head8 rows in 4 bits; ids mapped on the device
         std::ifstream in(dv);
