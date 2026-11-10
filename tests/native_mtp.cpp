@@ -15,7 +15,10 @@
 
 int main(int argc, char ** argv) {
     try {
-        if (argc != 3) throw std::runtime_error("usage: test-native-mtp WEIGHTS TOKENIZER");
+        // optional DRAFT_VOCAB (llama.cpp map file): the MTP draft head then scores only those rows (4-bit head subset +
+        // int8 re-score); drafts change, the output must not
+        if (argc != 3 && argc != 4) throw std::runtime_error("usage: test-native-mtp WEIGHTS TOKENIZER [DRAFT_VOCAB]");
+        const std::string draft_vocab = argc == 4 ? argv[3] : "";
         tqllm::Tokenizer tok;
         tok.load(argv[2]);
         std::vector<std::string> prompts{
@@ -46,6 +49,7 @@ int main(int argc, char ** argv) {
         for (int lookup : {0, 16}) {  // MTP alone, then MTP with prompt lookup (prompt 3 repeats a sentence 40 times)
         tqllm::EngineOptions with = base;
         with.native_mtp = true;
+        with.draft_vocab = draft_vocab;
         with.lookup = lookup;
         tqllm::Model model(argv[1], argv[2], 8192, 1, with);
         size_t r = 0;
@@ -127,6 +131,8 @@ int main(int argc, char ** argv) {
             }
             tqllm::EngineOptions with = base;
             with.native_mtp = true;
+            with.draft_vocab = draft_vocab;
+        with.draft_vocab = draft_vocab;
             tqllm::Model model(argv[1], argv[2], 8192, 1, with);
             uint64_t drafted = 0, accepted = 0, first_diff = 0;
             for (int s = 0; s < seeds; ++s) {

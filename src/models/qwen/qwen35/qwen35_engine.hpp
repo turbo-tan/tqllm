@@ -514,6 +514,14 @@ private:
     Buf dsub_ids, dsub_w, dsub_s;  // optional DFlash2 draft-vocabulary head (4-bit) + row -> token id
     int dsub_rows = 0;
     bool dsub_in_head4 = false;  // draft vocabulary read from head4 rows through dsub_ids
+    bool mtp_head4_sub = false;  // --mtp --draft-vocab: the MTP draft head scores dsub_ids rows of head4
+    cudaStream_t commit_side = nullptr;  // TQLLM_DEBUG=commit_overlap: commit replay stream
+    cudaEvent_t commit_fork = nullptr, commit_done = nullptr;
+    bool commit_inflight = false;
+    void join_commit() {
+        if (commit_inflight) { ck(cudaStreamWaitEvent(stream, commit_done, 0)); commit_inflight = false; }
+    }
+    std::vector<char> mtp_draft_q6k_host;  // Q6_K draft-vocabulary rows until allocate() decides (head4 or Q6_K)
     Mat dsub_mat{};  // draft vocabulary head in the LM head's own weight format (TQ4); else dsub_w / dsub_s are u4h
     bool prefill_final = true;
     std::unique_ptr<tqllm_cuda::Fp8Gemm> fp8;  // --prefill-fp8 on (sm_89+): FP8 prefill GEMMs
@@ -547,6 +555,13 @@ private:
     template <class Body>
     cudaGraphExec_t cached_graph(int family, uint64_t key, Body && body) {
         if (cudaGraphExec_t e = glru.find(family, key)) return e;
+        static const bool dbg_graphs = tqllm::debug_on("graphs");
+        if (dbg_graphs) {
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            std::fprintf(stderr, "graph miss family %d key %016llx (cached %zu, evictions %zu, free %zu MB)\n", family,
+                         (unsigned long long) key, glru.size(), glru.evictions(), fr >> 20);
+        }
         return glru.insert(
             family, key, [&] { return tqllm::instantiate_graph(tqllm::capture_graph(stream, body)); },
             [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
@@ -615,7 +630,14 @@ public:
     void verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) override;
     // kernel launches are not checked one by one: a launch that fails (the driver or a library cannot allocate on a
     // nearly full device) would silently skip its kernel, so every stream sync also collects the last launch error
+    // sync without joining an in-flight commit replay: MTP draft passes read neither the recurrent states nor its scratch
+    void sync_main() {
+        ck(cudaStreamSynchronize(stream));
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(e));
+    }
     void sync_ck() {
+        join_commit();
         ck(cudaStreamSynchronize(stream));
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(e));
@@ -635,6 +657,7 @@ public:
 
     void verify_async(const uint32_t * tokens, const int * pos_host, int n, uint32_t pos,
                       uint32_t * next, bool copy_all) {
+        join_commit();  // a commit replay on the side stream writes the state this verify reads
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
         if (!(defer && tree_step && n <= NVER)) flush_pending();
@@ -1418,7 +1441,28 @@ private:
 
     void commit(int k) override {
         if (k < 1 || k > last_n) throw std::runtime_error("commit: accepted count out of range");
-        if (k < last_n) commit_body(k);
+        if (k < last_n) {
+            // TQLLM_DEBUG=commit_overlap (opt-in until test-native-mtp covers --np > 1): replay on a side stream so it overlaps the MTP repair pass that follows (that pass
+            // reads neither the recurrent states nor the replay's scratch); the next verify waits for it (join_commit)
+            static const bool overlap = tqllm::debug_on("commit_overlap");
+            if (overlap) {
+                if (!commit_side) {
+                    ck(cudaStreamCreateWithFlags(&commit_side, cudaStreamNonBlocking));
+                    ck(cudaEventCreateWithFlags(&commit_fork, cudaEventDisableTiming));
+                    ck(cudaEventCreateWithFlags(&commit_done, cudaEventDisableTiming));
+                }
+                ck(cudaEventRecord(commit_fork, stream));
+                ck(cudaStreamWaitEvent(commit_side, commit_fork, 0));
+                const cudaStream_t main_stream = stream;
+                stream = commit_side;  // cached_graph captures on `stream`
+                const uint64_t key = (uint64_t(1) << 40) | uint64_t(k) | (uint64_t(cur) << 16) | (uint64_t(sp) << 24) |
+                                     (uint64_t(active) << 32) | (uint64_t(stash_col0) << 44);
+                ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, [&] { commit_body(k); }), commit_side));
+                stream = main_stream;
+                ck(cudaEventRecord(commit_done, commit_side));
+                commit_inflight = true;
+            } else commit_body(k);
+        }
         cur = (cur + 1) % NSLOT;
         last_n = 0;
     }

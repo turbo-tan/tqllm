@@ -173,7 +173,9 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
                 mtp.draft_ids.push_back(id);
                 std::copy(all.begin() + id * row_bytes, all.begin() + (id + 1) * row_bytes, sub.begin() + i * row_bytes);
             }
-            mtp.draft_head = {put(sub.data(), sub.size()), GGML_Q6_K, int(nd), H};
+            // uploaded in allocate() only if the 4-bit head cannot serve the draft vocabulary (frees ~0.2 GB of VRAM
+            // for the KV cache and captured graphs when it can)
+            mtp_draft_q6k_host = std::move(sub);
         }
     }
     layer.resize(cfg.layers);
@@ -514,6 +516,22 @@ void Qwen35Engine::allocate() {
         // single-token decode then reads 0.64 GB instead of the 1.27 GB int8 head (Qwen3.8), with or without a drafter
         if (fmt_target) build_head4();
     }
+    // --mtp with --draft-vocab and no DFlash drafter: score the draft vocabulary from head4 rows (u4h_matvec_ids, the
+    // same 4-bit rows the verify head's first pass reads) instead of the FP32 Q6_K subset matvec. Drafts only steer
+    // speculation (the verify stays exact), so the cheaper head changes speed, not output.
+    if (opt.native_mtp && !mtp.draft_ids.empty() && opt.draft_model.empty() && head4.p && !dsub_rows) {
+        const auto nd = mtp.draft_ids.size();
+        dsub_ids = Buf(nd * 4);
+        ck(cudaMemcpyAsync(dsub_ids.p, mtp.draft_ids.data(), nd * 4, cudaMemcpyHostToDevice, stream));
+        dsub_rows = int(nd);
+        dsub_in_head4 = true;
+        mtp_head4_sub = true;
+        sync_ck();
+    }
+    if (!mtp_head4_sub && !mtp_draft_q6k_host.empty())
+        mtp.draft_head = {put(mtp_draft_q6k_host.data(), mtp_draft_q6k_host.size()), GGML_Q6_K, int(mtp.draft_ids.size()),
+                          int(cfg.hidden)};
+    std::vector<char>().swap(mtp_draft_q6k_host);
     if (fmt_target && !cfg.tied && opt.embed_host) {
         size_t bytes = 0;  // raw GGUF rows: one token's row is read per lookup
         const size_t n = size_t(embed.rows) * embed.cols;
