@@ -55,7 +55,7 @@ int main() {
     std::mt19937 rng(38);
     ok &= run(256, 512, 4, 64, 2e-3, rng);
     ok &= run(256, 512, 4, 128, 2e-3, rng);
-    ok &= run(128, 512, 6, 64, 5e-3, rng);
+    ok &= run(128, 512, 6, 64, 1e-2, rng);  // requantized: MLX picks its own scale / bias
     std::printf(ok ? "matrix unit: PASS\n" : "matrix unit: FAIL\n");
     return ok ? 0 : 1;
 }
