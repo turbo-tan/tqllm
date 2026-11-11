@@ -15,6 +15,7 @@
 #include <mlx/ops.h>
 #include <mlx/transforms.h>
 
+#include "matrix_unit.hpp"
 #include "attention_split.hpp"
 #include "shape_constants.hpp"
 
@@ -263,7 +264,7 @@ inline bool segmented_attention_available(int dim = 256) {
             return true;
         } catch (const std::exception&) {return false;}
     };
-    static const bool ok128 = probe(128), ok256 = probe(256);
+    static const bool ok128 = m5_matrix_unit() && probe(128), ok256 = m5_matrix_unit() && probe(256);
     return dim == 128 ? ok128 : dim == 256 ? ok256 : false;
 }
 #else

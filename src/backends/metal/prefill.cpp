@@ -61,6 +61,7 @@ y[i]=bfloat16_t(float(as_type<char>(p[2+col%32]))*d);
 }
 }
 mx::array dense(const KQuantWeights& w) {return mx::astype(kquant_dequant(w), mx::bfloat16);}
+mx::array dense(const AffineWeights& w) {return mx::astype(mx::dequantize(w.blocks, w.scales, w.biases, w.group, w.bits, "affine"), mx::bfloat16);}
 mx::array stage_bf16(const Matrix& weights) {
     return std::visit([](const auto& w)->mx::array {
         using T=std::decay_t<decltype(w)>;

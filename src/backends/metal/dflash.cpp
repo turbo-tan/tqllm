@@ -1,4 +1,5 @@
 #include <sstream>
+#include "matrix_unit.hpp"
 #include "debug.hpp"
 #include "dflash.hpp"
 #include "dspine.hpp"
@@ -319,8 +320,10 @@ struct DFlash2::Impl {
             } else if(tensor.type==GGML_NAX_A4_G64 || tensor.type==GGML_NAX_A4_G128 || tensor.type==GGML_NAX_A6_G64) {
                 auto raw=file.read(tensor);
                 const int bits=tensor.type==GGML_NAX_A6_G64?6:4,group=tensor.type==GGML_NAX_A4_G128?128:64;
-                nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
-                                                 int(tensor.ne[1]),int(tensor.ne[0]),bits,group));
+                auto loaded=nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
+                                            int(tensor.ne[1]),int(tensor.ne[0]),bits,group);
+                if(m5_matrix_unit())nax.emplace(name,std::move(loaded));
+                else {auto a=affine_from_nax(loaded);mx::eval(a.blocks,a.scales,a.biases);matrices.emplace(name,std::move(a));}
             } else if(tensor.ne.size()==2 && name.find(".weight")!=std::string::npos &&
                       tensor.ne[0]>128 && tensor.ne[1]>128) {
                 auto w=load_matrix(file,name);

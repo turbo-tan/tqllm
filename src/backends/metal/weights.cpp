@@ -83,6 +83,11 @@ mx::array linear(const Matrix& weights, const mx::array& input) {
             return q6_matmul(w, input);
         } else if constexpr (std::is_same_v<T, KQuantWeights>) {
             return kquant_matmul(w, input);
+        } else if constexpr (std::is_same_v<T, AffineWeights>) {
+            if (w.blocks.ndim() != 2 || w.blocks.shape(1) * 32 / w.bits != input.shape(1))
+                throw std::invalid_argument("incompatible affine linear dimensions");
+            return mx::astype(mx::quantized_matmul(mx::astype(input, mx::float16), w.blocks, w.scales, w.biases, true, w.group,
+                                                   w.bits, "affine"), mx::float32);
         } else {
             return q8_matmul(w, input);
         }

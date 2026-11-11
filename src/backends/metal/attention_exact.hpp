@@ -9,6 +9,7 @@
 //   then the block rows on the row's path in depth order (for AR and a chain: the next positions).
 // A block row t at depth d has x = P + d with d <= 15, so every block key falls in the loop, and T(x) is the same for the
 // row and its AR step: the two runs do the same operations on the same values.
+#include "matrix_unit.hpp"
 #include "attention_decode.hpp"
 #include "attention_qsa.hpp"
 #include "shape_constants.hpp"
@@ -236,6 +237,7 @@ inline mlx::core::array decode_attention_exact(const mlx::core::array& q, const 
 inline bool matrix_unit_available() {
     static const bool ok = [] {
         namespace mx = mlx::core;
+        if (!m5_matrix_unit()) return false;
         try {
             auto q = mx::zeros({1, 6, 1, 256}, mx::float32);
             auto k = mx::zeros({1, 1, 128, 256}, mx::bfloat16);
