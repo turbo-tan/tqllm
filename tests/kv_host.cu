@@ -11,15 +11,25 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <chrono>
 #include <vector>
 
 using namespace tqllm;
 using namespace tqllm_cuda;
 
 static int fails = 0;
+// progress on stderr after every step (stream synced first), so a slow or stuck run shows where it is (HIP gfx1100, PR #31)
+static const auto t_start = std::chrono::steady_clock::now();
+static void progress(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
+static void progress(const char * fmt, ...) {
+    std::fprintf(stderr, "kv_host [%7.2f s] ", std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+    va_list ap; va_start(ap, fmt); std::vfprintf(stderr, fmt, ap); va_end(ap);
+    std::fputc('\n', stderr); std::fflush(stderr);
+}
 #define CHECK(c, ...) do { if (!(c)) { std::printf("FAIL %s:%d ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); ++fails; } } while (0)
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return 1; } } while (0)
 
@@ -30,7 +40,9 @@ int main() {
     st = cudaStreamPerThread;
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    progress("start: %d SMs", sms);
     auto mem = make_cuda_kv_memory(st);
+    progress("KV memory backend made: granule %zu bytes", size_t(mem->granule()));
     if (!mem->granule()) {
         std::printf("kv_host: SKIP (no virtual memory management on this device)\n");
         return 0;
@@ -59,9 +71,12 @@ int main() {
         CK(cudaMalloc(&fk, krow * ctx));
         CK(cudaMalloc(&fv, vrow * ctx));
         KvGeometry geo{1, krow, vrow, ctx, dev_rows};
+        progress("%s: making the split pool (device rows %lld of %lld)", name, (long long)dev_rows, (long long)ctx);
         KvPool pool(*mem, geo, 1, 0);
         auto s = kv_store_policy("flat")->make(pool, ctx);
         CHECK(s->reserve(ctx), "%s: split store reserves the context", name);
+        progress("%s: split store reserved: device %.1f MB, host %.1f MB", name, double(pool.bytes(KvTier::device)) / 1e6,
+                 double(pool.bytes(KvTier::host)) / 1e6);
         void * sk = s->base(0, true), * sv = s->base(0, false);
         const int64_t boundary = int64_t(pool.bytes(KvTier::device) / 2 / krow);  // approx: first host row (K side)
         CHECK(pool.bytes(KvTier::host) > 0, "%s: part of the KV is in host memory", name);
@@ -71,8 +86,10 @@ int main() {
         for (int64_t p = 0; p < start; p += nbuf) steps.push_back({p, int(std::min<int64_t>(nbuf, start - p))});
         for (int64_t p = start; p < boundary + 2 * nbuf; p += nbuf) steps.push_back({p, nbuf});
         for (int64_t p = boundary + 2 * nbuf; p < boundary + 2 * nbuf + 5 * nver; p += nver) steps.push_back({p, nver});
-        int bad_o = 0, checked = 0;
+        int bad_o = 0, checked = 0, step = 0;
         for (const auto & [p, n] : steps) {
+            CK(cudaStreamSynchronize(st));
+            progress("%s: step %d / %zu, positions %lld + %d", name, step++, steps.size(), (long long)p, n);
             for (auto & v : hk) v = __float2bfloat16(nd(g));
             for (auto & v : hq) v = __float2bfloat16(nd(g));
             CK(cudaMemcpyAsync(k0, hk.data(), size_t(n) * ts * 2, cudaMemcpyHostToDevice, st));
@@ -115,6 +132,7 @@ int main() {
         CK(cudaMalloc(&fk, krow * ctx));
         CK(cudaMalloc(&fv, vrow * ctx));
         KvGeometry geo{1, krow, vrow, ctx, 12000, true};
+        progress("%s staged: making the pool", name);
         KvPool pool(*mem, geo, 1, 0);
         auto s = kv_store_policy("flat")->make(pool, ctx);
         s->reserve(ctx);
@@ -125,8 +143,10 @@ int main() {
         for (int64_t p = 0; p < 40000; p += nbuf) steps.push_back({p, nbuf});
         for (int64_t p = 40000; p < 40000 + 6 * nver; p += nver) steps.push_back({p, nver});
         steps.push_back({20000, nbuf});  // a rewind below the evicted boundary (request carryover)
-        int bad_o = 0, checked = 0;
+        int bad_o = 0, checked = 0, step = 0;
         for (const auto & [p, n] : steps) {
+            CK(cudaStreamSynchronize(st));
+            progress("%s staged: step %d / %zu, positions %lld + %d", name, step++, steps.size(), (long long)p, n);
             CHECK(pool.stage_ensure(p, p + n), "%s: window holds the block at %lld", name, (long long)p);
             const int64_t b[2] = {int64_t(pool.staged_bytes(true)), int64_t(pool.staged_bytes(false))};
             CK(cudaMemcpyAsync(nb, b, 16, cudaMemcpyHostToDevice, st));
@@ -154,6 +174,7 @@ int main() {
         s.reset();
         cudaFree(nb), cudaFree(fk), cudaFree(fv);
     }
+    progress("teardown check");
     {  // teardown order of an engine: its stream is destroyed before the pool unmaps (regression: WSL lost the context)
         cudaStream_t s2;
         CK(cudaStreamCreate(&s2));
