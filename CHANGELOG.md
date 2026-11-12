@@ -3,6 +3,18 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Changed
+- int8 prefill (`--prefill-int8`, Ampere / RTX 40 / RTX 50) for llama.cpp IQ4_XS GGUFs: the weights are quantised to int8
+  straight from the 4-bit data (one pass, bit-identical to the FP16 dequant + quantise passes), the int8 weight operand
+  lives inside the FP16 prefill scratch (no extra VRAM), and plain-basis weights get dynamic SmoothQuant column scales
+  (activation outlier channels moved into the weights, per GEMM). Per-token int8 activations were all of the int8 error
+  on these files (KLD vs a Q6_K reference 0.0079 FP16 -> 0.0103 int8; with the scales 0.0080), and the int8 drafter
+  features test now passes on them. RTX 3090, Qwen3.8-27B IQ4_XS, DFlash2, 128K q8/q4, prefill tok/s FP16 / int8 before /
+  int8 now: 8K 1739 / 1968 / 2102, 32K 1590 / 1880 / 1994, 98K 1270 / 1458 / 1527. TQ formats (rotated basis) keep plain
+  int8: the scales buy them nothing.
+
 ## 1.5.0 (2026-11-10)
 
 ### Added

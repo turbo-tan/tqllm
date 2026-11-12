@@ -116,6 +116,7 @@ public:
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
             calibrate_prefill();
+            smooth_prebuild();
             memlog("calibrate");
             pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
@@ -530,6 +531,14 @@ private:
     std::unique_ptr<tqllm_cuda::Fp8Gemm> fp8;  // --prefill-fp8 on (sm_89+): FP8 prefill GEMMs
     std::unique_ptr<tqllm_cuda::Int8Gemm> i8;  // --prefill-int8 on (Ampere): int8 prefill GEMMs into gemm_c as int32
     bool i8_used = false;
+    // int8 SmoothQuant (the int8 path's default; TQLLM_DEBUG=i8_nosmooth for plain per-token activations): per gemm_rows
+    // call, x / s and w * s with s from the column abs-max of x (sm_ax) and of w (sm_aw, built once per matrix)
+    Buf sm_ax, sm_s;
+    std::map<const void *, Buf> sm_aw;
+    bool sm_on = false;
+    bool smooth_setup(const Mat & m, int n);
+    const float * smooth_aw(const Mat & m);  // nullptr: no smoothing for this matrix
+    void smooth_prebuild();
     Buf fp8_sw;                     // row scales of the current gemm_rows output, [ldo]
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)

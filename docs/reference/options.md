@@ -131,7 +131,7 @@ same file's plain decoding. Files without indexers ignore the option.
 | `--graph-keep-mb MiB` | 384 (0 under WSL) | a graph miss also evicts while less than this is free on the device; lower it when the card is full by design (e.g. a drafter plus a long KV pool) so the cache keeps its graphs instead of re-capturing every step |
 | `-ub N` | automatic | prefill chunk (ubatch) size |
 | `--prefill-fp8 on\|off` | off | FP8 prefill GEMMs (sm_89+): about +40 % prefill on GB10 but KLD ~0.01 vs FP16 prefill, so opt-in; slower on 16 GB cards |
-| `--prefill-int8 on\|off` | on for RTX 30 / 40 / 50 | int8 prefill GEMMs (RTX 50: +11-13 % prefill on a 5060 Ti; RTX 40 by analogy) |
+| `--prefill-int8 on\|off` | on for RTX 30 / 40 / 50 | int8 prefill GEMMs (RTX 50: +11-13 % prefill on a 5060 Ti; RTX 40 by analogy). IQ4_XS GGUF weights go straight to int8; plain-basis weights (llama.cpp GGUFs) get SmoothQuant column scales, which keep the KLD at the FP16 prefill's (RTX 3090, Qwen3.8-27B IQ4_XS: prefill +20-25 % over FP16, +5-7 % over int8 before) |
 
 ### Memory fit: what it does and how to override it
 

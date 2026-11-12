@@ -80,6 +80,14 @@ struct WeightFormat {
     // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
     // dequant_h + per-chunk quantise path (the default for every format).
     virtual bool dequant_i8(const Mat &, int8_t * w8, float * row_scale, cudaStream_t) const { return false; }
+    // dequant_i8 above returns true (the engine then needs no FP16 scratch for this format's int8 GEMMs)
+    virtual bool has_dequant_i8() const { return false; }
+    // dequant_i8 of the weights times col_mul[column] (SmoothQuant column scales, cols floats on the device); false: not
+    // supported (the engine then smooths through dequant_h, or not at all for a format with a plain dequant_i8)
+    virtual bool dequant_i8_cm(const Mat &, const float * /*col_mul*/, int8_t * /*w8*/, float * /*row_scale*/, cudaStream_t) const {
+        return false;
+    }
+    virtual bool has_dequant_i8_cm() const { return false; }
     // Device bytes per row of the data / aux arrays when rows are stored contiguously (a row range is then a Mat of its
     // own: p + r0 * row_bytes, aux + r0 * aux_row_bytes); 0 = not row-sliceable.
     virtual size_t row_bytes(int /*cols*/) const { return 0; }
