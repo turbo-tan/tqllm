@@ -606,8 +606,64 @@ PrefillPath Qwen35Engine::path_of(const Mat & m, int n) const {
     return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, verify_width);
 }
 
+// int8 SmoothQuant scales for this gemm_rows call (one s for all parts of a composite, so the activations are quantised
+// once). Per-token int8 activations are where the int8 prefill loses accuracy (the per-row int8 weights do not: the
+// FP16 GEMM on int8-rounded weights alone is at the FP16 KLD); moving the outlier channels into the weights recovers it.
+const float * Qwen35Engine::smooth_aw(const Mat & m) {
+    static const bool off = tqllm::debug_on("i8_nosmooth");
+    if (off || !i8 || !m.p || !m.fmt || m.cols % 16) return nullptr;
+    std::vector<Mat> parts;
+    if (const auto * ps = m.fmt->parts()) parts.assign(ps->begin(), ps->end());
+    else parts.push_back(m);
+    for (const Mat & p : parts) {
+        // rotated formats (TQ3 / TQ4: Walsh-Hadamard input basis) already spread the activation outliers: smoothing buys no
+        // accuracy there (int8 drafter features on TQ_XS unchanged) and costs ~2 % of prefill
+        if (p.fmt->basis() != Basis::Plain) return nullptr;
+        // a format with its own int8 reconstruct but no column-scaled one keeps it, unsmoothed
+        if (p.fmt->has_dequant_i8() && !p.fmt->has_dequant_i8_cm()) return nullptr;
+    }
+    auto it = sm_aw.find(m.p);
+    if (it == sm_aw.end()) {  // the weights' column abs-max, once per matrix (at load: smooth_prebuild)
+        Buf aw(size_t(m.cols) * 4);
+        ck(cudaMemsetAsync(aw.p, 0, size_t(m.cols) * 4, stream));
+        for (const Mat & p : parts) {
+            p.fmt->dequant_h(p, gemm_w.as<__half>(), stream);
+            tqllm_cuda::int8_colmax_h(gemm_w.as<__half>(), p.rows, p.cols, p.cols, aw.as<float>(), stream);
+        }
+        it = sm_aw.emplace(m.p, std::move(aw)).first;
+    }
+    return it->second.as<float>();
+}
+
+void Qwen35Engine::smooth_prebuild() {
+    if (!i8) return;
+    for (const auto & L : layer)
+        for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
+                              &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
+            smooth_aw(*m);
+    sync_ck();
+}
+
+// int8 SmoothQuant scales for this gemm_rows call (one s for all parts of a composite, so the activations are quantised
+// once). Per-token int8 activations are where the int8 prefill loses accuracy (the per-row int8 weights do not: the
+// FP16 GEMM on int8-rounded weights alone is at the FP16 KLD); moving the outlier channels into the weights recovers it.
+bool Qwen35Engine::smooth_setup(const Mat & m, int n) {
+    static const float alpha = [] {
+        const std::string * v = tqllm::debug_value("i8_alpha");
+        return v ? std::stof(*v) : 0.75f;
+    }();
+    if (!i8 || gemm_pad_rows(n, NBUF) < 1024) return false;
+    const float * aw = smooth_aw(m);
+    if (!aw) return false;
+    ck(cudaMemsetAsync(sm_ax.p, 0, size_t(m.cols) * 4, stream));
+    tqllm_cuda::int8_colmax_h(v_xh.as<__half>(), n, m.cols, m.cols, sm_ax.as<float>(), stream);
+    tqllm_cuda::int8_smooth_scales(sm_ax.as<float>(), aw, sm_s.as<float>(), m.cols, alpha, stream);
+    return true;
+}
+
 void Qwen35Engine::gemm_rows(const Mat & m, bf16 * out, int n, int ldo) {
     fp8_x_ready = fp8_used = i8_used = false;
+    sm_on = smooth_setup(m, n);
     if (const auto * ps = m.fmt->parts()) {  // composite: each part's GEMM into its own row block
         int r0 = 0;
         for (const auto & p : *ps) {
@@ -648,14 +704,15 @@ void Qwen35Engine::gemm_c_rows(const Mat & m, int n, int ldo, int r_off) {
         // Formats that can quantise their weights to int8 themselves (X3's straight-to-int8 reconstruct with
         // load-time scales) skip the FP16 round trip and the per-chunk weight quantise pass entirely.
         float* sw = fp8_sw.as<float>() + r_off;
-        const bool preq = m.fmt->dequant_i8(m, i8->w8(), sw, stream);
+        const float * cm = sm_on ? sm_s.as<float>() : nullptr;  // SmoothQuant column scales (smooth_setup)
+        const bool preq = cm ? m.fmt->dequant_i8_cm(m, cm, i8->w8(), sw, stream) : m.fmt->dequant_i8(m, i8->w8(), sw, stream);
         if (!preq) m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
         if (!fp8_x_ready) {
-            i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream);
+            i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream, cm);
             fp8_x_ready = true;
         }
         if (preq) i8->gemm_prequant(m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, stream);
-        else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream);
+        else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream, cm);
         i8_used = true;
         return;
     }

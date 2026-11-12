@@ -79,6 +79,11 @@ struct PluginPatch final : WeightFormat {
         else base->dequant_h(m, out, s);
     }
     bool dequant_i8(const Mat & m, int8_t * w8, float * rs, cudaStream_t s) const override { return base->dequant_i8(m, w8, rs, s); }
+    bool has_dequant_i8() const override { return base->has_dequant_i8(); }
+    bool dequant_i8_cm(const Mat & m, const float * cm, int8_t * w8, float * rs, cudaStream_t s) const override {
+        return base->dequant_i8_cm(m, cm, w8, rs, s);
+    }
+    bool has_dequant_i8_cm() const override { return base->has_dequant_i8_cm(); }
     size_t row_bytes(int cols) const override { return base->row_bytes(cols); }
     size_t aux_row_bytes(int cols) const override { return base->aux_row_bytes(cols); }
     bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override { return base->gemm(m, x, y, n, s); }

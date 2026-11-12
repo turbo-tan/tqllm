@@ -627,14 +627,35 @@ void Qwen35Engine::allocate() {
                     for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
                                           &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
                         if (m->p && m->fmt) mk = std::max(mk, size_t(m->cols));
+                // The int8 weight operand can live in gemm_w behind the FP16 dequant of the largest matrix whose format
+                // has no dequant_i8 (an int8 GEMM reads only one of the two, and gemm_w is otherwise free between GEMMs):
+                // no extra VRAM when those matrices are at most half the largest. cuBLAS and cuBLASLt share blas_ws.
+                size_t e_h = 0;  // elements of the largest matrix the int8 path dequantises to FP16 first
+                for (const auto & L : layer)
+                    for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
+                                          &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
+                        if (m->p && m->fmt) {
+                            if (const auto * ps = m->fmt->parts()) {
+                                for (const auto & p : *ps)
+                                    if (!p.fmt->has_dequant_i8()) e_h = std::max(e_h, size_t(p.rows) * p.cols);
+                            } else if (!m->fmt->has_dequant_i8()) {
+                                e_h = std::max(e_h, size_t(m->rows) * m->cols);
+                            }
+                        }
+                const size_t w8_off = (e_h * 2 + 255) / 256 * 256;
+                int8_t * w8 = w8_off + mx <= mx * 2 && !tqllm::debug_on("i8_own_w8") ? static_cast<int8_t *>(gemm_w.p) + w8_off : nullptr;
+                blas_ws = Buf(size_t(32) << 20);
                 i8 = std::make_unique<tqllm_cuda::Int8Gemm>();
-                i8->init(mx, size_t(NBUF) * mk, int(mr), NBUF);
+                i8->init(mx, size_t(NBUF) * mk, int(mr), NBUF, w8, blas_ws.p, size_t(32) << 20);
                 if (!fp8_sw.p) fp8_sw = Buf(size_t(mr) * 4);
-                std::fprintf(stderr, "tqllm: prefill GEMMs in int8 (per-row x per-token scales; --prefill-int8 off for FP16)\n");
+                sm_ax = Buf(mk * 4);
+                sm_s = Buf(mk * 4);
+                std::fprintf(stderr, "tqllm: prefill GEMMs in int8 (per-row x per-token scales%s; --prefill-int8 off for FP16)\n",
+                             w8 ? ", int8 weights in the FP16 scratch" : "");
             }
             gemm_c_bytes = size_t(NBUF) * mr * 4;
             gemm_c = Buf(gemm_c_bytes);
-            blas_ws = Buf(size_t(32) << 20);
+            if (!blas_ws.p) blas_ws = Buf(size_t(32) << 20);
             cb(cublasSetWorkspace(blas, blas_ws.p, size_t(32) << 20));
         }
     }

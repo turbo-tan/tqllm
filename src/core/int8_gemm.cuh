@@ -19,6 +19,11 @@ namespace tqllm_cuda {
 // out[r][c] = round(in[r][c] / scale[r]), scale[r] = max_c |in[r][c]| / 127 (1 for an all-zero row)
 void int8_quant_rows(const __half * in, int rows, int cols, int ld_in, int8_t * out, float * scale, cudaStream_t s);
 // out[m * ldo + n] = bf16(c[m * ldo + n] * sw[n] * sx[m]) / fp16 (same), n < ldo, m < ntok
+// SmoothQuant-style column scales for one int8 GEMM (x / scale, w * scale: the product is unchanged, the activation
+// outlier channels move into the weights, whose per-row int8 has room): scale[c] = ax[c]^alpha / aw[c]^(1 - alpha),
+// ax / aw the column abs-max of x and of w (int8_colmax_h accumulates into a zeroed out[cols])
+void int8_colmax_h(const __half * a, int rows, int cols, int ld, float * out, cudaStream_t s);
+void int8_smooth_scales(const float * ax, const float * aw, float * scale, int cols, float alpha, cudaStream_t s);
 void int8_i32_to_bf16_scaled(const int32_t * c, __nv_bfloat16 * out, int ntok, int ldo, const float * sw, const float * sx, cudaStream_t s);
 void int8_i32_to_h_scaled(const int32_t * c, __half * out, int ntok, int ldo, const float * sw, const float * sx, cudaStream_t s);
 
@@ -26,11 +31,15 @@ class Int8Gemm {
 public:
     static bool supported();   // int8 tensor cores: compute capability >= 8.0
     static bool default_on();  // Ampere and RTX 50 measured, RTX 40 by analogy; GB10 uses FP8
-    void init(size_t max_w, size_t max_x, int max_rows, int max_tok);
+    // w8 / ws: caller-owned scratch to use instead of allocating (w8 >= max_w bytes; ws = ws_bytes of cuBLAS(Lt)
+    // workspace); both only touched by work on the stream of the calls below
+    void init(size_t max_w, size_t max_x, int max_rows, int max_tok, int8_t * w8 = nullptr, void * ws = nullptr, size_t ws_bytes = 0);
     ~Int8Gemm();
     // X quantised once per GEMM group; W [rows][k] FP16; Y int32 [tok][ldo] (unscaled), row scales to sw_out [rows]
-    void quant_x(const __half * x, int ldx, int tok, int k, cudaStream_t s);
-    void gemm(const __half * w, int rows, int k, int tok, int32_t * y, int ldo, float * sw_out, cudaStream_t s);
+    // col_div / col_mul (k floats, optional): x columns divided by / w columns multiplied by them before quantising
+    void quant_x(const __half * x, int ldx, int tok, int k, cudaStream_t s, const float * col_div = nullptr);
+    void gemm(const __half * w, int rows, int k, int tok, int32_t * y, int ldo, float * sw_out, cudaStream_t s,
+              const float * col_mul = nullptr);
     // Weights already quantised into w8_ (a format's straight-to-int8 reconstruct) with the row scales in place:
     // multiply only, no quantise pass.
     void gemm_prequant(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s);
@@ -42,6 +51,7 @@ private:
     int8_t * w8_ = nullptr, * x8_ = nullptr;
     float * sw_ = nullptr, * sx_ = nullptr;
     void * ws_ = nullptr;
+    bool own_w8_ = true, own_ws_ = true;
     void matmul(int rows, int k, int tok, int32_t * y, int ldo, cudaStream_t s);
     size_t ws_bytes_ = size_t(32) << 20;
     std::map<std::tuple<int, int, int, int>, cublasLtMatmulAlgo_t> algos_;

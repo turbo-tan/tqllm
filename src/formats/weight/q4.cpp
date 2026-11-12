@@ -3,6 +3,7 @@
 #include "dequant.hpp"
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
+#include "debug.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -372,6 +373,25 @@ struct Iq4n final : WeightFormat {
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         tqllm_cuda::iq4n_dequant_h(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), out, m.rows,
                                    m.cols, s);
+    }
+    // int8 prefill: the int8 operand and row scales of dequant_h + int8_quant_rows in one pass over the 4-bit data
+    static bool twopass() {
+        static const bool v = tqllm::debug_on("iq4_i8_twopass");  // A/B: dequant_h + int8_quant_rows
+        return v;
+    }
+    bool has_dequant_i8() const override { return !twopass(); }
+    bool dequant_i8(const Mat & m, int8_t * w8, float * row_scale, cudaStream_t s) const override {
+        if (twopass()) return false;
+        tqllm_cuda::iq4n_dequant_i8(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), w8, row_scale,
+                                    m.rows, m.cols, s);
+        return true;
+    }
+    bool has_dequant_i8_cm() const override { return !twopass(); }
+    bool dequant_i8_cm(const Mat & m, const float * col_mul, int8_t * w8, float * row_scale, cudaStream_t s) const override {
+        if (twopass()) return false;
+        tqllm_cuda::iq4n_dequant_i8(static_cast<const uint8_t *>(m.p), static_cast<const uint8_t *>(m.aux), w8, row_scale,
+                                    m.rows, m.cols, s, col_mul);
+        return true;
     }
 };
 

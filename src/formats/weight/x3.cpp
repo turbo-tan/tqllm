@@ -516,6 +516,7 @@ public:
 
     // int8 prefill: each part reconstructed straight to int8 with the load-time row scales (no FP16 round trip, no
     // per-chunk quantise pass); row_scale copied from the descriptor's load-time array.
+    bool has_dequant_i8() const override { return true; }
     bool dequant_i8(const Mat& m, int8_t* w8, float* row_scale, cudaStream_t s) const override {
         auto* d = static_cast<X3Desc*>(const_cast<void*>(m.aux));
         ensure_scales(*d, s);

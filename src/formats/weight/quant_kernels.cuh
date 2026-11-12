@@ -223,6 +223,10 @@ void iq3_matvec_split_bf16(const uint8_t * w, const uint8_t * rec, const __half 
 void iq3_matvec_split(const uint8_t * w, const uint8_t * rec, const __half * xh, float * y, int rows, int k, int ncols,
                       int pf, cudaStream_t);
 void iq4n_dequant_h(const uint8_t * w, const uint8_t * rec, __half * out, int rows, int k, cudaStream_t);
+// int8 prefill: IQ4N straight to int8 [rows][k] + row scales amax/127 (= iq4n_dequant_h, then int8_quant_rows);
+// cm (k floats, optional): columns multiplied by cm before quantising
+void iq4n_dequant_i8(const uint8_t * w, const uint8_t * rec, int8_t * out, float * scale, int rows, int k, cudaStream_t,
+                     const float * cm = nullptr);
 void tq4_matvec_i8_bf16(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
                         cudaStream_t, int mt = 2);
 void tq4_matvec_bf16(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,

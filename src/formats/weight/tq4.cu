@@ -992,6 +992,81 @@ void iq4n_dequant_h(const uint8_t * w, const uint8_t * rec, __half * out, int ro
     iq4n_dequant_h_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(w, rec, out, n, k);
 }
 
+// The 16 FP16 weights of group gi exactly as iq4n_dequant_h_k writes them.
+__device__ __forceinline__ void iq4n_group_h(const uint8_t * w, const uint8_t * rec, int64_t gi, int k, __half (&v)[16]) {
+    const int64_t blk = gi / 2;
+    const int h = int(gi % 2), nb = k / 32;
+    const int64_t row = blk / nb;
+    const int b = int(blk % nb);
+    const __half sc = tq4k::iq4_scale(rec + (row * (nb / 8) + b / 8) * 8, b % 8);
+    const uint2 q = *reinterpret_cast<const uint2 *>(w + blk * 16 + h * 8);
+    const uint32_t qw[2] = {q.x, q.y};
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const uint32_t lv = tq4k::iq4_levels((u & 1) ? qw[u / 2] >> 16 : qw[u / 2]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) v[4 * u + e] = __hmul(__int2half_rn(int((lv >> (8 * e)) & 0xFF) - 128), sc);
+    }
+}
+
+// IQ4N straight to int8 [rows][k] for the int8 prefill GEMM, one block per row: the row scale amax/127 of the FP16 row
+// iq4n_dequant_h writes (1 for a zero row), then the values int8_quant_rows makes of that row - the same int8 operand and
+// scales as dequant_h + int8_quant_rows, without the FP16 round trip (the second pass re-reads the row from L1/L2).
+// cm (k floats, optional): the FP16 values times cm[column] first (SmoothQuant column scales).
+template <bool CM>
+__global__ void __launch_bounds__(64) iq4n_dequant_i8_k(const uint8_t * w, const uint8_t * rec, int k, int8_t * out, float * scale,
+                                                        const float * cm) {
+    // 64 threads per row: 5120 / 17408 columns are 320 / 1088 groups of 16, a multiple of 64 (no idle second pass)
+    const int64_t r = blockIdx.x, g0 = r * (k / 16);
+    const int ng = k / 16;
+    auto group = [&](int g, float (&f)[16]) {
+        __half v[16];
+        iq4n_group_h(w, rec, g0 + g, k, v);
+        if constexpr (CM) {
+            const float4 * c4 = reinterpret_cast<const float4 *>(cm + g * 16);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float4 c = __ldg(c4 + q);
+                f[4 * q] = __half2float(v[4 * q]) * c.x;
+                f[4 * q + 1] = __half2float(v[4 * q + 1]) * c.y;
+                f[4 * q + 2] = __half2float(v[4 * q + 2]) * c.z;
+                f[4 * q + 3] = __half2float(v[4 * q + 3]) * c.w;
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) f[e] = __half2float(v[e]);
+        }
+    };
+    float m = 0.f;
+    for (int g = threadIdx.x; g < ng; g += 64) {
+        float f[16];
+        group(g, f);
+#pragma unroll
+        for (int e = 0; e < 16; ++e) m = fmaxf(m, fabsf(f[e]));
+    }
+    __shared__ float red[2];
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = m;
+    __syncthreads();
+    m = fmaxf(red[0], red[1]);
+    const float sc = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sc;
+    if (threadIdx.x == 0) scale[r] = sc;
+    for (int g = threadIdx.x; g < ng; g += 64) {
+        float f[16];
+        group(g, f);
+        __align__(16) int8_t q[16];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) q[e] = int8_t(__float2int_rn(fminf(fmaxf(f[e] * inv, -127.f), 127.f)));
+        reinterpret_cast<uint4 *>(out)[g0 + g] = *reinterpret_cast<const uint4 *>(q);
+    }
+}
+void iq4n_dequant_i8(const uint8_t * w, const uint8_t * rec, int8_t * out, float * scale, int rows, int k, cudaStream_t s,
+                     const float * cm) {
+    if (rows < 1) return;
+    if (cm) iq4n_dequant_i8_k<true><<<rows, 64, 0, s>>>(w, rec, k, out, scale, cm);
+    else iq4n_dequant_i8_k<false><<<rows, 64, 0, s>>>(w, rec, k, out, scale, nullptr);
+}
+
 // dequantise IQ4L to FP16 [rows][k]; one thread per 16-weight group, two 16-byte stores
 __global__ void iq4l_dequant_h_k(const uint8_t * w, const __half * sc, __half * out, int64_t ngroups) {
     const int64_t gi = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
