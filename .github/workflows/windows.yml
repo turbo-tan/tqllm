@@ -109,8 +109,9 @@ jobs:
       - name: Host objects (every C++ file of tqserve, MSVC)
         shell: bash
         run: |
-          ninja -C build -t targets all | sed -n 's/^\([^:]*\.cpp\.obj\): .*/\1/p' | sort -u > host_objs.txt
-          echo "$(wc -l < host_objs.txt) host objects"
+          # only what tqserve links: tests and the MoE tools are Linux-only (docs/guides/windows.md)
+          ninja -C build -t commands tqserve | grep -o '/Fo[^ ]*\.cpp\.obj' | sed 's#^/Fo##; s#\\#/#g' | sort -u > host_objs.txt
+          echo "$(wc -l < host_objs.txt) host objects"; [ -s host_objs.txt ] || { echo "::error::no host objects found for tqserve"; exit 1; }
           xargs -n 40 ninja -C build -k 0 < host_objs.txt
 
       - name: tqserve (CUDA kernels and link)
