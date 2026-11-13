@@ -3,6 +3,11 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
+
 ## 1.6.0 (2026-11-13)
 
 ### Added

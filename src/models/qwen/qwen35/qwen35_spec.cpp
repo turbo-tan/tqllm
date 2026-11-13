@@ -253,6 +253,10 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         int m_last = 0;
         // drafter K/V ring: positions older than P - ring are overwritten before the first draft, so skip them
         const uint32_t inj0 = dfl.ring > 0 && P > uint32_t(dfl.ring) ? P - uint32_t(dfl.ring) : 0;
+        // Where the final chunk's head left the last prompt position's top-16 (verify_body): a chunk longer than NVER runs
+        // the head on its last position only, into column 0; a shorter one (a chat prompt's last message is a chunk of its
+        // own, a few tokens) runs it on every column, so the last position is column m - 1.
+        const auto final_top16 = [](int m) { return m <= NVER ? size_t(m - 1) * 16 : size_t(0); };
         try {
             for (uint32_t t = P0, ci = 0; t < P; t += uint32_t(m_last), ++ci) {
                 const int m = int(std::min<uint32_t>(chunk_end(starts, t, P, uint32_t(CH)) - t, snap > t ? snap - t : P));
@@ -275,8 +279,9 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                         next = h_tok[0];
                         if (sampling()) {  // sample the first token now: the first MTP draft below must follow it, and
                                            // the draft's head pass may overwrite column 0's top-16 on the device
-                            ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
-                            ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
+                            const size_t tc = final_top16(m);
+                            ck(cudaMemcpy(h_sid.data(), s_id.as<uint32_t>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
+                            ck(cudaMemcpy(h_slg.data(), s_lg.as<float>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
                             next = draw(dist(0), rng);
                         }
                     }
@@ -318,9 +323,10 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
             }
         }
         if (!use_mtp) next = h_tok[0];
-        if (sampling() && !use_mtp) {  // the final chunk's head wrote column 0's top-16 (MTP: sampled in the loop)
-            ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
-            ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
+        if (sampling() && !use_mtp) {  // the last prompt position's top-16 (MTP: sampled in the loop)
+            const size_t tc = final_top16(m_last);
+            ck(cudaMemcpy(h_sid.data(), s_id.as<uint32_t>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(h_slg.data(), s_lg.as<float>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
             next = draw(dist(0), rng);
         }
         if (kv_cmp && opt.kv_compact_turn) {  // refit the old blocks on this request's queries before decoding
