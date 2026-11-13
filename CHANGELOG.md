@@ -12,6 +12,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - 27B with a DFlash2 drafter: a reply ends at its end-of-sequence token. When the EOS was accepted inside a draft block, the drafts after it and the bonus token were appended too (greedy or sampled, chain or tree).
 - Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
 - Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
+- MSVC: `tests/gguf_validation.cpp`, `tests/tokenizer_gguf.cpp` and `tests/expert_bank_plan.cpp` build without `<unistd.h>` / `setenv`, `tqllm/rope_scaling.hpp` no longer needs `M_PI`, and `-DBUILD_TESTING=OFF` defines no test target (124 `test-*` executables were still built).
 
 ## 1.6.0 (2026-11-13)
 
