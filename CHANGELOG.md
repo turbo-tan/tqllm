@@ -6,6 +6,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Fixed
+- Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
 - Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
 
 ## 1.6.0 (2026-11-13)
