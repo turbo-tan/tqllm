@@ -117,3 +117,15 @@ jobs:
       - name: tqserve (CUDA kernels and link)
         shell: pwsh
         run: cmake --build build --target tqserve -- -k 0
+
+      - name: Everything else (not a gate; lists what does not build on MSVC)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          ninja -C build -k 0 all > rest.log 2>&1; rc=$?
+          grep -o '^FAILED: [^ ]* [^ ]*' rest.log | awk '{print $NF}' | sort -u > rest_failed.txt
+          echo "### Not building on MSVC (outside tqserve): $(wc -l < rest_failed.txt) objects" >> $GITHUB_STEP_SUMMARY
+          sed 's/^/- /' rest_failed.txt >> $GITHUB_STEP_SUMMARY
+          for f in $(cat rest_failed.txt); do grep -A3 "^FAILED: .*$f" rest.log | grep -m1 -E "error C|fatal error" | sed "s#^#$f: #"; done | cut -c1-240
+          exit $rc
