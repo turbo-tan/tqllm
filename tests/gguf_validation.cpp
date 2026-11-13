@@ -1,11 +1,11 @@
 #include "gguf.hpp"
+#include "platform/os_file.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 namespace {
 int failures = 0;
@@ -44,7 +44,7 @@ void check(const Fixture & fixture, bool accept, const std::string & name, const
 }
 }
 int main() {
-    const auto path = (std::filesystem::temp_directory_path() / ("tqllm_gguf_validation_" + std::to_string(getpid()))).string();
+    const auto path = (std::filesystem::temp_directory_path() / ("tqllm_gguf_validation_" + std::to_string(tqllm::os::process_id()))).string();
     Fixture f;
     check(f, true, "default alignment", path);
     f.explicit_alignment = true; f.alignment = 64;
