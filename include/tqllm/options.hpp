@@ -19,7 +19,7 @@ struct EngineOptions {
     std::string kv;
     bool exact = true;  // --exact on|off (see above)
     int qsa_from = -1;  // --qsa-from N|off: QSA sparse attention for rows past N keys when the model file carries QSA indexers
-                        // (-1: the file's qsa.sparse_from, else 49152; 0 / off: always dense). The value changes the text.
+                        // (-1: Metal the file's qsa.sparse_from, else 49152; CUDA dense, QSA is opt-in there; 0 / off: always dense). The value changes the text.
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)
     RopeScaling rope;   // --rope-scaling none|linear|yarn --rope-scale F --yarn-orig-ctx N ... (llama.cpp names)
     int kv_compact = 0;    // --kv-compact R: TqCache compaction (opt-in): while the server is idle, old evicted 8K blocks become
@@ -28,8 +28,10 @@ struct EngineOptions {
                                    // queries (the question), at the cost of that time before the first token
     int prefill_int8 = -1;  // --prefill-int8 on|off: prefill GEMMs in int8 (per-row x per-token scales) default on RTX 30 / 40 / 50, opt-in elsewhere (sm_80+)
     int prefill_fp8 = -1;  // --prefill-fp8 on|off: prefill GEMMs in FP8 (E4M3, per-row x per-token scales); default on GB10 (validated), opt-in on other sm_89+ GPUs
-    bool prompt_cache = false;  // --prompt-cache on|off: one slot keeps the previous request's cache and prefills only the
+    bool prompt_cache = false;  // --prompt-cache on|off: each slot keeps its conversation's cache and prefills only the
                                 // part of a new prompt past the shared prefix (on with --kv-compact)
+    int prompt_park = -1;       // --prompt-park N: kept conversation states parked outside the slots (host memory), so a
+                                // follow-up resumes after its slot served others; -1: from memory, 0: off
     bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
                            // link speed (one slot, compressed KV); off: the newest positions stay in host memory
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
@@ -37,6 +39,11 @@ struct EngineOptions {
     std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (the MTP head is then not loaded)
     int tp_rank = 0, tp_world = 1, tp_port = 29600;  // --tp-rank R --tp-peer IP [--tp-port P]: MiniMax over two linked boxes
     std::string tp_peer;       // rank 0's address on the linked network (rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`)
+    bool split_layers = false; // --split layer (with --tp-rank): each rank (GPU) holds a contiguous range of layers, the hidden
+                               // rows go rank to rank (exact; capacity: two GPUs hold one model). docs/steering plans multi-gpu
+    bool split_experts = false; // --split experts (with --tp-rank, Flash-Next): while rank 1 has no request of its own it computes
+                                // the experts e % 2 == 1 of rank 0's decode forwards (exact: same kernels, combine in one-box order)
+    int split_at = -1;         // --split-at N: first layer of rank 1 (-1: half the layers)
     std::vector<std::string> plugins;          // --plugin PATH (repeatable): weight-format plugins, CUDA builds (docs/guides/plugins.md)
     std::vector<std::string> inexact_patches;  // set by the plugin loader: applied patches not byte-identical to the built-in
     std::string hot_map;       // --hot-map FILE: MiniMax routing counts; the busiest experts are preloaded, the rest stay on disk
@@ -75,7 +82,7 @@ struct EngineOptions {
     bool fit_lossy = true;  // -fitl off: refuse a load that needs another KV codec / context / prefill split (default: apply and announce)
     // parallel slots (tqserve --np): --slot-reserve MiB free per slot after loading, else the load refuses the --np and
     // names the largest that fits; --graph-cache N captured CUDA graphs kept (~12 MB each, least recently used evicted)
-    long slot_reserve_mb = 128;
+    long slot_reserve_mb = -1;  // -1: by drafter (fit_slot_reserve_mb: 128 with -md / --mtp, else 32)
     int graph_cache = 256;
     long graph_keep_mb = 384;  // a graph miss also evicts while less than this is free; the fit sets 0 under WSL
 

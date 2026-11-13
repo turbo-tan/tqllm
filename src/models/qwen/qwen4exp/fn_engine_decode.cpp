@@ -4,6 +4,7 @@
 namespace tqllm::flashnext {
 
 void FlashNextEngine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
+    const auto lk = ep_lock();
     auto & checkpoint = *f_.cp;
     require(n > 0 && pos + uint32_t(n) <= slot_context(), "Flash-Next verify: block past the slot context");
     if (pos == 0 || !S().model_) {
@@ -61,6 +62,7 @@ void FlashNextEngine::remember_copy(SlotState & sl) {
     if (copy_history_.size() > 4) copy_history_.erase(copy_history_.begin());
 }
 bool FlashNextEngine::spec_advance() {
+    const auto lk = ep_lock();
     if (S().done_) return false;
     if (S().steps_ == 8 && tqllm::debug_on("mem")) ledger("decode step 8");
     bind();
@@ -119,6 +121,7 @@ bool FlashNextEngine::spec_advance() {
 }
 
 void FlashNextEngine::spec_step(const int * ids, int n, bool * done) {
+    const auto lk = ep_lock();
     const int topk = f_.cp->config.topk;
     std::vector<int> act;
     for (int i = 0; i < n; ++i) { done[i] = slots_[size_t(ids[i])].done_; if (!done[i]) act.push_back(i); }

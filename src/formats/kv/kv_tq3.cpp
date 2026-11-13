@@ -15,6 +15,8 @@ struct KvTq3 final : KvFormat {
     }
     int split_factor() const override { return 2; }
     bool tree_ok() const override { return true; }
+    bool qsa_ok() const override { return true; }
+    bool qsa_host_ok() const override { return true; }
     bool compact_codecs(int & k, int & v) const override { k = v = int(tqllm_cuda::KvCodec::Tq3); return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override {
         if (hd != 256) throw std::runtime_error("KV format tq3 requires head_dim 256");
@@ -27,7 +29,8 @@ struct KvTq3 final : KvFormat {
                                             a.head_dim, a.stream);
         tqllm_cuda::attention_kv_split(tqllm_cuda::KvCodec::Tq3, tqllm_cuda::KvCodec::Tq3, a.q, k3, v3,
                                        a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.n > a.nver ? 1 : a.split, a.stream, a.par, a.dep,
-                                       static_cast<const tqllm_cuda::KvCompactSeg *>(a.compact));
+                                       static_cast<const tqllm_cuda::KvCompactSeg *>(a.compact), a.par ? a.qsa_sel : nullptr, a.qsa_from,
+                                       a.qsa_mixed);
     }
 };
 }  // namespace

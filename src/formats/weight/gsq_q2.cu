@@ -30,7 +30,7 @@ template<class T> __global__ void dot_warp(const unsigned char * weights, const 
         const __half2 * xv = reinterpret_cast<const __half2 *>(x + int64_t(input) * cols);
         for (int b = 0; b < cols / 64; ++b) {
             const unsigned char * block = r + b * 18;
-            const float scale = __half2float(__ushort_as_half(uint16_t(block[0] | block[1] << 8)));
+            const float scale = __half2float(*reinterpret_cast<const __half *>(block));  // 18-byte blocks: 2-byte aligned
             const unsigned q = block[2 + lane / 2] >> (4 * (lane & 1));
             const float2 xx = __half22float2(xv[b * 32 + lane]);
             sum += scale * (int(q & 3u) - 1) * xx.x;
@@ -110,7 +110,7 @@ template<int C> __global__ void __launch_bounds__(256) dot_grouped(const unsigne
             for (int c = 0; c < C; ++c) sum[c] = 0.f;
             for (int b = 0; b < cols / 64; ++b) {
                 const unsigned char * block = r + b * 18;
-                const float scale = __half2float(__ushort_as_half(uint16_t(block[0] | block[1] << 8)));
+                const float scale = __half2float(*reinterpret_cast<const __half *>(block));  // 18-byte blocks: 2-byte aligned
                 const unsigned q = block[2 + lane / 2] >> (4 * (lane & 1));
 #pragma unroll
                 for (int c = 0; c < C; ++c) {
@@ -224,7 +224,7 @@ namespace {
 // dot_warp's (k < 3072) or dot_wide's (k >= 3072), in the same order.
 // narrow rows: block = 64 rows (8 warps x 8), the group's inputs staged in shared memory once per block (each warp read
 // them per column before: input traffic, not weights, bounded it at np 8); wide rows: warp per row, inputs from global
-template<bool WIDE> __global__ void __launch_bounds__(256) dot_dedup(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int cols, const int * dmap, int groups) {
+template<bool WIDE, bool STAGE = false> __global__ void __launch_bounds__(256) dot_dedup(const unsigned char * weights, const __half * x, __nv_bfloat16 * y, int rows, int cols, const int * dmap, int groups) {
     constexpr int DC = tqllm_cuda::kDedupCols;
     extern __shared__ __half2 xs[];  // narrow: [nc][cols / 2]
     for (int gi = int(blockIdx.y); gi < groups; gi += int(gridDim.y)) {  // groups past the grid; padding ends at slot -1
@@ -237,6 +237,58 @@ template<bool WIDE> __global__ void __launch_bounds__(256) dot_dedup(const unsig
             xs[i] = reinterpret_cast<const __half2 *>(x + int64_t(e[2 + i / (cols / 2)]) * cols)[i % (cols / 2)];
         __syncthreads();
     }
+    const unsigned char * ws = nullptr;  // STAGE: this warp's rows, copied once (the per-block byte loads bounded it)
+    if constexpr (STAGE) {
+        const int row0 = blockIdx.x * 64 + warp * 8, nr = min(8, rows - row0);
+        unsigned char * dst = reinterpret_cast<unsigned char *>(xs + DC * (cols / 2)) + warp * 8 * nb * 18;
+        if (nr > 0) {
+            const unsigned char * src = weights + (int64_t(e[0]) * rows + row0) * nb * 18;
+            const int bytes = nr * nb * 18, vec = (reinterpret_cast<uintptr_t>(src) & 15) ? 0 : bytes / 16;
+            for (int i = lane; i < vec; i += 32) reinterpret_cast<uint4 *>(dst)[i] = reinterpret_cast<const uint4 *>(src)[i];
+            for (int i = vec * 16 + lane; i < bytes; i += 32) dst[i] = src[i];
+        }
+        __syncwarp();
+        ws = dst;
+        // four rows per warp, one per 8 lanes: thread t holds lanes t, t + 8, t + 16, t + 24 of the one-row form and adds them
+        // as the first two butterfly steps did ((t + t+16) + (t+8 + t+24)), so each output has the same bits
+        const int t = lane & 7, quarter = lane >> 3;
+        for (int rp = 0; rp < 8; rp += 4) {
+            if (blockIdx.x * 64 + warp * 8 + rp >= rows) break;
+            const int rr = rp + quarter, row = blockIdx.x * 64 + warp * 8 + rr;
+            const bool live = row < rows;
+            float s0[DC], s1[DC], s2[DC], s3[DC];
+#pragma unroll
+            for (int c = 0; c < DC; ++c) { s0[c] = 0.f; s1[c] = 0.f; s2[c] = 0.f; s3[c] = 0.f; }
+            if (live) {
+                const unsigned char * r = ws + rr * nb * 18;
+                const int sh = 4 * (t & 1);
+                for (int b = 0; b < nb; ++b) {
+                    const unsigned char * block = r + b * 18;
+                    const float scale = __half2float(*reinterpret_cast<const __half *>(block));
+                    const unsigned q0 = block[2 + t / 2] >> sh, q1 = block[6 + t / 2] >> sh, q2 = block[10 + t / 2] >> sh, q3 = block[14 + t / 2] >> sh;
+#pragma unroll
+                    for (int c = 0; c < DC; ++c) {
+                        if (c >= nc) break;
+                        const __half2 * xr = xs + c * (cols / 2) + b * 32 + t;
+                        const float2 x0 = __half22float2(xr[0]), x1 = __half22float2(xr[8]), x2 = __half22float2(xr[16]), x3 = __half22float2(xr[24]);
+                        s0[c] += scale * (int(q0 & 3u) - 1) * x0.x; s0[c] += scale * (int((q0 >> 2) & 3u) - 1) * x0.y;
+                        s1[c] += scale * (int(q1 & 3u) - 1) * x1.x; s1[c] += scale * (int((q1 >> 2) & 3u) - 1) * x1.y;
+                        s2[c] += scale * (int(q2 & 3u) - 1) * x2.x; s2[c] += scale * (int((q2 >> 2) & 3u) - 1) * x2.y;
+                        s3[c] += scale * (int(q3 & 3u) - 1) * x3.x; s3[c] += scale * (int((q3 >> 2) & 3u) - 1) * x3.y;
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < DC; ++c) {
+                if (c >= nc) break;
+                float v = (s0[c] + s2[c]) + (s1[c] + s3[c]);
+                for (int d = 4; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+                if (live && !t) y[int64_t(e[2 + DC + c]) * rows + row] = __float2bfloat16_rn(v);
+            }
+        }
+        __syncwarp();
+        continue;
+    }
     for (int rr = 0; rr < (WIDE ? 1 : 8); ++rr) {
     const int row = WIDE ? blockIdx.x * 8 + warp : blockIdx.x * 64 + warp * 8 + rr;
     if (row >= rows) break;
@@ -247,7 +299,7 @@ template<bool WIDE> __global__ void __launch_bounds__(256) dot_dedup(const unsig
     if constexpr (!WIDE) {
         for (int b = 0; b < nb; ++b) {
             const unsigned char * block = r + b * 18;
-            const float scale = __half2float(__ushort_as_half(uint16_t(block[0] | block[1] << 8)));
+            const float scale = __half2float(*reinterpret_cast<const __half *>(block));  // 18-byte blocks: 2-byte aligned
             const unsigned q = block[2 + lane / 2] >> (4 * (lane & 1));
 #pragma unroll
             for (int c = 0; c < DC; ++c) {
@@ -295,6 +347,11 @@ void gsq_q2_expert_dedup(const void * w, const __half * x, __nv_bfloat16 * y, in
     const unsigned gy = unsigned(std::min(groups, tqllm_cuda::kDedupGridGroups));
     if (k >= 3072) { dot_dedup<true><<<dim3(unsigned((r + 7) / 8), gy), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, dmap, groups); return; }
     const size_t smem = size_t(tqllm_cuda::kDedupCols) * k * sizeof(__half);  // k < 3072: at most 48 KB
+    const size_t staged = smem + size_t(64) * (k / 64) * 18;  // + the block's 64 rows of weights
+    if (staged <= 48 * 1024) {
+        dot_dedup<false, true><<<dim3(unsigned((r + 63) / 64), gy), 256, staged, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, dmap, groups);
+        return;
+    }
     dot_dedup<false><<<dim3(unsigned((r + 63) / 64), gy), 256, smem, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, dmap, groups);
 }
 void gsq_q2_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int r, int k, int n, cudaStream_t s) {

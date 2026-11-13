@@ -40,6 +40,7 @@ struct FnServe {
     size_t seq_fixed = 0;  // several sequences: one sequence's state beside its K/V (measured at load, sequence_fixed_bytes)
     size_t state_full = 0; int state_tokens = 0;  // one sequence's full-context state (context_keep) and its token count
     size_t plan_budget = 0;  // free + bank bytes after the warm-up (pool trimmed, 256 MB steps): a prompt length always plans the same chunk / block
+    size_t mtp_bank_bytes = 0;  // the MTP expert bank's device bytes at start (the plan's catch-up term and a multi-chunk prompt's room)
     float * res_host = nullptr; size_t res_host_cap = 0;  // pinned prompt residuals of a multi-chunk prefill (one prefill at a time)
 };
 class FlashNextEngine final : public tqllm::Engine {
@@ -64,6 +65,7 @@ class FlashNextEngine final : public tqllm::Engine {
         // prompt in seq_) whose recurrent conv / state and PLE history rows were copied during the prefill, so a prompt
         // that starts with seq_[0, snap_] prefills only from snap_ (an agent's next turn: earlier turns + new message)
         std::vector<int> seq_; int snap_ = 0;
+        bool serving_ = false;  // a request is in this slot (spec_begin .. spec_finish / spec_abort): --split experts rank 1 is not idle
         std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
     };
     // the next turn re-renders the end of the last prompt (assistant header) differently. A reused prompt is not
@@ -80,6 +82,12 @@ class FlashNextEngine final : public tqllm::Engine {
     // restored state buffer is from it (relative rms; a wrong buffer is ~1, rounding ~1e-3)
     void pc_verify(const std::vector<int> & ids, int p);
     std::vector<SlotState> slots_; int cur_ = 0;
+    // --split experts, rank 1: every serving call holds the gate, so the helper thread computes rank 0's forwards only
+    // between them and only while no request of this box's own is in a slot
+    std::shared_ptr<EpHelperGate> ep_gate_;
+    std::unique_lock<std::recursive_mutex> ep_lock() { return ep_gate_ ? std::unique_lock<std::recursive_mutex>(ep_gate_->mu) : std::unique_lock<std::recursive_mutex>(); }
+    void start_ep_helper();
+    void ep_note_state() { if (ep_gate_) ep_grant(*f_.cp, *ep_gate_); }  // under ep_lock: idle again -> lease to rank 0
     std::function<void()> first_token_hook_;  // set_first_token_hook
     void trace_step(int slots, int drafts, const std::vector<std::pair<size_t, std::vector<int>>> & per_slot, const std::vector<int> & slot_ids);
     uint64_t batched_steps_ = 0, serial_steps_ = 0;  // spec_step: one verify pass for all slots / one slot at a time (TQLLM_DEBUG=mem)
@@ -96,6 +104,8 @@ public:
     FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options);
     // TQLLM_DEBUG=mem: where the device memory is (MiB); "other" = KV, QSA keys, recurrent state, CUDA context
     void ledger(const char * at) const;
+    void stop_followers() override { if (f_.cp && f_.cp->run.ep) ep_stop(*f_.cp); }
+    ~FlashNextEngine() override { if (ep_gate_) { std::lock_guard<std::recursive_mutex> g(ep_gate_->mu); ep_gate_->stop = true; } }
     // borrowed banks back, filled with the prompt's most-routed experts (Strata does the same)
     // after release_prefill (buffers freed, pool trimmed): the ledger rebuilds the borrowed banks; a bank that no longer
     // fits refills on its first use in decode
@@ -106,12 +116,15 @@ public:
     void remember_copy(SlotState & sl);
     void spec_abort(int s) override {  // a failed request: the slot no longer counts as running, its state is dropped
         if (s < 0 || size_t(s) >= slots_.size()) return;
+        const auto lk = ep_lock();
         auto & sl = slots_[size_t(s)];
-        sl.done_ = true;
+        sl.done_ = true; sl.serving_ = false; ep_note_state();
         try { if (sl.model_) { cudaDeviceSynchronize(); cudaGetLastError(); sl.model_.reset(); } } catch (...) {}
         sl.snap_ = 0;
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
+        const auto lk = ep_lock();
+        struct Done { FlashNextEngine & e; SlotState & sl; ~Done() { sl.serving_ = false; e.ep_note_state(); } } done{*this, S()};
         bind();
         while (spec_advance()) {}
         // steps, drafted, accepted drafts, decode us, prefill us (tqserve timings)
@@ -128,6 +141,12 @@ public:
                          (unsigned long long) (s.miss_copies - b.miss_copies), double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e9, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e9,
                          (unsigned long long) (s.refetch - b.refetch), (unsigned long long) (s.refetch_soon - b.refetch_soon), double(s.refetch_bytes - b.refetch_bytes) / 1e9,
                          (unsigned long long) (s.pf_evicted_unused - b.pf_evicted_unused));
+            {   const double toks = std::max<double>(1, double(S().toks_));
+                std::fprintf(stderr, "LEDGER decode link: %.2f MB per token (demand %.2f, guesses %.2f) | guesses queued %llu copied %llu expired %llu promoted %llu shared %llu refused %llu | pickups %llu (%llu late) | most guess copies ahead of a demand %llu\n",
+                             double(s.transfer_bytes - b.transfer_bytes) / 1e6 / toks, double(s.miss_copy_bytes - b.miss_copy_bytes) / 1e6 / toks, double(s.pf_copy_bytes - b.pf_copy_bytes) / 1e6 / toks,
+                             (unsigned long long) (s.pf_queued - b.pf_queued), (unsigned long long) (s.pf_started - b.pf_started), (unsigned long long) (s.pf_expired - b.pf_expired),
+                             (unsigned long long) (s.pf_promoted - b.pf_promoted), (unsigned long long) (s.pf_shared - b.pf_shared), (unsigned long long) (s.pf_refused - b.pf_refused),
+                             (unsigned long long) (s.pickups - b.pickups), (unsigned long long) (s.late_pickups - b.late_pickups), (unsigned long long) s.demand_behind_max); }
             { unsigned long long d[3] = {0, 0, 0}; tqllm_cuda::moe_dedup_stats(d);
               if (d[0]) std::fprintf(stderr, "LEDGER device maps since start: %llu layer calls, %.1f groups and %.1f distinct experts per call\n",
                                      d[0], double(d[1]) / double(d[0]), double(d[2]) / double(d[0])); }

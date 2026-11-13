@@ -24,4 +24,9 @@ std::unique_ptr<Engine> make_qwen35_engine(const std::string & path, const std::
     return std::make_unique<Qwen35Engine>(path, tokenizer, context, slots, options);
 }
 
+std::unique_ptr<Engine> make_qwen35_split_engine(const std::string & path, const std::string & tokenizer, uint32_t context,
+                                                 int slots, const EngineOptions & options, std::shared_ptr<TpComm> tp) {
+    return std::make_unique<Qwen35Engine>(path, tokenizer, context, slots, options, std::move(tp));
+}
+
 } // namespace tqllm

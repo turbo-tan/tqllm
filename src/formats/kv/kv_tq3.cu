@@ -261,12 +261,24 @@ struct Tcq3 {  // K: 2 x (128-value 512-state trellis group: 390 stream bits + f
 };
 }  // namespace kvc
 
-template <int NW, class KC, class VC, int NB>
+// SEL (QSA, qwen35_qsa.cuh; two-part verify, pstride > 0): grid y = one row of the verify block; its keys are the 4
+// positions of each of its selected blocks sel[z][512], in that order, in place of the cache positions below its split
+// point. A row whose split point is below `from` is left alone (a dense row). Same decode and arithmetic as the dense
+// cache part; the row's partials depend on its own query and selection only.
+template <int NW, class KC, class VC, int NB, bool SEL = false>
 __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc,
                                                            __nv_bfloat16 * y, float * part, const int * dseq0, int nq,
                                                            int heads, int kvheads, float scale, int nsplit,
                                                            const int * dep, int pstride, int zoff, const int * dstart,
-                                                           int cstride, const float * kbias, int flat, int poff) {
+                                                           int cstride, const float * kbias, int flat, int poff,
+                                                           const int32_t * sel = nullptr, int from = 0) {
+    constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
+    if constexpr (SEL) {
+        const int z = blockIdx.y;
+        if (tq_split_point(*dseq0 - 1 + (dep ? dep[z] : z)) < from) return;
+        q += int64_t(z) * heads * tq3a::DIM, part += int64_t(z) * heads * pstride * (tq3a::DIM + 2), sel += int64_t(z) * (SEL_KEYS / 4);
+        nq = 1, dep = nullptr, zoff = 0;
+    }
     // kbias (TqCache stand-ins): natural-log weight per key and KV head added to the logit; flat: every query sees the
     // keys [0, *dseq0) (no causal step per column); poff: partial slot offset (with cstride)
     using namespace tq3a;
@@ -288,12 +300,12 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     float * qsc = ksf + NB * 8 * TILE;                             // [ROWS][2]
     const int kh = blockIdx.x, split = blockIdx.z, t = threadIdx.x, warp = t / 32, lane = t % 32, gid = lane / 4, tig = lane % 4;
     const int g = heads / kvheads, rows = nq * g;
-    const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;
+    const int r0 = SEL ? 0 : (gridDim.y - 1 - blockIdx.y) * ROWS;
     const int seq0 = *dseq0;
     const int q_lo = r0 / g, q_hi = min(r0 + ROWS - 1, rows - 1) / g;
     // pstride > 0 (two-part tree verify): query z at depth dep[z] (zoff + z for a chain) takes the keys below
     // tq_split_point(qpos) and writes a partial with stride pstride; attn_blk_codec_k adds the rest and merges
-    auto qlim = [&](int z) { return pstride ? tq_split_point(seq0 - 1 + (dep ? dep[z] : zoff + z)) : flat ? seq0 : seq0 + z; };
+    auto qlim = [&](int z) { return SEL ? SEL_KEYS : pstride ? tq_split_point(seq0 - 1 + (dep ? dep[z] : zoff + z)) : flat ? seq0 : seq0 + z; };
     int key_end = qlim(q_hi), mask_from = qlim(q_lo);
     if (pstride)
         for (int z = q_lo; z <= q_hi; ++z) key_end = max(key_end, qlim(z)), mask_from = min(mask_from, qlim(z));
@@ -346,8 +358,10 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     auto load = [&](int t0) {
 #pragma unroll
         for (int i = 0; i < UPT; ++i) {
-            const int u = t + i * NT, lk = u % 32, b = u / 32, p = t0 + lk;
+            const int u = t + i * NT, lk = u % 32, b = u / 32;
+            int p = t0 + lk;
             if (p < kend) {
+                if constexpr (SEL) p = sel[p / 4] * 4 + p % 4;
                 const uint8_t * rk = kc + (int64_t(p) * kvheads + kh) * KRB, * rv = vc + (int64_t(p) * kvheads + kh) * VRB;
                 KC::load(rk, b, kw[i], kr[i]);
                 VC::load(rv, b, vw[i], vr[i]);
@@ -854,11 +868,29 @@ static void compact_partial(const __nv_bfloat16 * q, const KvCompactSeg & c, flo
 template <class KC, class VC>
 static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void * vc, __nv_bfloat16 * y, float * part,
                             const int * dseq0, int nq, int h, int kh, float scale, int nsplit, cudaStream_t s,
-                            const int * par, const int * dep, const KvCompactSeg * cs) {
+                            const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel, int qsa_from,
+                            bool qsa_mixed) {
     const int * d0 = cs ? cs->start : nullptr;
     if (h % kh) throw std::invalid_argument("attention_kv_split: heads % kvheads");
     const auto * k = static_cast<const uint8_t *>(kc);
     const auto * v = static_cast<const uint8_t *>(vc);
+    if (qsa_sel) {  // QSA rows: their cache part over the selected keys; a block that crosses `from` runs the dense part first
+        if (!par || cs || h / kh > 64 || (nq > 8 && !dep)) throw std::invalid_argument("QSA attention: a two-part verify block without stand-ins");
+        const int ps = nsplit + 1, qmax = 64 / (h / kh);
+        for (int z0 = 0; qsa_mixed && z0 < nq; z0 += qmax)
+            tq3_launch<4, KC, VC, 1>(q + int64_t(z0) * h * 256, k, v, y, part + int64_t(z0) * h * ps * (256 + 2), dseq0,
+                                     std::min(qmax, nq - z0), h, kh, scale, nsplit, s, dep ? dep + z0 : nullptr, ps, z0, nullptr);
+        static bool configured = false;
+        if (!configured) {
+            cudaFuncSetAttribute(attn_tq3kv_k<4, KC, VC, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tq3a::smem<4, 1>()));
+            configured = true;
+        }
+        attn_tq3kv_k<4, KC, VC, 1, true><<<dim3(kh, nq, nsplit), 4 * 32, tq3a::smem<4, 1>(), s>>>(
+            q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, dep, ps, 0, nullptr, 0, nullptr, 0, 0, qsa_sel, qsa_from);
+        attn_blk_codec_k<KC, VC><<<dim3(h, nq), 256, 0, s>>>(q, k, v, part, dseq0, par, h, kh, scale, nsplit, ps, y);
+        inverse_v<VC>(y, nq, h, s);
+        return;
+    }
     // 4-query launches single buffered (two blocks per SM; 5060 Ti 200K 86 -> 103 tok/s, 3090 +17-19% vs double)
     if (par) {  // cache part in launches of <= 64 rows with the same split count, so a query's result is width independent
         const int ps = nsplit + 1, qmax = 64 / (h / kh);
@@ -893,15 +925,16 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
 
 void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q, const void * kc, const void * vc,
                         __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit,
-                        cudaStream_t s, const int * par, const int * dep, const KvCompactSeg * cs) {
+                        cudaStream_t s, const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel,
+                        int qsa_from, bool qsa_mixed) {
     auto with_v = [&](auto kt) {
         using KC = decltype(kt);
         switch (vcodec) {
-            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs); return;
-            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs); return;
-            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs); return;
-            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs); return;
-            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs); return;
+            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
         }
         throw std::invalid_argument("attention_kv_split: unsupported V codec");
     };

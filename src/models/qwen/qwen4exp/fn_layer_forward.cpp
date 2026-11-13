@@ -3,9 +3,39 @@
 #include "debug.hpp"
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
+#include <atomic>
+#include "fn_graphs.hpp"
 #include <map>
+#include <mutex>
+#include <thread>
 #include <tuple>
 #include "hot_cold_policy.hpp"
+#include "core/tp_comm.hpp"
+#include "experts/moe_kernels.cuh"
+
+namespace {
+// --split experts, rank 0: every trunk layer of a decode forward that takes the full_slots path exchanges with rank 1. The
+// forward is announced on the control channel at layer 0 (rows n); rank 1 then runs exactly c.layers exchanges
+// or declines it (decode_rules.hpp ep_before_layer / ep_after_layer keep the two ranks in step or turn it off).
+tqllm::flashnext::EpForwardState g_ep_fwd;
+// Control channel (TCP, ordered). Rank 1 grants a lease while it has no request of its own (kEpLease); rank 0 then sends
+// each decode forward (kEpForward n) without waiting for an answer (the link's round trip is 0.5-1.6 ms, ~3 % of a 1-user
+// step). Rank 1 takes the lease back for a request of its own (kEpRevoke) and waits for kEpLeaseEnd: rank 0 sends it in
+// order after its last forward, so rank 1 has finished every forward sent to it before it serves.
+enum : int32_t { kEpForward = 1, kEpStop = 2, kEpLeaseEnd = 3, kEpLease = 21, kEpRevoke = 22 };
+// rank 0: the lease, set by a reader thread (it answers a revoke even while this box is idle); sends go out under `m`
+struct EpLease { std::mutex m; bool leased = false; };
+EpLease g_ep_lease;
+// a layer's expert formats have the dedup kernels the split launch uses (rank 1 checks every layer at start and refuses
+// otherwise, so on rank 0 a full bank's own layer is enough)
+bool ep_formats_ok(const MixedExpertCache & cache, int layer) {
+    for (int p = 0; p < 3; ++p) if (!cache.bank_mat(layer, p).fmt->has_expert_dedup()) return false;
+    return true;
+}
+}
+
+namespace { tqllm::flashnext::DecodeGraphs g_decode_graphs; }  // fn_graphs.hpp
+void release_decode_graphs(uint64_t owner) { g_decode_graphs.release(owner); }
 
 // A step whose captured part fails (an operation not allowed in a capture: a weight uploaded on its first use, a handle
 // created) runs again without a graph; nothing in an open capture has executed, so the plain run starts from the same
@@ -57,11 +87,6 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // Every step updates all kernel parameters (weights included), so layers of one kind share an exec, keyed by its
     // topology: the node count changes with the position in attention layers and with the draft in the MTP layer.
     // One exec per layer and variant (~11 x 49) held ~1.3 GB the expert banks had taken (out of memory on a 3090).
-    struct GraphKey { const void * model; int kind, n; size_t nodes; bool operator<(const GraphKey & o) const { return std::tie(model, kind, n, nodes) < std::tie(o.model, o.kind, o.n, o.nodes); } };
-    static std::map<GraphKey, int> calls;  // kind = layer here: calls 1-2 of each layer run plain
-    struct GraphSlot { cudaGraphExec_t exec = nullptr; cudaEvent_t done = nullptr; };
-    static std::map<GraphKey, std::vector<GraphSlot>> graphs;
-    const GraphKey gkey{this, layer, n, 0};
     // A decode call into a bank that holds every expert (GB10: all resident) builds its slot and dedup maps on the device
     // from the routed ids: no readback, no host map build, and the layer's graph runs to the end of the layer (same
     // kernels and maps as the split path with every assignment a hit: test-dedup-maps).
@@ -81,13 +106,31 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             }
         }
     }
+    // --split experts, rank 0: each forward is offered to rank 1 at layer 0 (a busy rank 1 declines); a rank 1 that went
+    // away (or a forward left open) turns expert parallelism off. The local branch below computes every expert (all
+    // resident), so the output stays the same either way.
+    const bool ep_rank0 = cp.run.ep && cp.run.ep->rank() == 0 && layer < c.layers;
+    bool ep_on = false;
+    if (ep_rank0) {
+        const bool was_off = g_ep_fwd.off;
+        tqllm::TpComm & ep = *cp.run.ep;
+        auto announce = [&](int rows) {  // host only, before this layer's graph capture begins; no answer awaited
+            std::lock_guard<std::mutex> g(g_ep_lease.m);
+            if (!g_ep_lease.leased) return false;  // rank 1 serves its own users
+            const int32_t hdr[2] = {kEpForward, rows}; ep.ctl_send(hdr, sizeof hdr);
+            return true;
+        };
+        const auto call = tqllm::flashnext::ep_before_layer(g_ep_fwd, layer, n, full_slots && ep_formats_ok(cache, layer), ep.alive(), announce);
+        if (g_ep_fwd.off && !was_off) std::fprintf(stderr, "tqllm: --split experts off: %s; every layer runs locally\n", cp.run.ep->alive() ? "a forward was left open" : "rank 1 went away");
+        if (call == tqllm::flashnext::EpCall::Fail) throw std::runtime_error("--split experts: the forward lost its exchanges with rank 1 at layer " + std::to_string(layer));
+        ep_on = call == tqllm::flashnext::EpCall::Exchange;
+    }
     bool capturing = false;
     // several sequences (segs) only when the maps are built on the device: their split path waits on the routed ids per layer
     // up to 8 rows; with the maps on the device (no host wait in the layer) up to 32 (np 8 x 4-row blocks)
     if (graph_on && spec && (!segs || full_slots) && !sink && n <= (full_slots ? 32 : 8) && g_arena && !g_persistent) {
-        static int epoch = -1; if (epoch != cp.rt.prefill_epoch) { epoch = cp.rt.prefill_epoch; calls.clear(); }  // lazy scratch is rebuilt by plain calls
-        if (plain) calls[gkey] = 0;
-        if (++calls[gkey] > 2) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
+        static int epoch = -1; if (epoch != cp.rt.prefill_epoch) { epoch = cp.rt.prefill_epoch; g_decode_graphs.reset_warmup(); }  // lazy scratch is rebuilt by plain calls
+        if (g_decode_graphs.capture(graph_owner, layer, n, plain)) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
     const bool trunk = layer < c.layers, attention = !trunk || c.compress_ratios[layer];
     Device<float> norm(size_t(width) * n), mixed(size_t(h) * n), inject(size_t(c.hc) * n), block(size_t(h) * n), combined(size_t(width) * n);
@@ -259,23 +302,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         cudaGraph_t cg = nullptr;
         const cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &cg);
         if (e != cudaSuccess || !cg) throw std::runtime_error(std::string("CUDA graph: capture of layer ") + std::to_string(layer) + " failed: " + cudaGetErrorString(e));
-        size_t nodes = 0; ck(cudaGraphGetNodes(cg, nullptr, &nodes));
         const bool ple = trunk && ple_rows && std::find(c.ple_layers.begin(), c.ple_layers.end(), layer) != c.ple_layers.end();
         const int kind = !trunk ? -1 : (attention ? 2 * c.compress_ratios[layer] : 0) + ple;
-        // an exec still queued on the GPU (another layer's launch) is not updated: each shape keeps a few, one per launch in flight
-        auto & pool = graphs[GraphKey{this, kind, n, nodes}];
-        GraphSlot * slot = nullptr;
-        for (auto & g : pool) if (cudaEventQuery(g.done) == cudaSuccess) { slot = &g; break; }
-        if (!slot && pool.size() < 8) { pool.push_back({}); slot = &pool.back(); ck(cudaEventCreateWithFlags(&slot->done, cudaEventDisableTiming)); }
-        if (!slot) { slot = &pool.front(); ck(cudaEventSynchronize(slot->done)); }
-        if (slot->exec) {
-            cudaGraphExecUpdateResultInfo info;
-            if (cudaGraphExecUpdate(slot->exec, cg, &info) != cudaSuccess) { cudaGetLastError(); ck(cudaGraphExecDestroy(slot->exec)); slot->exec = nullptr; }
-        }
-        if (!slot->exec) ck(cudaGraphInstantiate(&slot->exec, cg, 0));
-        ck(cudaGraphDestroy(cg));
-        ck(cudaGraphLaunch(slot->exec, cudaStreamPerThread));
-        ck(cudaEventRecord(slot->done, cudaStreamPerThread));
+        g_decode_graphs.launch(graph_owner, kind, n, cg, cudaStreamPerThread);
         };
     if (!full_slots) end_capture();
     using clk = std::chrono::steady_clock; auto h0 = clk::now();
@@ -405,6 +434,35 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                         " gate=" + std::to_string(eb) + " up=" + std::to_string(eu_bad));
             }
         }
+    } else if (ep_on) {
+        // --split experts, rank 0: the input rows and routed ids go to rank 1, this rank computes the experts e % 2 == 0 (and
+        // the assignments past the result cap), rank 1 sends back its results; the combine runs in the one-box order
+        // (test ep_split: bit-identical to the branch below)
+        const int A = n * c.topk, cap = tqllm::flashnext::ep_result_cap(A); constexpr int DS = tqllm_cuda::kDedupStride;
+        tqllm::TpComm & ep = *cp.run.ep;
+        Device<__half> xr(mixed.count);
+        tqllm_cuda::vis_f32_to_h(mixed.p, xr.p, int64_t(mixed.count), nullptr); shared_expert(xr.p);
+        end_capture();  // the exchanges run eagerly between this layer's graph and the next
+        const cudaStream_t s = cudaStreamPerThread;
+        ep.group_begin(); ep.send(xr.p, size_t(n) * h * sizeof(__half), 1, s); ep.send(routed.p, size_t(A) * sizeof(int), 1, s); ep.group_end();
+        const Mat mg = cache.bank_mat(layer, 0), mu = cache.bank_mat(layer, 1), md = cache.bank_mat(layer, 2);
+        Device<int> local(A), maps(size_t(A) * (1 + 2 * DS));
+        int * slots_p = maps.p, * gu = maps.p + A, * dn = gu + size_t(A) * DS;
+        tqllm_cuda::ep_local_ids(routed.p, A, nullptr, 0, 0, cap, local.p, s);
+        tqllm_cuda::moe_dedup_maps(local.p, full_slots, A, c.topk, slots_p, gu, dn, A, s);
+        Device<__nv_bfloat16> eg(size_t(A) * c.expert_ff), eu(eg.count), ed(size_t(A) * h), rb(size_t(std::max(cap, 1)) * h);
+        Device<__half> ax(eg.count);
+        if (mg.fmt == mu.fmt) mg.fmt->expert_matvec_dedup2(mg, mu, xr.p, eg.p, eu.p, c.expert_ff, gu, A, s);
+        else { mg.fmt->expert_matvec_dedup(mg, xr.p, eg.p, c.expert_ff, gu, A, s); mu.fmt->expert_matvec_dedup(mu, xr.p, eu.p, c.expert_ff, gu, A, s); }
+        tqllm_cuda::fn_swiglu_bf16_h(eg.p, eu.p, ax.p, int64_t(eg.count), s);
+        md.fmt->expert_matvec_dedup(md, ax.p, ed.p, h, dn, A, s);
+        if (cap > 0) { ep.recv(rb.p, size_t(cap) * h * sizeof(__nv_bfloat16), 1, s); tqllm_cuda::ep_scatter(rb.p, routed.p, A, 0, cap, ed.p, h, s); }
+        if (layer + 1 == c.layers) {  // the forward's last exchange: a rank 1 that went away during it fails the request
+            ck(cudaStreamSynchronize(s));
+            if (!ep.alive()) throw std::runtime_error("--split experts: rank 1 went away during a forward");
+        }
+        tqllm_cuda::fn_moe_combine(ed.p, weights.p, sd.p, shared_weights.p, fo.p, h, c.topk, n, s);
+        cache.add_device_counters(uint64_t(A), 0, 0, 0);
     } else if (full_slots) {
         const int A = n * c.topk; constexpr int DS = tqllm_cuda::kDedupStride;
         Device<__half> xr(mixed.count);
@@ -731,6 +789,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     auto updated = std::make_unique<Device<float>>(size_t(width) * n);
     tqllm_cuda::hc_combine(combined.p, fo.p, inject.p, updated->p, h, c.hc, n, nullptr); residual = std::move(updated);
     end_capture();
+    if (ep_rank0) tqllm::flashnext::ep_after_layer(g_ep_fwd, layer, c.layers);
 }
 
 void DecodeModel::router(const std::string & prefix, const float * x, float * logits, int n) {
@@ -775,4 +834,112 @@ void DecodeModel::router(const std::string & prefix, const float * x, float * lo
         tqllm_cuda::fn_gemv_f32_tokens_ld(cp.dense_device(prefix + "ffn_gate_inp.weight"), x, logits, c.experts, h, n, c.experts + 1, nullptr);
         tqllm_cuda::fn_gemv_f32_tokens_ld(cp.dense_device(prefix + "ffn_gate_inp_shexp.weight"), x, logits + c.experts, 1, h, n, c.experts + 1, nullptr);
     }
+}
+
+void ep_stop(const Checkpoint & cp) {
+    if (cp.run.ep->rank() != 0) return;
+    std::lock_guard<std::mutex> g(g_ep_lease.m);
+    const int32_t hdr[2] = {kEpStop, 0}; cp.run.ep->ctl_send(hdr, sizeof hdr);
+}
+void ep_start_reader(const Checkpoint & cp) {
+    const std::shared_ptr<tqllm::TpComm> link = cp.run.ep;
+    if (!link || link->rank() != 0) return;
+    std::thread([link] {  // detached: lives as long as the link
+        for (;;) {
+            int32_t msg[2] = {0, 0};
+            try { link->ctl_recv(msg, sizeof msg); }
+            catch (const std::exception &) { std::lock_guard<std::mutex> g(g_ep_lease.m); g_ep_lease.leased = false; return; }  // rank 1 went away
+            std::lock_guard<std::mutex> g(g_ep_lease.m);
+            if (msg[0] == kEpLease) g_ep_lease.leased = true;
+            else if (msg[0] == kEpRevoke) {  // after every forward already sent
+                g_ep_lease.leased = false;
+                const int32_t end[2] = {kEpLeaseEnd, 0};
+                try { link->ctl_send(end, sizeof end); } catch (const std::exception &) { return; }
+            }
+        }
+    }).detach();
+}
+void ep_grant(const Checkpoint & cp, EpHelperGate & gate) {
+    if (!cp.run.ep || cp.run.ep->rank() != 1 || gate.stop || !gate.idle() || !gate.refresh) return;
+    { std::lock_guard<std::mutex> l(gate.lm); if (gate.lease_out) return; }
+    if (gate.served != gate.banks_checked) {  // banks full, tables current
+        if (!gate.refresh()) {  // a request of this box left a bank not full (a long prompt borrowed it): no lease until a later one ends
+            static bool said = false;
+            if (!said) { said = true; std::fprintf(stderr, "tqllm: --split experts rank 1: a bank is not full after this box's request; rank 0 runs alone until one is\n"); }
+            return;
+        }
+        gate.banks_checked = gate.served;
+    }
+    { std::lock_guard<std::mutex> l(gate.lm); gate.lease_out = true; }
+    try { const int32_t msg[2] = {kEpLease, 1}; std::lock_guard<std::mutex> w(gate.wmu); cp.run.ep->ctl_send(msg, sizeof msg); }
+    catch (const std::exception &) { std::lock_guard<std::mutex> l(gate.lm); gate.lease_out = false; }
+}
+void ep_reclaim(const Checkpoint & cp, EpHelperGate & gate) {
+    if (!cp.run.ep || cp.run.ep->rank() != 1) return;
+    std::unique_lock<std::mutex> l(gate.lm);
+    if (!gate.lease_out) return;
+    try { const int32_t msg[2] = {kEpRevoke, 0}; std::lock_guard<std::mutex> w(gate.wmu); cp.run.ep->ctl_send(msg, sizeof msg); }
+    catch (const std::exception &) { gate.lease_out = false; return; }
+    gate.lcv.wait(l, [&] { return !gate.lease_out; });  // the helper sees kEpLeaseEnd after rank 0's last forward
+}
+void ep_help(const Checkpoint & cp, MixedExpertCache & cache, std::shared_ptr<EpHelperGate> gate) {
+    const std::shared_ptr<tqllm::TpComm> link = cp.run.ep;  // kept alive while this thread waits on it
+    if (!link || link->rank() != 1) throw std::runtime_error("--split experts: the helper is rank 1");
+    tqllm::TpComm & ep = *link;
+    const auto & c = cp.config; const int h = c.hidden, ff = c.expert_ff, layers = c.layers; constexpr int DS = tqllm_cuda::kDedupStride;
+    for (int l = 0; l < layers; ++l)
+        if (!ep_formats_ok(cache, l)) throw std::runtime_error("--split experts: layer " + std::to_string(l) + " has an expert format without dedup kernels");
+    // own stream and buffers sized for the largest forward (rows x topk <= 1024): nothing shared with the serving thread's
+    // scratch arena, so this box can serve its own users between the forwards it computes for rank 0
+    cudaStream_t s = nullptr; ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    const int amax = 1024, nmax = amax / c.topk;
+    auto alloc = [](size_t bytes) { void * p = nullptr; ck(cudaMalloc(&p, std::max<size_t>(bytes, 256))); return p; };
+    auto * x = static_cast<__half *>(alloc(size_t(nmax) * h * 2));
+    auto * ids = static_cast<int *>(alloc(size_t(amax) * 4)), * local = static_cast<int *>(alloc(size_t(amax) * 4));
+    auto * maps = static_cast<int *>(alloc(size_t(amax) * (1 + 2 * DS) * 4));
+    auto * eg = static_cast<__nv_bfloat16 *>(alloc(size_t(amax) * ff * 2)), * eu = static_cast<__nv_bfloat16 *>(alloc(size_t(amax) * ff * 2));
+    auto * ax = static_cast<__half *>(alloc(size_t(amax) * ff * 2));
+    auto * ed = static_cast<__nv_bfloat16 *>(alloc(size_t(amax) * h * 2)), * sb = static_cast<__nv_bfloat16 *>(alloc(size_t(amax) * h * 2));
+    std::vector<std::vector<int>> host_tables(static_cast<size_t>(layers)); std::vector<int *> tables(static_cast<size_t>(layers), nullptr);
+    // the banks this box holds now: every one full (its own prefills may have reshaped them), device slot tables current
+    auto banks_full = [&] {
+        std::vector<int> slot_of;
+        for (int l = 0; l < layers; ++l) {
+            if (!cache.full_bank(l, slot_of)) return false;
+            if (!tables[size_t(l)]) tables[size_t(l)] = static_cast<int *>(alloc(slot_of.size() * 4));
+            if (host_tables[size_t(l)] != slot_of) { host_tables[size_t(l)] = slot_of; ck(cudaMemcpyAsync(tables[size_t(l)], slot_of.data(), slot_of.size() * 4, cudaMemcpyHostToDevice, s)); ck(cudaStreamSynchronize(s)); }
+        }
+        return true;
+    };
+    std::fprintf(stderr, "tqllm: --split experts rank 1: computing experts e %% 2 == 1 for rank 0 when this box is idle\n");
+    { std::lock_guard<std::recursive_mutex> lk(gate->mu); gate->refresh = banks_full; ep_grant(cp, *gate); }
+    auto lease_over = [&] { std::lock_guard<std::mutex> l(gate->lm); gate->lease_out = false; gate->lcv.notify_all(); };
+    uint64_t forwards = 0;
+    for (;;) {
+        int32_t hdr[2] = {0, 0};
+        try { ep.ctl_recv(hdr, sizeof hdr); } catch (const std::exception &) { break; }  // rank 0 went away
+        if (hdr[0] == kEpStop) break;
+        if (hdr[0] == kEpLeaseEnd) { lease_over(); continue; }
+        if (hdr[0] != kEpForward || hdr[1] <= 0 || hdr[1] > nmax) { std::fprintf(stderr, "tqllm: --split experts rank 1: bad forward header\n"); break; }
+        const int n = hdr[1], A = n * c.topk, cap = tqllm::flashnext::ep_result_cap(A);
+        // a forward under the lease: this box has no request of its own (its next one waits in ep_reclaim for the lease end)
+        std::lock_guard<std::recursive_mutex> lk(gate->mu);
+        for (int layer = 0; layer < layers; ++layer) {
+            ep.group_begin(); ep.recv(x, size_t(n) * h * sizeof(__half), 0, s); ep.recv(ids, size_t(A) * sizeof(int), 0, s); ep.group_end();
+            const Mat mg = cache.bank_mat(layer, 0), mu = cache.bank_mat(layer, 1), md = cache.bank_mat(layer, 2);
+            int * slots_p = maps, * gu = maps + A, * dn = gu + size_t(A) * DS;
+            tqllm_cuda::ep_local_ids(nullptr, 0, ids, A, 1, cap, local, s);
+            tqllm_cuda::moe_dedup_maps(local, tables[size_t(layer)], A, c.topk, slots_p, gu, dn, A, s);
+            if (mg.fmt == mu.fmt) mg.fmt->expert_matvec_dedup2(mg, mu, x, eg, eu, ff, gu, A, s);
+            else { mg.fmt->expert_matvec_dedup(mg, x, eg, ff, gu, A, s); mu.fmt->expert_matvec_dedup(mu, x, eu, ff, gu, A, s); }
+            tqllm_cuda::fn_swiglu_bf16_h(eg, eu, ax, int64_t(A) * ff, s);
+            md.fmt->expert_matvec_dedup(md, ax, ed, h, dn, A, s);
+            if (cap > 0) { tqllm_cuda::ep_gather(ed, 0, ids, A, 1, cap, sb, h, s); ep.send(sb, size_t(cap) * h * sizeof(__nv_bfloat16), 0, s); }
+        }
+        ck(cudaStreamSynchronize(s));  // the forward's work is done before the serving thread may run
+        if (++forwards % 1000 == 0) std::fprintf(stderr, "tqllm: --split experts rank 1: %llu forwards computed\n", (unsigned long long) forwards);
+    }
+    { std::lock_guard<std::recursive_mutex> lk(gate->mu); gate->refresh = nullptr; }  // its tables live on this stack
+    lease_over();  // a request of this box waiting for the lease goes on
+    std::fprintf(stderr, "tqllm: --split experts rank 1: rank 0 stopped after %llu forwards computed\n", (unsigned long long) forwards);
 }

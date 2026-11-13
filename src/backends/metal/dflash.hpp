@@ -56,6 +56,18 @@ public:
     // the ring's device head / fill back to the host at `position` (the target's position), so a host inject can continue
     // the same sequence (a request that extends the previous one's text)
     void settle_to_host(int position);
+    // the ring window with its head / fill and the far caches' partial chunk-key sum at the injected position (host
+    // injects only, i.e. during a prefill), for a later request that resumes the prompt there; the far rows below the
+    // position stay in the caches, so it holds until the next reset
+    class Kept {
+        struct State;
+        std::shared_ptr<const State> state_;
+        friend class DFlash2;
+    };
+    Kept keep() const;
+    // evaluate the caches (window, far context, chunk sums) and wait: see Qwen35::settle
+    void settle() const;
+    void restore(const Kept& kept);
     // rows one inject may carry (the pipeline's verify rows: 16, or 32 for a 31-node tree); sizes the attention span of a
     // draft issued before its inject settles
     void inject_block(int rows);

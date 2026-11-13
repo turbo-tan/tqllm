@@ -343,6 +343,11 @@ int main(int argc, char ** argv) {
 #endif
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
+        if (engine.split_layers && engine.tp_rank > 0) {  // --split layer: this rank follows rank 0's server
+            std::fprintf(stderr, "tqserve: --split layer rank %d loaded; following rank 0\n", engine.tp_rank);
+            model.follow();
+            return 0;
+        }
         std::unique_ptr<tqserve::Monitor> monitor;
         std::unique_ptr<tqserve::MonitorServer> monitor_server;
         {
@@ -361,6 +366,62 @@ int main(int argc, char ** argv) {
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
         std::atomic<int> inflight{0};
         std::mutex generation_mutex;
+        // one slot: after a chat reply the engine may prefill the reply as the client will return it (Engine::prefill_ahead).
+        // It runs here under the generation lock, so a request that arrives first is served first (and cancels it); a
+        // request that arrives during it waits for the tokens it would prefill itself when the expectation holds.
+        struct AheadWorker {
+            tqllm::Model & model;
+            std::mutex & generation;
+            std::mutex m;
+            std::condition_variable cv;
+            // the expected next prompt, rendered and tokenized on this thread (off the reply's path)
+            std::function<std::vector<uint32_t>()> next;
+            uint64_t posted = 0;  // counts posts: a post or cancel during the rendering makes that rendering stale
+            bool stop = false;
+            std::thread t;
+            AheadWorker(tqllm::Model & mo, std::mutex & g) : model(mo), generation(g), t([this] { run(); }) {}
+            ~AheadWorker() {
+                { std::lock_guard<std::mutex> l(m); stop = true; }
+                cv.notify_all();
+                t.join();
+            }
+            void post(std::function<std::vector<uint32_t>()> f) {
+                { std::lock_guard<std::mutex> l(m); next = std::move(f); ++posted; }
+                cv.notify_all();
+            }
+            void cancel() { std::lock_guard<std::mutex> l(m); next = nullptr; ++posted; }
+            void run() {
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> l(m);
+                        cv.wait(l, [&] { return stop || next; });
+                        if (stop) return;
+                    }
+                    std::vector<uint32_t> p;
+                    uint64_t mine = 0;
+                    try {
+                        std::function<std::vector<uint32_t>()> f;
+                        { std::lock_guard<std::mutex> l(m); f = next; mine = posted; }
+                        if (f) p = f();
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: next prompt for the idle prefill: " << e.what() << "\n";
+                    }
+                    std::lock_guard<std::mutex> g(generation);
+                    {
+                        std::lock_guard<std::mutex> l(m);
+                        if (!next || posted != mine) continue;  // a request came first, or a newer reply was posted
+                        next = nullptr;
+                    }
+                    if (p.empty()) continue;
+                    try {
+                        model.select_slot(0);
+                        model.prefill_ahead(0, p);
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: idle prefill failed: " << e.what() << "\n";
+                    }
+                }
+            }
+        } ahead_worker{model, generation_mutex};
         listener = bind_socket(host, static_cast<uint16_t>(port));
         if (listener < 0) throw std::runtime_error("socket bind/listen failed (error " + std::to_string(tqnet::last_error()) + ")");
         std::signal(SIGINT, stop_server);
@@ -509,6 +570,7 @@ int main(int argc, char ** argv) {
                 else if (api == tqserve::Api::Messages) in = tqserve::messages_to_chat(in, adapt_error);
                 std::unique_lock<std::mutex> generation_lock(generation_mutex, std::defer_lock);
                 if (!scheduler) generation_lock.lock();
+                if (!scheduler) ahead_worker.cancel();
                 auto parsed = adapt_error.empty()
                     ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
                     : tqserve::ChatRequest{};
@@ -521,6 +583,7 @@ int main(int argc, char ** argv) {
                     for (size_t i = 0; i < peers.size(); ++i)
                         asks.emplace_back([&, i] { boxes[i + 1] = tqserve::peer_status(peers[i], parsed.prompt_text, request.authorization, 100); });
                     boxes[0] = scheduler->route_status(parsed.prompt_text);
+                    boxes[0].helped = engine.split_experts && engine.tp_rank == 0;
                     for (auto & t : asks) t.join();
                     const double prompt = double(parsed.prompt_text.size()) / scheduler->chars_per_token();
                     const double gen = std::min<double>(parsed.max_tokens, 512);
@@ -536,6 +599,17 @@ int main(int argc, char ** argv) {
                         }
                         pick = tqserve::pick_box(boxes, prompt, gen);
                         ++inflight[size_t(pick)];
+                        if (tqllm::debug_on("route")) {
+                            std::string line = "tqserve: route -> box " + std::to_string(pick) + " |";
+                            for (size_t i = 0; i < boxes.size(); ++i) {
+                                const auto & b = boxes[i];
+                                char buf[160];
+                                std::snprintf(buf, sizeof buf, " b%zu ok %d free %d busy %d queued %d inflight %d cost %.2f", i, int(b.ok),
+                                              b.free, b.busy, b.queued, b.inflight, b.ok ? tqserve::route_cost(b, prompt, gen) : -1.0);
+                                line += buf;
+                            }
+                            std::fprintf(stderr, "%s\n", line.c_str());
+                        }
                     }
                     if (pick > 0) {
                         const auto & peer = peers[size_t(pick - 1)];
@@ -561,6 +635,17 @@ int main(int argc, char ** argv) {
                         parsed.thinking = false;
                     }
                 }
+                // --prompt-cache on, after a chat reply: the engine may prefill the reply as the client will return it while the server is idle
+                // (Engine::prefill_ahead). Not for tool calls (the next request follows at once) or image prompts.
+                auto prefill_ahead = [&](const tqserve::DecodeResult & reply) {
+                    if (!engine.prompt_cache || scheduler || !chat || !reply.error.empty() || !reply.tool_calls.empty() || !parsed.images.empty()) return;
+                    // rendered on the worker: a non-streamed reply is sent without waiting for it
+                    ahead_worker.post([&tokenizer, &renderer, &default_kwargs, body = in, reply, max_tokens, system, reasoning, effort] {
+                        const auto prefix = tqserve::next_prompt_prefix(body, reply, tqserve::returns_reasoning(body), max_tokens, system, reasoning,
+                                                                        effort, renderer ? &renderer : nullptr, &default_kwargs);
+                        return prefix.empty() ? std::vector<uint32_t>{} : tokenizer.encode(prefix);
+                    });
+                };
                 if (!parsed.ok) {
                     status = 400;
                     body = tqserve::json_error(parsed.error);
@@ -629,6 +714,7 @@ int main(int argc, char ** argv) {
                         const auto generated = run_stream(parsed, out);
                         if (!generated.error.empty()) out.error(generated.error);
                         else out.close(generated);
+                        prefill_ahead(generated);
                     }
                     if (!scheduler) model.set_continuation(0);  // a thinking budget's held phase 1 state, if phase 2 did not run
                     if (parsed.observation) parsed.observation->finish();
@@ -672,6 +758,7 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         generated = run(parsed);
+                        prefill_ahead(generated);
                     }
                     if (!scheduler) model.set_continuation(0);
                     if (!generated.error.empty()) {

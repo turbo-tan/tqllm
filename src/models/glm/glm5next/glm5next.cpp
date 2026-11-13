@@ -18,6 +18,8 @@
 #include "moe_kernels.cuh"
 #include "quant_kernels.cuh"
 #include "packed_experts.hpp"
+#include "cpu_kquant.hpp"
+#include "cpu_pool.hpp"
 #include "weight_format.hpp"
 
 #include <cublas_v2.h>
@@ -26,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -259,6 +262,15 @@ private:
     // what to load), so it does not capture a graph.
     int slots_ = 0;
     bool bank_mode_ = false;
+    // decode on the bank path: experts the bank lacks run on the CPU straight from the mapped GGUF (src/experts/cpu_kquant)
+    // while the GPU runs the ones it holds; no re-pack, no copy per miss. On when every expert matrix is a K-quant.
+    std::unique_ptr<CpuPool> cpu_pool_;
+    uint64_t cpu_hits_ = 0, cpu_misses_ = 0, cpu_calls_ = 0;
+    double t_state_ = 0, t_d2h_ = 0, t_cpu_ = 0, t_join_ = 0;  // seconds in moe_cpu_split (TQLLM_DEBUG=glm_cpu)
+    std::vector<float> h_xn_, h_gu_, h_y_;
+    struct PinnedFree { void operator()(void * p) const { if (p) cudaFreeHost(p); } };
+    std::unique_ptr<void, PinnedFree> h_out_;  // the CPU rows on their way to yd_ (pinned)
+    size_t h_out_cap_ = 0;
     size_t budget_ = 0;         // device bytes the banks plus loader staging may hold
     size_t bank_bytes_ = 0;     // what a full set of banks costs: the default budget
     std::vector<size_t> slot_bytes_;  // per layer: one slot's bytes in the bank row layout (0: no bank there)
@@ -476,6 +488,13 @@ private:
         bank_ = std::make_unique<MixedExpertCache>(int(L_.size()), experts_, H_, expert_ff_, cap, budget_,
                                                    [this](int l, int e) { return expert_payload(l, e); }, stream_);
         bank_->set_layer_slots(caps);
+        bool kq = true;
+        for (int l = dense_lead_; l < int(L_.size()) && kq; ++l)
+            for (const auto & p : expert_payload(l, 0)) kq = kq && tqllm::cpu::kq_supported(p.type);
+        if (kq) {
+            cpu_pool_ = std::make_unique<CpuPool>(8);  // 8 threads reach the 5950X's DRAM bandwidth (43 GB/s measured)
+            std::fprintf(stderr, "glm5next: decode misses run on the CPU (%d threads, K-quant experts)\n", cpu_pool_->threads());
+        }
         const char * path = std::getenv("TQLLM_GLM_EXPERTS");
         if (!path) return;
         packed_ = std::make_unique<PackedExperts>(open_packed(path));
@@ -521,6 +540,11 @@ private:
                      (unsigned long long)s.hits, (unsigned long long)s.misses, (unsigned long long)s.evictions,
                      s.transfer_bytes / 1e9, (unsigned long long)bank_->prefetched(), (unsigned long long)bank_->prefetch_used(),
                      s.device_bytes / 1e9, bank_->peak_device_bytes() / 1e9, pf_ ? ", prefetch on" : "");
+        if (cpu_calls_)
+            std::fprintf(stderr, "glm5next: decode split: %llu layer calls, hits %llu misses %llu (%.1f %% hit); seconds: bank state %.2f, "
+                         "input to host %.2f, CPU experts + launch %.2f (of which the GPU join %.2f)\n",
+                         (unsigned long long)cpu_calls_, (unsigned long long)cpu_hits_, (unsigned long long)cpu_misses_,
+                         100.0 * double(cpu_hits_) / double(std::max<uint64_t>(1, cpu_hits_ + cpu_misses_)), t_state_, t_d2h_, t_cpu_, t_join_);
     }
     // per-head matrices of the latent MLA ([heads][rows][cols] FP16 on the device)
     const __half * heads_f16(const std::string & n) {
@@ -1004,6 +1028,7 @@ private:
         hist.insert(hist.end(), routed.end() - size_t(std::min(n, kPfHistory)) * topk_, routed.end());
         if (hist.size() > size_t(kPfHistory) * size_t(topk_))
             hist.erase(hist.begin(), hist.begin() + long(hist.size() - size_t(kPfHistory) * topk_));
+        if (cpu_pool_ && n <= kCpuMissTokens && bank_->bank_ready(l)) { moe_cpu_split(Y, l, n, routed); return; }
         const int fe = expert_ff_;
         for (const auto & wv : stacked_expert_waves(routed, topk_, bank_->slots(l))) {
             const auto slot = bank_->prepare(l, wv.ids);
@@ -1038,6 +1063,101 @@ private:
         }
         ffn(Y.sh_gate, Y.sh_up, Y.sh_down, xn, Y.clamp_sh, sh_.as<float>(), n);
         tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+    }
+
+    static constexpr int kCpuMissTokens = 16;  // decode and verify blocks; prompts keep the bank path
+    // Decode split: rows whose expert sits in the layer's bank run on the GPU; the others run on the CPU from the mapped
+    // GGUF bytes and overwrite their (placeholder) GPU rows before the weighted sum. The bank is not changed.
+    void moe_cpu_split(Layer & Y, int l, int n, const std::vector<int> & routed) {
+        const int fe = expert_ff_, A = n * topk_;
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        const auto t0 = now();
+        const auto st = bank_->bank_state(l);
+        std::vector<int> slot_of(size_t(experts_), -1), phys(static_cast<size_t>(A)), miss;
+        for (size_t s = 0; s < st.ids.size(); ++s) if (st.ids[s] >= 0 && st.ids[s] < experts_) slot_of[size_t(st.ids[s])] = int(s);
+        for (int a = 0; a < A; ++a) {
+            const int s = slot_of[size_t(routed[size_t(a)])];
+            phys[size_t(a)] = s >= 0 ? s : 0;  // a miss computes slot 0 on the GPU; its row is overwritten below
+            if (s < 0) miss.push_back(a);
+        }
+        cpu_hits_ += uint64_t(A) - miss.size(), cpu_misses_ += miss.size(), ++cpu_calls_;
+        const auto t1 = now();
+        if (!miss.empty()) {  // the layer input, for the CPU (the stream is idle: the routed ids were just read)
+            h_xn_.resize(size_t(n) * H_);
+            ck(cudaMemcpy(h_xn_.data(), xn_.p, h_xn_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        const auto t2 = now();
+        t_state_ += sec(t0, t1), t_d2h_ += sec(t1, t2);
+        ck(cudaMemcpyAsync(d_slots_.p, phys.data(), phys.size() * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        const Mat g = bank_->bank_mat(l, 0), u = bank_->bank_mat(l, 1), dn = bank_->bank_mat(l, 2);
+        bf16 * gw = ye_g_.as<bf16>(), * uw = ye_u_.as<bf16>();
+        if (g.fmt == u.fmt && Y.paired == 1) g.fmt->expert_matvec2(g, u, xh_.as<__half>(), gw, uw, fe, d_slots_.as<int>(), n, topk_, stream_);
+        else {
+            g.fmt->expert_matvec(g, xh_.as<__half>(), gw, fe, d_slots_.as<int>(), n, topk_, false, stream_);
+            u.fmt->expert_matvec(u, xh_.as<__half>(), uw, fe, d_slots_.as<int>(), n, topk_, false, stream_);
+        }
+        tqllm_cuda::glm_swiglu(gw, uw, act_.as<__half>(), A * fe, Y.clamp_exp, stream_);
+        dn.fmt->expert_matvec(dn, act_.as<__half>(), yd_.as<bf16>(), H_, d_slots_.as<int>(), n, topk_, true, stream_);
+        if (!miss.empty()) cpu_experts(Y, l, routed, miss);
+        t_cpu_ += sec(t2, now());
+        ffn(Y.sh_gate, Y.sh_up, Y.sh_down, xn_.as<float>(), Y.clamp_sh, sh_.as<float>(), n);
+        tqllm_cuda::moe_common::moe_sum(yd_.as<bf16>(), d_w_.as<float>(), sh_.as<float>(), fo_.as<float>(), topk_, H_, stream_, n);
+    }
+    // the missed rows on the CPU (gate / up, SwiGLU, down in row chunks over the pool), then into yd_ on the stream
+    void cpu_experts(const Layer & Y, int l, const std::vector<int> & routed, const std::vector<int> & miss) {
+        const int fe = expert_ff_, M = int(miss.size()), kGU = 256, kD = 512;
+        std::vector<std::array<ExpertPayload, 3>> pay;
+        pay.reserve(miss.size());
+        for (int a : miss) pay.push_back(expert_payload(l, routed[size_t(a)]));
+        std::vector<tqllm::cpu::Xq> xq(size_t(routed.size() / topk_));
+        std::vector<char> have(xq.size(), 0);
+        for (int a : miss) {
+            const int t = a / topk_;
+            if (!have[size_t(t)]) tqllm::cpu::quantize_x(h_xn_.data() + size_t(t) * H_, H_, xq[size_t(t)]), have[size_t(t)] = 1;
+        }
+        h_gu_.resize(size_t(M) * 2 * fe);
+        const int cg = (fe + kGU - 1) / kGU;
+        cpu_pool_->run(M * 2 * cg, [&](int task) {  // gate (p = 0) and up (p = 1) row chunks
+            const int m = task / (2 * cg), p = (task / cg) % 2, r0 = (task % cg) * kGU, r1 = std::min(fe, r0 + kGU);
+            const auto & w = pay[size_t(m)][size_t(p)];
+            tqllm::cpu::kq_matvec(w.type, reinterpret_cast<const uint8_t *>(w.bytes.data), H_, xq[size_t(miss[size_t(m)] / topk_)],
+                                  r0, r1, h_gu_.data() + (size_t(m) * 2 + size_t(p)) * fe + r0);
+        });
+        std::vector<tqllm::cpu::Xq> aq(static_cast<size_t>(M));
+        std::vector<float> act(static_cast<size_t>(fe));
+        const float lim = Y.clamp_exp;
+        for (int m = 0; m < M; ++m) {  // SwiGLU as glm_swiglu: gate clamped from above, up both ways
+            const float * gg = h_gu_.data() + size_t(m) * 2 * fe, * uu = gg + fe;
+            for (int i = 0; i < fe; ++i) {
+                float a = gg[i], b = uu[i];
+                if (lim > 1e-6f) a = std::min(a, lim), b = std::min(std::max(b, -lim), lim);
+                act[size_t(i)] = a / (1.f + std::exp(-a)) * b;
+            }
+            tqllm::cpu::quantize_x(act.data(), fe, aq[size_t(m)]);
+        }
+        h_y_.resize(size_t(M) * H_);
+        const int cd = (H_ + kD - 1) / kD;
+        cpu_pool_->run(M * cd, [&](int task) {
+            const int m = task / cd, r0 = (task % cd) * kD, r1 = std::min(H_, r0 + kD);
+            const auto & w = pay[size_t(m)][2];
+            tqllm::cpu::kq_matvec(w.type, reinterpret_cast<const uint8_t *>(w.bytes.data), fe, aq[size_t(m)], r0, r1,
+                                  h_y_.data() + size_t(m) * H_ + r0);
+        });
+        const size_t need = size_t(M) * H_ * sizeof(bf16);
+        const auto tj = std::chrono::steady_clock::now();
+        ck(cudaStreamSynchronize(stream_));  // the previous layer's copies out of h_out_ are done; this layer's GPU rows too
+        t_join_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tj).count();
+        if (!h_out_ || h_out_cap_ < need) {
+            void * p = nullptr;
+            ck(cudaHostAlloc(&p, need, cudaHostAllocDefault));
+            h_out_.reset(p), h_out_cap_ = need;
+        }
+        auto * ob = static_cast<bf16 *>(h_out_.get());
+        for (size_t i = 0; i < size_t(M) * H_; ++i) ob[i] = __float2bfloat16(h_y_[i]);
+        for (int m = 0; m < M; ++m)
+            ck(cudaMemcpyAsync(yd_.as<bf16>() + size_t(miss[size_t(m)]) * H_, ob + size_t(m) * H_, size_t(H_) * sizeof(bf16),
+                               cudaMemcpyHostToDevice, stream_));
     }
 
     // tokens [n] at positions pos .. pos + n - 1; next[i] = argmax after token i (null: no argmax)

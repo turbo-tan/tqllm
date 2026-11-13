@@ -16,6 +16,19 @@ y[i]=bfloat16_t(s*(INTEGER_LEVELS?LVI[code]:LV[code]));
     return kernel({w.codes,w.scales},{{r,k}},{mx::bfloat16},{r*k,1,1},{256,1,1},
                   {{"R",r},{"K",k},{"INTEGER_LEVELS",w.integer_levels}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
 }
+}
+mx::array stage_half(const Tq4Weights& w) {
+    const int r=w.codes.shape(0),k=w.codes.shape(1)*2;
+    static auto kernel=mx::fast::metal_kernel("tqllm_tq4_stage_half",{"codes","scales"},{"y"},R"METAL(
+uint i=thread_position_in_grid.x;
+if(i>=R*K) return;
+uint row=i/K,col=i%K,code=(codes[row*(K/2)+col/2]>>(4*(col%2)))&15u;
+y[i]=half(float(scales[row*(K/128)+col/128])*LVI[code]);
+)METAL","constant float LVI[16]={6.0f,18.0f,31.0f,44.0f,58.0f,75.0f,96.0f,127.0f,-6.0f,-18.0f,-31.0f,-44.0f,-58.0f,-75.0f,-96.0f,-127.0f};");
+    if(!w.integer_levels)throw std::invalid_argument("stage_half: integer-level TQ4 only");
+    return kernel({w.codes,w.scales},{{r,k}},{mx::float16},{r*k,1,1},{256,1,1},{{"R",r},{"K",k}},std::nullopt,false,mx::Device(mx::Device::gpu))[0];
+}
+namespace {
 mx::array dense(const Tq3Weights& w) {
     const int r=w.planes.shape(0),k=(w.interleaved?w.planes.shape(1):w.planes.shape(2))*32;
     static auto kernel=mx::fast::metal_kernel("tqllm_tq3_stage",{"planes","scales"},{"y"},R"METAL(
@@ -61,6 +74,7 @@ y[i]=bfloat16_t(float(as_type<char>(p[2+col%32]))*d);
 }
 }
 mx::array dense(const KQuantWeights& w) {return mx::astype(kquant_dequant(w), mx::bfloat16);}
+mx::array dense(const AffineWeights& w) {return mx::astype(mx::dequantize(w.blocks, w.scales, w.biases, w.group, w.bits, "affine"), mx::bfloat16);}
 mx::array stage_bf16(const Matrix& weights) {
     return std::visit([](const auto& w)->mx::array {
         using T=std::decay_t<decltype(w)>;

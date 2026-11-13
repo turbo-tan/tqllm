@@ -25,6 +25,7 @@ struct KvBf16 final : KvFormat {
     KvProvenance provenance() const override { return {"BF16 K and V (reference format, also read by the single-token path)"}; }
     bool compressed() const override { return false; }
     bool tree_ok() const override { return true; }
+    bool qsa_ok() const override { return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override { return size_t(c) * kvh * hd * 2; }
     size_t value_bytes(int64_t c, int kvh, int hd) const override { return size_t(c) * kvh * hd * 2; }
     void write_and_attend(const KvStep & a) const override {
@@ -35,6 +36,11 @@ struct KvBf16 final : KvFormat {
             if (a.par) throw std::invalid_argument("128-dimensional BF16 KV does not support tree masks");
             tqllm_cuda::attention_gen128(a.q, kc, vc, a.o, a.part, a.dpos, a.n, int(a.context), a.heads, a.kvheads,
                                         a.scale, true, 0, a.stream);
+            return;
+        }
+        if (a.par && a.qsa_sel) {
+            tqllm_cuda::attention_mq256_qsa(a.q, kc, vc, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.split,
+                                            a.stream, a.par, a.dep, a.qsa_sel, a.qsa_from, a.qsa_mixed);
             return;
         }
         if (a.par) {  // tree / chain verify block: cache part + in-block ancestors (n <= 8)

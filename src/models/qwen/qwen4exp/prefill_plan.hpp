@@ -108,6 +108,28 @@ inline PrefillChunkBytes prefill_chunk_bytes(const PrefillShape & s, const Prefi
     return b;
 }
 
+// The device room a prefill plan may use. `budget` is what the engine measured once at start with every buffer in place and
+// the allocator's pool trimmed (free + expert bank bytes, rounded down to 256 MB); it is the plan's input on purpose: with
+// the free memory of the moment the same prompt length took one chunk of 25600 or two of 21504 depending on what the
+// previous request left behind (+-1 s of TTFT, 11-12), and since the chunk boundary decides the tokens, the text followed
+// it. `have` is what the session offers now: free memory + the banks that are still resident + the cache's loader staging
+// + the request's own terms (the MTP bank a multi-chunk prompt drops before the trunk, the LM heads a parked prompt frees).
+// When the session cannot cover the budget at all (a leftover allocation no bank release can give back) the plan uses
+// `have` and `from_budget` is false, so the engine can say so in its log.
+struct PlanRoom { size_t room = 0, have = 0; bool from_budget = false; };
+inline PlanRoom plan_room(size_t budget, size_t free_now, size_t banks, size_t staging, size_t mtp = 0, size_t heads = 0) {
+    PlanRoom r; r.have = free_now + banks + staging + mtp + heads;
+    const size_t want = budget + mtp + heads;
+    if (budget && r.have >= want) { r.room = want; r.from_budget = true; } else r.room = r.have;
+    return r;
+}
+
+// The scratch arena a chunk and its selection block need: the measured per-token rule (prefill_arena_bytes) plus one
+// block's QSA score scratch and headroom.
+inline size_t prefill_arena_req(size_t arena_prefill, int chunk, int block, int attention_heads, size_t headroom = size_t(64) << 20) {
+    return std::min<size_t>(arena_prefill, prefill_arena_bytes(chunk)) + size_t(std::max(0, block)) * size_t(std::max(0, attention_heads)) * 2052 * 8 + headroom;
+}
+
 // The whole request: the trunk's chunk peak, the MTP catch-up that follows (trunk buffers released first), and how many
 // bank bytes must be released before the trunk starts.
 struct PrefillPlan {
@@ -132,6 +154,42 @@ inline PrefillPlan prefill_plan(const PrefillShape & s, const PrefillTuning & t,
     p.release = p.need > free_bytes ? p.need - free_bytes : 0;
     p.host_copies = size_t(p.chunks) * size_t(s.layers) * size_t(s.experts) * s.expert_block_bytes;
     return p;
+}
+
+// The chunk and selection block a prompt gets, and whether parking the LM heads is what would buy the whole prompt in one
+// chunk: a pure function of the prompt length, the plan's room and the sizes fixed at start. The engine halves the
+// selection block first (2048 -> 1024 -> 512, ~0.5 s at 32K) and then the chunk by 7/8 (every chunk streams every expert
+// once, so the largest chunk that fits is the cheapest). The park probe runs once the chunk has halved below the prompt: a
+// pinned 634 MB head copy costs ~1.1 s of TTFT, so it pays only when the heads' room makes the whole prompt one chunk.
+// A plan whose need is above `room` for every candidate is returned at the smallest chunk, where the caller's plan reports
+// it (nothing fits: the request fails as it did before).
+struct PrefillChoice { int chunk = 0, block = 0; bool park_heads = false; size_t need = 0; };
+using PrefillTuningFn = std::function<PrefillTuning(int chunk, int block)>;
+inline PrefillChoice prefill_choice(const PrefillShape & s, const PrefillTuningFn & tune_for, int prompt_tokens, size_t room,
+                                    size_t mtp_bytes, size_t heads, int chunk0, int block0, int min_chunk = 2048) {
+    if (prompt_tokens <= 0 || chunk0 < min_chunk) throw std::invalid_argument("prefill_choice: no tokens or no chunk");
+    PrefillChoice c; c.chunk = chunk0; c.block = block0;
+    const auto need_of = [&](int chunk, int block) {
+        try { return prefill_plan(s, tune_for(chunk, block), prompt_tokens, 0).need; } catch (const std::exception &) { return size_t(0); }
+    };
+    std::vector<int> blocks{block0};
+    if (block0 > 1024) blocks.push_back(1024);
+    if (block0 > 512) blocks.push_back(512);
+    bool probed = heads == 0;  // no resident LM heads to park: no probe
+    for (int chunk = chunk0;;) {
+        if (!probed && prompt_tokens > chunk) {
+            probed = true;
+            const size_t one = need_of(chunk0, block0);
+            if (one && one <= room + heads) { c.park_heads = true; c.chunk = chunk0; c.block = block0; c.need = one; return c; }
+        }
+        for (int block : blocks) {
+            const size_t need = need_of(chunk, block);
+            if (need && need <= room + (prompt_tokens > chunk ? mtp_bytes : 0)) { c.chunk = chunk; c.block = block; c.need = need; return c; }
+        }
+        if (chunk <= min_chunk) break;
+        chunk = std::max(min_chunk, int(size_t(chunk) * 7 / 8 / 1024 * 1024));
+    }
+    return c;
 }
 
 // the plan's own two numbers, as the shared bank arithmetic names them

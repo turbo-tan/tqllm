@@ -312,8 +312,11 @@ __global__ void __launch_bounds__(128) attn_gen_mq_k(const __nv_bfloat16 * q, co
     }
 }
 
-template <int DIM> __global__ void attn_gen_merge_k(const float * part, __nv_bfloat16 * y, int nsplit, int heads) {
+// qsa_seq0 (QSA rows of a chain block): only the rows whose split point is >= qsa_from are merged
+template <int DIM> __global__ void attn_gen_merge_k(const float * part, __nv_bfloat16 * y, int nsplit, int heads,
+                                                    const int * qsa_seq0 = nullptr, int qsa_from = 0) {
     const int h = blockIdx.x, d = threadIdx.x, qz = blockIdx.y;
+    if (qsa_seq0 && tqllm_dev::tq_split_point(*qsa_seq0 - 1 + qz) < qsa_from) return;
     const float * base = part + (int64_t(qz) * heads + h) * nsplit * (DIM + 2);
     y += int64_t(qz) * heads * DIM;
     float m = -CUDART_INF_F;
@@ -352,9 +355,11 @@ static __device__ __constant__ float turbo3_attn_centroids[8] = {
     -0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f
 };
 
-__global__ void turbo3_inverse_multi_k(__nv_bfloat16 * data, int heads, int dim) {
+// qsa_seq0 (QSA rows of a chain block): only the rows whose split point is >= qsa_from
+__global__ void turbo3_inverse_multi_k(__nv_bfloat16 * data, int heads, int dim, const int * qsa_seq0 = nullptr, int qsa_from = 0) {
     const int d = threadIdx.x, sub = blockIdx.x % (dim / 128), h = (blockIdx.x / (dim / 128)) % heads;
     const int q = blockIdx.x / (heads * (dim / 128));
+    if (qsa_seq0 && tqllm_dev::tq_split_point(*qsa_seq0 - 1 + q) < qsa_from) return;
     const int64_t base = (int64_t(q) * heads + h) * dim + sub * 128;
     __shared__ float x[128];
     x[d] = __bfloat162float(data[base + d]) * turbo3_attn_s2[d];
@@ -399,12 +404,22 @@ __device__ __forceinline__ void cp_async16(void * dst, const void * src) {
 // K/V tiles of 32 keys are double-buffered with cp.async.
 // Q8: the cache is int8 with one FP16 scale per 32 values ([pos][kv head][DIM / 32]); int8 tiles are double-buffered
 // with cp.async and converted to BF16 in shared memory before the (unchanged) tensor-core phases.
-template <int DIM, bool Q8, bool TURBO3V>
+// SEL (QSA, qwen35_qsa.cuh): grid z = one row of the verify block; its keys are the 4 positions of each of its selected
+// blocks sel[z][512], in that order, in place of the cache positions below its split point. A row whose split point is
+// below `from` is left alone (a dense row). The row's partials depend on its own query and selection only.
+template <int DIM, bool Q8, bool TURBO3V, bool SEL = false>
 __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const void * kc_, const void * vc_,
                                                  const __half * ksc, const __half * vsc, float * part,
                                                  const int * dseq0, int nq, int heads, int kvheads, float scale,
                                                  int nsplit, int query_offset, int pstride, int blk,
-                                                 const int * dep = nullptr) {
+                                                 const int * dep = nullptr, const int32_t * sel = nullptr, int from = 0) {
+    constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
+    if constexpr (SEL) {
+        const int z = blockIdx.z;
+        if (tq_split_point(*dseq0 - 1 + (dep ? dep[z] : z)) < from) return;
+        q += int64_t(z) * heads * DIM, part += int64_t(z) * heads * pstride * (DIM + 2), sel += int64_t(z) * (SEL_KEYS / 4);
+        nq = 1, dep = nullptr;
+    }
     static_assert(DIM == 256 && MQ_TILE == 32 && MQ_MAXROWS == 48, "warp layout assumes 8 warps, 3 m-tiles, 4 n-tiles");
     constexpr int MT = MQ_MAXROWS / 16;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -438,13 +453,13 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
     // tiles interleaved over the splits (tile i -> split i % nsplit): a key's split and summation order depend only on
     // its position, not on nq, so a query's result is the same for any verify width
     // blk: keys of the current block (slots seq0 - 1 ..) are left to attn_blk_k, so this pass covers [0, seq0 - 1)
-    const int stride = nsplit * MQ_TILE, beg = split * MQ_TILE, end = blk ? seq0 - 1 : seq_last;
+    const int stride = nsplit * MQ_TILE, beg = split * MQ_TILE, end = SEL ? SEL_KEYS : blk ? seq0 - 1 : seq_last;
     // blk (two-part verify attention): row r (query z = r / g at position qpos = seq0 - 1 + depth) takes keys below
     // tq_split_point(qpos) here; attn_blk_k does the rest. The split depends on qpos alone, never on where the block starts.
     __shared__ int lim[MQ_MAXROWS];
     if (t < MQ_MAXROWS) {
         const int z = t / g;
-        lim[t] = blk ? tq_split_point(seq0 - 1 + (dep ? dep[min(z, nq - 1)] : z)) : seq0 + z;
+        lim[t] = SEL ? SEL_KEYS : blk ? tq_split_point(seq0 - 1 + (dep ? dep[min(z, nq - 1)] : z)) : seq0 + z;
     }
     auto sh = [](const void * p) { return uint32_t(__cvta_generic_to_shared(p)); };
 
@@ -471,7 +486,9 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
             const int p = i / (DIM / 8), c = i % (DIM / 8);
             __nv_bfloat16 * dk = kbuf + (buf * MQ_TILE + p) * KS + c * 8, * dv = vbuf + (buf * MQ_TILE + p) * KS + c * 8;
             if (p < n) {
-                const int64_t src = (int64_t(t0 + p) * kvheads + kh) * DIM + c * 8;
+                int key = t0 + p;
+                if constexpr (SEL) key = sel[key / 4] * 4 + key % 4;
+                const int64_t src = (int64_t(key) * kvheads + kh) * DIM + c * 8;
                 cp_async16(dk, kc + src);
                 cp_async16(dv, vc + src);
             } else {  // zero tail: 0 * stale NaN in the MMA
@@ -731,6 +748,8 @@ int attention_mq_partial_floats(int heads, int nq, int nsplit) { return nq * hea
 #include "attention_fap.inc"
 
 #include "attention_fab.inc"
+
+#include "attention_qsa.inc"
 
 
 } // namespace tqllm_cuda

@@ -121,6 +121,17 @@ public:
         parked_.erase(it);
     }
     size_t park_heads() const { return park("output.weight") + park("draft_head"); }
+    // the device bytes park_heads() would hand back, without moving anything (a plan decides with it whether parking can
+    // make the prompt one chunk: pinning the copy costs ~0.9 s, so a probe that cannot succeed must not be paid)
+    size_t heads_bytes() const {
+        size_t total = 0;
+        for (const char * key : {"output.weight", "draft_head"}) {
+            const auto it = resident_.find(key);  // the same tensors park() moves
+            if (it == resident_.end() || !it->second || !it->second->m.fmt || it->second->dense || it->second->mem.empty() || parked_.count(key)) continue;
+            for (const auto & buf : it->second->mem) total += buf->count;
+        }
+        return total;
+    }
     void unpark_heads() const { unpark("output.weight"); unpark("draft_head"); }
     mutable std::map<std::string, std::unique_ptr<Device<float>>> dense_dev_;
     mutable cublasHandle_t blas_ = nullptr;

@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <climits>
+#include <vector>
 #include <math_constants.h>
 #include <stdexcept>
 #include <type_traits>
@@ -50,6 +51,17 @@ __device__ __forceinline__ float wht32(float v, int lane) {
 
 #include "quant_misc.inc"
 
+// one thread per 32-weight block of one expert: the block moves to its tile_expert_rows position
+__global__ void tile_rows_k(const char * src, char * dst, int rows, int nb, int bpb, int count, size_t stride) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x, per = int64_t(rows) * nb;
+    if (i >= per * count) return;
+    const int64_t e = i / per, j = i % per;
+    const int r = int(j / nb), s = int(j % nb);
+    const int64_t to = (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
+    const char * a = src + size_t(e) * stride + j * bpb;
+    char * b = dst + size_t(e) * stride + to;
+    for (int q = 0; q < bpb; ++q) b[q] = a[q];
+}
 } // namespace
 
 namespace tqllm_cuda {
@@ -139,6 +151,17 @@ void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb) {
             std::memcpy(dst + to, src + (int64_t(r) * nb + s) * bpb, size_t(bpb));
         }
 }
+void tile_expert_rows_device(char * p, int count, int rows, int k, int bpb, cudaStream_t s) {
+    if (!p || count <= 0 || rows % 16 || (k / 32) % 4 || bpb <= 0) throw std::invalid_argument("tile_expert_rows_device: invalid shape");
+    const int nb = k / 32;
+    const size_t stride = size_t(rows) * nb * size_t(bpb);
+    void * tmp = nullptr;
+    if (cudaMallocAsync(&tmp, stride * size_t(count), s) != cudaSuccess) throw std::runtime_error("tile_expert_rows_device: out of memory");
+    cudaMemcpyAsync(tmp, p, stride * size_t(count), cudaMemcpyDeviceToDevice, s);
+    const int64_t n = int64_t(rows) * nb * count;
+    tile_rows_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(static_cast<const char *>(tmp), p, rows, nb, bpb, count, stride);
+    cudaFreeAsync(tmp, s);
+}
 // gate and up in one launch (grid z = 2): same blocks, same per-row math as two k_expert_matvec_dedup calls
 void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
                       __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * ids, int n, int topk, cudaStream_t stream) {
@@ -170,16 +193,13 @@ void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint
 #undef TQ_PAIR
 }
 
-void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
-                            __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
-    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
-        throw std::invalid_argument("k_expert_matvec_dedup2: invalid shape");
+// paired dedup launch with the prefetching variant on or off (both bit-identical, test-expert-dedup)
+static void dedup2_launch(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                          __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, bool pf, cudaStream_t stream) {
     const dim3 grid(unsigned((rows + 15) / 16), unsigned(std::min(groups, kDedupGridGroups)), 2u);
     const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
-// 160+ groups (np 4+ verify blocks): the prefetching variant (GB10, 99 groups: -2..-6 %; 30 groups: +6..+9 %, so not
-// below), bit-identical (test-expert-dedup, 1,200 assignments)
-#define TQ_DEDUP2(F) (groups >= 160 ? u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 1, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups) \
-                                    : u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups))
+#define TQ_DEDUP2(F) (pf ? u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 1, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups) \
+                         : u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups))
     switch (fmt) {
         case 0: TQ_DEDUP2(0); break;
         case 1: TQ_DEDUP2(1); break;
@@ -195,6 +215,71 @@ void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, cons
         default: throw std::invalid_argument("k_expert_matvec_dedup2: unsupported format");
     }
 #undef TQ_DEDUP2
+}
+
+// group count from which the paired launch takes the prefetching variant, per u4h format: measured at start-up on the
+// real banks (calibrate_dedup_pf); 160 until then (GB10 IQ formats, untiled: 99 groups -2..-6 %, 30 groups +6..+9 %)
+static int g_dedup_pf_min[32] = {};
+static int dedup_pf_min(int fmt) { const int v = fmt >= 0 && fmt < 32 ? g_dedup_pf_min[fmt] : 0; return v > 0 ? v : 160; }
+void set_dedup_pf_min(int fmt, int groups) { if (fmt >= 0 && fmt < 32) g_dedup_pf_min[fmt] = groups; }
+int dedup_pf_threshold(int fmt) { return dedup_pf_min(fmt); }
+
+void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
+                            __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
+    if (!wa || !auxa || !wb || !auxb || !x || !ya || !yb || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
+        throw std::invalid_argument("k_expert_matvec_dedup2: invalid shape");
+    dedup2_launch(fmt, wa, auxa, wb, auxb, x, ya, yb, rows, cols, dmap, groups, groups >= dedup_pf_min(fmt), stream);
+}
+
+int calibrate_dedup_pf(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, int rows, int cols,
+                       int slots, cudaStream_t stream) {
+    if (fmt < 0 || fmt >= 32 || !wa || !wb || rows <= 0 || cols <= 0 || slots < 16) return dedup_pf_min(fmt);
+    constexpr int C = 2, ntok = 8;  // 2 columns per expert (a 4-8 stream verify block), 8 input rows
+    std::vector<int> counts;
+    for (int g : {16, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384}) if (g <= slots) counts.push_back(g);
+    const int gmax = counts.back(), R = 4;  // R disjoint-ish expert sets per count, rotated so the weights come from DRAM
+    __half * x = nullptr; __nv_bfloat16 * ya = nullptr, * yb = nullptr; int * dm = nullptr; cudaEvent_t e0 = nullptr, e1 = nullptr;
+    const size_t yrows = size_t(gmax) * C;
+    bool ok = cudaMalloc(&x, size_t(ntok) * cols * 2) == cudaSuccess && cudaMalloc(&ya, yrows * rows * 2) == cudaSuccess &&
+              cudaMalloc(&yb, yrows * rows * 2) == cudaSuccess && cudaMalloc(&dm, size_t(R) * gmax * kDedupStride * 4) == cudaSuccess &&
+              cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+    int found = 0;
+    if (ok) {
+        cudaMemsetAsync(x, 0, size_t(ntok) * cols * 2, stream);
+        std::vector<float> t_pf(counts.size()), t_np(counts.size());
+        for (size_t ci = 0; ci < counts.size(); ++ci) {
+            const int G = counts[ci];
+            std::vector<int> map(size_t(R) * G * kDedupStride, -1);
+            for (int r = 0; r < R; ++r)
+                for (int g = 0; g < G; ++g) {
+                    int * e = map.data() + (size_t(r) * G + g) * kDedupStride;
+                    e[0] = int((int64_t(r) * G + g) * 37 % slots); e[1] = C;
+                    for (int c = 0; c < C; ++c) { e[2 + c] = (g + c) % ntok; e[2 + kDedupCols + c] = g * C + c; }
+                }
+            cudaMemcpyAsync(dm, map.data(), map.size() * 4, cudaMemcpyHostToDevice, stream);
+            for (int v = 0; v < 2; ++v) {
+                const bool pf = v == 1;
+                auto run = [&](int i) { dedup2_launch(fmt, wa, auxa, wb, auxb, x, ya, yb, rows, cols, dm + size_t(i % R) * G * kDedupStride, G, pf, stream); };
+                for (int i = 0; i < 4; ++i) run(i);
+                cudaEventRecord(e0, stream);
+                for (int i = 0; i < 12; ++i) run(i);
+                cudaEventRecord(e1, stream); cudaEventSynchronize(e1);
+                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                (pf ? t_pf : t_np)[ci] = ms;
+            }
+        }
+        // the smallest count from which the prefetching variant is faster at every larger measured count
+        found = INT32_MAX;
+        for (size_t ci = counts.size(); ci-- > 0;) {
+            if (t_pf[ci] < 0.98f * t_np[ci]) found = counts[ci]; else break;
+        }
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    cudaFree(x); cudaFree(ya); cudaFree(yb); cudaFree(dm);
+    if (e0) cudaEventDestroy(e0); if (e1) cudaEventDestroy(e1);
+    if (!ok) { cudaGetLastError(); return dedup_pf_min(fmt); }
+    set_dedup_pf_min(fmt, found);
+    return found;
 }
 
 void k_expert_gemm(int fmt, const uint8_t * w, const void * aux, const __half * x,

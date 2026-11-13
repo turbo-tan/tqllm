@@ -24,6 +24,8 @@
 #include "int8_gemm.cuh"
 #include "qwen35_guard.hpp"
 #include "qwen35_kernels.cuh"
+#include "qwen35_qsa.cuh"
+#include "qwen35_qsa_plan.hpp"
 #include "quant_kernels.cuh"
 #include "moe_kernels.cuh"
 #include "vision_kernels.cuh"
@@ -69,14 +71,19 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
 #include "token_sampling.hpp"
+#include "layer_split.hpp"
+#include "../../../kv/prompt_park.hpp"
+#include "tp_comm.hpp"
 namespace tqllm {
 namespace qwen35_detail {
 
 class Qwen35Engine final : public Engine {
 public:
     // `path`: a checkpoint directory (safetensors, BF16), a .gguf file (TQ3_4S / Q6_K / F32), or a mapped folder (exl3).
-    Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o)
-        : opt(o), context_(ctx) {
+    // `tp` (--split layer): this process is one rank of a layer split; it loads and runs only its own layers
+    Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o,
+                 std::shared_ptr<TpComm> tp = nullptr)
+        : opt(o), context_(ctx), tp_(std::move(tp)) {
         glru.set_cap(size_t(std::max(1, opt.graph_cache)));
         graph_keep = size_t(std::max(0L, opt.graph_keep_mb)) << 20;
         if (slots < 1 || slots > 64) throw std::invalid_argument("slots must be in 1..64");
@@ -90,11 +97,21 @@ public:
         } else {
             cfg = read_config(path);
         }
+        lr_ = tp_ ? layer_range(cfg.layers, tp_->rank(), tp_->world(), opt.split_at) : LayerRange{0, cfg.layers};
+        if (tp_) {
+            if (!gguf || cfg.moe) throw std::invalid_argument("--split layer needs a dense qwen35 GGUF model");
+            if (opt.kv_host > 0 || opt.kv_compact)
+                throw std::invalid_argument("--split layer: --kv-host and --kv-compact are single-GPU only so far");
+            if (cfg.hidden % 256) throw std::invalid_argument("--split layer: hidden size must be a multiple of 256");
+            std::fprintf(stderr, "tqllm: --split layer: rank %d of %d runs layers %u..%u of %u\n", tp_->rank(), tp_->world(),
+                         lr_.lo, lr_.hi - 1, cfg.layers);
+        }
         ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         set_rope();
         try {
             tokenizer.load(tokpath);
             eos_ = tokenizer.eos_id();
+            im_start_ = tokenizer.special_id("<|im_start|>");
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
@@ -118,7 +135,7 @@ public:
             calibrate_prefill();
             smooth_prebuild();
             memlog("calibrate");
-            pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
+            pc_on = opt.prompt_cache || (kv_cmp && slots == 1);  // several slots: each keeps its own conversation
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
             parked.resize(size_t(slots));
             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
@@ -130,6 +147,7 @@ public:
                 swap_seq(tmp);
                 parked[size_t(s)] = std::move(tmp);
             }
+            park_init(slots);
         } catch (...) {
             release_raw();
             throw;
@@ -176,6 +194,22 @@ public:
     void pc_copy(bool save);
     // cache positions of prompt that can be kept (the recurrent state is set to match); the rest is prefilled
     uint32_t pc_match(const std::vector<uint32_t> & prompt);
+    // prompt tokens slot s would keep (no state change): the scheduler sends an agent's next turn to its slot
+    static uint32_t pc_shared(const std::vector<uint32_t> & seq, bool live, uint32_t snap, const std::vector<uint32_t> & prompt) {
+        const auto P = uint32_t(prompt.size());
+        auto shared = [&](uint32_t n) {
+            return n > 0 && n < P && n <= seq.size() && std::equal(seq.begin(), seq.begin() + n, prompt.begin());
+        };
+        if (live && shared(uint32_t(seq.size()))) return uint32_t(seq.size());
+        return shared(snap) ? snap : 0;
+    }
+    uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
+        if (!pc_on || s < 0 || s >= nslots) return 0;
+        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt)
+                                         : pc_shared(parked[size_t(s)].pc_seq, parked[size_t(s)].pc_live && !opt.exact,
+                                                     parked[size_t(s)].pc_snap, prompt);
+        return std::max(own, park_best(prompt, nullptr));  // a parked state resumes in any slot
+    }
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
 
 private:
@@ -208,7 +242,14 @@ private:
     bool quantized = false;
     bool fmt_target = false;     // target matrices come from a registered weight format (src/formats)
     Basis basis_ = Basis::Plain;  // how verify/prefill matmul inputs are prepared (from the target's weight format)
-    std::vector<Layer> layer;
+    std::vector<Layer> layer;  // full size; a --split layer rank loads only lr_ (the others stay empty)
+    std::shared_ptr<TpComm> tp_;
+    LayerRange lr_;
+    // --split layer: hidden rows [n][H], their sum-of-squares partials and the drafter features cross the boundary;
+    // the last rank sends its final rows back, so every rank runs the same head and drafter on the same rows
+    void split_enter(bf16 * X, int n);
+    void split_leave(bf16 * X, int n);
+    int split_min(int v);  // the smallest of every rank's v (sizes taken from free memory must agree)
     std::unique_ptr<KvMemory> kv_mem;  // declared before every KvStore so stores return their pages first
     std::unique_ptr<KvPool> kv_pool;
     std::unique_ptr<KvStore> kv_seq;   // the active slot's KV rows; key_cache / value_cache view them per attention layer
@@ -225,7 +266,7 @@ private:
     int cmp_layer = -1, ring_used = 0, ring_end = 0;  // the ring is written at position % kRing; newest row before ring_end
     std::vector<int> cmp_r;  // per attention layer; the middle ones lose most to compaction and keep twice the rows
     int64_t cmp_pos = 0, cmp_max = 0;  // cmp_max: positions the stand-in buffers can cover
-    // Prompt reuse (one slot): the cache holds pc_seq. With pc_live the recurrent state is at pc_seq.size(); pc_host
+    // Prompt reuse (per slot, swapped with it): the cache holds pc_seq. With pc_live the recurrent state is at pc_seq.size(); pc_host
     // holds the state at pc_snap, a prefill chunk boundary kTail tokens before the last prompt's end, for a prompt that
     // shares only that much (a chat template re-renders the previous answer without its think tags).
     static constexpr uint32_t kTail = 64;
@@ -233,11 +274,56 @@ private:
     uint32_t pc_snap = 0;
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
+    uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
+    uint32_t im_start_ = ~0u;  // the chat template's message-start token (prefill chunks restart there)
+    // kept states parked outside the slots (PromptPark, the TPark rules): a slot handed to another conversation parks its
+    // kept state (KV rows [0, snap) of this rank's attention layers + the recurrent state at snap); the next turn of that
+    // conversation picks it up into whichever slot it gets
+    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0; };
+    // the drafter's K/V rows that go with a kept state: its whole ring, else positions [0, snap)
+    size_t dfl_park_bytes(uint32_t snap) const {
+        if (!dfl.present || dfl_kc.empty()) return 0;
+        return size_t(dfl.ring ? uint32_t(dfl.ring) : snap) * size_t(dfl.kvheads) * dfl.hd * 2;
+    }
+    std::unique_ptr<PromptPark> park_;
+    std::vector<ParkSpace> park_sp_;
+    void park_init(int slots);
+    void park_out();
+    void park_swap(const std::vector<uint32_t> & prompt);
+    uint32_t park_best(const std::vector<uint32_t> & prompt, int * where) const;
     std::vector<Buf> q_ring, cmp_k, cmp_v, cmp_b;
     std::vector<tqllm_cuda::KvCompactSeg> cmp_seg;
     Buf d_cmp_i, d_stage_off, cmp_scratch, cmp_split;  // d_cmp_i: [start position, stand-in rows]; d_stage_off: [K, V] bytes
     cusolverDnHandle_t solver{};
     std::vector<KvRef> key_cache, value_cache;
+    // QSA (qwen35_qsa.cuh): sparse attention of verify rows past `from` keys when the file carries indexers. One slot,
+    // BF16 KV, two-part verify attention; anything else stays dense (qsa_setup logs why).
+    struct QsaLayer {
+        const __half * w = nullptr;  // [4 x 128 query | 128 key][hidden]
+        const float * q_norm = nullptr, * k_norm = nullptr, * block_norm = nullptr;
+        std::unique_ptr<HostBuf> tok;  // token keys [context][128] FP16 (pinned host memory, read by the pooling kernel)
+        Buf blocks;                    // block keys [context / 4][128]
+    };
+    struct Qsa {
+        bool on = false;
+        int file_from = 0, from = 0;  // rows whose split point is >= from are sparse
+        int max_blocks = 0;
+        std::vector<QsaLayer> layer;  // per attention layer; empty: no indexers in the file
+        Buf xu, proj, q, bits, sel, mass;
+        Buf tail_off;  // staged host KV tail: [K, V] first byte of the last evicted granule (sparse blocks stage back only that)
+        Buf mark;      // staged host KV tail: [max_blocks] block marks + 1 call tag (qsa27_stage_selected)
+        QsaPlan plan;   // token keys and block keys of the cache so far
+        int mode = 0;   // the verify block being launched: 0 dense, 1 every row sparse, 2 it crosses `from`
+        const int32_t * cur = nullptr;  // the selection of the attention layer that runs next (attn_core)
+        int mass_left = 0;              // TQLLM_DEBUG=qsa_mass: sparse steps still to report
+    } qsa;
+    void qsa_load(const GgufFile & f);
+    void qsa_setup();
+    // before a verify launch writes n positions at pos: the block's mode and the block keys its rows may pick from
+    void qsa_plan(uint32_t pos, int n);
+    // one attention layer of a verify block: token keys of its n rows; sparse blocks also get their rows' selections
+    void qsa_index(const Layer & L, uint32_t attn_i, int n, const int * dpos, const int * dep);
+    void qsa_mass_report(uint32_t attn_i);
     std::vector<Buf> conv_state, rec_state;
     Buf x, norm, resid, mix, gate, up, act, logits_buf, token, part, xq, xs, xf, part_x, part_m, amax;
     Buf t_in, t_qg, t_q, t_k, t_v, t_o, t_qkv, t_qkvc, t_z, t_a, t_b, t_core, t_gn;
@@ -484,6 +570,11 @@ private:
         SamplingParams samp;
         std::mt19937_64 rng{0};
         Gen gen;
+        bool pc_live = false;
+        uint32_t pc_snap = 0;
+        std::vector<uint32_t> pc_seq;
+        std::unique_ptr<HostBuf> pc_host;
+        uint64_t pc_conv = 0;
     };
     std::vector<SeqState> parked;  // parked[s] holds slot s while it is not active
     int active = 0, nslots = 1, NB = NVER;
@@ -694,8 +785,10 @@ public:
         // captured graphs bake in the slot's cache and state pointers, so the slot is part of the key
         const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > NVER && prefill_final) << 63) |
                              (uint64_t(sampling()) << 62) | (uint64_t(active) << 54) | (uint64_t(tree_step) << 53) |
-                             (uint64_t(sp) << 52);
-        if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
+                             (uint64_t(sp) << 52) | (uint64_t(qsa.mode) << 50);
+        if (qsa.mode && qsa.mass_left > 0) {
+            verify_body(n, int(bucket));
+        } else if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
             ck(cudaStreamSynchronize(stream));
             stage_on = true;
             stage_t = std::chrono::steady_clock::now();
@@ -795,8 +888,10 @@ public:
         if (!part) part = v_part.as<float>();
         const bool cmp = kv_cmp && cmp_layer >= 0;
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
-        kvf->write_and_attend({K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
-                               1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr});
+        KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
+                    1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr};
+        if (qsa.cur && (par || kvf->qsa_one_part())) step.qsa_sel = qsa.cur, step.qsa_from = qsa.from, step.qsa_mixed = qsa.mode == 2;
+        kvf->write_and_attend(step);
         if (!cfg.gated_attention) return;
         if (xh && basis_ == Basis::Tq4Rot128) tqllm_cuda::tq4_sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);
         else if (xh) tqllm_cuda::sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);  // + the wo input rotation
@@ -1249,9 +1344,10 @@ public:
         ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * segs.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
         upload_rpos(int(segs.size()), [&](int i) { return rdelta_of(rq[size_t(i)].slot); });
         for (const auto & g : segs) kv_track(g.pos, g.n);
-        uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40);
+        uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40) ^ (uint64_t(qsa.mode) << 44);
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+        if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
+        else ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         const size_t ncol = static_cast<size_t>(col);
         std::vector<uint32_t> res(ncol, 0u), in(ncol, 0u);
         std::vector<int> tpar(ncol, 0);
@@ -1295,9 +1391,14 @@ public:
                 std::vector<tqllm_cuda::PathGather> gd;
                 uint32_t lin_i = 0, attn_i = 0;
                 for (uint32_t l = 0; l < cfg.layers; ++l) {
+                    if (!lr_.owns(l)) {
+                        ++(cfg.full[l] ? attn_i : lin_i);
+                        continue;
+                    }
                     if (cfg.full[l]) {
                         gd.push_back({kc_of(g.slot)[attn_i].p, kv_row_bytes(true), 1});
                         gd.push_back({vc_of(g.slot)[attn_i].p, kv_row_bytes(false), 1});
+                        if (qsa.on) gd.push_back({qsa.layer[attn_i].tok->p, int64_t(tqllm_cuda::kQsa27Dim) * 2, 1});
                         ++attn_i;
                     } else {
                         const int64_t rb = int64_t(mix_rows(layer[l])) * 2;

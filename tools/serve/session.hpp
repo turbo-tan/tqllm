@@ -559,6 +559,60 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// The prompt a chat client's next request most likely begins with: this request's messages plus the reply as it comes
+// back (its content and tool calls; its reasoning too when the client returns reasoning), rendered as any request is, up to
+// the end of the reply's message. A request that begins with it shares that much with a prefill made in the meantime.
+// Empty when the request has no messages or does not render.
+inline std::string next_prompt_prefix(const std::string & body, const DecodeResult & reply, bool with_reasoning,
+                                      uint32_t default_max_tokens, const std::string & system, bool reasoning = false,
+                                      const std::string & default_effort = "xhigh", const PromptRenderer * renderer = nullptr,
+                                      const tqllm::Json * default_kwargs = nullptr) {
+    static const std::string probe = "\x02tqllm-next-turn\x02";  // the next user message: the prefix ends where its message starts
+    try {
+        auto root = tqllm::parse_json(body);
+        tqllm::Json * messages = nullptr;
+        for (auto & [k, v] : root.obj)
+            if (k == "messages") messages = &v;
+        if (!messages || messages->kind != tqllm::Json::Array || messages->arr.empty()) return {};
+        auto text = [](const std::string & t) { tqllm::Json j; j.kind = tqllm::Json::String; j.str = t; return j; };
+        auto object = [](std::vector<std::pair<std::string, tqllm::Json>> fields) {
+            tqllm::Json j; j.kind = tqllm::Json::Object; j.obj = std::move(fields); return j;
+        };
+        auto answer = object({{"role", text("assistant")}, {"content", text(reply.text)}});
+        if (with_reasoning && !reply.reasoning.empty()) answer.obj.push_back({"reasoning_content", text(reply.reasoning)});
+        if (!reply.tool_calls.empty()) {
+            tqllm::Json calls; calls.kind = tqllm::Json::Array;
+            for (const auto & c : reply.tool_calls)
+                calls.arr.push_back(object({{"type", text("function")},
+                                            {"function", object({{"name", text(c.name)}, {"arguments", text(c.arguments)}})}}));
+            answer.obj.push_back({"tool_calls", calls});
+        }
+        messages->arr.push_back(answer);
+        messages->arr.push_back(object({{"role", text("user")}, {"content", text(probe)}}));
+        const auto next = parse_request(dump(root), default_max_tokens, system, true, reasoning, default_effort, renderer, default_kwargs);
+        const auto at = next.ok ? next.prompt_text.find(probe) : std::string::npos;
+        const auto start = at == std::string::npos ? at : next.prompt_text.rfind("<|im_start|>", at);
+        return start == std::string::npos ? std::string() : next.prompt_text.substr(0, start);
+    } catch (const std::exception &) {
+        return {};
+    }
+}
+// whether the client returns reasoning: an assistant message of its request carries some
+inline bool returns_reasoning(const std::string & body) {
+    try {
+        const auto root = tqllm::parse_json(body);
+        const auto * messages = root.get("messages");
+        if (!messages || messages->kind != tqllm::Json::Array) return false;
+        for (const auto & m : messages->arr) {
+            const auto * role = m.kind == tqllm::Json::Object ? m.get("role") : nullptr;
+            if (!role || role->kind != tqllm::Json::String || role->str != "assistant") continue;
+            for (const char * key : {"reasoning_content", "thinking"})
+                if (const auto * r = m.get(key); r && r->kind == tqllm::Json::String && !r->str.empty()) return true;
+        }
+    } catch (const std::exception &) {}
+    return false;
+}
+
 // Closing tags of the tool-call syntax at the end of plain prose, with no call before them: the model echoes them
 // after a long tool-using conversation ("... done.\n</parameter>"). They are never answer text: where the trailing run
 // of such tags (and whitespace) starts, or t.size() when the text does not end with one. `partial`: a tail that may still

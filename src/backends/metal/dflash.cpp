@@ -1,4 +1,5 @@
 #include <sstream>
+#include "matrix_unit.hpp"
 #include "debug.hpp"
 #include "dflash.hpp"
 #include "dspine.hpp"
@@ -319,8 +320,10 @@ struct DFlash2::Impl {
             } else if(tensor.type==GGML_NAX_A4_G64 || tensor.type==GGML_NAX_A4_G128 || tensor.type==GGML_NAX_A6_G64) {
                 auto raw=file.read(tensor);
                 const int bits=tensor.type==GGML_NAX_A6_G64?6:4,group=tensor.type==GGML_NAX_A4_G128?128:64;
-                nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
-                                                 int(tensor.ne[1]),int(tensor.ne[0]),bits,group));
+                auto loaded=nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
+                                            int(tensor.ne[1]),int(tensor.ne[0]),bits,group);
+                if(m5_matrix_unit())nax.emplace(name,std::move(loaded));
+                else {auto a=affine_from_nax(loaded);mx::eval(a.blocks,a.scales,a.biases);matrices.emplace(name,std::move(a));}
             } else if(tensor.ne.size()==2 && name.find(".weight")!=std::string::npos &&
                       tensor.ne[0]>128 && tensor.ne[1]>128) {
                 auto w=load_matrix(file,name);
@@ -757,6 +760,55 @@ void DFlash2::settle_to_host(int position) {
     }
     i.drop_selections();
     i.end=position;
+}
+struct DFlash2::Kept::State {
+    const void* owner;
+    int end;
+    struct Layer {std::optional<mx::array> k,v,ksum;int filled,head;};
+    std::vector<Layer> layers;
+};
+void DFlash2::settle() const {
+    const auto& i=*impl_;
+    std::vector<mx::array> live;
+    for(const auto& c:i.caches)for(const auto* a:{&c.k,&c.v,&c.kfull,&c.vfull,&c.kfs,&c.vfs,&c.ksum})if(*a)live.push_back(**a);
+    for(const auto* a:{&i.head_dev,&i.filled_dev,&i.last_chosen})if(*a)live.push_back(**a);
+    if(!live.empty())mx::eval(live);
+    mx::synchronize();
+}
+DFlash2::Kept DFlash2::keep() const {
+    const auto& i=*impl_;
+    if(i.head_dev)throw std::logic_error("DFlash keep after device injects");
+    Kept::State st{impl_.get(),i.end,{}};
+    std::vector<mx::array> live;
+    const int c0=i.end/Impl::kChunk;
+    for(const auto& c:i.caches) {
+        Kept::State::Layer l{c.k,c.v,std::nullopt,c.filled,c.head};
+        if(c.ksum)l.ksum=mx::contiguous(mx::slice(*c.ksum,{0,0,c0,0},{1,i.kvheads,c0+1,i.hd}));
+        for(const auto* a:{&l.k,&l.v,&l.ksum})if(*a)live.push_back(**a);
+        st.layers.push_back(std::move(l));
+    }
+    if(!live.empty())mx::eval(live);
+    Kept kept;
+    kept.state_=std::make_shared<Kept::State>(std::move(st));
+    return kept;
+}
+void DFlash2::restore(const Kept& kept) {
+    auto& i=*impl_;const auto* s=kept.state_.get();
+    if(!s || s->owner!=impl_.get() || s->layers.size()!=i.caches.size())throw std::invalid_argument("DFlash kept state belongs to another drafter");
+    i.drop_selections();
+    i.head_dev.reset();i.filled_dev.reset();i.fill_settled=i.fill_unsettled=0;
+    const int c0=s->end/Impl::kChunk;
+    for(size_t l=0;l<i.caches.size();++l) {
+        auto& c=i.caches[l];const auto& h=s->layers[l];
+        c.k=h.k;c.v=h.v;c.filled=h.filled;c.head=h.head;
+        // chunk-key sums are added to: the chunks from the kept position on restart from the kept partial chunk and zeros
+        if(c.ksum && h.ksum) {
+            const int chunks=c.ksum->shape(2);
+            auto sums=mx::slice_update(*c.ksum,mx::zeros({1,i.kvheads,chunks-c0,i.hd},mx::float32),{0,0,c0,0},{1,i.kvheads,chunks,i.hd});
+            c.ksum=mx::slice_update(sums,*h.ksum,{0,0,c0,0},{1,i.kvheads,c0+1,i.hd});
+        }
+    }
+    i.end=s->end;
 }
 void DFlash2::inject_block(int rows) {
     auto& i=*impl_;

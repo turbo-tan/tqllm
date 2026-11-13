@@ -18,6 +18,7 @@ struct BoxStatus {
     double prefill_tps = 0;    // measured prompt tokens / s (0: unknown)
     double decode_tps = 0;     // measured tokens / s of one sequence alone (0: unknown)
     double hold_s = 0;         // mean wall time of a request on this box (0: unknown)
+    bool helped = false;       // the front door with --split experts: its lone requests get the other box's experts
 };
 
 // Decode slows with the sequences a box batches: per-sequence rate r1 / (1 + k (n - 1)). GB10 Flash-Next IQ3_S,
@@ -57,14 +58,45 @@ inline BoxStatus remembered_status(const BoxStatus & now, PeerMemory & m) {
     b.inflight = now.inflight;  // the front door's count is current
     return b;
 }
+inline bool route_has_slot(const BoxStatus & b) { return route_load(b) < std::max(1, b.busy + b.free); }
 // Index of the box to serve the request; box 0 is the front door (no network hop). Boxes that did not answer are
-// skipped; near-equal costs (within 2 %) go to the less loaded box, then the front door.
-inline int pick_box(const std::vector<BoxStatus> & boxes, double prompt, double gen) {
+// skipped; a box with a free slot wins over a full one (a faster-measured box otherwise took 10 of 16 requests and queued
+// two beside the other box's free slot, 11-11); near-equal costs (within 2 %) go to the less loaded box, then the front door.
+// A lone request (every box idle) goes to a box with expert help (--split experts: the helper computes half of its experts
+// only while it has no request of its own), unless another box holds kLoneReuse more of its prompt's K/V. Decode rates are
+// not compared: the helped box's measured rate mixes helped and unhelped requests, and a peer not yet measured reads 100.
+constexpr double kLoneReuse = 1024;
+inline int pick_box_lone(const std::vector<BoxStatus> & boxes, double prompt, double gen) {
+    int helped = -1;
+    for (int i = 0; i < int(boxes.size()); ++i) {
+        const auto & b = boxes[size_t(i)];
+        if (b.ok && route_load(b) > 0) return -1;
+        if (b.ok && b.helped && helped < 0) helped = i;
+    }
+    if (helped < 0) return -1;
+    (void) prompt; (void) gen;
+    for (const auto & b : boxes) if (b.ok && b.reuse >= boxes[size_t(helped)].reuse + kLoneReuse) return -1;
+    return helped;
+}
+// A box not measured yet is costed at the measured boxes' rates (the 100 / 1500 tok/s defaults read faster than a GB10:
+// 11-12, after a run of lone requests that all went to the helped front door, the first 4-user burst put 3 on the
+// never-measured peer, 132 vs 162 tok/s).
+inline std::vector<BoxStatus> with_measured_rates(std::vector<BoxStatus> boxes) {
+    double d = 0, p = 0;
+    for (const auto & b : boxes) if (b.ok) { d = std::max(d, b.decode_tps); p = std::max(p, b.prefill_tps); }
+    for (auto & b : boxes) { if (b.decode_tps <= 0) b.decode_tps = d; if (b.prefill_tps <= 0) b.prefill_tps = p; }
+    return boxes;
+}
+inline int pick_box(const std::vector<BoxStatus> & raw, double prompt, double gen) {
+    if (const int h = pick_box_lone(raw, prompt, gen); h >= 0) return h;
+    const auto boxes = with_measured_rates(raw);
+    bool room = false;
+    for (const auto & b : boxes) room = room || (b.ok && route_has_slot(b));
     int best = -1;
     double best_cost = 0;
     for (int i = 0; i < int(boxes.size()); ++i) {
         const auto & b = boxes[size_t(i)];
-        if (!b.ok) continue;
+        if (!b.ok || (room && !route_has_slot(b))) continue;
         const double c = route_cost(b, prompt, gen);
         if (best < 0) { best = i; best_cost = c; continue; }
         const auto & o = boxes[size_t(best)];

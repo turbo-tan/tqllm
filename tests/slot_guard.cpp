@@ -27,6 +27,16 @@ int main() {
     expect("one slot is never refused", tqllm::fit_slots(1, 2048, 4096, 0, size_t(0.81 * GB), reserve) == 1);
     expect("no memory left: one slot suggested", tqllm::fit_slots(8, 65536, 4096, size_t(0.5 * GB), size_t(0.81 * GB), reserve) == 1);
 
+    // default reserve (11-11, .77 3090, 27B TQ4_L --np 16 --context 262144, no drafter): with all KV in host memory the
+    // load left 2.53 GB free; a KV position of the 16 slots costs 1 MiB on the device. 128 MiB per slot kept every position
+    // in host memory (243 tok/s); the measured need (~39 MiB per slot, inside the base margin) keeps 1,024 on the GPU (397)
+    expect("reserve: asked wins", tqllm::fit_slot_reserve_mb(64, false) == 64 && tqllm::fit_slot_reserve_mb(0, true) == 0);
+    expect("reserve: drafter keeps 128", tqllm::fit_slot_reserve_mb(-1, true) == 128);
+    const size_t m16 = size_t(0.81 * GB) + 16 * (size_t(tqllm::fit_slot_reserve_mb(-1, false)) * MB);
+    expect("np 16 without a drafter: KV head back on the GPU", tqllm::fit_host_return(16384, size_t(2.53 * GB), m16, MB) <= 15360);
+    expect("np 16 at the old 128 MiB: nothing back (the cliff)",
+           tqllm::fit_host_return(16384, size_t(2.53 * GB), size_t(0.81 * GB) + 16 * 128 * MB, MB) == 16384);
+
     // GraphLru: fake handles; destroy records what was freed, quiesce must run before any destroy
     std::vector<int> freed;
     int quiesced = 0, destroyed_before_quiesce = 0;

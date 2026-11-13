@@ -37,6 +37,17 @@ void moe_split_ids(const int * ids, const int * hot_slot, const int * cold_slot,
 // dn), and the groups after them slot -1 (the dedup kernels skip those). count <= 1024; groups >= count.
 void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
                     cudaStream_t stream);
+// Expert parallelism over two ranks (rank r owns the experts e with e % 2 == r; every rank keeps every expert resident).
+// Per layer a rank runs one expert launch over its own A assignments followed by the peer's Ap (inputs: its own rows, then
+// the peer's). An own assignment of a peer-owned expert goes to the peer when it is among the first `cap` such assignments
+// in assignment order; past the cap it is computed here, so the result rows always fit a fixed-size exchange.
+// local_ids[i] (A + Ap): the expert id where this rank computes assignment i, else -1 (moe_dedup_maps skips it).
+void ep_local_ids(const int * ids, int A, const int * peer_ids, int Ap, int rank, int cap, int * local_ids, cudaStream_t stream);
+// send[k] = ed[A + b] for the k-th (k < cap) of the peer's assignments b that this rank computes; h bf16 per row
+void ep_gather(const __nv_bfloat16 * ed, int A, const int * peer_ids, int Ap, int rank, int cap, __nv_bfloat16 * send, int h,
+               cudaStream_t stream);
+// ed[a] = recv[k] for the k-th (k < cap) own assignment a that the peer computed
+void ep_scatter(const __nv_bfloat16 * recv, const int * ids, int A, int rank, int cap, __nv_bfloat16 * ed, int h, cudaStream_t stream);
 // moe_dedup_maps totals since start: calls, groups, distinct experts (synchronous read)
 void moe_dedup_stats(unsigned long long out[3]);
 // counts[ids[i]] += 1 (routing profile)

@@ -15,6 +15,15 @@ public:
     };
     Snapshot checkpoint() const;
     void restore(const Snapshot& snapshot);
+    // the recurrent state and KV length alone (no hidden / feature rows), evaluated: what a later request resumes a prompt
+    // prefix from. The KV rows below its position stay in the buffers, so it holds until the next reset
+    Snapshot checkpoint_state() const;
+    // evaluate every array the state holds (caches, KV buffers, hidden / feature rows) and wait for the GPU: MLX streams
+    // belong to the thread that made them, so a state another thread continues must hold no pending work (j2196)
+    void settle() const;
+    // QSA: a request of `rows` positions resumed at `position` attends as a cold one does (the prefix has its token keys,
+    // or the request stays dense)
+    bool qsa_prefix_ready(int position,int rows) const;
     class Verification {
         struct State;
         std::shared_ptr<const State> state_;

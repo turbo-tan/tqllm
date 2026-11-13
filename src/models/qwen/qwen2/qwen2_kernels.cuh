@@ -51,6 +51,16 @@ void attention_mq256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __
                      float * part, const int * dseq0, int nq, int heads, int kvheads, float scale, int nsplit,
                      cudaStream_t, int query_offset = 0, const int * par = nullptr,
                      const int * dep = nullptr);  // dep: node depths (tree), or null for a chain
+// attention_mq256's two-part verify block with QSA rows (qwen35_qsa.cuh): a row whose split point is >= from takes its
+// cache part from its selected blocks sel [nq][512] instead of every key below the split point.
+// mixed: the block crosses `from`, so its other rows take the dense cache part
+void attention_mq256_qsa(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
+                         float * part, const int * dseq0, int nq, int heads, int kvheads, float scale, int nsplit,
+                         cudaStream_t, const int * par, const int * dep, const int32_t * sel, int from, bool mixed);
+// row 0's dense attention mass on its selected keys, the other keys below the split point and the dense tail:
+// out [heads][3] (unnormalised sums of one softmax). An indexer wiring check, not a decode path
+void attention_qsa_mass(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const int32_t * sel, const int * dseq0, int heads,
+                        int kvheads, float scale, float * out, cudaStream_t);
 // Prefill chunk (any nq): the verify kernel's 8-query groups, many per launch (grid.z) as part_floats allows; per query
 // the same arithmetic as attention_mq256 with query_offset
 void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,

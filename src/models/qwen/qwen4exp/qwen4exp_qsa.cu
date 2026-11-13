@@ -4,6 +4,7 @@
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
 #include "decode_rules.hpp"
+#include "common.cuh"
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
@@ -16,6 +17,7 @@
 
 namespace tqllm_cuda {
 namespace {
+using tqllm_dev::butterfly_fold;
 void ck(cudaError_t e, int line = __builtin_LINE()) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(cudaGetErrorString(e)) + " (qwen4exp_qsa.cu:" + std::to_string(line) + ")");
 }
@@ -201,19 +203,6 @@ __global__ void score_pack_batch(const float * pooled_keys, const float * query,
 // per W * RB blocks instead of one each per (query, block): at 128K the re-reads made this kernel 13 s of a 74 s prefill);
 // the RB * 4 dots of a query reduce in a transposing butterfly (the pairs of the shfl_down tree; a + b == b + a) instead
 // of 5 shuffles each. Same keys bit for bit.
-// One level of the transposing butterfly over a lane's N values: lanes with bit OFF set keep their upper half and add
-// the partner's lower half, the others the reverse; N / 2 values remain. Compile-time OFF and N keep the array in
-// registers (a runtime loop turned the 15 shuffles into ~500 instructions of register-array emulation).
-template<int OFF, int N>
-__device__ __forceinline__ void butterfly_fold(float (&a)[16], int lane) {
-    const bool upper = lane & OFF;
-    #pragma unroll
-    for (int j = 0; j < N / 2; ++j) {
-        const float mine = upper ? a[j + N / 2] : a[j], send = upper ? a[j] : a[j + N / 2];
-        a[j] = mine + __shfl_xor_sync(0xffffffffu, send, OFF);
-    }
-    if constexpr (OFF > 2) butterfly_fold<OFF / 2, N / 2>(a, lane);
-}
 template<int RB, int QT, int W>
 __global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * pooled_keys, const float * query, uint64_t * keys,
                                                             int blocks, int tokens, int first_position, int ratio) {

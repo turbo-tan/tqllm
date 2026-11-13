@@ -3,7 +3,9 @@ FROM nvidia/cuda:13.0.1-devel-ubuntu24.04 AS build
 ARG CUDA_ARCHITECTURES=
 ARG TARGETARCH
 ARG BUILD_JOBS=4
-RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ && rm -rf /var/lib/apt/lists/*
+# libnccl-dev at the image's own libnccl2 version (the image holds it): multi-GPU (--split layer)
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ \
+      "libnccl-dev=$(dpkg-query -W -f='${Version}' libnccl2)" && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY CMakeLists.txt ./
 COPY src ./src

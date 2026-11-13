@@ -2,6 +2,7 @@
 // Flash-Next decode rules (no CUDA): the F39 verify path choice, the F38 slots=auto keep, the adaptive draft stop.
 #include "models/qwen/qwen4exp/decode_rules.hpp"
 #include <cstdio>
+#include <new>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -27,6 +28,22 @@ int main() {
     check(layer_takes_waves(one, 4, topk, slots, false), "prompt chunk (spec off) takes waves");
     check(!layer_takes_waves({1}, 1, topk, slots, false), "single-token step takes the split path");
 
+    // G2: decode graphs are per model (owner id), not per address
+    {
+        GraphWarmup w;
+        alignas(8) unsigned char storage[64];
+        struct Model { uint64_t owner = next_graph_owner(); };
+        auto * a = new (storage) Model;
+        const uint64_t first = a->owner;
+        check(!w.capture(a->owner, 3, 4, false) && !w.capture(a->owner, 3, 4, false) && w.capture(a->owner, 3, 4, false), "calls 1-2 run plain, call 3 is captured");
+        w.forget(a->owner); a->~Model();
+        auto * b = new (storage) Model;  // the next request's model at the same address
+        check(b->owner != first, "a model built at a finished model's address gets its own owner id");
+        check(!w.capture(b->owner, 3, 4, false), "its first call runs plain (it inherits no warm-up calls)");
+        check(w.size() == 1, "the finished model's warm-up entries are gone");
+        check(!w.capture(b->owner, 3, 4, true) && !w.capture(b->owner, 3, 4, false) && w.capture(b->owner, 3, 4, false), "a plain call (failed capture) starts the count over");
+        b->~Model();
+    }
     // F38: the keep grows with every sequence
     const size_t state = size_t(900) << 20, reserve = size_t(1200) << 20;
     check(auto_keep_bytes(4, state, reserve) - auto_keep_bytes(2, state, reserve) == 2 * state,
@@ -80,8 +97,11 @@ int main() {
     check(batch_drafts(6, 3, 10, 86, 512) == 0 && 6 * (0 + 1) * 10 <= 86, "np 6, smallest layer 86: one token per slot");
     check(batch_drafts(8, 3, 10, 86, 512) == 0, "np 8, smallest layer 86: 80 routed fit");
     check(batch_drafts(4, 3, 10, 0, 512) == -1, "a lent bank (0 slots): one slot at a time");
-    check(batch_drafts(8, 5, 10, 512, 512) == 5, "every expert resident (GB10): the routed count does not limit");
-    check(batch_drafts(16, 5, 10, 512, 512) == 3, "rows stay within 64 (16 x 4)");
+    // 4+ sequences: at most 2 drafts each (GB10 np 8, 11-11: 2 drafts +3..6 % over 3, texts = np 1)
+    check(batch_drafts(8, 5, 10, 512, 512) == 2, "every expert resident (GB10), 8 sequences: 2 drafts");
+    check(batch_drafts(16, 5, 10, 512, 512) == 2, "16 sequences: 2 drafts (48 rows within 64)");
+    check(batch_drafts(4, 3, 10, 512, 512) == 2 && batch_drafts(3, 3, 10, 512, 512) == 3, "4 sequences capped at 2, 3 keep their drafts");
+    check(batch_drafts(2, 3, 10, 512, 512) == 3, "2 sequences keep their drafts");
     check(batch_drafts(1, 3, 10, 10, 512) == 3, "one sequence: its own drafts");
     // CPU misses: miss-driven on discrete cards (any non-resident expert), the static eighth on small cards (F26)
     {
@@ -106,6 +126,36 @@ int main() {
     check(slot_floor(157, 144, 157) == 144 && slot_floor(247, 144, 157) == 226, "floor scales each layer's target like the total");
     check(slot_floor(70, 40, 157) == 64 && slot_floor(50, 40, 157) == 50, "floor never below 64, never above the target");
     check(verify_slot_min(5, 10) == 64 && verify_slot_min(3, 10) == 40, "verify floor: 6 rows x top-10 -> 64, 4 rows -> 40");
+    check(ep_result_cap(10) == 7 && ep_result_cap(80) == 50 && ep_result_cap(240) == 150 && ep_result_cap(1) == 1 && ep_result_cap(0) == 0,
+          "--split experts result cap: 5/8 of the assignments, rounded up, never more than all of them");
+    {   // --split experts forward state (3 trunk layers, rows 2)
+        int announced = 0; bool answer = true;
+        auto ann = [&](int) { ++announced; return answer; };
+        auto layer = [&](EpForwardState & st, int l, bool can = true, bool alive = true) { const auto c = ep_before_layer(st, l, 2, can, alive, ann); if (c != EpCall::Fail) ep_after_layer(st, l, 3); return c; };
+        auto whole = [&](EpForwardState & st, EpCall want) { bool ok = true; for (int l = 0; l < 3; ++l) ok = ok && layer(st, l) == want; return ok && !st.open; };
+        EpForwardState s;
+        check(whole(s, EpCall::Exchange) && announced == 1 && whole(s, EpCall::Exchange) && announced == 2, "--split experts: an accepted forward exchanges every layer, announced once");
+        answer = false;
+        check(whole(s, EpCall::Local) && announced == 3 && !s.off, "a declined forward runs locally; the next is asked again");
+        answer = true; s = {}; announced = 0;
+        check(ep_before_layer(s, 0, 2, true, true, ann) == EpCall::Exchange && ep_before_layer(s, 0, 2, true, true, ann) == EpCall::Exchange && announced == 1,
+              "a layer 0 re-run after a failed capture is not announced twice");
+        s = {}; layer(s, 0); layer(s, 1);
+        check(layer(s, 2, true, false) == EpCall::Fail && s.off && layer(s, 0) == EpCall::Local, "rank 1 gone inside an accepted forward: that request fails, then local");
+        s = {}; layer(s, 0); layer(s, 1);  // the forward failed at layer 2 (its send threw: rank 1 went away)
+        check(ep_before_layer(s, 0, 2, true, false, ann) == EpCall::Local && s.off, "rank 1 gone, next forward: local, not a second failed request (c5e139d9)");
+        s = {}; layer(s, 0); layer(s, 1);  // an accepted forward left open while rank 1 is alive (it still waits for layer 2)
+        announced = 0;
+        check(layer(s, 0) == EpCall::Local && s.off && announced == 0, "an accepted forward left open: the next runs locally, nothing announced (no out-of-step exchange)");
+        answer = false; s = {}; layer(s, 0); layer(s, 1); answer = true; announced = 0;
+        check(layer(s, 0) == EpCall::Exchange && announced == 1 && !s.off, "a declined forward left open: rank 1 waits for nothing, the next forward is asked");
+        s = {}; layer(s, 0);
+        check(layer(s, 1, false) == EpCall::Fail && s.off, "an accepted forward whose layer cannot exchange fails");
+        s = {};
+        check(layer(s, 0, false) == EpCall::Local && !s.open && !s.off && layer(s, 1) == EpCall::Local, "layer 0 cannot exchange: the forward is not announced, all local");
+        s = {}; layer(s, 0);
+        check(layer(s, 2) == EpCall::Fail && s.off, "an accepted forward's layer out of order: fails, parallelism off");
+    }
     check(slot_floor(57, 0, 57, verify_slot_min(3, 10)) == 40, "small card: a 57-slot layer can share down to 40");
     check(slot_tiers(1, false), "one sequence: slot tiers, small cards included (12 GB refill left 4 of 48 layers without a bank)");
     check(!slot_tiers(4, false) && !slot_tiers(1, true), "np > 1 or a keep override: no tiers");
@@ -125,14 +175,16 @@ int main() {
 
     // one sequence's draft count: a verify block (drafts + 1 rows) must fit the CPU expert pool when there is one
     for (int m : {1, 3, 5}) {
-        const DraftPlan small = one_sequence_drafts(m, true);
+        const DraftPlan small = one_sequence_drafts(m, kCpuPoolRows);
         check(small.drafts + 1 <= kCpuPoolRows && !small.adaptive, "CPU pool: the verify block fits the pool's rows, fixed length");
         check(small.drafts >= 1 && small.drafts <= m, "CPU pool: at least one draft, never more than the manifest's");
     }
-    check(one_sequence_drafts(3, false).drafts == 5 && one_sequence_drafts(3, false).adaptive, "no CPU pool: adaptive, up to 5");
-    check(one_sequence_drafts(7, false).drafts == 7, "no CPU pool: a larger manifest count stays");
-    check(one_sequence_drafts(3, false, true).drafts == 7 && one_sequence_drafts(3, false, true).adaptive, "every expert resident: adaptive, up to 7");
-    check(one_sequence_drafts(3, true, true).drafts + 1 <= kCpuPoolRows, "CPU pool wins over residency");
+    check(cpu_pool_rows(0, true) == 0 && cpu_pool_rows(15, true) == kCpuPoolRows && cpu_pool_rows(15, false) == kCpuPoolMaxRows,
+          "pool rows: no pool, none; a small card's 4-row block; a discrete card's 64");
+    check(one_sequence_drafts(3, 0).drafts == 5 && one_sequence_drafts(3, 0).adaptive, "no CPU pool: adaptive, up to 5");
+    check(one_sequence_drafts(7, 0).drafts == 7, "no CPU pool: a larger manifest count stays");
+    check(one_sequence_drafts(3, 0, true).drafts == 7 && one_sequence_drafts(3, 0, true).adaptive, "every expert resident: adaptive, up to 7");
+    check(one_sequence_drafts(3, kCpuPoolRows, true).drafts + 1 <= kCpuPoolRows, "CPU pool wins over residency");
     {  // copy drafts
         const std::vector<int> ctx = {5, 1, 2, 3, 9, 8, 7, 4, 1, 2, 3, 6, 6, 1, 2, 3};
         check(copy_draft(ctx, {}, 3, 4) == std::vector<int>({6, 6, 1, 2}), "copy: the latest earlier match wins");
@@ -147,11 +199,38 @@ int main() {
         check(copy_draft(self, {&old}, 3, 2) == std::vector<int>({3, 1}), "copy: the context itself before the history");
         check(copy_draft({1, 2}, {&old}, 3, 2).empty(), "copy: a context shorter than n");
     }
-    check(auto_slot_drafts(3, 5, 512, 512, false) == 7, "slots=auto with every expert resident drafts up to 7 (GB10 drafted 5)");
-    check(auto_slot_drafts(3, 5, 159, 512, false) == 5, "slots=auto on a 24 GB card keeps 5");
-    check(auto_slot_drafts(3, 3, 512, 512, true) == 3, "CPU pool keeps its block");
-    check(auto_slot_drafts(0, 0, 512, 512, false) == 0, "no MTP: no drafts");
-    check(one_sequence_drafts(0, false).drafts == 0 && !one_sequence_drafts(0, true).adaptive, "no MTP: no drafts");
+    check(auto_slot_drafts(3, 5, 512, 512, 0) == 7, "slots=auto with every expert resident drafts up to 7 (GB10 drafted 5)");
+    check(auto_slot_drafts(3, 5, 159, 512, 0) == 5, "slots=auto on a 24 GB card keeps 5");
+    check(auto_slot_drafts(3, 3, 512, 512, kCpuPoolRows) == 3, "CPU pool keeps its block");
+    check(auto_slot_drafts(0, 0, 512, 512, 0) == 0, "no MTP: no drafts");
+    check(one_sequence_drafts(0, 0).drafts == 0 && !one_sequence_drafts(0, kCpuPoolRows).adaptive, "no MTP: no drafts");
+    // a small card that must run exact: the CPU pool never runs, so the pool's row limit must not hold the block to 3
+    // drafts (16 GB 3090 IQ3_S, 11-11: decode 78.6 -> 89.3 tok/s at 1.2K, the same 192 greedy tokens)
+    check(sequence_drafts(3, true, -1, 32).drafts == 5 && sequence_drafts(3, true, -1, 32).adaptive,
+          "--exact on: no CPU pool, so the adaptive 5-draft block (not the pool's 3)");
+    check(sequence_drafts(3, false, -1, 32).drafts + 1 <= kCpuPoolRows && !sequence_drafts(3, false, -1, 32).adaptive,
+          "--exact off: the pool runs, the block stays inside its rows");
+    check(sequence_drafts(5, false, 0, 32).drafts == 5 && sequence_drafts(5, false, 0, 32).adaptive,
+          "TQFN_CPU_MISS=0 with --exact off: no pool either, adaptive drafts");
+    check(sequence_drafts(3, false, -1, 4).drafts == 3, "--exact off on 4 cores: one pool thread, the 4-row block");
+    // prefill chunk of a small card: the prompt's own length, 1 KiB up, never above the cap
+    check(small_card_chunk(1218, 32768) == 2048, "1.2K prompt: a 2K chunk, not the engine's 16K");
+    check(small_card_chunk(8520, 32768) == 9216, "8.5K prompt: its own length, one chunk");
+    check(small_card_chunk(25319, 32768) == 25600, "25.3K prompt: 25.6K, the largest the plan can take");
+    check(small_card_chunk(25319, 16384) == 16384 && small_card_chunk(40000, 32768) == 32768, "capped at the max chunk");
+    check(small_card_chunk(1, 32768) == 1024 && small_card_chunk(0, 32768) == 0, "tiny and empty prompts");
+
+    // parking the LM heads for a multi-chunk prompt: only when their room can make the whole prompt one chunk (the pin +
+    // unpark is ~1.1 s of TTFT, and a 25.3K prompt at 16 GB cannot reach one chunk with 11.1 GB free)
+    {
+        const size_t mb = size_t(1) << 20;
+        check(!park_heads_for_one_chunk(12405 * mb, 11098 * mb, 634 * mb, 0), "16 GB 25.3K: one chunk needs 12.4 GB of 11.7 GB -> no park");
+        check(park_heads_for_one_chunk(12405 * mb, 11900 * mb, 634 * mb, 0), "12.5 GB free + the heads: the probe can succeed, park");
+        check(park_heads_for_one_chunk(12405 * mb, 11098 * mb, 634 * mb, 700 * mb), "a trim that hands back 700 MB counts too");
+        check(park_heads_for_one_chunk(9240 * mb, 9000 * mb, 634 * mb, 0), "an 8.5K prompt fits one chunk with the heads' room");
+        check(park_heads_for_one_chunk(12405 * mb, 11098 * mb, 0, 0) && park_heads_for_one_chunk(0, 11098 * mb, 634 * mb, 0),
+              "nothing known (non-resident heads, no plan): keep the old probe");
+    }
 
     // CPU-owned experts: the device an expert runs on does not depend on residency (F26), owned experts stay out of banks
     {
@@ -169,6 +248,17 @@ int main() {
         for (size_t i = 1; i < top.size(); ++i) clean &= cnt[size_t(top[i - 1])] >= cnt[size_t(top[i])];
         check(clean, "a bank's experts: most routed first, no owned expert when the pool computes them");
         check(bank_experts(cnt, 7, 1000, false).size() == size_t(512 - std::count(cnt.begin(), cnt.end(), 0)), "no pool: every routed expert");
+        // staging slices: smaller for a prompt the engine chunk covers (the room goes to resident banks), the measured
+        // 128-expert slices for a longer prompt (its plan and its text are the measured ones)
+        check(small_card_stage(true, false, 128, 1220, 16384) == 64 && small_card_stage(true, false, 128, 8520, 16384) == 64,
+              "small card, prompt inside the engine chunk: 64-expert slices");
+        check(small_card_stage(true, false, 128, 25319, 16384) == 128 && small_card_stage(false, false, 128, 1220, 16384) == 128,
+              "longer prompt or a big card: the engine's slices");
+        check(small_card_stage(true, true, 96, 1220, 16384) == 96 && small_card_stage(true, false, 32, 1220, 16384) == 32,
+              "--prefill-stage wins; an already smaller setting stays");
+        // MTP catch-up piece: the MTP experts stream once per piece, so a 25K prompt takes 4K pieces, a short one its own size
+        check(mtp_piece_tokens(25319) == 4096 && mtp_piece_tokens(9000) == 4096, "a long prompt: 4096-position MTP pieces");
+        check(mtp_piece_tokens(1000) == 1000 && mtp_piece_tokens(0) == 1, "short or empty: one piece of its own size");
     }
 
     // packed experts without a pack file: built in memory on a discrete GPU, never on a GPU sharing system memory

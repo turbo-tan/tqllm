@@ -48,7 +48,8 @@ std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::st
     // parallel slots: each needs --slot-reserve MiB free after loading (its batched-verify / draft graphs); the fit makes
     // that room first (host placement, KV to host, context), then refuses an --np the memory cannot carry
     const size_t base_margin = fit_margin(opt.fit, opt.fit_target_mb, wsl);
-    const size_t slot_b = slots > 1 ? size_t(std::max(0L, opt.slot_reserve_mb)) << 20 : 0;
+    const long reserve_mb = fit_slot_reserve_mb(opt.slot_reserve_mb, !opt.draft_model.empty() || opt.native_mtp);
+    const size_t slot_b = slots > 1 ? size_t(reserve_mb) << 20 : 0;
     const size_t margin = base_margin ? base_margin + size_t(slots) * slot_b : 0;
     if (wsl) opt.graph_keep_mb = 0;  // the driver reads ~0 near the budget: the graph cache bounds itself by count only
     // in use before loading (CUDA context, desktop, other processes): read while far from the budget, so reliable on WSL too
@@ -128,7 +129,7 @@ std::unique_ptr<Engine> load_fitted_impl(const std::string & path, const std::st
         std::snprintf(msg, sizeof msg,
                       "--np %d does not fit: %.2f GB free after loading, context %u per slot; each slot needs %u positions "
                       "(-fitc) and %ld MiB (--slot-reserve) above the %.2f GB margin. Largest that fits: --np %u "
-                      "(or a smaller --context)", slots, double(fr) / 1e9, en->context(), opt.fit_min_ctx, opt.slot_reserve_mb,
+                      "(or a smaller --context)", slots, double(fr) / 1e9, en->context(), opt.fit_min_ctx, reserve_mb,
                       double(base_margin) / 1e9, ok);
         throw std::runtime_error(msg);
     };

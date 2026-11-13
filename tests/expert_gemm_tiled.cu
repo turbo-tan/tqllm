@@ -48,6 +48,10 @@ static void run(uint32_t type, int rows, int cols, bool per_expert) {
     for (auto & b : raw) b = char(rng());
     const auto half = __float2half_rn(0.02f);
     for (size_t b = 0; b < raw.size(); b += bytes) {
+        if (type == GGML_NVFP4G) {  // F32 global, then 8 E4M3 group scales (0x38 = 1.0): finite values
+            const float g = 0.02f; std::memcpy(raw.data() + b, &g, 4); std::memset(raw.data() + b + 4, 0x38, 8);
+            continue;
+        }
         std::memcpy(raw.data() + b, &half, 2);
         if (type == GGML_Q4_K) std::memcpy(raw.data() + b + 2, &half, 2);  // Q4_K: d and dmin are both FP16 scales
     }
@@ -138,6 +142,7 @@ int main() {
             run(GGML_IQ1_S, 64, 512, pe);    // MiniMax-M3.1-Flash experts (layers 8-54), batched prefill
             run(GGML_IQ2_XXS, 64, 512, pe);  // MiniMax experts (layers 3-7, 55-59)
             run(GGML_Q4_K, 64, 512, pe);
+            run(GGML_NVFP4G, 64, 512, pe);  // NVIDIA's Flash-Next NVFP4 experts (NVF4)
         }
         std::puts("expert gemm tiled PASS");
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }

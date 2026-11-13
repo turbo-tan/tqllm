@@ -1,11 +1,18 @@
 #pragma once
 // Flash-Next model: DecodeModel (decode, layer-major prefill, MTP drafting) and the packed expert file.
 #include "fn_layers.hpp"
+#include "decode_rules.hpp"
 #include "fn_cpu_experts.hpp"
 #include <atomic>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <set>
 #include <thread>
 struct PinnedInts { int * p = nullptr; size_t n = 0; void need(size_t k) { if (k > n) { if (p) cudaFreeHost(p); ck(cudaMallocHost(reinterpret_cast<void **>(&p), k * sizeof(int))); n = k; } } };
 inline double g_host_ms[3];  // decode host time blocked in: routed ids D2H, cache prepare, prefetch issue
+void release_decode_graphs(uint64_t owner);  // fn_layer_forward.cpp: a finished model's decode graphs
 struct DecodeModel {
     const Checkpoint & cp; const Fixtures & fx; const Qwen4ExpConfig & c; int h, width;
     MixedExpertCache & experts; MixedExpertCache * mtp_experts = nullptr;
@@ -49,6 +56,11 @@ struct DecodeModel {
           ple_past(c.layers), history(c.ple, capacity), ple_saved(c.layers), ple_old(c.layers) {
         ck(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
         ck(cudaStreamCreateWithFlags(&miss_stream, cudaStreamNonBlocking)); experts.set_miss_stream(miss_stream);
+        // TQLLM_DEBUG=graphs: models built at a finished model's address (address-keyed graphs were inherited there before)
+        if (tqllm::debug_on("graphs") && finished_models().count(this)) {
+            static int said = 0; if (said++ < 8) std::fprintf(stderr, "tqllm: DecodeModel %p reuses a finished model's address (owner %llu)\n",
+                                                          static_cast<void *>(this), (unsigned long long) graph_owner);
+        }
         PersistentAlloc keep; res_keep = std::make_unique<Device<float>>(size_t(64) * width); mtp_h = std::make_unique<Device<float>>(width);
         // K/V and QSA state sized by this sequence's capacity (its request, or the slot context with the prompt cache), not
         // the slot context of every sequence: np 2 on a 3090 mapped full-context K/V for each slot (11-03)
@@ -57,8 +69,12 @@ struct DecodeModel {
         mtp_att.cap = kv_capacity;
     }
     int kv_capacity = 0;
-    ~DecodeModel() { if (copy_stream) { cudaStreamSynchronize(copy_stream); cudaStreamDestroy(copy_stream); }
-                     if (miss_stream) { experts.set_miss_stream(nullptr); if (mtp_experts) mtp_experts->set_miss_stream(nullptr);
+    // decode graphs are this model's own (decode_rules.hpp GraphWarmup): a model built at a finished one's address starts afresh
+    const uint64_t graph_owner = tqllm::flashnext::next_graph_owner();
+    static std::set<const void *> & finished_models() { static std::set<const void *> s; return s; }
+    ~DecodeModel() { release_decode_graphs(graph_owner); if (tqllm::debug_on("graphs")) finished_models().insert(this);
+                     if (copy_stream) { cudaStreamSynchronize(copy_stream); cudaStreamDestroy(copy_stream); }
+                     if (miss_stream) { experts.release_miss_stream(miss_stream); if (mtp_experts) mtp_experts->release_miss_stream(miss_stream);
                                         cudaStreamSynchronize(miss_stream); cudaStreamDestroy(miss_stream); } }
     void set_spec(bool on) { spec = on; for (auto & r : rec) r.spec = on; }
 
@@ -182,6 +198,26 @@ struct DecodeModel {
     static void ck_copy(Device<float> & dst, const Device<float> & src) { ck(cudaMemcpyAsync(dst.p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
     static void ck_copy_n(Device<float> & dst, const float * src, size_t count) { ck(cudaMemcpyAsync(dst.p, src, count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
 };
+// --split experts, rank 1: the engine's serving calls and the helper share `mu`; the helper computes a forward for rank 0
+// only when it gets mu without waiting and the engine is idle (no request of its own), else it declines
+struct EpHelperGate {
+    std::recursive_mutex mu; bool stop = false; std::function<bool()> idle;
+    std::mutex wmu;                 // the control channel's writes (lease grants and revokes)
+    std::mutex lm; std::condition_variable lcv; bool lease_out = false;  // rank 0 may send forwards (kEpLease .. kEpLeaseEnd)
+    uint64_t served = 0, banks_checked = ~uint64_t(0);  // requests this box began / when its banks were last checked (under mu)
+    std::function<bool()> refresh;  // the helper's bank check: every bank full, slot tables current (under mu)
+};
+// --split experts, rank 1: grant rank 0 the lease when this box is idle (caller holds gate.mu); take it back before a request
+// of this box's own starts (caller does not hold gate.mu: the helper finishes the forwards already sent)
+void ep_grant(const Checkpoint & cp, EpHelperGate & gate);
+void ep_reclaim(const Checkpoint & cp, EpHelperGate & gate);
+// --split experts, rank 0: the control-channel reader (lease grants, revokes)
+void ep_start_reader(const Checkpoint & cp);
+// --split experts, rank 1 (a thread): rank 0's decode forwards it accepts (each: c.layers exchanges of input rows -> this
+// rank's experts e % 2 == 1 -> result rows), until rank 0 sends stop or goes away
+void ep_help(const Checkpoint & cp, MixedExpertCache & cache, std::shared_ptr<EpHelperGate> gate);
+// --split experts, rank 0: tell rank 1 to stop following
+void ep_stop(const Checkpoint & cp);
 
 // The packed expert file (TQFNEXP1 / TQFNEXPT), its reader and the per-expert repack are shared components now
 // (src/experts/packed_experts.hpp): GLM-5.3-Flash writes and reads the same file. These are the Checkpoint-shaped

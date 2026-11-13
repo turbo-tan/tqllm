@@ -5,6 +5,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <cstdio>
 #include <vector>
 
 namespace tqllm {
@@ -21,6 +22,13 @@ struct ExpertCacheStats {
     // prefetched experts evicted before any use
     uint64_t refetch = 0, refetch_soon = 0, refetch_bytes = 0, pf_evicted_unused = 0;
     uint64_t miss_copies = 0, miss_copy_bytes = 0, pf_copy_bytes = 0;  // H2D DMAs of demand misses (pieces), prefetch bytes
+    uint64_t zero_copy_items = 0;  // miss pieces read from pinned host memory by kernels (zero-copy)
+    // TQueue link (PCIe GPUs): guesses queued / copied into the park / dropped before their copy started / turned into a
+    // demand while queued (one copy) / demanded while their copy was on the link (shared); parked experts picked up by a
+    // layer (of those after their layer had passed once); guesses the park had no space for; the most guess copies a
+    // demand batch was ever issued behind
+    uint64_t pf_queued = 0, pf_started = 0, pf_expired = 0, pf_promoted = 0, pf_shared = 0, pickups = 0, late_pickups = 0, pf_refused = 0;
+    uint64_t demand_behind_max = 0;
 };
 
 // One stream owns preparation and projections. Views are valid until the next prepare/clear.
@@ -51,6 +59,9 @@ struct ExpertPayload {
     bool row_layout = false;  // data already matches the bank, without an auxiliary plane
 };
 // Per-layer stacked banks retain their native quantized layout. The byte budget includes loader staging.
+// Prints every expert cache's last link entries (queued / started / done / demand / pickup, with addresses) to stderr,
+// once per process: call it on the first GPU error, which usually surfaces far from the copy that caused it.
+void dump_expert_links(const char * why);
 class MixedExpertCache {
     struct State;
     std::unique_ptr<State> state_;
@@ -77,18 +88,24 @@ public:
     void prefetch(int layer, const std::vector<int> & expert_ids, cudaStream_t copy_stream);
     // ids from this index on (in the next prefetch calls) are admitted only over stale or rarely used victims (TQFN_PF_RANKED)
     void set_prefetch_strict(int from);
+    // guess copies on the link at once (default kGuessLinkDepth, expert_prediction.hpp); tests pin it
+    void set_guess_link_depth(int depth);
     // Same, for the layer about to run: the copies wait only for the bank's last release (its previous use), not for
     // work enqueued since, so they overlap the layer's attention. Returns false when the bank cannot take it yet.
     bool prefetch_released(int layer, const std::vector<int> & expert_ids, cudaStream_t copy_stream);
     // Split mode: misses upload on their own stream; the compute stream waits only in wait_misses(), so routed
     // experts that hit (last_missed() == 0 per assignment of the last prepare) can run while misses land.
     void set_miss_stream(cudaStream_t);
+    // A sequence's stream that ends: unbinds only when `mine` is the stream bound last (np > 1: another sequence's
+    // binding stays, so its misses keep the copy engine)
+    void release_miss_stream(cudaStream_t mine);
     void set_staged_misses(bool enabled);
     bool split() const;
     const std::vector<uint8_t> & last_missed() const;
     void wait_misses();
     uint64_t prefetched() const;
     uint64_t prefetch_used() const;  // prefetched slots a later prepare actually hit
+    void dump_link(std::FILE * out, const char * why) const;  // the link's last entries (TQTrace)
     Mat gate() const;
     Mat up() const;
     Mat down() const;
