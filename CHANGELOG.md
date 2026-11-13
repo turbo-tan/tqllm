@@ -3,6 +3,11 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
+
 ## 1.6.0 (2026-11-13)
 
 ### Added
