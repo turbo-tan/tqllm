@@ -87,8 +87,11 @@ jobs:
           Invoke-WebRequest $env:CUDA_INSTALLER -OutFile cuda.exe
           $v = $env:CUDA_VER
           $p = Start-Process .\cuda.exe -Wait -PassThru -ArgumentList @('-s', "nvcc_$v", "cudart_$v", "cublas_$v", "cublas_dev_$v",
-                 "cusolver_$v", "cusolver_dev_$v", "thrust_$v", "crt_$v", "nvvm_$v")
-          if ($p.ExitCode -ne 0) { throw "CUDA installer exit code $($p.ExitCode)" }
+                 "cusolver_$v", "cusolver_dev_$v", "thrust_$v")
+          if ($p.ExitCode -ne 0) {
+            Get-ChildItem "$env:LOCALAPPDATA\Temp" -Recurse -Include *.log -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'NVIDIA|CUDA' } | ForEach-Object { "== $($_.FullName)"; Get-Content $_ -Tail 40 }
+            throw ("CUDA installer exit code 0x{0:X8}" -f $p.ExitCode) }
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
 
       - name: MSVC environment
