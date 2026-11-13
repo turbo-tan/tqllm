@@ -14,17 +14,23 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New in [1.5.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.5.0)** ([all changes](CHANGELOG.md)):
+**New in [1.6.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.6.0)** ([all changes](CHANGELOG.md)):
 
-- **Mac, long prompts up to 1.45x faster:** part of every FFN runs on the Neural Engine beside the GPU. M5 Pro,
-  Qwen3.8-27B TQ_L-QSA: 685-704 tok/s at 8K and 598-605 at 32K (1.4.4: 477-484 and 429-430).
-- **Native Windows:** `tqserve.exe` builds with MSVC + CUDA, no WSL or Docker ([Windows guide](docs/guides/windows.md)).
-  RTX 5060 Ti 16 GB, Qwen3.8-27B TQ3_XS: prompts about 1,200 tok/s, answers 160 tok/s with the DFlash2 drafter.
-- **Several boxes behind one address:** `--peer` sends each request to the box that will answer first. Two DGX Sparks,
-  Flash-Next, 16 users: 220.6 tok/s total against 125.3 on one box.
-- **Drafting for sampled requests:** `--mtp` now also speeds up temperature > 0 (exact speculative sampling): 104-117 tok/s
-  against 50 on an RTX 3090.
-- **New files:** the DSpine drafter (opt-in), llama.cpp IQ4_XS GGUFs of Qwen3.8, and Qwen3.5 4B and smaller again.
+![tqLLM 1.6.0](https://tqllm.com/assets/tqllm-1.6.0.png)
+
+- **Long context, 3.2x faster on a 16 GB card:** QSA sparse attention for Qwen3.8-27B (`--qsa-from N`, opt-in,
+  approximate). Past N keys each answer token reads only the key blocks the in-file indexer picks. RTX 5060 Ti 16 GB,
+  TQ_XS-QSA, 200K prompt: 93.4 tok/s against 29.3. RTX 3090, TQ_L-QSA: 182.2 against 143.6 at 128K, 170.5 against
+  119.5 at 256K.
+- **Flash-Next over two linked boxes:** `--split experts` lets an idle second box compute half of each layer's experts;
+  the output is the same as one box. Two DGX Sparks, one user: 68.4 tok/s against 64.4. With `--peer`, 16 users over
+  both boxes: 238 tok/s.
+- **Two GPUs in one PC:** `--split layer` for the dense 27B ([multi-GPU guide](docs/guides/multi-gpu.md)).
+- **Mac, instant next turn:** `--prompt-cache on` resumes a chat from the state its last prompt kept; follow-up first
+  token at 34K in 0.36-0.47 s.
+- **int8 prefill for llama.cpp IQ4_XS GGUFs** (`--prefill-int8 on`), no extra VRAM.
+- **Fixed:** garbage tokens on M1-M4 Macs (#38). **Known issue:** the 12 GB / 4-user copy-engine fault from 1.5.0 is
+  not fixed; use `--np 2` on 12 GB cards.
 
 Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
@@ -32,15 +38,15 @@ Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 
 ## Supported models
 
-Checked on the release build: the model loads and answers fixed questions correctly (1.5.0: RTX 3090, M5 Pro Mac).
+Checked on the release build: the model loads and answers fixed questions correctly (1.6.0: RTX 3090, DGX Spark / GB10, M5 Pro Mac).
 
-| Model | Files tqLLM loads | Hardware | 1.5.0 check |
+| Model | Files tqLLM loads | Hardware | 1.6.0 check |
 |---|---|---|---|
 | Qwen3.8-27B and fine-tunes (e.g. Qwopus3.8) | TQ3_4S, TQ_L / TQ4, K-quant and IQ GGUFs; EXL3 folders; DFlash2 and MTP drafters | NVIDIA, 16 GB and up; DGX Spark / GB10 | passed |
 | Qwen3.8-27B on a Mac | mlx-community 4-bit, TQ_L, QSA files ([Mac guide](docs/guides/mac.md)) | Apple Silicon (48 GB tested) | passed |
 | Qwen3.8-Flash-Next (125B MoE, 6B active) | `.tqfn` manifest over the public IQ3_S GGUF, tqLLM's own file, Unsloth Dynamic v3.1 GGUFs, NVIDIA NVFP4 experts | 24 GB GPU + 64 GB RAM; DGX Spark / GB10 | passed |
-| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.5.0 |
-| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.5.0 |
+| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.6.0 |
+| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.6.0 |
 
 Not verified yet: Qwen3.5 / 3.6 mixture-of-experts GGUFs (`qwen35moe`, such as Qwen3.6-35B-A3B). The MoE models
 (Flash-Next, GLM-5.3-Flash, MiniMax) do not run on native Windows yet; use WSL 2 there.
@@ -93,7 +99,7 @@ docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" --
   ghcr.io/turbo-tan/tqllm:latest --model /models/model.gguf --host 0.0.0.0 --port 8086
 ```
 
-`latest` is the newest release; use a version tag such as `1.5.0` to pin one. Or build it locally with `docker compose up --build`. See [installation and requirements](docs/guides/quickstart.md).
+`latest` is the newest release; use a version tag such as `1.6.0` to pin one. Or build it locally with `docker compose up --build`. See [installation and requirements](docs/guides/quickstart.md).
 
 Two or more machines with the same model? Start a normal server on each, then point one at the others; it becomes the
 single address and sends each request to the box that will answer first (and a conversation back to the box that holds it):
