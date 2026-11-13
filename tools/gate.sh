@@ -2,7 +2,11 @@
 # Release gate on a GPU box: the full ctest with the model files set, then one record line, so "the model tests ran" is
 # written down and not assumed.
 #
-#   tools/gate.sh [--build DIR] [--model GGUF] [--drafter GGUF] [--draft-vocab TXT] [--env NAME=VALUE ...] [--record FILE]
+#   tools/gate.sh [--build DIR] [--env-file FILE] [--model GGUF] [--drafter GGUF] [--draft-vocab TXT] [--env NAME=VALUE ...]
+#                 [--record FILE]
+#
+# --env-file reads NAME=VALUE lines (# comments, ~ expanded; tools/gate.env.example lists every model variable), so
+# a box's gate is one command; flags after it override its values.
 #
 # --model / --drafter / --draft-vocab set TQLLM_TEST_MODEL / _DRAFTER / _DRAFT_VOCAB (values already in the environment
 # are kept when a flag is not given); --env sets any other test variable (embedder fixtures, TQLLM_TEST_TOKENS, ...).
@@ -21,8 +25,15 @@ while [ $# -gt 0 ]; do
     --drafter) export TQLLM_TEST_DRAFTER="$2"; shift 2 ;;
     --draft-vocab) export TQLLM_TEST_DRAFT_VOCAB="$2"; shift 2 ;;
     --env) export "${2?--env NAME=VALUE}"; shift 2 ;;
+    --env-file)
+      while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}; line=${line%"${line##*[![:space:]]}"}
+        [ -z "$line" ] && continue
+        case "$line" in *=*) export "${line%%=*}=${line#*=}" ;; *) echo "gate.sh: bad line in $2: $line" >&2; exit 2 ;; esac
+        v=${line#*=}; [ "${v:0:2}" = "~/" ] && export "${line%%=*}=$HOME/${v:2}"
+      done < "$2"; shift 2 ;;
     --record) RECORD="$2"; shift 2 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "gate.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
