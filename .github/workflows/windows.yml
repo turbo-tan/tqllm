@@ -123,7 +123,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          ninja -C build -k 0 all > rest.log 2>&1; rc=$?
+          rc=0; ninja -C build -k 0 all > rest.log 2>&1 || rc=$?   # bash -e: keep going to the list
           grep -o '^FAILED: [^ ]* [^ ]*' rest.log | awk '{print $NF}' | sort -u > rest_failed.txt
           echo "### Not building on MSVC (outside tqserve): $(wc -l < rest_failed.txt) objects" >> $GITHUB_STEP_SUMMARY
           sed 's/^/- /' rest_failed.txt >> $GITHUB_STEP_SUMMARY
