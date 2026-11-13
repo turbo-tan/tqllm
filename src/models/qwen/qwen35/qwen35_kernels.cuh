@@ -215,11 +215,20 @@ void kv_compact_block(const void * hk, const void * hv, KvCodec kcodec, KvCodec 
 void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q, const void * kc, const void * vc,
                         __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int heads, int kvheads, float scale,
                         int nsplit, cudaStream_t, const int * par = nullptr, const int * dep = nullptr,
-                        const KvCompactSeg * cs = nullptr);
+                        const KvCompactSeg * cs = nullptr,
+                        // QSA rows of a two-part verify block (qwen35_qsa.cuh): selected blocks [nq][512]; a row whose
+                        // split point is >= qsa_from attends to them; qsa_mixed: the block crosses qsa_from
+                        const int32_t * qsa_sel = nullptr, int qsa_from = 0, bool qsa_mixed = false);
 void cache_write_kv_side(KvCodec codec, const __nv_bfloat16 * x0, int ts, int n, void * c, const int * dpos0, int kvheads,
                          int dim, cudaStream_t);
 void cache_write_multi_t4kv(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, int ts, int n, Turbo4K256 * kc,
                             Turbo4K256 * vc, const int * dpos0, int kvheads, int dim, cudaStream_t);
+// QSA rows of a chain verify block on the turbo KV formats (one-part attention): a row whose split point is >= from
+// attends to its selected blocks, then the positions from its split point to itself. kind: 0 int8 K + Turbo3 V (ksc:
+// the K scales), 1 Turbo4 K + Turbo3 V, 2 Turbo4 K + Turbo4 V
+void attention_ctv_qsa(int kind, const __nv_bfloat16 * q, const void * kc, const void * vc, const __half * ksc, __nv_bfloat16 * y,
+                       float * part, const int * dseq0, int nq, int heads, int kvheads, float scale, int nsplit, cudaStream_t,
+                       const int32_t * sel, int from, bool mixed);
 void attention_mq256_t4kv(const __nv_bfloat16 * q, const Turbo4K256 * kc, const Turbo4K256 * vc, __nv_bfloat16 * y,
                           float * part, const int * dseq0, int nq, int heads, int kvheads, float scale, int nsplit,
                           cudaStream_t, int query_offset = 0);

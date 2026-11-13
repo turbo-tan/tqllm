@@ -1,3 +1,4 @@
+#include "matrix_unit.hpp"
 #include "debug.hpp"
 #include "release_defaults.hpp"
 #include "qwen35.hpp"
@@ -7,6 +8,7 @@
 #include "gdn.hpp"
 #include "prefill_fused.hpp"
 #include "ane_plan.hpp"
+#include "prefill.hpp"
 #include "ane_program.hpp"
 #include "draft_head.hpp"
 #include "attention_rows.hpp"
@@ -448,8 +450,14 @@ struct Qwen35::Impl {
             if(const auto& stored=file.tensors.at(name);stored.type==GGML_NAX_A4_G128||stored.type==GGML_NAX_A6_G64||stored.type==GGML_NAX_A4_G64) {
                 auto raw=file.read(stored);
                 const int bits=stored.type==GGML_NAX_A6_G64?6:4,group=stored.type==GGML_NAX_A4_G128?128:64;
-                nax.emplace(name,nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
-                                                 int(stored.ne[1]),int(stored.ne[0]),bits,group));
+                auto loaded=nax_affine_load({reinterpret_cast<const uint8_t*>(raw.data()),raw.size()},
+                                            int(stored.ne[1]),int(stored.ne[0]),bits,group);
+                if(!m5_matrix_unit()) {  // M1-M4: MLX's affine layout on quantized_matmul (#38)
+                    auto a=affine_from_nax(loaded);mx::eval(a.blocks,a.scales,a.biases);
+                    matrices.emplace(name,std::move(a));
+                    return;
+                }
+                nax.emplace(name,std::move(loaded));
                 if(name=="output.weight")nax_head_payload.assign(reinterpret_cast<const uint8_t*>(raw.data()),reinterpret_cast<const uint8_t*>(raw.data())+raw.size());
                 return;
             }
@@ -462,7 +470,7 @@ struct Qwen35::Impl {
                 else mx::eval(v.blocks);
             },w);
             // TQ4 with integer levels runs on the matrix unit; the repacked copy replaces the original
-            if(auto packed=std::get_if<Tq4Weights>(&w);packed && packed->integer_levels && packed->codes.shape(0)%128==0) {
+            if(auto packed=std::get_if<Tq4Weights>(&w);packed && m5_matrix_unit() && packed->integer_levels && packed->codes.shape(0)%128==0) {
                 nax_tq4.emplace(name,nax_from_tq4(*packed));
                 return;
             }
@@ -478,7 +486,7 @@ struct Qwen35::Impl {
         matrix("output.weight");scalar("output_norm.weight");
         const auto head_matrix = matrices.find("output.weight");
         const auto* q6_head = head_matrix == matrices.end() ? nullptr : std::get_if<Q6Weights>(&head_matrix->second);
-        if (q6_head) nax.emplace("output.weight", nax_from_q6(*q6_head));
+        if (q6_head && m5_matrix_unit()) nax.emplace("output.weight", nax_from_q6(*q6_head));
         for(int l=0;l<layers;++l) {
             const std::string p="blk."+std::to_string(l)+".";
             for(const auto* name:{"ffn_gate.weight","ffn_up.weight","ffn_down.weight"}) matrix(p+name);
@@ -550,6 +558,11 @@ struct Qwen35::Impl {
             };
             if(auto found=nax_tq4.find(name);found!=nax_tq4.end())return gemm16(found->second,half_input(true),true);
             if(auto found=nax.find(name);found!=nax.end())return gemm16(found->second,half_input(false),true);
+            // TQ4 without a matrix-unit copy (M1-M4): the TQ4 kernel's time grows with the rows (j2143: 64 rows 7-13 ms a
+            // matrix), one FP16 staging + GEMM does not (3.9 ms)
+            if(auto it=matrices.find(name);it!=matrices.end())
+                if(const auto* t=std::get_if<Tq4Weights>(&it->second);t && t->integer_levels && !m5_matrix_unit())
+                    return round_product(mx::matmul(half_input(true),mx::transpose(stage_half(*t))));
         }
         if(auto found=nax_tq4.find(name);found!=nax_tq4.end()) {
             if(!nax_rotated_input || nax_rotated_input->first.id()!=x.id())nax_rotated_input=std::pair{x,tq4_rotate_half(x)};
@@ -1376,6 +1389,31 @@ Qwen35::Snapshot Qwen35::checkpoint() const {
     result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches,impl_->last_hidden,impl_->last_features});
     return result;
 }
+Qwen35::Snapshot Qwen35::checkpoint_state() const {
+    std::vector<mx::array> live;
+    for(const auto& c:impl_->caches)for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})if(*a)live.push_back(**a);
+    if(!live.empty())mx::eval(live);
+    Snapshot result;
+    result.state_=std::make_shared<Snapshot::State>(Snapshot::State{impl_.get(),impl_->epoch,impl_->pos,impl_->caches,std::nullopt,std::nullopt});
+    return result;
+}
+void Qwen35::settle() const {
+    const auto& i=*impl_;
+    std::vector<mx::array> live;
+    auto add=[&](const std::optional<mx::array>& a) {if(a)live.push_back(*a);};
+    for(const auto* cs:{&i.caches})for(const auto& c:*cs)for(const auto* a:{&c.conv,&c.state,&c.keys,&c.values})add(*a);
+    for(const auto* a:{&i.mtp_cache.conv,&i.mtp_cache.state,&i.mtp_cache.keys,&i.mtp_cache.values})add(*a);
+    for(const auto* kv:{&i.kv_keys,&i.kv_values,&i.kv_kscale,&i.kv_vscale,&i.kv_index,&i.kv_blocks})for(const auto& a:*kv)add(a);
+    add(i.last_hidden);add(i.last_features);add(i.mtp_hidden);
+    if(!live.empty())mx::eval(live);
+    mx::synchronize();
+}
+bool Qwen35::qsa_prefix_ready(int position,int rows) const {
+    const auto& i=*impl_;
+    if(i.qsa_min==0 || rows<i.qsa_min)return true;
+    for(size_t l=0;l<i.qsa.size();++l)if(i.qsa[l] && i.qsa_keyed[l]<position)return false;
+    return true;
+}
 void Qwen35::restore(const Snapshot& snapshot) {
     if(!snapshot.state_ || snapshot.state_->owner!=impl_.get() || snapshot.state_->epoch!=impl_->epoch)
         throw std::invalid_argument("MLX snapshot belongs to another engine or reset generation");
@@ -1609,7 +1647,7 @@ void Qwen35::draft_shortlist(const mx::array& logits,int count) {
         return;
     }
     const auto* head=std::get_if<Q6Weights>(&impl_->matrices.at("output.weight"));
-    if(!head)throw std::invalid_argument("MTP shortlist requires Q6_K target head");
+    if(!head)return;  // another head format (M1-M4: MLX affine): the drafter scores the whole vocabulary
     auto ordered=mx::reshape(mx::argsort(logits,-1),{impl_->vocab});
     impl_->mtp_ids=mx::contiguous(tail_slice(ordered,0,impl_->vocab-count,impl_->vocab));
     impl_->mtp_head=Q6Weights{mx::contiguous(mx::take(head->blocks,*impl_->mtp_ids,0))};

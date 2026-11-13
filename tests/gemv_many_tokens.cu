@@ -2,6 +2,7 @@
 // Each (row, token) must equal the old one-launch-per-8-tokens result bit for bit, and the one launch must be faster
 // (the weights are read once from DRAM, not once per 8 tokens). Shapes: the hyper-connection mixers (320 x 10240, 10240 x
 // 320) and the router (512 x 2560, written strided).
+#include <algorithm>
 #include "qwen4exp_kernels.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -45,10 +46,15 @@ int main() {
             report(same, msg);
         }
         for (int t : {16, 24, 38}) {
-            float ms1 = 0, ms2 = 0; constexpr int reps = 50;
+            // fastest of 7 interleaved trials per arm: ctest -j runs other GPU tests beside this one, and a single timed
+            // window could land on their load (a lone failure under ctest -j 2, 11-12; 5/5 alone)
+            float ms1 = 1e30f, ms2 = 1e30f; constexpr int reps = 50;
             for (int k = 0; k < 5; ++k) { call(dx, y1, t); per8(t); }
-            check(cudaEventRecord(a)); for (int k = 0; k < reps; ++k) call(dx, y1, t); check(cudaEventRecord(b)); check(cudaEventSynchronize(b)); check(cudaEventElapsedTime(&ms1, a, b));
-            check(cudaEventRecord(a)); for (int k = 0; k < reps; ++k) per8(t); check(cudaEventRecord(b)); check(cudaEventSynchronize(b)); check(cudaEventElapsedTime(&ms2, a, b));
+            for (int trial = 0; trial < 7; ++trial) {
+                float m = 0;
+                check(cudaEventRecord(a)); for (int k = 0; k < reps; ++k) call(dx, y1, t); check(cudaEventRecord(b)); check(cudaEventSynchronize(b)); check(cudaEventElapsedTime(&m, a, b)); ms1 = std::min(ms1, m);
+                check(cudaEventRecord(a)); for (int k = 0; k < reps; ++k) per8(t); check(cudaEventRecord(b)); check(cudaEventSynchronize(b)); check(cudaEventElapsedTime(&m, a, b)); ms2 = std::min(ms2, m);
+            }
             std::printf("  %s, %d tokens: one launch %.1f us, per 8 tokens %.1f us\n", sh.name, t, 1e3f * ms1 / reps, 1e3f * ms2 / reps);
             if (t == 24) { char msg[160]; std::snprintf(msg, sizeof msg, "%s, 24 tokens: one launch faster", sh.name); report(ms1 < ms2, msg); }
         }

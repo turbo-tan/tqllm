@@ -28,6 +28,11 @@ struct KvStep {  // one attention layer, n new tokens (verify: n <= nver; prefil
     const int * par = nullptr;  // tree verify (device, n parents; chain allowed): two-part attention (tree_ok formats)
     const int * dep = nullptr;  // node depths (null: chain)
     const void * compact = nullptr;  // TqCache stand-in segment (tqllm_cuda::KvCompactSeg); only formats with compact_ok()
+    // QSA rows of a two-part verify block (formats with qsa_ok()): each row's selected blocks [n][512]; a row whose split
+    // point is >= qsa_from attends to them instead of the whole cache part. qsa_mixed: the block crosses qsa_from
+    const int32_t * qsa_sel = nullptr;
+    int qsa_from = 0;
+    bool qsa_mixed = false;
 };
 
 // One layer of sparse attention: each query attends to its `width` selected positions (valid[i] == 0: padding).
@@ -72,6 +77,10 @@ struct KvFormat {
     // true: write_and_attend() takes KvStep::par / dep (two-part tree verify; partials need split + 1 splits) and a cache row
     // (one position, all KV heads: key_bytes(1, ...) / value_bytes(1, ...)) is self-contained, so a commit may move rows
     virtual bool tree_ok() const { return false; }
+    virtual bool qsa_ok() const { return false; }  // write_and_attend() takes KvStep::qsa_sel
+    virtual bool qsa_one_part() const { return false; }  // ... for chain verify blocks without par (one-part attention)
+    // ... over a staged host KV tail: one position's K and V are one cache row each, so QSA can stage back only its picks
+    virtual bool qsa_host_ok() const { return false; }
     virtual void write_and_attend(const KvStep &) const = 0;
     // Sparse attention over selected positions (Flash-Next's QSA): one layer's K and V rows in this format's layout
     // (bf16: [position][kvheads][head_dim], K and V in separate buffers). Formats without it are refused by engines

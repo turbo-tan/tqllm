@@ -1,10 +1,13 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 // Flash-Next engine load: manifest, checkpoint and expert caches, warm-up, expert slots and the context fit.
 #include <fstream>
 #include <iterator>
 #include "debug.hpp"
 #include "device_free.hpp"
 #include "fn_engine.hpp"
+#include "core/tp_comm.hpp"
 #include "decode_rules.hpp"
 #include "memory_plan.hpp"
 #include <chrono>
@@ -128,12 +131,22 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                      "a pinned pack would not fit this machine's RAM");
     run.small_card = f.slots_auto && (!f.experts.empty() || pack_in_memory) && tqllm::device_free_bytes() < (size_t(16) << 30);
     // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
-    // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not on small
-    // cards: their CPU expert pool takes blocks of at most kCpuPoolRows rows (decode_rules.hpp one_sequence_drafts).
+    // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not while a
+    // CPU expert pool serves the misses: it takes blocks of at most its row budget (decode_rules.hpp sequence_drafts).
+    // The pool only runs with --exact off, so the 16 GB cards that must run exact (the small-card path, 107 of 512 experts
+    // resident) keep the adaptive block instead of the pool's 3 drafts.
     // --np > 1 verifies every slot's full block, so it keeps the manifest's drafts
     const int manifest_drafts = f.drafts;
+    // the decode pool's row budget (0: no pool): the banks' verify floor and the memory plan's draft count follow it, so a
+    // plan can no longer assume a 4-row block for a card whose pool does not run (11-12)
+    auto cpu_pool_rows_now = [&] {
+        return tqllm::flashnext::cpu_pool_rows(tqllm::flashnext::cpu_miss_threads(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
+                                                                                  run.exact, int(std::thread::hardware_concurrency())), run.small_card);
+    };
     if (slots_.size() == 1) {
-        const DraftPlan plan = one_sequence_drafts(f.drafts, run.small_card, !f.slots_auto && f.slots >= c.experts);
+        const DraftPlan plan = sequence_drafts(f.drafts, run.exact,
+                                               std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
+                                               int(std::thread::hardware_concurrency()), !f.slots_auto && f.slots >= c.experts);
         f.drafts = plan.drafts;
         if (plan.adaptive) {
             run.draft_tau = 0.9f;
@@ -143,7 +156,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     if (run.small_card) {
         // the dense fp16 cache holds one layer (measured high-water 119 MB on Flash-Next IQ3_S), not 600 MB
         if (!run.tune.dense_cache_set) run.tune.dense_cache_mb = std::min(run.tune.dense_cache_mb, 160L);
-        // 256 experts stage as two even slices of 128 (192 + 64 at the default): 325 MB less staging, the same slice count
+        // 256 experts stage as two even slices of 128 (192 + 64 at the default): 325 MB less staging, the same slice count;
+        // a prompt the engine chunk covers takes 64-expert slices per request (decode_rules.hpp small_card_stage)
         if (!run.tune.stage_set) run.tune.stage = std::min(run.tune.stage, 128);
     }
     checkpoint.cold_overlap=f.cold_overlap;
@@ -368,7 +382,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     auto mem_run = [&] {
         tqllm::flashnext::MemRun r; r.context = int(context); r.kv_host = kv_host_enabled();
         r.kv_host_keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
-        r.sequences = slots_.size(); r.small_card = run.small_card; r.caching = caching(); r.manifest_drafts = f.drafts; return r;
+        r.sequences = slots_.size(); r.small_card = run.small_card; r.caching = caching(); r.manifest_drafts = f.drafts;
+        r.pool_rows = cpu_pool_rows_now(); return r;
     };
     auto context_keep = [&] {
         const auto k = tqllm::flashnext::context_keep(mem_shape(), mem_run());
@@ -453,7 +468,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               if (after >= need || f.slots <= 1) break;
               extra += need - after;
           }
-          if (slots_.size() == 1) f.drafts = auto_slot_drafts(manifest_drafts, f.drafts, f.slots, c.experts, run.small_card);
+          if (slots_.size() == 1) f.drafts = auto_slot_drafts(manifest_drafts, f.drafts, f.slots, c.experts, cpu_pool_rows_now());
           // tier A (the floor a bank never drops below): the slots a full-context state leaves, as with one sequence's whole
           // state kept free; tier B (the target) is what the smaller keep allows (decode_rules.hpp auto_keep_bytes)
           if (slot_tiers(nseq, false)) {
@@ -501,6 +516,58 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           if (layers_filled)
               std::fprintf(stderr, "tqllm: expert banks filled at start-up: %d layers hold all %d experts (%d loaded) in %.1f s\n",
                            layers_filled, c.experts, loaded, std::chrono::duration<double>(pclk::now() - t0).count());
+          // every bank full (a GB10 keeps every expert resident, no pack): tile them in place as a pack is tiled, so the expert
+          // kernels read lane-contiguous tiles (same bits; IQ gate/up -30 % per call at 40-110 groups, expert-dedup-bench 11-11).
+          const bool mtp_full = f.mtp_cache && preload_all_experts(f.mtp_cache->slots(), c.experts);
+          if (!f.packed.tiled && f.experts.empty() && layers_filled == c.layers + (mtp_full ? 1 : 0) && (!f.mtp_cache || mtp_full)) {
+              const auto t1 = pclk::now();
+              std::vector<int> all(size_t(c.experts)); for (int e = 0; e < c.experts; ++e) all[size_t(e)] = e;
+              auto banks = [&](auto && fn) {
+                  for (int l = 0; l <= c.layers; ++l) {
+                      auto * cache = l < c.layers ? f.cache.get() : f.mtp_cache.get();
+                      if (!cache) continue;
+                      (void) cache->prepare(l, all);
+                      fn(cache->gate(), c.expert_ff, c.hidden);
+                      fn(cache->up(), c.expert_ff, c.hidden);
+                      fn(cache->down(), c.hidden, c.expert_ff);
+                  }
+              };
+              // per bank: formats with a tiled layout are tiled; others (e.g. GSQ_Q2_0) keep theirs: the tiled flag is read only by
+              // the grouped u4h kernels of tileable formats (quant_u4h.inc: GROUPED && tiled_bpb(FMT) && c_tiled_experts)
+              int tiled = 0, kept = 0;
+              banks([&](const tqllm::Mat & m, int rows, int k) {  // m: the bank, its slots stacked (m.rows = slots x rows); data only
+                  const int bpb = m.fmt ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;
+                  if (bpb > 0) {  // a tileable format must be tiled: the kernels read every bank of it as tiles once the flag is on
+                      require(rows % 16 == 0 && (k / 32) % 4 == 0 && m.cols == k && m.rows % rows == 0, "tileable expert bank with an unexpected layout");
+                      tqllm_cuda::tile_expert_rows_device(static_cast<char *>(const_cast<void *>(m.p)), m.rows / rows, rows, k, bpb, nullptr);
+                      ++tiled;
+                  } else ++kept;
+              });
+              if (tiled) {
+                  ck(cudaDeviceSynchronize());
+                  f.packed.tiled = true; tqllm_cuda::set_tiled_experts(true); run.tile_experts = true;
+                  std::fprintf(stderr, "tqllm: resident expert banks tiled in place: %d tiled, %d in a format without tiles, %.1f s\n",
+                               tiled, kept, std::chrono::duration<double>(pclk::now() - t1).count());
+              }
+
+          }
+      }
+      {   // the group count from which the paired gate / up launch prefetches, per expert format, timed on the loaded banks
+          // (full banks on a GB10, the packed tiled banks of a discrete card; both variants give the same bits; was a fixed 160)
+          std::vector<int> seen;
+          for (int l = 0; l < c.layers; ++l) {
+              if (!f.cache->has_layout(l) || f.cache->slots(l) < 16) continue;
+              (void) f.cache->prepare(l, {0});
+              const tqllm::Mat g = f.cache->gate(), u = f.cache->up();
+              if (!g.fmt || !u.fmt || g.fmt->u4h_id() < 0 || g.fmt->u4h_id() != u.fmt->u4h_id()) continue;
+              const int id = g.fmt->u4h_id();
+              if (std::find(seen.begin(), seen.end(), id) != seen.end()) continue;
+              seen.push_back(id);
+              const int pf = tqllm_cuda::calibrate_dedup_pf(id, static_cast<const uint8_t *>(g.p), g.aux, static_cast<const uint8_t *>(u.p), u.aux,
+                                                            c.expert_ff, c.hidden, g.rows / c.expert_ff, nullptr);
+              if (pf == INT32_MAX) std::fprintf(stderr, "tqllm: paired %s experts: no prefetch (never faster here)\n", g.fmt->name());
+              else std::fprintf(stderr, "tqllm: paired %s experts: prefetch from %d groups\n", g.fmt->name(), pf);
+          }
       }
       // spec_begin grows pinned residuals to the actual prompt, not the configured slot capacity.
       f.cache->set_miss_stream(nullptr);
@@ -540,6 +607,11 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
         const size_t q = size_t(256) << 20;
         f.plan_budget = (tqllm::device_free_bytes() + f.cache->stats().device_bytes) / q * q;
+        // the MTP bank a multi-chunk prompt drops before its trunk: it is a plan term, so take it here instead of from the
+        // bank's state at the request (a partly filled bank would move the plan, and the plan moves the tokens)
+        f.mtp_bank_bytes = f.mtp_cache ? f.mtp_cache->peak_device_bytes() : 0;
+        std::fprintf(stderr, "tqllm: prefill plan room: %.0f MB fixed (pool trimmed, 256 MB steps), MTP bank %.0f MB\n",
+                     f.plan_budget / 1048576.0, f.mtp_bank_bytes / 1048576.0);
     }
     {   // a long prompt allocates the attention state for the whole context next to the banks: refuse a slot count that
         // cannot hold it (it would prefill for minutes and then fail in decode)
@@ -560,6 +632,20 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     // the default stream is per thread: the engine thread's stream is not ordered after the loading thread's work
     ck(cudaDeviceSynchronize());
+    if (f.cp->run.ep && f.cp->run.ep->rank() == 1) start_ep_helper();
+    if (f.cp->run.ep && f.cp->run.ep->rank() == 0) ep_start_reader(*f.cp);
+}
+
+// --split experts, rank 1: this box serves its own users and, while it has none, computes rank 0's experts e % 2 == 1
+void FlashNextEngine::start_ep_helper() {
+    ep_gate_ = std::make_shared<EpHelperGate>();
+    ep_gate_->idle = [this] { for (const auto & sl : slots_) if (sl.serving_) return false; return true; };
+    const Checkpoint * cp = f_.cp.get(); MixedExpertCache * cache = f_.cache.get(); auto gate = ep_gate_;
+    // detached: it waits on rank 0's control channel; after the engine is gone (gate->stop) it declines every forward
+    std::thread([cp, cache, gate] {
+        try { ep_help(*cp, *cache, gate); }
+        catch (const std::exception & e) { std::fprintf(stderr, "tqllm: --split experts rank 1 helper stopped: %s\n", e.what()); }
+    }).detach();
 }
 
 }  // namespace tqllm::flashnext

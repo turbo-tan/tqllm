@@ -15,6 +15,7 @@
 #include "attention_exact.hpp"
 #include "kv_tcq.hpp"
 #include "spec_pipeline.hpp"
+#include "turn_reuse.hpp"
 #include "width_policy.hpp"
 #include "wired_limit.hpp"
 #include "gguf.hpp"
@@ -74,6 +75,8 @@ public:
     const std::vector<uint32_t>& spec_tokens(int) const override;
     std::vector<uint32_t> spec_finish(uint64_t* stats) override;
     void spec_step(const int*, int, bool*) override;
+    bool prefill_ahead(int slot, const std::vector<uint32_t>& prefix) override;
+    void begin_request(const std::vector<uint32_t>& prompt, uint32_t count, int slot);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -90,7 +93,7 @@ struct MlxQwen35Engine::Impl {
     int width = 15, chunk = 8192;  // block-16 drafts; prefill batches of 8192 run layer-major in 2048-row slices
     bool exact = true;  // --exact on|off
     bool far = false;   // the drafter retrieves far context for the active request
-    bool tail_reuse = false;  // tail_prefill_reuse(): --exact off, or --prompt-cache on
+    bool tail_reuse = false;  // --exact off (see the constructor)
     // thinking budget (set_continuation): phase 1 keeps its state, phase 2 prefills only its tail (the closing tag) on it;
     // both phases are one request, so this holds under --exact on too (the continuation is the state the request made)
     int continuation = 0;
@@ -100,6 +103,27 @@ struct MlxQwen35Engine::Impl {
     // the pending token), valid only after a token-tree request that committed exactly its text; a prompt that extends
     // them prefills only its tail (a thinking budget's second phase: prompt + thinking + the closing tag)
     std::vector<uint32_t> prompt, held;
+    // turn reuse (turn_reuse.hpp): the target's and the drafter's state at a message start of a prompt whose tokens up
+    // to the role after that start are `tokens`. A prompt that begins with them resumes there under --exact on too: a
+    // cold prefill of it has a chunk boundary at that position, and the BF16 KV rows below it are the ones it would write
+    struct Kept {
+        uint32_t at = 0;
+        std::vector<uint32_t> tokens;
+        Qwen35::Snapshot target;
+        DFlash2::Kept drafter;
+    };
+    // --prompt-cache on: chunks restart at message starts (turn_chunks) and states are kept (turn_reuse; TQLLM_DEBUG=
+    // no_turn_reuse: nothing kept, every prompt prefills from 0 in the same chunks). Off: the prompt in plain chunks, as
+    // 1.5.0 (a chat that arrives with a long history of short messages prefills ~30 % faster that way)
+    bool turn_chunks = false, turn_reuse = false;
+    uint32_t im_start = ~0u;
+    Kept kept;   // at the last prefilled prompt's last message start (its generation prompt)
+    Kept after;  // at the end of the answer's message, prefilled while idle (prefill_ahead); tokens end with the next message's start
+    void drop_state() {  // nothing of an earlier request stays
+        engine->reset(); engine->release_kv(); drafter->reset();
+        mx::clear_cache();
+        held.clear(); kept = {}; after = {};
+    }
     // the active request
     std::vector<uint32_t> output;
     uint32_t count = 0, pending = 0;
@@ -137,10 +161,11 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
     i.exact = options.exact;
     i.engine->set_exact(i.exact);
     i.engine->qsa_from(options.qsa_from);
-    i.tail_reuse = tqllm::tail_prefill_reuse(options);
-    if (i.exact && options.prompt_cache)
-        tqllm::warn_exact_conflicts({"--prompt-cache on: a prompt that extends the previous request's text prefills only its tail, "
-                                     "so the text can differ from a fresh prefill"}, std::cerr);
+    // a prompt that extends the previous request's whole text resumes on its live decode state (not a prefill's numbers):
+    // with --exact off, or with --prompt-cache on under --exact on before turn reuse. Under --exact on the cache now
+    // resumes at kept prefill states instead (exact), so the live state is not kept between requests; a thinking budget's
+    // second phase still continues its first (one request)
+    i.tail_reuse = tqllm::tail_prefill_reuse(options) && !(options.exact && options.prompt_cache);
     if (i.engine->head_dim() == 256) {
     mlx_backend::warm_compressed_kv_kernels(i.engine->q_heads(), i.engine->kv_heads());
     mlx_backend::warm_split_attention_kernels(i.engine->q_heads(), i.engine->kv_heads());
@@ -148,6 +173,9 @@ MlxQwen35Engine::MlxQwen35Engine(const std::string& weights, const std::string& 
     }
     tqllm::Tokenizer tok; tok.load(tokenizer.empty() ? weights : tokenizer);
     i.eos = tok.eos_id();
+    i.turn_chunks = options.prompt_cache;
+    i.turn_reuse = i.turn_chunks && !tqllm::debug_on("no_turn_reuse");
+    i.im_start = tok.special_id("<|im_start|>");
     i.context_ = context; i.vocab = uint32_t(i.engine->vocabulary());
     std::fprintf(stderr, "tqserve: MLX backend, drafter %s, block 16, 4-bit proposal head, exact %s\n", options.draft_model.c_str(),
                  options.exact ? "on" : "off");
@@ -172,8 +200,7 @@ void MlxQwen35Engine::set_continuation(int phase) {
     i.continuation = phase;
     if (phase == 0 && i.held_for_continuation && !i.active) {  // phase 1 ended without a phase 2: free what it kept
         i.held_for_continuation = false; i.held.clear();
-        i.engine->reset(); i.engine->release_kv(); i.drafter->reset();
-        mx::clear_cache();
+        if (!i.kept.at) i.drop_state();  // the prompt's kept state stays for the next turn
     }
 }
 void MlxQwen35Engine::set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float presence) {
@@ -195,10 +222,22 @@ static void memlog_point(const char* stage, long a = -1) {
     else std::fprintf(stderr, "MEMLOG %-22s active %6.2f GB peak %6.2f GB cache %5.2f GB\n", stage, mx::get_active_memory() / 1e9, mx::get_peak_memory() / 1e9, mx::get_cache_memory() / 1e9);
 }
 
-void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int) {
+void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t count, int slot) {
     auto& i = *impl_;
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     if (prompt.size() + count + 16 > i.context_) throw std::invalid_argument("prompt and answer exceed the context");
+    // a request that fails here leaves nothing behind: the next one starts from a clean engine (a half-resumed state
+    // made every later request fail too, j2177)
+    try {begin_request(prompt, count, slot);}
+    catch (...) {
+        i.active = false; i.ahead.reset(); i.tree_ahead.reset(); i.held_for_continuation = false;
+        try {i.drop_state();} catch (...) {}
+        throw;
+    }
+}
+
+void MlxQwen35Engine::begin_request(const std::vector<uint32_t>& prompt, uint32_t count, int) {
+    auto& i = *impl_;
     i.output.clear(); i.count = count; i.steps = i.drafted = i.accepted = 0; i.decode_us = 0; i.widths.begin(int(prompt.size())); i.drafter->native_block(i.widths.native());
     i.h_build = i.h_submit = i.h_wait = i.h_post = i.h_gap = 0; i.h_inject = i.h_encode = i.h_vsubmit = 0; i.last_advance_end.reset();
     i.sampling = i.temperature > 0.f;
@@ -208,15 +247,29 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     if (may_reuse && !i.held.empty() && prompt.size() > i.held.size() && std::equal(i.held.begin(), i.held.end(), prompt.begin()) &&
         i.engine->position() == int(i.held.size()))
         reuse = i.held.size();
+    // the longest kept state the prompt begins with: after the answer prefilled while idle, else at the last generation prompt
+    const Impl::Kept* state = reuse || !i.turn_reuse ? nullptr : mlx_backend::turn_shared(i.after.tokens, prompt) ? &i.after :
+                             mlx_backend::turn_shared(i.kept.tokens, prompt) ? &i.kept : nullptr;
+    size_t resume = state ? state->at : 0;
     i.held.clear(); i.held_for_continuation = false;
+    if (!reuse && !resume) i.drop_state();  // before the plan: what an unrelated request held is not in use for this one
     bool lean_prefill = false;
     {
-        const auto plan = i.engine->plan_kv_format(int(prompt.size()), int(count), i.chunk, i.drafter->far_row_bytes());
-        const auto tier = plan.tier;
+        auto plan = i.engine->plan_kv_format(int(prompt.size()), int(count), i.chunk, i.drafter->far_row_bytes());
         // no_far: the drafter's ring window only, what it costs against the far-context retrieval
-        const bool far = plan.far && !tqllm::debug_on("no_far");
-        if (reuse && (tier != i.engine->kv_format() || far != i.far)) reuse = 0;
-        if (!reuse) {i.engine->reset(); i.drafter->reset(); i.engine->kv_format(tier);}
+        bool far = plan.far && !tqllm::debug_on("no_far");
+        const bool fits = plan.tier == i.engine->kv_format() && far == i.far;
+        // a resume also needs BF16 rows (the compressed stores are not proven to roll back) and the prefix's QSA keys
+        if ((reuse && !fits) || (resume && !(fits && plan.tier == mlx_backend::KvTier::Bf16 &&
+                                             i.engine->qsa_prefix_ready(int(resume), int(prompt.size() + count) + 16)))) {
+            reuse = resume = 0; i.drop_state();
+            plan = i.engine->plan_kv_format(int(prompt.size()), int(count), i.chunk, i.drafter->far_row_bytes());
+            far = plan.far && !tqllm::debug_on("no_far");
+        }
+        const auto tier = plan.tier;
+        if (resume) {i.engine->restore(state->target); i.drafter->restore(state->drafter);}
+        else if (!reuse) i.engine->kv_format(tier);
+        i.after = {};  // rows past the generation prompt are this request's from here on
         i.engine->reserve_kv(int(prompt.size() + count) + 16);
         i.far = far;
         i.drafter->far_context(far); i.drafter->reserve_far(int(prompt.size() + count) + 16); lean_prefill = plan.lean;
@@ -236,12 +289,24 @@ void MlxQwen35Engine::spec_begin(const std::vector<uint32_t>& prompt, uint32_t c
     mx::set_cache_limit(lean_prefill ? size_t(512) << 20 : size_t(4096) << 20);
     if (reuse) std::fprintf(stderr, "tqserve: prompt extends the previous request's text: %zu of %zu tokens already held, prefill %zu\n",
                             reuse, prompt.size(), prompt.size() - reuse);
+    if (resume) std::fprintf(stderr, "tqserve: turn reuse: %zu of %zu prompt tokens held from the previous turn, prefill %zu\n",
+                             resume, prompt.size(), prompt.size() - resume);
     i.prompt = prompt;
-    for (size_t off = reuse; off < prompt.size(); off += size_t(i.chunk)) {
-        const int n = std::min(i.chunk, int(prompt.size() - off));
-        logits = i.engine->forward(std::span<const uint32_t>(prompt.data() + off, size_t(n)));
+    // --prompt-cache on: chunks restart at message starts; the state at the last one (the generation prompt) is kept for
+    // the next turn. Off: chunks of i.chunk rows from where the prefill begins
+    const auto starts = i.turn_chunks ? mlx_backend::message_starts(prompt, i.im_start) : std::vector<uint32_t>{};
+    const size_t from = reuse ? reuse : resume;
+    const uint32_t keep_at = i.turn_reuse ? mlx_backend::turn_kept_at(starts, uint32_t(from)) : 0;
+    for (size_t off = from; off < prompt.size();) {
+        const size_t end = i.turn_chunks ? mlx_backend::turn_chunk_end(starts, uint32_t(off), uint32_t(prompt.size()), uint32_t(i.chunk))
+                                         : std::min(prompt.size(), off + size_t(i.chunk));
+        logits = i.engine->forward(std::span<const uint32_t>(prompt.data() + off, end - off));
         i.drafter->inject(i.engine->feature_states(), int(off));
+        if (end == keep_at) {
+            i.kept = {keep_at, {prompt.begin(), prompt.begin() + keep_at + 2}, i.engine->checkpoint_state(), i.drafter->keep()};
+        }
         memlog_point("prefill chunk at", long(off));
+        off = end;
     }
     i.pending = mx::argmax(logits).item<uint32_t>();
     mx::set_cache_limit(size_t(512) << 20);
@@ -449,14 +514,58 @@ std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
     if (mlx_backend::keep_state_for(i.tail_reuse, i.continuation, exact_text)) {
         i.held_for_continuation = i.continuation == 1;
         i.drafter->settle_to_host(i.engine->position());
+        // the next request may run on another thread (tqserve: one per connection): no pending work in what is kept
+        i.engine->settle(); i.drafter->settle();
         i.held = i.prompt;
         i.held.insert(i.held.end(), i.output.begin(), i.output.end() - 1);
+    } else if (i.kept.at) {
+        i.engine->settle(); i.drafter->settle();  // the kept rows are read by the next request, maybe on another thread
+        mx::clear_cache();  // the prompt's kept state (and the KV rows below it) stays for the next turn
     } else {
-        i.engine->reset(); i.engine->release_kv(); i.drafter->reset();
-        mx::clear_cache();
+        i.drop_state();
     }
     memlog_point("request done");
     return i.output;  // EOS stays: finish() turns it into finish_reason "stop"
+}
+
+// The answer's message as the client returns it is a prefill chunk of its own (chunks restart at message starts), so it
+// can be prefilled now from the state kept at the generation prompt: a next prompt that begins with `prefix` and a
+// message start resumes after it. The state at the generation prompt stays (its rows are below), for any other prompt.
+bool MlxQwen35Engine::prefill_ahead(int, const std::vector<uint32_t>& prefix) {
+    auto& i = *impl_;
+    // BF16 rows, nothing live held for a continuation or a tail prefill
+    if (!i.turn_reuse || i.active || !i.kept.at || !i.held.empty() || i.held_for_continuation || i.continuation != 0 ||
+        i.engine->kv_format() != mlx_backend::KvTier::Bf16) return false;
+    const uint32_t at = i.kept.at, end = uint32_t(prefix.size());
+    if (!mlx_backend::turn_shared(i.kept.tokens, prefix) || end <= at + 2 || end + 16 > i.context_) return false;
+    i.after = {};
+    try {
+        const auto t0 = Clock::now();
+        i.engine->restore(i.kept.target); i.drafter->restore(i.kept.drafter);
+        // the returned answer can be longer than the reply's rows (template text, reasoning the client returns): the KV
+        // grows now instead of at the next request
+        if (end + 16 > i.prompt.size() + i.count + 16) i.engine->reserve_kv(int(end) + 16);
+        const auto starts = mlx_backend::message_starts(prefix, i.im_start);
+        mx::array logits = mx::array(0.0f);
+        for (uint32_t off = at; off < end;) {
+            const uint32_t stop = mlx_backend::turn_chunk_end(starts, off, end, uint32_t(i.chunk));
+            logits = i.engine->forward(std::span<const uint32_t>(prefix.data() + off, stop - off));
+            i.drafter->inject(i.engine->feature_states(), int(off));
+            off = stop;
+        }
+        mx::eval(logits);  // the forward is lazy: run it now, while idle
+        i.engine->settle(); i.drafter->settle();  // the idle worker's thread: nothing pending for the request thread
+        std::vector<uint32_t> tokens = prefix;
+        tokens.push_back(i.im_start);
+        i.after = {end, std::move(tokens), i.engine->checkpoint_state(), i.drafter->keep()};
+        mx::clear_cache();
+        std::fprintf(stderr, "tqserve: prefilled the returned answer while idle: %u tokens in %.2f s\n", end - at, us_since(t0) / 1e6);
+        return true;
+    } catch (const std::exception& e) {
+        i.after = {};
+        std::fprintf(stderr, "tqserve: idle prefill of the returned answer failed: %s\n", e.what());
+        return false;
+    }
 }
 
 void MlxQwen35Engine::spec_step(const int*, int, bool*) {

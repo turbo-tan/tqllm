@@ -3,7 +3,28 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.6.0 (2026-11-13)
+
+### Added
+- QSA sparse attention for the 27B on CUDA (`--qsa-from N`, opt-in, approximate): past N keys, each answer token attends
+  only to the key blocks the in-file indexer picks (top 512 blocks + the recent keys); prompt speed is unchanged. Works
+  with every compact KV format (tq3, q4 / tcq2, q8, turbo4 / t4kv, trellis pairs), also when the oldest K/V sits in host
+  memory (the picked rows are staged back once per layer). Files: `Qwen3.8-27B-TQ_L-QSA.gguf` (and TQ3_4S-v2-QSA).
+  RTX 3090, TQ_L-QSA + DFlash2-TQ3, turbo4 KV, mean of 3 prompts: 128K 143.6 -> 182.2 tok/s, 256K 119.5 -> 170.5, 32K
+  unchanged; q8/q8 KV with a host tail at 256K 27.3 -> 147.4. RTX 5060 Ti 16 GB, TQ_XS-QSA + DFlash2-TQ3, tq3 KV, 200K
+  prompt: 29.3 -> 93.4 tok/s. Quality at 128K vs the same config dense (last 2,048 positions): top-1 agreement 87-92 %,
+  mean KLD 0.05-0.26; needle 3/3 on every KV format. `--exact on` warns when QSA is on.
+- Two GPUs in one PC: `--split layer` for the dense 27B (layers split by rank, K/V on the owning rank; NCCL builds and the
+  Docker image). See docs/guides/multi-gpu.md.
+- Mac: next-turn reuse (`--prompt-cache on`): a chat's next turn resumes from the state its previous prompt kept, and the
+  answer is prefilled while the server is idle. Follow-up first token at 34K: 0.36-0.47 s. Without the flag prefill is
+  unchanged from 1.5.0.
+- Flash-Next over two linked boxes: `--split experts` (with `--tp-rank 0 / 1 --tp-peer`, NCCL builds). While the second
+  box has no request of its own it computes half of each layer's experts for the first box's decode steps; the output is
+  the same as one box (every expert stays resident on both). Run both behind `--peer`: a lone request is helped, several
+  users spread over both boxes. Two DGX Sparks (GB10), NVIDIA NVFP4 experts, one user over 32 unseen questions: through
+  the router 64.4 -> 68.4 tok/s (median, faster on all 32; 4 / 8 / 16 users and the second box's own users unchanged);
+  two `--np 1` servers 66.8 -> 70.5.
 
 ### Changed
 - int8 prefill (`--prefill-int8`, Ampere / RTX 40 / RTX 50) for llama.cpp IQ4_XS GGUFs: the weights are quantised to int8
@@ -14,6 +35,24 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   features test now passes on them. RTX 3090, Qwen3.8-27B IQ4_XS, DFlash2, 128K q8/q4, prefill tok/s FP16 / int8 before /
   int8 now: 8K 1739 / 1968 / 2102, 32K 1590 / 1880 / 1994, 98K 1270 / 1458 / 1527. TQ formats (rotated basis) keep plain
   int8: the scales buy them nothing.
+- Flash-Next on 16 GB cards: prompts shorter than a chunk prefill at their own length, staging is per request and MTP
+  catch-up runs in pieces (1.2K-token first token 2.41 -> 1.91 s); the guess pipeline holds demand misses on the link
+  (decode +4-5 %); the prefill plan is fixed at start, so the same prompt always gets the same chunks.
+
+### Fixed
+- #38: garbage tokens on M1-M4 Macs. NAX layouts and tensor-op attention run only on the M5 matrix unit; M1-M4 use MLX
+  affine weights.
+- Metal: requests from different threads could extend the previous request's text (also in 1.5.0).
+- x3 (EXL3) experts: uploads are ordered before the stream reads them, the shared scratch orders calls across streams, and
+  x3 weights on a second GPU in one process are refused with a clear message.
+- Flash-Next: a finished request no longer turns off the shared expert cache's copy stream while another request is bound
+  to it; on PCIe GPUs the fallback miss path uses the copy engine (no kernel reads of pinned host memory).
+- Decode graphs are keyed by model, and a finished request releases its graph execs (~2.4 MB leaked per request).
+
+### Known issue
+- The 12 GB / 4-user copy-engine fault reported in 1.5.0 is not fixed. It reproduces on one RTX 3090 desktop under a
+  constant 4-user load with the CPU expert pool; another 3090 runs the same load clean. Workaround: `--np 2` on 12 GB
+  cards, or 16 GB+.
 
 ## 1.5.0 (2026-11-10)
 

@@ -27,9 +27,13 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
     auto *O = v_o.as<bf16>(), *CORE = v_core.as<bf16>();
     auto * XH = v_xh.as<__half>();
     const auto * dtok = v_tokens.as<uint32_t>();
-    embed_multi(dtok, n, X);
-    if (mm_chunk) tqllm_cuda::mm_scatter(X, mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image tokens
-    tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
+    if (lr_.first()) {
+        embed_multi(dtok, n, X);
+        if (mm_chunk) tqllm_cuda::mm_scatter(X, mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image tokens
+        tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
+    } else {
+        split_enter(X, n);
+    }
     st("embed");
     const uint32_t n_attn = uint32_t(key_cache.size());
     if (kv_staged) {  // the first two attention layers' old positions, one per staging buffer, behind earlier work
@@ -40,6 +44,10 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
     }
     uint32_t attn_i = 0, lin_i = 0;
     for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (!lr_.owns(l)) {
+            ++(cfg.full[l] ? attn_i : lin_i);
+            continue;
+        }
         const auto & L = layer[l];
         capture_feature(l, X, v_feat.as<bf16>(), n);
         nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
@@ -47,8 +55,14 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         if (cfg.full[l]) {
             if (kv_staged) ck(cudaStreamWaitEvent(stream, kv_ready[attn_i & 1], 0));
             cmp_layer = int(attn_i);
+            if (qsa.on) {  // one sequence at column 0 (qsa_plan)
+                if (segs.empty()) qsa_index(L, attn_i, n, v_pos.as<int>(), vdep);
+                else qsa_index(L, attn_i, segs[0].n, v_pos.as<int>(), segs[0].tree ? d_tdep.as<int>() : d_cdep.as<int>());
+            }
             if (segs.empty()) attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);
             else attn_mixer(L, nullptr, nullptr, n, max_seq, int(attn_i));
+            if (qsa.cur && qsa.mass_left > 0) qsa_mass_report(attn_i);
+            qsa.cur = nullptr;
             cmp_layer = -1;
             if (kv_staged && attn_i + 2 < n_attn) {  // layer attn_i + 2 shares this staging buffer: refill it now
                 ck(cudaEventRecord(kv_done[attn_i & 1], stream));
@@ -113,6 +127,7 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         }
         ffn_block(L, n, X);
     }
+    split_leave(X, n);
     // final hidden states (pre-norm) feed the MTP drafter
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {  // batched verify: one head pass over every slot's columns (per-column results unchanged)
@@ -200,10 +215,11 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         rdelta = int(P) - p;
     }
     // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
+    if (pc_on && images.empty()) park_swap(prompt);
     const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
+    if (pc_on && !P0) pc_conv = ++conv_clock;  // a new conversation in this slot
     if (P0 < pc_snap) pc_snap = 0;
     pc_live = false;
-    const uint32_t snap = pc_on && P >= P0 + 2 * kTail ? P - kTail : 0;
     if (pc_on) pc_seq.assign(prompt.begin(), prompt.end());
     if (P0) std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused\n", P0, P);
     if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
@@ -216,7 +232,16 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         const char * tf_path = tf_dump && !tf_dump->empty() ? tf_dump->c_str() : nullptr;
         // prefill chunk: NPF tokens through the GEMM path (the dump needs every argmax)
         const int CH = tf_path ? NVER : std::clamp(NPF, 1, NBUF);
-        const size_t chunks = (P - P0 + CH - 1) / CH + 1;  // + 1: the split at snap
+        // the kept state sits on the chunk grid a cold prefill uses (multiples of CH from 0), at least kTail before the
+        // end, so a later turn that resumes there prefills exactly the chunks a cold prefill would: same kernels, same
+        // numbers, the same reply as with the cache off
+        // chat prompts: chunks restart at every message start and the state is kept at the last one, so the next turn
+        // re-reads only its new messages; prompts without message starts keep the plain grid
+        std::vector<uint32_t> starts;
+        if (im_start_ != ~0u && !tf_path)
+            for (uint32_t i = 1; i < P; ++i) if (prompt[i] == im_start_) starts.push_back(i);
+        const uint32_t snap = !pc_on ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
+        const size_t chunks = (P - P0 + CH - 1) / CH + 1 + starts.size();  // + the split at snap and at each message start
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
         HostBuf staged_pos(chunks * 2 * sizeof(int));
         std::memcpy(staged_tokens.p, prompt.data(), size_t(P) * sizeof(uint32_t));
@@ -230,7 +255,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         const uint32_t inj0 = dfl.ring > 0 && P > uint32_t(dfl.ring) ? P - uint32_t(dfl.ring) : 0;
         try {
             for (uint32_t t = P0, ci = 0; t < P; t += uint32_t(m_last), ++ci) {
-                const int m = int(std::min<uint32_t>(std::min<uint32_t>(uint32_t(CH), P - t), snap > t ? snap - t : P));
+                const int m = int(std::min<uint32_t>(chunk_end(starts, t, P, uint32_t(CH)) - t, snap > t ? snap - t : P));
                 m_last = m;
                 positions[2 * ci] = int(t);
                 positions[2 * ci + 1] = int(t) + 1;
@@ -418,9 +443,10 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * segs.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
     upload_rpos(int(segs.size()), [&](int i) { return rdelta_of(segs[size_t(i)].slot); });
     for (const auto & g : segs) kv_track(g.pos, g.n);
-    uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
+    uint64_t key = batch_graph_seed(batch_topk, unsigned(sp)) ^ (uint64_t(qsa.mode) << 44);  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-    ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+    if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
+    else ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -590,9 +616,14 @@ bool Qwen35Engine::dflash_advance() {
             const int nf = int(dfl.target_ids.size()), H = int(cfg.hidden);
             uint32_t lin_i = 0, attn_i = 0;
             for (uint32_t l = 0; l < cfg.layers; ++l) {
+                if (!lr_.owns(l)) {
+                    ++(cfg.full[l] ? attn_i : lin_i);
+                    continue;
+                }
                 if (cfg.full[l]) {
                     g.push_back({key_cache[attn_i].p, kv_row_bytes(true), 1});
                     g.push_back({value_cache[attn_i].p, kv_row_bytes(false), 1});
+                    if (qsa.on) g.push_back({qsa.layer[attn_i].tok->p, int64_t(tqllm_cuda::kQsa27Dim) * 2, 1});
                     ++attn_i;
                 } else {
                     g.push_back({v_stash2[sp][lin_i].p, int64_t(mix_rows(layer[l])) * 2, 0});
@@ -932,6 +963,7 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
         uint32_t lin_i = 0;
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             if (cfg.full[l]) continue;
+            if (!lr_.owns(l)) { ++lin_i; continue; }
             const auto & L = layer[l];
             const int rows = mix_rows(L);
             const bf16 * T = v_stash2[sp][lin_i].as<bf16>() + size_t(stash_col0) * rows;

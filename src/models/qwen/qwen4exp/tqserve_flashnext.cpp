@@ -1,6 +1,7 @@
 // Flash-Next behind the tqllm Engine interface (tqserve), registered as the .tqfn model type.
 #include "registry.hpp"
 #include "fn_engine.hpp"
+#include "core/tp_comm.hpp"
 
 namespace {
 using tqllm::flashnext::FlashNextEngine;
@@ -15,6 +16,11 @@ std::unique_ptr<tqllm::Engine> make_flashnext(const std::string & manifest, cons
     if (o.dense_cache_mb >= 0) { cfg.tune.dense_cache_mb = o.dense_cache_mb; cfg.tune.dense_cache_set = true; }
     if (o.prefill_borrow == "all") cfg.tune.borrow = tqllm::BorrowMode::All;
     else if (!o.prefill_borrow.empty() && o.prefill_borrow != "auto") { cfg.tune.borrow = tqllm::BorrowMode::Count; cfg.tune.borrow_count = std::atoi(o.prefill_borrow.c_str()); }
+    if (o.split_experts) {
+        if (o.tp_world != 2) throw std::invalid_argument("--split experts: two ranks (--tp-rank 0 / 1)");
+        if (o.tp_rank == 1 && o.tp_peer.empty()) throw std::invalid_argument("--split experts: rank 1 needs --tp-peer (rank 0's address)");
+        cfg.ep = std::make_shared<tqllm::TpComm>(o.tp_rank, 2, o.tp_peer.empty() ? "127.0.0.1" : o.tp_peer, o.tp_port);
+    }
     return std::make_unique<FlashNextEngine>(manifest, context, slots, cfg);
 }
 // a model path ending in .tqfn (a manifest of shard / expert / MTP files) selects Flash-Next; this object file is linked

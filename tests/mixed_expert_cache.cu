@@ -200,7 +200,59 @@ static void run() {
             std::printf("%s PASS\n", what.c_str());
         }
         int integrated = 0; check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0));
-        if (!integrated) {  // a full device (bank refill after a prefill borrow) must skip prefetches, not fail or leave freed staging
+        if (!integrated) {
+            {   // TQueue rule 2: a guess never takes a cache slot. Old: every prefetch evicted a cached expert for an expert
+                // that 30-38 % of the time was never used.
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                compare(0, {0, 1, 1, 2});
+                const auto before = current.stats();
+                current.prefetch(0, {3, 4}, copies); check(cudaDeviceSynchronize());
+                require(current.resident(0, 0) && current.resident(0, 1) && current.resident(0, 2), "a guess evicted a cached expert");
+                require(current.stats().evictions == before.evictions, "a guess counted an eviction");
+                compare(0, {0, 1, 1, 2}, true);
+                current.set_miss_stream(nullptr);
+                std::puts("TQueue: guesses never evict cached experts PASS");
+            }
+            {   // TQueue rules 1, 4, 5: at most two guess copies fly, a demand for a queued guess is copied once, a parked
+                // expert is picked up without a second trip over the link, and every projection stays byte-exact
+                MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
+                current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);
+                current.set_miss_stream(misses); selected = &current;
+                current.set_guess_link_depth(2);  // these queue / promotion / drop cases need more guesses than the depth
+                compare(0, {0, 1});
+                const uint64_t upto = current.stats().miss_copy_bytes;
+                compare(1, {0, 1});
+                const uint64_t one = (current.stats().miss_copy_bytes - upto) / 2;  // one layer-1 expert
+                compare(2, {0, 1}); compare(3, {0, 1});
+                const auto s0 = current.stats();
+                current.prefetch(1, {2, 3, 4}, copies);
+                const auto s1 = current.stats();
+                require(s1.pf_queued - s0.pf_queued == 3 && s1.pf_started - s0.pf_started == 2, "more than two guess copies on the link");
+                require(s1.pf_copy_bytes - s0.pf_copy_bytes == 2 * one, "guess bytes differ from two experts");
+                compare(1, {4, 2}, true);  // 4 was still queued (demand, one copy); 2 is parked or on its way (pickup)
+                const auto s2 = current.stats();
+                require(s2.pf_promoted - s1.pf_promoted == 1, "a queued guess that became a demand was not promoted");
+                require(s2.miss_copy_bytes - s1.miss_copy_bytes == one, "the promoted guess was not copied exactly once");
+                require(s2.pf_copy_bytes == s1.pf_copy_bytes, "a promoted guess was also copied as a guess");
+                require(s2.pickups - s1.pickups == 1, "the parked expert was not picked up");
+                require(s2.demand_behind_max <= 2, "a demand was issued behind more than two guess copies");
+                check(cudaDeviceSynchronize());
+                compare(1, {3, 3});  // parked for a layer that has run: a dead letter, still collectable
+                const auto s3 = current.stats();
+                require(s3.late_pickups - s2.late_pickups == 1 && s3.transfer_bytes == s2.transfer_bytes, "a late pickup crossed the link again");
+                current.prefetch(2, {2, 3, 4}, copies);
+                compare(2, {0, 1});  // layer 2 runs without them: the queued third guess is dropped before its copy starts
+                const auto s4 = current.stats();
+                require(s4.pf_expired - s3.pf_expired == 1 && s4.pf_started - s3.pf_started == 2, "a guess for a layer that ran was still copied");
+                require(s4.evictions == s3.evictions && s4.miss_copy_bytes == s3.miss_copy_bytes, "guesses changed the cache");
+                for (int l = 0; l < layers; ++l) { current.prefetch((l + 1) % layers, {2, 3, 4}, copies); compare(l, {2, 0, 4, 2}, true); }
+                require(current.stats().demand_behind_max <= 2, "a demand was issued behind more than two guess copies");
+                current.set_miss_stream(nullptr);
+                std::puts("TQueue: two copies on the link / promoted guess copied once / pickup and late pickup off the link / expiry PASS");
+            }
+            // a full device (bank refill after a prefill borrow) must skip prefetches, not fail or leave freed staging
             for (int a = 0; a < layers; ++a) {
                 MixedExpertCache current(layers, experts, hidden, ff, slots, budget, source, nullptr);
                 current.set_prepacked([&](int l, int id) { return blocks[l * experts + id]; }, true);

@@ -63,6 +63,41 @@ struct Scratch {
     half*  gx = nullptr; size_t gx_cap = 0;
     float* gy = nullptr; size_t gy_cap = 0;
     cublasHandle_t blas = nullptr;
+    // The scratch is one set for the process; its mutex orders the host side only. A call on another stream than the
+    // previous one waits for the previous call's GPU work, so two streams never use it at once. done is recorded after
+    // every call outside stream capture (while its stream is alive); inside a capture nothing is added to the graph, so
+    // one stream with CUDA graphs (every engine path today) costs nothing at replay.
+    cudaEvent_t done = nullptr;
+    cudaStream_t last = nullptr;
+    bool used = false, last_captured = false;
+    int device = -1;  // the GPU the scratch lives on: one per process (--split layer runs one tqserve per GPU)
+};
+
+// Scope of one call's use of the scratch on stream s (after the mutex).
+struct ScratchStream {
+    Scratch& sc;
+    cudaStream_t s;
+    bool captured = false;
+    ScratchStream(Scratch& scratch, cudaStream_t stream) : sc(scratch), s(stream) {
+        cudaStreamCaptureStatus c = cudaStreamCaptureStatusNone;
+        captured = cudaStreamIsCapturing(s, &c) == cudaSuccess && c == cudaStreamCaptureStatusActive;
+        if (!sc.done && cudaEventCreateWithFlags(&sc.done, cudaEventDisableTiming) != cudaSuccess)
+            throw std::runtime_error("x3: scratch event creation failed");
+        if (!sc.used || s == sc.last) return;
+        if (!sc.last_captured) {  // the previous call recorded done on its stream
+            if (cudaStreamWaitEvent(s, sc.done, captured ? cudaEventWaitExternal : 0) != cudaSuccess)
+                throw std::runtime_error("x3: scratch stream order failed");
+        } else if (!captured) {   // the previous use was a captured graph (no event): wait for the device once
+            if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("x3: scratch stream order failed");
+        } else {
+            throw std::runtime_error("x3: the shared scratch was captured into a CUDA graph on another stream; capture x3 "
+                                     "calls on one stream");
+        }
+    }
+    ~ScratchStream() {
+        if (!captured) cudaEventRecord(sc.done, s);
+        sc.used = true; sc.last = s; sc.last_captured = captured;
+    }
 };
 
 Scratch& scratch() { static Scratch s; return s; }
@@ -191,6 +226,12 @@ struct X3Format final : WeightFormat {
         {
             Scratch& sc = scratch();
             std::lock_guard<std::mutex> lock(sc.mtx);
+            int dev = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess) throw std::runtime_error("x3: no current GPU");
+            if (sc.device >= 0 && dev != sc.device)
+                throw std::runtime_error("x3: weights on a second GPU in one process are not supported (the routed-expert and "
+                                         "matvec scratch is one per process): run one tqserve per GPU (--split layer)");
+            sc.device = dev;
             size_t lb = 0;
             for (const X3Part& p : d->parts) {
                 lb = std::max(lb, p.codec->ws_bytes(p.cols, p.rows));
@@ -264,6 +305,7 @@ struct X3Format final : WeightFormat {
         const int count = n * topk, kp = x3::xw_moe_kparts(d->cols);
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
+        ScratchStream on_stream(sc, s);
         if (n == 1) {  // decode: one part per routed slot
             x3::x3_moe_build(ids, count, topk, per_slot_input, d->bank, rows, d->cols, kp, int(d->codecs.size()), x,
                              sc.moe_a, sc.moe_p, sc.moe_l, s);
@@ -299,6 +341,7 @@ struct X3Format final : WeightFormat {
         const int up_base = int(yb - ya);   // elements: the up half of the caller's single [2 * count][rows] buffer
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
+        ScratchStream on_stream(sc, s);
         if (n == 1) {
             x3::x3_moe_build2(ids, count, topk, da->bank, db->bank, rows, da->cols, kp, int(da->codecs.size()), x,
                               up_base, sc.moe_a, sc.moe_p, sc.moe_l, s);
@@ -332,6 +375,7 @@ struct X3Format final : WeightFormat {
         const int most = *std::max_element(cnt.begin(), cnt.end());
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
+        ScratchStream on_stream(sc, s);
         // window GEMV in batched lists: one part per (expert, pass of XW_MAX_N of its assignments), up to
         // XW_MOE_MAX_PARTS parts per launch, inputs read and outputs written through the assignment ids (one launch
         // set for many experts instead of gather + three launches + scatter per expert pass); the trellis is decoded in
@@ -420,7 +464,8 @@ private:
         d.expert_codec = std::move(ec);
         void* dev = nullptr;
         if (cudaMalloc(&dev, host.size() * sizeof(x3::XwExpert)) != cudaSuccess ||
-            cudaMemcpy(dev, host.data(), host.size() * sizeof(x3::XwExpert), cudaMemcpyHostToDevice) != cudaSuccess)
+            cudaMemcpy(dev, host.data(), host.size() * sizeof(x3::XwExpert), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)  // landed before any stream reads the bank
             throw std::runtime_error("x3: expert bank upload failed");
         d.bank = static_cast<x3::XwExpert*>(dev);
         // parts x columns: a decode part has one column, a verify part (distinct expert) up to n; parts x n <= MAX x MAX_N / 4
@@ -436,6 +481,7 @@ private:
     void run_window(const X3Desc& d, const __half* x, Out* y, int n, int ldy, cudaStream_t s) const {
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
+        ScratchStream on_stream(sc, s);
         void* ws = window_scratch(sc, d);
         for_each_window_run(d, [&](size_t i, size_t j, int off) {
             x3::XwList L;
@@ -458,6 +504,7 @@ public:
         const auto* d = static_cast<const X3Desc*>(m.aux);
         Scratch& sc = scratch();
         std::lock_guard<std::mutex> lock(sc.mtx);
+        ScratchStream on_stream(sc, s);
 
         const size_t k = size_t(m.cols);
         float* a = static_cast<float*>(grow(reinterpret_cast<void**>(&sc.a), sc.a_cap, size_t(n) * k * sizeof(float)));

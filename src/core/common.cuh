@@ -63,6 +63,21 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
 }
 
+// One level of the transposing butterfly over a lane's N values: lanes with bit OFF set keep their upper half and add
+// the partner's lower half, the others the reverse; N / 2 values remain. Compile-time OFF and N keep the array in
+// registers (a runtime loop turned the 15 shuffles into ~500 instructions of register-array emulation). The pairs are
+// those of the shfl_xor reduction tree (a + b == b + a), so each value's sum has the same bits.
+template<int OFF, int N>
+__device__ __forceinline__ void butterfly_fold(float (&a)[16], int lane) {
+    const bool upper = lane & OFF;
+    #pragma unroll
+    for (int j = 0; j < N / 2; ++j) {
+        const float mine = upper ? a[j + N / 2] : a[j], send = upper ? a[j] : a[j + N / 2];
+        a[j] = mine + __shfl_xor_sync(0xffffffffu, send, OFF);
+    }
+    if constexpr (OFF > 2) butterfly_fold<OFF / 2, N / 2>(a, lane);
+}
+
 // Two-part (tree) verify attention: a query at position qpos takes keys [0, split) from the cache kernel and [split, qpos]
 // from the in-block kernel. split <= qpos - TREE_MAX_DEPTH keeps it at or below the block start for any path of up to
 // 16 nodes, and depends only on qpos.

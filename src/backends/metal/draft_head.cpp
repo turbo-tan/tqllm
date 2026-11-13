@@ -1,4 +1,5 @@
 #include <string>
+#include "matrix_unit.hpp"
 #include "draft_head.hpp"
 #include "prefill.hpp"
 #include <stdexcept>
@@ -102,7 +103,7 @@ for(uint r=0;r<RT;++r)for(uint t=0;t<2;++t)simdgroup_store(C[r][t],out+r*8*N+(g*
 DraftHead4 draft_head4(const Matrix& original,bool fragment_layout) {
     // matrix-unit layout served (j785 tqserve mlxc geomean 67.7 vs 65.0 tok/s, draft 8.4 vs 11.6 ms); fragment_layout: the
     // 8-row simdgroup head (tests)
-    const bool nax_layout=!fragment_layout;
+    const bool nax_layout=!fragment_layout && m5_matrix_unit();
     if(nax_layout) {
         auto weights=mx::quantize(mx::astype(stage_bf16(original),mx::bfloat16),64,4,"affine");
         mx::eval(weights);

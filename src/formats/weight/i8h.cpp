@@ -1,6 +1,7 @@
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -27,6 +28,10 @@ inline void expert_matvec_u4h(int fmt, const Mat & m, const __half * x, __nv_bfl
 // I8H (engine id 1000): int8 + FP16 scale per 16 (drafter matrices, int8 LM-head copy).
 struct I8h final : WeightFormat {
     const char * name() const override { return "I8H"; }
+    // a several-sequence verify block (9..32 columns) in one launch: the u4h-family kernel keeps each column's k-order
+    // (tests/matvec_wide.cu); widths that are not a multiple of 64 take i8h_matvec, run in launches of 8 columns as before
+    int max_exact_cols() const override { return 32; }
+    int max_batch_cols() const override { return 32; }
     int u4h_id() const override { return 15; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
@@ -56,17 +61,17 @@ struct I8h final : WeightFormat {
         throw std::runtime_error("I8H is produced by other loaders");
     }
     void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
-        if (m.cols % 64) tqllm_cuda::i8h_matvec_bf16(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x, y, m.rows, m.cols, n, s);
+        if (m.cols % 64) { for (int c = 0; c < n; c += 8) tqllm_cuda::i8h_matvec_bf16(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x + size_t(c) * m.cols, y + size_t(c) * m.rows, m.rows, m.cols, std::min(8, n - c), s); }
         else tqllm_cuda::u4h_family_matvec_bf16(15, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
     }
     bool has_matvec_ld() const override { return true; }
     bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
-        if (m.cols % 64) tqllm_cuda::i8h_matvec_bf16(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x, y, m.rows, m.cols, n, s, ldy);
+        if (m.cols % 64) { for (int c = 0; c < n; c += 8) tqllm_cuda::i8h_matvec_bf16(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x + size_t(c) * m.cols, y + size_t(c) * size_t(ldy ? ldy : m.rows), m.rows, m.cols, std::min(8, n - c), s, ldy); }
         else tqllm_cuda::u4h_family_matvec_bf16(15, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
         return true;
     }
     void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
-        if (m.cols % 64) tqllm_cuda::i8h_matvec(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x, y, m.rows, m.cols, n, s);
+        if (m.cols % 64) { for (int c = 0; c < n; c += 8) tqllm_cuda::i8h_matvec(static_cast<const int8_t *>(m.p), static_cast<const __half *>(m.aux), x + size_t(c) * m.cols, y + size_t(c) * m.rows, m.rows, m.cols, std::min(8, n - c), s); }
         else tqllm_cuda::u4h_family_matvec_f32(15, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
     }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {

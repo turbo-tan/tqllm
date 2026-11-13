@@ -62,11 +62,27 @@ __device__ __forceinline__ void mma_s8(int (&c)[4], uint32_t a0, uint32_t a1, ui
 
 // T4K: Turbo4 K (Q rotated per 128 by the same transform, int8 per (row, 128); scores rescaled twice per head)
 // T4V: Turbo4 V records (4-bit, PV layout) instead of Turbo3 V.
-template <bool T4K, bool T4V>
+// SEL (QSA, qwen35_qsa.cuh; chain verify): grid z = one row of the block at position qpos = *dseq0 - 1 + z. Its keys
+// are the 4 positions of each of its selected blocks sel[z][512], in that order, then the positions from its split
+// point to itself, in place of every cache position up to itself. A row whose split point is below `from` is left
+// alone (a dense row). Same decode and arithmetic; the partials depend on the row's own query and selection only.
+template <bool T4K, bool T4V, bool SEL = false>
 __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, const void * kq_, const uint8_t * v3,
                                                      const __half * ksc, float * part, const int * dseq0, int nq,
-                                                     int heads, int kvheads, float scale, int nsplit, int query_offset) {
+                                                     int heads, int kvheads, float scale, int nsplit, int query_offset,
+                                                     const int32_t * sel = nullptr, int from = 0) {
     using namespace ctv;
+    constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
+    int sel_tail = 0, sel_end = 0;  // first dense position, keys in all
+    if constexpr (SEL) {
+        const int z = blockIdx.z, qpos = *dseq0 - 1 + z;
+        sel_tail = tqllm_dev::tq_split_point(qpos), sel_end = SEL_KEYS + qpos + 1 - sel_tail;
+        if (sel_tail < from) return;
+        q += int64_t(z) * heads * DIM, part += int64_t(z) * heads * nsplit * (DIM + 2), sel += int64_t(z) * (SEL_KEYS / 4);
+        nq = 1;
+    }
+    // cache position of key index i, and whether row r sees key index i
+    auto kpos = [&](int i) { return !SEL ? i : i < SEL_KEYS ? sel[i / 4] * 4 + i % 4 : sel_tail + i - SEL_KEYS; };
     constexpr int MT = MAXR / 16;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     int8_t * q8 = reinterpret_cast<int8_t *>(smem_raw);                          // [MAXR][RS]
@@ -85,7 +101,8 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
     const int g = heads / kvheads, rows = nq * g, mt = (rows + 15) / 16;
     const int seq0 = *dseq0 + query_offset, seq_last = seq0 + nq - 1;
     // tiles interleaved over the splits (tile i -> split i % nsplit): a query's result does not depend on nq
-    const int stride = nsplit * TILE, beg = split * TILE, end = seq_last;
+    const int stride = nsplit * TILE, beg = split * TILE, end = SEL ? sel_end : seq_last;
+    auto sees = [&](int i, int r) { return SEL ? i < sel_end : i < seq0 + r / g; };
 
     auto stage_k = [&](int buf, int t0) {
         const int n = min(TILE, end - t0);
@@ -95,14 +112,14 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
                 if (p < n)
                     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
                                      uint32_t(__cvta_generic_to_shared(k8 + (buf * TILE + p) * K4B + w * 4))),
-                                 "l"(k4g + (int64_t(t0 + p) * kvheads + kh) * K4B + w * 4));
+                                 "l"(k4g + (int64_t(kpos(t0 + p)) * kvheads + kh) * K4B + w * 4));
             }
         } else {
             for (int i = t; i < TILE * (DIM / 16); i += blockDim.x) {
                 const int p = i / (DIM / 16), c = i % (DIM / 16);
-                if (p < n) cp_async16(k8 + (buf * TILE + p) * RS + c * 16, kq + (int64_t(t0 + p) * kvheads + kh) * DIM + c * 16);
+                if (p < n) cp_async16(k8 + (buf * TILE + p) * RS + c * 16, kq + (int64_t(kpos(t0 + p)) * kvheads + kh) * DIM + c * 16);
             }
-            if (t < n) cp_async16(kss + (buf * TILE + t) * NBK, ksc + (int64_t(t0 + t) * kvheads + kh) * NBK);
+            if (t < n) cp_async16(kss + (buf * TILE + t) * NBK, ksc + (int64_t(kpos(t0 + t)) * kvheads + kh) * NBK);
         }
     };
     auto stage_v = [&](int buf, int t0) {
@@ -112,7 +129,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
             if (p < n)
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
                                  uint32_t(__cvta_generic_to_shared(v3s + (buf * TILE + p) * VB + w * 4))),
-                             "l"(v3 + (int64_t(t0 + p) * kvheads + kh) * VB + w * 4));
+                             "l"(v3 + (int64_t(kpos(t0 + p)) * kvheads + kh) * VB + w * 4));
         }
     };
     auto commit = [] { asm volatile("cp.async.commit_group;\n" ::); };
@@ -231,7 +248,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const int r = r0 + (i >= 2 ? 8 : 0), p = nt * 8 + tig * 2 + (i & 1);
-                    sc[r * SCS + p] = r < rows && p < n && t0 + p < seq0 + r / g ? cf[i] * scale : -CUDART_INF_F;
+                    sc[r * SCS + p] = r < rows && p < n && sees(t0 + p, r) ? cf[i] * scale : -CUDART_INF_F;
                 }
             }
         } else {  // S = Q K^T
@@ -265,7 +282,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const int r = (m_lo + mm) * 16 + gid + (i >= 2 ? 8 : 0), p = nt * 8 + tig * 2 + (i & 1);
-                    sc[r * SCS + p] = r < rows && p < n && t0 + p < seq0 + r / g ? cf[mm][i] * scale : -CUDART_INF_F;
+                    sc[r * SCS + p] = r < rows && p < n && sees(t0 + p, r) ? cf[mm][i] * scale : -CUDART_INF_F;
                 }
             }
         }

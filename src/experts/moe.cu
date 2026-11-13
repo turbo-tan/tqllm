@@ -492,3 +492,50 @@ void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, i
     dedup_maps_k<<<1, (count + 31) / 32 * 32, 0, stream>>>(ids, slot_of, count, topk, slots, gu, dn, groups);
 }
 }
+
+namespace {
+// k-th position of item i among the items of `ids` (count n) whose expert lives on rank `on`, or -1 when i is not one
+__device__ int ep_rank_of(const int * ids, int n, int i, int on) {
+    const int e = ids[i];
+    if (e < 0 || (e & 1) != on) return -1;
+    int k = 0;
+    for (int j = 0; j < i; ++j) k += ids[j] >= 0 && (ids[j] & 1) == on;
+    return k;
+}
+__global__ void ep_local_ids_k(const int * ids, int A, const int * peer_ids, int Ap, int rank, int cap, int * local_ids) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < A) {
+        const int e = ids[i];
+        local_ids[i] = e < 0 ? -1 : (e & 1) == rank ? e : ep_rank_of(ids, A, i, 1 - rank) >= cap ? e : -1;
+    } else if (i < A + Ap) {
+        const int b = i - A, k = ep_rank_of(peer_ids, Ap, b, rank);
+        local_ids[i] = k >= 0 && k < cap ? peer_ids[b] : -1;
+    }
+}
+__global__ void ep_gather_k(const __nv_bfloat16 * ed, int A, const int * peer_ids, int rank, int cap, __nv_bfloat16 * send, int h, int Ap) {
+    const int b = blockIdx.x; if (b >= Ap) return;
+    __shared__ int k; if (threadIdx.x == 0) k = ep_rank_of(peer_ids, Ap, b, rank);
+    __syncthreads();
+    if (k < 0 || k >= cap) return;
+    for (int j = threadIdx.x; j < h; j += blockDim.x) send[size_t(k) * h + j] = ed[size_t(A + b) * h + j];
+}
+__global__ void ep_scatter_k(const __nv_bfloat16 * recv, const int * ids, int A, int rank, int cap, __nv_bfloat16 * ed, int h) {
+    const int a = blockIdx.x; if (a >= A) return;
+    __shared__ int k; if (threadIdx.x == 0) k = ep_rank_of(ids, A, a, 1 - rank);
+    __syncthreads();
+    if (k < 0 || k >= cap) return;
+    for (int j = threadIdx.x; j < h; j += blockDim.x) ed[size_t(a) * h + j] = recv[size_t(k) * h + j];
+}
+}
+namespace tqllm_cuda {
+void ep_local_ids(const int * ids, int A, const int * peer_ids, int Ap, int rank, int cap, int * local_ids, cudaStream_t stream) {
+    if (A < 0 || Ap < 0 || (rank & ~1) || cap < 0) throw std::invalid_argument("ep_local_ids: invalid shape");
+    if (A + Ap > 0) ep_local_ids_k<<<(A + Ap + 127) / 128, 128, 0, stream>>>(ids, A, peer_ids, Ap, rank, cap, local_ids);
+}
+void ep_gather(const __nv_bfloat16 * ed, int A, const int * peer_ids, int Ap, int rank, int cap, __nv_bfloat16 * send, int h, cudaStream_t stream) {
+    if (Ap > 0 && cap > 0) ep_gather_k<<<Ap, 256, 0, stream>>>(ed, A, peer_ids, rank, cap, send, h, Ap);
+}
+void ep_scatter(const __nv_bfloat16 * recv, const int * ids, int A, int rank, int cap, __nv_bfloat16 * ed, int h, cudaStream_t stream) {
+    if (A > 0 && cap > 0) ep_scatter_k<<<A, 256, 0, stream>>>(recv, ids, A, rank, cap, ed, h);
+}
+}

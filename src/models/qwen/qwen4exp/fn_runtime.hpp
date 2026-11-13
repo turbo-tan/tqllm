@@ -1,6 +1,8 @@
 #pragma once
 // Flash-Next engine runtime: CUDA error checks, scratch arena, prefill tuning and the shared per-process state.
 #include <unordered_map>
+#include <memory>
+namespace tqllm { class TpComm; }
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
 #include "cuda_recover.hpp"
@@ -73,6 +75,7 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
 using namespace tqllm;
 inline void ck(cudaError_t rc, const char * file = __builtin_FILE(), int line = __builtin_LINE()) {
     if (rc == cudaSuccess) return;
+    if (rc != cudaErrorMemoryAllocation) dump_expert_links(cudaGetErrorString(rc));
     const char * base = std::strrchr(file, '/');
     throw std::runtime_error(std::string(cudaGetErrorString(rc)) + " (" + (base ? base + 1 : file) + ":" + std::to_string(line) + ")");
 }
@@ -148,6 +151,8 @@ struct FnConfig {
     int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
     bool prompt_cache = false;  // --prompt-cache on (several slots): a slot keeps its sequence and reuses a shared prompt prefix
     bool unified_memory = false;  // the GPU shares system memory (GB10): set at load
+    // --split experts: the link to the other rank (rank 0 serves, rank 1 computes its experts of rank 0's decode forwards)
+    std::shared_ptr<tqllm::TpComm> ep;
 };
 // one engine's mutable state shared by its sequences (one stream): Checkpoint::rt
 struct FnRuntime {
@@ -162,6 +167,7 @@ struct FnRuntime {
     int block_seqs = 1;        // sequences in the decode block being run (batched np > 1 verify): predicts() scales its row limit
     int trace_waves = 0, trace_min_slots = 1 << 30;  // TQLLM_DEBUG=steptrace: decode layers on the waves path / fewest bank slots this step
     int sub_req = 0;           // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
+    int prefill_stage = 0;     // the request's staging slices (experts per half), 0 = the engine's --prefill-stage / small-card clamp
     int prefill_epoch = 0;     // bumped when a prefill releases decode scratch: graph capture warms up again
     uint64_t kv_epoch = 0;     // bumped at every request start: device copies of K/V rows (the gather's row cache) start empty
     std::unique_ptr<tqllm_cuda::QsaBatchScratch> qsa_batch;  // QSA selection scratch, sized by qsa_block

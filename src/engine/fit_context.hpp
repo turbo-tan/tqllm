@@ -140,6 +140,12 @@ inline size_t fit_free(bool wsl, size_t driver_free, size_t total, size_t used_b
 // left free after loading (its batched-verify / draft graphs, ~12 MB each), on top of `margin`. Returns np when they fit,
 // else the largest count that does (at least 1: one slot is the plain fit). tqserve refuses to start rather than fail
 // requests mid-run.
+// Default free memory per parallel slot after loading (--slot-reserve unset: asked < 0). Measured at the run-time peak
+// (3090, Qwen3.8-27B TQ4_L, 11-11, 8K-token distinct prompts on every slot): np 16 without a drafter used 628 MiB in all
+// (~39 MiB per slot, inside the 768 MiB base margin alone); np 8 with DFlash2 ~110 MiB per slot. 128 MiB per slot without
+// a drafter held 2 GB back at np 16, so the fit put every KV position in host memory (243 tok/s, all KV over PCIe); 32
+// keeps 1,024 positions per slot on the GPU (397 tok/s, replies identical to np 1).
+inline long fit_slot_reserve_mb(long asked, bool drafter) { return asked >= 0 ? asked : drafter ? 128 : 32; }
 inline uint32_t fit_slots(uint32_t np, uint32_t slot_ctx, uint32_t min_ctx, size_t free_b, size_t margin, size_t slot_b) {
     if (np <= 1) return np;
     const uint32_t by_ctx = !min_ctx || slot_ctx >= min_ctx ? np : uint32_t(uint64_t(slot_ctx) * np / min_ctx);

@@ -187,6 +187,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         const auto p = "blk." + std::to_string(l) + ".";
         auto & L = layer[l];
         L = {};
+        if (!lr_.owns(l)) continue;  // --split layer: another rank's layer
         L.in_norm = g_f32(f, p + "attn_norm.weight", H);
         L.post_norm = g_f32(f, p + (cfg.gated_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), H);
         if (cfg.moe) {
@@ -235,6 +236,85 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             L.gnorm_w = g_f32(f, p + "ssm_norm.weight", cfg.lin_dv);
         }
     }
+    qsa_load(f);
+}
+
+// QSA indexers (tools/qsa_indexer_gguf.py + gguf_add.py): all full-attention layers or none
+void Qwen35Engine::qsa_load(const GgufFile & f) {
+    using namespace tqllm_cuda;
+    const int H = int(cfg.hidden);
+    if (!cfg.gated_attention || cfg.moe || H % 256) return;
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (!cfg.full[l]) continue;
+        const auto p = "blk." + std::to_string(l) + ".";
+        if (!f.tensors.count(p + "qsa_q.weight")) {
+            qsa.layer.clear();
+            return;
+        }
+        std::vector<char> w;
+        for (const auto & [name, rows] : {std::pair<const char *, int>{"qsa_q.weight", kQsa27Heads * kQsa27Dim}, {"qsa_k.weight", kQsa27Dim}}) {
+            const auto & t = gt(f, p + name);
+            if (t.type != GGML_F16 || t.ne.size() != 2 || t.ne[0] != uint64_t(H) || t.ne[1] != uint64_t(rows))
+                throw std::runtime_error(p + name + ": expected F16 [" + std::to_string(rows) + ", " + std::to_string(H) + "]");
+            const auto raw = f.read(t);
+            w.insert(w.end(), raw.begin(), raw.end());
+        }
+        QsaLayer q;
+        q.w = static_cast<const __half *>(put(w.data(), w.size()));
+        q.q_norm = g_f32(f, p + "qsa_q_norm.weight", kQsa27Dim);
+        q.k_norm = g_f32(f, p + "qsa_k_norm.weight", kQsa27Dim);
+        q.block_norm = g_f32(f, p + "qsa_k_block_norm.weight", kQsa27Dim);
+        qsa.layer.push_back(std::move(q));
+    }
+    qsa.file_from = int(f.num("qwen35.qsa.sparse_from", 0));
+}
+
+void Qwen35Engine::qsa_setup() {
+    using namespace tqllm_cuda;
+    if (const char * note = qsa_missing_note(opt.qsa_from, !qsa.layer.empty())) std::fprintf(stderr, "tqllm: WARN: %s\n", note);
+    if (qsa.layer.empty()) return;
+    qsa.from = qsa_cuda_from(opt.qsa_from);
+    const char * why = nullptr;
+    ensure_mq_split();
+    if (opt.qsa_from < 0) why = "QSA is opt-in on CUDA (--qsa-from N, e.g. 49152)";
+    else if (qsa.from == 0) why = "--qsa-from off";
+    else if (nslots != 1) why = "more than one slot";
+    else if (tp_) why = "--split layer";
+    else if (!kvf->qsa_ok() || !(kvf->qsa_one_part() || chain2) || cfg.head_dim != 256 || cfg.heads / cfg.kvheads > 8)
+        why = "this KV format has no QSA rows";
+    else if (kv_staged && !kvf->qsa_host_ok()) why = "this KV format cannot read its staged host KV tail in place";
+    else if (opt.kv_compact > 0) why = "--kv-compact";
+    else if (int64_t(context_) <= qsa.from + 64) why = nullptr;  // no row can reach `from`: nothing to say
+    if (why || int64_t(context_) <= qsa.from + 64) {
+        if (why) std::fprintf(stderr, "tqllm: QSA indexers in the file, attention stays dense: %s\n", why);
+        return;
+    }
+    qsa.max_blocks = int(context_ / kQsa27Block);
+    const size_t H = cfg.hidden;
+    for (auto & q : qsa.layer) {
+        q.tok = std::make_unique<HostBuf>(size_t(context_) * kQsa27Dim * 2);
+        q.blocks = Buf(size_t(qsa.max_blocks) * kQsa27Dim * 4);
+    }
+    qsa.xu = Buf(size_t(std::max(NBUF, NVER)) * H * 2);
+    qsa.proj = Buf(std::max(size_t(NBUF) * kQsa27Dim, size_t(NVER) * kQsa27Rows) * 4);
+    qsa.q = Buf(size_t(NVER) * kQsa27Heads * kQsa27Dim * 4);
+    qsa.bits = Buf(size_t(NVER) * qsa.max_blocks * 4);
+    qsa.sel = Buf(size_t(NVER) * kQsa27Pick * 4);
+    qsa.mass = Buf(size_t(cfg.heads) * 3 * 4);
+    if (kv_staged) {
+        qsa.tail_off = Buf(2 * sizeof(int64_t)), ck(cudaMemset(qsa.tail_off.p, 0, 2 * sizeof(int64_t)));
+        qsa.mark = Buf((size_t(qsa.max_blocks) + 1) * sizeof(int));
+        ck(cudaMemset(qsa.mark.p, 0xff, size_t(qsa.max_blocks) * sizeof(int)));
+        ck(cudaMemset(static_cast<int *>(qsa.mark.p) + qsa.max_blocks, 0, sizeof(int)));
+    }
+    qsa.mass_left = kvf->compressed() ? 0 : tqllm::debug_int("qsa_mass");  // the report reads BF16 keys
+    qsa.on = true;
+    if (opt.exact)
+        std::fprintf(stderr, "tqllm: WARN: --exact on with a QSA file: rows past %d keys attend sparsely, so the text differs from dense "
+                     "attention (spec output still equals plain decoding); --qsa-from off keeps attention dense\n", qsa.from);
+    std::fprintf(stderr, "tqllm: QSA: verify rows past %d keys attend to their top %d key blocks + the recent keys "
+                 "(%.2f GB of block keys on the device, %.2f GB of token keys in host memory)\n", qsa.from, kQsa27Pick,
+                 double(qsa.layer.size()) * qsa.max_blocks * kQsa27Dim * 4 / 1e9, double(qsa.layer.size()) * context_ * kQsa27Dim * 2 / 1e9);
 }
 
 void Qwen35Engine::alloc_seq_state() {
@@ -243,7 +323,8 @@ void Qwen35Engine::alloc_seq_state() {
     if (!kv_pool) {  // first slot: one pool for every slot
         if (std::string(kvs->name()) != "flat")
             throw std::runtime_error(std::string("--kv-store ") + kvs->name() + ": the attention kernels read flat KV only so far");
-        const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true));
+        int attn_layers = 0;  // --split layer: only this rank's attention layers get pool pages
+        for (uint32_t l = lr_.lo; l < lr_.hi; ++l) attn_layers += cfg.full[l] ? 1 : 0;
         kv_mem = make_cuda_kv_memory(stream);
         const int64_t host = std::min<int64_t>(std::max(0L, opt.kv_host), context_);
         // staged: the newest positions stay in a device window (>= 2048: a prefill chunk plus a verify block always
@@ -313,15 +394,17 @@ void Qwen35Engine::alloc_seq_state() {
     }
     kv_seq = kvs->make(*kv_pool, context_);
     if (!kv_seq->reserve(context_)) throw std::runtime_error("out of memory");
+    // indexed by every attention / recurrent layer; another rank's layers (--split layer) get empty entries
     for (uint32_t l = 0, a = 0; l < cfg.layers; ++l) {
+        const bool own = lr_.owns(l);
         if (cfg.full[l]) {
-            key_cache.push_back({kv_seq->base(int(a), true)});
-            value_cache.push_back({kv_seq->base(int(a), false)});
-            ++a;
+            key_cache.push_back({own ? kv_seq->base(int(a), true) : nullptr});
+            value_cache.push_back({own ? kv_seq->base(int(a), false) : nullptr});
+            a += own ? 1 : 0;
         } else {
             for (int sl = 0; sl < NSLOT; ++sl) {
-                conv_state.emplace_back(size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2);
-                rec_state.emplace_back(size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4);
+                conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
+                rec_state.emplace_back(own ? size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4 : 0);
             }
         }
     }
@@ -345,7 +428,7 @@ void Qwen35Engine::allocate() {
         const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true));
         const int64_t dev_pos = int64_t(context_) - std::min<int64_t>(std::max(0L, opt.kv_host), context_);
         const size_t kv_dev = size_t(attn_layers) * size_t(dev_pos) * size_t(kv_row_bytes(true) + kv_row_bytes(false));
-        NPF = NBUF = prefill_chunk(int64_t(context_), tot, fr, kv_dev);  // GB10 prefill 8K: 650 -> 1135 tok/s
+        NPF = NBUF = split_min(prefill_chunk(int64_t(context_), tot, fr, kv_dev));  // GB10 prefill 8K: 650 -> 1135 tok/s
         prefill_room = fr > kv_dev ? fr - kv_dev : 0;
     }
     if (opt.ubatch) NPF = NBUF = std::max(NVER, opt.ubatch);
@@ -452,7 +535,7 @@ void Qwen35Engine::allocate() {
     v_part = Buf(part_floats * 4);
     for (uint32_t l = 0; l < cfg.layers; ++l)
         if (!cfg.full[l])
-            for (auto & st : v_stash2) st.emplace_back(size_t(NB) * mix_rows * 2);
+            for (auto & st : v_stash2) st.emplace_back(lr_.owns(l) ? size_t(NB) * mix_rows * 2 : 0);
     v_hid = Buf(NBUF * H * 2);
     v_cat = Buf(NVER * 2 * H * 2);
     mtp_h = Buf(H * 2);
@@ -482,6 +565,7 @@ void Qwen35Engine::allocate() {
     if (opt.native_mtp && nslots != 1)  // refused at start-up, not per request
         throw std::runtime_error("--mtp drafts for one slot only for now: use --np 1 (or -md for --np > 1)");
     chain2 = cfg.gated_attention && kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
+    qsa_setup();
     // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
     if (cfg.gated_attention && opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
         if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)

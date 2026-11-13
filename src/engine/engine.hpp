@@ -85,6 +85,11 @@ struct Engine {
     // prompt tokens slot s would reuse from its previous request (0: none); the scheduler routes a request to the free
     // slot with the longest reuse
     virtual uint32_t prefix_reuse(int, const std::vector<uint32_t> &) const { return 0; }
+    // While idle: `prefix` is what the slot's next prompt is expected to begin with (its last prompt plus the reply as the
+    // client returns it). An engine that kept the last prompt's state may prefill the rest of the prefix now, so a next
+    // prompt that does begin with it starts sooner; any other next prompt is served as if this was never called.
+    // true: prefilled.
+    virtual bool prefill_ahead(int, const std::vector<uint32_t> &) { return false; }
     // DFlash drafter training data: prefill `tokens` from position 0 and return the drafter's target features
     // [P][nf * hidden] (raw BF16 bits) of every position; returns nf (0: no drafter loaded)
     virtual int drafter_features(const std::vector<uint32_t> &, std::vector<uint16_t> &) { return 0; }
@@ -121,6 +126,11 @@ std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t c
                                             const std::string & tokenizer = "", const TpConfig & tp = {},
                                             const std::string & hot_map = "",  // routing counts: preload the hot experts
                                             const std::string & draft_vocab = "");  // --draft-vocab: the DSpark head over a token subset
+class TpComm;
+// --split layer: one rank of a layer split (one process per GPU, NCCL between them); loads and runs only its own layers.
+// The backend wraps it in a LockstepEngine (src/engine/lockstep.hpp): rank 0 serves, the others run follow().
+std::unique_ptr<Engine> make_qwen35_split_engine(const std::string & path, const std::string & tokenizer, uint32_t context,
+                                                 int slots, const EngineOptions & options, std::shared_ptr<TpComm> tp);
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

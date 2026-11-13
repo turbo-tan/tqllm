@@ -47,6 +47,15 @@ bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tile
 void set_tiled_experts(bool on);
 int tiled_block_bytes(int fmt);  // code bytes per 32 weights of a tileable u4h format, else 0
 void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb);
+// the same layout in place on the device for `count` experts stored back to back (rows x k each, data only)
+void tile_expert_rows_device(char * p, int count, int rows, int k, int bpb, cudaStream_t s);
+// paired dedup launches switch to the prefetching variant from this many groups (per u4h format; both variants give the same
+// bits). calibrate_dedup_pf times both on a real bank (slots experts, rows x cols each) and sets the threshold it returns
+// (INT32_MAX: the prefetching variant never won); set_dedup_pf_min sets it directly (tests)
+int calibrate_dedup_pf(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, int rows, int cols,
+                       int slots, cudaStream_t stream);
+void set_dedup_pf_min(int fmt, int groups);
+int dedup_pf_threshold(int fmt);
 void k_expert_matvec_dedup2(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
                             __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
 void k_expert_matvec(int fmt, const uint8_t *, const void *, const __half *, __nv_bfloat16 *,

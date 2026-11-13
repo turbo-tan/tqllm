@@ -40,6 +40,8 @@ struct KvSplit final : KvFormat {
     }
     int split_factor() const override { return 2; }
     bool tree_ok() const override { return true; }
+    bool qsa_ok() const override { return true; }
+    bool qsa_host_ok() const override { return true; }
     bool compact_codecs(int & kc, int & vc) const override {
         kc = int(k.id), vc = int(v.id);
         return (k.id == KvCodec::Tq3 || k.id == KvCodec::Tcq3) && (v.id == KvCodec::Tq3 || v.id == KvCodec::Tcq2);
@@ -58,7 +60,8 @@ struct KvSplit final : KvFormat {
                                         a.stream);
         tqllm_cuda::attention_kv_split(k.id, v.id, a.q, a.kc, a.vc, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale,
                                        a.n > a.nver ? 1 : a.split, a.stream, a.par, a.dep,
-                                       static_cast<const tqllm_cuda::KvCompactSeg *>(a.compact));
+                                       static_cast<const tqllm_cuda::KvCompactSeg *>(a.compact), a.par ? a.qsa_sel : nullptr, a.qsa_from,
+                                       a.qsa_mixed);
     }
 };
 }  // namespace

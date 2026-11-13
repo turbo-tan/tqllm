@@ -22,6 +22,8 @@ struct KvQ8Turbo3V final : KvFormat {
                 "TurboQuant+ record layouts (TheTom/turboquant_plus, Apache-2.0)", "Apache-2.0", "see NOTICE"};
     }
     int split_factor() const override { return 2; }
+    bool qsa_ok() const override { return true; }
+    bool qsa_one_part() const override { return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override { const size_t n = size_t(c) * kvh * hd; return n + n / 32 * 2; }
     size_t value_bytes(int64_t c, int kvh, int hd) const override { need256(hd, name()); return size_t(c) * kvh * sizeof(Turbo3V256); }
     void write_and_attend(const KvStep & a) const override {
@@ -31,6 +33,11 @@ struct KvQ8Turbo3V final : KvFormat {
         auto * v3 = static_cast<Turbo3V256 *>(a.vc);
         tqllm_cuda::cache_write_multi_q8_turbo3v(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, k8, ks, v3, a.dpos,
                                                  a.kvheads, a.head_dim, a.stream);
+        if (a.qsa_sel && a.n <= a.nver) {
+            tqllm_cuda::attention_ctv_qsa(0, a.q, k8, v3, ks, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.split,
+                                          a.stream, a.qsa_sel, a.qsa_from, a.qsa_mixed);
+            return;
+        }
         for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {
             const size_t qoff = size_t(off) * a.heads * a.head_dim;
             tqllm_cuda::attention_mq256_q8_turbo3v(a.q + qoff, k8, v3, ks, a.o + qoff, a.part, a.dpos + 1,
@@ -47,6 +54,9 @@ struct KvT4kTurbo3V final : KvFormat {
                 "TurboQuant+ record layouts (TheTom/turboquant_plus, Apache-2.0)", "Apache-2.0", "see NOTICE"};
     }
     int split_factor() const override { return 2; }
+    bool qsa_ok() const override { return true; }
+    bool qsa_one_part() const override { return true; }
+    bool qsa_host_ok() const override { return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override { need256(hd, name()); return size_t(c) * kvh * sizeof(Turbo4K256); }
     size_t value_bytes(int64_t c, int kvh, int hd) const override { need256(hd, name()); return size_t(c) * kvh * sizeof(Turbo3V256); }
     void write_and_attend(const KvStep & a) const override {
@@ -54,6 +64,11 @@ struct KvT4kTurbo3V final : KvFormat {
         auto * v3 = static_cast<Turbo3V256 *>(a.vc);
         tqllm_cuda::cache_write_multi_t4k_turbo3v(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, k4, v3, a.dpos, a.kvheads,
                                                   a.head_dim, a.stream);
+        if (a.qsa_sel && a.n <= a.nver) {
+            tqllm_cuda::attention_ctv_qsa(1, a.q, k4, v3, nullptr, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.split,
+                                          a.stream, a.qsa_sel, a.qsa_from, a.qsa_mixed);
+            return;
+        }
         for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {
             const size_t qoff = size_t(off) * a.heads * a.head_dim;
             tqllm_cuda::attention_mq256_t4k_turbo3v(a.q + qoff, k4, v3, a.o + qoff, a.part, a.dpos + 1, std::min(c, a.n - off),
@@ -70,6 +85,9 @@ struct KvT4kv final : KvFormat {
                 "TurboQuant+ record layouts (TheTom/turboquant_plus, Apache-2.0)", "Apache-2.0", "see NOTICE"};
     }
     int split_factor() const override { return 2; }
+    bool qsa_ok() const override { return true; }
+    bool qsa_one_part() const override { return true; }
+    bool qsa_host_ok() const override { return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override { need256(hd, name()); return size_t(c) * kvh * sizeof(Turbo4K256); }
     size_t value_bytes(int64_t c, int kvh, int hd) const override { return key_bytes(c, kvh, hd); }
     void write_and_attend(const KvStep & a) const override {
@@ -80,6 +98,11 @@ struct KvT4kv final : KvFormat {
             const int ns = std::max(1, a.split * a.kvheads / (a.kvheads * ((a.n + 7) / 8)));
             tqllm_cuda::attention_mq256_t4kv_prefill(a.q, k4, v4, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale,
                                                      ns, a.stream);
+            return;
+        }
+        if (a.qsa_sel) {
+            tqllm_cuda::attention_ctv_qsa(2, a.q, k4, v4, nullptr, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.split,
+                                          a.stream, a.qsa_sel, a.qsa_from, a.qsa_mixed);
             return;
         }
         for (int off = 0, c = ctv_chunk(a.heads, a.kvheads); off < a.n; off += c) {

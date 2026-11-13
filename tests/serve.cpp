@@ -329,7 +329,51 @@ void test_sampling_numbers() {
     check(c.ok && c.top_k == 0 && c.seed == 0, "nullable optional sampling fields");
 }
 
+// next_prompt_prefix: what the server expects the next request to begin with equals what a client then sends, for the
+// ways a reply comes back (content alone, with reasoning, cut inside its reasoning, a tool call, odd whitespace)
+void test_next_prompt_prefix() {
+    auto request = [](const std::string & body) { return tqserve::parse_request(body, 512, "", true, true); };
+    auto begins = [&](const std::string & what, const std::string & first, const tqserve::DecodeResult & reply, bool with_reasoning,
+                      const std::string & next) {
+        const auto prefix = tqserve::next_prompt_prefix(first, reply, with_reasoning, 512, "", true);
+        const auto r = request(next);
+        check(r.ok, what + ": the next request parses: " + r.error);
+        check(!prefix.empty() && prefix.size() > request(first).prompt_text.size() - 40, what + ": a prefix past the first prompt's history");
+        check(r.prompt_text.compare(0, prefix.size(), prefix) == 0, what + ": the next prompt begins with the predicted prefix");
+        check(prefix.size() >= 11 && prefix.compare(prefix.size() - 11, 11, "<|im_end|>\n") == 0, what + ": the prefix ends with the reply's message");
+        check(r.prompt_text.compare(prefix.size(), 12, "<|im_start|>") == 0, what + ": the next message starts right after it");
+    };
+    const std::string first = R"({"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Capital of France?"}]})";
+    const std::string head = R"({"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Capital of France?"},)";
+    tqserve::DecodeResult reply;
+    reply.text = "Paris."; reply.reasoning = "The user asks for a capital.";
+    begins("content alone", first, reply, false, head + R"({"role":"assistant","content":"Paris."},{"role":"user","content":"And Spain?"}]})");
+    begins("with reasoning", first, reply, true,
+           head + R"({"role":"assistant","content":"Paris.","reasoning_content":"The user asks for a capital."},{"role":"user","content":"And Spain?"}]})");
+    check(tqserve::next_prompt_prefix(first, reply, false, 512, "", true) != tqserve::next_prompt_prefix(first, reply, true, 512, "", true),
+          "returned reasoning changes the prefix");
+    check(!tqserve::returns_reasoning(first) &&
+          tqserve::returns_reasoning(head + R"({"role":"assistant","content":"Paris.","reasoning_content":"x"},{"role":"user","content":"y"}]})") &&
+          !tqserve::returns_reasoning(head + R"({"role":"assistant","content":"Paris."},{"role":"user","content":"y"}]})"),
+          "a client that returns reasoning is seen from its request");
+    tqserve::DecodeResult cut;  // the token limit fell inside the reasoning: no content
+    cut.reasoning = "Still thinking";
+    begins("cut inside the reasoning", first, cut, false, head + R"({"role":"assistant","content":""},{"role":"user","content":"Go on."}]})");
+    tqserve::DecodeResult spaced;
+    spaced.text = "\n  Paris.  \n\n";
+    begins("whitespace kept as sent", first, spaced, false,
+           head + R"({"role":"assistant","content":"\n  Paris.  \n\n"},{"role":"user","content":"And Spain?"}]})");
+    const std::string tools = R"(,"tools":[{"type":"function","function":{"name":"lookup","description":"d","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]})";
+    const std::string tfirst = first.substr(0, first.size() - 1) + tools;
+    tqserve::DecodeResult call;
+    call.text = "Let me check."; call.tool_calls.push_back({"lookup", R"({"q":"France"})"});
+    begins("tool call", tfirst, call, false,
+           head + R"({"role":"assistant","content":"Let me check.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"France\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"Paris"}])" + tools);
+    check(tqserve::next_prompt_prefix(R"({"prompt":"raw text"})", reply, false, 512, "", true).empty(), "a completion request has no next prefix");
+}
+
 int main(int argc, char ** argv) {
+    test_next_prompt_prefix();
     {  // requests without sampling fields take the server defaults (--temperature / --top-p / --top-k); explicit values win
         const auto body = std::string(R"({"messages":[{"role":"user","content":"hi"}]})");
         const auto greedy = tqserve::parse_request(body, 64, "", true);

@@ -28,6 +28,7 @@ struct MemRun {
     int kv_host_keep = 32768;
     size_t sequences = 1;        // --np
     bool small_card = false;     // under 16 GB free with the CPU expert pool
+    int pool_rows = 0;           // the decode CPU pool's row budget (0: no pool): decode_rules.hpp cpu_pool_rows
     bool caching = false;        // --prompt-cache: every slot keeps its full context
     int manifest_drafts = 3;
 };
@@ -84,8 +85,8 @@ struct SlotPlan {
 
 // slots=auto: free = device memory free with no bank, extra = what rebuilding the banks took beyond the slots (measured
 // by the engine's rounds), slot_bytes = one slot in every layer. Drafts: one sequence drafts adaptively (up to 5, or 7
-// when every expert is resident), small cards keep the CPU pool's block; several sequences keep the manifest's count
-// (batch_drafts trims them per step).
+// when every expert is resident), a CPU pool's row budget caps the block (4 rows: 3 drafts, and the verify floor follows);
+// several sequences keep the manifest's count (batch_drafts trims them per step).
 inline SlotPlan auto_slot_plan(const MemShape & s, const MemRun & r, size_t free, size_t slot_bytes, size_t measured_state,
                                size_t extra = 0) {
     SlotPlan p;
@@ -95,8 +96,8 @@ inline SlotPlan auto_slot_plan(const MemShape & s, const MemRun & r, size_t free
     p.slots = tqllm::auto_expert_slots(free, p.keep, slot_bytes, s.experts);
     p.drafts = r.manifest_drafts;
     if (r.sequences == 1) {
-        const DraftPlan d = one_sequence_drafts(r.manifest_drafts, r.small_card, false);
-        p.drafts = auto_slot_drafts(r.manifest_drafts, d.drafts, p.slots, s.experts, r.small_card);
+        const DraftPlan d = one_sequence_drafts(r.manifest_drafts, r.pool_rows, false);
+        p.drafts = auto_slot_drafts(r.manifest_drafts, d.drafts, p.slots, s.experts, r.pool_rows);
         p.adaptive = d.adaptive;
     }
     p.tiers = slot_tiers(r.sequences, false);

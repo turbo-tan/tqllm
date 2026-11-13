@@ -65,7 +65,9 @@ Matrix load_matrix(const GgufFile& file, const std::string& name) {
     auto payload = file.read(tensor);
     return load_matrix(tensor, {reinterpret_cast<const uint8_t*>(payload.data()), payload.size()});
 }
-mx::array linear(const Matrix& weights, const mx::array& input) {
+mx::array linear(const Matrix& weights, const mx::array& in) {
+    // FP16 / BF16 rows (callers written for the matrix-unit kernels, which take them; M1-M4 route those here: #38)
+    const auto input = in.dtype() == mx::float16 || in.dtype() == mx::bfloat16 ? mx::astype(in, mx::float32) : in;
     if (input.ndim() != 2 || input.dtype() != mx::float32 || input.shape(0) <= 0)
         throw std::invalid_argument("linear input must be a nonempty FP32 matrix");
     return std::visit([&](const auto& w) -> mx::array {
@@ -83,6 +85,11 @@ mx::array linear(const Matrix& weights, const mx::array& input) {
             return q6_matmul(w, input);
         } else if constexpr (std::is_same_v<T, KQuantWeights>) {
             return kquant_matmul(w, input);
+        } else if constexpr (std::is_same_v<T, AffineWeights>) {
+            if (w.blocks.ndim() != 2 || w.blocks.shape(1) * 32 / w.bits != input.shape(1))
+                throw std::invalid_argument("incompatible affine linear dimensions");
+            return mx::astype(mx::quantized_matmul(mx::astype(w.rotated ? tq4_rotate(input) : input, mx::float16), w.blocks, w.scales, w.biases, true, w.group,
+                                                   w.bits, "affine"), mx::float32);
         } else {
             return q8_matmul(w, input);
         }

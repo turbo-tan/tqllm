@@ -20,6 +20,14 @@
 #include <string>
 #include <vector>
 
+#include <signal.h>
+#include <sys/prctl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char ** environ;
+
 using namespace tqllm;
 
 namespace {
@@ -27,20 +35,68 @@ uint32_t g = 777u;
 uint32_t lcg() { g = g * 1664525u + 1013904223u; return g; }
 float rnd() { return (float(int32_t(lcg() >> 8)) / float(1 << 23)) * 0.5f; }
 bool ok = true;
+// The checks run while a second process keeps the GPU busy (--gpu-load below): the GPU then time-slices between the two
+// contexts and the order in which this process's streams run is no longer the launch order. That is how ctest -j or any
+// other GPU user reorders things; the test's own uploads must therefore be ordered before stream `s` reads them (this
+// build uses per-thread default streams, so a helper's cudaMemcpy runs on the calling thread's stream, not on `s`).
+__global__ void load_kernel(float * out, int iters) {
+    float a = threadIdx.x * 1e-3f, b = 1.0001f;
+    for (int i = 0; i < iters; ++i) a = fmaf(a, b, 1e-7f);
+    out[blockIdx.x * blockDim.x + threadIdx.x] = a;
+}
+int gpu_load(double seconds) {
+    float * out; if (cudaMalloc(&out, size_t(1024) * 1024 * 4) != cudaSuccess) return 1;
+    prctl(PR_SET_PDEATHSIG, SIGKILL);  // never outlive the test, whatever way it exits
+    const pid_t parent = getppid();
+    for (const auto t0 = clock(); double(clock() - t0) / CLOCKS_PER_SEC < seconds && getppid() == parent;) {
+        for (int k = 0; k < 4; ++k) load_kernel<<<1024, 1024>>>(out, 200000);  // a queue of long kernels, as a GEMM loop
+        if (cudaDeviceSynchronize() != cudaSuccess) return 1;
+    }
+    return 0;
+}
 void check(bool c, const std::string & what) { if (!c) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); ok = false; } }
-void ck(cudaError_t e) { if (e != cudaSuccess) { std::fprintf(stderr, "cuda: %s\n", cudaGetErrorString(e)); std::exit(2); } }
-template <class T> T * up(const std::vector<T> & h) { T * d; ck(cudaMalloc(&d, h.size() * sizeof(T))); ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice)); return d; }
+pid_t g_load = 0;
+void ck(cudaError_t e) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "cuda: %s\n", cudaGetErrorString(e));
+        if (g_load > 0) kill(g_load, SIGKILL);
+        std::exit(2);
+    }
+}
+// Uploads run on the calling thread's default stream (this build: per-thread default streams), as every helper copy does.
+// A spin kernel goes first there: the copy lands late, as it does when another process holds the GPU, so a reader on
+// `s` that were not ordered after the upload would read the poisoned allocation on every run (c2f30376: illegal memory
+// access in xw_moe_build_dedup). The helper therefore waits for its stream before returning.
+__global__ void spin_kernel(long long cycles) { const long long t0 = clock64(); while (clock64() - t0 < cycles) {} }
+void late_copy(void * d, const void * h, size_t b) {
+    spin_kernel<<<1, 1, 0, cudaStreamPerThread>>>(4000000LL);
+    ck(cudaGetLastError());
+    ck(cudaMemcpyAsync(d, h, b, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ck(cudaStreamSynchronize(cudaStreamPerThread));  // the data is on the device before any stream reads it
+}
+template <class T> T * up(const std::vector<T> & h) { T * d; ck(cudaMalloc(&d, h.size() * sizeof(T))); ck(cudaMemset(d, 0xFF, h.size() * sizeof(T))); late_copy(d, h.data(), h.size() * sizeof(T)); return d; }
 template <class T> std::vector<T> down(const T * d, size_t n) { std::vector<T> h(n); ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost)); return h; }
 }  // namespace
 
-int main() try {
+int main(int argc, char ** argv) try {
+    if (argc > 1 && std::string(argv[1]) == "--gpu-load") return gpu_load(argc > 2 ? std::atof(argv[2]) : 120.0);
+    pid_t load = 0;
+    {
+        char arg0[] = "--gpu-load";
+        char * child[] = {argv[0], arg0, nullptr};
+        if (posix_spawn(&load, "/proc/self/exe", nullptr, nullptr, child, environ) != 0) load = 0;
+        else usleep(1500 * 1000);  // let it reach the GPU first
+    }
+    g_load = load;
+    struct StopLoad { pid_t p; ~StopLoad() { if (p > 0) { kill(p, SIGTERM); waitpid(p, nullptr, 0); } } } stop_load{load};
+    std::printf("x3_moe: %s\n", load > 0 ? "a second process keeps the GPU busy" : "no GPU load process (spawn failed)");
     const int E = 6, topk = 2;
     const int K[E] = {2, 3, 2, 2, 3, 2};
     const WeightFormat * wf = weight_format(GGML_X3);
     check(wf && wf->has_expert_matvec(), "x3 format with expert matvec");
     cudaStream_t s; ck(cudaStreamCreate(&s));
 
-    auto upload = [](const void * h, size_t b) -> const void * { void * d; ck(cudaMalloc(&d, b)); ck(cudaMemcpy(d, h, b, cudaMemcpyHostToDevice)); return d; };
+    auto upload = [](const void * h, size_t b) -> const void * { void * d; ck(cudaMalloc(&d, b)); late_copy(d, h, b); return d; };
 
     auto run_bank = [&](int rows, int cols) {
         auto build_raw = [&]() {
@@ -74,7 +130,7 @@ int main() try {
             __half * dx = up(x); int * di = up(ids);
             __nv_bfloat16 * dy; ck(cudaMalloc(&dy, size_t(N) * topk * rows * 2));
             // poison: the verify path writes y [assignment][rows] from the out launch itself, so every row must be set
-            ck(cudaMemset(dy, 0xA5, size_t(N) * topk * rows * 2));
+            ck(cudaMemsetAsync(dy, 0xA5, size_t(N) * topk * rows * 2, s));  // on s: ordered before the writes it poisons
             wf->expert_matvec(m, dx, dy, rows, di, N, topk, per_slot != 0, s); ck(cudaStreamSynchronize(s));
             const auto y = down(dy, size_t(N) * topk * rows);
             double err = 0, ref2 = 0;
@@ -178,7 +234,7 @@ int main() try {
                 __half * dx = up(x); int * di = up(wid);
                 __nv_bfloat16 * dy, * dy1;
                 ck(cudaMalloc(&dy, size_t(NW) * topk * rows * 2));
-                ck(cudaMemset(dy, 0xA5, size_t(NW) * topk * rows * 2));   // every assignment row must be written
+                ck(cudaMemsetAsync(dy, 0xA5, size_t(NW) * topk * rows * 2, s));   // every assignment row must be written
                 ck(cudaMalloc(&dy1, size_t(topk) * rows * 2));
                 wf->expert_matvec(m, dx, dy, rows, di, NW, topk, per_slot != 0, s);
                 int same = 0;
@@ -209,8 +265,8 @@ int main() try {
                 __half * dx = up(x); int * di = up(pid);
                 const size_t el = size_t(n) * topk * rows;
                 __nv_bfloat16 * p1, * p2;
-                ck(cudaMalloc(&p1, 2 * el * 2)); ck(cudaMemset(p1, 0xA5, 2 * el * 2));
-                ck(cudaMalloc(&p2, 2 * el * 2)); ck(cudaMemset(p2, 0xA5, 2 * el * 2));
+                ck(cudaMalloc(&p1, 2 * el * 2)); ck(cudaMemsetAsync(p1, 0xA5, 2 * el * 2, s));
+                ck(cudaMalloc(&p2, 2 * el * 2)); ck(cudaMemsetAsync(p2, 0xA5, 2 * el * 2, s));
                 bool paired = true;
                 try { wf->expert_matvec2(m, m2, dx, p1, p1 + el, rows, di, n, topk, s); }
                 catch (const std::exception & e) { paired = false; std::printf("x3_moe paired n=%d refused: %s\n", n, e.what()); }
@@ -223,6 +279,40 @@ int main() try {
                 std::printf("x3_moe paired n=%d: one pass == two calls, bit for bit\n", n);
                 cudaFree(dx); cudaFree(di); cudaFree(p1); cudaFree(p2);
             }
+        }
+        {   // two streams at once: the engine API takes a stream, so expert_matvec2 on stream s and on another stream may run
+            // concurrently (the shared routed-expert scratch must not let one call read the other's part lists). Rounds
+            // with jittered spins in front of each call, every output bit-identical to the same call alone.
+            const Mat m2 = wf->load(build_raw(), rows * E, cols, upload, s), m3 = wf->load(build_raw(), rows * E, cols, upload, s);
+            cudaStream_t s2; ck(cudaStreamCreate(&s2));
+            for (int n : {1, 12}) {
+                std::vector<int> ia(size_t(n) * topk), ib(ia.size());
+                for (size_t a = 0; a < ia.size(); ++a) { ia[a] = int((a * 5 + 1) % E); ib[a] = int((a * 3 + 2) % E); }
+                std::vector<__half> x(size_t(n) * cols);
+                for (auto & v : x) v = __float2half(rnd());
+                __half * dx = up(x); int * da = up(ia), * db = up(ib);
+                const size_t el = size_t(n) * topk * rows;
+                __nv_bfloat16 * ya, * yb;
+                ck(cudaMalloc(&ya, 2 * el * 2)); ck(cudaMalloc(&yb, 2 * el * 2));
+                wf->expert_matvec2(m, m2, dx, ya, ya + el, rows, da, n, topk, s);
+                wf->expert_matvec2(m3, m, dx, yb, yb + el, rows, db, n, topk, s);
+                ck(cudaStreamSynchronize(s));
+                const auto ra = down(ya, 2 * el), rb = down(yb, 2 * el);
+                int bad = 0;
+                for (int round = 0; round < 200; ++round) {
+                    ck(cudaMemsetAsync(ya, 0xA5, 2 * el * 2, s)); ck(cudaMemsetAsync(yb, 0xA5, 2 * el * 2, s2));
+                    spin_kernel<<<1, 1, 0, s>>>(static_cast<long long>(lcg() % 300000)); spin_kernel<<<1, 1, 0, s2>>>(static_cast<long long>(lcg() % 300000));
+                    wf->expert_matvec2(m, m2, dx, ya, ya + el, rows, da, n, topk, s);
+                    wf->expert_matvec2(m3, m, dx, yb, yb + el, rows, db, n, topk, s2);
+                    ck(cudaStreamSynchronize(s)); ck(cudaStreamSynchronize(s2));
+                    const auto oa = down(ya, 2 * el), ob = down(yb, 2 * el);
+                    bad += std::memcmp(oa.data(), ra.data(), oa.size() * 2) != 0 || std::memcmp(ob.data(), rb.data(), ob.size() * 2) != 0;
+                }
+                std::printf("x3_moe two streams n=%d: %d of 200 rounds differ from the calls alone\n", n, bad);
+                check(bad == 0, "expert_matvec2 on two streams at once == each call alone");
+                cudaFree(dx); cudaFree(da); cudaFree(db); cudaFree(ya); cudaFree(yb);
+            }
+            ck(cudaStreamDestroy(s2));
         }
         cudaFree(wd);
     };

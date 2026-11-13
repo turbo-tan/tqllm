@@ -48,6 +48,8 @@ Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v
 | `--hot-map FILE` | none | MiniMax: routing counts; the busiest experts are preloaded, the rest stay on disk |
 | `--plugin PATH` | none | load a weight-format plugin (repeatable, CUDA builds): new GGUF types or kernel patches; each must pass the format contract at load ([plugins](../guides/plugins.md)) |
 | `--tp-rank R --tp-peer IP [--tp-port P]` | single box, port 29600 | MiniMax over two linked boxes (rank 0 serves; rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
+| `--split layer [--split-at N]` | off; half the layers per GPU | one model over two GPUs, one `tqserve` per GPU (`--tp-rank 0` serves, `--tp-rank 1 --tp-peer ADDR` follows); same output as one GPU; `--split-at N` puts layers N and up on rank 1. Dense Qwen3.5 / 3.6 / 3.8 GGUFs; see docs/guides/multi-gpu.md |
+| `--split experts` | off | Flash-Next (`.tqfn`, every expert resident) over two linked boxes: `--tp-rank 0` and `--tp-rank 1 --tp-peer ADDR` both serve users (e.g. behind `--peer`); while rank 1 has no request of its own it computes the experts e % 2 == 1 of rank 0's decode steps (NCCL; build with `-DTQLLM_NCCL_DIR`). Same output as one box |
 | `--yarn-orig-ctx N` `--yarn-ext-factor F` `--yarn-attn-factor F` `--yarn-beta-fast F` `--yarn-beta-slow F` | model metadata | YaRN context extension, llama.cpp meanings (with `--rope-scaling yarn`) |
 | Flash-Next prefill: `--prefill-chunk N` `--prefill-sub N` `--prefill-stage N` | 16384, 2048, 192 | rows per prefill chunk, per sub-batch, and per expert stage |
 | Flash-Next: `--prefill-reserve-mb N` `--prefill-arena-mb N` `--dense-cache-mb N` | 1000, 3800, 600 | GPU memory kept free during prefill, the prefill arena, the dense-weight cache |
@@ -74,11 +76,25 @@ prints one `WARN --exact on with ...` line per option, runs the asked option, an
 | Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs `--exact on` at 32K-128K) | BF16 KV while it fits; when memory forces int8 KV (one `WARN`), the int8-query attention, whose rows equal their single-row calls bit for bit, so greedy spec output still equals plain decoding |
 | MiniMax, GLM | (their only path) | no exact path yet: they run their approximate path with a WARN |
 
-QSA sparse attention (Metal, Qwen3.8 27B): a model file that carries QSA indexers (the 16 of higa2515/Qwen3.8-27B-QSA-BF16,
-added with `tools/qsa_indexer_gguf.py` + `tools/gguf_add.py`) makes each decode step past `--qsa-from N` keys (default
-the file's `qsa.sparse_from`, else 49152) attend the 2,048 keys its indexer picks plus the recent keys, instead of the whole
-cache. `--qsa-from off` keeps every step dense. QSA changes the text, but under `--exact on` spec output still equals the
-same file's plain decoding. Files without indexers ignore the option.
+QSA sparse attention (Qwen3.8 27B, Metal and CUDA): a model file that carries QSA indexers (the 16 of
+higa2515/Qwen3.8-27B-QSA-BF16, added with `tools/qsa_indexer_gguf.py` + `tools/gguf_add.py`) can make each decode step
+past `--qsa-from N` keys attend the 2,048 keys its indexer picks plus the recent keys, instead of the whole cache.
+On Metal it is on for such files (default N: the file's `qsa.sparse_from`, else 49152; `--qsa-from off` keeps every step
+dense). On CUDA it is an approximate path and therefore off unless `--qsa-from N` is given (for example 49152); it needs
+one slot (`--np 1`) and a KV format with QSA rows (bf16, tq3, q8, q4 and the tcq codecs, any K/V pair of them, all on
+the GPU); with more slots, the turbo KV formats, a staged host KV tail, `--kv-compact` or `--split layer` attention
+stays dense and the start-up log says why. QSA changes the text, but spec output still equals
+the same file's plain decoding. Files without indexers ignore the option. Prefill is dense on both backends.
+Measured on an RTX 3090 with QSA on (Qwen3.8-27B-TQ_L-QSA, `--context 140000`, native MTP drafts, source-code prompts): decode 51 tok/s
+at 63K / 79K / 93K prompt tokens against 40-42 / 39 / 39 dense (BF16 KV, all on the GPU). At 128K the BF16 cache no
+longer fits: QSA 44 with a host KV tail, against 12 for dense BF16 with the same host spill and 37 for dense with a
+compact KV (q4/tcq2) that fits; a passphrase at 10 / 50 / 90 % of 63K / 93K / 128K prompts is recalled 9 of 9 times, as with dense
+attention. The indexers are a pilot (trained at 16K): teacher forced against dense attention on the same file, the top
+token agrees at 86 % / 90 % / 98 % of the last 2,048 positions of 66K / 96K / 120K chunks (mean KLD 0.73 / 0.87 / 0.05,
+median 0.018 / 0.002 / 0.0004; perplexity +5 % / +17 % / +2 %), which is why CUDA keeps it opt-in; with `--exact on` the
+start-up log carries one WARN when it is on.
+The indexer state takes about 0.4 GB of device memory at a 140K context: on a 24 GB card that moves 4,096 more KV
+positions to host memory, and time to first token at 128K rises from 134 s to 161 s (shorter prompts: unchanged).
 
 ### Reasoning and chat template
 
@@ -111,7 +127,8 @@ same file's plain decoding. Files without indexers ignore the option.
 | `--kv-host N` | memory fit | KV positions kept in system RAM (exact); by default the fit moves only what does not fit on the GPU |
 | `--kv-stage on\|off` | on | stream the RAM part back to the GPU layer by layer while decoding |
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
-| `--prompt-cache on\|off` | off | keep the previous turn's KV so a follow-up does not re-read the document (one slot; on with `--kv-compact`) |
+| `--prompt-cache on\|off` | off | each slot keeps its conversation's KV so a follow-up does not re-read the document; replies are the same as with it off (on with `--kv-compact`). Mac (Metal): a follow-up turn resumes where the previous prompt ended even when the client drops the reasoning, and the server prefills the returned answer while idle, so a follow-up starts in about 0.3-0.4 s at 24-34K tokens; the kept conversation holds about 3-5 GB (34-51K tokens). Replies equal a cold prefill of the same prompt with the cache on; they can differ in the last digits from runs with it off (other prefill chunks). Off: the prompt is prefilled as one stream (faster for a chat that arrives with a long history of short messages) |
+| `--prompt-park N` | from memory (a quarter of RAM on unified memory, up to 16 GB otherwise) | with `--prompt-cache on` and several slots: up to N conversations' kept states wait in host memory when their slot serves someone else, so their next turn still resumes; 0 = off |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |
 
@@ -126,7 +143,7 @@ same file's plain decoding. Files without indexers ignore the option.
 | `--gemm-rows N` | 0 (fit) | prefill FP16 weight blocks of N rows (less VRAM); the memory fit picks 2048 when needed and says so |
 | `--mtp` | off | draft with the model's own MTP (nextn) head instead of `-md` (text-only, greedy, `--np 1`; default depth 4, `--draft-max N`) |
 | `--draft-retrieve N` | 0 (off) | with `-md`: N far chunks of 16 positions in the drafter window; long prompts get faster (32: +8-12 % at 31K-51K on a 3090) but the drafter keeps K/V for the whole context (~20 KB / token: 1.25 GiB at 64K, 3.9 GiB at 200K), so turn it on when memory allows |
-| `--slot-reserve MiB` | 128 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
+| `--slot-reserve MiB` | 128 with a drafter (`-md`, `--mtp`), else 32 | free memory per parallel slot after loading; an `--np` that does not fit is refused at startup with the largest that does |
 | `--graph-cache N` | 256 | captured CUDA graphs kept (~12 MB each); least recently used are evicted, also when free memory runs low |
 | `--graph-keep-mb MiB` | 384 (0 under WSL) | a graph miss also evicts while less than this is free on the device; lower it when the card is full by design (e.g. a drafter plus a long KV pool) so the cache keeps its graphs instead of re-capturing every step |
 | `-ub N` | automatic | prefill chunk (ubatch) size |

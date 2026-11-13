@@ -114,6 +114,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "on" && v != "off") throw std::invalid_argument("--prompt-cache must be on or off");
         o.prompt_cache = v == "on";
     }
+    else if (a == "--prompt-park") o.prompt_park = std::stoi(value());
     else if (a == "--rope-scaling") o.rope.type = value();
     else if (a == "--rope-scale") o.rope.factor = std::stof(value());
     else if (a == "--yarn-orig-ctx") o.rope.orig_ctx = std::stol(value());
@@ -124,6 +125,13 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "-md" || a == "--model-draft") o.draft_model = value();
     else if (a == "--tp-rank") o.tp_rank = std::stoi(value()), o.tp_world = 2;
     else if (a == "--tp-peer") o.tp_peer = value();
+    else if (a == "--split") {
+        const std::string v = value();
+        if (v == "layer") o.split_layers = true;
+        else if (v == "experts") o.split_experts = true;
+        else throw std::invalid_argument("--split: layer or experts");
+    }
+    else if (a == "--split-at") o.split_at = std::stoi(value());
     else if (a == "--tp-port") o.tp_port = std::stoi(value());
     else if (a == "--plugin") o.plugins.push_back(value());
     else if (a == "--hot-map") o.hot_map = value();
@@ -160,7 +168,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 
 const char * engine_options_usage() {
     return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
-           "          [--qsa-from N|off (QSA models: sparse attention past N keys; default the file's, else 49152)]\n"
+           "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"

@@ -168,7 +168,7 @@ __device__ __forceinline__ uint32_t nvf4_codes(uint32_t c) {
 // TQFN_TILED expert banks: the code bytes of 16-row x 4-block tiles are stored lane-contiguous (row-in-tile major, then
 // block-in-quad), so the 32 lanes of a warp load one contiguous run instead of 8 strided row pieces. Same bytes, same math.
 __constant__ int c_tiled_experts = 0;
-__host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
+__host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 || f == 16 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
 __device__ __forceinline__ int64_t u4h_block_off(int r, int s, int nb, int bpb, bool tiled) {
     if (!tiled) return (int64_t(r) * nb + s) * bpb;
     return (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
@@ -189,8 +189,8 @@ struct U4hTile {
         if (ok) {
             const bool tl = GROUPED && tiled_bpb(FMT) && c_tiled_experts;
             if constexpr (FMT == 16) {  // NVF4: 16 B natural nibbles per 32 weights; aux row = k / 16 E4M3 scales, then the F32 global
-                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(ra) * nb + s) * 16));
-                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(rb) * nb + s) * 16));
+                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(ra, s, nb, 16, tl)));
+                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(rb, s, nb, 16, tl)));
                 const auto * ab = reinterpret_cast<const uint8_t *>(sm);
                 const int64_t rs = k / 16 + 4;
                 const uint8_t * pa = ab + int64_t(ra) * rs, * pb = ab + int64_t(rb) * rs;

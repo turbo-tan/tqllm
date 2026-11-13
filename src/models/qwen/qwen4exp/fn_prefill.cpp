@@ -82,7 +82,8 @@ void DecodeModel::release_prefill() {
 
 void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * ple_rows, MixedExpertCache & cache, AttentionState * att_override,
                                 __nv_bfloat16 * wide_b) {
-    const int sub = std::max(16, cp.rt.sub_req > 0 ? std::min(cp.run.tune.sub, cp.rt.sub_req) : cp.run.tune.sub), stage_k = std::max(1, cp.run.tune.stage);
+    const int sub = std::max(16, cp.rt.sub_req > 0 ? std::min(cp.run.tune.sub, cp.rt.sub_req) : cp.run.tune.sub),
+              stage_k = std::max(1, cp.rt.prefill_stage > 0 ? cp.rt.prefill_stage : cp.run.tune.stage);
     const int K = c.topk, A = n * K, E = c.experts, ff = c.expert_ff;
     auto & st = stage();
     if (!st.copy || st.K != stage_k) {  // staging banks sized for the largest expert block of any layer

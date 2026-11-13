@@ -2,13 +2,37 @@
 // Flash-Next decode decisions that change exactness or memory, as pure functions (no CUDA) so tests/decode_rules.cpp can
 // check them on any machine.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <cstdlib>
 #include <cstddef>
 #include <vector>
 #include <string>
 
 namespace tqllm::flashnext {
+
+// Decode graphs belong to one DecodeModel (a request's sequence): each model gets a fresh owner id, and its graphs are keyed
+// by it and released when the model ends. Keyed by the model's address, a model built where a finished one had lived
+// inherited its warm-up calls (its first call captured instead of running plain) and its graph execs, and every finished
+// model's execs stayed (G2, the 12 GB np 4 fault hunt).
+inline uint64_t next_graph_owner() { static std::atomic<uint64_t> n{0}; return ++n; }
+// calls 1-2 of each (owner, layer, rows) run plain, later ones are captured; a plain call (a failed capture) starts over
+class GraphWarmup {
+    std::map<std::tuple<uint64_t, int, int>, int> calls_;
+public:
+    bool capture(uint64_t owner, int layer, int n, bool plain) {
+        int & c = calls_[{owner, layer, n}];
+        if (plain) c = 0;
+        return ++c > 2;
+    }
+    void forget(uint64_t owner) {
+        for (auto it = calls_.lower_bound({owner, -(1 << 30), -(1 << 30)}); it != calls_.end() && std::get<0>(it->first) == owner;) it = calls_.erase(it);
+    }
+    void clear() { calls_.clear(); }
+    size_t size() const { return calls_.size(); }
+};
 
 // Expert path of one trunk layer call: true = waves (several prepares, grouped per wave), false = one split prepare.
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
@@ -70,8 +94,12 @@ inline std::vector<int> lift_layer_floor(std::vector<int> caps, int min_slots, i
 // no layer may take the waves path, or the text differs from np 1). -1: not even one
 // token per slot fits, the slots step one at a time. With the full drafts only, np 8 on a 3090 (51 slots / layer)
 // stepped one slot at a time for 259 of 260 steps: 27 tok/s together against 84-100 at np 1 (11-03).
+// 4+ sequences verify at most 2 drafts each: GB10 np 8, 8 users, 11-11 (one box, both Flash-Next files, texts = np 1):
+// 2 drafts 119 / 124-128 tok/s vs 3 drafts 111-114 / 123-127, 4 drafts 85-94 / 111-113; at 4 users 2 and 3 were level
+constexpr int kManyDraftCap = 2, kManyActive = 4;
 inline int batch_drafts(int active, int drafts, int topk, int slots, int experts, int max_rows = 64) {
     if (active < 2) return drafts;
+    if (active >= kManyActive) drafts = std::min(drafts, kManyDraftCap);
     for (int d = std::max(drafts, 0); d >= 0; --d) {
         const int rows = active * (d + 1);
         if (rows <= max_rows && (slots >= experts || rows * topk <= slots)) return d;
@@ -86,6 +114,45 @@ inline size_t auto_keep_bytes(size_t sequences, size_t state, size_t reserve) {
 // The fewest slots a bank keeps: every distinct expert of the largest verify block (drafts + 1 rows of topk), rounded up
 // to 8 (5 drafts x top-10: 64; a small card's 3 drafts: 40), so layer_takes_waves keeps the split path at every bank size.
 inline int verify_slot_min(int drafts, int topk) { return ((std::max(drafts, 0) + 1) * topk + 7) / 8 * 8; }
+// --split experts: result rows per layer exchanged for a forward of `assignments` (rows x topk). About half the assignments
+// route to the other rank (stage 0: p50 ~0.5, max ~0.66); 5/8 of them fits nearly every layer, and the rest are computed
+// locally (both ranks keep every expert), so the exchange has one fixed size per row count, known on both hosts.
+// --split experts, rank 0: the forward being exchanged with rank 1. Each forward is announced at layer 0 and rank 1
+// accepts (it then runs exactly `layers` exchanges) or declines (busy with its own users: every layer runs locally). A
+// forward that cannot finish its accepted exchanges leaves rank 1 out of step, so expert parallelism then stays off for the
+// process (off) and every layer runs locally (every expert resident: same output).
+struct EpForwardState { bool open = false, accepted = false, off = false; int next = 0, n = 0; };
+enum class EpCall { Local, Exchange, Fail };
+// Before a trunk layer (can = this layer may exchange: full bank, kernels for the split; alive = rank 1 is there).
+// announce(n) sends layer 0's header and returns rank 1's answer; a plain re-run of a layer 0 whose capture failed is
+// not announced again. Fail: an accepted forward lost its exchanges (the request fails).
+template<class Announce>
+inline EpCall ep_before_layer(EpForwardState & s, int layer, int n, bool can, bool alive, Announce && announce) {
+    if (s.off) return EpCall::Local;
+    if (!alive) {
+        const bool fail = s.open && s.accepted && layer == s.next;
+        s = {}; s.off = true; return fail ? EpCall::Fail : EpCall::Local;
+    }
+    if (layer == 0) {
+        if (s.open && s.next == 0 && s.n == n) return s.accepted ? EpCall::Exchange : EpCall::Local;  // the re-run of layer 0
+        if (s.open && s.accepted) { s = {}; s.off = true; return EpCall::Local; }  // an accepted forward was left open
+        s = {};
+        if (!can) return EpCall::Local;
+        s.open = true; s.n = n; s.accepted = announce(n);
+        return s.accepted ? EpCall::Exchange : EpCall::Local;
+    }
+    if (!s.open) return EpCall::Local;
+    if (layer != s.next || n != s.n || (s.accepted && !can)) {
+        const bool fail = s.accepted; s = {}; s.off = fail; return fail ? EpCall::Fail : EpCall::Local;
+    }
+    return s.accepted ? EpCall::Exchange : EpCall::Local;
+}
+// After a trunk layer's work (exchanged or local): the open forward moves on; past the last layer it closes
+inline void ep_after_layer(EpForwardState & s, int layer, int layers) {
+    if (!s.open || layer != s.next) return;
+    if (++s.next == layers) { s.open = false; s.accepted = false; s.next = 0; }
+}
+inline int ep_result_cap(int assignments) { return std::min(std::max(assignments, 0), (5 * std::max(assignments, 0) + 7) / 8); }
 
 // A layer's slot floor (tier A) from its target: scaled like the slot total (tier_a of tier_b per layer on average), and
 // never below min_slots (verify_slot_min, F39), so the text does not depend on how much a long prompt took.
@@ -203,24 +270,32 @@ constexpr int kCpuPoolRows = 4;
 // Discrete cards (--exact off, miss-driven pool): any decode block up to batch_drafts' max_rows, so batched np > 1 steps
 // use the pool too (with the small-card limit of 4 rows np 2+ never did: every miss went over PCIe).
 constexpr int kCpuPoolMaxRows = 64;
+// The pool's row budget for a decode layer call, 0 when no pool runs (decode_rules.hpp cpu_miss_threads). The miss-driven
+// pool on a small card keeps the 4-row block it was measured with; a discrete card takes any block (layout only, exact).
+inline int cpu_pool_rows(int pool_threads, bool small_card) { return pool_threads <= 0 ? 0 : (small_card ? kCpuPoolRows : kCpuPoolMaxRows); }
 
 // One sequence's draft count. Without a CPU expert pool: adaptive length, up to 5 drafts (3090 chat +0.6 %, 32K +3 %).
-// With one (small cards): a verify block must fit the pool's rows, or every miss of the step goes over PCIe instead
-// (12 GB 3090: 5 drafts 44.8 / 44.6 tok/s, 3 drafts 49-50).
+// With one (small cards): the verify block must fit the pool's rows, or every miss of the step goes over PCIe instead
+// (12 GB 3090: 5 drafts 44.8 / 44.6 tok/s, 3 drafts 49-50). pool_rows = the pool's row budget (0: no pool).
 // Every expert resident (GB10): a longer block costs no copies, so up to 7 drafts (an 8-row block still runs in the layer
 // graphs); GB10 np 1 at 5 drafts ended 27 of 123 steps with every draft kept.
 struct DraftPlan { int drafts; bool adaptive; };
-inline DraftPlan one_sequence_drafts(int manifest_drafts, bool cpu_pool, bool every_expert_resident = false) {
+inline DraftPlan one_sequence_drafts(int manifest_drafts, int pool_rows, bool every_expert_resident = false) {
     if (manifest_drafts < 1) return {manifest_drafts, false};
-    if (cpu_pool) return {std::min(manifest_drafts, kCpuPoolRows - 1), false};
+    if (pool_rows > 0) return {std::min(manifest_drafts, std::max(pool_rows - 1, 1)), false};
     return {std::max(manifest_drafts, every_expert_resident ? 7 : 5), true};
 }
 // One sequence after slots=auto sized the banks: every expert resident (GB10: 512 of 512) drafts as a pinned slots=512
 // manifest does; the count chosen at load came before the slots were known (GB10 decode 104 instead of 122 tok/s).
-inline int auto_slot_drafts(int manifest_drafts, int chosen, int slots, int experts, bool cpu_pool) {
-    if (cpu_pool || slots < experts) return chosen;
-    return std::max(chosen, one_sequence_drafts(manifest_drafts, false, true).drafts);
+inline int auto_slot_drafts(int manifest_drafts, int chosen, int slots, int experts, int pool_rows) {
+    if (pool_rows > 0 || slots < experts) return chosen;
+    return std::max(chosen, one_sequence_drafts(manifest_drafts, 0, true).drafts);
 }
+// The plan a single sequence's request actually gets: the pool's row limit applies only while the pool serves the misses
+// (cpu_miss_threads: --exact off, or TQFN_CPU_MISS above 0). A 16 GB card that must run exact (107 of 512 experts
+// resident) keeps the adaptive block of one_sequence_drafts (11-11: 1.2K / 8.5K / 25.3K decode 78.6 / 77.0 / 66.6 ->
+// 89.3 / 87.2 / 72.0 tok/s, the same 192 greedy tokens; the pool's 3-draft cap was what held it to 4 rows).
+inline DraftPlan sequence_drafts(int manifest_drafts, bool exact, int env_threads, int cores, bool every_expert_resident = false);
 
 // CPU-owned experts (small cards, F26): a fixed eighth of each layer's experts, a pure function of (layer, expert), runs
 // on the CPU expert pool and is kept out of the GPU banks; every other expert runs on the GPU, resident or not. Which
@@ -241,10 +316,17 @@ inline bool runs_on_cpu(int layer, int expert, bool resident, bool pool_serves_c
 // runs the hits. 5950X, 14 threads: ~0.1 ms per expert (tests/cpu_miss_perf); a 3090 decode layer call ~0.55 ms (np 1,
 // 4-row verify, ~26 ms per step over 48 layers): 4 experts.
 // CPU miss pool threads: TQFN_CPU_MISS (env_threads >= 0) wins; else --exact off runs the pool on every card with
-// min(15, cores / 2 - 1) threads, --exact on runs none
+// min(15, cores / 2 - 1) threads, --exact on runs none (11-12: running the owned set under --exact on a 16 GB card cut the
+// 25.3K decode 72.0 -> 63.6 tok/s, so it stays off; see REPORT.md round 3)
 inline int cpu_miss_threads(int env_threads, bool exact, int cores) {
     if (env_threads >= 0) return env_threads;
     return exact ? 0 : std::max(1, std::min(15, cores / 2 - 1));
+}
+inline DraftPlan sequence_drafts(int manifest_drafts, bool exact, int env_threads, int cores, bool every_expert_resident) {
+    // the 4-row block is the measured rule for one sequence's pool on any card (a 12 GB 3090: 5 drafts 44.8 / 44.6 tok/s,
+    // 3 drafts 49-50); the layer call keeps its own budget (kCpuPoolMaxRows on a discrete card)
+    const int threads = cpu_miss_threads(env_threads, exact, cores);
+    return one_sequence_drafts(manifest_drafts, cpu_pool_rows(threads, true), every_expert_resident);
 }
 // the pool reads missed experts from the pinned packed copy whenever it runs (11-06: the 3090 np 8 --exact off rows fell from
 // 76 / 77 to 68 / 70 tok/s when the pool came from --exact off alone and read the GGUF mapping instead)
@@ -269,6 +351,31 @@ inline int next_cpu_budget(int budget, bool gpu_still_busy, int calls_at_zero, i
     if (!gpu_still_busy) return budget - 1;
     return std::min(max_budget, budget + 1);
 }
+// Staging slices (experts per double-buffered half) for one request on a small card: 64 instead of 128 for a prompt the
+// engine's own chunk already covers. The smaller slices are 325 MB less plan room, and on a one-chunk prompt that room goes
+// to expert banks that then stay resident (fewer experts streamed: 1.2K TTFT 2.22 -> 1.91 s, 8.5K 4.37 -> 4.29 s). A
+// prompt longer than the engine chunk keeps the 128-expert slices: its plan is the measured one, and a smaller plan there
+// lets a bigger QSA block fit, which changes the tokens (the prefill's chunk and block size are not text invariant).
+inline int small_card_stage(bool small_card, bool stage_set, int stage, int prompt_tokens, int engine_chunk, int cap = 64) {
+    if (!small_card || stage_set) return stage;
+    return prompt_tokens <= engine_chunk ? std::min(stage, cap) : std::min(stage, 128);
+}
+// Positions per MTP catch-up piece (one-chunk prompts): the MTP layer's bank holds 64 of 512 experts, so a piece streams the
+// MTP experts it routes to that the bank does not hold (one 1.9 MB expert each), and every piece routes to nearly all of
+// them: the traffic is the MTP expert set once per piece. 1024-position pieces stream it 25 times for a 25K prompt (1.5 s of
+// its TTFT), 4096-position pieces 7 times; the piece's buffers (mtp_prefill's concatenated rows, ~82 KB a position) set the
+// ceiling. The MTP's routing shapes the drafts only, never the emitted tokens (verify is exact), so this is a speed knob.
+inline int mtp_piece_tokens(int tokens, int cap = 4096) { return std::max(1, std::min(tokens, cap)); }
+// Parking the LM heads (pinning a 634 MB copy, ~0.9 s with cudaMallocHost, and the unpark another ~0.2 s) for a prompt longer
+// than the engine chunk is a probe: the room it frees can turn the prompt into one chunk and halve the expert bytes. Worth
+// it only when that room can actually reach the one-chunk plan: at 16 GB a 25.3K prompt that needs 12.4 GB with 11.1 GB
+// free paid 1.1 s of TTFT for a probe that could not succeed (11-12). plan_need = the one-chunk plan's need, room = what
+// the plan sees free, heads = the bytes parking hands back, cached = what a trim of the async pool would add.
+inline bool park_heads_for_one_chunk(size_t plan_need, size_t room, size_t heads, size_t cached) {
+    if (!heads || !plan_need) return true;  // nothing known (a non-resident or composite head): keep the probe
+    return plan_need <= room + heads + cached;
+}
+
 // The experts a layer's bank is built with: the most routed first (ties by id), at most cap, owned experts left out when
 // a CPU pool computes them.
 inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int layer, size_t cap, bool cpu_pool) {
@@ -304,6 +411,15 @@ inline bool warm_at_start(const std::string & tensor, double tensor_bytes, doubl
 // Prefill chunk: the engine's --prefill-chunk setting (default 16384), whether or not the manifest names one; the
 // manifest value counts only when that setting is off. A manifest without chunk= once prefilled in chunks of 8 (32K: 263 s).
 inline int prefill_chunk(int tune_chunk, int manifest_chunk) { return tune_chunk > 0 ? tune_chunk : manifest_chunk; }
+// A small card's prefill chunk (every chunk streams every expert once, so the plan takes the largest that fits): the
+// prompt's own length, rounded up to 1 KiB, never above max_chunk. A prompt shorter than the engine's chunk gets its own
+// length: the experts stream either way, and the 16K chunk's activation and staging buffers (6.5 GB at 1.2K tokens) are
+// only taken from the expert banks, which then have to be refilled after the prompt (11-11: 1.2K TTFT 2.41 -> 2.20 s).
+inline int small_card_chunk(int prompt_tokens, int max_chunk) {
+    if (prompt_tokens <= 0) return 0;
+    const int up = (prompt_tokens + 1023) / 1024 * 1024;
+    return std::min(max_chunk, std::max(up, 1024));
+}
 // Byte cap of the expert banks. slots=auto sizes the banks from free device memory itself, so its cap is the device; a
 // fixed budget_gb (taken from one card) capped a GB10's 512 resident slots at 18 GB and evicted layers mid-prompt.
 inline size_t bank_budget_bytes(bool slots_auto, double budget_gb, size_t device_total) {
