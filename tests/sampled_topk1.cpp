@@ -1,7 +1,8 @@
 // A sampled request at top_k = 1 draws the argmax at every position, so its text must equal the greedy text: DFlash2
 // chain, DFlash2 token tree and native MTP. 1.6.0 broke it from the first token: a chat prompt's last turn is a prefill
 // chunk of its own (a few tokens), and the sampled first token was drawn from that chunk's first position instead of the
-// last prompt position (PR #42). Model test: TQLLM_TEST_MODEL (a qwen35 GGUF) and TQLLM_TEST_DRAFTER (its DFlash2
+// last prompt position (PR #42). Every reply also ends at its first EOS: DFlash2 drafting appended the drafts after an
+// accepted EOS and the bonus token. Model test: TQLLM_TEST_MODEL (a qwen35 GGUF) and TQLLM_TEST_DRAFTER (its DFlash2
 // drafter); TQLLM_TEST_DRAFT_VOCAB is optional; skipped without the model and drafter.
 #include "tqllm/model.hpp"
 #include "tqllm/options.hpp"
@@ -14,6 +15,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// a reply stops at its end-of-sequence token: nothing may follow it
+static bool ends_at_eos(const std::vector<uint32_t> & v, uint32_t eos) {
+    const auto at = std::find(v.begin(), v.end(), eos);
+    return at == v.end() || at + 1 == v.end();
+}
 
 static std::vector<uint32_t> run(tqllm::Model & m, const std::vector<uint32_t> & in, uint32_t count) {
     m.spec_begin(in, count, 7);
@@ -36,6 +43,9 @@ int main() {
         for (const auto & t : turns)
             prompts.push_back(tok.encode("<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\n" + t +
                                          "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        const auto eos_ids = tok.encode("<|im_end|>");
+        if (eos_ids.size() != 1) throw std::runtime_error("<|im_end|> is not one token");
+        const uint32_t eos = eos_ids[0];
         const uint32_t count = 96;
         const uint32_t context = 8192;
         tqllm::EngineOptions base;
@@ -47,8 +57,10 @@ int main() {
             tqllm::Model greedy(model, model, context, 1, base);
             for (const auto & p : prompts) refs.push_back(run(greedy, p, count));
         }
-        struct Case { const char * name; bool tree, mtp; };
         int failures = 0, ran = 0;
+        for (size_t i = 0; i < refs.size(); ++i)
+            if (!ends_at_eos(refs[i], eos)) { std::cout << "FAIL greedy DFlash2 chain prompt " << i << ": tokens after EOS\n"; ++failures; }
+        struct Case { const char * name; bool tree, mtp; };
         for (const Case c : {Case{"DFlash2 chain", false, false}, Case{"DFlash2 tree", true, false}, Case{"native MTP", false, true}}) {
             tqllm::EngineOptions o = base;
             o.tree = c.tree;
@@ -65,6 +77,7 @@ int main() {
             for (size_t i = 0; i < prompts.size(); ++i) {
                 const auto got = run(*m, prompts[i], count);
                 ++ran;
+                if (!ends_at_eos(got, eos)) { std::cout << "FAIL " << c.name << " prompt " << i << ": tokens after EOS\n"; ++failures; }
                 if (got == refs[i]) continue;
                 const size_t at = size_t(std::mismatch(refs[i].begin(), refs[i].end(), got.begin(), got.end()).first - refs[i].begin());
                 std::cout << "FAIL " << c.name << " prompt " << i << ": top_k = 1 differs from greedy at token " << at << " of "
