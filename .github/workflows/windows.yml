@@ -3,7 +3,8 @@ name: windows
 # Windows 11 users run the same Linux image through WSL 2 GPU passthrough.
 # GitHub's Windows runners can only build Windows containers, so the image itself
 # is built by build.yml on Linux. This job checks what breaks on a Windows
-# checkout: CRLF line endings in scripts and compose files that don't parse.
+# checkout: CRLF line endings in scripts and compose files that don't parse. windows-msvc builds tqserve
+# natively (MSVC + CUDA), as the native Windows guide does.
 
 on:
   push:
@@ -57,3 +58,58 @@ jobs:
           MODEL_DIR='C:\models' MODEL_NAME=model.gguf docker compose -f compose.yaml config --quiet
           MODEL_DIR='/home/user/models' docker compose -f compose.yaml config --quiet
           echo "OK: compose.yaml parses"
+
+  windows-msvc:
+    # Native build with MSVC + nvcc, as docs/guides/windows.md: a POSIX-only header or a GCC-only attribute in code that
+    # the Linux image builds fails this job. Host objects compile first (fast, every .cpp of tqserve), then the full
+    # tqserve link for one architecture.
+    name: Windows MSVC build (tqserve, CUDA 12.8, sm_86)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CUDA_VER: '12.8'
+      CUDA_INSTALLER: https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe
+      CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+          key: cuda-12.8.1-nvcc-cudart-cublas-cusolver-v1
+
+      - name: Install the CUDA toolkit (compiler and the libraries tqserve links, no driver)
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:CUDA_INSTALLER -OutFile cuda.exe
+          $v = $env:CUDA_VER
+          $p = Start-Process .\cuda.exe -Wait -PassThru -ArgumentList @('-s', "nvcc_$v", "cudart_$v", "cublas_$v", "cublas_dev_$v",
+                 "cusolver_$v", "cusolver_dev_$v", "thrust_$v", "crt_$v", "nvvm_$v")
+          if ($p.ExitCode -ne 0) { throw "CUDA installer exit code $($p.ExitCode)" }
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+      - name: MSVC environment
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV } }
+          "$env:CUDA_PATH\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF
+
+      - name: Host objects (every C++ file of tqserve, MSVC)
+        shell: bash
+        run: |
+          ninja -C build -t targets all | sed -n 's/^\([^:]*\.cpp\.obj\): .*/\1/p' | sort -u > host_objs.txt
+          echo "$(wc -l < host_objs.txt) host objects"
+          xargs -n 40 ninja -C build -k 0 < host_objs.txt
+
+      - name: tqserve (CUDA kernels and link)
+        shell: pwsh
+        run: cmake --build build --target tqserve -- -k 0
