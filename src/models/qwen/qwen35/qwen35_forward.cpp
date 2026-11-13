@@ -1,6 +1,6 @@
 // qwen35 engine: the forward pass (decode, prefill, layers). The class is declared in qwen35_engine.hpp.
 #include "qwen35_engine.hpp"
-#include <unistd.h>
+#include "device_free.hpp"
 
 namespace tqllm {
 namespace qwen35_detail {
@@ -1612,7 +1612,7 @@ void Qwen35Engine::park_init(int slots) {
     per += 2 * dfl_park_bytes(typical) * dfl_kc.size();
     int n = opt.prompt_park;
     if (n < 0) {
-        const size_t host = size_t(sysconf(_SC_PHYS_PAGES)) * size_t(sysconf(_SC_PAGE_SIZE));
+        const size_t host = tqllm::host_ram_bytes();  // physical RAM capped by the container limit (portable: no sysconf)
         int dev = 0, integrated = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);

@@ -5,7 +5,7 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__)  // GCC / Clang: target attributes and __builtin_cpu_supports (MSVC takes the scalar path, as cpu_expert_matvec.cpp)
 #include <immintrin.h>
 #define TQ_KQ_X86 1
 #endif
