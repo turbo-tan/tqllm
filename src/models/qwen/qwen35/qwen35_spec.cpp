@@ -487,11 +487,11 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
         gen.drafted += draft.size();
         gen.accepted += uint64_t(j);
         bool hit_eos = false;
-        for (int k = 0; k < j && gen.out.size() < gen.count; ++k) {
+        for (int k = 0; k < j && gen.out.size() < gen.count && !hit_eos; ++k) {  // the reply ends at an accepted EOS
             gen.out.push_back(draft[size_t(k)]);
-            hit_eos |= draft[size_t(k)] == eos_;
+            hit_eos = draft[size_t(k)] == eos_;
         }
-        if (gen.out.size() < gen.count) gen.out.push_back(r[j]);
+        if (!hit_eos && gen.out.size() < gen.count) gen.out.push_back(r[j]);
         last_n = g.n;
         stash_col0 = g.col0;
         commit(j + 1);
@@ -643,12 +643,12 @@ bool Qwen35Engine::dflash_advance() {
         gen.drafted += uint64_t(n - 1);
         gen.accepted += uint64_t(j);
         bool hit_eos = false;
-        for (int i = 1; i <= j && out.size() < count; ++i) {
+        for (int i = 1; i <= j && out.size() < count && !hit_eos; ++i) {  // the reply ends at an accepted EOS
             out.push_back(in[size_t(path[size_t(i)])]);
-            hit_eos |= in[size_t(path[size_t(i)])] == eos_;
+            hit_eos = in[size_t(path[size_t(i)])] == eos_;
         }
         const uint32_t bonus = sampling() ? drawn : res[size_t(path.back())];
-        if (out.size() < count) out.push_back(bonus);
+        if (!hit_eos && out.size() < count) out.push_back(bonus);
         const auto t3 = now();
         bool contiguous = true;
         for (int i = 0; i <= j; ++i) contiguous &= path[size_t(i)] == i;
@@ -730,11 +730,11 @@ bool Qwen35Engine::dflash_advance() {
         gen.drafted += draft.size();
         gen.accepted += j;
         bool hit_eos = false;
-        for (int i = 0; i < j && out.size() < count; ++i) {
+        for (int i = 0; i < j && out.size() < count && !hit_eos; ++i) {  // the reply ends at an accepted EOS
             out.push_back(draft[i]);
-            hit_eos |= draft[i] == eos_;
+            hit_eos = draft[i] == eos_;
         }
-        if (out.size() < count) out.push_back(res[j]);
+        if (!hit_eos && out.size() < count) out.push_back(res[j]);
         const auto t3 = now();
         commit(j + 1);
         dflash_inject(v_feat.as<bf16>(), j + 1, pos);  // real features of the accepted positions
