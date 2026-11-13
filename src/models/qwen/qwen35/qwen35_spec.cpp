@@ -5,6 +5,12 @@
 namespace tqllm {
 namespace qwen35_detail {
 
+// TQLLM_DEBUG=sample_chain: sampled requests (temperature > 0) draft one chain, as before the sampled tree walk
+static bool sample_chain() {
+    static const bool v = tqllm::debug_on("sample_chain");
+    return v;
+}
+
 void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
     if (!fmt_target) throw std::runtime_error("verify() needs a quantized GGUF model (a registered weight format)");
     if (n < 1 || n > NVER || pos + n > context_) throw std::runtime_error("verify: bad token count or position");
@@ -173,7 +179,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     }
     // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
     if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
-    D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : std::min(NVER - 1, dfl.block - 1)) : use_mtp ? D : 0;
+    D = dfl_on ? std::min(D, tree_mode && !(sampling() && sample_chain()) ? NVER - 1 : std::min(NVER - 1, dfl.block - 1)) : use_mtp ? D : 0;
     const int reserve = use_mtp ? D + 1 : dfl.block + 1;
     if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
         throw std::runtime_error("request exceeds context capacity");
@@ -539,7 +545,7 @@ bool Qwen35Engine::dflash_advance() {
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     static const bool tree_chain = tqllm::debug_on("tree_chain");  // tree kernels, chain drafts (draft-independence check)
-    if (tree_mode && !sampling() && D > 1 && !tree_chain) {  // token-tree step (greedy)
+    if (tree_mode && !(sampling() && sample_chain()) && D > 1 && !tree_chain) {  // token-tree step (greedy or sampled)
         // draft -> tree -> verify queued back to back on the device; one host sync after the verify
         const auto t0 = now();
         uint32_t lk[NVER];
@@ -573,12 +579,39 @@ bool Qwen35Engine::dflash_advance() {
         in.resize(size_t(n));
         ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
         ck(cudaMemcpyAsync(tpar.data(), d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+        if (sampling()) {  // every node's top-16: the walk below draws from them
+            ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
+            ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
+        }
         sync_ck();
         const auto t2 = now();
         gen.t_draft += ms(t0, t1);
         gen.t_verify += ms(t1, t2);
         // follow the target's argmax down the tree; siblings may repeat a token (tree vs lookup chain): keep the deepest
         std::vector<int> path{0}, best;
+        uint32_t drawn = 0;  // sampled walk: the draw that left the tree (the next token)
+        if (sampling()) {
+            // Sampled tree walk: at each node on the path the next token is drawn from the target's distribution there
+            // (top-16, penalties, temperature, top-k, top-p: the same dist() as chain verification). A child that holds
+            // the drawn token continues the path; otherwise the draw itself is the next token. Every output token is
+            // therefore a plain sample of the target at its own prefix: exact, whatever the tree proposed. With siblings
+            // that repeat a token (lookup chain) the first one is taken: choosing by depth would look at later draws.
+            std::vector<uint32_t> recent;  // penalty window: the output so far, then each accepted token
+            if (samp.penalized()) {
+                const size_t no = gen.out.size(), r0 = no > size_t(kPresenceLastN) ? no - kPresenceLastN : 0;
+                recent.assign(gen.out.begin() + long(r0), gen.out.end());
+            }
+            for (int node = 0;;) {
+                drawn = draw(dist(node, recent), rng);
+                int next = -1;
+                for (int c = node + 1; c < n && next < 0; ++c)
+                    if (tpar[size_t(c)] == node && in[size_t(c)] == drawn) next = c;
+                if (next < 0) break;
+                if (samp.penalized()) recent.push_back(drawn);
+                path.push_back(next);
+                node = next;
+            }
+        }
         std::function<void(int)> walk = [&](int node) {
             bool leaf = true;
             for (int c = node + 1; c < n; ++c)
@@ -590,7 +623,9 @@ bool Qwen35Engine::dflash_advance() {
                 }
             if (leaf && path.size() > best.size()) best = path;
         };
-        if (nl) {
+        if (sampling()) {
+            // path built above
+        } else if (nl) {
             walk(0);
             path = best;
         } else {  // no lookup chain: sibling tokens are distinct, the first match is the only one
@@ -612,7 +647,7 @@ bool Qwen35Engine::dflash_advance() {
             out.push_back(in[size_t(path[size_t(i)])]);
             hit_eos |= in[size_t(path[size_t(i)])] == eos_;
         }
-        const uint32_t bonus = res[size_t(path.back())];
+        const uint32_t bonus = sampling() ? drawn : res[size_t(path.back())];
         if (out.size() < count) out.push_back(bonus);
         const auto t3 = now();
         bool contiguous = true;

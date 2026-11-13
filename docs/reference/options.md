@@ -177,7 +177,7 @@ prefill FP16 weight blocks of 2048 rows (choose yourself with --kv, -ub, --gemm-
 | Option / variable | What it does |
 |---|---|
 | `--list-kv`, `--list-flags` | KV formats; every environment flag with its status |
-| `TQLLM_DEBUG=key,...` | memlog, profile, steps, stageprof, matvec, tune, prefill, draft, tree_chain, tf_dump:FILE, fakeq_k:N, fakeq_v:N |
+| `TQLLM_DEBUG=key,...` | memlog, profile, steps, stageprof, matvec, tune, prefill, draft, tree_chain, sample_chain, tf_dump:FILE, fakeq_k:N, fakeq_v:N |
 | `TQLLM_MATVEC_RULE=BITS:KERNEL[:PF],...` | override the decode matvec kernel per format (e.g. `3:legacy:0`) |
 
 ## Request sampling numbers

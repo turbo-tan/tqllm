@@ -5,6 +5,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Changed
+- Sampled requests (temperature > 0) on the 27B use the DFlash2 token tree on CUDA too (it was greedy-only): the walk draws each node's token from the target's distribution and follows a matching child. RTX 4090, Qwen3.8-27B TQ4 + DFlash2-TQ3, temperature 0.6, 6 x 2,000 tokens: 146 -> 173 tok/s, accepted drafts 30 % -> 37 %. `TQLLM_DEBUG=sample_chain` keeps chain drafts.
+
 ### Fixed
 - Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
 - Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
