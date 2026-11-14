@@ -165,6 +165,9 @@ struct DecodeModel {
 
     // Keep the first m of the last step's n tokens (speculative verify): restore every carried state to token m-1.
     void accept(int m);
+    // accept for several sequences of one batched verify: every row copy in one launch and, per GDN layer, one replay for
+    // all sequences that rolled back (the same bits as accept per sequence)
+    static void accept_multi(const std::vector<std::pair<DecodeModel *, int>> & accepts);
 
     // MTP block on n (token, wide residual) pairs: appends n MTP KV entries; returns the argmax after the last pair and
     // keeps its wide output in mtp_h (input of the next chained draft).

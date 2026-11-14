@@ -130,8 +130,9 @@ int main() {
             CHECK(pool.stage_ensure(p, p + n), "%s: window holds the block at %lld", name, (long long)p);
             const int64_t b[2] = {int64_t(pool.staged_bytes(true)), int64_t(pool.staged_bytes(false))};
             CK(cudaMemcpyAsync(nb, b, 16, cudaMemcpyHostToDevice, st));
-            kv_stage_copy(pool.host_copy(0, true), sk, nb, 4 * sms, st);
-            kv_stage_copy(pool.host_copy(0, false), sv, nb + 1, 4 * sms, st);
+            // the engine stages by the copy engine (Qwen35Engine::kv_prefetch): no kernel reads the host copy
+            if (b[0]) CK(cudaMemcpyAsync(sk, pool.host_copy(0, true), size_t(b[0]), cudaMemcpyHostToDevice, st));
+            if (b[1]) CK(cudaMemcpyAsync(sv, pool.host_copy(0, false), size_t(b[1]), cudaMemcpyHostToDevice, st));
             for (auto & v : hk) v = __float2bfloat16(nd(g));
             for (auto & v : hq) v = __float2bfloat16(nd(g));
             CK(cudaMemcpyAsync(k0, hk.data(), size_t(n) * ts * 2, cudaMemcpyHostToDevice, st));

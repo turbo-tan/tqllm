@@ -37,7 +37,7 @@ constexpr uint32_t ID_U4H = 1001, ID_W4S = 1002, ID_K4 = 1003, ID_K3 = 1004, /* 
 // u4h (engine id 1001): 4-bit codes in 16-groups (element 4u + j -> byte (u / 2) * 4 + j, nibble u % 2),
 // FP16 (scale, min) per 32. Produced from Q4_K (drafter) or non-uniform Q4_0.
 struct U4h : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     const char * name() const override { return "U4H"; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
@@ -88,7 +88,7 @@ struct U4h : WeightFormat {
 // K4 (engine id 1003): native Q4_K, u4h codes + the raw 16-byte Q4_K superblock header (d, dmin, 6-bit scales / mins)
 // per 256 weights: 4.5 bpw on the device instead of u4h's 5.0.
 struct K4 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -142,7 +142,7 @@ struct K4 final : WeightFormat {
 
 // IQ3X (engine id 1007): native IQ3_XXS, per 32 weights 12 B (grid-index bytes + scale/sign word) + 4 B per 256 (d).
 struct Iq3x final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 5; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -226,7 +226,7 @@ struct IQ3_XXS final : WeightFormat {
 // IQ3 (engine id 1006): native IQ3_S, per 32 weights 12 B (grid-index low bytes, sign bytes) + per 256 a 16-byte record
 // (d, qh[8], scales[4], pad): 3.5 bpw on the device.
 struct Iq3 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 4; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -328,7 +328,7 @@ struct IQ3_S final : WeightFormat {
 // unchanged 8-byte record per 256 weights (d, scales_h, scales_l), on the 16-row split-K kernel (<= 16 columns; wider
 // batches dequantise to FP16). 4.25 bpw on the device, same as the file.
 struct Iq4n final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 13; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -397,7 +397,7 @@ struct Iq4n final : WeightFormat {
 
 // IQ4L (engine id 1009): IQ4_NL in natural nibble order (16 B per 32 weights) + one FP16 scale per 32 weights (aux).
 struct Iq4l final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 14; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -448,7 +448,7 @@ struct Iq4l final : WeightFormat {
 // row: the cols / 16 E4M3 group scales, then the row's F32 global scale (NVIDIA's bytes: 4.5 bits per weight with the codes).
 // Experts only (no dense dequant).
 struct Nvf4 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 16; }
     bool has_expert_matvec() const override { return true; }
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
@@ -609,7 +609,7 @@ struct IQ4_XS final : WeightFormat {
 // K3 (engine id 1004): native Q3_K, 3-bit planes (12 B per 32 weights) + per 256 weights a 20-byte record (16 int8
 // scales, FP16 d): 3.6 bpw on the device. Matvec / dequant: the u4h kernels with FMT 2.
 struct K3 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     const char * name() const override { return "K3"; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
@@ -835,7 +835,7 @@ struct Q4_K final : WeightFormat {
 // K6 (engine id 1011): native Q6_K. Per 32 weights 16 nibble bytes in K4 order + 2 words of 2-bit highs; aux = per 256
 // weights the 20-byte K3 record (16 int8 scales, FP16 d); value d * scale * (code - 32).
 struct K6 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -930,7 +930,7 @@ struct Q6_K final : WeightFormat {
 // K5 (engine id 1010): native Q5_K. Per 32 weights 16 nibble bytes in K4 order + one word of high code bits; aux = the
 // 16-byte Q5_K header (d, dmin, scales) per 256 weights per row.
 struct K5 final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {
@@ -1020,7 +1020,7 @@ struct Q5_K final : WeightFormat {
 // UD low-bit types (engine ids 1012..1016, kernel fmt 8..12) on the u4h kernel: per 32 weights the GGUF block's code
 // bytes, per row and 256 weights a record of its scalars (src/formats/weight/quant_kernels.cuh, udq_*).
 struct Udq final : WeightFormat {
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return fmt == 10 ? 10 : -1; }
     int gemm_f32_id() const override { return fmt; }
     bool has_expert_matvec() const override { return true; }  // every UD format (grouped kernels cover u4h fmt 0..15)

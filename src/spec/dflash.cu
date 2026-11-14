@@ -1,3 +1,4 @@
+#include "zero_copy_guard.hpp"
 #include <cstdlib>
 #include "dflash_kernels.cuh"
 
@@ -283,6 +284,7 @@ void gather_path(const PathGather * descs, int n, const int * cols, int k, int p
 }
 
 void gather_rows(const void * src, void * dst, const uint32_t * ids, int n, int64_t row_bytes, cudaStream_t s) {
+    require_device_memory(src, "gather_rows source"); require_device_memory(dst, "gather_rows destination");
     gather_rows_k<<<n, 256, 0, s>>>(static_cast<const uint8_t *>(src), static_cast<uint8_t *>(dst), ids, row_bytes);
 }
 

@@ -180,7 +180,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
     if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
     D = dfl_on ? std::min(D, tree_mode && !(sampling() && sample_chain()) ? NVER - 1 : std::min(NVER - 1, dfl.block - 1)) : use_mtp ? D : 0;
-    const int reserve = use_mtp ? D + 1 : dfl.block + 1;
+    const int reserve = use_mtp ? D + 1 : std::max(dfl.block, int(NVER)) + 1;
     if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
         throw std::runtime_error("request exceeds context capacity");
     if (use_mtp) {
@@ -347,6 +347,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     gen = Gen{};
     gen.out.assign(1, next);
     if (opt.lookup) gen.hist.assign(prompt.begin(), prompt.end());
+    if (dfl_on && tree_mode && !opt.lookup) gen.copy.append(prompt.data(), prompt.size());
     gen.P = P;
     gen.count = count;
     gen.D = D;
@@ -458,7 +459,7 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     uint64_t key = batch_graph_seed(batch_topk, unsigned(sp)) ^ (uint64_t(qsa.mode) << 44);  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
     if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
-    else ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+    else ck(cudaGraphLaunch(cached_verify_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -558,10 +559,19 @@ bool Qwen35Engine::dflash_advance() {
             const int n2 = lookup(lk2, tqllm::lookup_first_limit(NV));
             if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
         }
-        const int nt = tqllm::tree_cols(D, nl, lf, NV), n = nt + nl;
+        int nt = tqllm::tree_cols(D, nl, lf, NV);
+        if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
+            for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
+            nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
+            const auto cp = gen.copy.propose(NV - nt);
+            if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
+            nl = int(cp.size());
+            std::copy(cp.begin(), cp.end(), lk);
+        }
         dflash_draft(pending, pos, 0, nullptr, nullptr, true);
         tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
                                 v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+        const int n = nt + nl;
         if (nl) {  // lookup chain: columns nt .. n - 1, the first under the root
             int lp[NVER], ld[NVER];
             for (int i = 0; i < nl; ++i) lp[i] = i ? nt + i - 1 : 0, ld[i] = i + 1;
@@ -595,7 +605,9 @@ bool Qwen35Engine::dflash_advance() {
             // (top-16, penalties, temperature, top-k, top-p: the same dist() as chain verification). A child that holds
             // the drawn token continues the path; otherwise the draw itself is the next token. Every output token is
             // therefore a plain sample of the target at its own prefix: exact, whatever the tree proposed. With siblings
-            // that repeat a token (lookup chain) the first one is taken: choosing by depth would look at later draws.
+            // that repeat a token (a lookup / copy chain beside the tree) the last one is taken, a choice by position only
+            // (by depth would look at later draws): the chains sit after the tree columns, so a drafter sibling equal to
+            // the copy's first token no longer cuts the copy off.
             std::vector<uint32_t> recent;  // penalty window: the output so far, then each accepted token
             if (samp.penalized()) {
                 const size_t no = gen.out.size(), r0 = no > size_t(kPresenceLastN) ? no - kPresenceLastN : 0;
@@ -604,7 +616,7 @@ bool Qwen35Engine::dflash_advance() {
             for (int node = 0;;) {
                 drawn = draw(dist(node, recent), rng);
                 int next = -1;
-                for (int c = node + 1; c < n && next < 0; ++c)
+                for (int c = n - 1; c > node && next < 0; --c)
                     if (tpar[size_t(c)] == node && in[size_t(c)] == drawn) next = c;
                 if (next < 0) break;
                 if (samp.penalized()) recent.push_back(drawn);

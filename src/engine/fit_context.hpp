@@ -1,4 +1,5 @@
 #pragma once
+#include "graph_lru.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -114,9 +115,13 @@ auto fit_try_load(Make && make, Clear && clear) -> decltype(make()) {
 }
 // Free bytes the memory fit must leave after loading: -fitt MiB (default 768, 256 under WSL), never below 64 MiB - a WSL /
 // Windows card past its VRAM spills into shared memory and reports ~0 free, so "0 free" must not pass; 0 when the fit is off.
+// The margin holds the graph cache's working set by construction (GraphLru floor x kGraphCacheFloorBytes, 48 MB), on top of
+// -fitt; the defaults stay 768 MB (Linux) and 256 MB (WSL) in total
 inline size_t fit_margin(bool fit, long target_mb, bool wsl) {
-    const long mb = target_mb < 0 ? (wsl ? 256 : 768) : target_mb;
-    return fit ? size_t(mb < 64 ? 64 : mb) << 20 : 0;
+    const size_t graphs = kGraphCacheFloor * kGraphCacheFloorBytes;
+    const long graphs_mb = long(graphs >> 20);
+    const long mb = target_mb < 0 ? (wsl ? 256 : 768) - graphs_mb : target_mb;
+    return fit ? (size_t(mb < 64 ? 64 : mb) << 20) + graphs : 0;
 }
 // Free device memory the fit judges a load by. Linux: the driver's figure. WSL / Windows (WDDM): the driver reads ~0 near
 // the budget whether or not the card has spilled into shared memory, so the free figure is our own accounting instead:

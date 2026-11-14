@@ -416,6 +416,8 @@ struct Qwen35::Impl {
                 throw std::invalid_argument("invalid qwen35 integer metadata: "+key);
             return int(x);
         };
+        if(file.has("pplx.embedding_length"))
+            throw std::runtime_error("a contextual embedding model, not a chat model: tqserve serves it on POST /v1/embeddings (CUDA)");
         layers=integer("block_count")-int(file.num(a+"nextn_predict_layers",0));
         hidden=integer("embedding_length");heads=integer("attention.head_count");
         kvheads=integer("attention.head_count_kv");hd=integer("attention.key_length");

@@ -1,3 +1,5 @@
+#include <set>
+#include <tuple>
 #include <chrono>
 // Flash-Next layer forward (decode, verify and short prefill chunks) and the router.
 #include "debug.hpp"
@@ -38,11 +40,23 @@ namespace { tqllm::flashnext::DecodeGraphs g_decode_graphs; }  // fn_graphs.hpp
 void release_decode_graphs(uint64_t owner) { g_decode_graphs.release(owner); }
 
 // A step whose captured part fails (an operation not allowed in a capture: a weight uploaded on its first use, a handle
-// created) runs again without a graph; nothing in an open capture has executed, so the plain run starts from the same
-// state. Its layer key then takes two plain calls again before the next capture.
+// created) runs again without a graph; nothing in an open capture has executed, so the host state the step changed
+// (StepUndo: buffer swaps, lengths, first-use buffers) is restored and the plain run starts from the same state. Its layer
+// key then takes two plain calls again before the next capture.
 void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                    AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs,
                    const PrefillSink * sink) {
+    tqllm::flashnext::StepUndo<std::unique_ptr<Device<float>>> undo;
+    auto save = [&](DecodeModel & m) {
+        if (layer < int(m.rec.size())) {
+            RecurrentState & r = m.rec[size_t(layer)];
+            undo.swapped(r.history, r.history2); undo.swapped(r.state, r.state2); undo.value(r.last_n); undo.value(r.channels);
+        }
+        if (layer < int(m.att.size())) undo.value(m.att[size_t(layer)].len); else undo.value(m.mtp_att.len);
+        if (layer < int(m.ple_past.size())) { undo.first_use(m.ple_past[size_t(layer)]); undo.first_use(m.ple_old[size_t(layer)]); undo.first_use(m.ple_saved[size_t(layer)]); }
+    };
+    if (segs) for (const auto & sg : *segs) save(*sg.m); else save(*this);
+    if (attn) undo.value(attn->len);
     try { layer_forward_step(layer, residual, n, ple_rows, attn, cache, segs, sink, false); }
     catch (const std::exception & e) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -52,6 +66,7 @@ void DecodeModel::layer_forward(int layer, std::unique_ptr<Device<float>> & resi
         (void) cudaGetLastError();
         static int logged = 0;
         if (logged++ < 4) std::fprintf(stderr, "tqllm: layer %d graph capture failed (%s); the step runs without a graph\n", layer, e.what());
+        undo.restore();
         layer_forward_step(layer, residual, n, ple_rows, attn, cache, segs, sink, true);
     }
 }
@@ -91,7 +106,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // from the routed ids: no readback, no host map build, and the layer's graph runs to the end of the layer (same
     // kernels and maps as the split path with every assignment a hit: test-dedup-maps).
     const int * full_slots = nullptr;
-    if (!sink && !cp.rt.hot_map && !cp.run.small_card && (spec || n == 1) && n * c.topk <= std::min(1024, cache.slots(layer))) {
+    if (!sink && !cp.rt.hot_map && !cp.run.small_card && tqllm::flashnext::device_maps(n, c.topk, cache.slots(layer), c.experts, spec)) {
         struct Table { std::vector<int> host; std::unique_ptr<Device<int>> dev; };
         static std::map<std::pair<const MixedExpertCache *, int>, Table> tables;
         static std::vector<int> slot_of;
@@ -127,8 +142,16 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     }
     bool capturing = false;
     // several sequences (segs) only when the maps are built on the device: their split path waits on the routed ids per layer
-    // up to 8 rows; with the maps on the device (no host wait in the layer) up to 32 (np 8 x 4-row blocks)
-    if (graph_on && spec && (!segs || full_slots) && !sink && n <= (full_slots ? 32 : 8) && g_arena && !g_persistent) {
+    // up to 8 rows; with the maps on the device (no host wait in the layer) every verify batch the device maps take
+    // (graph_rows_max); each row count keeps its own graphs
+    const bool graph_path = graph_on && spec && (!segs || full_slots) && !sink && n <= tqllm::flashnext::layer_graph_rows(full_slots, c.topk) && g_arena && !g_persistent;
+    static const bool dbg_paths = tqllm::debug_on("graphs");
+    if (dbg_paths && layer == 0 && !sink) {  // TQLLM_DEBUG=graphs: the path of each decode / verify row count, once
+        static std::set<std::tuple<int, bool, bool>> seen;
+        if (seen.insert({n, full_slots != nullptr, graph_path}).second)
+            std::fprintf(stderr, "tqllm: decode rows %d: %s maps, %s\n", n, full_slots ? "device" : "host", graph_path ? "layer graphs" : "eager");
+    }
+    if (graph_path) {
         static int epoch = -1; if (epoch != cp.rt.prefill_epoch) { epoch = cp.rt.prefill_epoch; g_decode_graphs.reset_warmup(); }  // lazy scratch is rebuilt by plain calls
         if (g_decode_graphs.capture(graph_owner, layer, n, plain)) { ck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); capturing = true; }  // calls 1-2 run plain: lazy allocations happen outside capture
     }
@@ -207,11 +230,14 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 cp.project(pf + "attn_k.weight", mixed.p, kB.p, h, kvh * ad, n);
                 cp.project(pf + "attn_v.weight", mixed.p, vB.p, h, kvh * ad, n);
             }
-            for (const auto & sg : *segs) {
-                const AttnPre pre{qgB.p + size_t(sg.off) * heads * ad * 2, kB.p + size_t(sg.off) * kvh * ad, vB.p + size_t(sg.off) * kvh * ad};
-                attention_core(cp, mixed.p + size_t(sg.off) * h, nullptr, sg.n, layer, nullptr, trunk ? &sg.m->att[layer] : &sg.m->mtp_att,
-                               &pre, aoB.p + size_t(sg.off) * heads * ad);
-            }
+            std::vector<AttnSeg> as;
+            for (const auto & sg : *segs) as.push_back({trunk ? &sg.m->att[layer] : &sg.m->mtp_att, sg.off, sg.n});
+            if (!attention_multi(cp, mixed.p, as, n, layer, AttnPre{qgB.p, kB.p, vB.p}, aoB.p))
+                for (const auto & sg : *segs) {
+                    const AttnPre pre{qgB.p + size_t(sg.off) * heads * ad * 2, kB.p + size_t(sg.off) * kvh * ad, vB.p + size_t(sg.off) * kvh * ad};
+                    attention_core(cp, mixed.p + size_t(sg.off) * h, nullptr, sg.n, layer, nullptr, trunk ? &sg.m->att[layer] : &sg.m->mtp_att,
+                                   &pre, aoB.p + size_t(sg.off) * heads * ad);
+                }
             tqllm_cuda::fn_attention_gate(aoB.p, qgB.p, heads, ad, n, nullptr);
             cp.project(pf + "attn_output.weight", aoB.p, block.p, heads * ad, h, n);
         } else {
@@ -224,10 +250,19 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
                 cp.project(pf + "ssm_alpha.weight", mixed.p, aB.p, h, vh, n);
                 cp.project(pf + "ssm_beta.weight", mixed.p, bB.p, h, vh, n);
             }
+            // decode blocks (each under the chunked kernel's 64 rows): the recurrence of every sequence in one launch
+            bool one = segs->size() > 1 && segs->size() <= size_t(tqllm_cuda::GdnSeqs::kMax);
+            for (const auto & sg : *segs) one = one && sg.n < 64;
+            std::unique_ptr<Device<float>> convB; tqllm_cuda::GdnSeqs seqs; std::vector<tqllm_cuda::ScatterItem> saves;
+            if (one) convB = std::make_unique<Device<float>>(qkvB.count);
             for (const auto & sg : *segs) {
-                const GdnPre pre{qkvB.p + size_t(sg.off) * channels, zB.p + size_t(sg.off) * vh * sd, aB.p + size_t(sg.off) * vh, bB.p + size_t(sg.off) * vh};
+                GdnPre pre{qkvB.p + size_t(sg.off) * channels, zB.p + size_t(sg.off) * vh * sd, aB.p + size_t(sg.off) * vh, bB.p + size_t(sg.off) * vh};
+                if (one) { pre.conv = convB->p + size_t(sg.off) * channels; pre.off = sg.off; pre.defer = &seqs; pre.copies = &saves; }
                 recurrent_core(cp, nullptr, nullptr, sg.n, layer, nullptr, &sg.m->rec[layer], &pre, roB.p + size_t(sg.off) * vh * sd);
             }
+            if (!saves.empty()) tqllm_cuda::scatter_copy(saves.data(), int(saves.size()), nullptr);  // the batch's rollback saves, one launch
+            if (one) tqllm_cuda::fn_gdn_multi(convB->p, aB.p, bB.p, cp.dense_device(pf + "ssm_a"), cp.dense_device(pf + "ssm_dt.bias"), seqs,
+                                              roB.p, kh, vh, sd, float(cp.epsilon), nullptr);
             tqllm_cuda::fn_gated_rms(roB.p, zB.p, cp.dense_device(pf + "ssm_norm.weight"), gB.p, vh, sd, n, float(cp.epsilon), nullptr);
             cp.project(pf + "ssm_out.weight", gB.p, block.p, vh * sd, h, n);
         }
@@ -239,6 +274,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         }
     } else if (attention) attention_core(cp, mixed.p, block.p, n, layer, nullptr, attn ? attn : &att[layer], nullptr, nullptr, mixh ? mixh->p : nullptr, mixb ? mixb->p : nullptr);
     else recurrent_core(cp, mixed.p, block.p, n, layer, nullptr, &rec[layer], nullptr, nullptr, mixh ? mixh->p : nullptr, mixb ? mixb->p : nullptr);
+    // TQLLM_DEBUG=capture_throw:L: a capture of layer L fails after its mixer core changed the host state (test of the rerun)
+    static const int throw_layer = tqllm::debug_cstr("capture_throw") ? std::atoi(tqllm::debug_cstr("capture_throw")) : -1;
+    if (capturing && layer == throw_layer) throw std::runtime_error("TQLLM_DEBUG=capture_throw");
     // a prefill sub-chunk writes its combined rows straight into the layer's wide rows (combine is elementwise, so in place
     // over the residual view is safe)
     float * comb = sink && !wb ? sink->wide + size_t(sink->off) * width : combined.p;
@@ -337,7 +375,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // with the slot count (F2: a 23-token prompt ran waves at 140 slots and split at 150 in layer 1)
     // F39 rule (decode_rules.hpp): a verify block takes the split path whenever its distinct experts fit
     constexpr bool old_rule = false;  // F39 rule: np > 1 text equals np 1
-    if (trunk && (cp.rt.hot_map || n * c.topk > cache.slots(layer) || (!spec && n > 1))) {  // incl. the short last chunk of a prompt
+    if (trunk && tqllm::flashnext::reads_routes_for_waves(cp.rt.hot_map, full_slots != nullptr, n, c.topk, cache.slots(layer), spec)) {  // incl. the short last chunk of a prompt
         wave_ids = routed.get();
         if(predict && cp.rt.hot_map && cp.cold_prefetch)cp.cold_prefetch(layer+1,next_ids->get());
         if (cp.rt.hot_map) for (int id : wave_ids) if (id < 0 || id >= c.experts) {
@@ -495,8 +533,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         ck(cudaMemcpyAsync(ids_host.p, routed.p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         if (predict) ck(cudaMemcpyAsync(ids_host.p + A, next_ids->p, size_t(A) * 4, cudaMemcpyDeviceToHost, cs));
         static cudaEvent_t ids_ready = [] { cudaEvent_t e; ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return e; }();
-        static const int cpu_miss = tqllm::flashnext::cpu_miss_threads(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
-                                                                       cp.run.exact, int(std::thread::hardware_concurrency()));  // decode_rules.hpp
+        static const int cpu_miss = tqllm::flashnext::cpu_miss_threads(tqllm::flashnext::cpu_miss_env(),
+                                                                       cp.run.exact, int(std::thread::hardware_concurrency()),
+                                                                       cp.run.small_card && cp.run.parallel);  // decode_rules.hpp
         static std::unique_ptr<CpuMissPool> cpu_pool = cpu_miss > 0 ? std::make_unique<CpuMissPool>(cpu_miss, h, c.expert_ff) : nullptr;
         const bool miss_driven = cpu_pool && !cp.run.small_card;  // decode_rules.hpp runs_on_cpu
         static int cpu_budget = tqllm::flashnext::kCpuMissBudget, calls_at_zero = 0;  // decode_rules.hpp next_cpu_budget

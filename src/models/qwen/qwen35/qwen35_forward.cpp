@@ -1,5 +1,6 @@
 // qwen35 engine: the forward pass (decode, prefill, layers). The class is declared in qwen35_engine.hpp.
 #include "qwen35_engine.hpp"
+#include "cuda_compat.hpp"
 #include "device_free.hpp"
 
 namespace tqllm {
@@ -7,7 +8,8 @@ namespace qwen35_detail {
 
 void Qwen35Engine::release_raw() {
     if (stream) cudaStreamSynchronize(stream);
-    glru.clear([](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
+    glru.clear([this](cudaGraphExec_t g) { drop_graph(g); });
+    if (stage_dummy_host) cudaFreeHost(stage_dummy_host);
     if (side) cudaStreamDestroy(side);
     if (kv_side) cudaStreamDestroy(kv_side);
     if (solver) cusolverDnDestroy(solver);
@@ -945,13 +947,45 @@ void Qwen35Engine::qsa_mass_report(uint32_t attn_i) {
     if (attn_i + 1 == qsa.layer.size()) --qsa.mass_left;
 }
 
+// [K bytes, V bytes, K offset, V offset] each attention layer stages host -> staging this step: the compacted prefix is not
+// staged; a block of sparse rows reads old positions from host memory, so only the last evicted granule (rows that straddle
+// the boundary are read from the staging copy) comes back
+std::array<int64_t, 4> Qwen35Engine::stage_plan() const {
+    std::array<int64_t, 4> s{int64_t(kv_pool->staged_bytes(true)), int64_t(kv_pool->staged_bytes(false)), 0, 0};
+    if (kv_cmp) s[2] = cmp_pos * int64_t(kv_row_bytes(true)), s[3] = cmp_pos * int64_t(kv_row_bytes(false));
+    else if (qsa.tail_off.p && qsa.mode == 1) {
+        const int64_t g = int64_t(kv_mem->granule());
+        s[2] = std::max<int64_t>(0, s[0] - g), s[3] = std::max<int64_t>(0, s[1] - g);
+    }
+    return s;
+}
+void Qwen35Engine::stage_copy(const std::array<int64_t, 4> & s, uint32_t a, bool key, void ** dst, const void ** src, size_t * n) const {
+    const int64_t off = s[key ? 2 : 3], end = s[key ? 0 : 1];
+    if (end > off) {
+        *src = static_cast<const char *>(kv_pool->host_copy(int(a), key)) + off;
+        *dst = static_cast<char *>(key ? key_cache[a].p : value_cache[a].p) + off;
+        *n = size_t(end - off);
+    } else *src = stage_dummy_host, *dst = stage_dummy_dev.p, *n = 16;
+}
+
 void Qwen35Engine::kv_prefetch(uint32_t a) {  // attention layer a's old positions host -> its staging buffer (parity a & 1)
-    const auto * nb = d_stage_bytes.as<int64_t>();
-    // the compacted prefix is not staged; a block of sparse rows reads old positions from host memory, so only the last
-    // evicted granule (rows that straddle the boundary are read from the staging copy) comes back
-    const auto * off = kv_cmp ? d_stage_off.as<int64_t>() : qsa.tail_off.p && qsa.mode == 1 ? qsa.tail_off.as<int64_t>() : nullptr;
-    tqllm_cuda::kv_stage_copy(kv_pool->host_copy(int(a), true), key_cache[a].p, nb, kv_blocks, kv_side, off);
-    tqllm_cuda::kv_stage_copy(kv_pool->host_copy(int(a), false), value_cache[a].p, nb + 1, kv_blocks, kv_side, off ? off + 1 : nullptr);
+    // by the copy engine (in a captured verify graph: memcpy nodes, kept and updated per plan): no kernel reads host memory
+    const auto s = stage_plan();
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    ck(cudaStreamIsCapturing(kv_side, &cs));
+    const bool capturing = cs != cudaStreamCaptureStatusNone;
+    for (const bool key : {true, false}) {
+        void * d = nullptr; const void * src = nullptr; size_t n = 0;
+        stage_copy(s, a, key, &d, &src, &n);
+        if (!capturing && src == stage_dummy_host) continue;
+        ck(cudaMemcpyAsync(d, src, n, cudaMemcpyHostToDevice, kv_side));
+        if (capturing) {
+            const cudaGraphNode_t * deps = nullptr; size_t nd = 0;
+            ck(tqllm_cuda::stream_capture_deps(kv_side, &cs, &deps, &nd));
+            if (nd != 1) throw std::runtime_error("KV host tail: staging copy node not found in the capture");
+            stage_capture.push_back({deps[0], a, key});
+        }
+    }
     ck(cudaEventRecord(kv_ready[a & 1], kv_side));
 }
 
@@ -1207,6 +1241,9 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
         tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, lg_out, id_out, s_scr.p, stream);
 }
 
+// With the embeddings in host memory (fit, 12/16 GB cards) this is a deliberate zero-copy gather: n rows (a few KB) whose
+// ids exist only on the device inside captured verify / draft graphs; bulk host data goes by the copy engine
+// (zero_copy_guard.hpp)
 void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     const int H = int(cfg.hidden);
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::embed_multi_tq3(embed.p, dtok, n, Y, H, stream);

@@ -1,5 +1,6 @@
 // qwen35 engine: loading and allocation. The class is declared in qwen35_engine.hpp.
 #include "qwen35_engine.hpp"
+#include "cuda_compat.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -338,6 +339,8 @@ void Qwen35Engine::alloc_seq_state() {
         if (kv_staged) {
             d_stage_bytes = Buf(2 * sizeof(int64_t));
             ck(cudaMemsetAsync(d_stage_bytes.p, 0, 2 * sizeof(int64_t), stream));
+            stage_dummy_dev = Buf(16);
+            if (!stage_dummy_host) ck(cudaHostAlloc(&stage_dummy_host, 16, cudaHostAllocDefault));
             ck(cudaStreamCreateWithFlags(&kv_side, cudaStreamNonBlocking));
             ck(cudaEventCreateWithFlags(&kv_fork, cudaEventDisableTiming));
             for (auto * e : {&kv_ready[0], &kv_ready[1], &kv_done[0], &kv_done[1]})
@@ -593,7 +596,8 @@ void Qwen35Engine::allocate() {
             head8 = Buf(size_t(lm_head.rows) * H);
             head8s = Buf(size_t(lm_head.rows) * H / 16 * 2);
         }
-        if (lm_head.type == GGML_Q5_K)
+        if (head_host) head8_to_host();
+        else if (lm_head.type == GGML_Q5_K)
             tqllm_cuda::q5k_to_i8(lm_head.p, const_cast<int8_t *>(w8()), const_cast<__half *>(s8()), lm_head.rows, int(H), stream);
         else tqllm_cuda::q6k_to_i8(lm_head.p, const_cast<int8_t *>(w8()), const_cast<__half *>(s8()), lm_head.rows, int(H), stream);
         sync_ck();
@@ -985,8 +989,11 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     } else if (!opt.draft_vocab.empty() && has_head8()) {
         const uint64_t nd = uint64_t(dsub_rows);
         Buf w8(nd * H), sc8(nd * H / 16 * 2);
-        tqllm_cuda::gather_rows(this->w8(), w8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H), stream);
-        tqllm_cuda::gather_rows(s8(), sc8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 16 * 2, stream);
+        if (h8_host) head8_rows_from_host(w8.as<int8_t>(), sc8.as<__half>(), int(nd));
+        else {
+            tqllm_cuda::gather_rows(this->w8(), w8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H), stream);
+            tqllm_cuda::gather_rows(s8(), sc8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 16 * 2, stream);
+        }
         dsub_w = Buf(nd * H / 2);
         dsub_s = Buf(nd * H / 32 * 4);
         tqllm_cuda::u4h_from_i8h(w8.as<int8_t>(), sc8.as<__half>(), dsub_w.as<uint8_t>(), dsub_s.as<__half2>(),
@@ -1028,11 +1035,65 @@ void Qwen35Engine::build_head4() {
     const int64_t n = int64_t(lm_head.rows) * cfg.hidden;
     head4 = Buf(size_t(n / 2));
     head4s = Buf(size_t(n / 32) * 4);
-    tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
+    if (h8_host) {  // the int8 rows come back a chunk at a time by the copy engine: no kernel reads host memory
+        const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
+        Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
+        const auto * hw = static_cast<const int8_t *>(h8_host);
+        const auto * hs = reinterpret_cast<const char *>(hw + size_t(rows) * H);
+        for (int r0 = 0; r0 < rows; r0 += chunk) {
+            const int nr = std::min(chunk, rows - r0);
+            ck(cudaMemcpyAsync(w.p, hw + size_t(r0) * H, size_t(nr) * H, cudaMemcpyHostToDevice, stream));
+            ck(cudaMemcpyAsync(s.p, hs + size_t(r0) * H / 16 * 2, size_t(nr) * H / 16 * 2, cudaMemcpyHostToDevice, stream));
+            tqllm_cuda::u4h_from_i8h(w.as<int8_t>(), s.as<__half>(), head4.as<uint8_t>() + size_t(r0) * H / 2,
+                                     head4s.as<__half2>() + size_t(r0) * H / 32, int64_t(nr) * H, stream);
+        }
+        sync_ck();  // the staging is freed with this scope
+    } else tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
     tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
     h2_vals = Buf(size_t(NB) * 16 * 4);
     h2_idx = Buf(size_t(NB) * 16 * 4);
     h2_scr = Buf(size_t(NB) * 64 * 16 * 8);
+    sync_ck();
+}
+
+
+// head in host memory: the int8 copy is built on the device a row chunk at a time and copied to host memory by the copy
+// engine (no kernel touches host memory: zero-copy beside the copy engine's DMA faults PCIe GPUs); the load peak is one chunk
+void Qwen35Engine::head8_to_host() {
+    const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
+    const bool q5 = lm_head.type == GGML_Q5_K;
+    const size_t qrow = size_t(H) / 256 * (q5 ? 176 : 210);
+    Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
+    auto * hw = static_cast<int8_t *>(h8_host);
+    auto * hs = reinterpret_cast<char *>(hw + size_t(rows) * H);
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+        const int nr = std::min(chunk, rows - r0);
+        const char * src = static_cast<const char *>(lm_head.p) + size_t(r0) * qrow;
+        if (q5) tqllm_cuda::q5k_to_i8(src, w.as<int8_t>(), s.as<__half>(), nr, H, stream);
+        else tqllm_cuda::q6k_to_i8(src, w.as<int8_t>(), s.as<__half>(), nr, H, stream);
+        ck(cudaMemcpyAsync(hw + size_t(r0) * H, w.p, size_t(nr) * H, cudaMemcpyDeviceToHost, stream));
+        ck(cudaMemcpyAsync(hs + size_t(r0) * H / 16 * 2, s.p, size_t(nr) * H / 16 * 2, cudaMemcpyDeviceToHost, stream));
+    }
+    sync_ck();
+}
+
+// the int8 head rows of dsub_ids (host memory) into w [n][H] / sc [n][H / 16] by the copy engine
+void Qwen35Engine::head8_rows_from_host(int8_t * w, __half * sc, int n) {
+    const size_t H = cfg.hidden, sb = H / 16 * 2;
+    std::vector<uint32_t> ids(static_cast<size_t>(n));
+    ck(cudaMemcpyAsync(ids.data(), dsub_ids.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+    sync_ck();
+    const auto * hw = static_cast<const char *>(h8_host);
+    const char * hs = hw + size_t(lm_head.rows) * H;
+    std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
+    for (int i = 0; i < n; ++i) {
+        dst.push_back(reinterpret_cast<char *>(w) + size_t(i) * H); src.push_back(hw + size_t(ids[size_t(i)]) * H); bytes.push_back(H);
+        dst.push_back(reinterpret_cast<char *>(sc) + size_t(i) * sb); src.push_back(hs + size_t(ids[size_t(i)]) * sb); bytes.push_back(sb);
+    }
+    for (size_t at = 0; at < dst.size(); at += 8192) {
+        const size_t cnt = std::min<size_t>(8192, dst.size() - at);
+        ck(tqllm_cuda::memcpy_batch_async(dst.data() + at, src.data() + at, bytes.data() + at, cnt, stream));
+    }
     sync_ck();
 }
 

@@ -245,6 +245,10 @@ void attention_mq256_t4k_turbo3v(const __nv_bfloat16 * q, const Turbo4K256 * kc,
 void attention_mq256_q8_turbo3v(const __nv_bfloat16 * q, const int8_t * kc, const Turbo3V256 * vc, const __half * ksc,
                                __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int heads, int kvheads,
                                float scale, int nsplit, cudaStream_t, int query_offset = 0);
+// Bidirectional prefill attention over BF16 q [nq][h][256], k / v [nq + seq0 - 1][kh][256] (*dseq0 = 1 for a fresh
+// sequence): every query sees every key. The causal kernel (attention_mq256_prefill) is the same code, CAUSAL = true.
+void attention_mq256_prefill_bidir(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
+                                   __nv_bfloat16 * y, const int * dseq0, int nq, int h, int kh, float scale, cudaStream_t);
 // o[i] *= sigmoid(gate) for n tokens: o [n][heads*dim] contiguous, qg of token i at qg0 + i * ts.
 void sigmoid_gate_multi(__nv_bfloat16 * o, const __nv_bfloat16 * qg0, int ts, int n, int heads, int dim, cudaStream_t);
 // act[i][f] = silu(gu[i][f]) * gu[i][F + f] for n tokens, gu rows 2F apart, act [n][F].

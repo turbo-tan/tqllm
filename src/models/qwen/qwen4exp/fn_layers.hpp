@@ -2,7 +2,14 @@
 // Flash-Next layer cores: GDN recurrence, attention (dense and QSA) and the hyper-connection mixer.
 #include "debug.hpp"
 #include "fn_state.hpp"
-struct GdnPre { const float * qkv, * z, * a, * b; };
+#include "experts/moe_kernels.cuh"
+#include <vector>
+// conv / defer (several sequences): the conv rows go to conv (the batch buffer, row off), and the recurrence is recorded in
+// defer for one tqllm_cuda::fn_gdn_multi launch over the batch instead of running here
+// copies (several sequences): the rollback saves (history / qkv / conv / a / b) go into this list for one scatter_copy launch per
+// layer after the batch (their sources are final once the conv ran; the saves are read only by a later step's rollback)
+struct GdnPre { const float * qkv, * z, * a, * b; float * conv = nullptr; int off = 0; tqllm_cuda::GdnSeqs * defer = nullptr;
+                std::vector<tqllm_cuda::ScatterItem> * copies = nullptr; };
 inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p, float * result, int n,
                            int layer, const Fixtures * fixtures, RecurrentState * carry, const GdnPre * pre = nullptr, float * raw_out = nullptr,
                            const __half * input_h = nullptr, const __nv_bfloat16 * input_b = nullptr);
@@ -68,7 +75,7 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
     }
     const float * conv_weights = checkpoint.dense_device(prefix + "ssm_conv1d.weight");
     Device<float> history(size_t(taps - 1) * channels), next_history(history.count);
-    auto convolved_d = mk(direct ? carry->conv_saved->p : nullptr, qkv.count); auto & convolved = *convolved_d;
+    auto convolved_d = mk(direct ? carry->conv_saved->p : pre && pre->conv ? pre->conv : nullptr, qkv.count); auto & convolved = *convolved_d;
     if (carry && !carry->history) {
         PersistentAlloc keep;
         carry->history = std::make_unique<Device<float>>(history.count);
@@ -79,8 +86,13 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
         PersistentAlloc keep;
         if (!carry->old_history) carry->old_history = std::make_unique<Device<float>>(history.count);
         if (!carry->qkv_saved || carry->qkv_saved->count < qkv.count) carry->qkv_saved = std::make_unique<Device<float>>(qkv.count);
-        ck(cudaMemcpyAsync(carry->old_history->p, carry->history->p, history.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
-        if (!direct) ck(cudaMemcpyAsync(carry->qkv_saved->p, qkv.p, qkv.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+        // the conv below writes history2 and swaps, so this step leaves the pre-step history buffer alone: its save may be deferred
+        if (pre && pre->copies) pre->copies->push_back({reinterpret_cast<const char *>(carry->history->p), reinterpret_cast<char *>(carry->old_history->p), history.count * sizeof(float)});
+        else ck(cudaMemcpyAsync(carry->old_history->p, carry->history->p, history.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+        if (!direct) {
+            if (pre && pre->copies) pre->copies->push_back({reinterpret_cast<const char *>(qkv.p), reinterpret_cast<char *>(carry->qkv_saved->p), qkv.count * sizeof(float)});
+            else ck(cudaMemcpyAsync(carry->qkv_saved->p, qkv.p, qkv.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+        }
         carry->last_n = n; carry->channels = channels;
     }
     // The conv history and recurrent state go to a second buffer and the pointers swap (no D2D copy).
@@ -106,18 +118,22 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
     float * state_out = carry ? carry->state2->p : next_state.p;
     if (carry && carry->spec) {
         PersistentAlloc keep;
-        auto keep_copy = [](std::unique_ptr<Device<float>> & dst, const Device<float> & src) {
+        auto keep_copy = [pre](std::unique_ptr<Device<float>> & dst, const Device<float> & src) {
             if (!dst || dst->count < src.count) dst = std::make_unique<Device<float>>(src.count);
-            ck(cudaMemcpyAsync(dst->p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+            if (pre && pre->copies) pre->copies->push_back({reinterpret_cast<const char *>(src.p), reinterpret_cast<char *>(dst->p), src.count * sizeof(float)});
+            else ck(cudaMemcpyAsync(dst->p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         };
         if (!direct) { keep_copy(carry->conv_saved, convolved); keep_copy(carry->a_saved, a); keep_copy(carry->b_saved, b); }
         if (!carry->replay_out || carry->replay_out->count < out.count) carry->replay_out = std::make_unique<Device<float>>(out.count);
         carry->neg_a = neg_a; carry->bias = bias; carry->kh = kh; carry->vh = vh; carry->dim = dim; carry->eps = float(checkpoint.epsilon);
-        tqllm_cuda::fn_gdn(convolved.p, a.p, b.p, neg_a, bias, carry->state->p, state_out, out.p,
-                          kh, vh, dim, n, float(checkpoint.epsilon), nullptr);
+    }
+    const float * state_in = carry ? carry->state->p : state.p;
+    if (pre && pre->defer && carry) {
+        auto & d = *pre->defer;
+        require(d.count < tqllm_cuda::GdnSeqs::kMax, "GDN: too many sequences in one batch");
+        d.off[d.count] = pre->off; d.n[d.count] = n; d.state[d.count] = state_in; d.next[d.count] = state_out; ++d.count;
     } else
-    tqllm_cuda::fn_gdn(convolved.p, a.p, b.p, neg_a, bias, carry ? carry->state->p : state.p, state_out, out.p,
-                      kh, vh, dim, n, float(checkpoint.epsilon), nullptr);
+        tqllm_cuda::fn_gdn(convolved.p, a.p, b.p, neg_a, bias, state_in, state_out, out.p, kh, vh, dim, n, float(checkpoint.epsilon), nullptr);
     if (carry) std::swap(carry->state, carry->state2);
     if (fixtures) compare("gdn_recurrent_output" + suffix, out.get(), fixtures->values("attn_output" + suffix), .02);
     if (fixtures && fixtures->has("new_state" + suffix))
@@ -313,6 +329,76 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
         compare("attention_gated_output" + suffix, out.get(), fixtures->values("attn_gated" + suffix), .02);
     checkpoint.project(prefix + "attn_output.weight", out.p, projected.p, heads * dim, c.hidden, n);
     if (fixtures) compare("attention_projected_output" + suffix, [&] { std::vector<float> v2(size_t(n) * c.hidden); ck(cudaMemcpy(v2.data(), result, v2.size() * 4, cudaMemcpyDeviceToHost)); return v2; }(), fixtures->values("attn_output" + suffix), .02);
+}
+// Decode blocks of several sequences, every context within the indexer budget: norm / RoPE, the K/V appends, the indexer
+// keys and the attention of all sequences in one launch each instead of one per sequence. Per sequence the same operations
+// as attention_core (bit-identical); false (nothing done) when a sequence needs the per-sequence path.
+struct AttnSeg { AttentionState * carry; int off, n; };
+inline bool attention_multi(const Checkpoint & checkpoint, const float * input_p, const std::vector<AttnSeg> & segs, int n, int layer,
+                            const AttnPre & pre, float * raw_out) {
+    const auto & c = checkpoint.config;
+    const std::string prefix = "blk." + std::to_string(layer) + ".";
+    const int heads = checkpoint.attention_heads, kvheads = checkpoint.attention_kvheads, dim = checkpoint.attention_dim;
+    const int top_k = 2048, ratio = 4, iheads = 4, idim = 128;  // attention_core's QSA shape
+    const bool has_indexer = checkpoint.has_tensor(prefix + "indexer.k_proj.weight");
+    if (segs.size() < 2 || segs.size() > size_t(tqllm_cuda::AttnSeqs::kMax) || dim % 32 || dim > 256) return false;
+    int longest = 0;
+    for (const auto & sg : segs) {
+        if (!sg.carry || sg.n >= 32 || (has_indexer && sg.carry->len + sg.n > top_k) ||
+            sg.carry->len + sg.n > kv_cap(*sg.carry, checkpoint.rt.kv_capacity)) return false;
+        longest = std::max(longest, sg.carry->len + sg.n);
+    }
+    if (!tqllm::flashnext::attention_multi_fits(n, heads, dim, longest)) return false;
+    const size_t row = size_t(kvheads) * dim;
+    tqllm_cuda::AttnSeqs seqs; seqs.count = int(segs.size());
+    for (size_t i = 0; i < segs.size(); ++i) {
+        AttentionState & carry = *segs[i].carry;
+        if (!carry.k) {
+            const int cap = kv_cap(carry, checkpoint.rt.kv_capacity);
+            PersistentAlloc keep; carry.k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16)); carry.v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16));
+        }
+        seqs.off[i] = segs[i].off; seqs.n[i] = segs[i].n; seqs.pos[i] = carry.len; seqs.k[i] = carry.k->p; seqs.v[i] = carry.v->p;
+    }
+    Device<float> q(size_t(n) * heads * dim), kn(size_t(n) * row);
+    Device<float2> table(size_t(n) * (checkpoint.rotary / 2));
+    tqllm_cuda::fn_rope_table_multi(table.p, seqs, checkpoint.rotary, checkpoint.theta, nullptr);
+    tqllm_cuda::fn_norm_rope_table(pre.qg, checkpoint.dense_device(prefix + "attn_q_norm.weight"), q.p, table.p, heads, dim, n, checkpoint.rotary,
+                                   float(checkpoint.epsilon), true, nullptr);
+    tqllm_cuda::fn_norm_rope_table(pre.k, checkpoint.dense_device(prefix + "attn_k_norm.weight"), kn.p, table.p, kvheads, dim, n, checkpoint.rotary,
+                                   float(checkpoint.epsilon), false, nullptr);
+    Device<__nv_bfloat16> kb(kn.count), vb(kn.count);
+    tqllm_cuda::f32_to_bf16(kn.p, kb.p, kn.count, nullptr);
+    tqllm_cuda::f32_to_bf16(pre.v, vb.p, vb.count, nullptr);
+    std::vector<tqllm_cuda::ScatterItem> appends;
+    for (int i = 0; i < seqs.count; ++i) {
+        const size_t bytes = size_t(seqs.n[i]) * row * sizeof(__nv_bfloat16), at = size_t(seqs.pos[i]) * row, from = size_t(seqs.off[i]) * row;
+        appends.push_back({reinterpret_cast<const char *>(kb.p + from), reinterpret_cast<char *>(segs[size_t(i)].carry->k->p + at), bytes});
+        appends.push_back({reinterpret_cast<const char *>(vb.p + from), reinterpret_cast<char *>(segs[size_t(i)].carry->v->p + at), bytes});
+    }
+    tqllm_cuda::scatter_copy(appends.data(), int(appends.size()), nullptr);
+    if (has_indexer) {
+        ArenaMark scratch;
+        Device<float> ik(size_t(n) * idim);
+        checkpoint.project(prefix + "indexer.k_proj.weight", input_p, ik.p, c.hidden, idim, n);
+        const float * knorm = checkpoint.dense_device(prefix + "indexer.k_norm.weight");
+        std::vector<tqllm_cuda::QsaIndexer *> ixs; std::vector<int> offs, ns;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            AttentionState & carry = *segs[i].carry;
+            const int pos = carry.len;
+            if (!carry.qsa) {
+                { size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+                  if (fr < (size_t(1) << 30)) { cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); } }
+                PersistentAlloc keep; carry.qsa = std::make_unique<tqllm_cuda::QsaIndexer>(kv_cap(carry, checkpoint.rt.kv_capacity), ratio, top_k, iheads, idim,
+                                   std::min(checkpoint.rotary, idim), checkpoint.theta, float(checkpoint.epsilon)); }
+            if (carry.qsa->size() > pos) carry.qsa->truncate(pos);
+            ixs.push_back(carry.qsa.get()); offs.push_back(segs[i].off); ns.push_back(segs[i].n);
+        }
+        tqllm_cuda::QsaIndexer::append_multi(ixs, ik.p, offs, ns, knorm, nullptr);
+    }
+    Device<float> ws(tqllm_cuda::fn_dense_attention_multi_workspace(heads, dim, seqs));
+    tqllm_cuda::fn_dense_attention_multi(q.p, seqs, raw_out, heads, kvheads, dim, ws.p, nullptr);
+    for (const auto & sg : segs) sg.carry->len += sg.n;
+    return true;
 }
 struct MixerResult { std::vector<float> mixed, inject; };
 // Device GR Read for decode: mixed [n][h] and inject [n][streams] stay on the device.

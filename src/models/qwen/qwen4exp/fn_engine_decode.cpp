@@ -167,15 +167,17 @@ void FlashNextEngine::spec_step(const int * ids, int n, bool * done) {
     for (size_t a = 0; a < act.size(); ++a) { greedy = greedy && slots_[size_t(ids[act[a]])].temp_ <= 0.f; total += blocks[a].size(); }
     const std::vector<int> all = greedy ? f_.cp->head_argmax_rows(rows_d->p, int(total)) : std::vector<int>{};
     size_t off = 0;
-    for (size_t a = 0; a < act.size(); ++a) {  // pick and roll back each slot before any MTP catch-up reuses the arena
+    std::vector<std::pair<DecodeModel *, int>> accepts;
+    for (size_t a = 0; a < act.size(); ++a) {  // pick each slot; all roll back below, before any MTP catch-up reuses the arena
         select_slot(ids[act[a]]); auto & sl = S();
         const auto v = greedy ? std::vector<int>(all.begin() + long(off), all.begin() + long(off + blocks[a].size()))
                               : pick(rows_d->p + off * size_t(f_.cp->config.hidden), int(blocks[a].size()));
         off += blocks[a].size();
         int m = 1; while (m <= int(drs[a].size()) && v[m - 1] == drs[a][m - 1]) ++m;
         for (int i = 0; i < m && int(sl.out_.size()) < sl.generate_; ++i) { sl.out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
-        sl.model_->accept(m); ++sl.steps_; sl.toks_ += m; sl.offered_ += drs[a].size(); ++sl.taken_[size_t(std::min(m, 16))]; vs[a] = v; ms_acc[a] = m;
+        accepts.push_back({sl.model_.get(), m}); ++sl.steps_; sl.toks_ += m; sl.offered_ += drs[a].size(); ++sl.taken_[size_t(std::min(m, 16))]; vs[a] = v; ms_acc[a] = m;
     }
+    DecodeModel::accept_multi(accepts);
     { std::vector<std::pair<size_t, std::vector<int>>> tr;
       for (size_t a = 0; a < act.size(); ++a) tr.push_back({slots_[size_t(ids[act[a]])].out_.size(), std::vector<int>(vs[a].begin(), vs[a].begin() + ms_acc[a])});
       std::vector<int> sid; for (int i : act) sid.push_back(ids[i]);

@@ -1,10 +1,13 @@
 #include "tqllm/tokenizer.hpp"
+
+#include <thread>
 #include "gguf.hpp"
 #include "hf_folder.hpp"
 #include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <iterator>
+#include <queue>
 #include <stdexcept>
 
 namespace tqllm {
@@ -48,6 +51,7 @@ int code_to_byte(uint32_t cp) {
 }
 
 void Tokenizer::load(const std::string & path) {
+    cache_ = std::make_shared<PieceCache>();
     if (hf_folder(path)) { load_gguf(path); return; }  // gguf_open() presents the folder's tokenizer.json as GGUF keys
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open tokenizer: " + path);
@@ -56,12 +60,12 @@ void Tokenizer::load(const std::string & path) {
     if (!in || std::string(magic, 8) != "TQTOK001") throw std::runtime_error("invalid tokenizer file");
     const auto nv = read<uint32_t>(in), nm = read<uint32_t>(in), ns = read<uint32_t>(in);
     eos_id_ = read<uint32_t>(in);
-    id_to_piece_.clear(); piece_to_id_.clear(); special_to_id_.clear(); merges_.clear(); merge_rank_.clear();
+    id_to_piece_.clear(); piece_to_id_.clear(); special_to_id_.clear(); user_specials_.clear(); merges_.clear(); merge_rank_.clear();
     id_to_piece_.resize(300000);
     for (uint32_t i = 0; i < nv; ++i) { auto id=read<uint32_t>(in); auto s=read_u16_string(in); if (id>=id_to_piece_.size()) id_to_piece_.resize(id+1); id_to_piece_[id]=s; piece_to_id_.emplace(std::move(s),id); }
     merges_.reserve(nm);
     for (uint32_t i = 0; i < nm; ++i) { auto a=read_u16_string(in), b=read_u16_string(in); const auto rank=static_cast<uint32_t>(i); merge_rank_.emplace(a+char(0)+b,rank); merges_.emplace_back(std::move(a),std::move(b)); }
-    for (uint32_t i = 0; i < ns; ++i) { auto id=read<uint32_t>(in); auto s=read_u16_string(in); special_to_id_.emplace(std::move(s),id); }
+    for (uint32_t i = 0; i < ns; ++i) { auto id=read<uint32_t>(in); auto s=read_u16_string(in); if (!s.empty()) special_to_id_.emplace(std::move(s),id); }  // an empty special would match everywhere and stop encode() advancing
     const auto nr=read<uint32_t>(in); unicode_ranges_.clear(); unicode_ranges_.reserve(nr);
     for (uint32_t i=0;i<nr;++i) { const auto a=read<uint32_t>(in); const auto b=read<uint32_t>(in); const auto m=read<uint8_t>(in); unicode_ranges_.emplace_back(a,b,m); }
     const auto regex_len=read<uint32_t>(in); marks_in_letters_=read_string(in,regex_len).find("\\p{M}")!=std::string::npos;
@@ -84,13 +88,14 @@ void Tokenizer::load_gguf(const std::string & path) {
     const auto & types = key("tokenizer.ggml.token_type").arr;
     const auto & merges = key("tokenizer.ggml.merges").strs;
     if (tokens.empty() || types.size() != tokens.size()) throw std::runtime_error("GGUF tokenizer tokens/types mismatch: " + path);
-    id_to_piece_.clear(); piece_to_id_.clear(); special_to_id_.clear(); merges_.clear(); merge_rank_.clear();
+    id_to_piece_.clear(); piece_to_id_.clear(); special_to_id_.clear(); user_specials_.clear(); merges_.clear(); merge_rank_.clear();
     id_to_piece_.resize(std::max<size_t>(300000, tokens.size()));
     // token_type: 1 normal, 3 control, 4 user-defined (both matched atomically, as HF added tokens), 5 unused padding
     for (size_t i = 0; i < tokens.size(); ++i) {
         const int t = int(types[i]);
         if (t == 1) { id_to_piece_[i] = tokens[i]; piece_to_id_.emplace(tokens[i], uint32_t(i)); }
-        else if (t == 3 || t == 4) special_to_id_.emplace(tokens[i], uint32_t(i));
+        else if ((t == 3 || t == 4) && !tokens[i].empty()) special_to_id_.emplace(tokens[i], uint32_t(i));  // an empty one would match everywhere
+        if (t == 4 && !tokens[i].empty()) user_specials_.push_back(tokens[i]);
     }
     merges_.reserve(merges.size());
     for (size_t i = 0; i < merges.size(); ++i) {
@@ -227,17 +232,67 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const 
     return out;
 }
 
-std::vector<uint32_t> Tokenizer::encode_piece(const std::string & piece) const {
-    std::vector<std::string> symbols;
-    for (unsigned char b:piece) { std::string s; append_utf8(s,byte_to_code(b)); symbols.push_back(std::move(s)); }
-    while(symbols.size()>1) {
-        uint32_t best=UINT32_MAX; size_t at=symbols.size();
-        for(size_t i=0;i+1<symbols.size();++i){auto it=merge_rank_.find(symbols[i]+char(0)+symbols[i+1]); if(it!=merge_rank_.end()&&it->second<best){best=it->second;at=i;}}
-        if(at==symbols.size())break;
-        symbols[at]+=symbols[at+1]; symbols.erase(symbols.begin()+at+1);
+size_t Tokenizer::piece_cache_capacity() const { return std::max<size_t>(size_t(1) << 18, 2 * piece_to_id_.size()); }
+size_t Tokenizer::piece_cache_size() const { std::shared_lock<std::shared_mutex> l(cache_->m); return cache_->map.size(); }
+
+std::vector<uint32_t> Tokenizer::encode_piece(const std::string & piece, std::vector<uint32_t> * lens) const {
+    constexpr size_t kMaxPiece = 64;
+    if (piece.size() > kMaxPiece) return merge_piece(piece, lens);
+    {
+        std::shared_lock<std::shared_mutex> l(cache_->m);
+        if (const auto it = cache_->map.find(piece); it != cache_->map.end()) {
+            if (lens) lens->insert(lens->end(), it->second.second.begin(), it->second.second.end());
+            return it->second.first;
+        }
     }
-    std::vector<uint32_t> ids; ids.reserve(symbols.size());
-    for(const auto & s:symbols){auto it=piece_to_id_.find(s);if(it==piece_to_id_.end())throw std::runtime_error("tokenizer has no byte-fallback piece");ids.push_back(it->second);}
+    std::vector<uint32_t> n;
+    auto ids = merge_piece(piece, &n);
+    if (lens) lens->insert(lens->end(), n.begin(), n.end());
+    const size_t cap = piece_cache_capacity();
+    std::unique_lock<std::shared_mutex> l(cache_->m);
+    if (cache_->map.size() >= cap)  // drop a quarter (hash order), keep the rest warm
+        for (auto it = cache_->map.begin(); it != cache_->map.end() && cache_->map.size() > cap - cap / 4;) it = cache_->map.erase(it);
+    cache_->map.emplace(piece, std::make_pair(ids, std::move(n)));
+    return ids;
+}
+
+// BPE: merge the lowest-ranked adjacent pair, the leftmost among equals, until none is in the merge table. A heap of
+// candidate pairs over a linked list of symbols, O(n log n): the rescan of every pair after each merge was quadratic,
+// and a request can hold a piece of hundreds of kilobytes with no pre-token break.
+std::vector<uint32_t> Tokenizer::merge_piece(const std::string & piece, std::vector<uint32_t> * lens) const {
+    struct Sym { std::string s; int prev, next; uint32_t ver; };
+    const int n = int(piece.size());
+    std::vector<Sym> sy(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) { append_utf8(sy[i].s, byte_to_code(static_cast<unsigned char>(piece[i]))); sy[i].prev = i - 1; sy[i].next = i + 1 < n ? i + 1 : -1; sy[i].ver = 0; }
+    struct Cand { uint32_t rank; int at; uint32_t vl, vr; };
+    auto later = [](const Cand & a, const Cand & b) { return a.rank != b.rank ? a.rank > b.rank : a.at > b.at; };
+    std::priority_queue<Cand, std::vector<Cand>, decltype(later)> q(later);
+    std::string key;
+    auto push = [&](int i) {
+        const int j = sy[i].next;
+        if (j < 0) return;
+        key = sy[i].s; key += char(0); key += sy[j].s;
+        if (const auto it = merge_rank_.find(key); it != merge_rank_.end()) q.push({it->second, i, sy[i].ver, sy[j].ver});
+    };
+    for (int i = 0; i + 1 < n; ++i) push(i);
+    while (!q.empty()) {
+        const Cand c = q.top(); q.pop();
+        const int i = c.at, j = sy[i].next;
+        if (j < 0 || sy[i].ver != c.vl || sy[j].ver != c.vr) continue;  // a symbol of this pair changed since it was queued
+        sy[i].s += sy[j].s; ++sy[i].ver;
+        sy[i].next = sy[j].next; if (sy[j].next >= 0) sy[sy[j].next].prev = i;
+        sy[j].s.clear(); ++sy[j].ver; sy[j].next = -1;
+        if (sy[i].prev >= 0) push(sy[i].prev);
+        push(i);
+    }
+    std::vector<uint32_t> ids;
+    for (int i = n ? 0 : -1; i >= 0; i = sy[i].next) {
+        const auto & s = sy[i].s;
+        const auto it = piece_to_id_.find(s);
+        if (it == piece_to_id_.end()) throw std::runtime_error("tokenizer has no byte-fallback piece for \"" + s + "\"");
+        ids.push_back(it->second);
+        if (lens) { uint32_t m = 0; for (unsigned char ch : s) m += (ch & 0xC0) != 0x80; lens->push_back(m); }
+    }
     return ids;
 }
 
@@ -252,6 +307,50 @@ std::vector<uint32_t> Tokenizer::encode(const std::string & text) const {
     }
     return ids;
 }
+std::vector<uint32_t> Tokenizer::encode(const std::string & text, Specials specials,
+                                       std::vector<std::pair<uint32_t, uint32_t>> * offsets) const {
+    if (specials == Specials::all && !offsets) return encode(text);
+    std::vector<uint32_t> ids, lens; size_t cursor=0;
+    if (offsets) offsets->clear();
+    auto plain=[&](size_t from, size_t to){
+        size_t at=from;
+        for(const auto & part:pretokenize(text.substr(from,to-from))){
+            lens.clear(); auto x=encode_piece(part,&lens); ids.insert(ids.end(),x.begin(),x.end());
+            if(offsets) for(auto n:lens){offsets->emplace_back(uint32_t(at),uint32_t(at+n)); at+=n;}
+            else at+=part.size();
+        }
+        if(at!=to) throw std::runtime_error("tokenizer: pretokenized pieces do not cover the text");
+    };
+    while(cursor<text.size()) {
+        size_t pos=std::string::npos, end=0; const std::string * found=nullptr;
+        auto scan=[&](const std::string & sp){auto p=text.find(sp,cursor);if(p<pos){pos=p;end=p+sp.size();found=&sp;}};
+        if(specials==Specials::all) for(const auto & [sp,id]:special_to_id_){(void)id;scan(sp);}
+        else for(const auto & sp:user_specials_) scan(sp);
+        if(pos==std::string::npos){plain(cursor,text.size());break;}
+        if(pos>cursor) plain(cursor,pos);
+        ids.push_back(special_to_id_.at(*found));
+        if(offsets) offsets->emplace_back(uint32_t(pos),uint32_t(end));
+        cursor=end;
+    }
+    return ids;
+}
+size_t Tokenizer::warm_cache(unsigned threads) const {
+    if (!threads) threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::string> pieces;
+    for (const auto & s : id_to_piece_) {
+        if (s.empty()) continue;
+        std::string raw;
+        for (const auto & r : runes(s)) { const int b = code_to_byte(r.cp); if (b < 0) { raw.clear(); break; } raw.push_back(char(b)); }
+        if (!raw.empty() && raw.size() <= 64) pieces.push_back(std::move(raw));
+    }
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads; ++t)
+        pool.emplace_back([&, t] { for (size_t i = t; i < pieces.size(); i += threads) encode_piece(pieces[i]); });
+    for (auto & th : pool) th.join();
+    std::shared_lock<std::shared_mutex> l(cache_->m);
+    return cache_->map.size();
+}
+
 std::string Tokenizer::decode(const std::vector<uint32_t> & ids) const {
     std::string out;
     for(uint32_t id:ids){if(id>=id_to_piece_.size()||id_to_piece_[id].empty())continue; const auto & s=id_to_piece_[id]; bool special=false;for(const auto & p:special_to_id_)if(p.first==s){special=true;break;} if(special)continue;

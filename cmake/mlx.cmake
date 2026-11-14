@@ -12,7 +12,7 @@ if(NOT TARGET jaccl::jaccl AND MLX_DIR AND EXISTS "${MLX_DIR}/../jaccl/jacclTarg
 endif()
 enable_language(OBJCXX)
 add_library(tqmlx STATIC src/backends/metal/tq4.cpp src/backends/metal/tq3.cpp src/backends/metal/q6.cpp src/backends/metal/q8.cpp
-            src/backends/metal/q4_embedding.cpp src/backends/metal/weights.cpp src/backends/metal/kquant.cpp src/spec/draft_tree.cpp)
+            src/backends/metal/q4_embedding.cpp src/backends/metal/weights.cpp src/backends/metal/kquant.cpp src/spec/draft_tree.cpp src/spec/suffix_copy.cpp)
 target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/metal)
 target_link_libraries(tqmlx PUBLIC mlx tqllm)
 target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp
@@ -93,6 +93,13 @@ if(BUILD_TESTING)
   add_executable(test-mlx-cross-thread-model tests/mlx_cross_thread_model.cpp src/backends/metal/engine_mlx.cpp)
   target_include_directories(test-mlx-cross-thread-model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-mlx-cross-thread-model PRIVATE tqmlx tqllm)
+  # model test: copy drafts beside the token tree keep the greedy text and fill the 16-row verify (TQLLM_TEST_MODEL / _DRAFTER)
+  add_executable(test-copy-first tests/copy_first.cpp src/engine/model.cpp src/engine/registry.cpp src/backends/metal/engine_mlx.cpp
+                 src/backends/metal/builtin_mlx.cpp src/core/gguf_mapped.cpp)
+  target_include_directories(test-copy-first PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  target_link_libraries(test-copy-first PRIVATE tqmlx tqllm Threads::Threads)
+  add_test(NAME copy_first COMMAND test-copy-first)
+  set_tests_properties(copy_first PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # pip wheel (pyproject.toml, scikit-build-core): tqserve inside the tqllm package, linked to the mlx package's libmlx

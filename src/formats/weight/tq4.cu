@@ -341,7 +341,7 @@ constexpr uint32_t TQ3_CB_HI = 0x01315372u;  // negative: -14, -45, -79, -127
 // activation fragment (L2) serves MT tiles (the 3-bit weights are fewer bytes than the activations they meet). Per row
 // and column the k split, MMA order and 8-warp reduction do not depend on MT or PF: same results.
 template <int NCOL, class OUT, int PF = 0, int MT = 1, bool PFX = false, int BITS = 3>
-__global__ void __launch_bounds__(256) tq3b_matvec_h_k(const uint32_t * w3, const __half * sc,
+__global__ void __launch_bounds__(256, NCOL > 8 && MT == 2 ? 2 : 1) tq3b_matvec_h_k(const uint32_t * w3, const __half * sc,
                                                                       const __half * xh, OUT * y, int rows, int k, int nc,
                                                                       int ldy) {
     constexpr int NACC = NCOL > 8 ? 8 : 4;
@@ -783,14 +783,16 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
             if (u > best + 1e-9) best = u, nw = w;
         }
     }
-    // the 16-row split-K kernel (tq3b_matvec_h_k) for <= 16 columns; prefetch mode 0 / 1 / 2 (see the kernel);
-    // variants 20 / 21 / 22 force it with that mode (tests / benches)
-    auto launch_new = [&](int pfm) {
+    // the 16-row split-K kernel (tq3b_matvec_h_k) for <= 16 columns; prefetch mode 0 / 1 / 2 (see the kernel), 16 x mtn
+    // rows per block; variants 20 / 21 / 22 force it with that mode, 23-25 the same with 2 row tiles, 26-28 with 4 (benches)
+    auto launch_new = [&](int pfm, int mtn = 1) {
         const uint32_t * w = reinterpret_cast<const uint32_t *>(w4);
-        const int grid = (rows + 15) / 16;
+        const int grid = (rows + 16 * mtn - 1) / (16 * mtn);
         auto go3 = [&](auto ncol_c, auto pf_c) {
             constexpr int NC = decltype(ncol_c)::value, P = decltype(pf_c)::value;
-            tq3b_matvec_h_k<NC, OUT, P, 1, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            if (mtn == 4) tq3b_matvec_h_k<NC, OUT, P, 4, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            else if (mtn == 2) tq3b_matvec_h_k<NC, OUT, P, 2, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            else tq3b_matvec_h_k<NC, OUT, P, 1, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
         };
         auto by_pf = [&](auto ncol_c) {
             if (pfm == 2) go3(ncol_c, std::integral_constant<int, 2>{});
@@ -800,14 +802,14 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
         if (ncols <= 8) by_pf(std::integral_constant<int, 8>{});
         else by_pf(std::integral_constant<int, 16>{});
     };
-    if (v >= 20 && v <= 22 && ncols <= 16) {
-        launch_new(v - 20);
+    if (v >= 20 && v <= 28 && ncols <= 16) {
+        launch_new((v - 20) % 3, v >= 26 ? 4 : v >= 23 ? 2 : 1);
         return;
     }
     if (v == 0) {  // default: the rule table (src/formats/weight/matvec_rules.hpp)
         const auto pick = mvr::choose(BITS, rows, k, ncols);
         if (pick.kern == mvr::Kern::Split16) {
-            launch_new(pick.pf);
+            launch_new(pick.pf, pick.mt);
             return;
         }
     }

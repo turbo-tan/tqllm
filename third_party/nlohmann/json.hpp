@@ -38,6 +38,13 @@ public:
 private:
     const std::string & s_;
     size_t i_ = 0;
+    int depth_ = 0;  // arrays / objects open; request bodies are untrusted, so recursion is bounded
+    static constexpr int kMaxDepth = 512;
+    struct Nest {
+        Parser & p;
+        explicit Nest(Parser & q) : p(q) { if (++p.depth_ > kMaxDepth) p.fail("nesting deeper than 512 levels"); }
+        ~Nest() { --p.depth_; }
+    };
 
     [[noreturn]] void fail(const char * what) { throw std::runtime_error(std::string("safetensors JSON: ") + what); }
     void ws() {
@@ -126,6 +133,7 @@ private:
         Json v;
         const char c = peek();
         if (c == '{') {
+            const Nest nest(*this);
             v.kind = Json::Object;
             ++i_;
             if (peek() == '}') return ++i_, v;
@@ -139,6 +147,7 @@ private:
             }
         }
         if (c == '[') {
+            const Nest nest(*this);
             v.kind = Json::Array;
             ++i_;
             if (peek() == ']') return ++i_, v;

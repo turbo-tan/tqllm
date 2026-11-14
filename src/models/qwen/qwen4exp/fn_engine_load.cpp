@@ -25,10 +25,16 @@ std::array<ExpertPayload,3> mapped_cold_payload(FnServe & f,int layer,int expert
 }
 
 
+// decode scratch per verify row (measured on a GB10: 11-13 1,604 MB high at np 16 x 3 rows, ~30.7 MB a row; 11-14 2,182 MB
+// at np 32 x 2 rows, ~32.1 MB a row; a 31 MB row filled the arena to its last MB) and the rows of a batched decode step
+// (kBatchRowsMax, decode_rules.hpp): no step's temporaries spill out of the arena
+constexpr int kArenaRowMb = 34, kArenaRowsMax = tqllm::flashnext::kBatchRowsMax;
 FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options) : context_(context), slots_(size_t(std::max(1, nslots))) {
     // up to 16 sequences: each layer keeps np x topk slots and a request makes room for its K/V at its start (decode_rules.hpp
-    // lift_layer_floor, memory_plan.hpp request_shrink_bytes); 3090 np 10 / 12 exact, all texts == np 1 (11-05)
-    require(nslots <= 16, "Flash-Next serves up to --np 16");
+    // lift_layer_floor, memory_plan.hpp request_shrink_bytes); 3090 np 10 / 12 exact, all texts == np 1 (11-05). With every
+    // expert resident (slots = 512, a GB10) no layer runs short of slots: up to 32, the batched kernels' sequence limit
+    // (GdnSeqs / AttnSeqs / QsaBlockJobs kMax); checked once the manifest is read
+    require(nslots <= 32, "Flash-Next serves up to --np 32");
     auto & f = f_; std::ifstream in(manifest); require(bool(in), "cannot open Flash-Next manifest " + manifest);
     const auto dir = std::filesystem::path(manifest).parent_path();
     auto resolve = [&](const std::string & v) { return std::filesystem::path(v).is_absolute() ? v : (dir / v).string(); };
@@ -104,14 +110,14 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
                    // (start-up arena capped at the 8K-chunk size: a bigger chunk's arena is borrowed per request, not held while
                    // the banks are built)
                    f.chunk >= 256 ? std::min(f.chunk, 8192) / 5 + 64 : 2 * f.chunk + 128,
-                   slots_.size() > 1 ? 26 * std::min(64, int(slots_.size()) * (f.drafts + 1)) + 128 : 0})) << 20;  // + one span per batched verify (~26 MB a row)
+                   slots_.size() > 1 ? kArenaRowMb * std::min(kArenaRowsMax, int(slots_.size()) * (f.drafts + 1)) + 128 : 0})) << 20;  // + one span per batched verify row
     ck(cudaMalloc(&f.arena.base, f.arena.size)); g_arena = &f.arena; f.arena_prefill = f.arena.size;
     // --prefill-arena-mb: the prefill arena alone (bigger dense sub-chunks); the startup and decode arena keep their size,
     // the request's borrow evicts banks for the difference and they refill after the prompt
     f.arena_prefill = std::max({f.arena_prefill, size_t(std::max(0L, options.tune.arena_mb)) << 20, tqllm::prefill_arena_bytes(f.chunk)});
     // decode needs far less than a layer-major prefill (one step's temporaries); the arena shrinks after each long prompt
     f.arena_decode = std::getenv("TQFN_ARENA_MB") ? f.arena.size : std::min(f.arena.size, size_t(std::max(256,
-                     slots_.size() > 1 ? 26 * std::min(64, int(slots_.size()) * (f.drafts + 1)) + 128 : 0)) << 20);
+                     slots_.size() > 1 ? kArenaRowMb * std::min(kArenaRowsMax, int(slots_.size()) * (f.drafts + 1)) + 128 : 0)) << 20);
     f.arg_store = {"tqserve", "-"}; for (const auto & g : f.ggufs) f.arg_store.push_back(g);
     f.arg_store.push_back("--mtp"); f.arg_store.push_back(f.mtp); if (f.gsq_rco) f.arg_store.push_back("--gsq-rco");
     for (auto & a : f.arg_store) f.argv.push_back(a.data());
@@ -120,6 +126,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     { int dev = 0, um = 0; cudaGetDevice(&dev);
       f.cp->run.unified_memory = cudaDeviceGetAttribute(&um, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && um; }
     const auto & c = f.cp->config; auto & checkpoint = *f.cp; FnConfig & run = checkpoint.run; FnRuntime & rt = checkpoint.rt;
+    require(nslots <= tqllm::flashnext::np_max(f.slots_auto, f.slots, c.experts),
+            "Flash-Next serves up to --np 16 unless every expert is resident (slots=" + std::to_string(c.experts) + " in the manifest)");
     rt.kv_capacity = int(context);  // per slot
     int integrated = 0; { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev); }
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
@@ -130,6 +138,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
                      "a pinned pack would not fit this machine's RAM");
     run.small_card = f.slots_auto && (!f.experts.empty() || pack_in_memory) && tqllm::device_free_bytes() < (size_t(16) << 30);
+    run.parallel = slots_.size() > 1;
     // One sequence: adaptive draft length (stop below a 0.9 draft probability, next-layer prediction for 6-token blocks):
     // 3090 chat +1.5 %, 32K +3 %; GB10 32K +4.4 %; text identical to drafts=3 (verify is batch-invariant). Not while a
     // CPU expert pool serves the misses: it takes blocks of at most its row budget (decode_rules.hpp sequence_drafts).
@@ -140,12 +149,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // the decode pool's row budget (0: no pool): the banks' verify floor and the memory plan's draft count follow it, so a
     // plan can no longer assume a 4-row block for a card whose pool does not run (11-12)
     auto cpu_pool_rows_now = [&] {
-        return tqllm::flashnext::cpu_pool_rows(tqllm::flashnext::cpu_miss_threads(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
-                                                                                  run.exact, int(std::thread::hardware_concurrency())), run.small_card);
+        return tqllm::flashnext::cpu_pool_rows(tqllm::flashnext::cpu_miss_threads(tqllm::flashnext::cpu_miss_env(),
+                                                                                  run.exact, int(std::thread::hardware_concurrency()),
+                                                                                  run.small_card && run.parallel), run.small_card);
     };
     if (slots_.size() == 1) {
         const DraftPlan plan = sequence_drafts(f.drafts, run.exact,
-                                               std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1,
+                                               tqllm::flashnext::cpu_miss_env(),
                                                int(std::thread::hardware_concurrency()), !f.slots_auto && f.slots >= c.experts);
         f.drafts = plan.drafts;
         if (plan.adaptive) {
@@ -322,8 +332,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     if (f.packed.tiled) { tqllm_cuda::set_tiled_experts(true); run.tile_experts = true; }
     // the CPU pool reads the pinned copy whenever it runs (decode_rules.hpp); the GGUF expert pages would hold the experts twice
-    if (tqllm::flashnext::cpu_pool_reads_packed(std::getenv("TQFN_CPU_MISS") ? std::atoi(std::getenv("TQFN_CPU_MISS")) : -1, run.exact,
-                                                int(std::thread::hardware_concurrency()))) {
+    if (tqllm::flashnext::cpu_pool_reads_packed(tqllm::flashnext::cpu_miss_env(), run.exact,
+                                                int(std::thread::hardware_concurrency()), run.small_card && run.parallel)) {
         static CpuPackedView pv; pv = CpuPackedView{}; pv.map = f.packed.map; pv.base = f.packed.base; pv.block = f.packed.block;
         pv.sizes = f.packed.sizes; pv.tiled = f.packed.tiled; pv.layers = f.packed.layers;
         for (int l = 0; l < f.packed.layers; ++l) pv.fmt.push_back(expert_u4h_ids(checkpoint, l));
@@ -453,7 +463,8 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
           // np 4 at 32K ran out of memory in the second request's state (F38)
           const size_t nseq = slots_.size();
           const size_t need = run.small_card ? size_t(512) << 20 : auto_keep_bytes(nseq, state, reserve);
-          if (run.small_card) std::fprintf(stderr, "tqllm: small card: CPU expert pool, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n");
+          if (run.small_card) std::fprintf(stderr, "tqllm: small card: %s, 64 MTP slots, banks up to a 512 MB keep (long prompts borrow banks)\n",
+                                           run.parallel && tqllm::flashnext::cpu_miss_env() < 0 ? "CPU expert pool off (--np > 1; one request keeps it)" : "CPU expert pool");
           size_t extra = 0;  // what rebuilding the banks takes beyond the slots themselves (measured, not estimated)
           for (int round = 0; round < 3; ++round) {
               for (int l = 0; l < c.layers; ++l) f.cache->release_bank(l);

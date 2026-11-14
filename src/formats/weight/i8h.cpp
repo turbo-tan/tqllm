@@ -30,7 +30,7 @@ struct I8h final : WeightFormat {
     const char * name() const override { return "I8H"; }
     // a several-sequence verify block (9..32 columns) in one launch: the u4h-family kernel keeps each column's k-order
     // (tests/matvec_wide.cu); widths that are not a multiple of 64 take i8h_matvec, run in launches of 8 columns as before
-    int max_exact_cols() const override { return 32; }
+    int max_exact_cols() const override { return 64; }
     int max_batch_cols() const override { return 32; }
     int u4h_id() const override { return 15; }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
