@@ -1,6 +1,7 @@
 // Shared FP32 kernels (common_kernels.cuh): the GLM-5.3 engine's originals, unchanged.
 #include "common_kernels.cuh"
 #include <cfloat>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
