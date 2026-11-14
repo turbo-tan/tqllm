@@ -11,8 +11,9 @@
 # --model / --drafter / --draft-vocab set TQLLM_TEST_MODEL / _DRAFTER / _DRAFT_VOCAB (values already in the environment
 # are kept when a flag is not given); --env sets any other test variable (embedder fixtures, TQLLM_TEST_TOKENS, ...).
 # A model test is a registered test whose source reads one of the model-file variables below; each is listed as run,
-# skipped, no-model (passed with none of its model variables set) or FAIL. Exit status: 0 when every test passed
-# and every model test ran with its model, 1 otherwise.
+# skipped, no-model (passed with none of its model variables set), no-model-available (listed in TQLLM_GATE_NO_MODEL:
+# nobody has its files; shown, not failing) or FAIL. Exit status: 0 when every test passed and every other model test
+# ran with its model, 1 otherwise.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -86,12 +87,16 @@ gpu = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
 # a model test that passed while none of its model variables was set ran without a model
 for n, used in model_tests.items():
     if status.get(n) == "run" and not any(os.environ.get(v) for v in used): status[n] = "no-model"
+# TQLLM_GATE_NO_MODEL: tests whose model files nobody has (comma list); reported, never failing the gate
+unavailable = {x.strip() for x in os.environ.get("TQLLM_GATE_NO_MODEL", "").split(",") if x.strip()}
+for n in model_tests:
+    if n in unavailable and status.get(n) in ("no-model", "skipped"): status[n] = "no-model-available"
 models = " ".join(f"{n}={status.get(n, 'missing')}" for n in sorted(model_tests))
 line = (f"GATE {commit}{dirty} {socket.gethostname()} ({gpu[0] if gpu else 'no GPU'}) passed {passed}/{total}"
         f"{' failed ' + ','.join(failed) if failed else ''} | model tests {len(model_tests)}: {models}")
 print(line)
 if record:
     open(record, "a").write(line + "\n")
-ok = ctest_rc == 0 and not failed and all(status.get(n) == "run" for n in model_tests)
+ok = ctest_rc == 0 and not failed and all(status.get(n) in ("run", "no-model-available") for n in model_tests)
 sys.exit(0 if ok else 1)
 PY
