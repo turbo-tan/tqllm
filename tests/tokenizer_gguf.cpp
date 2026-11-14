@@ -1,6 +1,7 @@
 // GGUF-embedded tokenizer: a mock GGUF checks loading, merges, specials and errors; with TQLLM_TOK_GGUF and
 // TQLLM_TOK_TQTOK set, a real model's GGUF metadata must give the same ids as its tokenizer.tqtok.
 #include "tqllm/tokenizer.hpp"
+#include "platform/os_file.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -10,7 +11,6 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 namespace {
 int failures = 0;
@@ -72,7 +72,7 @@ const char * kTexts[] = {
 }
 
 int main() {
-    const auto dir = std::filesystem::temp_directory_path() / ("tqllm_tok_gguf_" + std::to_string(::getpid()));
+    const auto dir = std::filesystem::temp_directory_path() / ("tqllm_tok_gguf_" + std::to_string(tqllm::os::process_id()));
     std::filesystem::create_directories(dir);
 
     tqllm::Tokenizer t;

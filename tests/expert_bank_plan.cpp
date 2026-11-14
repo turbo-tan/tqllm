@@ -22,6 +22,15 @@ void ok(bool pass, const char * what) {
 }
 constexpr size_t MB = size_t(1) << 20;
 
+// an empty value removes the variable
+void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
 // mock routing: top-k per token over `pool` of the `experts` experts; returns the distinct experts seen over `tokens`
 // tokens, which is what an engine measures per layer to size its banks.
 int routing_spread(int experts, int topk, int tokens, int pool, unsigned seed) {
@@ -157,10 +166,10 @@ int main() {
         const auto clamped = parse_layer_slots("900,10,10,10", 300, 256);
         ok(clamped[0] == 256 && clamped[1] >= 1, "clamped to the expert count, never to zero");
         ok(parse_layer_slots("", 64, 256).empty(), "an empty list is no override");
-        setenv("TQLLM_TEST_LAYER_SLOTS", "5,6,7", 1);
+        set_env("TQLLM_TEST_LAYER_SLOTS", "5,6,7");
         ok(layer_slots_text("TQLLM_TEST_LAYER_SLOTS", "") == "5,6,7", "the environment is read");
         ok(layer_slots_text("TQLLM_TEST_LAYER_SLOTS_UNSET", "").empty(), "unset environment, no experts file: no override");
-        unsetenv("TQLLM_TEST_LAYER_SLOTS");
+        set_env("TQLLM_TEST_LAYER_SLOTS", "");
     }
     // 7. the ledger over per-layer banks of different sizes: it borrows the fewest LRU banks that cover the shortfall,
     //    refuses to refill while the prefill buffers are held, and gives every bank back.

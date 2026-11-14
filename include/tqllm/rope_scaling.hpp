@@ -39,8 +39,9 @@ inline RopeTable rope_scaling_table(const RopeScaling & s, int rot, float base, 
         return t;
     }
     const float ext = s.ext_factor < 0 ? 1.f : s.ext_factor;
+    const double pi = 3.14159265358979323846;  // not M_PI: MSVC defines it only under _USE_MATH_DEFINES
     auto corr = [&](float n_rot) {
-        return float(rot) * std::log(float(orig_ctx) / (n_rot * 2.f * float(M_PI))) / (2.f * std::log(base));
+        return float(rot) * std::log(float(orig_ctx) / (n_rot * 2.f * float(pi))) / (2.f * std::log(base));
     };
     const float low = std::max(0.f, std::floor(corr(s.beta_fast))), high = std::min(float(rot - 1), std::ceil(corr(s.beta_slow)));
     for (int d = 0; d < pairs; ++d) {
