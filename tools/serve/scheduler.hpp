@@ -2,6 +2,7 @@
 // Multi-slot request scheduler (tqserve --np N): connection threads enqueue requests and wait; one engine thread
 // owns every model call, admits queued requests into free slots and round-robins one draft + verify step per slot.
 #include "admission.hpp"
+#include "cuda_health.hpp"
 #include "router.hpp"
 #include "session.hpp"
 #include "tqllm/model.hpp"
@@ -187,6 +188,16 @@ private:
     // the engine forgets a failed request's slot (Engine::spec_abort): otherwise it still counts it as running, refuses
     // the next request for memory while the scheduler sees nothing to wait for, and that refusal becomes another 500
     void abort_slot(int s) { try { model_.spec_abort(s); } catch (...) {} }
+    // The CUDA context is lost (cuda_health.hpp: tqserve exits shortly): every running and queued request gets its error
+    // now, none waits for the exit
+    void fail_everything(const std::string & why) {
+        std::deque<std::shared_ptr<Job>> queued;
+        { std::lock_guard<std::mutex> lock(mutex_); queued.swap(queue_); }
+        const std::string error = "generation failed: the CUDA context is lost (" + why + "); tqserve is restarting";
+        for (auto & job : queued) { job->result.error = error; complete(job); }
+        for (size_t s = 0; s < active_.size(); ++s)
+            if (active_[s]) { active_[s]->result.error = error; abort_slot(int(s)); complete(active_[s]); }
+    }
     void complete(std::shared_ptr<Job> & job) {
         if (!job->result.error.empty()) std::fprintf(stderr, "tqserve: request failed (HTTP 500): %s\n", job->result.error.c_str());
         {
@@ -241,6 +252,16 @@ private:
                     admitted.push_back(active_[size_t(best)]);
                 }
             }
+            if (!admitted.empty()) {  // this thread runs the engine: clear a pending CUDA error; a lost context fails them all
+                if (const std::string lost = check_cuda_context(); !lost.empty()) fail_everything(lost);
+#if TQLLM_WITH_CUDA
+                {   // TQLLM_DEBUG=cuda_fault:N: the N-th admitted request faults the GPU (the lost-context test)
+                    static const int fault_at = tqllm::debug_int("cuda_fault");
+                    static int admits = 0;
+                    if (fault_at > 0 && admits < fault_at && (admits += int(admitted.size())) >= fault_at) tqllm_cuda::debug_device_fault();
+                }
+#endif
+            }
             for (size_t s = 0; s < active_.size(); ++s) {  // prefill newly admitted requests
                 auto & job = active_[s];
                 if (!job || std::find(admitted.begin(), admitted.end(), job) == admitted.end()) continue;
@@ -275,6 +296,7 @@ private:
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     abort_slot(int(s));
                     complete(job);
+                    if (const std::string lost = check_cuda_context(); !lost.empty()) fail_everything(lost);
                 }
             }
             for (size_t s = 0; s < active_.size(); ++s) {  // cancelled streams (client gone)
@@ -297,6 +319,7 @@ private:
                     job->result.error = std::string("generation failed: ") + e.what();  // tqserve kFailed: HTTP 500
                     abort_slot(ids[0]);
                     complete(job);
+                    if (const std::string lost = check_cuda_context(); !lost.empty()) fail_everything(lost);
                 }
             } else if (!ids.empty()) {  // batched: one verify pass over all slots
                 std::vector<char> done;
@@ -314,6 +337,7 @@ private:
                         abort_slot(id);
                         complete(job);
                     }
+                    if (const std::string lost = check_cuda_context(); !lost.empty()) fail_everything(lost);
                 }
             }
         }

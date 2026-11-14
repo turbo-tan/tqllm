@@ -206,6 +206,13 @@ public:
         if (live && shared(uint32_t(seq.size()))) return uint32_t(seq.size());
         return shared(snap) ? snap : 0;
     }
+    // A failed request (tqserve): its slot's prompt cache may name tokens whose K/V or recurrent state a skipped kernel
+    // never wrote, so nothing of it is reused; the slot's next request prefills from position 0
+    void spec_abort(int s) override {
+        if (s < 0 || s >= nslots) return;
+        if (s == active) { pc_drop(); pc_seq.clear(); }
+        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); }
+    }
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
         if (!pc_on || s < 0 || s >= nslots) return 0;
         const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt)

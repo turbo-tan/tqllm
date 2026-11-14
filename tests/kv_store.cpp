@@ -117,7 +117,18 @@ struct FakeMemory : KvMemory {
         --phys_live;
         delete P;
     }
+    int fail_map_phys = -1;  // > 0: the n-th map_phys from now fails (out of memory under another process's load)
+    bool covered(char * a, size_t n) {  // every byte of [a, a + n) is mapped (no hole a kernel would fault on)
+        for (size_t o = 0; o < n; o += gran) {
+            Range * r = range_of(a + o, gran);
+            bool hit = false;
+            for (const auto & m : r ? r->maps : std::vector<Map>{}) hit = hit || (a + o >= m.at && a + o < m.at + m.bytes);
+            if (!hit) return false;
+        }
+        return true;
+    }
     bool map_phys(void * at, void * p) override {  // whole allocation only, as cuMemMap
+        if (fail_map_phys > 0 && --fail_map_phys == 0) return false;
         char * a = static_cast<char *>(at);
         const size_t n = static_cast<Phys *>(p)->bytes, off = 0;
         Range * r = range_of(a, n);
@@ -398,6 +409,68 @@ static void test_staged() {
     }
 }
 
+// a remap that fails while a granule moves to or from host (11-14, 3090: an out-of-memory map beside another process) leaves
+// no unmapped granule in the K/V range: the old mapping and the rows are back, the request fails, the next one runs
+static void test_staged_remap_failure() {
+    const int64_t ctx = 2048, window = 512, blk = 48;
+    const int layers = 4;
+    FakeMemory mem(size_t(1) << 30, size_t(1) << 30);
+    mem.gran = page_granule();
+    const KvGeometry g{layers, 448, 448, ctx, window, true};
+    KvPool pool(mem, g, 1, 0);
+    auto s = kv_store_policy("flat")->make(pool, ctx);
+    s->reserve(ctx);
+    auto byte_of = [](int l, bool key, int64_t pos) { return uint8_t(pos * 5 + l * 17 + (key ? 0 : 77)); };
+    auto write_block = [&](int64_t p0, int64_t p1) {
+        for (int l = 0; l < layers; ++l)
+            for (bool key : {true, false})
+                for (int64_t p = p0; p < p1; ++p) std::memset(static_cast<char *>(s->base(l, key)) + p * 448, byte_of(l, key, p), 448);
+    };
+    auto holes = [&](int64_t end) {  // granules of [0, end) rows without a mapping, over every layer and side
+        int h = 0;
+        for (int l = 0; l < layers; ++l)
+            for (bool key : {true, false}) {
+                char * b = static_cast<char *>(s->base(l, key));
+                for (size_t o = 0; o < size_t(end) * 448; o += mem.gran) h += !mem.covered(b + o, mem.gran);
+            }
+        return h;
+    };
+    int64_t p = 0;
+    for (; p < ctx && pool.evictions() == 0; p += blk) { CHECK(pool.stage_ensure(p, p + blk), "fills"); write_block(p, p + blk); }
+    // the next eviction's maps fail at each step of the move (first staging map of layer 0, a later layer's device map)
+    for (const int nth : {1, 2, 5}) {
+        const auto ev = pool.evictions();
+        int64_t q = p;
+        bool threw = false;
+        mem.fail_map_phys = nth;
+        for (; q < ctx && pool.evictions() == ev && !threw; q += blk) {
+            try { if (pool.stage_ensure(q, q + blk)) write_block(q, q + blk); } catch (const std::runtime_error &) { threw = true; }
+        }
+        mem.fail_map_phys = -1;
+        CHECK(threw, "a failed remap fails the request (map %d)", nth);
+        CHECK(holes(p) == 0, "no unmapped granule below the written rows after a failed eviction (map %d): %d holes", nth, holes(p));
+        int bad = 0;
+        for (int l = 0; l < layers; ++l)
+            for (bool key : {true, false})
+                for (int64_t r = (p > 4 * blk ? p - 4 * blk : 0); r < p; ++r)
+                    if (size_t(r) * 448 >= pool.staged_bytes(key) + mem.gran)  // rows still on the device (not aliased to staging)
+                        bad += static_cast<const uint8_t *>(s->base(l, key))[r * 448] != byte_of(l, key, r);
+        CHECK(bad == 0, "the device rows read back unchanged after the failed eviction (map %d): %d bad", nth, bad);
+    }
+    // and the next request still runs: every later block fits, rows read back
+    bool ok = true;
+    for (; p < ctx && ok; p += blk) { ok = pool.stage_ensure(p, std::min(ctx, p + blk)); if (ok) write_block(p, std::min(ctx, p + blk)); }
+    CHECK(ok && pool.evictions() > 1 && holes(ctx) == 0, "after the failures the request runs to the end with evictions, no holes");
+    // a truncate (the next request rewrites below the evicted boundary) whose map fails: still no hole
+    mem.fail_map_phys = 3;
+    bool threw = false;
+    try { pool.stage_truncate(100); } catch (const std::runtime_error &) { threw = true; }
+    mem.fail_map_phys = -1;
+    CHECK(threw && holes(ctx) == 0, "a failed truncate leaves no unmapped granule (%d holes)", holes(ctx));
+    pool.stage_truncate(100);  // live afterwards: rows below 100 and the device window above them (later rows map as they stage)
+    CHECK(holes(100 + window / 2) == 0, "the retried truncate maps every live row (%d holes)", holes(100 + window / 2));
+}
+
 // a cache with no V side (value_row 0): the GLM nope-MLA latent cache, one row per position that is both key and value
 static void test_no_v_side() {
     const int64_t ctx = 8192, row = 512 * 4;  // kv_lora_rank 512, FP32
@@ -461,6 +534,7 @@ int main() {
     test_newest_page_stays();
     test_host_tail();
     test_staged();
+    test_staged_remap_failure();
     test_no_v_side();
     test_out_of_memory();
     if (fails) std::printf("kv_store: %d failure(s)\n", fails);

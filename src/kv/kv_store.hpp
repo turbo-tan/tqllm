@@ -17,6 +17,9 @@ namespace tqllm {
 enum class KvTier : uint8_t { none, device, host };
 
 // Device and host allocations and copies: CUDA in the engine (make_cuda_kv_memory), a byte budget in tests.
+// A remap of K/V memory that failed and could not be undone leaves an unmapped hole in an address range every attention
+// kernel reads: the process cannot serve on (the next read faults the GPU, Xid 31), so it stops with the reason.
+[[noreturn]] void kv_lost_mapping(const char * what);
 struct KvMemory {
     virtual ~KvMemory() = default;
     virtual void * device_alloc(size_t bytes) = 0;  // nullptr when out of memory

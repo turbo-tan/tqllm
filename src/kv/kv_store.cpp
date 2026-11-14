@@ -1,6 +1,8 @@
 #include "kv_store.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -92,6 +94,13 @@ void KvPool::stage_release() {
     dev_ = Arena{};
 }
 
+[[noreturn]] void kv_lost_mapping(const char * what) {
+    std::fprintf(stderr, "tqllm: K/V memory: %s failed and the old mapping could not be restored; the K/V address range "
+                         "has a hole, stopping (restart the server)\n", what);
+    std::fflush(stderr);
+    std::abort();
+}
+
 bool KvPool::stage_ensure(int64_t start, int64_t end) {
     if (!st_.on) return true;
     const size_t gr = st_.gran;
@@ -107,12 +116,24 @@ bool KvPool::stage_ensure(int64_t start, int64_t end) {
                 mem_.copy(static_cast<char *>(st_.host[size_t(l) * 2 + s]) + size_t(c) * gr, base + size_t(c) * gr, gr);
             }
             mem_.sync();
+            // Granule c of every layer moves: its address aliases the staging granule, the device granule moves to c + d.
+            // A map that fails (out of memory under another process's load) puts every layer back as it was: an unmapped
+            // granule inside the live range was read by the next request's attention (FAULT_PDE, Xid 31; 3090, 11-14).
             for (int l = 0; l < g_.layers; ++l) {
                 char * base = static_cast<char *>(dev_.base[size_t(l) * 2 + s]);
+                void * dev_g = st_.ring[size_t(l) * 2 + s][size_t(c % d)];
                 mem_.unmap(base + size_t(c) * gr, gr);
-                if (!mem_.map_phys(base + size_t(c) * gr, st_.staging[l % 2][s][size_t(c)]) ||
-                    !mem_.map_phys(base + size_t(c + d) * gr, st_.ring[size_t(l) * 2 + s][size_t(c % d)]))
-                    throw std::runtime_error("KV store: remapping an evicted granule failed");
+                const bool staged = mem_.map_phys(base + size_t(c) * gr, st_.staging[l % 2][s][size_t(c)]);
+                if (staged && mem_.map_phys(base + size_t(c + d) * gr, dev_g)) continue;
+                bool back = (!staged || (mem_.unmap(base + size_t(c) * gr, gr), true)) && mem_.map_phys(base + size_t(c) * gr, dev_g);
+                for (int k = 0; k < l && back; ++k) {  // the layers already moved
+                    char * b = static_cast<char *>(dev_.base[size_t(k) * 2 + s]);
+                    mem_.unmap(b + size_t(c + d) * gr, gr);
+                    mem_.unmap(b + size_t(c) * gr, gr);
+                    back = mem_.map_phys(b + size_t(c) * gr, st_.ring[size_t(k) * 2 + s][size_t(c % d)]);
+                }
+                if (!back) kv_lost_mapping("evicting a granule to host");
+                throw std::runtime_error("KV store: remapping an evicted granule failed (out of memory); the K/V is unchanged");
             }
             ++st_.e[s];
             ++st_.evictions;
@@ -129,15 +150,32 @@ void KvPool::stage_truncate(int64_t pos) {
         const int64_t c0 = int64_t(size_t(std::max<int64_t>(0, pos)) * row / gr), n = st_.n[s], d = st_.d[s];
         bool moved = false;
         while (st_.e[s] > c0) {
-            const int64_t c = --st_.e[s];
+            const int64_t c = st_.e[s] - 1;
+            // as in stage_ensure: a map that fails puts every layer back (evicted) and leaves no unmapped granule
             for (int l = 0; l < g_.layers; ++l) {
                 char * base = static_cast<char *>(dev_.base[size_t(l) * 2 + s]);
+                void * dev_g = st_.ring[size_t(l) * 2 + s][size_t(c % d)];
                 if (c + d < n) mem_.unmap(base + size_t(c + d) * gr, gr);
                 mem_.unmap(base + size_t(c) * gr, gr);
-                if (!mem_.map_phys(base + size_t(c) * gr, st_.ring[size_t(l) * 2 + s][size_t(c % d)]))
-                    throw std::runtime_error("KV store: restoring an evicted granule failed");
-                mem_.copy(base + size_t(c) * gr, static_cast<char *>(st_.host[size_t(l) * 2 + s]) + size_t(c) * gr, gr);
+                if (mem_.map_phys(base + size_t(c) * gr, dev_g)) {
+                    mem_.copy(base + size_t(c) * gr, static_cast<char *>(st_.host[size_t(l) * 2 + s]) + size_t(c) * gr, gr);
+                    continue;
+                }
+                bool back = mem_.map_phys(base + size_t(c) * gr, st_.staging[l % 2][s][size_t(c)]) &&
+                            (c + d >= n || mem_.map_phys(base + size_t(c + d) * gr, dev_g));
+                for (int k = 0; k < l && back; ++k) {  // the layers already brought back: evicted again (host still holds them)
+                    char * b = static_cast<char *>(dev_.base[size_t(k) * 2 + s]);
+                    void * g2 = st_.ring[size_t(k) * 2 + s][size_t(c % d)];
+                    mem_.sync();
+                    mem_.unmap(b + size_t(c) * gr, gr);
+                    back = mem_.map_phys(b + size_t(c) * gr, st_.staging[k % 2][s][size_t(c)]) &&
+                           (c + d >= n || mem_.map_phys(b + size_t(c + d) * gr, g2));
+                }
+                if (!back) kv_lost_mapping("bringing a granule back from host");
+                if (moved) mem_.sync();
+                throw std::runtime_error("KV store: restoring an evicted granule failed (out of memory); the K/V is unchanged");
             }
+            --st_.e[s];
             moved = true;
         }
         if (moved) mem_.sync();

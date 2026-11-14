@@ -12,3 +12,8 @@ inline cudaError_t clear_stale_cuda_error() {
     return cudaSuccess;
 }
 }  // namespace tqllm
+namespace tqllm_cuda {
+// TQLLM_DEBUG=cuda_fault:N (tqserve): a kernel writes through a bad address on the N-th request, a sticky error (the
+// CUDA context is lost), as a kernel fault after an out-of-memory launch did on a 3090 (11-14, Xid 31)
+void debug_device_fault(cudaStream_t stream = nullptr);
+}  // namespace tqllm_cuda
