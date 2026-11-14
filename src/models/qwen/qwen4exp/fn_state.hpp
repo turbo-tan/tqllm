@@ -51,7 +51,7 @@ struct KvBuf {
         m.unmap(a, page);
         const auto want = to_host ? tqllm::KvTier::host : tqllm::KvTier::device, back = to_host ? tqllm::KvTier::device : tqllm::KvTier::host;
         const bool ok = m.map(a, page, want);
-        if (!ok && !m.map(a, page, back)) throw std::runtime_error("attention KV page lost (both tiers out of memory)");
+        if (!ok && !m.map(a, page, back)) tqllm::kv_lost_mapping("moving an attention K/V page (both tiers out of memory)");
         ck(cudaMemcpy(a, st, page, cudaMemcpyDefault));
         if (ok) on_host[i] = to_host;
         return ok;

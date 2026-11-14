@@ -49,6 +49,20 @@ curl http://localhost:8086/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Explain a hash map."}],"temperature":0,"max_tokens":128}'
 ```
 
+## When the GPU context is lost
+
+A request that fails because the GPU ran out of memory fails on its own (HTTP 500, `generation failed: ...`); the next
+request runs normally. A request that faults the GPU itself (the log shows an Xid, the reply says "illegal memory
+access") leaves the CUDA context unusable: no later request could succeed. tqserve then answers that request (and any
+other request in flight) with HTTP 500, logs
+
+```
+tqserve: the CUDA context is lost (an illegal memory access was encountered); exiting with status 70 so it can be restarted
+```
+
+and exits with status 70 two seconds later. Run it under something that restarts it: `compose.yaml` sets
+`restart: on-failure`; with systemd use `Restart=on-failure`.
+
 ## Native build
 
 ```sh
