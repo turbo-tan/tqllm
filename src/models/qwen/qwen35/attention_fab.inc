@@ -6,6 +6,8 @@ constexpr int NW = 4, ROWS = NW * 16, TILE = 32, DIM = 256, LS = DIM + 8;
 constexpr size_t smem() { return (size_t(ROWS) + 4 * TILE) * LS * 2; }
 }
 
+// CAUSAL = false (contextual embedders: pplx-embed-v2-context): every query sees all seq0 + nq - 1 keys.
+template <bool CAUSAL = true>
 __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __nv_bfloat16 * q, const __nv_bfloat16 * kc,
                                                                        const __nv_bfloat16 * vc, __nv_bfloat16 * y,
                                                                        const int * dseq0, int nq, int heads, int kvheads,
@@ -20,7 +22,8 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
     const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;  // longest (latest) row blocks first
     const int seq0 = *dseq0;                             // query i sees keys < seq0 + i
     const int q_lo = r0 / g, q_hi = min(r0 + ROWS - 1, rows - 1) / g;
-    const int key_end = seq0 + q_hi, ntile = (key_end + TILE - 1) / TILE, mask_from = seq0 + q_lo;
+    const int key_end = CAUSAL ? seq0 + q_hi : seq0 + nq - 1, ntile = (key_end + TILE - 1) / TILE;
+    const int mask_from = CAUSAL ? seq0 + q_lo : key_end;
 
     auto stage = [&](int buf, int t0) {
         for (int i = t; i < TILE * (DIM / 8); i += NW * 32) {
@@ -46,7 +49,8 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
     }
 
     const int ra = warp * 16 + gid, rb = ra + 8;
-    const int lim_a = seq0 + min(r0 + ra, rows - 1) / g, lim_b = seq0 + min(r0 + rb, rows - 1) / g;  // key < lim visible
+    const int lim_a = CAUSAL ? seq0 + min(r0 + ra, rows - 1) / g : key_end;  // key < lim visible
+    const int lim_b = CAUSAL ? seq0 + min(r0 + rb, rows - 1) / g : key_end;
     const float sl2 = scale * 1.4426950408889634f;
     float o[32][4];
 #pragma unroll
@@ -263,13 +267,26 @@ void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, 
     constexpr int DIM = 256;
     static bool configured = false;
     if (!configured) {
-        if (cudaFuncSetAttribute(attn_bf16_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
+        if (cudaFuncSetAttribute(attn_bf16_prefill_k<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
             cudaSuccess)
             throw std::runtime_error("attention_mq256_prefill: 99 KB of shared memory per block unavailable");
         configured = true;
     }
     const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;
-    attn_bf16_prefill_k<<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
+    attn_bf16_prefill_k<true><<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
+}
+
+void attention_mq256_prefill_bidir(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
+                                   __nv_bfloat16 * y, const int * dseq0, int nq, int h, int kh, float scale, cudaStream_t s) {
+    static bool configured = false;
+    if (!configured) {
+        if (cudaFuncSetAttribute(attn_bf16_prefill_k<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
+            cudaSuccess)
+            throw std::runtime_error("attention_mq256_prefill_bidir: 99 KB of shared memory per block unavailable");
+        configured = true;
+    }
+    const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;
+    attn_bf16_prefill_k<false><<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
 }
 
 void attention_mq256_q8(const __nv_bfloat16 * q, const int8_t * kc, const int8_t * vc, const __half * ksc,

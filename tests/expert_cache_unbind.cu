@@ -61,8 +61,14 @@ static void run() {
         const auto st = cache.stats();
         std::printf("misses %llu, copy-engine pieces %llu, zero-copy pieces %llu\n", (unsigned long long) st.misses,
                     (unsigned long long) st.miss_copies, (unsigned long long) st.zero_copy_items);
-        require(st.misses > 0 && st.miss_copies > 0, "no copy-engine misses");
-        require(st.zero_copy_items == 0, "misses fell back to zero-copy kernel reads of host memory");
+        // coherent host memory (GB10): split-mode misses are zero-copy by design; PCIe GPUs: the copy engine only
+        int coh = 0; check(cudaDeviceGetAttribute(&coh, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0));
+        require(st.misses > 0, "no misses");
+        if (coh) require(st.zero_copy_items > 0, "coherent host memory: split-mode misses should read the pack directly");
+        else {
+            require(st.miss_copies > 0, "no copy-engine misses");
+            require(st.zero_copy_items == 0, "misses fell back to zero-copy kernel reads of host memory");
+        }
         cache.release_miss_stream(b);  // the owner unbinds
         require(!cache.split(), "the bound sequence's release left the miss stream bound");
         // no sequence bound (between requests, warm-up): PCIe GPUs still copy misses by the copy engine, never zero-copy

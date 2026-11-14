@@ -45,6 +45,7 @@ int main() {
     bool low = false;
     auto low_memory = [&] { return low; };
     tqllm::GraphLru<int> lru(3);
+    lru.set_floor(0);  // the policy below: low memory empties the cache
     for (int k = 1; k <= 3; ++k) lru.insert(0, uint64_t(k), [&] { return 100 + k; }, low_memory, quiesce, destroy);
     expect("hit returns the graph", lru.find(0, 1) == 101);  // 1 is now the most recent
     expect("family is part of the key", lru.find(1, 1) == 0);
@@ -68,6 +69,18 @@ int main() {
     expect("other errors propagate", rethrown && lru.size() == 1);
     lru.clear(destroy);
     expect("clear frees everything", lru.size() == 0 && lru.evictions() == freed.size());
+    // a step's working set under constant low memory (16 GB host-tail fit, free < graph_keep): with a floor the 3 graphs are
+    // captured once; with floor 0 (low memory empties the cache) every use is a capture
+    for (const size_t floor : {size_t(4), size_t(0)}) {
+        tqllm::GraphLru<int> w(8, floor); low = true; int makes = 0;
+        for (int round = 0; round < 10; ++round)
+            for (int k = 1; k <= 3; ++k)
+                if (!w.find(3, uint64_t(k))) w.insert(3, uint64_t(k), [&] { ++makes; return 200 + k; }, low_memory, quiesce, destroy);
+        if (floor) expect("low memory keeps the working set (floor 4): 3 captures in 10 rounds", makes == 3 && w.size() == 3);
+        else expect("floor 0: every use recaptures", makes == 30);
+        w.clear(destroy);
+    }
+    low = false;
 
     // result-changing fit steps are reported (tqserve refuses them without -fitl on); placement-only loads report nothing.
     // .77 3090, 27B TQ4_L --np 8 --context 262144 (10-13): the fit switched the KV cache to t4k-turbo3v (2 of 8 answers

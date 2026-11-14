@@ -212,6 +212,8 @@ inline Config config_from_gguf(const GgufFile & f) {
     c.moe = arch == "qwen35moe";
     c.architecture = arch;
     c.gated_attention = arch != "qwen3";
+    if (f.has("pplx.embedding_length"))  // pplx-embed-v2-context: bidirectional attention, no LM head
+        throw std::runtime_error("a contextual embedding model, not a chat model: tqserve serves it on POST /v1/embeddings");
     const uint32_t blocks = uint32_t(f.num(A + "block_count"));
     const uint32_t nextn = uint32_t(f.num(A + "nextn_predict_layers", 0));
     if (nextn > blocks) throw std::runtime_error("nextn_predict_layers exceeds block_count");

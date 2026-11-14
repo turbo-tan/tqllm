@@ -8,6 +8,8 @@
 #include "debug.hpp"
 #include "batch_graph_key.hpp"
 #include "engine.hpp"
+#include <array>
+#include <unordered_map>
 #include <random>
 #include "nlohmann/json.hpp"
 #include "qwen2_kernels.cuh"
@@ -19,6 +21,7 @@
 #include "graph_capture.hpp"
 #include "graph_lru.hpp"
 #include "tree_columns.hpp"
+#include "suffix_copy.hpp"
 #include "dev_alloc.cuh"
 #include "fp8_gemm.cuh"
 #include "int8_gemm.cuh"
@@ -62,7 +65,7 @@
 #include <vector>
 
 #ifndef TQLLM_VERIFY_COLUMNS
-#define TQLLM_VERIFY_COLUMNS 12
+#define TQLLM_VERIFY_COLUMNS 16
 #endif
 
 namespace tqllm {
@@ -549,6 +552,9 @@ private:
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
+        // copy drafts (token tree without --lookup): prompt + the first `copied` output tokens
+        tqllm::SuffixCopy copy{tqllm::SuffixCopyOptions{4, tqllm::kCopyFirstMatch, 64, 64}};
+        size_t copied = 0;
         std::vector<uint32_t> mtp_draft;
         bool native_mtp = false;
         uint32_t P = 0, count = 0, pos = 0, pending = 0;
@@ -662,13 +668,58 @@ private:
         if (dbg_graphs) {
             size_t fr = 0, tot = 0;
             cudaMemGetInfo(&fr, &tot);
-            std::fprintf(stderr, "graph miss family %d key %016llx (cached %zu, evictions %zu, free %zu MB)\n", family,
-                         (unsigned long long) key, glru.size(), glru.evictions(), fr >> 20);
+            // graph-owned memory (allocations made inside captures) stays reserved by the driver after its execs are
+            // destroyed until cudaDeviceGraphMemTrim; the stream-ordered pool keeps freed blocks until trimmed
+            int dev = 0; cudaGetDevice(&dev);
+            unsigned long long g_res = 0, g_used = 0; size_t p_res = 0; cudaMemPool_t pool = nullptr;
+            cudaDeviceGetGraphMemAttribute(dev, cudaGraphMemAttrReservedMemCurrent, &g_res);
+            cudaDeviceGetGraphMemAttribute(dev, cudaGraphMemAttrUsedMemCurrent, &g_used);
+            if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+                uint64_t r = 0; cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &r); p_res = size_t(r);
+            }
+            std::fprintf(stderr, "graph miss family %d key %016llx (cached %zu, evictions %zu, free %zu MB; graph memory "
+                         "reserved %llu / used %llu MB, pool reserved %zu MB)\n", family, (unsigned long long) key, glru.size(),
+                         glru.evictions(), fr >> 20, g_res >> 20, g_used >> 20, p_res >> 20);
         }
         return glru.insert(
             family, key, [&] { return tqllm::instantiate_graph(tqllm::capture_graph(stream, body)); },
             [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
-            [&] { cudaStreamSynchronize(stream); }, [](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
+            [&] { cudaStreamSynchronize(stream); }, [this](cudaGraphExec_t g) { drop_graph(g); });
+    }
+    // verify graphs with the host KV tail: captured once, the staging copies' memcpy nodes kept and updated in place
+    template <class Body>
+    cudaGraphExec_t cached_verify_graph(int family, uint64_t key, Body && body) {
+        if (!kv_staged) return cached_graph(family, key, std::forward<Body>(body));
+        cudaGraphExec_t e = glru.find(family, key);
+        if (!e)
+            e = glru.insert(
+                family, key,
+                [&] {
+                    stage_capture.clear();
+                    cudaGraph_t g = tqllm::capture_graph(stream, body);
+                    cudaGraphExec_t x = nullptr;
+                    if (const cudaError_t r = cudaGraphInstantiate(&x, g, 0); r != cudaSuccess) {
+                        cudaGraphDestroy(g);
+                        throw std::runtime_error(std::string("graph instantiate: ") + cudaGetErrorString(r));
+                    }
+                    stage_graphs[x] = {g, stage_capture, stage_plan()};
+                    return x;
+                },
+                [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
+                [&] { cudaStreamSynchronize(stream); }, [this](cudaGraphExec_t g) { drop_graph(g); });
+        if (auto it = stage_graphs.find(e); it != stage_graphs.end()) {
+            const auto s = stage_plan();
+            if (s != it->second.plan) {
+                for (const auto & sn : it->second.nodes) {
+                    void * d = nullptr; const void * src = nullptr; size_t n = 0;
+                    stage_copy(s, sn.layer, sn.key, &d, &src, &n);
+                    ck(cudaGraphExecMemcpyNodeSetParams1D(e, sn.node, d, src, n, cudaMemcpyHostToDevice));
+                }
+                it->second.plan = s;
+                ++stage_updates;
+            }
+        }
+        return e;
     }
     // TQLLM_DEBUG=stageprof: verify blocks run eagerly with a stream sync after every stage; per-stage wall time (kernel +
     // its launch latency in isolation) is printed with the per-step profile. Perturbs the step; for attribution only.
@@ -757,6 +808,23 @@ public:
     // every KV write of n positions at pos: staging window (host tail) or the device-resident TqCache bookkeeping
     void kv_track(uint32_t pos, int n);
     void kv_prefetch(uint32_t a);
+    std::array<int64_t, 4> stage_plan() const;
+    // one staging copy (layer a's K or V) of a plan: a range of the host copy into the same range of the staging buffer, or a
+    // 16-byte copy into a scratch pair when nothing is staged (a captured memcpy node exists for every layer either way)
+    void stage_copy(const std::array<int64_t, 4> & s, uint32_t a, bool key, void ** dst, const void ** src, size_t * n) const;
+    // host KV tail staged by the copy engine inside captured verify graphs: each graph keeps its memcpy nodes, updated in
+    // place (cudaGraphExecMemcpyNodeSetParams1D) when the plan changes (every few tokens as the device window slides)
+    struct StageNode { cudaGraphNode_t node; uint32_t layer; bool key; };
+    struct StageGraph { cudaGraph_t graph = nullptr; std::vector<StageNode> nodes; std::array<int64_t, 4> plan{}; };
+    std::unordered_map<cudaGraphExec_t, StageGraph> stage_graphs;
+    std::vector<StageNode> stage_capture;  // kv_prefetch's nodes during a capture
+    Buf stage_dummy_dev;
+    void * stage_dummy_host = nullptr;
+    uint64_t stage_updates = 0;
+    void drop_graph(cudaGraphExec_t g) {
+        if (auto it = stage_graphs.find(g); it != stage_graphs.end()) { cudaGraphDestroy(it->second.graph); stage_graphs.erase(it); }
+        cudaGraphExecDestroy(g);
+    }
 
     void verify_async(const uint32_t * tokens, const int * pos_host, int n, uint32_t pos,
                       uint32_t * next, bool copy_all) {
@@ -801,7 +869,7 @@ public:
             // bound (~12 MB each; a 2-slot server OOMed after ~800 requests), and launch cost is negligible at this size
             verify_body(n, int(bucket));
         } else {
-            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
+            ck(cudaGraphLaunch(cached_verify_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
         }
         if (next) {
             const auto * src = v_tok.as<uint32_t>() + (copy_all || n > NVER ? 0 : n - 1);
@@ -962,6 +1030,9 @@ public:
     // Verify rescoring reads 16 candidate rows per column, and the drafter uses head4 / its subset: the full int8 head
     // (1.27 GB for Qwen3.8) can live in pinned host memory the device reads over PCIe (~0.6 MB per 8-column round).
     void head8_host_alloc();
+    static constexpr int kHead8Chunk = 16384;  // rows per device staging chunk of the host int8 head (84 MB at 5,120 columns)
+    void head8_to_host();
+    void head8_rows_from_host(int8_t * w, __half * sc, int n);
     int L_conv_rows() const { return dfl.L.empty() ? 0 : dfl.L[0].conv_attn.rows; }
 
     // generic TQ3 matvec on n rows of a BF16 input (rotates into v_xh first)
@@ -1347,7 +1418,7 @@ public:
         uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40) ^ (uint64_t(qsa.mode) << 44);
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
         if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
-        else ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+        else ck(cudaGraphLaunch(cached_verify_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         const size_t ncol = static_cast<size_t>(col);
         std::vector<uint32_t> res(ncol, 0u), in(ncol, 0u);
         std::vector<int> tpar(ncol, 0);

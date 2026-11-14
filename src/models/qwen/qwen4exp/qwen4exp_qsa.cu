@@ -3,6 +3,7 @@
 #include <vector>
 #include "debug.hpp"
 #include "qwen4exp_kernels.cuh"
+#include "moe_kernels.cuh"
 #include "decode_rules.hpp"
 #include "common.cuh"
 #include <cub/block/block_scan.cuh>
@@ -46,10 +47,7 @@ __global__ void score_blocks(const float * pooled_keys, const float * query, flo
     if (lane == 0) scores[block] = total;
 }
 
-__global__ void pool_raw_keys(const float * raw, float * pooled, int first_block,
-                              int nblocks, int ratio, int dim, int ring) {
-    const int b = first_block + blockIdx.x;
-    if (blockIdx.x >= nblocks) return;
+__device__ __forceinline__ void pool_block(const float * raw, float * pooled, int b, int ratio, int dim, int ring) {
     auto at = [&](int64_t cell) { return (cell % ring) * dim; };  // raw keys live in a ring of the newest cells
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float sum = raw[at(int64_t(b) * ratio) + d];
@@ -58,11 +56,20 @@ __global__ void pool_raw_keys(const float * raw, float * pooled, int first_block
         pooled[int64_t(b) * dim + d] = __fmul_rn(sum, 1.f / ratio);
     }
 }
+__global__ void pool_raw_keys(const float * raw, float * pooled, int first_block,
+                              int nblocks, int ratio, int dim, int ring) {
+    if (blockIdx.x >= nblocks) return;
+    pool_block(raw, pooled, first_block + blockIdx.x, ratio, dim, ring);
+}
+// one cache per blockIdx.y
+__global__ void pool_raw_keys_multi(const QsaBlockJobs jobs, int ratio, int dim) {
+    const int j = blockIdx.y;
+    if (int(blockIdx.x) >= jobs.blocks[j]) return;
+    pool_block(jobs.in[j], jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, jobs.ring[j]);
+}
 
-__global__ void norm_rope_blocks(const float * pooled, const float * weight, float * normalized,
-                                 int first_block, int ratio, int dim, int rotary,
-                                 float theta, float epsilon) {
-    const int block = first_block + blockIdx.x;
+__device__ __forceinline__ void norm_rope_block(const float * pooled, const float * weight, float * normalized,
+                                                int block, int ratio, int dim, int rotary, float theta, float epsilon) {
     const int lane = threadIdx.x;
     const float * src = pooled + int64_t(block) * dim;
     float ss = 0.f;
@@ -83,6 +90,17 @@ __global__ void norm_rope_blocks(const float * pooled, const float * weight, flo
         }
         normalized[int64_t(block) * dim + d] = value;
     }
+}
+__global__ void norm_rope_blocks(const float * pooled, const float * weight, float * normalized,
+                                 int first_block, int ratio, int dim, int rotary,
+                                 float theta, float epsilon) {
+    norm_rope_block(pooled, weight, normalized, first_block + blockIdx.x, ratio, dim, rotary, theta, epsilon);
+}
+__global__ void norm_rope_blocks_multi(const QsaBlockJobs jobs, const float * weight, int ratio, int dim, int rotary,
+                                       float theta, float epsilon) {
+    const int j = blockIdx.y;
+    if (int(blockIdx.x) >= jobs.blocks[j]) return;
+    norm_rope_block(jobs.in[j], weight, jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, rotary, theta, epsilon);
 }
 
 __global__ void expand_selection(const uint64_t * sorted, int32_t * positions, uint8_t * valid,
@@ -617,6 +635,67 @@ void QsaRawKeyCache::append(const float * keys, int tokens, cudaStream_t stream)
         ck(cudaPeekAtLastError());
     }
     size_ = end;
+}
+
+void QsaRawKeyCache::append_deferred(const float * keys, int tokens, std::vector<std::pair<const float *, float *>> & runs,
+                                     std::vector<size_t> & bytes, QsaBlockJobs & pools, cudaStream_t stream) {
+    if (!keys || tokens <= 0 || tokens > max_cells_ - size_)
+        throw std::invalid_argument("QSA raw-key cache: invalid append");
+    reserve_ring(tokens + size_ % ratio_ + 2 * ratio_ + kRollback, stream);
+    const int end = size_ + tokens;
+    for (int c = size_; c < end;) {
+        const int run = std::min(end - c, ring_ - c % ring_);
+        runs.push_back({keys + int64_t(c - size_) * dim_, raw_ + int64_t(c % ring_) * dim_}); bytes.push_back(size_t(run) * dim_ * sizeof(float));
+        c += run;
+    }
+    if (host_raw_) ck(cudaMemcpyAsync(host_raw_ + int64_t(size_) * dim_, keys, size_t(tokens) * dim_ * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    const int first = size_ / ratio_, count = end / ratio_ - first;
+    if (count > 0) {
+        const int j = pools.count++;
+        pools.in[j] = raw_; pools.out[j] = pooled_; pools.first[j] = first; pools.blocks[j] = count; pools.ring[j] = ring_;
+    }
+    size_ = end;
+}
+
+void QsaRawKeyCache::normalize_deferred(QsaBlockJobs & norms) {
+    const int count = complete_blocks() - normalized_blocks_;
+    if (!count) return;
+    const int j = norms.count++;
+    norms.in[j] = pooled_; norms.out[j] = normalized_; norms.first[j] = normalized_blocks_; norms.blocks[j] = count;
+    normalized_blocks_ += count;
+}
+
+void QsaRawKeyCache::append_multi(const std::vector<QsaRawKeyCache *> & caches, const float * keys, const std::vector<int> & off,
+                                  const std::vector<int> & tokens, const float * weight, int rotary, float theta, float epsilon,
+                                  cudaStream_t stream) {
+    if (caches.empty() || caches.size() > size_t(QsaBlockJobs::kMax) || off.size() != caches.size() || tokens.size() != caches.size() ||
+        !weight || rotary < 2 || rotary % 2 || !std::isfinite(theta) || theta <= 0.f || !std::isfinite(epsilon) || epsilon <= 0.f)
+        throw std::invalid_argument("QSA raw-key cache (multi): invalid batch");
+    const int ratio = caches[0]->ratio_, dim = caches[0]->dim_;
+    std::vector<std::pair<const float *, float *>> runs; std::vector<size_t> bytes; QsaBlockJobs pools, norms;
+    for (size_t i = 0; i < caches.size(); ++i) {
+        if (caches[i]->ratio_ != ratio || caches[i]->dim_ != dim || rotary > dim) throw std::invalid_argument("QSA raw-key cache (multi): mixed shapes");
+        caches[i]->append_deferred(keys + int64_t(off[i]) * dim, tokens[i], runs, bytes, pools, stream);
+    }
+    std::vector<ScatterItem> items;
+    for (size_t i = 0; i < runs.size(); ++i) items.push_back({reinterpret_cast<const char *>(runs[i].first), reinterpret_cast<char *>(runs[i].second), bytes[i]});
+    if (!items.empty()) scatter_copy(items.data(), int(items.size()), stream);
+    int most = 0; for (int j = 0; j < pools.count; ++j) most = std::max(most, pools.blocks[j]);
+    if (pools.count) { pool_raw_keys_multi<<<dim3(most, pools.count), 128, 0, stream>>>(pools, ratio, dim); ck(cudaPeekAtLastError()); }
+    for (auto * c : caches) c->normalize_deferred(norms);
+    most = 0; for (int j = 0; j < norms.count; ++j) most = std::max(most, norms.blocks[j]);
+    if (norms.count) { norm_rope_blocks_multi<<<dim3(most, norms.count), 32, 0, stream>>>(norms, weight, ratio, dim, rotary, theta, epsilon); ck(cudaPeekAtLastError()); }
+}
+
+void QsaIndexer::append_multi(const std::vector<QsaIndexer *> & indexers, const float * raw_keys, const std::vector<int> & off,
+                              const std::vector<int> & tokens, const float * key_norm, cudaStream_t stream) {
+    if (indexers.empty() || !key_norm) throw std::invalid_argument("QSA indexer: invalid batch append");
+    std::vector<QsaRawKeyCache *> caches;
+    for (auto * ix : indexers) caches.push_back(&ix->keys_);
+    const QsaIndexer & a = *indexers[0];
+    for (auto * ix : indexers)
+        if (ix->rotary_ != a.rotary_ || ix->theta_ != a.theta_ || ix->epsilon_ != a.epsilon_) throw std::invalid_argument("QSA indexer: mixed batch");
+    QsaRawKeyCache::append_multi(caches, raw_keys, off, tokens, key_norm, a.rotary_, a.theta_, a.epsilon_, stream);
 }
 
 void QsaRawKeyCache::truncate(int cells) {

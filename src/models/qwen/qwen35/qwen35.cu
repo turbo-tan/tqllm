@@ -1,3 +1,4 @@
+#include "zero_copy_guard.hpp"
 #include <cstdlib>
 #include "qwen35_kernels.cuh"
 
@@ -269,8 +270,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
         for (int i = 0; i < R; ++i) S0[i][t] = S[i];
     }
     const int ntot = n + pend;
-    for (int g0 = 0; g0 < ntot; g0 += NMAX) {  // token groups; the state column stays in registers throughout
-        const int ng = min(NMAX, ntot - g0);
+    for (int g0 = 0, ng = 0; g0 < ntot; g0 += ng) {  // token groups; the state column stays in registers throughout
+        // tree: the deferred replay (pend tokens) in groups of its own, then the whole tree (n <= NMAX) as one group
+        ng = par ? (g0 < pend ? min(NMAX, pend - g0) : n) : min(NMAX, ntot - g0);
     #pragma unroll
         for (int tkn = 0; tkn < NMAX; ++tkn) {
             if (tkn >= ng) break;
@@ -346,9 +348,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
             }
             if (write && sl == 0) y[int64_t(g0 + tkn - pend) * vheads * dv + h * dv + j] = __float2bfloat16_rn(sq_out * nq + delta * kq);
         };
-        if (par) {  // tree (pend + n <= NMAX): node i starts from its parent's state; off the chain, rebuilt from S0
-            for (int tkn = 0; tkn < pend; ++tkn) step(tkn, false);  // deferred commit of the previous step
-            if (pend) {
+        if (par && g0 < pend) {  // deferred commit of the previous step's path, then its state -> rp.smid and S0
+            for (int tkn = 0; tkn < ng; ++tkn) step(tkn, false);
+            if (g0 + ng == pend) {
                 float * Sm = rp.smid + (int64_t(h) * DK + sl * R) * dv + j;
 #pragma unroll
                 for (int i = 0; i < R; ++i) {
@@ -356,6 +358,7 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
                     S0[i][t] = S[i];
                 }
             }
+        } else if (par) {  // the tree: node i starts from its parent's state; off the chain, rebuilt from S0
             int prev = -1;
             for (int nd = 0; nd < n; ++nd) {
                 const int p = spar[nd];
@@ -364,9 +367,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
                     for (int i = 0; i < R; ++i) S[i] = S0[i][t];
                     int path[NMAX], len = 0;
                     for (int a = p; a >= 0; a = spar[a]) path[len++] = a;
-                    for (int q = len - 1; q >= 0; --q) step(pend + path[q], false);
+                    for (int q = len - 1; q >= 0; --q) step(path[q], false);
                 }
-                step(pend + nd, true);
+                step(nd, true);
                 prev = nd;
             }
         } else {
@@ -814,6 +817,7 @@ __global__ void kv_stage_copy_k(const uint4 * src, uint4 * dst, const int64_t * 
 }
 
 void kv_stage_copy(const void * src, void * dst, const int64_t * nbytes, int blocks, cudaStream_t s, const int64_t * off) {
+    require_device_memory(src, "kv_stage_copy source"); require_device_memory(dst, "kv_stage_copy destination");
     kv_stage_copy_k<<<blocks, 256, 0, s>>>(static_cast<const uint4 *>(src), static_cast<uint4 *>(dst), nbytes, off);
 }
 
@@ -880,7 +884,7 @@ void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const
                int vheads, int dk, int dv, bool tiled, cudaStream_t s, const int * par, const GdnReplay & rp) {
     if (dk != 128 || dv % 32) throw std::invalid_argument("gdn_multi: dk 128, dv % 32 == 0");
     if (par && n > 16) throw std::invalid_argument("gdn_multi: tree mode needs n <= 16");
-    if (rp.smid && (!par || n > 8)) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode, n <= 8");
+    if (rp.smid && !par) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode");
     if (dv % GDN_CPB) throw std::invalid_argument("gdn_multi: dv % columns per block");
     gdn_multi_k<128><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
                                                           vheads, dv, tiled, par, rp);

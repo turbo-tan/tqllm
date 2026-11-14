@@ -97,7 +97,11 @@ inline std::vector<int> lift_layer_floor(std::vector<int> caps, int min_slots, i
 // 4+ sequences verify at most 2 drafts each: GB10 np 8, 8 users, 11-11 (one box, both Flash-Next files, texts = np 1):
 // 2 drafts 119 / 124-128 tok/s vs 3 drafts 111-114 / 123-127, 4 drafts 85-94 / 111-113; at 4 users 2 and 3 were level
 constexpr int kManyDraftCap = 2, kManyActive = 4;
-inline int batch_drafts(int active, int drafts, int topk, int slots, int experts, int max_rows = 64) {
+// Rows of one batched decode / verify step, the one limit the drafts rule, the decode arena (fn_engine_load) and the layer
+// graphs (layer_graph_rows) share: the arena was sized for 102 rows the rule never makes (np 32 x 3: ~1.2 GB unused)
+constexpr int kBatchRowsMax = 64;
+inline int batch_drafts(int active, int drafts, int topk, int slots, int experts) {
+    const int max_rows = kBatchRowsMax;
     if (active < 2) return drafts;
     if (active >= kManyActive) drafts = std::min(drafts, kManyDraftCap);
     for (int d = std::max(drafts, 0); d >= 0; --d) {
@@ -152,6 +156,57 @@ inline void ep_after_layer(EpForwardState & s, int layer, int layers) {
     if (!s.open || layer != s.next) return;
     if (++s.next == layers) { s.open = false; s.accepted = false; s.next = 0; }
 }
+// rows of a decode / verify step whose maps the device can build with every expert resident: the device dedup maps take at
+// most 1024 assignments (moe_dedup_maps)
+inline int graph_rows_max(int topk) { return 1024 / std::max(topk, 1); }
+// rows a decode / verify layer runs as a graph: every row of a batch (kBatchRowsMax, within graph_rows_max; the decode arena
+// is sized for as many, so nothing in a captured layer falls back to a pool allocation) with every expert resident (device
+// maps), else 8 (the split path waits on the routed ids on the host); more rows run eager
+inline int layer_graph_rows(bool full_slots, int topk) { return full_slots ? std::min(kBatchRowsMax, graph_rows_max(topk)) : 8; }
+// --np limit: 16 (each layer keeps np x topk slots); 32 when the manifest pins every expert resident (slots >= the expert
+// count, 512 for Flash-Next): no layer runs short of slots, and 32 is the batched kernels' sequence limit
+inline int np_max(bool slots_auto, int slots, int experts) { return !slots_auto && slots >= experts ? 32 : 16; }
+// The batched attention's split workspace (rows x heads x splits of 128 positions x (dim + 2) floats, fn_dense_attention_
+// multi_workspace) stays within the 64 MB the one-sequence path blocks its queries to; above it the sequences take that
+// path. Flash-Next's attention layers all carry a QSA indexer, which keeps the batch below 2,048 positions; a file
+// without one would reach ~25 MB a row at 128K inside a captured step.
+constexpr size_t kAttnWorkspaceMax = size_t(64) << 20;
+inline bool attention_multi_fits(int rows, int heads, int dim, int longest) {
+    const size_t splits = size_t((std::max(longest, 1) + 127) / 128);
+    return size_t(std::max(rows, 0)) * size_t(std::max(heads, 0)) * splits * size_t(dim + 2) * sizeof(float) <= kAttnWorkspaceMax;
+}
+// A decode / verify call builds its slot and dedup maps on the device (no routed-id readback, the layer's graph runs to
+// its end) when its bank holds every expert: rows up to graph_rows_max, whatever the slot count. Bounding the assignments
+// by the bank's slots as well stopped a 512-slot top-10 bank at 51 rows (np 18-21 at 3 rows, np 26-32 at 2 ran eager
+// with a readback per layer).
+inline bool device_maps(int n, int topk, int bank_slots, int experts, bool spec) {
+    return bank_slots >= experts && (spec || n == 1) && n <= graph_rows_max(topk);
+}
+// A trunk call reads the routed ids back for the waves rule (layer_takes_waves) when a block's assignments outnumber the
+// bank's slots or a prompt chunk runs; a bank holding every expert never takes waves, so it never reads them.
+inline bool reads_routes_for_waves(bool hot_map, bool device_maps_on, int n, int topk, int slots, bool spec) {
+    return hot_map || (!device_maps_on && (n * topk > slots || (!spec && n > 1)));
+}
+// Host state a decode layer step changes before its captured kernels run: the GDN history / state double buffers swap,
+// buffers are made on first use (their zero fill is captured too), the attention lengths advance (the QSA keys follow
+// them: the next call truncates to len). A captured part that fails has executed nothing, so its plain rerun
+// (layer_forward) starts from what this saved; rerunning from the swapped buffers gave silently wrong state.
+template<class Ptr> struct StepUndo {
+    struct Pair { Ptr * a, * b; const void * a0, * b0; };
+    std::vector<Pair> pairs; std::vector<std::pair<Ptr *, bool>> made; std::vector<std::pair<int *, int>> ints;
+    void swapped(Ptr & a, Ptr & b) { pairs.push_back({&a, &b, a.get(), b.get()}); }
+    void first_use(Ptr & p) { made.push_back({&p, bool(p)}); }
+    void value(int & v) { ints.push_back({&v, v}); }
+    void restore() {
+        for (auto & p : pairs) {
+            if (p.a->get() != p.a0 && p.b->get() == p.a0) std::swap(*p.a, *p.b);
+            if (!p.b0) p.b->reset();
+            if (!p.a0) p.a->reset();
+        }
+        for (auto & [p, had] : made) if (!had) p->reset();
+        for (auto & [p, v] : ints) *p = v;
+    }
+};
 inline int ep_result_cap(int assignments) { return std::min(std::max(assignments, 0), (5 * std::max(assignments, 0) + 7) / 8); }
 
 // A layer's slot floor (tier A) from its target: scaled like the slot total (tier_a of tier_b per layer on average), and
@@ -318,8 +373,14 @@ inline bool runs_on_cpu(int layer, int expert, bool resident, bool pool_serves_c
 // CPU miss pool threads: TQFN_CPU_MISS (env_threads >= 0) wins; else --exact off runs the pool on every card with
 // min(15, cores / 2 - 1) threads, --exact on runs none (11-12: running the owned set under --exact on a 16 GB card cut the
 // 25.3K decode 72.0 -> 63.6 tok/s, so it stays off; see REPORT.md round 3)
-inline int cpu_miss_threads(int env_threads, bool exact, int cores) {
+// A small card serving several requests at once (--np > 1) runs no pool (G2, 11-13): the pool's CPU threads saturating host
+// memory beside the expert cache's copy-engine DMA faulted the GPU on a 12 GB 3090 (Xid 31 / 32; reproduced without tqLLM:
+// docs ISSUE-12gb-np4-g2), and the pool did not pay at np 4 there. One request keeps it.
+// TQFN_CPU_MISS as cpu_miss_threads' env_threads: its value, -1 when unset
+inline int cpu_miss_env() { const char * v = std::getenv("TQFN_CPU_MISS"); return v ? std::atoi(v) : -1; }
+inline int cpu_miss_threads(int env_threads, bool exact, int cores, bool small_card_parallel = false) {
     if (env_threads >= 0) return env_threads;
+    if (small_card_parallel) return 0;
     return exact ? 0 : std::max(1, std::min(15, cores / 2 - 1));
 }
 inline DraftPlan sequence_drafts(int manifest_drafts, bool exact, int env_threads, int cores, bool every_expert_resident) {
@@ -330,7 +391,9 @@ inline DraftPlan sequence_drafts(int manifest_drafts, bool exact, int env_thread
 }
 // the pool reads missed experts from the pinned packed copy whenever it runs (11-06: the 3090 np 8 --exact off rows fell from
 // 76 / 77 to 68 / 70 tok/s when the pool came from --exact off alone and read the GGUF mapping instead)
-inline bool cpu_pool_reads_packed(int env_threads, bool exact, int cores) { return cpu_miss_threads(env_threads, exact, cores) > 0; }
+inline bool cpu_pool_reads_packed(int env_threads, bool exact, int cores, bool small_card_parallel = false) {
+    return cpu_miss_threads(env_threads, exact, cores, small_card_parallel) > 0;
+}
 // Per-layer expert-slot profile of Qwen3.8-Flash-Next (48 layers, 512 experts), relative: scale_layer_slots fits it to the
 // card's slot budget. Measured routing popularity (the brain manifests' layer_slots, 10-27). Used when a manifest gives no
 // layer_slots (11-06: Unsloth UD-IQ3_XXS on a 3090 with uniform slots 130.6 / 85.4 tok/s, with this profile 143.3 / 92.4;

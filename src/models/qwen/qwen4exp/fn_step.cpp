@@ -136,3 +136,70 @@ void DecodeModel::accept(int m) {
     history.rollback(spec_hist0 + size_t(m));
     position = spec_pos0 + m;
 }
+
+void DecodeModel::accept_multi(const std::vector<std::pair<DecodeModel *, int>> & accepts) {
+    std::vector<std::pair<DecodeModel *, int>> back;  // sequences that keep fewer tokens than their block
+    for (const auto & [d, m] : accepts) if (m < d->spec_n) { require(d->spec && m >= 1, "accept: speculative state was not recorded"); back.push_back({d, m}); }
+    if (back.size() < 2 || back.size() > size_t(tqllm_cuda::GdnSeqs::kMax)) { for (const auto & [d, m] : accepts) d->accept(m); return; }
+    const DecodeModel & d0 = *back[0].first;
+    const int layers = d0.c.layers;
+    int rows = 0; for (const auto & [d, m] : back) rows += m;
+    // GDN replay inputs: per layer the first m rows of each sequence's saved conv / a / b, gathered contiguously
+    std::vector<size_t> base(size_t(layers), SIZE_MAX); size_t ws = 0, out = 0;
+    for (int l = 0; l < layers; ++l) {
+        int have = 0; for (const auto & [d, m] : back) have += d->rec[size_t(l)].state && d->rec[size_t(l)].conv_saved;
+        if (have && have < int(back.size())) { for (const auto & [d, m] : accepts) d->accept(m); return; }
+        if (!have) continue;
+        const auto & r = d0.rec[size_t(l)];
+        base[size_t(l)] = ws; ws += size_t(rows) * (size_t(r.channels) + 2 * size_t(r.vh)); out = std::max(out, size_t(rows) * r.vh * r.dim);
+    }
+    Device<float> gathered(std::max<size_t>(ws, 1)), replay(std::max<size_t>(out, 1));
+    std::vector<tqllm_cuda::ScatterItem> items;
+    auto copy = [&](const float * src, float * dst, size_t count) {
+        items.push_back({reinterpret_cast<const char *>(src), reinterpret_cast<char *>(dst), count * sizeof(float)});
+    };
+    for (int l = 0; l < layers; ++l) {
+        int off = 0;
+        for (const auto & [d, m] : back) {
+            auto & r = d->rec[size_t(l)];
+            if (r.state && r.conv_saved) {
+                const size_t ch = size_t(r.channels), taps1 = r.history->count / ch;
+                if (base[size_t(l)] != SIZE_MAX) {
+                    float * cx = gathered.p + base[size_t(l)], * ca = cx + size_t(rows) * ch, * cb = ca + size_t(rows) * r.vh;
+                    copy(r.conv_saved->p, cx + size_t(off) * ch, size_t(m) * ch);
+                    copy(r.a_saved->p, ca + size_t(off) * r.vh, size_t(m) * r.vh);
+                    copy(r.b_saved->p, cb + size_t(off) * r.vh, size_t(m) * r.vh);
+                }
+                for (size_t j = 0; j < taps1; ++j) {  // history = last taps-1 rows of (old history ++ block inputs[0..m))
+                    const size_t row = size_t(m) + j;
+                    copy(row < taps1 ? r.old_history->p + row * ch : r.qkv_saved->p + (row - taps1) * ch, r.history->p + j * ch, ch);
+                }
+            }
+            if (d->ple_past[size_t(l)] && d->ple_saved[size_t(l)]) {
+                const size_t w = size_t(d->width), hist_rows = d->ple_past[size_t(l)]->count / w;
+                for (size_t j = 0; j < hist_rows; ++j) {
+                    const size_t row = size_t(m) + j;
+                    copy(row < hist_rows ? d->ple_old[size_t(l)]->p + row * w : d->ple_saved[size_t(l)]->p + (row - hist_rows) * w, d->ple_past[size_t(l)]->p + j * w, w);
+                }
+            }
+            off += m;
+        }
+    }
+    tqllm_cuda::scatter_copy(items.data(), int(items.size()), nullptr);
+    for (int l = 0; l < layers; ++l) {
+        if (base[size_t(l)] != SIZE_MAX) {
+            const auto & r = d0.rec[size_t(l)];
+            const size_t ch = size_t(r.channels);
+            const float * cx = gathered.p + base[size_t(l)], * ca = cx + size_t(rows) * ch, * cb = ca + size_t(rows) * r.vh;
+            tqllm_cuda::GdnSeqs seqs; int off = 0;
+            for (const auto & [d, m] : back) {
+                auto & rq = d->rec[size_t(l)];
+                seqs.off[seqs.count] = off; seqs.n[seqs.count] = m; seqs.state[seqs.count] = rq.state2->p; seqs.next[seqs.count] = rq.state->p; ++seqs.count; off += m;
+            }
+            // rerun the same recurrence for m tokens from the pre-block state (bit-identical to fn_gdn per sequence)
+            tqllm_cuda::fn_gdn_multi(cx, ca, cb, r.neg_a, r.bias, seqs, replay.p, r.kh, r.vh, r.dim, r.eps, nullptr);
+        }
+        for (const auto & [d, m] : back) if (l < int(d->att.size()) && d->att[size_t(l)].k) d->att[size_t(l)].len = d->spec_pos0 + m;
+    }
+    for (const auto & [d, m] : back) { d->history.rollback(d->spec_hist0 + size_t(m)); d->position = d->spec_pos0 + m; }
+}

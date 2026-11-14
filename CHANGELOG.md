@@ -5,14 +5,62 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Added
+- Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
+  pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
+  chunk's vector sees the rest of the document; `"task": "query"` embeds queries; `encoding_format` `float`, `base64`
+  (the OpenAI client's default) or `int8`. No embedding GGUF is published: you convert perplexity's Hugging Face
+  snapshot with `tools/convert/pplx/pplx_context_to_gguf.py` into one of three files: 0.6B BF16 with an F32 token table
+  (`--outtype bf16`, 2.4 GB served), 9B TQ4 for 8 GB GPUs (`--outtype tq4`, 6.6 GB), 9B Q8_0 for 12 / 16 GB
+  (`--outtype q8_0`, 10.2 GB). 0.6B vs
+  the Hugging Face model in FP32 (RTX 3090): covid-qa nDCG@10 56.17 (HF 56.32); DGX Spark (GB10) 51.1K document
+  tokens/s and ~2.3K queries/s (HF bf16 34.9K / 1,021), RTX 3090 75.2K / ~2.9K (HF 21.1K / 283). Limits per request:
+  4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
+
 ### Changed
+- 27B on an RTX 3090, 9-16 verify rows (copy passes): the TQ3 gate/up and GDN mixer matvecs read two 16-row tiles per
+  block (same numbers). TQ_S + DFlash2-TQ3, greedy, same session: editing code 392.9 -> 402.9 tok/s, editing JSONL
+  417.1 -> 428.8; text identical.
+- 27B on an RTX 3090: the TQ3 gate/up matvec at 7-8 verify rows reads two 16-row tiles per block (one activation load
+  for both; same numbers). TQ_S + DFlash2-TQ3, greedy, same session: code 208.7 -> 217.5 tok/s, story 106.2 -> 110.7,
+  translation 176.1 -> 184.3, structured 292.5 -> 302.5, long JSONL 282.4 -> 291.0; text identical.
+- 27B with a DFlash2 drafter: when the reply repeats at least 32 tokens of the prompt or of itself, the copy is verified
+  beside the drafter's tree in one 16-row pass (it was 8). Text is unchanged. RTX 3090, TQ_S + DFlash2-TQ3, greedy,
+  same session: editing code 205.6 -> 388.2 tok/s, editing JSONL 277.0 -> 413.5; tasks without such a repeat unchanged
+  (within run-to-run range).
+- Mac: the same copy drafts beside the token tree, in the 16-row verify the Mac already runs. M5 Pro, TQ_L-QSA + DFlash2,
+  greedy, same session: editing code 138.4 -> 188.7 tok/s; editing JSONL 188.9 -> 191.3 (the drafter already filled the
+  block); the other 13 tasks unchanged (within run-to-run range); text unchanged on all 15.
+- Flash-Next with many users: when every expert is resident, the layers of every decode batch run as captured graphs
+  with the slot and dedup maps built on the device, at every batch size a step makes (up to 64 rows: 21 users at 3 rows,
+  32 at 2; it was 32 rows), the GDN, attention, rollback and accept steps run once for all
+  sequences of a batch, and `--np` goes up to 32 when every expert is resident (16 otherwise). Replies are unchanged.
+  Two DGX Sparks (GB10), NVIDIA NVFP4 experts, through the router, same session: 16 users 238.5 -> 265.3 tok/s;
+  32 users (16 + 16) 314-322 tok/s. One box: 8 users 124.0 -> 135.0, 16 users 130.2 -> 153.2. RTX 3090, the model
+  card's files: 8 users 85.1 -> 91.0, one user unchanged.
+- 27B with the oldest K/V in host memory: the tail is staged by the copy engine (it was a kernel reading host memory),
+  and an LM head placed in host memory is built and read back by the copy engine. RTX 3090 at a 16 GB budget:
+  159.7 -> 166.0 tok/s, text identical.
+- Small cards (12-16 GB) with `--np` above 1 no longer run the CPU expert pool (one request keeps it; the startup log
+  says which). On one test machine that CPU load beside the GPU's copies from host memory ended in GPU faults
+  (Xid 31 / 32, "unspecified launch failure") within 4-12 minutes; the same fault was reproduced there without tqLLM,
+  with a plain CUDA copy test beside a CPU memory reader, so it is a platform limit. 12 GB, 4 users, 512-token
+  requests: 64.9 tok/s either way. If you see these faults, check that your memory runs at the CPU's rated speed for
+  your DIMM count, and try the kernel parameter `iommu=pt`.
 - Sampled requests (temperature > 0) on the 27B use the DFlash2 token tree on CUDA too (it was greedy-only): the walk draws each node's token from the target's distribution and follows a matching child. RTX 4090, Qwen3.8-27B TQ4 + DFlash2-TQ3, temperature 0.6, 6 x 2,000 tokens: 146 -> 173 tok/s, accepted drafts 30 % -> 37 %. `TQLLM_DEBUG=sample_chain` keeps chain drafts.
 
 ### Fixed
 - 27B with a DFlash2 drafter: a reply ends at its end-of-sequence token. When the EOS was accepted inside a draft block, the drafts after it and the bonus token were appended too (greedy or sampled, chain or tree).
-- Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
-- Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
 - MSVC: `tests/gguf_validation.cpp`, `tests/tokenizer_gguf.cpp` and `tests/expert_bank_plan.cpp` build without `<unistd.h>` / `setenv`, `tqllm/rope_scaling.hpp` no longer needs `M_PI`, and `-DBUILD_TESTING=OFF` defines no test target (124 `test-*` executables were still built).
+- 27B with a DFlash2 drafter, sampled requests (thinking on): when the drafter's guess equalled the first copied token,
+  the walk followed the drafter's one-token branch and dropped the copy, so sampled edits got almost none of the copy
+  speed-up. RTX 3090, TQ_S + DFlash2-TQ3, thinking on (temperature 1.0), same seed: editing code 85.1 -> 216.6 tok/s,
+  editing JSONL 123.0 -> 341.6; text identical.
+- The graph cache emptied itself on every miss when free VRAM sat just under its reserve (27B at a 16 GB budget with a
+  host K/V tail): the same graphs were captured again and again (2,392 captures for 16 graphs in a 12K-token chat). It
+  now keeps a working set under low memory.
+- Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
+- Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
 
 ## 1.6.0 (2026-11-13)
 

@@ -419,13 +419,20 @@ struct U4hTile {
 #ifndef U4H_DENSE_MINB
 #define U4H_DENSE_MINB 1
 #endif
-template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false>
+// CT (dense): CT blocks of NCOL columns per row block, adjacent in blockIdx.x so they read the same weight rows together
+// (the second read hits L2); each column's math is unchanged.
+template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false, int CT = 1>
 __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) u4h_matvec_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                     OUT * y, int rows, int k, int nc, const uint32_t * rid = nullptr,
                                                     int ldy = 0, const int * expert_ids = nullptr, int topk = 1, bool per_expert_input = false,
                                                     const uint8_t * w4b = nullptr, const __half2 * smb = nullptr, OUT * yb = nullptr,
                                                     int ngroups = 0) {
     if (blockIdx.z) { w4 = w4b; sm = smb; y = yb; }  // second matrix of a paired launch (gate + up)
+    // dense, columns split over CTAs (short matrices): blockIdx.y is the block of NCOL columns; each column's math is unchanged
+    if constexpr (!GROUPED)
+        if (const int tile = int(blockIdx.y) + (CT > 1 ? int(blockIdx.x) % CT : 0)) {
+            xh += int64_t(tile) * NCOL * k; y += int64_t(tile) * NCOL * (ldy ? ldy : rows); nc -= tile * NCOL;
+        }
     int source_row = 0;
     // Dedup (GROUPED, NCOL > 1): expert_ids holds kDedupStride ints per unique expert: slot, columns, input rows[4],
     // output assignments[4]; the expert's weights are read once for all assignments that use it.
@@ -469,7 +476,8 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
         }
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
-    const int row0 = blockIdx.x * 16 * MT;
+    static_assert(CT == 1 || !GROUPED, "u4h_matvec_k: CT is dense only");
+    const int row0 = int(blockIdx.x) / CT * 16 * MT;
     const uint32_t NEG1024 = 0xE400E400u;
     const int nb = k / 32;  // a lane owns one 32-weight block (16 B codes + one (s, m) pair) per iteration
     // Dedup: a block walks groups blockIdx.y, + gridDim.y, ... up to ngroups or the first slot -1 (a device-built map is

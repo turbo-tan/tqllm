@@ -304,8 +304,8 @@ __global__ void fn_gdn_gates_k(const float * alpha, const float * beta, const fl
     gates[2 * i + 1] = 1.f / (1.f + expf(-beta[i]));
 }
 template <int VPW>  // value columns per warp: independent chains for latency hiding, same per-column op order
-__global__ void fn_gdn_main_k(const float * qkv, const float * qk, const float * gates, const float * state, float * next,
-                              float * out, int kh, int vh, int dim, int n) {
+__device__ __forceinline__ void gdn_main_body(const float * qkv, const float * qk, const float * gates, const float * state, float * next,
+                                              float * out, int kh, int vh, int dim, int n) {
     const int head = blockIdx.x, value0 = (blockIdx.y * 4 + threadIdx.y) * VPW, lane = threadIdx.x;
     const int key_head = head % kh, channels = (2 * kh + vh) * dim;
     float column[VPW][8];
@@ -334,6 +334,19 @@ __global__ void fn_gdn_main_k(const float * qkv, const float * qk, const float *
         const int64_t base = (int64_t(head) * dim + value0 + v) * dim;
         for (int r = 0; r < pieces; ++r) next[base + r * 32 + lane] = column[v][r];
     }
+}
+template <int VPW>
+__global__ void fn_gdn_main_k(const float * qkv, const float * qk, const float * gates, const float * state, float * next,
+                              float * out, int kh, int vh, int dim, int n) {
+    gdn_main_body<VPW>(qkv, qk, gates, state, next, out, kh, vh, dim, n);
+}
+// several sequences in one launch (blockIdx.z = sequence): each runs fn_gdn_main_k's math on its own rows and state
+template <int VPW>
+__global__ void fn_gdn_main_multi_k(const float * qkv, const float * qk, const float * gates, const tqllm_cuda::GdnSeqs seqs,
+                                    float * out, int kh, int vh, int dim) {
+    const int q = blockIdx.z, off = seqs.off[q], channels = (2 * kh + vh) * dim;
+    gdn_main_body<VPW>(qkv + int64_t(off) * channels, qk + int64_t(off) * 2 * kh * dim, gates + int64_t(off) * 2 * vh,
+                       seqs.state[q], seqs.next[q], out + int64_t(off) * vh * dim, kh, vh, dim, seqs.n[q]);
 }
 // Key-head GDN prefill: the gated delta rule token by token over the whole sub-chunk, one block per (key head, 32 value columns) and
 // its VPK value heads (they share q and k); the state slice in registers (thread (c, rg): rows rg*32..+31 of column c),
@@ -875,17 +888,14 @@ __global__ void fn_gemv_sum_k(const float * part, float * y, int rows, int split
 }
 // Split-K attention (flash decoding): block (head, token, split) scores keys [split*chunk, ...) with 8 warps, lanes over
 // dims (dim <= 256, multiple of 32); partials (max, sum, acc[dim]) are merged by fn_attention_merge_k.
-__global__ void fn_attention_split_k(const float * q, const __nv_bfloat16 * k, const __nv_bfloat16 * v, float * part,
-                                     int heads, int kvheads, int dim, int pos, int chunk, int splits) {
-    const int head = blockIdx.x, token = blockIdx.y, split = blockIdx.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int kh = head / (heads / kvheads), count = pos + token + 1;
+__device__ __forceinline__ void attention_split_body(const float * query, const __nv_bfloat16 * k, const __nv_bfloat16 * v, float * out,
+                                                     int kh, int kvheads, int dim, int count, int split, int chunk) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int begin = split * chunk, end = min(count, begin + chunk);
-    float * out = part + ((int64_t(token) * heads + head) * splits + split) * (dim + 2);
     extern __shared__ float sm[];  // scores[chunk] then acc[8][dim]
     float * scores = sm; float * acc = sm + chunk;
     __shared__ float red[8];
     if (begin >= end) { if (!tid) { out[dim] = -INFINITY; out[dim + 1] = 0.f; } return; }
-    const float * query = q + (int64_t(token) * heads + head) * dim;
     const float scale = 1.f / sqrtf(float(dim));
     for (int key = begin + warp; key < end; key += 8) {
         float dot = 0.f;
@@ -917,6 +927,32 @@ __global__ void fn_attention_split_k(const float * q, const __nv_bfloat16 * k, c
     __syncthreads();
     for (int d = tid; d < dim; d += blockDim.x) { float t = 0.f; for (int w = 0; w < 8; ++w) t += acc[w * dim + d]; out[d] = t; }
     if (!tid) { float t = 0.f; for (int w = 0; w < 8; ++w) t += red[w]; out[dim] = m; out[dim + 1] = t; }
+}
+__global__ void fn_attention_split_k(const float * q, const __nv_bfloat16 * k, const __nv_bfloat16 * v, float * part,
+                                     int heads, int kvheads, int dim, int pos, int chunk, int splits) {
+    const int head = blockIdx.x, token = blockIdx.y, split = blockIdx.z;
+    attention_split_body(q + (int64_t(token) * heads + head) * dim, k, v, part + ((int64_t(token) * heads + head) * splits + split) * (dim + 2),
+                         head / (heads / kvheads), kvheads, dim, pos + token + 1, split, chunk);
+}
+__device__ __forceinline__ int attn_seq_of(const AttnSeqs & s, int row) {
+    int q = 0;
+    while (q + 1 < s.count && row >= s.off[q + 1]) ++q;
+    return q;
+}
+// row = a token of the batch; its sequence's K/V and causal count. Splits past a sequence's own count write the empty
+// partial (-inf), which the merge skips: the same bits as fn_attention_split_k with that sequence's split count.
+__global__ void fn_attention_split_multi_k(const float * q, const AttnSeqs seqs, float * part, int heads, int kvheads, int dim,
+                                           int chunk, int splits) {
+    const int head = blockIdx.x, row = blockIdx.y, split = blockIdx.z, sq = attn_seq_of(seqs, row);
+    attention_split_body(q + (int64_t(row) * heads + head) * dim, seqs.k[sq], seqs.v[sq], part + ((int64_t(row) * heads + head) * splits + split) * (dim + 2),
+                         head / (heads / kvheads), kvheads, dim, seqs.pos[sq] + row - seqs.off[sq] + 1, split, chunk);
+}
+__global__ void fn_rope_table_multi_k(float2 * tab, const AttnSeqs seqs, int n, int rotary, float theta) {
+    const int half = rotary / 2, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * half) return;
+    const int row = i / half, pair = i % half, sq = attn_seq_of(seqs, row);
+    const double angle = double(seqs.pos[sq] + row - seqs.off[sq]) / pow(double(theta), double(2 * pair) / rotary);
+    tab[i] = make_float2(float(cos(angle)), float(sin(angle)));
 }
 __global__ void fn_attention_merge_k(const float * part, float * out, int heads, int dim, int splits) {
     const int head = blockIdx.x, token = blockIdx.y;
@@ -1400,6 +1436,32 @@ void fn_gdn(const float * qkv, const float * alpha, const float * beta, const fl
     }
 }
 void fn_gdn_set_kh(int on) { g_gdn_kh = on; }
+void fn_gdn_multi(const float * qkv, const float * alpha, const float * beta, const float * neg_a, const float * bias,
+                  const GdnSeqs & seqs, float * out, int kh, int vh, int dim, float eps, cudaStream_t s) {
+    int rows = 0, nmax = 0;
+    for (int q = 0; q < seqs.count; ++q) {
+        if (seqs.n[q] <= 0 || seqs.off[q] != rows || !seqs.state[q] || !seqs.next[q] || seqs.state[q] == seqs.next[q])
+            throw std::invalid_argument("Flash-Next GDN (multi): sequences must be contiguous, non-empty, with distinct states");
+        rows += seqs.n[q]; nmax = std::max(nmax, seqs.n[q]);
+    }
+    if (seqs.count <= 0 || seqs.count > GdnSeqs::kMax || kh <= 0 || vh <= 0 || vh % kh || dim < 32 || dim > 256 || dim % 32 ||
+        vh > 65535 || (int64_t(2) * kh + vh) * dim * rows > std::numeric_limits<int>::max() || !std::isfinite(eps) || eps <= 0.f ||
+        !qkv || !alpha || !beta || !neg_a || !bias || !out)
+        throw std::invalid_argument("Flash-Next GDN (multi): invalid shape, pointer or epsilon");
+    float *& work = g_gdn_ws.work; size_t & cap = g_gdn_ws.cap;
+    const size_t need = size_t(rows) * 2 * kh * dim + size_t(rows) * vh * 2;
+    if (need > cap && !gdn_ws_grow(work, cap, need, s)) throw std::runtime_error("Flash-Next GDN: workspace allocation failed");
+    float * qk = work, * gates = work + size_t(rows) * 2 * kh * dim;
+    // the row-wise prep and gates once for all rows (per row the same math as per sequence)
+    fn_gdn_prep_k<<<dim3(rows, kh), 32, 0, s>>>(qkv, qk, kh, vh, dim, eps);
+    fn_gdn_gates_k<<<(rows * vh + 127) / 128, 128, 0, s>>>(alpha, beta, neg_a, bias, gates, vh, rows);
+    static const bool unified = [] { int dev = 0, on = 0; cudaGetDevice(&dev); return cudaDeviceGetAttribute(&on, cudaDevAttrIntegrated, dev) == cudaSuccess && on; }();
+    const int vpw = g_gdn_vpw ? g_gdn_vpw : !unified ? 8 : nmax <= 4 ? 2 : 4;
+    const unsigned z = unsigned(seqs.count);
+    if (vpw == 2) fn_gdn_main_multi_k<2><<<dim3(vh, dim / 8, z), dim3(32, 4), 0, s>>>(qkv, qk, gates, seqs, out, kh, vh, dim);
+    else if (vpw == 4) fn_gdn_main_multi_k<4><<<dim3(vh, dim / 16, z), dim3(32, 4), 0, s>>>(qkv, qk, gates, seqs, out, kh, vh, dim);
+    else fn_gdn_main_multi_k<8><<<dim3(vh, dim / 32, z), dim3(32, 4), 0, s>>>(qkv, qk, gates, seqs, out, kh, vh, dim);
+}
 void fn_gdn_set_vpw(int v) { g_gdn_vpw = v == 2 || v == 4 || v == 8 ? v : 0; }
 __global__ void h_to_f32_k(const __half * x, float * y, int64_t n) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) y[i] = __half2float(x[i]);
@@ -1463,6 +1525,47 @@ void fn_dense_attention(const float * q, const __nv_bfloat16 * k, const __nv_bfl
         return;
     }
     fn_attention_k<<<dim3(heads, n), 128, (pos + n) * sizeof(float), s>>>(q, k, v, out, heads, kvheads, dim, pos);
+}
+static int attn_seqs_rows(const AttnSeqs & seqs, bool need_kv) {
+    int rows = 0;
+    if (seqs.count <= 0 || seqs.count > AttnSeqs::kMax) throw std::invalid_argument("Flash-Next attention (multi): 1..32 sequences");
+    for (int q = 0; q < seqs.count; ++q) {
+        if (seqs.off[q] != rows || seqs.n[q] <= 0 || seqs.pos[q] < 0 || int64_t(seqs.pos[q]) + seqs.n[q] > (1 << 20) ||
+            (need_kv && (!seqs.k[q] || !seqs.v[q])))
+            throw std::invalid_argument("Flash-Next attention (multi): sequences must be contiguous, non-empty, with K/V");
+        rows += seqs.n[q];
+    }
+    return rows;
+}
+static int attn_seqs_splits(const AttnSeqs & seqs) {
+    int splits = 1;
+    for (int q = 0; q < seqs.count; ++q) splits = std::max(splits, (seqs.pos[q] + seqs.n[q] + 127) / 128);
+    return splits;
+}
+void fn_rope_table_multi(float2 * table, const AttnSeqs & seqs, int rot, float theta, cudaStream_t s) {
+    const int n = attn_seqs_rows(seqs, false);
+    if (rot < 2 || rot % 2 || !std::isfinite(theta) || theta <= 0.f || !table) throw std::invalid_argument("Flash-Next RoPE table (multi): invalid rotary or pointer");
+    fn_rope_table_multi_k<<<(n * (rot / 2) + 255) / 256, 256, 0, s>>>(table, seqs, n, rot, theta);
+}
+void fn_norm_rope_table(const float * x, const float * weight, float * out, const float2 * table, int heads, int dim, int n,
+                        int rot, float eps, bool interleaved, cudaStream_t s) {
+    if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n || rot < 2 || rot > dim || rot % 2 ||
+        !std::isfinite(eps) || eps <= 0.f || !x || !weight || !out || !table || out == x || out == weight)
+        throw std::invalid_argument("Flash-Next norm/RoPE (table): invalid shape, pointer or epsilon");
+    const int rows = heads * n;
+    fn_norm_rope_tab_k<<<(rows + 7) / 8, 256, 0, s>>>(x, weight, out, table, rows, heads, dim, rot, eps, interleaved ? 2 : 1);
+}
+size_t fn_dense_attention_multi_workspace(int heads, int dim, const AttnSeqs & seqs) {
+    return size_t(attn_seqs_rows(seqs, false)) * heads * attn_seqs_splits(seqs) * (dim + 2);
+}
+void fn_dense_attention_multi(const float * q, const AttnSeqs & seqs, float * out, int heads, int kvheads, int dim, float * workspace, cudaStream_t s) {
+    const int n = attn_seqs_rows(seqs, true);
+    if (heads <= 0 || heads > 65535 || kvheads <= 0 || heads % kvheads || dim <= 0 || dim > 256 || dim % 32 || n > 65535 ||
+        !q || !out || !workspace || out == q)
+        throw std::invalid_argument("Flash-Next dense attention (multi): invalid shape or pointer");
+    const int chunk = 128, splits = attn_seqs_splits(seqs);
+    fn_attention_split_multi_k<<<dim3(heads, n, splits), 256, (chunk + 8 * dim) * sizeof(float), s>>>(q, seqs, workspace, heads, kvheads, dim, chunk, splits);
+    fn_attention_merge_k<<<dim3(heads, n), 128, 0, s>>>(workspace, out, heads, dim, splits);
 }
 void fn_attention_gate_h(const float * in, const float * qg, __half * out, int heads, int dim, int n, cudaStream_t s) {
     if (heads <= 0 || dim <= 0 || n <= 0 || int64_t(heads) * dim > std::numeric_limits<int>::max() / n || !in || !qg || !out)

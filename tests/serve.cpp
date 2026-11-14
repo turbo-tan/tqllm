@@ -144,6 +144,9 @@ void test_jinja_images() {
         R"({"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]},)"
         R"({"role":"user","content":"hi"}]})", 512, "", true, false, "xhigh", &stub);
     check(!bad.ok, "jinja path refuses images outside user messages");
+    // an untrusted body nested deeper than the parser's limit is a request error, not a stack overflow
+    const auto deep = tqserve::parse_request("{\"messages\":" + std::string(200000, '[') + std::string(200000, ']') + "}", 512, "", true);
+    check(!deep.ok && deep.error.find("nesting") != std::string::npos, "deeply nested chat body refused (" + deep.error + ")");
 }
 
 // Jinja path: the template must receive the resolved reasoning effort. A request that sets none gets the server's

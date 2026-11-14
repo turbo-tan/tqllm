@@ -15,6 +15,8 @@
 #include "attention_exact.hpp"
 #include "kv_tcq.hpp"
 #include "spec_pipeline.hpp"
+#include "suffix_copy.hpp"
+#include "tree_columns.hpp"
 #include "turn_reuse.hpp"
 #include "width_policy.hpp"
 #include "wired_limit.hpp"
@@ -88,6 +90,11 @@ struct MlxQwen35Engine::Impl {
     // greedy requests: verify(k) and draft(k+1) chained on the GPU (spec_pipeline.hpp, gated j892)
     std::optional<tqllm::mlx_backend::DraftAhead> ahead;
     std::optional<tqllm::mlx_backend::TreeAhead> tree_ahead;  // tree requests: the device tree pipeline
+    // copy drafts beside the tree (src/spec/suffix_copy.hpp): committed prompt + output; a repeat of kCopyFirstMatch tokens
+    // takes the verify block (TreeAhead::step)
+    tqllm::SuffixCopy copy{tqllm::SuffixCopyOptions{4, tqllm::kCopyFirstMatch, 64, 64}};
+    size_t copied = 0;
+    uint64_t copy_passes = 0;
     tqllm::mlx_backend::WidthPolicy widths;  // verify 7 or 15 drafted tokens per step (time lines kept across requests)
     uint32_t context_ = 0, eos = 0, vocab = 0, layers_ = 0, hidden_ = 0;
     int width = 15, chunk = 8192;  // block-16 drafts; prefill batches of 8192 run layer-major in 2048-row slices
@@ -351,6 +358,7 @@ void MlxQwen35Engine::begin_request(const std::vector<uint32_t>& prompt, uint32_
         i.tree_ahead.emplace(*i.engine, *i.drafter, tree_options);
         if (i.sampling) i.tree_ahead->sample(i.temperature, i.top_k, i.top_p, &i.rng);
         i.tree_ahead->start(i.pending);
+        i.copy.reset(); i.copy.append(i.prompt.data(), i.prompt.size()); i.copied = 0; i.copy_passes = 0;
         memlog_point("tree draft-ahead started");
     }
     if (!i.sampling && !i.tree && i.pending != i.eos && i.output.size() < i.count) {
@@ -466,7 +474,10 @@ bool MlxQwen35Engine::spec_advance() {
 bool MlxQwen35Engine::tree_step(int, uint32_t limit) {
     auto& i = *impl_;
     if (!i.tree_ahead) {i.done = true; return false;}
-    const auto st = i.tree_ahead->step(int(limit - i.output.size()));
+    for (; i.copied < i.output.size(); ++i.copied) i.copy.append(i.output[i.copied]);
+    const auto cp = i.copy.propose(tqllm::mlx_backend::TreeAhead::kPositions - 1);  // after the anchor (output's last)
+    if (!cp.empty()) ++i.copy_passes;
+    const auto st = i.tree_ahead->step(int(limit - i.output.size()), cp.empty() ? nullptr : &cp);
     i.h_build += st.build_ms; i.h_submit += st.submit_ms; i.h_wait += st.wait_ms; i.h_post += st.post_ms;
     i.h_inject += st.inject_ms; i.h_encode += st.encode_ms; i.h_vsubmit += st.vsubmit_ms;
     if (i.steps == 0) i.first_phases = {st.build_ms, st.submit_ms, st.wait_ms, st.post_ms};
@@ -492,6 +503,9 @@ std::vector<uint32_t> MlxQwen35Engine::spec_finish(uint64_t* stats) {
         stats[0] = i.steps; stats[1] = i.drafted; stats[2] = i.accepted;
         stats[3] = uint64_t(i.decode_us); stats[4] = uint64_t(i.prefill_us);
     }
+    if (i.tree && i.steps > 0)
+        std::fprintf(stderr, "tqserve: tree passes %llu, copy passes %llu, tokens per pass %.2f\n", static_cast<unsigned long long>(i.steps),
+                     static_cast<unsigned long long>(i.copy_passes), double(i.output.size()) / double(i.steps));
     if (i.widths.narrow_steps() + i.widths.wide_steps() > 0)
         std::fprintf(stderr, "tqserve: verify widths 7 x %d, 15 x %d\n", i.widths.narrow_steps(), i.widths.wide_steps());
     if (!i.first_steps.empty()) {  // per-request one-off costs land in the first steps (doc8k: 14 steps)

@@ -12,6 +12,7 @@
 | Connect coding agents | [Agent setup](guides/coding-agents.md) |
 | Add DFlash2 or native MTP drafting | [Speculative decoding](guides/speculative-decoding.md) |
 | Fit a long context into GPU and host memory | [TqCache](guides/long-context.md) |
+| Serve contextual embeddings (pplx-embed-v2-context, `POST /v1/embeddings`) | [Embeddings](guides/embeddings.md) |
 | Choose model weight formats | [Formats](reference/formats.md), [illustrated](reference/formats.html) |
 | Configure serving, sampling and memory | [Options](reference/options.md) |
 | Reproduce performance measurements | [Benchmarks](BENCHMARKS.md) |

@@ -23,6 +23,10 @@ int main() {
     expect("WSL default margin 256 MiB", tqllm::fit_margin(true, -1, true) == 256 * MB);
     expect("-fitt 0 keeps a floor (0 free = spilled)", tqllm::fit_margin(true, 0, true) >= 64 * MB);
     expect("-fitt 0 keeps a floor on Linux too", tqllm::fit_margin(true, 0, false) >= 64 * MB);
+    // the graph cache's working set is part of every margin (the fit and GraphLru agree by construction)
+    const size_t graphs = tqllm::kGraphCacheFloor * tqllm::kGraphCacheFloorBytes;
+    expect("-fitt 300: 300 MiB + the graph working set", tqllm::fit_margin(true, 300, false) == 300 * MB + graphs);
+    expect("the default holds the graph working set", tqllm::fit_margin(true, -1, false) >= 64 * MB + graphs);
     // 5060 Ti, TQ_XS 200K (2026-10-09): host tails of 15360 then 21504 positions left 0.05 then 0.19 GB (margin 0.27); the
     // fit halved the context to 102400 instead of moving ~4K more positions to host
     expect("converging host refinement continues", tqllm::fit_host_again(2, size_t(0.19 * GB), size_t(0.05 * GB), 21504, 204800));

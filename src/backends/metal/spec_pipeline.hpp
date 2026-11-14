@@ -140,14 +140,18 @@ public:
     };
     // max_rows: the rows (path + bonus) the request can still emit; a longer accepted path is cut on the device before the
     // commit and the drafter's inject, so the target and drafter hold exactly the emitted text
-    Step step(int max_rows = 1 << 30) {
+    // copy: tokens that followed an earlier repeat of the committed text (src/spec/suffix_copy.hpp); when given, this pass
+    // verifies anchor + the copy as a chain (rows 1 .. c) beside the drafted tree's best first draft (the last row), in the
+    // same 16 rows. The walk is unchanged, so the text is the target's whatever was proposed; the chain comes first, so a
+    // first draft equal to the copy's first token follows the copy.
+    Step step(int max_rows = 1 << 30, const std::vector<uint32_t>* copy = nullptr) {
         namespace mx = mlx::core;
         if (!active()) throw std::logic_error("tree draft-ahead step before start");
         using Clock = std::chrono::steady_clock;
         auto ms = [](Clock::time_point a, Clock::time_point b) {return std::chrono::duration<double, std::milli>(b - a).count();};
         const auto t0 = Clock::now();
         const int pos = engine_.position();
-        const DeviceTree tree = *tree_;
+        const DeviceTree tree = copy && !copy->empty() ? copy_tree(*tree_, *copy, pos) : *tree_;
         Qwen35::Verification ticket;
         engine_.defer_eval(true);
         mx::array verified = mx::array(0.0f);
@@ -194,6 +198,27 @@ public:
         return out;
     }
 private:
+    DeviceTree copy_tree(const DeviceTree& drafted, const std::vector<uint32_t>& copy, int pos) const {
+        namespace mx = mlx::core;
+        const int c = std::min(int(copy.size()), rows() - 2);
+        const bool sibling = !chain_at(pos, pos + c + 2);  // exact chains (no matrix unit, or the segment boundary): copy only
+        const int n = 1 + c + (sibling ? 1 : 0);
+        std::vector<int32_t> parents(static_cast<size_t>(n));
+        parents[0] = -1;
+        for (int r = 1; r <= c; ++r) parents[size_t(r)] = r - 1;
+        if (sibling) parents[size_t(n - 1)] = 0;
+        std::vector<mx::array> parts = {mx::slice(drafted.ids, {0}, {1}), mx::array(copy.data(), {c}, mx::uint32)};
+        if (sibling) {  // two equal children of the anchor would both be on the device walk's path: a draft equal to the
+                        // copy's first token is replaced by another valid id (the copy's row is the one that may match)
+            const uint32_t first = copy[0], other = first > 0 ? first - 1 : 1;
+            auto draft = mx::slice(drafted.ids, {1}, {2});
+            parts.push_back(mx::where(mx::equal(draft, mx::array(first)), mx::array(other), draft));
+        }
+        DeviceTree t{mx::concatenate(parts, 0), mx::array(parents.data(), {n}, mx::int32), mx::array(0), mx::array(false), n};
+        auto [visible, depth] = tree_ancestors(t.parents);
+        t.visible = visible; t.depth = depth;
+        return t;
+    }
     // A block that crosses the first attention segment boundary verifies some rows on the folded path and some on the
     // segmented one in their AR steps; a chain keeps every row's keys where AR has them, so that step drafts a chain.
     // The next tree is drafted before its anchor position is read back, so every anchor the verify could produce counts.

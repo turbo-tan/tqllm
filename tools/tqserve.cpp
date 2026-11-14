@@ -7,10 +7,12 @@
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
+#include "serve/embeddings.hpp"
 #include "gguf.hpp"
 #include "flags_gen.hpp"
 #if TQLLM_WITH_CUDA
 #include "kv_format.hpp"
+#include "models/qwen/qwen35/pplx_embed.hpp"
 #include "plugin_format.hpp"
 #endif
 #include "kv_store.hpp"
@@ -37,6 +39,7 @@
 #include <memory>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -152,6 +155,163 @@ template <class F> tqserve::DecodeResult guarded(F && f) {
         return r;
     }
 }
+
+#if TQLLM_WITH_CUDA
+// A contextual embedding GGUF (pplx-embed-v2-context): POST /v1/embeddings only. Connections run on their own threads;
+// tokenizing runs in parallel, the forward passes one request at a time on the one GPU.
+int serve_embeddings(const std::string & model_path, const tqllm::Tokenizer & tokenizer, const std::string & host, int port,
+                     const std::string & name, const std::string & api_key) {
+    constexpr size_t kEmbedBatchTokens = 65536;
+    auto model = tqllm::PplxEmbedder::load(model_path, 0, tqllm::PplxEmbedder::Mode::fast);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t n = tokenizer.warm_cache();
+        std::cerr << "tqserve: tokenizer piece cache warmed (" << n << " pieces, "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s)\n";
+    }
+    {  // one short document and one query at load: lazy CUDA module loading, cuBLAS setup and the activation buffers
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<tqllm::EmbedInput> warm;
+        warm.push_back(tqllm::embed_document_input(tokenizer, model->prompt(), {"Warm-up document.", "Second chunk."}));
+        model->embed_many(warm);
+        warm.clear();
+        warm.push_back(tqllm::embed_query_input(tokenizer, model->prompt(), "warm-up query"));
+        model->embed_many(warm);
+        std::cerr << "tqserve: embedder warmed (" << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s)\n";
+    }
+    listener = bind_socket(host, static_cast<uint16_t>(port));
+    if (listener < 0) throw std::runtime_error("socket bind/listen failed (error " + std::to_string(tqnet::last_error()) + ")");
+    std::signal(SIGINT, stop_server);
+    std::signal(SIGTERM, stop_server);
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    std::cerr << "tqserve: engine turbo-tan/tqllm " TQLLM_COMMIT "\n";
+    std::cerr << "tqserve: embeddings on " << host << ':' << port << " (model=" << name << ", dim " << model->dim()
+              << ", POST /v1/embeddings)\n";
+    std::string models = "{\"object\":\"list\",\"data\":[{\"id\":";
+    tqserve::jstr(models, name);
+    models += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
+    std::mutex gpu;
+    std::atomic<int> inflight{0};
+    // one thread per connection (at most 64): a slow client, or a long request, never holds up /health or another accept
+    auto handle = [&](int client) {
+            tqnet::set_recv_timeout(client, 30);
+            tqserve::Request request;
+            std::string error;
+            int status = 400;
+            std::string body;
+            if (!receive_request(client, request, error, status)) {
+                body = tqserve::json_error(error);
+            } else if (!api_key.empty() && request.authorization != "Bearer " + api_key) {
+                status = 401; body = tqserve::json_error("invalid or missing API key");
+            } else if (request.method == "GET" && request.path == "/health") {  // never waits for the GPU
+                status = 200; body = "{\"status\":\"ok\"}";
+            } else if (request.method == "GET" && request.path == "/v1/models") {
+                status = 200; body = models;
+            } else if (request.path != "/v1/embeddings") {
+                status = 404; body = tqserve::json_error("not found: this server serves an embedding model (POST /v1/embeddings)");
+            } else if (request.method != "POST") {
+                status = 405; body = tqserve::json_error("POST /v1/embeddings");
+            } else {
+                const auto t_start = std::chrono::steady_clock::now();
+                auto ms_since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); };
+                const auto r = tqserve::parse_embed_request(std::string(request.body.begin(), request.body.end()));
+                const std::string dim_error = r.error.empty() ? tqserve::check_dimensions(r, model->dim()) : std::string();
+                if (!r.error.empty() || !dim_error.empty()) {
+                    status = 400; body = tqserve::json_error(r.error.empty() ? dim_error : r.error);
+                } else {
+                    try {
+                        std::vector<std::vector<float>> vectors;
+                        // tokenize the entries on worker threads (the tokenizer is read-only and its piece cache is shared)
+                        std::vector<tqllm::EmbedInput> ins(r.docs.size());
+                        std::vector<std::exception_ptr> errs(r.docs.size());
+                        {
+                            const size_t nt = std::min<size_t>(r.docs.size(), std::max(1u, std::thread::hardware_concurrency()));
+                            std::vector<std::thread> pool;
+                            for (size_t t = 0; t < nt; ++t)
+                                pool.emplace_back([&, t] {
+                                    for (size_t i = t; i < r.docs.size(); i += nt) {
+                                        try {
+                                            ins[i] = r.query ? tqllm::embed_query_input(tokenizer, model->prompt(), r.docs[i][0])
+                                                             : tqllm::embed_document_input(tokenizer, model->prompt(), r.docs[i]);
+                                        } catch (...) { errs[i] = std::current_exception(); }
+                                    }
+                                });
+                            for (auto & th : pool) th.join();
+                            for (auto & e : errs) if (e) std::rethrow_exception(e);
+                        }
+                        size_t request_tokens = 0;
+                        for (const auto & in : ins) request_tokens += in.ids.size();
+                        if (request_tokens > tqserve::kEmbedMaxTokens)
+                            throw std::invalid_argument("the request has " + std::to_string(request_tokens) + " tokens; the limit per request is " +
+                                                        std::to_string(tqserve::kEmbedMaxTokens));
+                        const double t_tok = ms_since(t_start);
+                        std::lock_guard<std::mutex> lock(gpu);  // one forward at a time on the one GPU; tokenizing runs outside it
+                        const auto t_gpu = std::chrono::steady_clock::now();
+                        std::vector<tqllm::EmbedInput> batch;
+                        size_t tokens = 0, batch_tokens = 0;
+                        auto flush = [&] {
+                            for (auto & v : model->embed_many(batch)) vectors.push_back(std::move(v));
+                            batch.clear(); batch_tokens = 0;
+                        };
+                        for (auto & in : ins) {  // entries run as segments of one pass, up to kEmbedBatchTokens (64K; the engine splits passes)
+                            if (in.ids.size() > model->max_tokens())
+                                throw std::invalid_argument("input of " + std::to_string(in.ids.size()) + " tokens; the model takes " +
+                                                            std::to_string(model->max_tokens()));
+                            if (!batch.empty() && batch_tokens + in.ids.size() > kEmbedBatchTokens) flush();
+                            tokens += in.ids.size();
+                            batch_tokens += in.ids.size();
+                            batch.push_back(std::move(in));
+                        }
+                        if (!batch.empty()) flush();
+                        const double t_fwd = ms_since(t_gpu);
+                        const auto t_out = std::chrono::steady_clock::now();
+                        status = 200; body = tqserve::embed_response(r, vectors, model->dim(), name, tokens);
+                        std::fprintf(stderr, "tqserve: embeddings %zu inputs, %zu tokens: parse + tokenize %.1f ms, forward %.1f ms, response %.1f ms\n",
+                                     r.docs.size(), tokens, t_tok, t_fwd, ms_since(t_out));
+                    } catch (const std::invalid_argument & e) {
+                        status = 400; body = tqserve::json_error(e.what());
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: embeddings failed: " << e.what() << "\n";
+                        status = 500; body = tqserve::json_error(std::string("embeddings failed: ") + e.what());
+                    }
+                }
+            }
+        tqnet::set_send_timeout(client, 30);  // a client that stops reading cannot hold its thread forever
+        send_all(client, response(status, body));
+        tqnet::close(client);
+    };
+    while (running) {
+        const int client = tqnet::accept(listener);
+        if (client < 0) {
+            const int e = tqnet::last_error();
+            if (!running || tqnet::interrupted(e)) break;
+            continue;
+        }
+        if (inflight >= 64) {
+            tqnet::set_send_timeout(client, 5);
+            send_all(client, response(503, tqserve::json_error("too many connections")));
+            tqnet::close(client);
+            continue;
+        }
+        ++inflight;
+        try {
+            std::thread([&, client] {
+                try { handle(client); }
+                catch (const std::exception & e) {
+                    std::fprintf(stderr, "tqserve: embeddings request failed: %s\n", e.what());
+                    send_all(client, response(500, tqserve::json_error(std::string("request failed: ") + e.what())));
+                    tqnet::close(client);
+                }
+                --inflight;
+            }).detach();
+        } catch (...) { --inflight; tqnet::close(client); }
+    }
+    for (; inflight > 0;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return 0;
+}
+#endif
 
 } // namespace
 
@@ -281,6 +441,9 @@ int main(int argc, char ** argv) {
         std::cerr << "tqserve: loading model from " << model_path << "\n";
         tqllm::Tokenizer tokenizer;
         tokenizer.load(tokenizer_path);
+#if TQLLM_WITH_CUDA
+        if (tqllm::PplxEmbedder::is_embedding_gguf(model_path)) return serve_embeddings(model_path, tokenizer, host, port, name, api_key);
+#endif
         if (tokenizer.encode("</mm:think>").size() == 1) {  // MiniMax-M3: its own thinking tags; the answer follows the end tag
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";

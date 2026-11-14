@@ -374,9 +374,19 @@ int main() {
     {  // matvec rule table: the measured picks per (format bits, compute capability, shape), host-only lookups
         using tqllm_cuda::mvr::Kern;
         using tqllm_cuda::mvr::lookup;
-        struct Case { int bits, cc, rows, k, nc; Kern kern; int pf; };
+        struct Case { int bits, cc, rows, k, nc; Kern kern; int pf; int mt = 1; };
         const Case cases[] = {
-            {3, 86, 34816, 5120, 8, Kern::Split16, 0},   // TQ3 gate/up, 3090
+            {3, 86, 34816, 5120, 8, Kern::Split16, 0, 2},  // TQ3 gate/up, 3090, 8 columns: two row tiles
+            {3, 86, 34816, 5120, 1, Kern::Split16, 0},     // TQ3 gate/up, 3090, 1 column: one row tile
+            {3, 86, 34816, 5120, 7, Kern::Split16, 0, 2},  // TQ3 gate/up, 3090, 7 columns: two row tiles
+            {3, 86, 34816, 5120, 6, Kern::Split16, 0},     // TQ3 gate/up, 3090, 6 columns: one row tile
+            {3, 86, 34816, 5120, 16, Kern::Split16, 0, 2}, // TQ3 gate/up, 3090, 16 columns: two row tiles
+            {3, 86, 34816, 5120, 12, Kern::Split16, 0, 2}, // TQ3 gate/up, 3090, 12 columns: two row tiles
+            {3, 86, 16384, 5120, 16, Kern::Split16, 0, 2}, // TQ3 GDN mixer, 3090, 16 columns: two row tiles
+            {3, 86, 14336, 5120, 16, Kern::Split16, 0},    // TQ3 attention mixer, 3090, 16 columns: one row tile
+            {3, 120, 34816, 5120, 16, Kern::Split16, 0},   // TQ3 gate/up, 5060 Ti / 5090, 16 columns: one row tile
+            {4, 86, 34816, 5120, 16, Kern::Split16, 0},    // TQ4 gate/up, 3090, 16 columns: one row tile
+            {3, 86, 16384, 5120, 8, Kern::Split16, 0},     // TQ3 GDN mixer, 3090: one row tile
             {3, 86, 5120, 17408, 8, Kern::Split16, 1},   // TQ3 down, 3090
             {3, 120, 34816, 5120, 8, Kern::Split16, 0},  // TQ3 gate/up, 5060 Ti
             {3, 120, 5120, 17408, 8, Kern::Legacy, 0},   // TQ3 down, 5060 Ti
@@ -397,7 +407,7 @@ int main() {
         bool ok = true;
         for (const auto & c : cases) {
             const auto p = lookup(c.bits, c.cc, c.rows, c.k, c.nc);
-            const bool hit = p.kern == c.kern && (p.kern == Kern::Legacy || p.pf == c.pf);
+            const bool hit = p.kern == c.kern && (p.kern == Kern::Legacy || (p.pf == c.pf && p.mt == c.mt));
             if (!hit) std::printf("   rule miss: bits %d cc %d %d x %d nc %d\n", c.bits, c.cc, c.rows, c.k, c.nc);
             ok &= hit;
         }

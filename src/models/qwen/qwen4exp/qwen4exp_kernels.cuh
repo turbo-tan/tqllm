@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <climits>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace tqllm_cuda {
 // F32 residual and norm tensors use [tokens][streams][hidden], matching reference HC math.
@@ -73,6 +75,17 @@ void fn_gdn_release_workspaces();
 void fn_gdn(const float * qkv, const float * alpha, const float * beta, const float * neg_a,
             const float * dt_bias, const float * state, float * next_state, float * out,
             int kheads, int vheads, int dim, int tokens, float epsilon, cudaStream_t);
+// Decode blocks of several sequences in one launch: rows [off, off + n) of qkv / alpha / beta / out belong to sequence q
+// (contiguous, in order), which reads state[q] and writes next[q]. Per sequence the same per-token math as fn_gdn
+// (bit-identical) for blocks under the chunked-kernel threshold.
+struct GdnSeqs {
+    static constexpr int kMax = 32;
+    int count = 0, off[kMax] = {}, n[kMax] = {};
+    const float * state[kMax] = {};
+    float * next[kMax] = {};
+};
+void fn_gdn_multi(const float * qkv, const float * alpha, const float * beta, const float * neg_a, const float * dt_bias,
+                  const GdnSeqs & seqs, float * out, int kheads, int vheads, int dim, float epsilon, cudaStream_t);
 // Same as fn_gdn, also writing the state after every token to states[t][vheads][value][key] (speculative rollback).
 // Prefills of at least n tokens use the chunked gated-delta kernel (0: never; default 64). Tests.
 void fn_gdn_set_chunk_min(int n);
@@ -99,6 +112,20 @@ void fn_dense_attention(const float * query, const __nv_bfloat16 * keys, const _
 // floats of split workspace fn_dense_attention uses (0: none); a caller's workspace keeps the call free of allocations
 // (capturable: a cudaMallocAsync in a CUDA graph becomes graph-owned memory mapped at every launch)
 size_t fn_dense_attention_workspace(int heads, int dim, int tokens, int position);
+// Decode blocks of several sequences in one launch: rows [off, off + n) of the batch are sequence q's tokens at positions
+// pos, pos + 1, ..., its K/V cache k / v. Per sequence the same bits as fn_norm_rope / fn_dense_attention.
+struct AttnSeqs {
+    static constexpr int kMax = 32;
+    int count = 0, off[kMax] = {}, n[kMax] = {}, pos[kMax] = {};
+    const __nv_bfloat16 * k[kMax] = {}, * v[kMax] = {};
+};
+// the RoPE cosine / sine of every row (rows x rotary / 2), shared by the query and key norm / RoPE of the batch
+void fn_rope_table_multi(float2 * table, const AttnSeqs & seqs, int rotary, float theta, cudaStream_t);
+void fn_norm_rope_table(const float * x, const float * weight, float * out, const float2 * table, int heads, int dim, int tokens,
+                        int rotary, float epsilon, bool interleaved, cudaStream_t);
+size_t fn_dense_attention_multi_workspace(int heads, int dim, const AttnSeqs & seqs);
+void fn_dense_attention_multi(const float * query, const AttnSeqs & seqs, float * out, int heads, int kvheads, int dim,
+                              float * workspace, cudaStream_t);
 void fn_attention_gate(float * out, const float * query_gate, int heads, int dim, int tokens, cudaStream_t);
 // Decode elementwise ops (device-resident step): routed SwiGLU BF16 -> FP16, shared SwiGLU F32, and
 // out[t] = sum_k w[t][k] * routed[t][k] + shared_w[t] * shared[t].
@@ -151,10 +178,22 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
 // Raw keys are read only while their block is being pooled, so they live in a ring of the newest cells (one append + two
 // blocks + a rollback margin, grown on a larger append): 10-28 the full-context FP32 copy took ~1 GB of a 128K decode's VRAM.
 // A pinned host mirror of every appended key serves a truncate further back than the ring (same values, any rollback).
+// per cache: blocks [first, first + blocks) to pool (raw ring -> pooled) or to norm / RoPE (pooled -> normalized)
+struct QsaBlockJobs {
+    static constexpr int kMax = 32;
+    int count = 0, first[kMax] = {}, blocks[kMax] = {}, ring[kMax] = {};
+    const float * in[kMax] = {};
+    float * out[kMax] = {};
+};
 class QsaRawKeyCache {
 public:
     // ring: initial raw-key cells (0: min(max_cells, 4096 + 2 x ratio + kRollback))
     QsaRawKeyCache(int max_cells, int ratio, int dim, int ring = 0);
+    // append + normalize_new of several caches (one per sequence; keys rows [off, off + tokens) of one buffer): the ring
+    // copies in one launch, the pooling in one, the norm / RoPE in one. Per cache the same values as append + normalize_new.
+    static void append_multi(const std::vector<QsaRawKeyCache *> & caches, const float * keys, const std::vector<int> & off,
+                             const std::vector<int> & tokens, const float * weight, int rotary, float theta, float epsilon,
+                             cudaStream_t stream);
     ~QsaRawKeyCache();
     QsaRawKeyCache(const QsaRawKeyCache &) = delete;
     QsaRawKeyCache & operator=(const QsaRawKeyCache &) = delete;
@@ -172,6 +211,10 @@ public:
 
 private:
     void reserve_ring(int cells, cudaStream_t stream);
+    // append / normalize_new with the ring copies and the kernels recorded instead of issued
+    void append_deferred(const float * keys, int tokens, std::vector<std::pair<const float *, float *>> & runs, std::vector<size_t> & bytes,
+                         QsaBlockJobs & pools, cudaStream_t stream);
+    void normalize_deferred(QsaBlockJobs & norms);
     int max_cells_, ratio_, dim_, size_ = 0, ring_ = 0;
     float * raw_ = nullptr;
     float * host_raw_ = nullptr;  // pinned, max_cells x dim
@@ -248,6 +291,9 @@ public:
     QsaIndexer(const QsaIndexer &) = delete;
     QsaIndexer & operator=(const QsaIndexer &) = delete;
     void append(const float * raw_keys, int tokens, const float * key_norm, cudaStream_t stream);
+    // append for several indexers of one layer (the same shape), raw key rows [off, off + tokens) each
+    static void append_multi(const std::vector<QsaIndexer *> & indexers, const float * raw_keys, const std::vector<int> & off,
+                             const std::vector<int> & tokens, const float * key_norm, cudaStream_t stream);
     void truncate(int cells) { keys_.truncate(cells); }
     QsaDeviceSelection select(const float * raw_query, const float * query_norm,
                               int query_position, cudaStream_t stream);

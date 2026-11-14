@@ -91,6 +91,12 @@ int main(int argc, char ** argv) try {
         {"1u follower cap 40", 150, 45, 8 * 5120 + 512, 40 * 5120, true},
         {"1u follower cap 80", 150, 45, 8 * 5120 + 512, 80 * 5120, true},
         {"follower empty", 150, 45, 1, 1, true},
+        // exact TP2 (11-13): per layer, in = all-gather of the head outputs (rows x 3072 FP32 per rank) before the replicated
+        // output projection, out = expert results per assignment (BF16 x 2560); work = per-rank stand-ins at ~240 GB/s
+        {"tp2 16u p50", 70, 297, 48 * 3072 * 4, 240 * 5120},
+        {"tp2 16u max", 70, 297, 48 * 3072 * 4, 300 * 5120},
+        {"tp2 8u", 45, 195, 24 * 3072 * 4, 120 * 5120},
+        {"tp2 1u", 24, 56, 3 * 3072 * 4, 15 * 5120},
     };
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

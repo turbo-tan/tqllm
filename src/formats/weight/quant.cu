@@ -1,3 +1,4 @@
+#include "zero_copy_guard.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -775,6 +776,8 @@ __global__ void embed_multi_bf16_k(const __nv_bfloat16 * w, const uint32_t * dto
     const int n = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < k) y[int64_t(n) * k + i] = w[int64_t(dtok[n]) * k + i];
 }
+constexpr int kEmbedGridY = 65535;
+
 __global__ void embed_multi_q8_0_k(const uint8_t * w, const uint32_t * dtok, __nv_bfloat16 * y, int k) {
     const int n = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= k) return;
@@ -821,11 +824,13 @@ __global__ void embed_multi_q3k_k(const uint8_t * w, const uint32_t * dtok, __nv
     y[int64_t(n) * k + i] = __float2bfloat16_rn(d * float(sc) * float(q));
 }
 void embed_multi_q3k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
-    embed_multi_q3k_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
+    for (int t0 = 0; t0 < n; t0 += kEmbedGridY)  // grid y = token, at most 65,535 per launch
+        embed_multi_q3k_k<<<dim3((k + 255) / 256, std::min(kEmbedGridY, n - t0)), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok + t0, y + int64_t(t0) * k, k);
 }
 
 void embed_multi_q4k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
-    embed_multi_q4k_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
+    for (int t0 = 0; t0 < n; t0 += kEmbedGridY)  // grid y = token, at most 65,535 per launch
+        embed_multi_q4k_k<<<dim3((k + 255) / 256, std::min(kEmbedGridY, n - t0)), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok + t0, y + int64_t(t0) * k, k);
 }
 
 // Q5_K rows (176-byte blocks: d, dmin, scales[12], qh[32], qs[128]) as in q5k_to_i8_k / src/formats/weight/dequant.cpp q5k:
@@ -852,7 +857,8 @@ __global__ void embed_multi_q5k_k(const uint8_t * w, const uint32_t * dtok, __nv
     y[int64_t(n) * k + i] = __float2bfloat16_rn(d * float(s) * float(c) - dmin * float(m));
 }
 void embed_multi_q5k(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
-    embed_multi_q5k_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
+    for (int t0 = 0; t0 < n; t0 += kEmbedGridY)  // grid y = token, at most 65,535 per launch
+        embed_multi_q5k_k<<<dim3((k + 255) / 256, std::min(kEmbedGridY, n - t0)), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok + t0, y + int64_t(t0) * k, k);
 }
 
 void norm_h(const __nv_bfloat16 * x, const float * w, const float * partial, float eps, __half * xh, int k, int ncols,
@@ -977,10 +983,12 @@ void u4h_dequant_h(const uint8_t * w4, const __half2 * sm, __half * out, int row
 }
 
 void embed_multi_bf16(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
-    embed_multi_bf16_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const __nv_bfloat16 *>(w), dtok, y, k);
+    for (int t0 = 0; t0 < n; t0 += kEmbedGridY)  // grid y = token, at most 65,535 per launch
+        embed_multi_bf16_k<<<dim3((k + 255) / 256, std::min(kEmbedGridY, n - t0)), 256, 0, s>>>(static_cast<const __nv_bfloat16 *>(w), dtok + t0, y + int64_t(t0) * k, k);
 }
 void embed_multi_q8_0(const void * w, const uint32_t * dtok, int n, __nv_bfloat16 * y, int k, cudaStream_t s) {
-    embed_multi_q8_0_k<<<dim3((k + 255) / 256, n), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok, y, k);
+    for (int t0 = 0; t0 < n; t0 += kEmbedGridY)  // grid y = token, at most 65,535 per launch
+        embed_multi_q8_0_k<<<dim3((k + 255) / 256, std::min(kEmbedGridY, n - t0)), 256, 0, s>>>(static_cast<const uint8_t *>(w), dtok + t0, y + int64_t(t0) * k, k);
 }
 
 void tq3_matvec_h_variant(const void * w, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols, int variant,
@@ -1164,10 +1172,12 @@ __global__ void q5k_to_i8_k(const uint8_t * w, int8_t * w8, __half * sc, int64_t
     sc[gi] = sh;
 }
 void q5k_to_i8(const void * q5k, int8_t * w8, __half * sc, int rows, int k, cudaStream_t s) {
+    require_device_memory(q5k, "q5k_to_i8 source"); require_device_memory(w8, "q5k_to_i8 int8 rows"); require_device_memory(sc, "q5k_to_i8 scales");
     const int64_t ng = int64_t(rows) * k / 16;
     q5k_to_i8_k<<<int((ng + 255) / 256), 256, 0, s>>>(static_cast<const uint8_t *>(q5k), w8, sc, ng);
 }
 void q6k_to_i8(const void * q6k, int8_t * w8, __half * sc, int rows, int k, cudaStream_t s) {
+    require_device_memory(q6k, "q6k_to_i8 source"); require_device_memory(w8, "q6k_to_i8 int8 rows"); require_device_memory(sc, "q6k_to_i8 scales");
     const int64_t n = int64_t(rows) * k;
     q6k_to_i8_k<<<int((n + 255) / 256), 256, 0, s>>>(static_cast<const uint8_t *>(q6k), w8, sc, rows, k);
 }
@@ -1209,6 +1219,8 @@ __global__ void __launch_bounds__(512) i8h_rescore_argmax_k(const int8_t * w8, c
     }
 }
 
+// With the int8 head in host memory (fit, 12/16 GB cards) this is a deliberate zero-copy gather: 16 candidate rows per
+// column, ids from the device's 4-bit top-k inside captured graphs; not guarded (zero_copy_guard.hpp)
 void i8h_rescore_argmax(const int8_t * w8, const __half * sc, const __half * xh, const uint32_t * cand, int k,
                         int ncols, uint32_t * out, cudaStream_t s, float * scores) {
     if (k % 256) throw std::invalid_argument("i8h_rescore_argmax: k must be a multiple of 256");
@@ -1308,6 +1320,12 @@ template <class OUT, int FMT = 0>
 static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh, OUT * y, int rows, int k, int ncols,
                        cudaStream_t s, int mt = -1, const uint32_t * rid = nullptr, int ldy = 0) {
     if (k % 64) throw std::invalid_argument("u4h_matvec: k must be a multiple of 64");
+    // a short matrix with more than 8 columns: one CTA per (16 rows, 8 columns) instead of all column tiles in one CTA, so
+    // the grid fills the GPU (320 rows x 24 columns: 20 -> 60 CTAs on a 48-SM GB10). Same bits per column (test u4h_columns).
+    if (ncols > 8 && ncols <= 64 && (rows + 15) / 16 < 96) {
+        u4h_matvec_k<8, OUT, 1, FMT><<<dim3((rows + 15) / 16, (ncols + 7) / 8), 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        return;
+    }
     if (mt < 0 && ncols <= 8) {
         auto & tm = tuned<FMT>();
         const auto it = tm.find({rows, k * 2 + (ncols > 1 ? 1 : 0)});
@@ -1346,7 +1364,11 @@ static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh
             // (GB10 IQ4_XS 2560 -> 10240 133 -> 108 us, 12288 rows 164 -> 125); short matrices keep one (640 rows 12 -> 16)
             else if (ncols > 24 && ncols <= 32 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
             else if (ncols > 24 && ncols <= 32) u4h_matvec_k<32, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-            else throw std::invalid_argument("u4h_matvec: 1..32 columns");
+            // 33-64 columns (np 16 x 3-4 rows): two 32-column blocks per row block, side by side in the grid, so the weight rows
+            // come from DRAM once instead of once per 32-column launch
+            else if (ncols > 32 && ncols <= 64 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT, 0, false, 2><<<(rows + 31) / 32 * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 32 && ncols <= 64) u4h_matvec_k<32, OUT, 1, FMT, 0, false, 2><<<grid * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else throw std::invalid_argument("u4h_matvec: 1..64 columns");
     }
 }
 
@@ -1540,6 +1562,8 @@ void k3_tune(const uint8_t * w3, const uint8_t * kr, int rows, int k, cudaStream
 }
 
 void u4h_from_i8h(const int8_t * w8, const __half * sc, uint8_t * w4, __half2 * sm, int64_t n, cudaStream_t s) {
+    require_device_memory(w8, "u4h_from_i8h int8 rows"); require_device_memory(sc, "u4h_from_i8h scales");
+    require_device_memory(w4, "u4h_from_i8h 4-bit rows"); require_device_memory(sm, "u4h_from_i8h 4-bit scales");
     const int64_t nblk = n / 32;
     u4h_from_i8h_k<<<unsigned((nblk + 255) / 256), 256, 0, s>>>(w8, sc, w4, sm, nblk);
 }

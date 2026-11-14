@@ -144,6 +144,7 @@ struct FnConfig {
     // slots=auto on a card with < 16 GB free after the dense weights (12 / 16 GB cards): CPU expert pool, small MTP bank and
     // banks sized up to a 512 MB keep (fn_engine_load); TQFN_* variables still override each part
     bool small_card = false;
+    bool parallel = false;  // --np > 1: several requests share the card (a small card then runs no CPU expert pool)
     // expert slots hold lane-contiguous tiles: only with a packed experts file (cold GGUF uploads stay untiled); --pack-experts
     // writes tiled blocks unless TQFN_TILED=0
     bool tile_experts = false;

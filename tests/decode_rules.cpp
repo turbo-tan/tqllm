@@ -2,6 +2,7 @@
 // Flash-Next decode rules (no CUDA): the F39 verify path choice, the F38 slots=auto keep, the adaptive draft stop.
 #include "models/qwen/qwen4exp/decode_rules.hpp"
 #include <cstdio>
+#include <memory>
 #include <new>
 #include <cstdlib>
 #include <string>
@@ -356,6 +357,61 @@ int main() {
         check(cpu_pool_reads_packed(-1, false, 32), "--exact off without TQFN_CPU_MISS: the pool reads the pinned packed experts");
         check(!cpu_pool_reads_packed(-1, true, 32) && !cpu_pool_reads_packed(0, false, 32), "no pool, no packed view");
         check(cpu_miss_threads(-1, false, 4) == 1, "small CPU: at least one thread");
+        // G2 (11-13): a small card with --np > 1 runs no pool; one request keeps it; TQFN_CPU_MISS still wins
+        check(cpu_miss_threads(-1, false, 32, true) == 0 && cpu_miss_threads(-1, false, 32, false) == 15 && cpu_miss_threads(6, false, 32, true) == 6,
+              "small card, several requests: no CPU expert pool unless asked");
+        check(!cpu_pool_reads_packed(-1, false, 32, true) && cpu_pool_reads_packed(-1, false, 32, false), "the packed view follows the pool");
+    }
+    {   // --np limit: 32 only when the manifest pins every expert resident (slots=512), else 16
+        check(np_max(false, 512, 512) == 32, "slots=512 (every expert resident): up to --np 32");
+        check(np_max(true, 512, 512) == 16 && np_max(false, 511, 512) == 16 && np_max(false, 150, 512) == 16, "slots=auto or fewer than 512: up to --np 16");
+        for (int np = 17; np <= 32; ++np) check(np <= np_max(false, 512, 512) && np > np_max(true, 512, 512), "np 17-32: resident serves, not resident refuses");
+        check(np_max(false, 256, 256) == 32 && np_max(false, 384, 512) == 16, "the model's expert count decides, not 512");
+    }
+    {   // layer graphs: up to 1024 / topk rows with every expert resident (device maps), 8 otherwise; more rows run eager
+        check(graph_rows_max(10) == 102 && graph_rows_max(8) == 128 && graph_rows_max(0) == 1024, "device maps: 1024 / topk rows");
+        check(kBatchRowsMax * 10 <= 1024 && kBatchRowsMax <= graph_rows_max(10), "a batch's rows fit the device maps (top-10)");
+        for (int n = 33; n <= 64; ++n) check(n <= layer_graph_rows(true, 10), "resident, top-10: 33-64 rows run as graphs");
+        check(65 > layer_graph_rows(true, 10), "resident, top-10: past a batch's 64 rows: eager");
+        int most = 0; for (int a = 2; a <= 32; ++a) most = std::max(most, a * (batch_drafts(a, 5, 10, 512, 512) + 1));
+        check(most <= kBatchRowsMax && most > 51, "np 2-32 with every expert resident: up to 64 rows a step, all within the graph rule");
+        check(layer_graph_rows(false, 10) == 8, "not resident: up to 8 rows graphed, 9 eager");
+    }
+    {   // device maps and the waves readback (fn_layer_forward): a 512-slot bank of 512 top-10 experts, verify rows 52-64
+        for (int n = 1; n <= 64; ++n)
+            check(device_maps(n, 10, 512, 512, true) && !reads_routes_for_waves(false, true, n, 10, 512, true),
+                  "every expert resident: " + std::to_string(n) + " rows build their maps on the device, no readback");
+        check(!device_maps(2, 10, 150, 512, true) && reads_routes_for_waves(false, false, 16, 10, 150, true), "a partial bank keeps the host maps");
+        check(!device_maps(4, 10, 512, 512, false) && device_maps(1, 10, 512, 512, false), "prompt chunks keep the host maps");
+        check(!device_maps(graph_rows_max(10) + 1, 10, 512, 512, true), "past 1024 assignments: host maps");
+    }
+    {   // batched attention workspace (Flash-Next: 24 heads x 256): within 64 MB, else the per-sequence path (blocks of 64 MB)
+        check(attention_multi_fits(64, 24, 256, 2048), "64 rows below the indexer budget (2,048): batched");
+        check(!attention_multi_fits(64, 24, 256, 131072) && !attention_multi_fits(4, 24, 256, 131072) && attention_multi_fits(1, 24, 256, 131072), "128K without an indexer: 4+ rows take the per-sequence path (one row: 25 MB)");
+        check(attention_multi_fits(8, 24, 256, 8192) && !attention_multi_fits(8, 24, 256, 65536), "8 rows: batched to ~16K, not at 64K");
+    }
+    {   // StepUndo: a captured step that failed after swapping the GDN buffers, advancing len and making a first-use buffer
+        struct Rec { std::unique_ptr<int> history, history2, state, state2; int last_n = 3, channels = 8; } r;
+        r.history = std::make_unique<int>(1); r.history2 = std::make_unique<int>(2); r.state = std::make_unique<int>(3);
+        int len = 40; std::unique_ptr<int> ple;
+        const int * h0 = r.history.get(), * h1 = r.history2.get(), * s0 = r.state.get();
+        StepUndo<std::unique_ptr<int>> undo;
+        undo.swapped(r.history, r.history2); undo.swapped(r.state, r.state2); undo.value(r.last_n); undo.value(len); undo.first_use(ple);
+        std::swap(r.history, r.history2);                                        // the conv history swap
+        r.state2 = std::make_unique<int>(4); std::swap(r.state, r.state2);       // state2 made on first use, then the swap
+        r.last_n = 7; len += 7; ple = std::make_unique<int>(5);
+        undo.restore();
+        check(r.history.get() == h0 && r.history2.get() == h1, "rerun: history buffers back in place");
+        check(r.state.get() == s0 && !r.state2, "rerun: state back, the first-use second buffer dropped");
+        check(r.last_n == 3 && len == 40 && !ple, "rerun: lengths back, the first-use PLE buffer dropped (made again, zeroed)");
+        StepUndo<std::unique_ptr<int>> none; none.swapped(r.history, r.history2); none.value(len); none.restore();
+        check(r.history.get() == h0 && len == 40, "a step that changed nothing: restore keeps it");
+    }
+    {   // TQFN_CPU_MISS: its value when set, -1 when unset
+        unsetenv("TQFN_CPU_MISS"); check(cpu_miss_env() == -1, "TQFN_CPU_MISS unset: -1");
+        setenv("TQFN_CPU_MISS", "6", 1); check(cpu_miss_env() == 6, "TQFN_CPU_MISS=6: 6");
+        setenv("TQFN_CPU_MISS", "0", 1); check(cpu_miss_env() == 0, "TQFN_CPU_MISS=0: 0 (pool off)");
+        unsetenv("TQFN_CPU_MISS");
     }
     {   // the built-in Flash-Next routing profile (manifests without layer_slots, e.g. Unsloth files)
         const std::string prof = flashnext_layer_profile(48, 512);
