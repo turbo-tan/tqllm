@@ -3,7 +3,8 @@ name: windows
 # Windows 11 users run the same Linux image through WSL 2 GPU passthrough.
 # GitHub's Windows runners can only build Windows containers, so the image itself
 # is built by build.yml on Linux. This job checks what breaks on a Windows
-# checkout: CRLF line endings in scripts and compose files that don't parse.
+# checkout: CRLF line endings in scripts and compose files that don't parse. windows-msvc builds tqserve
+# natively (MSVC + CUDA), as the native Windows guide does.
 
 on:
   push:
@@ -57,3 +58,74 @@ jobs:
           MODEL_DIR='C:\models' MODEL_NAME=model.gguf docker compose -f compose.yaml config --quiet
           MODEL_DIR='/home/user/models' docker compose -f compose.yaml config --quiet
           echo "OK: compose.yaml parses"
+
+  windows-msvc:
+    # Native build with MSVC + nvcc, as docs/guides/windows.md: a POSIX-only header or a GCC-only attribute in code that
+    # the Linux image builds fails this job. Host objects compile first (fast, every .cpp of tqserve), then the full
+    # tqserve link for one architecture.
+    name: Windows MSVC build (tqserve, CUDA 12.8, sm_86)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CUDA_VER: '12.8'
+      CUDA_INSTALLER: https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe
+      CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+          key: cuda-12.8.1-nvcc-cudart-cublas-cusolver-v1
+
+      - name: Install the CUDA toolkit (compiler and the libraries tqserve links, no driver)
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:CUDA_INSTALLER -OutFile cuda.exe
+          $v = $env:CUDA_VER
+          $p = Start-Process .\cuda.exe -Wait -PassThru -ArgumentList @('-s', "nvcc_$v", "cudart_$v", "cublas_$v", "cublas_dev_$v",
+                 "cusolver_$v", "cusolver_dev_$v", "thrust_$v")
+          if ($p.ExitCode -ne 0) {
+            Get-ChildItem "$env:LOCALAPPDATA\Temp" -Recurse -Include *.log -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'NVIDIA|CUDA' } | ForEach-Object { "== $($_.FullName)"; Get-Content $_ -Tail 40 }
+            throw ("CUDA installer exit code 0x{0:X8}" -f $p.ExitCode) }
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+      - name: MSVC environment
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV } }
+          "$env:CUDA_PATH\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF
+
+      - name: Host objects (every C++ file of tqserve, MSVC)
+        shell: bash
+        run: |
+          # only what tqserve links: tests and the MoE tools are Linux-only (docs/guides/windows.md)
+          ninja -C build -t commands tqserve | grep -o '/Fo[^ ]*\.cpp\.obj' | sed 's#^/Fo##; s#\\#/#g' | sort -u > host_objs.txt
+          echo "$(wc -l < host_objs.txt) host objects"; [ -s host_objs.txt ] || { echo "::error::no host objects found for tqserve"; exit 1; }
+          xargs -n 40 ninja -C build -k 0 < host_objs.txt
+
+      - name: tqserve (CUDA kernels and link)
+        shell: pwsh
+        run: cmake --build build --target tqserve -- -k 0
+
+      - name: Everything else (not a gate; lists what does not build on MSVC)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          rc=0; ninja -C build -k 0 all > rest.log 2>&1 || rc=$?   # bash -e: keep going to the list
+          { grep -o '^FAILED: [^ ]* [^ ]*' rest.log || true; } | awk '{print $NF}' | sort -u > rest_failed.txt
+          echo "### Not building on MSVC (outside tqserve): $(wc -l < rest_failed.txt) objects" >> $GITHUB_STEP_SUMMARY
+          sed 's/^/- /' rest_failed.txt >> $GITHUB_STEP_SUMMARY
+          for f in $(cat rest_failed.txt); do grep -A3 "^FAILED: .*$f" rest.log | grep -m1 -E "error C|fatal error" | sed "s#^#$f: #" || true; done | cut -c1-240
+          exit $rc
