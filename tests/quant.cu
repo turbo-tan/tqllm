@@ -379,6 +379,8 @@ int main() {
             {3, 86, 34816, 5120, 8, Kern::Split16, 0, 2},  // TQ3 gate/up, 3090, 8 columns: two row tiles
             {3, 86, 34816, 5120, 1, Kern::Split16, 0},     // TQ3 gate/up, 3090, 1 column: one row tile
             {3, 86, 34816, 5120, 7, Kern::Split16, 0, 2},  // TQ3 gate/up, 3090, 7 columns: two row tiles
+            {3, 89, 34816, 5120, 8, Kern::Split16, 0},     // TQ3 gate/up, RTX 4090 (cc 8.9), 8 columns: one row tile
+            {3, 89, 34816, 5120, 16, Kern::Split16, 0},    // TQ3 gate/up, RTX 4090, 16 columns: one row tile
             {3, 86, 34816, 5120, 6, Kern::Split16, 0},     // TQ3 gate/up, 3090, 6 columns: one row tile
             {3, 86, 34816, 5120, 16, Kern::Split16, 0, 2}, // TQ3 gate/up, 3090, 16 columns: two row tiles
             {3, 86, 34816, 5120, 12, Kern::Split16, 0, 2}, // TQ3 gate/up, 3090, 12 columns: two row tiles
