@@ -8,6 +8,7 @@
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
 #include "serve/embeddings.hpp"
+#include "serve/cuda_health.hpp"
 #include "gguf.hpp"
 #include "flags_gen.hpp"
 #if TQLLM_WITH_CUDA
@@ -142,16 +143,31 @@ void usage() {
                  "  --peer URL (repeatable, needs --np > 1): other tqserve boxes with the same model; each chat request goes to the box expected to\n"
                  "    answer first (free slots, decoding load, the K/V a slot already holds for the prompt); POST /admin/route reports a box's status\n";
 }
-// A generation that throws (e.g. a kernel launch that fails on a nearly full device) fails its own request only: the next
-// request starts at position 0 and resets the sequence state.
+// A generation that throws (e.g. a kernel launch that fails on a nearly full device) fails its own request only: `on_fail`
+// drops what the request half-wrote (the engine's prompt cache for its slot) and a pending CUDA error is cleared, so the
+// next request starts clean. A lost CUDA context (a kernel fault) fails the request and tqserve exits (cuda_health.hpp).
 const char * const kFailed = "generation failed: ";
-template <class F> tqserve::DecodeResult guarded(F && f) {
+// engine_thread: the engine runs here (no scheduler); with --np the scheduler's thread checks the context itself (a device
+// sync from every HTTP thread would stall the batch)
+template <class F, class G> tqserve::DecodeResult guarded(F && f, G && on_fail, bool engine_thread) {
+    tqserve::DecodeResult r;
+    if (const std::string lost = engine_thread ? tqserve::check_cuda_context() : tqserve::context_lost() ? std::string("lost earlier") : std::string();
+        !lost.empty()) {
+        r.error = std::string(kFailed) + "the CUDA context was lost by an earlier request (" + lost + "); tqserve is restarting";
+        return r;
+    }
     try {
+        static const int fault_at = tqllm::debug_int("cuda_fault");
+        static std::atomic<int> requests{0};
+#if TQLLM_WITH_CUDA
+        if (engine_thread && fault_at > 0 && ++requests == fault_at) tqllm_cuda::debug_device_fault();
+#endif
         return f();
     } catch (const std::exception & e) {
         std::cerr << "tqserve: " << kFailed << e.what() << "\n";
-        tqserve::DecodeResult r;
+        try { on_fail(); } catch (...) {}
         r.error = std::string(kFailed) + e.what();
+        if (engine_thread && !tqserve::check_cuda_context().empty()) r.error += " (the CUDA context is lost: tqserve is restarting)";
         return r;
     }
 }
@@ -836,7 +852,7 @@ int main(int argc, char ** argv) {
                         auto result = guarded([&] {
                             return scheduler ? scheduler->submit_stream(r, on_tokens)
                                              : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
-                        });
+                        }, [&] { if (!scheduler) model.spec_abort(0); }, !scheduler);
                         observe_result(r.observation, result);
                         return result;
                     };
@@ -885,7 +901,8 @@ int main(int argc, char ** argv) {
                     return;
                 } else {
                     auto run = [&](const tqserve::ChatRequest & r) {
-                        auto result = guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        auto result = guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); },
+                                              [&] { if (!scheduler) model.spec_abort(0); }, !scheduler);
                         observe_result(r.observation, result);
                         return result;
                     };

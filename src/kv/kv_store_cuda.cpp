@@ -85,9 +85,14 @@ struct CudaKvMemory : KvMemory {
         d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         d.location.id = dev;
         d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemSetAccess(a, n, &d, 1) != CUDA_SUCCESS) {  // a mapping without access would fault: undo it
+            cuMemUnmap(a, n);
+            cuMemRelease(h);
+            return false;
+        }
         it->second.push_back({a, n, h, true, where == KvTier::device});
         if (where == KvTier::device) tqllm_cuda::dev_bytes_counter() += n;  // the memory fit counts device granules
-        return cuMemSetAccess(a, n, &d, 1) == CUDA_SUCCESS;
+        return true;
     }
     void * phys_alloc(size_t n) override {
         const CUmemAllocationProp p = prop(KvTier::device);
@@ -114,8 +119,9 @@ struct CudaKvMemory : KvMemory {
         d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         d.location.id = dev;
         d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemSetAccess(a, n, &d, 1) != CUDA_SUCCESS) { cuMemUnmap(a, n); return false; }  // as in map()
         it->second.push_back({a, n, P->h, false, true});
-        return cuMemSetAccess(a, n, &d, 1) == CUDA_SUCCESS;
+        return true;
     }
     void unmap(void * at, size_t n) override {
         const CUdeviceptr a = reinterpret_cast<CUdeviceptr>(at);

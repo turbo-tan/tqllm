@@ -1,6 +1,7 @@
 // Shared FP32 kernels (common_kernels.cuh): the GLM-5.3 engine's originals, unchanged.
 #include "common_kernels.cuh"
 #include <cfloat>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -161,3 +162,10 @@ void argmax_rows(const float * x, int n, int rows, int * out, cudaStream_t s) {
     check_launch("common kernel: ");
 }
 }  // namespace tqllm_cuda::common
+
+namespace {
+__global__ void debug_device_fault_k(int * p) { p[threadIdx.x] = 1; }
+}
+namespace tqllm_cuda {
+void debug_device_fault(cudaStream_t stream) { debug_device_fault_k<<<1, 32, 0, stream>>>(reinterpret_cast<int *>(uintptr_t(0x10))); }
+}  // namespace tqllm_cuda

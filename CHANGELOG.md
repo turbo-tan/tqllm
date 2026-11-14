@@ -50,6 +50,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Sampled requests (temperature > 0) on the 27B use the DFlash2 token tree on CUDA too (it was greedy-only): the walk draws each node's token from the target's distribution and follows a matching child. RTX 4090, Qwen3.8-27B TQ4 + DFlash2-TQ3, temperature 0.6, 6 x 2,000 tokens: 146 -> 173 tok/s, accepted drafts 30 % -> 37 %. `TQLLM_DEBUG=sample_chain` keeps chain drafts.
 
 ### Fixed
+- A request that failed for lack of GPU memory could leave the server faulting the GPU on every later request ("illegal
+  memory access", Xid 31; 27B on an RTX 3090 beside another GPU process). Moving the oldest K/V to host memory unmapped a
+  granule before mapping its replacement; when that map failed, the granule stayed unmapped and the next request's
+  attention read the hole. A failed move now puts the old mapping back (the request fails, the K/V is unchanged), and
+  Flash-Next's page moves do the same. Should the GPU context still be lost, tqserve answers that request with HTTP 500
+  and exits with status 70 so a supervisor restarts it, instead of serving on; `compose.yaml` now restarts on failure.
 - 27B with a DFlash2 drafter: a reply ends at its end-of-sequence token. When the EOS was accepted inside a draft block, the drafts after it and the bonus token were appended too (greedy or sampled, chain or tree).
 - MSVC: `tests/gguf_validation.cpp`, `tests/tokenizer_gguf.cpp` and `tests/expert_bank_plan.cpp` build without `<unistd.h>` / `setenv`, `tqllm/rope_scaling.hpp` no longer needs `M_PI`, and `-DBUILD_TESTING=OFF` defines no test target (124 `test-*` executables were still built).
 - 27B with a DFlash2 drafter, sampled requests (thinking on): when the drafter's guess equalled the first copied token,
