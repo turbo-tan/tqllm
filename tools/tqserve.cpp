@@ -608,6 +608,7 @@ int main(int argc, char ** argv) {
 #ifdef SIGPIPE
         std::signal(SIGPIPE, SIG_IGN);
 #endif
+    bool template_effort = false;  // the chat template reads reasoning_effort (the monitor chat then offers the levels)
     tqserve::PromptRenderer renderer;
     tqllm::Json default_kwargs;
     if (use_jinja || !template_file.empty()) {
@@ -650,9 +651,15 @@ int main(int argc, char ** argv) {
                 try { default_kwargs = tqllm::parse_json(template_kwargs_text); } catch (const std::exception & e) { std::cerr << "tqserve: --chat-template-kwargs: " << e.what() << "\n"; return 2; }
             }
             std::cerr << "tqserve: chat template: Jinja (" << src.size() << " bytes), llama.cpp's engine\n";
+            template_effort = src.find("reasoning_effort") != std::string::npos;
         }
     }
 
+        if (monitor) {  // levels: the template's reasoning_effort, or the native Qwen layout where the server writes the effort text
+            std::string def = effort == "minimal" ? "low" : (effort == "high" || effort == "max") ? "xhigh" : effort;
+            monitor->reasoning(reasoning, (template_effort || !renderer) ? std::vector<std::string>{"low", "medium", "xhigh"}
+                                                                         : std::vector<std::string>{}, def);
+        }
         std::cerr << "tqserve: engine turbo-tan/tqllm " TQLLM_COMMIT "\n";
         std::cerr << "tqserve: listening on " << host << ':' << port << " (model=" << name
                   << ", context=" << slot_context << (np > 1 ? " per slot, slots=" + std::to_string(np) : std::string())

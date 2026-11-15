@@ -71,6 +71,7 @@ void chat_proxy_gate() {
 int main(int argc, char ** argv) {
     try {
         Monitor m({"Sample Qwen engine", "fixture", "Test host", "", 32768, 2});
+        m.reasoning(false, {"low", "medium", "xhigh"}, "medium");  // a template with reasoning_effort, thinking off by default
 #if defined(__linux__)
         if (argc >= 3 && argc <= 5 && std::string(argv[1]) == "--fixture") {
             tqserve::MonitorServer server(m, "127.0.0.1", 0, argc >= 4 ? argv[3] : "", "", argc == 5 ? uint16_t(std::stoul(argv[4])) : 0);
@@ -110,6 +111,11 @@ int main(int argc, char ** argv) {
         check(j.get("schema_version")->num == 1, "version");
         check(j.get("requests")->arr.empty(), "initial empty");
         check(j.get("hardware")->get("gpu_percent")->kind == tqllm::Json::Null, "unknown is null");
+        {
+            const auto * rs = j.get("engine")->get("reasoning");
+            check(rs && rs->get("default_on")->kind == tqllm::Json::Bool && rs->get("default_on")->num == 0 && rs->get("efforts")->arr.size() == 3 &&
+                  rs->get("efforts")->arr[1].str == "medium" && rs->get("default_effort")->str == "medium", "reasoning capabilities");
+        }
         auto r = m.begin();
         check(latest(snapshot(m)).get("phase")->str == "queued", "queue");
         r->prefill(4096);

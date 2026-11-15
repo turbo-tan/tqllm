@@ -85,6 +85,12 @@ public:
         uint64_t id_;
     };
     explicit Monitor(Info info) : info_(std::move(info)) {}
+    // What the chat panel can offer: thinking default on/off, the reasoning_effort values the chat template understands
+    // (empty: only on/off), and the server's default effort. Set once the chat template is known.
+    void reasoning(bool default_on, std::vector<std::string> efforts, std::string default_effort) {
+        std::lock_guard<std::mutex> lock(data_->mutex);
+        reasoning_on_ = default_on; efforts_ = std::move(efforts); default_effort_ = std::move(default_effort);
+    }
     std::shared_ptr<Request> begin() {
         std::lock_guard<std::mutex> lock(data_->mutex);
         // Retain 32 completed requests; never evict an active request.
@@ -107,7 +113,10 @@ public:
         out += ",\"uptime_ms\":" + std::to_string(milliseconds(now - started_)) + ",\"engine\":{\"model\":";
         jstr(out, info_.model); out += ",\"build\":"; jstr(out, info_.build);
         out += ",\"host\":"; jstr(out, info_.host); out += ",\"device_id\":"; jstr(out, info_.device);
-        out += ",\"context_per_slot\":" + std::to_string(info_.context) + ",\"slots\":" + std::to_string(info_.slots) + "},\"requests\":[";
+        out += ",\"context_per_slot\":" + std::to_string(info_.context) + ",\"slots\":" + std::to_string(info_.slots);
+        out += std::string(",\"reasoning\":{\"default_on\":") + (reasoning_on_ ? "true" : "false") + ",\"efforts\":[";
+        for (size_t i = 0; i < efforts_.size(); ++i) { if (i) out += ','; jstr(out, efforts_[i]); }
+        out += "],\"default_effort\":"; jstr(out, default_effort_); out += "}},\"requests\":[";
         bool first = true;
         for (const auto & e : data_->entries) {
             if (!first) out += ',';
@@ -150,6 +159,9 @@ private:
         if (value && std::isfinite(double(*value))) out += std::to_string(*value); else out += "null";
     }
     Info info_;
+    bool reasoning_on_ = false;
+    std::vector<std::string> efforts_;
+    std::string default_effort_;
     const Clock::time_point started_ = Clock::now();
     const std::string instance_ = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
     std::shared_ptr<Shared> data_ = std::make_shared<Shared>();
