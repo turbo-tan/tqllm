@@ -140,6 +140,7 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
 @media(max-width:520px){.bar{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:6px}.bar .brand{font-size:18px;grid-column:1;grid-row:1}.bar .id{display:block;grid-column:1/-1;grid-row:3;font-size:11px}.bar .pill{grid-column:1;grid-row:2;justify-self:start;margin:0;font-size:11px;padding:2px 6px}#themeButton{grid-column:2;grid-row:1/3}#keyButton{grid-column:3;grid-row:1/3}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.compose{grid-template-columns:1fr}.compose .buttons{justify-content:flex-end}.lens-actions{width:100%}.lens-actions button{flex:1}}
 @media(max-width:360px){.lens-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
+.chat-head select{background:var(--bg);color:inherit;border:1px solid var(--line);border-radius:6px;padding:4px 6px;min-height:36px;font:inherit;text-transform:none;letter-spacing:0}
 /* Phones: Monitor / Chat tabs, a full-height chat with the composer at the bottom, request cards. */
 .tabs{display:none}
 .tabs i{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--decode);margin-left:6px;vertical-align:middle;animation:blink 1s steps(2) infinite}
@@ -222,7 +223,7 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
   <div id="monitorPanels"></div>
 </section>
 <section class="right" aria-label="Chat">
-  <div class="chat-head"><span>chat / this instance</span><label class="toggle"><input type="checkbox" id="chatThink"> thinking</label><button type="button" id="chatClear" class="icon-button" title="Clear conversation" aria-label="Clear conversation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg></button></div>
+  <div class="chat-head"><span>chat / this instance</span><label class="toggle" for="chatThink">thinking <select id="chatThink" title="Thinking for the next message: off, or the reasoning effort levels this model's chat template offers"><option value="off">off</option><option value="on">on</option></select></label><button type="button" id="chatClear" class="icon-button" title="Clear conversation" aria-label="Clear conversation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg></button></div>
   <div id="transcript" tabindex="0" role="region" aria-label="Conversation"><div class="hint" id="chatHint">Talk to the model this server is running. Enter sends, Shift+Enter adds a line, Esc stops a reply.</div></div>
   <form class="compose" id="compose"><span class="caret">&gt;</span><textarea id="chatInput" aria-label="Message to this model" aria-describedby="composeHelp" rows="2" placeholder="message" autocomplete="off" spellcheck="false"></textarea><div class="buttons"><button type="submit" id="chatSend" class="icon-button primary" title="Send message (Enter)" aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V4m-6 6 6-6 6 6"/></svg></button><button type="button" id="chatStop" class="icon-button" title="Stop response (Escape)" aria-label="Stop response" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button></div></form>
   <div class="chat-help" id="composeHelp">Enter to send / Shift+Enter for a new line / Esc to stop</div><div class="chat-foot"><span id="chatStatus" role="status">idle</span><span id="chatStats"></span></div>
@@ -322,9 +323,30 @@ $('pinRequest').addEventListener('click', () => {
   if (!r || !terminal(r.phase)) return;
   pinnedRequest = pinnedRequest && pinnedRequest.id === r.id ? null : {...r}; requestLens();
 });
+// thinking selector: off, then the reasoning_effort levels the server reports for this model's chat template (or just on);
+// it follows the server default (e.g. --reasoning on --reasoning-effort medium) until the user picks a value
+let thinkPicked = false, thinkKey = '';
+$('chatThink').addEventListener('change', () => { thinkPicked = true; });
+function thinkOptions(r) {
+  const efforts = Array.isArray(r?.efforts) ? r.efforts.filter(e => typeof e === 'string' && /^[a-z]+$/.test(e)) : [];
+  const values = ['off', ...(efforts.length ? efforts : ['on'])], key = values.join(',');
+  const want = r?.default_on ? (efforts.includes(r.default_effort) ? r.default_effort : efforts.length ? efforts[0] : 'on') : 'off';
+  if (key !== thinkKey) {
+    const keep = $('chatThink').value;
+    $('chatThink').replaceChildren(...values.map(v => Object.assign(document.createElement('option'), {value: v, textContent: v})));
+    $('chatThink').value = thinkPicked && values.includes(keep) ? keep : want;
+    thinkKey = key;
+  } else if (!thinkPicked) $('chatThink').value = want;
+}
+function thinkRequest(v) {
+  if (v === 'off') return {chat_template_kwargs: {enable_thinking: false}};
+  if (v === 'on') return {chat_template_kwargs: {enable_thinking: true}};
+  return {chat_template_kwargs: {enable_thinking: true, reasoning_effort: v}};
+}
 function render(data) {
   if (data.schema_version !== 1 || !data.engine || !Array.isArray(data.requests)) throw new Error('Unsupported telemetry schema');
   if (instance !== data.instance_id) { samples = []; previous = null; focusedId = null; pinnedRequest = null; instance = data.instance_id; }
+  thinkOptions(data.engine.reasoning);
   const now = performance.now(), rows = data.requests, active = rows.filter(r => !terminal(r.phase)), latest = rows.at(-1);
   currentRows = rows; requestLens(); $('requestLens').removeAttribute('data-stale');
   const decoders = active.filter(r => r.phase === 'decode'), total = rows.reduce((n, r) => n + (r.output_tokens || 0), 0);
@@ -448,7 +470,7 @@ async function send(prompt) {
   try {
     const response = await fetch('/api/monitor/v1/chat/completions', {method: 'POST', signal: controller.signal, cache: 'no-store',
       headers: {...(key ? {Authorization: 'Bearer ' + key} : {}), 'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.assign({messages: history, stream: true}, $('chatThink').checked ? {} : {chat_template_kwargs: {enable_thinking: false}}))});
+      body: JSON.stringify(Object.assign({messages: history, stream: true}, thinkRequest($('chatThink').value)))});
     if (response.status === 401 || response.status === 403) { showAuth(true); throw new Error('the server rejected the key'); }
     if (response.status === 409 || response.status === 429) throw new Error('another chat is already running on this monitor');
     if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);

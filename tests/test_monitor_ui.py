@@ -188,6 +188,16 @@ def main():
                 expect(page.locator('.msg.model pre:not(.thought)')).to_have_text('<b>safe text</b> cafe\u00e9')
                 assert page.locator('.msg.model b').count() == 0, 'chat rendered model HTML'
                 assert upstream.requests[-1]['chat_template_kwargs']['enable_thinking'] is False
+                # thinking levels come from the snapshot (fixture: low / medium / xhigh, off by default); a level is sent as
+                # reasoning_effort with thinking on
+                assert page.locator('#chatThink option').evaluate_all('(o)=>o.map(x=>x.value)') == ['off', 'low', 'medium', 'xhigh']
+                expect(page.locator('#chatThink')).to_have_value('off')
+                page.locator('#chatThink').select_option('low')
+                page.locator('#chatInput').fill('hello monitor')
+                page.locator('#chatSend').click()
+                expect(page.locator('#chatStatus')).to_have_text('done')
+                assert upstream.requests[-1]['chat_template_kwargs'] == {'enable_thinking': True, 'reasoning_effort': 'low'}, upstream.requests[-1]
+                page.locator('#chatThink').select_option('off')
                 expect(page.locator('#chatStats')).to_contain_text('123.4 tok/s (server)')
                 page.locator('#themeButton').click()
                 assert page.evaluate('document.documentElement.dataset.theme') == 'light'
