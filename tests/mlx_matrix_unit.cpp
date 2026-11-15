@@ -49,8 +49,12 @@ int main() {
     const auto info = mx::device_info(mx::Device::gpu);
     const auto* arch = std::get_if<std::string>(&info.at("architecture"));
     std::printf("this GPU: %s, M5 matrix unit: %d\n", arch ? arch->c_str() : "?", int(m5_matrix_unit()));
-    if (!tqllm::debug_on("no_matrix_unit") && arch && m5_matrix_unit() != (apple_gpu_generation(*arch) >= kMatrixUnitGeneration)) {
-        std::printf("FAIL: m5_matrix_unit() disagrees with the architecture\n"); ok = false;
+    if (!tqllm::debug_on("no_matrix_unit") && arch && apple_gpu_generation(*arch) >= kMatrixUnitGeneration) {
+        // #24: on an M5 the matrix-unit kernels must match the CPU references (else serving falls back to the M1-M4 paths)
+        const auto check = matrix_unit_check();
+        std::printf("matrix unit load check: %s (worst relative error %.3e%s%s)\n", check.ok ? "ok" : "FAIL", check.error,
+                    check.ok ? "" : ", first failure: ", check.failed);
+        if (!check.ok || !m5_matrix_unit()) {std::printf("FAIL: the M5 matrix unit is not usable on this system\n"); ok = false;}
     }
     std::mt19937 rng(38);
     ok &= run(256, 512, 4, 64, 2e-3, rng);
