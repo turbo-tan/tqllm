@@ -139,6 +139,42 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
 @media(min-width:1101px){.right{position:sticky;top:0;max-height:100vh;min-height:min(100vh,800px)}#transcript{height:0;max-height:none}}
 @media(max-width:520px){.bar{display:grid;grid-template-columns:minmax(0,1fr) 44px 44px;gap:6px}.bar .brand{font-size:18px;grid-column:1;grid-row:1}.bar .id{display:block;grid-column:1/-1;grid-row:3;font-size:11px}.bar .pill{grid-column:1;grid-row:2;justify-self:start;margin:0;font-size:11px;padding:2px 6px}#themeButton{grid-column:2;grid-row:1/3}#keyButton{grid-column:3;grid-row:1/3}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.compose{grid-template-columns:1fr}.compose .buttons{justify-content:flex-end}.lens-actions{width:100%}.lens-actions button{flex:1}}
 @media(max-width:360px){.lens-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* Phones: Monitor / Chat tabs, a full-height chat with the composer at the bottom, request cards. */
+.tabs{display:none}
+.tabs i{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--decode);margin-left:6px;vertical-align:middle;animation:blink 1s steps(2) infinite}
+#chatStop:disabled{opacity:.6}#chatStop:not(:disabled){border-color:var(--bad);color:var(--bad)}
+@media(max-width:760px){
+  .bar{display:grid;grid-template-columns:minmax(0,1fr) auto 44px 44px;gap:6px 8px;padding:10px 12px}
+  .bar .brand{grid-column:1;grid-row:1;font-size:18px}.bar .pill{grid-column:2;grid-row:1;margin:0;font-size:11px;padding:2px 8px}
+  #themeButton{grid-column:3;grid-row:1}#keyButton{grid-column:4;grid-row:1}
+  .bar .id{display:block;grid-column:1/-1;grid-row:2;font-size:11px;flex-basis:auto}
+  .tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:6px 12px;position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line)}
+  .tabs button{min-height:40px;border-radius:10px;background:transparent;border-color:transparent;color:var(--muted);font-weight:600}
+  .tabs button[aria-pressed="true"]{background:var(--panel2);border-color:var(--line);color:var(--text)}
+  .left,.right{scroll-margin-top:53px}
+  .right{height:calc(100vh - 120px);height:calc(100dvh - 120px);min-height:360px;max-height:none;position:static}  /* 53 px tabs + the footer: the chat head stays in view at the end of the page */
+  #transcript{flex:1;height:auto;max-height:none;min-height:0}
+  .chat-head{padding:4px 12px}
+  .compose{grid-template-columns:minmax(0,1fr) auto;padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom))}
+  .compose textarea{min-height:44px;max-height:40vh;resize:none;border-radius:12px}
+  .compose .buttons{justify-content:flex-end}
+  .compose .buttons .icon-button{border-radius:12px}
+  .chat-help{display:none}.chat-foot{padding:6px 12px;padding-bottom:max(6px,env(safe-area-inset-bottom))}
+  .status{display:flex;row-gap:2px}#phase{flex:1 1 60%}.status-rate{order:5;margin-left:0;font-size:11px}.status #sample{order:9;width:100%;font-size:11px}
+  .lens-actions button{flex:0 1 auto}
+}
+@media(max-width:520px){
+  .table-wrap{max-height:none;overflow:visible}
+  table{min-width:0}thead{display:none}
+  table,tbody,tr,td{display:block}
+  tbody{display:flex;flex-direction:column;gap:8px}
+  tbody tr{display:grid;grid-template-columns:auto repeat(3,minmax(0,1fr));gap:6px 12px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--panel)}
+  td{padding:0;font-size:12px;white-space:normal}
+  td::before{content:attr(data-label);display:block;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  td:first-child{grid-row:span 2;align-self:center}td:first-child::before{content:none}
+  .request-select{min-width:44px}
+}
 </style>
 </head>
 <body data-connection="connecting">
@@ -149,6 +185,7 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
   <button type="button" id="themeButton" title="Switch to light theme" aria-label="Switch to light theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A8.5 8.5 0 0 1 9 4a8.5 8.5 0 1 0 11 11Z"/></svg></button>
   <button type="button" id="keyButton" class="icon-button" title="Server API key" aria-label="Server API key" aria-expanded="false" aria-controls="auth"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="4"/><path d="m11 12 8 8m-4-4 3-3m-6 0 3-3"/></svg></button>
 </header>
+<nav class="tabs" aria-label="View"><button type="button" data-view="monitor" aria-pressed="true">Monitor</button><button type="button" data-view="chat" aria-pressed="false">Chat<i id="chatDot" hidden title="reply streaming"></i></button></nav>
 <main>
 <section class="left" aria-label="Telemetry">
   <div id="notice" class="notice" hidden role="alert"></div>
@@ -156,7 +193,7 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
   <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span id="prefillStatus" class="status-rate" title="Completed prefill tokens per second, excluding cached tokens" hidden><span id="prefillSpeed">--</span> tok/s prefill <span id="prefillCount"></span></span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
   <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
   <section class="lens" id="requestLens" aria-label="Selected request">
-    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><div class="lens-actions"><button type="button" id="followLatest" hidden title="Follow the latest request">Follow latest</button><button type="button" id="pinRequest" disabled>Pin as reference</button></div></div>
+    <div class="lens-top"><div><div class="eyebrow" id="lensPhase">Awaiting a request</div><h2 id="lensTitle">Your next request starts here</h2></div><div class="lens-actions"><button type="button" id="followLatest" hidden title="Follow the latest request">Follow latest</button><button type="button" id="pinRequest" disabled hidden>Pin as reference</button></div></div>
     <div class="journey" aria-label="Time before and after first output"><span id="journeyWait" style="flex-grow:1"></span><span id="journeyOutput" style="flex-grow:0"></span></div>
     <div class="journey-caption"><span>Before first output <b id="journeyBefore">--</b></span><span>After first output <b id="journeyAfter">--</b></span></div>
     <div class="lens-metrics"><div><small id="lensPrefillLabel">PREFILL RATE</small><strong id="lensPrefill">--</strong></div><div><small id="lensRateLabel">OUTPUT RATE</small><strong id="lensRate">--</strong></div><div><small>FIRST OUTPUT</small><strong id="lensFirst">--</strong></div><div><small>ELAPSED</small><strong id="lensElapsed">--</strong></div></div>
@@ -202,6 +239,7 @@ const number = (v, d = 0) => typeof v === 'number' && Number.isFinite(v) ? v.toL
 const terminal = p => ['complete', 'failed', 'cancelled'].includes(p);
 const text = (id, value) => { if ($(id).textContent !== String(value)) $(id).textContent = value; };
 let focusedId = null, pinnedRequest = null, currentRows = [];
+const COLUMNS = ['id', 'phase', 'in / out', 'first out', 'tok/s', 'elapsed'];
 let key = '', timer = null, instance = null, samples = [], previous = null, lastSuccess = null, generation = 0;
 
 function connection(state, message) { document.body.dataset.connection = state; text('connection', message); }
@@ -244,7 +282,7 @@ function requestLens() {
   if (!r) {
     text('lensPhase', 'Awaiting a request'); text('lensTitle', 'Your next request starts here');
     for (const id of ['lensFirst','lensPrefill','lensRate','lensElapsed','journeyBefore','journeyAfter']) text(id, '--');
-    $('comparison').hidden = true; $('pinRequest').disabled = true;
+    $('comparison').hidden = true; $('pinRequest').disabled = true; $('pinRequest').hidden = true;
     $('journeyWait').style.flexGrow = 1; $('journeyOutput').style.flexGrow = 0;
     text('lensNote', 'Engine measurements, without guessing why a request is waiting.');
     return;
@@ -262,7 +300,7 @@ function requestLens() {
   text('lensRate', Number.isFinite(r.decode_tokens_per_second) ? number(r.decode_tokens_per_second, 1) + ' tok/s' : '--');
   text('lensNote', (r.phase === 'prefill' ? 'Prefill: ' + number(r.prefill_processed_tokens ?? 0) + ' / ' + number(r.prompt_tokens) + ' tokens. ' : '') + 'Before first output includes queue time. Blue shows wall time after first output, not isolated GPU time. ' +
     (terminal(r.phase) ? 'Finished request; measurements are retained.' : 'Live snapshot; the journey grows as the request runs.'));
-  $('pinRequest').disabled = !terminal(r.phase); $('followLatest').disabled = false;
+  $('pinRequest').disabled = !terminal(r.phase); $('pinRequest').hidden = false; $('followLatest').disabled = false;
   $('pinRequest').textContent = pinnedRequest && pinnedRequest.id === r.id ? 'Clear reference' : 'Pin as reference';
   $('comparison').hidden = !pinnedRequest;
   if (pinnedRequest) {
@@ -314,7 +352,7 @@ function render(data) {
     const cells = [r.id, r.phase, number(r.prompt_tokens) + ' / ' + number(r.output_tokens), typeof r.first_output_ms === 'number' ? number(r.first_output_ms) + ' ms' : '--',
       typeof (r.phase === 'prefill' ? r.prefill_tokens_per_second : r.decode_tokens_per_second) === 'number' ? number(r.phase === 'prefill' ? r.prefill_tokens_per_second : r.decode_tokens_per_second, 1) : '--', number(r.elapsed_ms / 1000, 1) + ' s'];
     cells.forEach((value, i) => {
-      const td = document.createElement('td'); td.textContent = value; if (i === 1) td.className = 'phase-' + r.phase;
+      const td = document.createElement('td'); td.textContent = value; td.dataset.label = COLUMNS[i]; if (i === 1) td.className = 'phase-' + r.phase;
       if (i === 0) {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'request-select';
         button.textContent = String(r.id); button.setAttribute('aria-label', 'Inspect request ' + r.id);
@@ -385,6 +423,7 @@ setInterval(() => { if (lastSuccess !== null && performance.now() - lastSuccess 
 // chat: one streaming completion at a time against this instance's bridge, same key, text rendered as text only
 const history = [];
 let controller = null, chatGeneration = 0;
+const touch = window.matchMedia('(pointer: coarse)').matches;
 function line(role, who) {
   const msg = document.createElement('div'); msg.className = 'msg ' + role;
   const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
@@ -393,7 +432,7 @@ function line(role, who) {
   else msg.append(w, pre);
   $('chatHint')?.remove(); $('transcript').append(msg); return pre;
 }
-function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatInput').disabled = on; }
+function chatBusy(on) { $('chatSend').disabled = on; $('chatStop').disabled = !on; $('chatDot').hidden = !on; }
 let followOutput = true;
 $('transcript').addEventListener('scroll', () => { const t = $('transcript'); followOutput = t.scrollHeight - t.clientHeight - t.scrollTop < 48; });
 function chatScroll() { const t = $('transcript'); if (followOutput) t.scrollTop = t.scrollHeight; }
@@ -452,11 +491,27 @@ async function send(prompt) {
       if (done && reply && !failed && !controller.signal.aborted) history.push({role: 'assistant', content: reply});
       else history.splice(checkpoint);
     }
-    controller = null; chatBusy(false); $('chatInput').focus();
+    controller = null; chatBusy(false); if (!touch) $('chatInput').focus();
   }
 }
-$('compose').addEventListener('submit', event => { event.preventDefault(); const value = $('chatInput').value.trim(); if (!value || controller) return; $('chatInput').value = ''; send(value); });
-$('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
+$('compose').addEventListener('submit', event => { event.preventDefault(); const value = $('chatInput').value.trim(); if (!value || controller) return; $('chatInput').value = ''; grow(); send(value); });
+// the composer grows with its text (up to its CSS max-height); touch keyboards keep Return for new lines
+function grow() { const t = $('chatInput'); t.style.height = 'auto'; t.style.height = t.scrollHeight + 2 + 'px'; }
+$('chatInput').addEventListener('input', grow);
+if (touch) { $('chatHint').textContent = 'Talk to the model this server is running. Return adds a line; tap the arrow to send.'; text('composeHelp', 'Tap the arrow to send / Return for a new line'); }
+// phones: the Monitor / Chat tabs jump between the two sections (both stay on the page); the active tab follows the scroll
+const sections = {monitor: document.querySelector('.left'), chat: document.querySelector('.right')};
+function view(name) {
+  const smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  sections[name].scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'start'});
+  if (name === 'chat') { followOutput = true; chatScroll(); }
+}
+for (const b of document.querySelectorAll('.tabs button')) b.addEventListener('click', () => view(b.dataset.view));
+if ('IntersectionObserver' in window) new IntersectionObserver(entries => {
+  for (const e of entries) for (const b of document.querySelectorAll('.tabs button'))
+    b.setAttribute('aria-pressed', String((b.dataset.view === 'chat') === e.isIntersecting));
+}, {threshold: 0.5}).observe(sections.chat);
+$('chatInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !touch && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); $('compose').requestSubmit(); } if (event.key === 'Escape' && controller) controller.abort(); });
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;
   if (controller) controller.abort();
