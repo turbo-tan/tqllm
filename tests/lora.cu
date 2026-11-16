@@ -64,7 +64,7 @@ static bool run(int rows, int cols, int rank, int n, float scale, bool rotate, s
         cudaFree(dxb), cudaFree(dab), cudaFree(dah);
     }
     float *da = up(a), *db = up(b), *dt = nullptr, *ds = up(std::vector<float>{scale});
-    check(cudaMalloc(&dt, size_t(n) * rank * 4));
+    check(cudaMalloc(&dt, tqllm_cuda::lora_scratch_floats(n, cols, rank) * 4));
     __nv_bfloat16 * dy = up(y0);
     tqllm_cuda::lora_apply(da, db, rows, cols, rank, dx, dy, n, rows, ds, dt, nullptr);
     check(cudaDeviceSynchronize());

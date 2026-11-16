@@ -135,7 +135,7 @@ public:
             nslots = slots;
             load_lora();
             allocate();
-            if (lora_n) lora_t = Buf(size_t(NBUF) * size_t(lora_rmax) * 4);
+            if (lora_n) lora_t = Buf(tqllm_cuda::lora_scratch_floats(NBUF, lora_cmax, lora_rmax) * 4);
             memlog("buffers");
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
@@ -763,9 +763,9 @@ private:
     // adapter kernels run at all (some scale of the verify's slots nonzero) is part of the graph key (lora_now).
     struct LoraPiece { int adapter = 0, rank = 0; Buf a, b; };
     std::unordered_map<const Mat *, std::vector<LoraPiece>> lora_of;
-    int lora_n = 0, lora_rmax = 0;
+    int lora_n = 0, lora_rmax = 0, lora_cmax = 0;
     std::vector<std::vector<float>> lora_slot;  // [slot][adapter]: host copy of d_lscale
-    Buf d_lscale, lora_t;                       // lora_t: [NBUF][lora_rmax] floats, A x of one matrix
+    Buf d_lscale, lora_t;                       // lora_t: A x partials of one matrix (lora_scratch_floats)
     void load_lora();
     bool lora_on(int slot) const {
         for (float v : lora_slot[size_t(slot)]) if (v != 0.f) return true;

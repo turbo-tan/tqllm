@@ -305,6 +305,7 @@ void Qwen35Engine::load_lora() {
             p.b = upload(b.data(), b.size() * 4);
             lora_of[m].push_back(std::move(p));
             rlo = std::min(rlo, t.rank), rhi = std::max(rhi, t.rank);
+            lora_cmax = std::max(lora_cmax, t.cols);
         }
         lora_rmax = std::max(lora_rmax, rhi);
         std::fprintf(stderr, "tqllm: LoRA %d: %s, %zu matrices (%d in a rotated basis), rank %d%s%s, alpha %g, scale %g%s\n", i,

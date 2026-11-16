@@ -1,22 +1,26 @@
-// Runtime LoRA kernels (lora.cuh): t = A x (one block per CB columns x RB ranks), then y += scale * B t.
+// Runtime LoRA kernels (lora.cuh): partial A x per column slice (one block per slice x CB columns x RB ranks), then
+// y += scale * B t with t summed over the slices in a fixed order. Decode widths (n <= 16) spread A x over every slice
+// of the input instead of one block per column, so the adapter costs a few microseconds per matrix.
 #include "lora.cuh"
 
 namespace tqllm_cuda {
 
 namespace {
-constexpr int kCB = 4, kRB = 8, kThreads = 256;
+constexpr int kCB = 4, kRB = 8, kThreads = kLoraSlice / 2;
 
+// part [slices][n][rank]
 __global__ void lora_down_k(const float * __restrict__ a, int cols, int rank, const __half * __restrict__ x, int n,
-                            const float * __restrict__ scale, float * __restrict__ t) {
+                            const float * __restrict__ scale, float * __restrict__ part) {
     if (*scale == 0.f) return;
-    const int j0 = blockIdx.x * kCB, k0 = blockIdx.y * kRB;
+    const int sl = blockIdx.x, j0 = blockIdx.y * kCB, k0 = blockIdx.z * kRB;
     const int nj = min(kCB, n - j0), nk = min(kRB, rank - k0);
+    const int c = sl * kLoraSlice + 2 * threadIdx.x;
     float acc[kCB][kRB];
 #pragma unroll
     for (int jj = 0; jj < kCB; ++jj)
 #pragma unroll
         for (int kk = 0; kk < kRB; ++kk) acc[jj][kk] = 0.f;
-    for (int c = 2 * threadIdx.x; c < cols; c += 2 * kThreads) {
+    if (c < cols) {
         float2 xv[kCB];
 #pragma unroll
         for (int jj = 0; jj < kCB; ++jj)
@@ -27,7 +31,7 @@ __global__ void lora_down_k(const float * __restrict__ a, int cols, int rank, co
             if (kk >= nk) break;
             const float2 av = *reinterpret_cast<const float2 *>(a + size_t(k0 + kk) * cols + c);
 #pragma unroll
-            for (int jj = 0; jj < kCB; ++jj) acc[jj][kk] = fmaf(av.x, xv[jj].x, fmaf(av.y, xv[jj].y, acc[jj][kk]));
+            for (int jj = 0; jj < kCB; ++jj) acc[jj][kk] = fmaf(av.x, xv[jj].x, av.y * xv[jj].y + acc[jj][kk]);
         }
     }
     __shared__ float red[kCB * kRB][kThreads / 32];
@@ -48,18 +52,22 @@ __global__ void lora_down_k(const float * __restrict__ a, int cols, int rank, co
             float v = 0.f;
 #pragma unroll
             for (int w = 0; w < kThreads / 32; ++w) v += red[threadIdx.x][w];
-            t[size_t(j0 + jj) * rank + k0 + kk] = v;
+            part[(size_t(sl) * n + j0 + jj) * rank + k0 + kk] = v;
         }
     }
 }
 
-__global__ void lora_up_k(const float * __restrict__ b, int rows, int rank, const float * __restrict__ t,
-                          __nv_bfloat16 * __restrict__ y, int ldy, const float * __restrict__ scale) {
+__global__ void lora_up_k(const float * __restrict__ b, int rows, int rank, const float * __restrict__ part, int slices,
+                          int n, __nv_bfloat16 * __restrict__ y, int ldy, const float * __restrict__ scale) {
     const float s = *scale;
     if (s == 0.f) return;
     __shared__ float tj[kLoraMaxRank];
     const int j = blockIdx.y;
-    if (threadIdx.x < rank) tj[threadIdx.x] = t[size_t(j) * rank + threadIdx.x];
+    if (threadIdx.x < rank) {
+        float v = 0.f;
+        for (int sl = 0; sl < slices; ++sl) v += part[(size_t(sl) * n + j) * rank + threadIdx.x];
+        tj[threadIdx.x] = v;
+    }
     __syncthreads();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows) return;
@@ -74,8 +82,9 @@ __global__ void lora_up_k(const float * __restrict__ b, int rows, int rank, cons
 void lora_apply(const float * a, const float * b, int rows, int cols, int rank, const __half * x, __nv_bfloat16 * y, int n,
                 int ldy, const float * scale, float * t, cudaStream_t s) {
     if (n <= 0 || rank <= 0) return;
-    lora_down_k<<<dim3((n + kCB - 1) / kCB, (rank + kRB - 1) / kRB), kThreads, 0, s>>>(a, cols, rank, x, n, scale, t);
-    lora_up_k<<<dim3((rows + kThreads - 1) / kThreads, n), kThreads, 0, s>>>(b, rows, rank, t, y, ldy, scale);
+    const int slices = (cols + kLoraSlice - 1) / kLoraSlice;
+    lora_down_k<<<dim3(slices, (n + kCB - 1) / kCB, (rank + kRB - 1) / kRB), kThreads, 0, s>>>(a, cols, rank, x, n, scale, t);
+    lora_up_k<<<dim3((rows + 255) / 256, n), 256, 0, s>>>(b, rows, rank, t, slices, n, y, ldy, scale);
 }
 
 }  // namespace tqllm_cuda
