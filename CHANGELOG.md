@@ -6,6 +6,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Added
+- Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
+  `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
+  `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /
+  `ffn_down` adapters (e.g. Heretic abliteration exports), plain or TQ rotated weight bases. The base weights are not
+  changed: a request at scale 0 gives the same tokens as serving without `--lora`. Qwen3.8-27B Q4_K_M + a rank-3 abliteration
+  adapter, RTX 3090: refusals 100/100 at scale 0, 13/100 at scale 1 (the same adapter merged into the weights before
+  quantising: 15/100); decode with DFlash2 at temperature 0.7 is 130.0 tok/s on vs 132.1 off, 8K prefill 1561 vs 1669 tok/s.
 - Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
   pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
   chunk's vector sees the rest of the document; `"task": "query"` embeds queries; `encoding_format` `float`, `base64`
