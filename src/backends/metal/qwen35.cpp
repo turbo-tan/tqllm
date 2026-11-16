@@ -505,6 +505,26 @@ struct Qwen35::Impl {
             if((l+1)%interval==0)pack(p+"attn_in",{p+"attn_q.weight",p+"attn_k.weight",p+"attn_v.weight"});
             else pack(p+"gdn_in",{p+"attn_qkv.weight",p+"attn_gate.weight"});
         }
+        // #24: this file's own matrix-unit products against their stored values. On wrong values (macOS 27 on an M5 answered
+        // one repeated token) the model moves to the M1-M4 paths, matrix by matrix so the two copies never coexist
+        if(m5_matrix_unit() && !(nax.empty() && nax_tq4.empty())) {
+            const auto bad=check_model_matrix_unit(nax,nax_tq4,packs);
+            if(bad.empty())std::fprintf(stderr,"tqllm: matrix unit: this model's weights check ok\n");
+            else {
+                veto_matrix_unit(bad.c_str());
+                packs.clear();pack_rows.clear();nax_head_payload.clear();nax_head_payload.shrink_to_fit();
+                for(auto it=nax.begin();it!=nax.end();it=nax.erase(it)) {
+                    if(it->second.q6)continue;  // the Q6_K head: its original stays in matrices
+                    auto a=affine_from_nax(it->second);mx::eval(a.blocks,a.scales,a.biases);
+                    matrices.insert_or_assign(it->first,std::move(a));
+                }
+                for(auto it=nax_tq4.begin();it!=nax_tq4.end();it=nax_tq4.erase(it)) {
+                    auto w=load_matrix(file,it->first);
+                    if(auto* t=std::get_if<Tq4Weights>(&w))mx::eval(t->codes,t->scales);
+                    matrices.insert_or_assign(it->first,std::move(w));
+                }
+            }
+        }
         // a TQ4 model's dense matrices (TQ_L: BF16 ssm_alpha / ssm_beta) are stored in the TQ4 rotated basis and take the
         // rotated activation, as the CUDA engine reads them (j945: plain input = mean KL 0.53 vs CUDA on its own)
         tq4_basis=!nax_tq4.empty() || std::any_of(matrices.begin(),matrices.end(),[](const auto& m) {return std::holds_alternative<Tq4Weights>(m.second);});

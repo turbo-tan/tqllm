@@ -245,7 +245,7 @@ inline bool matrix_unit_available() {
             return true;
         } catch (const std::exception&) {return false;}
     }();
-    return ok;
+    return ok && m5_matrix_unit();
 }
 
 // compile the exact-attention kernels once at load, so the first request does not pay the Metal compile

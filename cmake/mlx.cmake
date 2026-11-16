@@ -17,7 +17,7 @@ target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends
 target_link_libraries(tqmlx PUBLIC mlx tqllm)
 target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp
                src/formats/weight/dequant.cpp src/backends/metal/draft_head.cpp src/backends/metal/prefill.cpp
-               src/backends/metal/nax_affine.cpp src/backends/metal/prefill_fused.cpp src/backends/metal/ane_program.mm)
+               src/backends/metal/nax_affine.cpp src/backends/metal/matrix_unit_check.cpp src/backends/metal/prefill_fused.cpp src/backends/metal/ane_program.mm)
 set_source_files_properties(src/backends/metal/ane_program.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(tqmlx PUBLIC "-framework Foundation" "-framework Metal" "-framework IOSurface")
 foreach(tool tqmlx-probe:tqmlx_probe tqmlx-dflash:tqmlx_dflash tqmlx-spec:tqmlx_spec tqmlx-ar:tqmlx_ar tqmlx-tree-bench:tqmlx_tree_bench tqmlx-qsa-bench:tqmlx_qsa_bench bench-mlx-sdpa:bench_mlx_sdpa

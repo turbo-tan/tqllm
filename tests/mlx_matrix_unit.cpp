@@ -8,6 +8,9 @@
 #include <cstring>
 #include <random>
 #include <vector>
+#include <map>
+#include <string>
+#include "nax_affine.hpp"
 
 namespace mx = mlx::core;
 using namespace tqllm::mlx_backend;
@@ -49,8 +52,33 @@ int main() {
     const auto info = mx::device_info(mx::Device::gpu);
     const auto* arch = std::get_if<std::string>(&info.at("architecture"));
     std::printf("this GPU: %s, M5 matrix unit: %d\n", arch ? arch->c_str() : "?", int(m5_matrix_unit()));
-    if (!tqllm::debug_on("no_matrix_unit") && arch && m5_matrix_unit() != (apple_gpu_generation(*arch) >= kMatrixUnitGeneration)) {
-        std::printf("FAIL: m5_matrix_unit() disagrees with the architecture\n"); ok = false;
+    if (!tqllm::debug_on("no_matrix_unit") && arch && apple_gpu_generation(*arch) >= kMatrixUnitGeneration) {
+        // #24: on an M5 the matrix-unit kernels must match the CPU references (else serving falls back to the M1-M4 paths)
+        const auto check = matrix_unit_check();
+        std::printf("matrix unit load check: %s (worst relative error %.3e%s%s)\n", check.ok ? "ok" : "FAIL", check.error,
+                    check.ok ? "" : ", first failure: ", check.failed);
+        if (!check.ok || !m5_matrix_unit()) {std::printf("FAIL: the M5 matrix unit is not usable on this system\n"); ok = false;}
+    }
+    if (m5_matrix_unit()) {
+        // #24: the model check on 27B-like shapes (5120 / 17408 columns, split-K, 4- and 6-bit, the first layer's SwiGLU)
+        std::mt19937 r2(24);
+        auto make = [&](int rows, int k, int bits, int group) {
+            std::vector<uint8_t> codes(size_t(rows) * k);
+            for (auto& c : codes) c = uint8_t(r2() & ((1u << bits) - 1u));
+            std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+            std::vector<uint16_t> s(size_t(rows) * (k / group)), b(s.size());
+            for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(r2)); b[i] = bf16_bits(bd(r2));}
+            return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, bits, group), rows, k, bits, group);
+        };
+        std::map<std::string, NaxAffine> nax, none;
+        nax.emplace("blk.0.ffn_gate.weight", make(512, 5120, 4, 64));
+        nax.emplace("blk.0.ffn_up.weight", make(512, 5120, 4, 64));
+        nax.emplace("blk.0.ffn_down.weight", make(256, 17408, 4, 64));
+        nax.emplace("blk.0.attn_qkv.weight", make(256, 5120, 4, 128));
+        nax.emplace("output.weight", make(256, 5120, 6, 64));
+        const auto bad = check_model_matrix_unit(nax, none, none);
+        std::printf("model matrix-unit check: %s\n", bad.empty() ? "ok" : bad.c_str());
+        if (!bad.empty()) ok = false;
     }
     std::mt19937 rng(38);
     ok &= run(256, 512, 4, 64, 2e-3, rng);
