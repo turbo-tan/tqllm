@@ -27,6 +27,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   the model fits, to free VRAM for context (until now only the memory fit chose this, when the card was short).
   Qwen3.8-27B IQ4_XS on an RTX 3090, both on: 1.98 GB less VRAM, decode 141.7 -> 141.2 tok/s and 8K prefill
   2005 -> 1995 tok/s with a DFlash2 drafter (noise), greedy replies identical.
+- TQV-12 weight format (GGUF type 305 with `tqllm.tqv.codebook = tqv12-v1`): TQ4's size (4.125 bits per weight) and
+  rotated basis, 4 weights per 12-bit index into a 4096-point int8 codebook, decode matvec 1-16 columns, native prefill
+  GEMM, FP16 / int8 prefill. No file is published: `tools/convert/qwen35/tqv12_quant.py` makes one from the BF16
+  weights, a stock TQ file as layout template and calibration text with vector GPTQ (docs/guides/tqv12.md; about 2 h on
+  an RTX 3090), using the new `TQLLM_DEBUG=calib_dump` capture. Qwen3.8-27B, same size as TQ_L (14.72 GB): KLD against
+  BF16 0.0184 vs TQ_L 0.0245 (WikiText-2, 8 x 2048 tokens); GSM8K 250 (low effort, greedy) 242 vs 245 (paired p = 0.45).
 - Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
   pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
   chunk's vector sees the rest of the document; `"task": "query"` embeds queries; `encoding_format` `float`, `base64`
