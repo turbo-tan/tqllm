@@ -1,6 +1,8 @@
 #pragma once
 #include <mlx/mlx.h>
 #include <cstdint>
+#include <map>
+#include <string>
 #include <optional>
 #include <span>
 #include <utility>
@@ -71,6 +73,11 @@ NaxAffine nax_from_q6(const Q6Weights& weights);
 // Rows `keep` (in that order, a multiple of 128) of a stored payload, repacked as their own matrix.
 NaxAffine nax_affine_select_rows(std::span<const uint8_t> payload, int rows, int columns, int bits, int group,
                                  std::span<const uint32_t> keep);
+
+// #24: this model's matrix-unit products (each shape / format / split once, 1 / 16 / 64 rows, and the first layer's
+// SwiGLU) against the stored values dequantized into an FP32 GEMM; empty when they agree, else what failed
+std::string check_model_matrix_unit(const std::map<std::string, NaxAffine>& nax, const std::map<std::string, NaxAffine>& nax_tq4,
+                                    const std::map<std::string, NaxAffine>& packs);
 
 // 8-bit affine, group 64, row-major codes: a token-embedding table read by gather.
 struct Affine8Embedding {

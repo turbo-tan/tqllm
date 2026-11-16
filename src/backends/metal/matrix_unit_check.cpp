@@ -7,6 +7,9 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <set>
+#include <string>
+#include <tuple>
 #include <vector>
 
 namespace tqllm::mlx_backend {
@@ -66,36 +69,114 @@ MatrixUnitCheck matrix_unit_check() {
         note("matmul 16 rows", rel_err(host(nax_affine_matmul(w, mx::slice(X, {0, 0}, {16, k}))), first(16)), 1e-2);
         note("prefill GEMM", rel_err(host(nax_affine_prefill(w, mx::astype(X, mx::float16))), want), 2e-2);
 
-        // tensor-op exact attention: one row, 6 query heads on one KV head, head dim 256, 100 of 128 cached keys
-        const int heads = 6, dim = 256, cap = 128, length = 100;
-        const float scale = 0.0625f;
-        std::normal_distribution<float> nd(0.0f, 1.0f);
-        std::vector<float> q(size_t(heads) * dim), kc(size_t(cap) * dim), vc(kc.size());
-        for (auto& v : q) v = bf16_round(nd(rng));
-        for (auto& v : kc) v = bf16_round(nd(rng));
-        for (auto& v : vc) v = bf16_round(nd(rng));
-        std::vector<double> att(size_t(heads) * dim, 0.0);
-        for (int h = 0; h < heads; ++h) {
-            std::vector<double> sc(length);
-            double top = -INFINITY, den = 0;
-            for (int j = 0; j < length; ++j) {
-                double d = 0;
-                for (int e = 0; e < dim; ++e) d += double(q[size_t(h) * dim + e]) * kc[size_t(j) * dim + e];
-                sc[j] = d * scale;
-                top = std::max(top, sc[j]);
-            }
-            for (int j = 0; j < length; ++j) den += sc[j] = std::exp(sc[j] - top);
-            for (int j = 0; j < length; ++j)
-                for (int e = 0; e < dim; ++e) att[size_t(h) * dim + e] += sc[j] / den * vc[size_t(j) * dim + e];
+        // tensor-op exact attention, 24 query heads on 4 KV heads, head dim 256: a 16-row verify over 1000 keys (row t sees
+        // keys < 985 + t) and one row over 100 of 128 keys
+        for (auto [heads, kvh, cap, length, n] : {std::array{6, 1, 128, 100, 1}, std::array{24, 4, 1024, 1000, 16}}) {
+            const int dim = 256, group = heads / kvh;
+            const float scale = 0.0625f;
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            std::vector<float> q(size_t(heads) * n * dim), kc(size_t(kvh) * cap * dim), vc(kc.size());
+            for (auto& v : q) v = bf16_round(nd(rng));
+            for (auto& v : kc) v = bf16_round(nd(rng));
+            for (auto& v : vc) v = bf16_round(nd(rng));
+            std::vector<double> att(q.size(), 0.0);
+            for (int h = 0; h < heads; ++h)
+                for (int t = 0; t < n; ++t) {
+                    const int g = h / group, seen = length - n + t + 1;
+                    const float* qr = &q[(size_t(h) * n + t) * dim];
+                    std::vector<double> sc(seen);
+                    double top = -INFINITY, den = 0;
+                    for (int j = 0; j < seen; ++j) {
+                        double d = 0;
+                        for (int e = 0; e < dim; ++e) d += double(qr[e]) * kc[(size_t(g) * cap + j) * dim + e];
+                        top = std::max(top, sc[j] = d * scale);
+                    }
+                    for (int j = 0; j < seen; ++j) den += sc[j] = std::exp(sc[j] - top);
+                    double* out = &att[(size_t(h) * n + t) * dim];
+                    for (int j = 0; j < seen; ++j)
+                        for (int e = 0; e < dim; ++e) out[e] += sc[j] / den * vc[(size_t(g) * cap + j) * dim + e];
+                }
+            auto Q = mx::array(q.data(), {1, heads, n, dim}, mx::float32);
+            auto K = mx::astype(mx::array(kc.data(), {1, kvh, cap, dim}, mx::float32), mx::bfloat16);
+            auto V = mx::astype(mx::array(vc.data(), {1, kvh, cap, dim}, mx::float32), mx::bfloat16);
+            note(n == 1 ? "exact attention 1 row" : "exact attention 16 rows", rel_err(host(decode_attention_exact(Q, K, V, scale, length)), att), 2e-2);
         }
-        auto Q = mx::array(q.data(), {1, heads, 1, dim}, mx::float32);
-        auto K = mx::astype(mx::array(kc.data(), {1, 1, cap, dim}, mx::float32), mx::bfloat16);
-        auto V = mx::astype(mx::array(vc.data(), {1, 1, cap, dim}, mx::float32), mx::bfloat16);
-        note("exact attention", rel_err(host(decode_attention_exact(Q, K, V, scale, length)), att), 2e-2);
     } catch (const std::exception&) {
         // a kernel that does not compile or run here: the M1-M4 paths
         out.ok = false; out.failed = "kernel did not run"; out.error = INFINITY;
     }
     return out;
+}
+
+namespace {
+// the first `rows` rows of a stored matrix, run with the full matrix's split-K
+NaxAffine first_rows(const NaxAffine& w, int rows) {
+    if (w.rows <= rows) return w;
+    NaxAffine s = w;
+    auto cut = [&](const mx::array& a) {
+        if (a.ndim() < 1 || a.shape(0) != w.rows / 32) return a;
+        mx::Shape start(a.ndim(), 0), stop = a.shape();
+        stop[0] = rows / 32;
+        return mx::contiguous(mx::slice(a, start, stop));
+    };
+    s.words = cut(w.words); s.high = cut(w.high); s.scales = cut(w.scales); s.biases = cut(w.biases);
+    s.rows = rows; s.split = nax_affine_splits(w);
+    return s;
+}
+std::vector<double> host_double(const mx::array& y) {auto f = host(y); return {f.begin(), f.end()};}
+}  // namespace
+
+std::string check_model_matrix_unit(const std::map<std::string, NaxAffine>& nax, const std::map<std::string, NaxAffine>& nax_tq4,
+                                    const std::map<std::string, NaxAffine>& packs) {
+    try {
+        std::mt19937 rng(24);
+        std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+        std::set<std::tuple<int, int, int, int, bool, int>> seen;
+        auto input = [&](int m, int k) {
+            std::vector<float> x(size_t(m) * k);
+            for (auto& v : x) v = float(mx::float16_t(xd(rng)));
+            return mx::array(x.data(), {m, k}, mx::float32);
+        };
+        char why[256];
+        // each shape / format / split once: 1 and 16 rows on the row kernel, 64 rows on the prefill GEMM (4-bit), against
+        // the stored values dequantized into an FP32 GEMM
+        for (const auto* map : {&nax, &nax_tq4, &packs})
+            for (const auto& [name, full] : *map) {
+                if (full.q6) continue;
+                const int split = nax_affine_splits(full);
+                if (!seen.insert({full.rows, full.columns, full.bits, full.group, full.tq4, split}).second) continue;
+                const auto w = first_rows(full, std::min(full.rows, 4096));
+                auto X = input(64, w.columns);
+                auto ref = mx::matmul(X, mx::transpose(mx::astype(nax_affine_dequant(w), mx::float32)));
+                for (int m : {1, 16}) {
+                    auto Xm = mx::slice(X, {0, 0}, {m, w.columns});
+                    const double e = rel_err(host(nax_affine_matmul(w, Xm)), host_double(mx::slice(ref, {0, 0}, {m, w.rows})));
+                    if (!(e <= 1e-2)) {std::snprintf(why, sizeof why, "%s %dx%d %d-bit group %d split %d, %d rows: relative error %.3g", name.c_str(), full.rows, full.columns, full.bits, full.group, split, m, e); return why;}
+                }
+                if (w.bits == 4 && w.group % 64 == 0 && w.columns % 64 == 0 && w.rows % 64 == 0) {
+                    const double e = rel_err(host(nax_affine_prefill(w, mx::astype(X, mx::float16))), host_double(ref));
+                    if (!(e <= 2e-2)) {std::snprintf(why, sizeof why, "%s %dx%d prefill GEMM: relative error %.3g", name.c_str(), full.rows, full.columns, e); return why;}
+                }
+            }
+        // the decode FFN: gate and up with SwiGLU in one launch, first layer
+        for (const auto* map : {&nax, &nax_tq4}) {
+            auto g = map->find("blk.0.ffn_gate.weight"), u = map->find("blk.0.ffn_up.weight");
+            if (g == map->end() || u == map->end()) continue;
+            const auto G = first_rows(g->second, std::min(g->second.rows, 4096)), U = first_rows(u->second, std::min(u->second.rows, 4096));
+            auto X = input(16, G.columns);
+            auto gr = host(mx::matmul(X, mx::transpose(mx::astype(nax_affine_dequant(G), mx::float32))));
+            auto ur = host(mx::matmul(X, mx::transpose(mx::astype(nax_affine_dequant(U), mx::float32))));
+            std::vector<double> want(gr.size());
+            for (size_t i = 0; i < gr.size(); ++i) {
+                const float gb = bf16_round(gr[i]), act = bf16_round(gb / (1.0f + std::exp(-gb)));
+                want[i] = bf16_round(act * bf16_round(ur[i]));
+            }
+            const double e = rel_err(host(nax_affine_swiglu(G, U, X)), want);
+            if (!(e <= 2e-2)) {std::snprintf(why, sizeof why, "blk.0 FFN SwiGLU: relative error %.3g", e); return why;}
+        }
+    } catch (const std::exception& e) {
+        return std::string("a matrix-unit kernel failed: ") + e.what();
+    }
+    return {};
 }
 }  // namespace tqllm::mlx_backend

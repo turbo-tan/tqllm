@@ -8,6 +8,9 @@
 #include <cstring>
 #include <random>
 #include <vector>
+#include <map>
+#include <string>
+#include "nax_affine.hpp"
 
 namespace mx = mlx::core;
 using namespace tqllm::mlx_backend;
@@ -55,6 +58,27 @@ int main() {
         std::printf("matrix unit load check: %s (worst relative error %.3e%s%s)\n", check.ok ? "ok" : "FAIL", check.error,
                     check.ok ? "" : ", first failure: ", check.failed);
         if (!check.ok || !m5_matrix_unit()) {std::printf("FAIL: the M5 matrix unit is not usable on this system\n"); ok = false;}
+    }
+    if (m5_matrix_unit()) {
+        // #24: the model check on 27B-like shapes (5120 / 17408 columns, split-K, 4- and 6-bit, the first layer's SwiGLU)
+        std::mt19937 r2(24);
+        auto make = [&](int rows, int k, int bits, int group) {
+            std::vector<uint8_t> codes(size_t(rows) * k);
+            for (auto& c : codes) c = uint8_t(r2() & ((1u << bits) - 1u));
+            std::uniform_real_distribution<float> sd(0.002f, 0.02f), bd(-0.2f, 0.2f);
+            std::vector<uint16_t> s(size_t(rows) * (k / group)), b(s.size());
+            for (size_t i = 0; i < s.size(); ++i) {s[i] = bf16_bits(sd(r2)); b[i] = bf16_bits(bd(r2));}
+            return nax_affine_load(nax_affine_pack(codes, s, b, rows, k, bits, group), rows, k, bits, group);
+        };
+        std::map<std::string, NaxAffine> nax, none;
+        nax.emplace("blk.0.ffn_gate.weight", make(512, 5120, 4, 64));
+        nax.emplace("blk.0.ffn_up.weight", make(512, 5120, 4, 64));
+        nax.emplace("blk.0.ffn_down.weight", make(256, 17408, 4, 64));
+        nax.emplace("blk.0.attn_qkv.weight", make(256, 5120, 4, 128));
+        nax.emplace("output.weight", make(256, 5120, 6, 64));
+        const auto bad = check_model_matrix_unit(nax, none, none);
+        std::printf("model matrix-unit check: %s\n", bad.empty() ? "ok" : bad.c_str());
+        if (!bad.empty()) ok = false;
     }
     std::mt19937 rng(38);
     ok &= run(256, 512, 4, 64, 2e-3, rng);

@@ -5,6 +5,7 @@
 // kernels must also match CPU references once at load (issue #24: macOS 27 on an M5 / M5 Max gave wrong values).
 #include "debug.hpp"
 #include <mlx/mlx.h>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -23,6 +24,14 @@ inline constexpr int kMatrixUnitGeneration = 17;  // M5
 struct MatrixUnitCheck {bool ok = true; const char* failed = ""; double error = 0;};
 // the NAX matmul (1 / 16 rows), the NAX prefill GEMM and the tensor-op exact attention vs CPU references (matrix_unit_check.cpp)
 MatrixUnitCheck matrix_unit_check();
+// set when a model's own matrix-unit products disagree with their stored values (#24): every later m5_matrix_unit() is false
+inline std::atomic<bool>& matrix_unit_vetoed() {static std::atomic<bool> v{false}; return v;}
+inline void veto_matrix_unit(const char* why) {
+    if (!matrix_unit_vetoed().exchange(true))
+        std::fprintf(stderr, "tqllm: the GPU matrix unit gave wrong values on this model's weights (%s); using the M1-M4 paths "
+                             "instead (correct, slower). Please report your macOS version at "
+                             "https://github.com/turbo-tan/tqllm/issues/24\n", why);
+}
 // TQLLM_DEBUG=no_matrix_unit: the M1-M4 paths on an M5 (to check them where no older chip is at hand)
 inline bool m5_matrix_unit() {
     static const bool ok = [] {
@@ -41,6 +50,6 @@ inline bool m5_matrix_unit() {
                                  "https://github.com/turbo-tan/tqllm/issues/24\n", check.failed, check.error);
         return check.ok;
     }();
-    return ok;
+    return ok && !matrix_unit_vetoed().load();
 }
 }  // namespace tqllm::mlx_backend

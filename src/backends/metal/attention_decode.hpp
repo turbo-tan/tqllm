@@ -265,7 +265,7 @@ inline bool segmented_attention_available(int dim = 256) {
         } catch (const std::exception&) {return false;}
     };
     static const bool ok128 = m5_matrix_unit() && probe(128), ok256 = m5_matrix_unit() && probe(256);
-    return dim == 128 ? ok128 : dim == 256 ? ok256 : false;
+    return m5_matrix_unit() && (dim == 128 ? ok128 : dim == 256 ? ok256 : false);
 }
 #else
 inline bool segmented_attention_available(int = 256) {return false;}
