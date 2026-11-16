@@ -41,6 +41,8 @@
 #include "kv_store.hpp"
 #include "tqllm/rope_scaling.hpp"
 #include "weight_format.hpp"
+#include "lora.hpp"
+#include "lora.cuh"
 #include "tqllm/tokenizer.hpp"
 
 #include <cublas_v2.h>
@@ -131,7 +133,9 @@ public:
             else load_safetensors(path);
             memlog("weights");
             nslots = slots;
+            load_lora();
             allocate();
+            if (lora_n) lora_t = Buf(size_t(NBUF) * size_t(lora_rmax) * 4);
             memlog("buffers");
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
@@ -213,6 +217,8 @@ public:
         if (s == active) { pc_drop(); pc_seq.clear(); }
         else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); }
     }
+    int lora_count() const override { return lora_n; }
+    void set_lora(const std::vector<float> & scales) override;
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
         if (!pc_on || s < 0 || s >= nslots) return 0;
         const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt)
@@ -289,7 +295,8 @@ private:
     // kept states parked outside the slots (PromptPark, the TPark rules): a slot handed to another conversation parks its
     // kept state (KV rows [0, snap) of this rank's attention layers + the recurrent state at snap); the next turn of that
     // conversation picks it up into whichever slot it gets
-    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0; };
+    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0;
+                       std::vector<float> lora; };  // lora: the LoRA scales the state was built with
     // the drafter's K/V rows that go with a kept state: its whole ring, else positions [0, snap)
     size_t dfl_park_bytes(uint32_t snap) const {
         if (!dfl.present || dfl_kc.empty()) return 0;
@@ -696,6 +703,7 @@ private:
     // verify graphs with the host KV tail: captured once, the staging copies' memcpy nodes kept and updated in place
     template <class Body>
     cudaGraphExec_t cached_verify_graph(int family, uint64_t key, Body && body) {
+        if (lora_now()) key ^= uint64_t(1) << 48;  // free in verify keys (n < 256); batch keys are hashes
         if (!kv_staged) return cached_graph(family, key, std::forward<Body>(body));
         cudaGraphExec_t e = glru.find(family, key);
         if (!e)
@@ -742,9 +750,34 @@ private:
     double last_prefill_ms = 0;
     std::chrono::steady_clock::time_point dec_log_tp;  // last TQLLM_DEBUG=decode progress print
 
-    // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own)
+    // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own); + the matrix's LoRA
     void mm_h(const Mat & m, bf16 * out, int n) { mm_h(m, out, n, basis_); }
-    void mm_h(const Mat & m, bf16 * out, int n, Basis in);
+    void mm_h(const Mat & m, bf16 * out, int n, Basis in) {
+        mm_h_base(m, out, n, in);
+        if (!lora_of.empty()) lora_mm(m, out, n);
+    }
+    void mm_h_base(const Mat & m, bf16 * out, int n, Basis in);
+    // Runtime LoRA (--lora, lora.hpp): per adapted layer matrix, each adapter's A (stored in the matrix's input basis, so
+    // it reads the same prepared v_xh) and B (alpha / rank folded in). Scales live on the device per slot and adapter
+    // (d_lscale [nslots][lora_n]); captured graphs read them at run time, so a new scale needs no recapture. Whether the
+    // adapter kernels run at all (some scale of the verify's slots nonzero) is part of the graph key (lora_now).
+    struct LoraPiece { int adapter = 0, rank = 0; Buf a, b; };
+    std::unordered_map<const Mat *, std::vector<LoraPiece>> lora_of;
+    int lora_n = 0, lora_rmax = 0;
+    std::vector<std::vector<float>> lora_slot;  // [slot][adapter]: host copy of d_lscale
+    Buf d_lscale, lora_t;                       // lora_t: [NBUF][lora_rmax] floats, A x of one matrix
+    void load_lora();
+    bool lora_on(int slot) const {
+        for (float v : lora_slot[size_t(slot)]) if (v != 0.f) return true;
+        return false;
+    }
+    bool lora_now() const {  // the verify being built (segs, else the active slot) runs any adapter
+        if (lora_of.empty()) return false;
+        if (segs.empty()) return lora_on(active);
+        for (const auto & g : segs) if (lora_on(g.slot)) return true;
+        return false;
+    }
+    void lora_mm(const Mat & m, bf16 * out, int n);
     // Prefill dispatch by memory traffic (prefill_path.hpp): short chunks of formats without a native GEMM no longer pay
     // the per-chunk FP16 dequantisation of every weight.
     std::map<const WeightFormat *, PrefillCross> pf_cross;  // measured per format at load (calibrate_prefill)

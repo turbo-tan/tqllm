@@ -2,6 +2,7 @@
 
 #include "flags_gen.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -136,6 +137,13 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--plugin") o.plugins.push_back(value());
     else if (a == "--hot-map") o.hot_map = value();
     else if (a == "--draft-vocab") o.draft_vocab = value();
+    else if (a == "--lora") o.lora.push_back(value()), o.lora_scaled.push_back(std::nanf(""));
+    else if (a == "--lora-scaled") {
+        const std::string f = value();
+        o.lora.push_back(f), o.lora_scaled.push_back(std::stof(value()));
+    }
+    else if (a == "--lora-scale") o.lora_scale = std::stof(value());
+    else if (a == "--lora-init-without-apply") o.lora_init_without_apply = true;
     else if (a == "--mtp") o.native_mtp = true;
     else if (a == "--draft-window") o.draft_window = count(0);
     else if (a == "--draft-retrieve") o.draft_retrieve = count(0);
@@ -171,6 +179,7 @@ const char * engine_options_usage() {
            "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
+           "          [--lora FILE | --lora-scaled FILE S (repeatable: runtime LoRA adapters, ids 0, 1, ...)] [--lora-scale S (1)] [--lora-init-without-apply] (a request's \"lora\": [{\"id\": 0, \"scale\": 1}] overrides)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"
            "          [--prefill-arena-mb N (3800)] [--dense-cache-mb N (600)] [--prefill-borrow auto|all|N (auto)]\n"

@@ -522,6 +522,11 @@ int main(int argc, char ** argv) {
 #endif
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
+        {  // --lora: request defaults (ids in load order)
+            auto & ld = tqserve::lora_defaults();
+            ld.paths = engine.lora;
+            for (size_t i = 0; i < engine.lora.size(); ++i) ld.scales.push_back(engine.lora_init(i));
+        }
         if (engine.split_layers && engine.tp_rank > 0) {  // --split layer: this rank follows rank 0's server
             std::fprintf(stderr, "tqserve: --split layer rank %d loaded; following rank 0\n", engine.tp_rank);
             model.follow();
@@ -704,7 +709,8 @@ int main(int argc, char ** argv) {
             // --np 1 (no scheduler): one generation at a time, but /health and /v1/models answer while it runs; every
             // connection has its own thread, so a long generation no longer blocks the accept loop
             static std::mutex single_slot;
-            const bool status_path = request.method == "GET" && (request.path == "/health" || request.path == "/v1/models" || request.path == "/v1/models/" + name);
+            const bool status_path = (request.method == "GET" && (request.path == "/health" || request.path == "/v1/models" || request.path == "/v1/models/" + name)) ||
+                                     request.path == "/lora-adapters";  // request defaults only: never waits for the GPU
             std::unique_lock<std::mutex> hold(single_slot, std::defer_lock);
             if (!scheduler && !status_path) hold.lock();
             std::string body;
@@ -745,6 +751,31 @@ int main(int argc, char ** argv) {
                 body = "{\"object\":\"list\",\"data\":[{\"id\":";
                 tqserve::jstr(body, name);
                 body += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
+            } else if (request.path == "/lora-adapters" && (request.method == "GET" || request.method == "POST")) {
+                // llama.cpp's endpoint: GET lists [{"id", "path", "scale"}]; POST [{"id": N, "scale": S}] sets the scales of
+                // requests without a "lora" field (adapters not listed keep theirs)
+                auto & ld = tqserve::lora_defaults();
+                std::lock_guard<std::mutex> lk(ld.mu);
+                if (request.method == "POST") {
+                    std::string err;
+                    std::vector<float> sc = ld.scales;
+                    try {
+                        const auto root = tqllm::parse_json(std::string(request.body.begin(), request.body.end()));
+                        if (tqserve::read_lora_list(root, sc, err)) ld.scales = sc;
+                    } catch (const std::exception & e) { err = e.what(); }
+                    if (!err.empty()) status = 400, body = tqserve::json_error(err);
+                }
+                if (status == 200) {
+                    body = "[";
+                    for (size_t i = 0; i < ld.paths.size(); ++i) {
+                        body += std::string(i ? "," : "") + "{\"id\":" + std::to_string(i) + ",\"path\":";
+                        tqserve::jstr(body, ld.paths[i]);
+                        char num[32];
+                        std::snprintf(num, sizeof num, "%g", double(ld.scales[i]));
+                        body += std::string(",\"scale\":") + num + "}";
+                    }
+                    body += "]";
+                }
             } else if (request.method == "POST" && request.path == "/v1/messages/count_tokens") {
                 body = "{\"input_tokens\":" + std::to_string(request.body.size() / 4) + "}";  // estimate (Claude Code asks)
             } else if (request.method == "POST" && tqserve::api_for_path(request.path) != tqserve::Api::None) {
@@ -960,7 +991,7 @@ int main(int argc, char ** argv) {
                 if (parsed.observation) parsed.observation->finish(status == 200 ? "complete" : "failed");
                 if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
-                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" || request.path == "/admin/route" ||
+                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" || request.path == "/admin/route" || request.path == "/lora-adapters" ||
                     request.path == "/v1/models/" + name || tqserve::api_for_path(request.path) != tqserve::Api::None;
                 status = known_path ? 405 : 404;
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");

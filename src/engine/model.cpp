@@ -37,6 +37,8 @@ Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots
     }
     const std::string mode_note = check_mode(p, o, *engine, slots);
     impl_->e = engine->make(w, t, c, slots, o);
+    if (!o.lora.empty() && impl_->e->lora_count() != int(o.lora.size()))
+        throw std::invalid_argument("--lora: this model's engine does not support runtime LoRA adapters");
     auto & note = impl_->e->note;
     if (!mode_note.empty()) note = note.empty() ? mode_note : mode_note + " " + note;
 }
@@ -82,6 +84,8 @@ void Model::commit(int accepted) { impl_->e->commit(accepted); }
 void Model::spec_abort(int slot) { impl_->e->spec_abort(slot); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
+int Model::lora_count() const { return impl_->e->lora_count(); }
+void Model::set_lora(const std::vector<float> & scales) { impl_->e->set_lora(scales); }
 void Model::set_ignore_eos(bool on) { impl_->e->set_ignore_eos(on); }
 void Model::set_first_token_hook(std::function<void()> hook) { impl_->e->set_first_token_hook(std::move(hook)); }
 void Model::set_continuation(int phase) { impl_->e->set_continuation(phase); }

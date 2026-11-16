@@ -106,6 +106,39 @@ inline SamplingDefaults & sampling_defaults() {
     return d;
 }
 
+// --lora adapters (ids in load order) and the scales requests without a "lora" field run with (POST /lora-adapters)
+struct LoraDefaults {
+    std::mutex mu;
+    std::vector<std::string> paths;
+    std::vector<float> scales;
+};
+inline LoraDefaults & lora_defaults() {
+    static LoraDefaults d;
+    return d;
+}
+// [{"id": N, "scale": S}, ...] (llama.cpp's request and /lora-adapters body) onto `scales`; false + error on a bad entry
+inline bool read_lora_list(const tqllm::Json & x, std::vector<float> & scales, std::string & error) {
+    if (x.kind != tqllm::Json::Array) {
+        error = "lora must be an array of {\"id\": N, \"scale\": S}";
+        return false;
+    }
+    for (const auto & e : x.arr) {
+        const auto * id = e.kind == tqllm::Json::Object ? e.get("id") : nullptr;
+        const auto * sc = e.kind == tqllm::Json::Object ? e.get("scale") : nullptr;
+        if (!id || id->kind != tqllm::Json::Number || std::floor(id->num) != id->num || id->num < 0 ||
+            id->num >= double(scales.size())) {
+            error = "invalid adapter id (" + std::to_string(scales.size()) + " LoRA adapters loaded)";
+            return false;
+        }
+        if (sc && (sc->kind != tqllm::Json::Number || !std::isfinite(sc->num))) {
+            error = "LoRA scale must be a number";
+            return false;
+        }
+        scales[size_t(id->num)] = sc ? float(sc->num) : 0.f;
+    }
+    return true;
+}
+
 struct ChatRequest {
     std::shared_ptr<Monitor::Request> observation;  // server-owned counters; never parsed from client JSON
     std::string prompt_text;
@@ -128,6 +161,7 @@ struct ChatRequest {
     float repeat_penalty = sampling_defaults().repeat_penalty;      // sampling only: repeat_penalty / repetition_penalty
     float frequency_penalty = sampling_defaults().frequency_penalty;
     uint64_t seed = 0;
+    std::vector<float> lora;  // scale per --lora adapter for this request (empty: none loaded)
     bool ignore_eos = false;  // decode to max_tokens through end-of-sequence tokens (vLLM / llama.cpp field)
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
@@ -204,6 +238,16 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         req.ignore_eos = ieos && ieos->kind == tqllm::Json::Bool && ieos->num != 0;
         const auto * rti = root.get("return_token_ids");
         req.return_token_ids = rti && rti->kind == tqllm::Json::Bool && rti->num != 0;
+
+        {  // runtime LoRA: the defaults, or the request's list (llama.cpp: adapters it does not name run at 0)
+            auto & ld = lora_defaults();
+            std::lock_guard<std::mutex> lk(ld.mu);
+            req.lora = ld.scales;
+        }
+        if (const auto * x = root.get("lora"); x && x->kind != tqllm::Json::Null) {
+            std::fill(req.lora.begin(), req.lora.end(), 0.f);
+            if (!read_lora_list(*x, req.lora, req.error)) return req;
+        }
 
         auto num = [&](const char * key, double & v) {
             if (const auto * x = root.get(key); x && x->kind == tqllm::Json::Number) { v = x->num; return true; }
@@ -843,6 +887,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        if (!req.lora.empty()) model.set_lora(req.lora);
         model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
         model.set_continuation(req.continuation);
@@ -1277,6 +1322,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+    if (!req.lora.empty()) model.set_lora(req.lora);
     model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
         model.set_continuation(req.continuation);

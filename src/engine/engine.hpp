@@ -49,6 +49,13 @@ struct Engine {
         if (temperature > 0.f) throw std::runtime_error("sampling not supported for this model");
         (void) top_p, (void) top_k, (void) seed, (void) presence;
     }
+    // Runtime LoRA (--lora): adapters loaded, and the scale of each for the active slot's next request (after select_slot;
+    // scales.size() == lora_count()). Engines without LoRA support load none and accept only all-zero scales.
+    virtual int lora_count() const { return 0; }
+    virtual void set_lora(const std::vector<float> & scales) {
+        for (float v : scales)
+            if (v != 0.f) throw std::runtime_error("runtime LoRA is not supported for this model");
+    }
     // Multi-slot serving: each slot holds one sequence (KV, recurrent state, drafter K/V, sampling). select_slot makes
     // a slot active for the calls that follow; spec_begin prefills it, spec_advance runs one draft + verify step
     // (false once done) and spec_finish returns the generated ids. generate_spec = begin + advance* + finish.

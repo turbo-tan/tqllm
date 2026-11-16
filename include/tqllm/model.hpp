@@ -39,6 +39,9 @@ public:
     // Sampling for generate_spec: temperature 0 = greedy; top_k <= 16, top_p, seed.
     void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0, float presence = 0.f);
     void set_penalties(float repeat = 1.f, float frequency = 0.f);  // after set_sampling: repeat (1 = off) / frequency penalty
+    // Runtime LoRA (EngineOptions::lora): adapters loaded, and the active slot's scales for its next request (one per adapter)
+    int lora_count() const;
+    void set_lora(const std::vector<float> & scales);
     void set_ignore_eos(bool on);  // decode to max_tokens through end-of-sequence tokens (fixed-length benchmarks)
     void set_first_token_hook(std::function<void()> hook);  // the next spec_begin calls it once its first token is picked
     void set_continuation(int phase);  // thinking budget: 1 phase 1, 2 phase 2 (continues phase 1), 0 neither (Engine::set_continuation)
