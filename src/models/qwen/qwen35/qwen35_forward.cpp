@@ -1,5 +1,6 @@
 // qwen35 engine: the forward pass (decode, prefill, layers). The class is declared in qwen35_engine.hpp.
 #include "qwen35_engine.hpp"
+#include "calib_dump.hpp"
 #include "cuda_compat.hpp"
 #include "device_free.hpp"
 
@@ -537,6 +538,7 @@ void Qwen35Engine::mm_h_base(const Mat & m, bf16 * out, int n, Basis in) {
         for (int c0 = 0; c0 < n; c0 += mc)
             m.fmt->matvec(m, xh + size_t(c0) * m.cols, out + size_t(c0) * m.rows, std::min(mc, n - c0), stream);
     };
+    calib_dump(m, n, in);  // every multi-token product of a quantised matrix reads v_xh here
     switch (path_of(m, n)) {
     case PrefillPath::matvec: m.fmt->matvec(m, xh, out, n, stream); return;
     case PrefillPath::batched: batched(); return;
@@ -546,6 +548,7 @@ void Qwen35Engine::mm_h_base(const Mat & m, bf16 * out, int n, Basis in) {
         break;
     case PrefillPath::dequant: break;
     }
+    struct Inner { bool & f; explicit Inner(bool & x) : f(x) { f = true; } ~Inner() { f = false; } } inner(cd_inner);
     gemm_rows(m, out, n, m.rows);
 }
 
@@ -585,6 +588,7 @@ void Qwen35Engine::set_lora(const std::vector<float> & scales) {
 }
 
 void Qwen35Engine::calibrate_prefill() {
+    struct Pause { bool & f; explicit Pause(bool & x) : f(x) { f = true; } ~Pause() { f = false; } } pause(cd_pause);
     if (!fmt_target || !gemm_w.p || NPF < NGEMM_BLAS) return;
     if (const std::string * v = tqllm::debug_value("prefill_path"); v && *v == "old") return;
     std::map<const WeightFormat *, const Mat *> rep;
@@ -705,7 +709,47 @@ bool Qwen35Engine::smooth_setup(const Mat & m, int n) {
     return true;
 }
 
+void Qwen35Engine::calib_dump(const Mat & m, int n, Basis in) {
+    static const std::string * v = tqllm::debug_value("calib_dump");
+    if (!v || cd_pause || n <= 1) return;  // not the load-time calibration (synthetic inputs), not decode
+    static const CalibDumpSpec spec = parse_calib_dump(*v);
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) return;  // no host copy in a graph
+    const char * role = nullptr;
+    int L = -1;
+    for (int l : spec.layers) {
+        if (l >= int(layer.size())) break;
+        const Layer & Y = layer[size_t(l)];
+        // the first matrix that reads each input (fused at load, or the first of the separate ones)
+        const Mat * mix = Y.w_mix.p ? &Y.w_mix : Y.wq.p ? &Y.wq : &Y.w_qkv;
+        const Mat * gu = Y.w_gu.p ? &Y.w_gu : &Y.w_gate;
+        const Mat * out = Y.wo.p ? &Y.wo : &Y.w_out;
+        role = &m == mix ? "mix" : &m == gu ? "gu" : &m == &Y.w_down ? "down" : &m == out ? "out" : nullptr;
+        if (role) { L = l; break; }
+    }
+    if (!role) return;
+    const std::string key = spec.dir + "/L" + std::to_string(L) + "_" + role;
+    std::vector<uint16_t> x(size_t(n) * size_t(m.cols));
+    sync_ck();
+    ck(cudaMemcpy(x.data(), v_xh.p, x.size() * 2, cudaMemcpyDeviceToHost));
+    long long & tok = cd_tok[key];
+    FILE * f = std::fopen((key + ".x16").c_str(), tok ? "ab" : "wb");  // the first write of a run starts the file afresh
+    if (!f) throw std::runtime_error("calib_dump: cannot write " + key + ".x16");
+    const bool ok = std::fwrite(x.data(), 2, x.size(), f) == x.size();
+    std::fclose(f);
+    if (!ok) throw std::runtime_error("calib_dump: short write to " + key + ".x16 (disk full?)");
+    if (!tok) std::fprintf(stderr, "calib_dump: %s.x16 (K %d, %s)\n", key.c_str(), m.cols, m.fmt ? m.fmt->name() : "?");
+    tok += n;
+    const char * bn = in == Basis::Tq4Rot128 ? "tq4rot128" : in == Basis::Tq3Rot32 ? "tq3rot32" : "plain";
+    if (FILE * j = std::fopen((key + ".json").c_str(), "w")) {
+        std::fprintf(j, "{\"k\": %d, \"tokens\": %lld, \"basis\": \"%s\", \"format\": \"%s\"}\n", m.cols, tok, bn,
+                     m.fmt ? m.fmt->name() : "?");
+        std::fclose(j);
+    }
+}
+
 void Qwen35Engine::gemm_rows(const Mat & m, bf16 * out, int n, int ldo) {
+    if (!cd_inner) calib_dump(m, n, m.fmt->basis());  // direct callers (fused GDN mix, FFN gate / up straight to SwiGLU)
     fp8_x_ready = fp8_used = i8_used = false;
     sm_on = smooth_setup(m, n);
     if (const auto * ps = m.fmt->parts()) {  // composite: each part's GEMM into its own row block

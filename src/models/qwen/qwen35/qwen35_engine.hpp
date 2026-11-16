@@ -651,6 +651,10 @@ private:
     bool smooth_setup(const Mat & m, int n);
     const float * smooth_aw(const Mat & m);  // nullptr: no smoothing for this matrix
     void smooth_prebuild();
+    // TQLLM_DEBUG=calib_dump (calib_dump.hpp): the prefill inputs of chosen layers to disk, for weight quantisers
+    void calib_dump(const Mat & m, int n, Basis in);
+    bool cd_pause = false, cd_inner = false;  // load-time prefill calibration; inside mm_h (already written)
+    std::map<std::string, long long> cd_tok;
     Buf fp8_sw;                     // row scales of the current gemm_rows output, [ldo]
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
