@@ -67,6 +67,10 @@ int main() {
     expect(d.graph_keep_mb == 384 && parse({"--graph-keep-mb", "128"}).graph_keep_mb == 128 &&
            parse({"--graph-keep-mb", "0"}).graph_keep_mb == 0, "--graph-keep-mb (384 default, 0 = by count only)");
     expect(throws({"--graph-keep-mb", "-1"}), "negative --graph-keep-mb rejected");
+    expect(!d.embed_host && !d.head_host, "--embed-host / --head-host default off (the fit decides)");
+    expect(parse({"--embed-host", "on"}).embed_host && !parse({"--embed-host", "off"}).embed_host, "--embed-host on|off");
+    expect(parse({"--head-host", "on"}).head_host && !parse({"--head-host", "off"}).head_host, "--head-host on|off");
+    expect(throws({"--head-host", "yes"}) && throws({"--embed-host"}), "--head-host / --embed-host need on or off");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");
     std::printf(fail ? "ENGINE_OPTIONS FAIL\n" : "ENGINE_OPTIONS PASS\n");

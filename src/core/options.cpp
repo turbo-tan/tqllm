@@ -99,6 +99,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
             throw std::invalid_argument("--prefill-borrow must be all, auto or a bank count");
         o.prefill_borrow = v;
     }
+    else if (a == "--embed-host" || a == "--head-host") {  // memory placement the fit otherwise picks only when short
+        const std::string v = value();
+        if (v != "on" && v != "off") throw std::invalid_argument(a + " must be on or off");
+        (a == "--embed-host" ? o.embed_host : o.head_host) = v == "on";
+    }
     else if (a == "--prefill-int8") {
         const std::string v = value();
         if (v != "on" && v != "off") throw std::invalid_argument("--prefill-int8 must be on or off");
@@ -167,7 +172,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
