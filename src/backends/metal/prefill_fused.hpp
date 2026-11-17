@@ -15,6 +15,9 @@ std::pair<mlx::core::array, mlx::core::array> rms_norm_bf16_pair(const mlx::core
 std::tuple<mlx::core::array, mlx::core::array, mlx::core::array> rms_norm_bf16_pair_residual(const mlx::core::array& x, const mlx::core::array& r,
                                                                                             const mlx::core::array& w, float eps,
                                                                                             bool rotate = false);
+// whether the two kernels above run their 1024 threads on this GPU at width d (#55: an M1 Max allows fewer); false: use
+// the MLX chains (their own reference)
+bool rms_norm_bf16_pair_runs(int d, bool rotate, bool residual);
 std::tuple<mlx::core::array, mlx::core::array, mlx::core::array> rms_norm_bf16_pair_residual_reference(const mlx::core::array& x, const mlx::core::array& r,
                                                                                                       const mlx::core::array& w, float eps);
 // SwiGLU of a gate | up product [rows, 2F] FP16: f16(bf(bf(g * sigmoid(g)) * u)) with g, u the BF16 roundings of the

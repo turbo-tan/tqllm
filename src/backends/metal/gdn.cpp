@@ -1,5 +1,6 @@
 #include "gdn.hpp"
 #include "shape_constants.hpp"
+#include "threadgroup_fit.hpp"
 #include <array>
 #include <cmath>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <string_view>
 #include <limits>
+#include <string>
 
 namespace tqllm::mlx_backend {
 namespace mx=mlx::core;
@@ -375,10 +377,11 @@ for(uint t=0;t<M;++t) {
     return {result[0],final,snapshots&&!compact?std::optional<mx::array>(result[1]):std::nullopt,
         compact?std::optional<mx::array>(result[2]):std::nullopt};
 }
-// One threadgroup of 1024 threads per value head: thread = (state row r = tid / 8, lane sub = tid % 8) holding
-// state columns [16 sub, 16 sub + 16) of row r. Prep (conv + silu for q, k, v of every token, gates, q / k norms)
-// goes to threadgroup memory once, the token recurrence then needs only 8-lane shuffles, and the gated norm over
-// the 128 rows of each token runs after one barrier. Same per-token arithmetic for m = 1 and m = 16 (verify == AR).
+// One threadgroup of TG threads per value head (1024; fewer where the GPU does not allow 1024, issue #55): thread =
+// (state row r = tid / 8 + pass * TG / 8, lane sub = tid % 8) holding state columns [16 sub, 16 sub + 16) of row r, the
+// 128 rows in 1024 / TG passes (rows are independent: the same arithmetic per row at every TG). Prep (conv + silu for
+// q, k, v of every token, gates, q / k norms) goes to threadgroup memory once, the token recurrence then needs only
+// 8-lane shuffles, and the gated norm over the 128 rows of each token runs after one barrier. Same per-token arithmetic for m = 1 and m = 16 (verify == AR).
 GdnStep gdn_step_fused(const mx::array& joined,const mx::array& weights,const mx::array& alpha,const mx::array& beta,
     const mx::array& bias,const mx::array& rate,const mx::array& z,const mx::array& norm_weight,float eps,float query_scale,
     const std::optional<mx::array>& state,int kh,int vh) {
@@ -390,8 +393,10 @@ GdnStep gdn_step_fused(const mx::array& joined,const mx::array& weights,const mx
 GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::array& weights,const mx::array& input,
     const mx::array& ab,const mx::array& bias,const mx::array& rate,const mx::array& z,const mx::array& norm_weight,
     float eps,float query_scale,const std::optional<mx::array>& state,int kh,int vh,int row_stride,int z_stride,int z_offset,
-    const mx::array* parents) {
+    const mx::array* parents,int threads) {
     const int m=rows.ndim()==2?rows.shape(0):0,width=2*kh*128+vh*128;
+    if(threads!=0 && (threads<32 || threads>1024 || (threads&(threads-1))))
+        throw std::invalid_argument("fused GDN step threads: a power of two in 32 .. 1024");
     if(parents && (parents->shape()!=mx::Shape{m} || parents->dtype()!=mx::int32))
         throw std::invalid_argument("fused GDN step parents: int32 [m]");
     const int rs=row_stride>0?row_stride:width,zs=z_stride>0?z_stride:vh*128;
@@ -411,7 +416,8 @@ GdnStep gdn_step_fused(const mx::array& prev,const mx::array& rows,const mx::arr
         throw std::invalid_argument("invalid fused GDN step state");
     static const std::string body=R"METAL(
 const uint tid=thread_position_in_threadgroup.x,head=threadgroup_position_in_grid.y;
-const uint khead=head%uint(KH),row=tid>>3,sub=tid&7u;
+const uint khead=head%uint(KH),sub=tid&7u;
+constexpr uint NSG=uint(TG)/32u;  // simdgroups
 const uint qoff=khead*128u,koff=uint(KH)*128u+khead*128u,voff=2u*uint(KH)*128u+head*128u;
 // 17-32 rows (M > 16): the queries and the recurrence outputs live in device scratch (qx, ox) instead of threadgroup
 // memory, so keys, values and gates still fit 32 KB; the values and their arithmetic are the same
@@ -427,7 +433,7 @@ threadgroup float bet[M];
 {
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
-for(uint i=tid;i<uint(M)*384u;i+=1024u) {
+for(uint i=tid;i<uint(M)*384u;i+=uint(TG)) {
     const uint t=i/384u,ch=i%384u;
     const uint col=ch<128u?qoff+ch:ch<256u?koff+(ch-128u):voff+(ch-256u);
     float sum=0.0f;
@@ -453,7 +459,7 @@ for(uint i=tid;i<uint(M)*384u;i+=1024u) {
 threadgroup float abv[2*M];
 if(ABF) {
     const uint g=tid>>5,lane=tid&31u;
-    for(uint gg=g;gg<2u*uint(M);gg+=32u) {  // one pass for M <= 16 (32 simdgroups)
+    for(uint gg=g;gg<2u*uint(M);gg+=NSG) {  // one pass for M <= 16 at TG 1024 (32 simdgroups)
         const uint t=gg>>1,which=gg&1u;
         const device float* xr=A+t*uint(HID)+lane*4u;
         const device float* wr=B+(which*uint(VH)+head)*uint(HID)+lane*4u;
@@ -480,7 +486,7 @@ if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // q / k normalization: simdgroup g < 2 M handles (token g / 2, q or k), 32 lanes x 4 channels
 if(M>16) {  // the same per-vector arithmetic, queries in device scratch, two (token, q | k) vectors per simdgroup
     const uint g=tid>>5,lane=tid&31u;
-    for(uint gg=g;gg<2u*uint(M);gg+=32u) {
+    for(uint gg=g;gg<2u*uint(M);gg+=NSG) {
         const uint t=gg>>1;
         const bool key=(gg&1u)!=0u;
         float x4[4];float ss=0.0f;
@@ -493,8 +499,8 @@ if(M>16) {  // the same per-vector arithmetic, queries in device scratch, two (t
         }
     }
 } else {
-    const uint g=tid>>5,lane=tid&31u;
-    if(g<2u*uint(M)) {
+    const uint lane=tid&31u;
+    for(uint g=tid>>5;g<2u*uint(M);g+=NSG) {
         threadgroup float* vec=(g&1u)?ks+(g>>1)*128u:qs+(g>>1)*128u;
         float ss=0.0f;
         for(uint e=0;e<4u;++e) {const float x=vec[lane*4u+e];ss+=x*x;}
@@ -506,6 +512,8 @@ if(M>16) {  // the same per-vector arithmetic, queries in device scratch, two (t
 threadgroup_barrier(mem_flags::mem_threadgroup);
 if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // recurrence over the tokens; the 8 lanes of a row reduce with xor shuffles inside their simdgroup
+for(uint pass=0;pass<1024u/uint(TG);++pass) {
+const uint row=(tid>>3)+pass*(uint(TG)/8u);
 float s[16];
 {
     const device float* src=initial+(head*128u+row)*128u+sub*16u;
@@ -575,10 +583,11 @@ if(chain) {
     device float* dst=state+(head*128u+row)*128u+sub*16u;
     for(uint j=0;j<16u;++j)dst[j]=s[j];
 }
+}
 // tape: normalized keys (key-head threadgroups), decay, conv history (rows M .. M + 2 of joined)
-if(head<uint(KH))for(uint i=tid;i<uint(M)*128u;i+=1024u)keys[((i>>7)*uint(KH)+head)*128u+(i&127u)]=ks[i];
+if(head<uint(KH))for(uint i=tid;i<uint(M)*128u;i+=uint(TG))keys[((i>>7)*uint(KH)+head)*128u+(i&127u)]=ks[i];
 if(tid<uint(M))decay[tid*uint(VH)+head]=dec[tid];
-for(uint i=tid;i<384u;i+=1024u) {
+for(uint i=tid;i<384u;i+=uint(TG)) {
     const uint r=i>>7,c=i&127u,j=uint(M)+r,dst=r*uint(WIDTH);  // history row r = row M + r of [prev; rows]
     const device float* src=j<3u?prev+j*uint(WIDTH):rows+(j-3u)*uint(RS);
     history[dst+voff+c]=src[voff+c];
@@ -588,8 +597,8 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 if(M>16)threadgroup_barrier(mem_flags::mem_device);
 // gated norm per token: simdgroup t < M, 32 lanes x 4 rows; bf16(o) -> rms_norm(w, eps) -> * silu(z) -> bf16
 {
-    const uint g=tid>>5,lane=tid&31u;
-    if(g<uint(M)) {
+    const uint lane=tid&31u;
+    for(uint g=tid>>5;g<uint(M);g+=NSG) {
         float a[4];float ss=0.0f;
         for(uint e=0;e<4u;++e) {
             a[e]=float(bfloat16_t(M>16?ox[(head*uint(M)+g)*128u+lane*4u+e]:os[g*128u+lane*4u+e]));ss+=a[e]*a[e];
@@ -614,14 +623,25 @@ if(M>16)threadgroup_barrier(mem_flags::mem_device);
     const int hid=abf?input.shape(1):0;
     if(abf && (input.shape(0)!=m || hid<128 || hid%128 || ab.shape()!=mx::Shape{2*vh,hid} || ab.dtype()!=mx::float32 || input.dtype()!=mx::float32))
         throw std::invalid_argument("invalid fused GDN step alpha / beta projection");
+    // the largest threadgroup this specialization runs at on this GPU (#55): once, on zero inputs of the same shapes
+    const auto spec=std::to_string(m)+","+std::to_string(kh)+","+std::to_string(vh)+","+std::to_string(int(abf))+","+std::to_string(hid)+","+
+        std::to_string(rs)+","+std::to_string(zs)+","+std::to_string(z_offset)+","+std::to_string(int(parents!=nullptr));
+    const int tg=threads>0?threads:fit_threadgroup("fused GDN step",spec,{1024,512,256,128,64,32},[&](int t) {
+        const auto zero=[](const mx::array& a) {return mx::zeros(a.shape(),a.dtype());};
+        const auto chain=mx::subtract(mx::arange(m,mx::int32),mx::array(1,mx::int32));
+        auto r=gdn_step_fused(zero(prev),zero(rows),zero(weights),zero(input),zero(ab),zero(bias),zero(rate),zero(z),zero(norm_weight),
+                              eps,query_scale,std::nullopt,kh,vh,row_stride,z_stride,z_offset,parents?&chain:nullptr,t);
+        mx::eval({r.out,r.state,r.deltas,r.keys,r.decay,r.history});
+    });
+    if(tg==0)throw std::runtime_error("fused GDN step: this GPU runs none of its threadgroup sizes");
     auto result=(abf?kernel_ab:kernel)({mx::contiguous(prev),mx::contiguous(rows),mx::contiguous(weights),mx::contiguous(input),mx::contiguous(ab),
         mx::contiguous(bias),mx::contiguous(rate),mx::contiguous(z),mx::contiguous(norm_weight),mx::array(eps),
         mx::array(query_scale),mx::contiguous(initial),
         parents?mx::contiguous(*parents):shape_constant("chain_parents",{m},[&] {return mx::subtract(mx::arange(m,mx::int32),mx::array(1,mx::int32));})},
         {{m,vh*128},{1,vh,128,128},{m,vh,128},{1,m,kh,128},{1,m,vh},{3,width},{vh,m>16?m:1,128},{vh,m>16?m:1,128}},
         {mx::float16,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32,mx::float32},
-        {1024,vh,1},{1024,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset},
-         {"TREE",int(parents!=nullptr)}},
+        {tg,vh,1},{tg,1,1},{{"M",m},{"KH",kh},{"VH",vh},{"WIDTH",width},{"ABF",int(abf)},{"HID",hid},{"RS",rs},{"ZS",zs},{"ZOFF",z_offset},
+         {"TREE",int(parents!=nullptr)},{"TG",tg}},
         std::nullopt,false,mx::Device(mx::Device::gpu));
     return {result[0],result[1],result[2],result[3],result[4],result[5]};
 }

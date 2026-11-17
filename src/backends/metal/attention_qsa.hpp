@@ -7,10 +7,12 @@
 // and the keys from T(x) to the row (16 to 79) stay dense in the exact loop. A row is sparse when T(x) >= `from`;
 // below that it runs the dense exact kernel. Every value a row uses depends only on its own query and the committed
 // cache, in a fixed order, so a tree row equals its one-token step bit for bit.
+#include "threadgroup_fit.hpp"
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace tqllm::mlx_backend {
@@ -118,8 +120,10 @@ inline mlx::core::array qsa_norm_rope(const mlx::core::array& x, const mlx::core
 
 // top kQsaPick blocks (ties: the lower block) among the blocks below each sparse row's T, ascending; -1 rows elsewhere.
 // q [16, 4, 128], blocks [>= nbmax, 128], plan as decode_attention_exact's; returns [16, kQsaPick] int32
+// threads: the selection's threadgroup size (a power of two, 32 .. 1024; the same selection at every size); 0: the largest
+// this GPU runs (1024 where allowed, #55)
 inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::array& blocks, const mlx::core::array& plan,
-                                   int n, int nbmax, int pw, int from) {
+                                   int n, int nbmax, int pw, int from, int threads = 0) {
     namespace mx = mlx::core;
     // scores of every row against every block below the bound: a threadgroup takes 16 blocks x 8 rows, both staged in
     // threadgroup memory, so the block keys are read once per 8 rows (coalesced); each score in the same fixed order
@@ -149,7 +153,7 @@ inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::a
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const int T = PLAN[t * uint(PW)];
     if (int(t) >= P[0] || T < P[1]) {
-        for (uint i = tid; i < uint(PICK); i += 1024u) SEL[t * uint(PICK) + i] = -1;
+        for (uint i = tid; i < uint(PICK); i += uint(TG)) SEL[t * uint(PICK) + i] = -1;
         return;
     }
     const uint nb = uint(T) / 4u;
@@ -159,10 +163,10 @@ inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::a
     threadgroup uint sh[3];  // prefix, mask, still wanted at the prefix
     if (tid == 0u) {sh[0] = 0u; sh[1] = 0u; sh[2] = uint(PICK);}
     for (int shift = 24; shift >= 0; shift -= 8) {
-        if (tid < 256u) atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        for (uint i = tid; i < 256u; i += uint(TG)) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint pre = sh[0], msk = sh[1];
-        for (uint b = tid; b < nb; b += 1024u) {
+        for (uint b = tid; b < nb; b += uint(TG)) {
             const uint u = as_type<uint>(S[b]);
             if ((u & msk) == pre) atomic_fetch_add_explicit(&hist[(u >> uint(shift)) & 255u], 1u, memory_order_relaxed);
         }
@@ -183,7 +187,7 @@ inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::a
     threadgroup uint wtake[32], wtie[32], base[2];
     if (tid == 0u) {base[0] = 0u; base[1] = 0u;}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c0 = 0; c0 < nb; c0 += 1024u) {
+    for (uint c0 = 0; c0 < nb; c0 += uint(TG)) {
         const uint b = c0 + tid;
         const uint u = b < nb ? as_type<uint>(S[b]) : 0u;
         const bool gt = b < nb && u > thr, eq = b < nb && u == thr;
@@ -202,7 +206,7 @@ inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::a
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0u) {
             uint a = 0u, e = 0u;
-            for (uint w = 0; w < 32u; ++w) {a += wtake[w]; e += wtie[w];}
+            for (uint w = 0; w < uint(TG) / 32u; ++w) {a += wtake[w]; e += wtie[w];}
             base[0] += a; base[1] += e;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -212,8 +216,19 @@ inline mlx::core::array qsa_select(const mlx::core::array& q, const mlx::core::a
     const auto P = mx::array(p.data(), {3}, mx::int32);
     auto sc = scores({mx::contiguous(q), blocks, P}, {{16, nbmax}}, {mx::float32}, {128 * ((nbmax + 15) / 16), 2, 1}, {128, 1, 1},
                      {}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
-    return kernel({sc, plan, P}, {{16, kQsaPick}}, {mx::int32}, {1024, 16, 1}, {1024, 1, 1}, {{"PICK", kQsaPick}, {"PW", pw}},
-                  std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    if (threads != 0 && (threads < 32 || threads > 1024 || (threads & (threads - 1))))
+        throw std::invalid_argument("qsa_select threads: a power of two in 32 .. 1024");
+    auto select = [&](const mx::array& s, const mx::array& pl, const mx::array& p, int tg) {
+        return kernel({s, pl, p}, {{16, kQsaPick}}, {mx::int32}, {tg, 16, 1}, {tg, 1, 1}, {{"PICK", kQsaPick}, {"PW", pw}, {"TG", tg}},
+                      std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+    };
+    // the largest threadgroup the selection runs at on this GPU (#55): once per plan width, on rows that select nothing
+    const int tg = threads > 0 ? threads : fit_threadgroup("QSA block selection", std::to_string(pw), {1024, 512, 256, 128, 64, 32}, [&](int t) {
+        const std::vector<int32_t> none = {0, 0, 1};
+        mx::eval(select(mx::zeros({16, 1}, mx::float32), mx::zeros({16 * pw}, mx::int32), mx::array(none.data(), {3}, mx::int32), t));
+    });
+    if (tg == 0) throw std::runtime_error("QSA block selection: this GPU runs none of its threadgroup sizes");
+    return select(sc, plan, P, tg);
 }
 
 // attention partials of the sparse rows over their selected keys, in the merge layout of decode_attention_exact
