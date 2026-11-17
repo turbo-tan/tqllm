@@ -53,7 +53,7 @@ Time to first token on this card: 3.2 s at 4K, 12.2 s at 16K, 44 s at 48K, 188 s
   answers agree with the exact path on 87-92 % of tokens (RTX 3090 check); use `--qsa-from off` when every token must
   match.
 
-Measured 11-17 on an RTX 5060 Ti 16 GB (Linux, 31 GB RAM), tqLLM ab001fa9 (1.7.0 line), one request, greedy. Chats: 5
+Measured 11-17 on an RTX 5060 Ti 16 GB (Linux, 31 GB RAM), a tqLLM 1.7.0 development build, one request, greedy. Chats: 5
 short questions, 512 tokens; documents: WikiText-2 cut to length, 64-256 tokens out; 123K / 200K: the C++ ladder prompt,
 up to 512 tokens out.
 

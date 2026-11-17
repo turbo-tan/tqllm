@@ -5,6 +5,16 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Fixed
+- Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
+  `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
+  argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
+  two cases now keep separate graphs.
+
+### Docs
+- [Choose a setup](docs/guides/choose-your-setup.md): which model, drafter and flags for 16 / 24 / 32 GB cards and GB10,
+  with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
+
 ### Added
 - Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
   pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
