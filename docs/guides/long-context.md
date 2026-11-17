@@ -8,15 +8,17 @@ Ask for more context than the GPU holds and the memory fit keeps the oldest KV p
 output is the same as with all KV on the GPU) instead of refusing the request. Reading that part over PCIe costs decode
 speed, so use it for prompts past what the GPU holds; below that, the default context is faster.
 
-RTX 5060 Ti 16 GB, Qwen3.8-27B-TQ_XS.gguf + DFlash2-TQ3, tq3 KV, decode tok/s. Default context: the memory fit caps the
-context at 204,800 on this card and keeps all KV on the GPU. `--context 262144`: TqCache keeps the oldest positions in RAM.
+RTX 5060 Ti 16 GB (Linux), Qwen3.8-27B-TQ_XS + DFlash2-TQ3, tq3 KV, 200,389-token prompt, decode tok/s (11-17):
 
-| prompt | default context (204,800, all KV on the GPU) | `--context 262144` (TqCache) |
+| setup | where the KV lives | decode |
 |---|---|---|
-| 200K | 113 | 70 (81,920 of its positions read from RAM) |
-| 224K | refused (longer than the context) | 42 |
-| 248K | refused | 32 |
+| TQ_XS, `--context 204800` | 82,944 of 204,800 positions in RAM (TqCache) | 43.7 |
+| TQ_XS-QSA, `--context 204800 --qsa-from 49152` | part in RAM; each token reads only the picked blocks | 109.5 |
 
-The fit reserves RAM for the whole requested context up front, so with `--context 262144` even a prompt that would fit
-on the GPU reads part of its KV over PCIe (the 200K row). Ask for more context than the default only when the prompts
+1.0.1 measures the same 43.7 on this card (58,368 positions in RAM); the 113 tok/s row this guide used to show came from an
+earlier Windows / WSL 2 setup (10-06) and does not reproduce on this card today. For 100K+
+prompts on 16 GB use the QSA file ([Choose a setup](choose-your-setup.md)).
+
+The fit reserves RAM for the whole requested context up front, so a larger `--context` moves more positions to RAM even for
+prompts that would fit on the GPU. Ask for more context than the default only when the prompts
 need it.

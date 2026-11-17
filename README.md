@@ -113,6 +113,7 @@ single address and sends each request to the box that will answer first (and a c
 
 | You want to... | Read |
 |---|---|
+| Pick the model and flags for your GPU (16 / 24 / 32 GB, GB10, measured speeds) | [Choose a setup](docs/guides/choose-your-setup.md) |
 | Run on a Mac (Apple Silicon, Metal) | [Mac](docs/guides/mac.md) |
 | Download a model and add a drafter | [DFlash2 and MTP](docs/guides/speculative-decoding.md) |
 | Run MiniMax-M3.1-Flash or GLM-5.3-Flash on a DGX Spark / GB10 | [Big MoE models on one GB10](docs/guides/gb10-big-moe.md) |
