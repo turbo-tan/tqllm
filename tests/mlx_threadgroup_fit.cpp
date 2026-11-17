@@ -61,7 +61,8 @@ int main() {
     }
     std::mt19937 rng(55);
     {   // (1)
-        const int kh = 2, vh = 4, width = 2 * kh * 128 + vh * 128, hidden = 256;
+        // vh = 8: an input below 8 elements reaches a custom kernel as a `constant` buffer (MLX), which the ABF branch cannot read
+        const int kh = 2, vh = 8, width = 2 * kh * 128 + vh * 128, hidden = 256;
         auto prev = randn(rng, {3, width}, 1.0f), weights = randn(rng, {width, 4}, 0.5f), ab = randn(rng, {2 * vh, hidden}, 0.05f);
         auto bias = randn(rng, {vh}, 0.5f), rate = mx::negative(mx::abs(randn(rng, {vh}, 0.5f))), w = randn(rng, {128}, 1.0f);
         auto state = randn(rng, {1, vh, 128, 128}, 0.1f);
