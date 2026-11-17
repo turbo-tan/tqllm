@@ -119,6 +119,25 @@ positions to host memory, and time to first token at 128K rises from 134 s to 16
 | `--draft-window N` | GGUF value | drafter attention window over the context (0 = whole context) |
 | `--lookup L [--lookup-first K]` | off | prompt-lookup drafts (copies of earlier text) next to the tree; shares the verify budget |
 
+### Runtime LoRA adapters
+
+llama.cpp names and request field. Qwen3.5 / Qwen3.8 dense GGUF models (the verify path: any registered weight format,
+plain or rotated basis). Adapted matrices so far: `attn_output`, `ssm_out`, `ffn_down` (abliteration adapters, e.g. Heretic's
+o_proj / out_proj / down_proj exports); convert a PEFT adapter with llama.cpp's `convert_lora_to_gguf.py --outtype f32`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--lora FILE` | | load a LoRA adapter (repeatable; ids 0, 1, ... in order); y = W x + scale x alpha / rank x B (A x), the base weights unchanged |
+| `--lora-scaled FILE S` | | the same with its own start scale S |
+| `--lora-scale S` | 1 | start scale of the `--lora` adapters |
+| `--lora-init-without-apply` | off | load the adapters at scale 0: requests without `"lora"` run the base model (bit-identical to serving without `--lora`) |
+
+A request sets the scales for itself with `"lora": [{"id": 0, "scale": 1.0}]` (OpenAI body field, llama.cpp-compatible;
+adapters it does not list run at 0). `GET /lora-adapters` lists the adapters and their current default scales;
+`POST /lora-adapters` with `[{"id": 0, "scale": 0.5}]` changes the defaults for requests without the field. Each slot
+(`--np`) runs its own request's scales; a slot's kept prompt state is reused only by a request with the same scales.
+Changing a scale needs no graph recapture (the kernels read it from device memory); scale 0 skips the adapter kernels.
+
 ### KV cache and long context (TqCache)
 
 | Option | Default | What it does |

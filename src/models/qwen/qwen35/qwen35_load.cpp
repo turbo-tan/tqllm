@@ -240,6 +240,86 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     qsa_load(f);
 }
 
+// Runtime LoRA adapters (--lora): A in each matrix's input basis (a rotated format reads x rotated per block, so A x =
+// (A R^T)(R x): the rows of A take the same rotation as an activation), B with alpha / rank folded in
+void Qwen35Engine::load_lora() {
+    if (opt.lora.empty()) return;
+    if (!fmt_target) throw std::invalid_argument("--lora needs a quantized GGUF model (the verify path)");
+    if (cfg.moe || tp_) throw std::invalid_argument("--lora: dense single-GPU Qwen3.5 / 3.8 models only so far");
+    lora_n = int(opt.lora.size());
+    auto upload = [&](const void * h, size_t bytes) {
+        Buf d(bytes);
+        ck(cudaMemcpy(d.p, h, bytes, cudaMemcpyHostToDevice));
+        return d;
+    };
+    for (int i = 0; i < lora_n; ++i) {
+        const std::string & path = opt.lora[size_t(i)];
+        const LoraFile lf = lora_read(path);
+        int rlo = 1 << 30, rhi = 0, rotated = 0;
+        for (const auto & [name, t] : lf.tensors) {
+            int l = -1;
+            char kind[64] = {};
+            if (std::sscanf(name.c_str(), "blk.%d.%63[^.].weight", &l, kind) != 2 || l < 0 || l >= int(cfg.layers) ||
+                name != "blk." + std::to_string(l) + "." + kind + ".weight")
+                throw std::invalid_argument("--lora " + path + ": " + name + " is not a layer matrix of this model");
+            Layer & L = layer[size_t(l)];
+            const std::string k = kind;
+            Mat * m = k == "attn_output" ? &L.wo : k == "ssm_out" ? &L.w_out : k == "ffn_down" ? &L.w_down : nullptr;
+            if (!m)
+                throw std::invalid_argument("--lora " + path + ": " + name +
+                                            ": only attn_output, ssm_out and ffn_down adapters are supported so far");
+            if (!m->p) throw std::invalid_argument("--lora " + path + ": the model has no " + name);
+            if (t.rows != m->rows || t.cols != m->cols)
+                throw std::invalid_argument("--lora " + path + ": " + name + " is " + std::to_string(t.rows) + " x " +
+                                            std::to_string(t.cols) + ", the model's " + std::to_string(m->rows) + " x " +
+                                            std::to_string(m->cols));
+            if (t.rank > tqllm_cuda::kLoraMaxRank || t.cols % 2)
+                throw std::invalid_argument("--lora " + path + ": " + name + ": rank above " +
+                                            std::to_string(tqllm_cuda::kLoraMaxRank) + " or odd column count");
+            const Basis bs = m->fmt ? m->fmt->basis() : Basis::Plain;
+            std::vector<float> a = t.a, b = t.b;
+            const float f = lora_factor(lf.alpha, t.rank);
+            for (float & v : b) v *= f;
+            if (bs != Basis::Plain) {  // the engine's own input rotation on the rows of A (BF16 in, FP16 out), power-of-2 scaled
+                float mx = 0.f;
+                for (float v : a) mx = std::max(mx, std::fabs(v));
+                if (mx > 0.f) {
+                    int e = 0;
+                    std::frexp(mx, &e);
+                    const float up = std::ldexp(1.f, 8 - e), down = 1.f / up;  // max |a| x up in [128, 256)
+                    std::vector<bf16> hb(a.size());
+                    for (size_t j = 0; j < a.size(); ++j) hb[j] = __float2bfloat16(a[j] * up);
+                    Buf db = upload(hb.data(), hb.size() * 2), dh(a.size() * 2);
+                    prep_input(bs, db.as<bf16>(), dh.as<__half>(), t.cols, t.rank);
+                    std::vector<__half> hh(a.size());
+                    ck(cudaMemcpyAsync(hh.data(), dh.p, hh.size() * 2, cudaMemcpyDeviceToHost, stream));
+                    sync_ck();
+                    for (size_t j = 0; j < a.size(); ++j) a[j] = __half2float(hh[j]) * down;
+                }
+                ++rotated;
+            }
+            LoraPiece p;
+            p.adapter = i;
+            p.rank = t.rank;
+            p.a = upload(a.data(), a.size() * 4);
+            p.b = upload(b.data(), b.size() * 4);
+            lora_of[m].push_back(std::move(p));
+            rlo = std::min(rlo, t.rank), rhi = std::max(rhi, t.rank);
+            lora_cmax = std::max(lora_cmax, t.cols);
+        }
+        lora_rmax = std::max(lora_rmax, rhi);
+        std::fprintf(stderr, "tqllm: LoRA %d: %s, %zu matrices (%d in a rotated basis), rank %d%s%s, alpha %g, scale %g%s\n", i,
+                     path.c_str(), lf.tensors.size(), rotated, rlo, rlo == rhi ? "" : "..", rlo == rhi ? "" : std::to_string(rhi).c_str(),
+                     double(lf.alpha), double(opt.lora_init(size_t(i))), opt.lora_init_without_apply ? " (until a request sets it)" : "");
+    }
+    std::vector<float> init(static_cast<size_t>(lora_n));
+    for (int i = 0; i < lora_n; ++i) init[size_t(i)] = opt.lora_init(size_t(i));
+    lora_slot.assign(size_t(nslots), init);
+    std::vector<float> all;
+    for (int s = 0; s < nslots; ++s) all.insert(all.end(), init.begin(), init.end());
+    d_lscale = upload(all.data(), all.size() * 4);
+}
+
 // QSA indexers (tools/qsa_indexer_gguf.py + gguf_add.py): all full-attention layers or none
 void Qwen35Engine::qsa_load(const GgufFile & f) {
     using namespace tqllm_cuda;

@@ -48,6 +48,17 @@ struct EngineOptions {
     std::vector<std::string> inexact_patches;  // set by the plugin loader: applied patches not byte-identical to the built-in
     std::string hot_map;       // --hot-map FILE: MiniMax routing counts; the busiest experts are preloaded, the rest stay on disk
     bool native_mtp = false;   // --mtp: draft with the model's own MTP (nextn) head, no -md (text-only, greedy, --np 1; depth 4 by default)
+    // runtime LoRA adapters (llama.cpp names): --lora FILE / --lora-scaled FILE S (repeatable; ids 0, 1, ... in order),
+    // --lora-scale S (the scale of --lora adapters, 1), --lora-init-without-apply (every adapter starts at scale 0). A
+    // request's "lora": [{"id": 0, "scale": 1.0}] sets the scales for that request (unlisted adapters 0).
+    std::vector<std::string> lora;
+    std::vector<float> lora_scaled;  // per adapter: its --lora-scaled S, or NaN for --lora (lora_scale applies)
+    float lora_scale = 1.f;
+    bool lora_init_without_apply = false;
+    float lora_init(size_t i) const {  // the scale adapter i starts with
+        if (lora_init_without_apply) return 0.f;
+        return i < lora_scaled.size() && lora_scaled[i] == lora_scaled[i] ? lora_scaled[i] : lora_scale;
+    }
     std::string draft_vocab;   // --draft-vocab FILE: token ids of the drafter / MTP head vocabulary subset
     int draft_window = -1;     // --draft-window N: drafter attention window over the context (-1: the GGUF value, 0: whole context)
     int draft_retrieve = 0;    // --draft-retrieve C: C x 16 positions of the drafter window are far chunks it retrieves (one slot)

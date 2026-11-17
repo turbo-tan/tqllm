@@ -44,7 +44,7 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
     {  // weights the single-token path cannot read (TQ4, W4A16, ...): one-column verify + commit, the same
        // per-column arithmetic as verify(n) (tqverify then checks verify(n) against this chain)
         const Mat & probe = layer[lr_.lo].w_gu.p ? layer[lr_.lo].w_gu : layer[lr_.lo].w_down;
-        if (cfg.moe || tp_ || (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16)) {
+        if (cfg.moe || tp_ || lora_n || (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16)) {
             if (capture) throw std::runtime_error("hidden-state capture needs TQ3_4S / BF16 weights");
             uint32_t next = 0;
             verify(&id, 1, pos, &next);
@@ -521,7 +521,7 @@ void Qwen35Engine::st(const char * name) {
     stage_t = t;
 }
 
-void Qwen35Engine::mm_h(const Mat & m, bf16 * out, int n, Basis in) {
+void Qwen35Engine::mm_h_base(const Mat & m, bf16 * out, int n, Basis in) {
     if (m.type == GGML_BF16) {  // small BF16 matrices of W4A16 models (Gated DeltaNet b/a): input is un-rotated
         tqllm_cuda::h_to_bf16(v_xh.as<__half>(), v_xb.as<bf16>(), int64_t(n) * m.cols, stream);
         // fixed-order kernel, not cuBLAS: a column's result must not depend on the verify width
@@ -547,6 +547,41 @@ void Qwen35Engine::mm_h(const Mat & m, bf16 * out, int n, Basis in) {
     case PrefillPath::dequant: break;
     }
     gemm_rows(m, out, n, m.rows);
+}
+
+void Qwen35Engine::lora_mm(const Mat & m, bf16 * out, int n) {
+    const auto it = lora_of.find(&m);
+    if (it == lora_of.end() || !lora_now()) return;
+    const auto * xh = v_xh.as<__half>();
+    float * sc = d_lscale.as<float>();
+    for (const auto & p : it->second) {
+        const auto * a = p.a.as<float>();
+        const auto * b = p.b.as<float>();
+        if (segs.empty()) {
+            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh, out, n, m.rows, sc + size_t(active) * lora_n + p.adapter,
+                                   lora_t.as<float>(), stream);
+            continue;
+        }
+        for (const auto & g : segs)  // batched verify: each slot's columns with its own request's scale
+            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh + size_t(g.col0) * m.cols, out + size_t(g.col0) * m.rows,
+                                   g.n, m.rows, sc + size_t(g.slot) * lora_n + p.adapter, lora_t.as<float>(), stream);
+    }
+}
+
+void Qwen35Engine::set_lora(const std::vector<float> & scales) {
+    if (int(scales.size()) != lora_n)
+        throw std::invalid_argument("LoRA: " + std::to_string(scales.size()) + " scales for " + std::to_string(lora_n) + " adapters");
+    if (!lora_n) return;
+    auto & cur = lora_slot[size_t(active)];
+    if (cur == scales) return;
+    // the slot's kept prompt state (prompt cache, prefill ahead) was built with the old scales: not reused
+    if (pend_k) set_pending(0);
+    pc_drop();
+    pc_seq.clear();
+    cur = scales;
+    // pageable source on purpose: staged before cudaMemcpyAsync returns; verifies queued earlier keep the old scales
+    ck(cudaMemcpyAsync(d_lscale.as<float>() + size_t(active) * lora_n, cur.data(), size_t(lora_n) * 4, cudaMemcpyHostToDevice,
+                       stream));
 }
 
 void Qwen35Engine::calibrate_prefill() {
@@ -1670,6 +1705,7 @@ uint32_t Qwen35Engine::park_best(const std::vector<uint32_t> & prompt, int * whe
     for (size_t i = 0; i < park_sp_.size(); ++i) {
         const auto & sp = park_sp_[i];
         if (!sp.snap || park_->where(sp.conv) != int(i)) continue;
+        if (lora_n && sp.lora != lora_slot[size_t(active)]) continue;  // built with other LoRA scales
         const uint32_t n = pc_shared(sp.seq, false, sp.snap, prompt);
         if (n > best) { best = n; if (where) *where = int(i); }
     }
@@ -1701,6 +1737,7 @@ void Qwen35Engine::park_out() {
     sp.conv = pc_conv;
     sp.seq.assign(pc_seq.begin(), pc_seq.begin() + pc_snap);
     sp.snap = pc_snap;
+    sp.lora = lora_n ? lora_slot[size_t(active)] : std::vector<float>();
     sp.state = std::move(pc_host);
     pc_drop();
     pc_conv = 0;

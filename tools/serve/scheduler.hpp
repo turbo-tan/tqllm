@@ -268,6 +268,7 @@ private:
                 try {
                     model_.select_slot(int(s));
                     model_.set_sampling(job->req.temperature, job->req.top_p, job->req.top_k, job->req.seed, job->req.presence_penalty);
+                    if (!job->req.lora.empty()) model_.set_lora(job->req.lora);
                     model_.set_penalties(job->req.repeat_penalty, job->req.frequency_penalty);
                     model_.set_ignore_eos(job->req.ignore_eos);
                     model_.set_continuation(job->req.continuation);
