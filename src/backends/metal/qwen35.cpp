@@ -254,6 +254,7 @@ struct Qwen35::Impl {
         if(x.ndim()!=2 || x.shape(1)<=4096 || x.dtype()!=mx::float32 || rows_norm_fused==0)return norm(x,name);
         // TQ4 models: the FP16 copy is the rotated matrix-unit input (tq4_rotate_half in the same launch)
         const bool rot=!nax_tq4.empty();
+        if(rows_norm_fused<0 && !rms_norm_bf16_pair_runs(x.shape(1),rot,false)) {rows_norm_fused=0;return norm(x,name);}
         auto pair=rms_norm_bf16_pair(x,w,eps,rot);
         if(rows_norm_fused<0) {
             auto ref=rms_norm_bf16_pair_reference(x,w,eps);
@@ -271,6 +272,9 @@ struct Qwen35::Impl {
             auto s=add_bf(x,r);return {s,norm(s,name)};
         }
         const bool rot=!nax_tq4.empty();
+        if(rows_add_norm_fused<0 && !rms_norm_bf16_pair_runs(x.shape(1),rot,true)) {
+            rows_add_norm_fused=0;auto s=add_bf(x,r);return {s,norm(s,name)};
+        }
         auto got=rms_norm_bf16_pair_residual(x,r,w,eps,rot);
         if(rows_add_norm_fused<0) {
             auto ref=rms_norm_bf16_pair_residual_reference(x,r,w,eps);
@@ -286,6 +290,7 @@ struct Qwen35::Impl {
     mx::array norm_prefill(const mx::array& x,const std::string& name) {
         const auto& w=plain.at(name);
         if(!fused_on() || x.ndim()!=2 || x.shape(1)<=4096 || x.dtype()!=mx::float32 || norm_fused==0)return norm(x,name);
+        if(norm_fused<0 && !rms_norm_bf16_pair_runs(x.shape(1),false,false)) {norm_fused=0;return norm(x,name);}
         auto pair=rms_norm_bf16_pair(x,w,eps);
         if(norm_fused<0) {
             auto ref=rms_norm_bf16_pair_reference(x,w,eps);

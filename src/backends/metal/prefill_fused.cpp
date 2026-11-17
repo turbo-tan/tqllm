@@ -1,8 +1,10 @@
 #include "prefill_fused.hpp"
 #include "shape_constants.hpp"
+#include "threadgroup_fit.hpp"
 #include <mlx/compile.h>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -166,6 +168,20 @@ std::tuple<mx::array, mx::array, mx::array> rms_norm_bf16_pair_residual(const mx
                     {mx::float32, mx::float32, mx::float16}, {rows * 1024, 1, 1}, {1024, 1, 1}, {{"D", d}, {"ROT", rotate}}, std::nullopt, false,
                     mx::Device(mx::Device::gpu));
     return {o[0], o[1], o[2]};
+}
+
+bool rms_norm_bf16_pair_runs(int d, bool rotate, bool residual) {
+    const auto spec = std::to_string(d) + "," + std::to_string(int(rotate));
+    return fit_threadgroup(residual ? "rms norm + residual (BF16 pair)" : "rms norm (BF16 pair)", spec, {1024}, [&](int) {
+        const auto x = mx::zeros({1, d}, mx::float32), w = mx::zeros({d}, mx::float32);
+        if (residual) {
+            const auto o = rms_norm_bf16_pair_residual(x, x, w, 1e-6f, rotate);
+            mx::eval({std::get<0>(o), std::get<1>(o), std::get<2>(o)});
+        } else {
+            const auto o = rms_norm_bf16_pair(x, w, 1e-6f, rotate);
+            mx::eval({o.first, o.second});
+        }
+    }) == 1024;
 }
 
 mx::array swiglu_pack16_reference(const mx::array& gate_up) {
