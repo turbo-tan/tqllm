@@ -1,6 +1,14 @@
 #pragma once
 // Pure rules of the qwen35 engine (no CUDA), tested in tests/qwen35_rules.cpp.
+#include <array>
+#include <cstdint>
 namespace tqllm::qwen35 {
+// Host K/V tail: which of K / V a verify step copies back (stage plan [K bytes, V bytes, K offset, V offset]). With
+// nothing to copy the captured node is a 16-byte placeholder between ordinary allocations, and CUDA refuses to update it
+// to the mapped K/V (cudaGraphExecMemcpyNodeSetParams1D: invalid argument), so each kind needs its own graph.
+inline uint64_t stage_graph_kind(const std::array<int64_t, 4> & s) {
+    return uint64_t(s[0] > s[2]) | uint64_t(s[1] > s[3]) << 1;
+}
 // Columns one batched verify step may hold across slots (drafts per slot shrink as slots grow; the greedy output does not
 // depend on the draft length). GA10x GeForce: 16 (3090 c=4: 16 -> 283 / 198, 24 -> 281 / 173, 32 -> 249 / 138 tok/s).
 // GB10 (integrated Blackwell): 24 (11-06, TQ4_SX + DFlash2-TQ3, 8 requests total: full width 104.5, 24 -> 135.1, 16 -> 128.0,

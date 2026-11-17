@@ -77,6 +77,7 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 #include "layer_split.hpp"
 #include "../../../kv/prompt_park.hpp"
 #include "tp_comm.hpp"
+#include "qwen35_rules.hpp"
 namespace tqllm {
 namespace qwen35_detail {
 
@@ -697,6 +698,7 @@ private:
     template <class Body>
     cudaGraphExec_t cached_verify_graph(int family, uint64_t key, Body && body) {
         if (!kv_staged) return cached_graph(family, key, std::forward<Body>(body));
+        key = (key ^ tqllm::qwen35::stage_graph_kind(stage_plan())) * 1099511628211ull;
         cudaGraphExec_t e = glru.find(family, key);
         if (!e)
             e = glru.insert(
