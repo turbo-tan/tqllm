@@ -6,8 +6,8 @@ Find your GPU memory, pick the row for what you do most, and start `tqserve` wit
 buffers, what moves to system RAM) the memory fit sizes at start and logs. Numbers are decode tokens per second for one
 request, measured on the card named, with the build and date given under each table.
 
-Files: [YTan2000/Qwen3.8-27B-TQ](https://huggingface.co/YTan2000/Qwen3.8-27B-TQ) (TQ_XS / TQ_S / TQ_M / TQ_L, the `-QSA`
-files and `Qwen3.8-27B-DFlash2-TQ3.gguf`), [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
+Files: [YTan2000/Qwen3.8-27B-TQ](https://huggingface.co/YTan2000/Qwen3.8-27B-TQ) (TQ_XS / TQ_S / TQ_M / TQ_L, the `qsa/`
+files and `drafters/Qwen3.8-27B-DFlash2-TQ3.gguf`), [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
 
 ## Quick pick
 
@@ -26,10 +26,13 @@ Its output is the same as without it (greedy).
 ## 16 GB (RTX 5060 Ti 16 GB)
 
 ```sh
+hf download YTan2000/Qwen3.8-27B-TQ Qwen3.8-27B-TQ_XS.gguf qsa/Qwen3.8-27B-TQ_XS-QSA.gguf \
+  drafters/Qwen3.8-27B-DFlash2-TQ3.gguf --local-dir models
 # chats, code, documents up to about 64K tokens
-tqserve --model Qwen3.8-27B-TQ_XS.gguf -md Qwen3.8-27B-DFlash2-TQ3.gguf --kv tq3 --context 65536
+tqserve --model models/Qwen3.8-27B-TQ_XS.gguf -md models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf --kv tq3 --context 65536
 # documents of 100K-200K tokens (approximate attention past 48K keys)
-tqserve --model Qwen3.8-27B-TQ_XS-QSA.gguf -md Qwen3.8-27B-DFlash2-TQ3.gguf --kv tq3 --context 204800 --qsa-from 49152
+tqserve --model models/qsa/Qwen3.8-27B-TQ_XS-QSA.gguf -md models/drafters/Qwen3.8-27B-DFlash2-TQ3.gguf --kv tq3 \
+  --context 204800 --qsa-from 49152
 ```
 
 | setup | chats | 4K document | 16K document | 48K document | 123K document | 200K document |
