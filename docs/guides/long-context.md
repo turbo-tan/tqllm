@@ -8,7 +8,9 @@ Ask for more context than the GPU holds and the memory fit keeps the oldest KV p
 output is the same as with all KV on the GPU) instead of refusing the request. Reading that part over PCIe costs decode
 speed, so use it for prompts past what the GPU holds; below that, the default context is faster.
 
-RTX 5060 Ti 16 GB, Qwen3.8-27B-TQ_XS.gguf + DFlash2-TQ3, tq3 KV, decode tok/s. Default context: the memory fit caps the
+RTX 5060 Ti 16 GB, Qwen3.8-27B-TQ_XS.gguf + DFlash2-TQ3, tq3 KV, decode tok/s, measured on an earlier build (10-06). On the
+1.7.0 line (11-17, ab001fa9) the fit keeps 82,944 of the 204,800 positions in RAM and the 200K row decodes at 43.7;
+[Choose a setup](choose-your-setup.md) has the current 16 GB rows, including QSA at 109.5. Default context: the memory fit caps the
 context at 204,800 on this card and keeps all KV on the GPU. `--context 262144`: TqCache keeps the oldest positions in RAM.
 
 | prompt | default context (204,800, all KV on the GPU) | `--context 262144` (TqCache) |

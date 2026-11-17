@@ -5,6 +5,7 @@
 | Start here | Guide |
 |---|---|
 | Install, Docker, native build and tokenizer conversion | [Quick start](guides/quickstart.md) |
+| Pick the model and flags for your GPU, with measured speeds | [Choose a setup](guides/choose-your-setup.md) |
 | Observe prefill, decode and hardware on the API port | [Runtime monitor](MONITOR.md) |
 | Follow a recorded monitor walkthrough | [Monitor demo](demos/monitor/README.md) |
 | Run on a Mac (Apple Silicon, Metal) | [Mac](guides/mac.md) |
