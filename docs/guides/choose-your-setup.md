@@ -38,6 +38,7 @@ tqserve --model Qwen3.8-27B-TQ_XS-QSA.gguf -md Qwen3.8-27B-DFlash2-TQ3.gguf --kv
 | TQ_XS-QSA + DFlash2, `--kv tq3`, context 200K, QSA on | | | | | 124.1 | 109.5 |
 | same, QSA off (exact) | | | | | 100.4 | 35.4 |
 | TQ_XS + DFlash2, `--kv tq3`, context 200K (no QSA file) | | | | | | 43.7 |
+| TQ_M + DFlash2, `--kv tq3`, context 64K | 76-146 (mean 110) | 82.1 | 75.9 | 64.5 | | |
 | TQ_M, no drafter, `--kv tq3`, context 64K | 30.8 | 30.5 | 29.7 | 27.7 | | |
 | TQ_M, no drafter, `-ctk q8_0 -ctv q8_0`, context 64K | 30.8 | 30.3 | 29.4 | 8.1 | | |
 
