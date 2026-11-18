@@ -117,7 +117,7 @@ python3 $Q verify --out models/Qwen3.8-27B-TQV12.gguf --bf16 models/Qwen3.8-27B-
   --template models/Qwen3.8-27B-TQ_L.gguf
 ```
 
-It checks tensor names, order, shapes and types against `TQ_L` (TQ4 -> 302, the rest unchanged), the metadata, that
+It checks tensor names, order, shapes and types against `TQ_L` (TQ4 -> 305, the rest unchanged), the metadata, that
 copied tensors are byte-identical to `TQ_L`, that every TQV-12 tensor was written and decode-checked, that no block has
 a zero scale, and decodes sample rows of each TQV-12 tensor back to the original basis against the BF16 source. It ends
 with `ALL CHECKS PASSED`. On Qwen3.8-27B (48 s, 2.4 GB RAM):

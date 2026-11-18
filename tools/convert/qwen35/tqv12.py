@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 CODEBOOK_INC = REPO / "src/formats/weight/tqv12_codebook.inc"
 CODEBOOK_SHA256 = "63437d856ae6263846036efbeedb326bc20de93ee792d480ef9f5c67b0e1f3fc"  # of the 16,384 table bytes
 CODEBOOK_TAG = "tqv12-v1"  # GGUF tqllm.tqv.codebook
-GGUF_TYPE = 302
+GGUF_TYPE = 305
 BLOCK = 128
 BLOCK_BYTES = 66
 # The int8 table is the k-means codebook (unit-variance |N(0, I4)| samples) divided by this step and rounded; the step

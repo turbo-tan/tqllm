@@ -1,6 +1,5 @@
 // TQV-12 weight format (src/formats/weight/tqv.cpp / tqv.cu, docs/reference/formats.md) through the WeightFormat registry:
-// 1. GGUF: type 302 + tqllm.tqv.codebook = "tqv12-v1" reads as GGML_TQV12; another tag is refused; without the tag 302
-//    stays GSQ_Q2_0.
+// 1. GGUF: type 305 + tqllm.tqv.codebook = "tqv12-v1" reads as GGML_TQV12; another tag is refused; 302 stays GSQ_Q2_0
 // 2. dequant_h == the CPU reference (dequantize_host_rows) within 1 FP16 ulp, ragged row counts included.
 // 3. matvec (1..16 columns) against a double dot over the CPU reference; every kernel variant (row tiles, prefetch,
 //    persistent grid) and every column count give identical bits per column; matvec_f32 == matvec (BF16-rounded);
@@ -141,15 +140,18 @@ int main(int argc, char ** argv) {
     {
         const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp";
         std::vector<char> data(2 * 66, 0);
-        const auto a = tqllm::gguf_open(write_gguf(dir + "/tqv12_a.gguf", "tqllm.tqv.codebook", "tqv12-v1", 302, data));
-        check(a.tensors.at("w").type == tqllm::GGML_TQV12 && a.tensors.at("w").bytes == 132, "gguf: 302 + tqv12-v1 -> TQV12, 132 bytes");
+        const auto a = tqllm::gguf_open(write_gguf(dir + "/tqv12_a.gguf", "tqllm.tqv.codebook", "tqv12-v1", 305, data));
+        check(a.tensors.at("w").type == tqllm::GGML_TQV12 && a.tensors.at("w").bytes == 132, "gguf: 305 + tqv12-v1 -> TQV12, 132 bytes");
         bool refused = false;
-        try { tqllm::gguf_open(write_gguf(dir + "/tqv12_b.gguf", "tqllm.tqv.codebook", "tqv12-v2", 302, data)); } catch (const std::exception &) { refused = true; }
+        try { tqllm::gguf_open(write_gguf(dir + "/tqv12_b.gguf", "tqllm.tqv.codebook", "tqv12-v2", 305, data)); } catch (const std::exception &) { refused = true; }
         check(refused, "gguf: another codebook tag is refused");
         std::vector<char> gsq(256 / 64 * 18, 0);
-        const auto c = tqllm::gguf_open(write_gguf(dir + "/tqv12_c.gguf", nullptr, nullptr, 302, gsq));
-        check(c.tensors.at("w").type == tqllm::GGML_GSQ_Q2_0, "gguf: 302 without the tag stays GSQ_Q2_0");
-        std::remove((dir + "/tqv12_a.gguf").c_str()); std::remove((dir + "/tqv12_b.gguf").c_str()); std::remove((dir + "/tqv12_c.gguf").c_str());
+        const auto c = tqllm::gguf_open(write_gguf(dir + "/tqv12_c.gguf", "tqllm.tqv.codebook", "tqv12-v1", 302, gsq));
+        check(c.tensors.at("w").type == tqllm::GGML_GSQ_Q2_0, "gguf: 302 stays GSQ_Q2_0, also in a TQV-12 file");
+        bool untagged = false;
+        try { tqllm::gguf_open(write_gguf(dir + "/tqv12_d.gguf", nullptr, nullptr, 305, data)); } catch (const std::exception &) { untagged = true; }
+        check(untagged, "gguf: 305 without the tag is refused");
+        std::remove((dir + "/tqv12_a.gguf").c_str()); std::remove((dir + "/tqv12_b.gguf").c_str()); std::remove((dir + "/tqv12_c.gguf").c_str()); std::remove((dir + "/tqv12_d.gguf").c_str());
     }
     const tqllm::WeightFormat * fmt = tqllm::weight_format(tqllm::GGML_TQV12);
     check(fmt && fmt->basis() == tqllm::Basis::Tq4Rot128 && fmt->max_matvec_cols() == 16, "registry: TQV12 registered, TQ4 basis, 16 columns");

@@ -293,7 +293,7 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
     }
     f.n_kv = n_kv;
     f.kv_end = uint64_t(r.in.tellg());
-    // TQV-12 files (docs/reference/formats.md): tensor type 302 + the codebook tag; any other tag is a codebook this build does not have
+    // TQV-12 files (docs/reference/formats.md): tensor type 305 + the codebook tag; any other tag is a codebook this build does not have
     const auto tqv = f.kv.find("tqllm.tqv.codebook");
     const bool tqv12 = tqv != f.kv.end();
     if (tqv12 && tqv->second.str != "tqv12-v1")
@@ -314,7 +314,6 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
         t.type_header_offset = uint64_t(r.in.tellg());
         t.type = r.get<uint32_t>();
         if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
-        if (t.type == GGML_GSQ_Q2_0 && tqv12) t.type = GGML_TQV12;
         if (t.type == GGML_TQV12 && !tqv12) throw std::runtime_error("GGUF TQV-12 tensor " + name + " without tqllm.tqv.codebook");
         t.offset = r.get<uint64_t>();
         if (t.type == GGML_X3) {  // self-describing X3Record groups (the K can differ per expert): size from x3.bytes.<name>

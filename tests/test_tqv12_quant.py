@@ -4,7 +4,7 @@
   and has the documented sha256.
 - The rotation is the engine's: an emulation of tq4_rotate_h_k's butterfly gives the same vector, and it is orthogonal.
 - pack() -> decode() round-trips, and decode() matches a literal reading of the bit layout in docs/reference/formats.md.
-- skeleton on a tiny template / source pair: TQ4 -> type 302 with tqllm.tqv.codebook, other tensors copied, a BF16 matrix
+- skeleton on a tiny template / source pair: TQ4 -> type 305 with tqllm.tqv.codebook, other tensors copied, a BF16 matrix
   stored rotated in the template is written rotated; a template from another model is refused.
 - With PyTorch: H from a capture dump equals X^T X; quantize (vector GPTQ, CPU) beats nearest rounding on the calibration
   inputs and its blocks decode to the GPTQ weights; verify passes on the result and fails on a corrupted copy.
@@ -173,7 +173,7 @@ class Pipeline(unittest.TestCase):
         meta = {k.decode(): v for k, _, v in kv}
         self.assertEqual(meta["tqllm.tqv.codebook"], b"tqv12-v1")
         types = {n.decode(): t for n, _, t, *_ in tensors}
-        self.assertEqual(sorted(n for n, t in types.items() if t == 302),
+        self.assertEqual(sorted(n for n, t in types.items() if t == 305),
                          sorted(n for n in self.w if not n.endswith("ssm_alpha.weight")))
         plan = tq.load_plan(self.out)
         alpha = next(p for p in plan["tensors"] if p["name"] == "blk.0.ssm_alpha.weight")

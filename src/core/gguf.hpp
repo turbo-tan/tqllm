@@ -37,10 +37,8 @@ enum GgmlType : uint32_t {
     GGML_NVFP4G = 323,    // NVFP4 (modelopt) per 128 weights: F32 global (weight_scale_2), 8 E4M3 group scales, 64 B E2M1 (low = even)
     GGML_MXFP8 = 321,     // OCP MXFP8: per row cols E4M3, then the row's cols / 32 E8M0 scales (32 weights in 33 B)
     GGML_X3 = 320,        // X3 (EXL3 mul1 trellis): X3Record row groups of trellis / suh / svh (303 / 304 are TQ4S / TQ3S)
-    // TQV-12 (rotated 4-D vector codebook, 66 B per 128, docs/reference/formats.md). Files store it as type 302 together with the key
-    // tqllm.tqv.codebook = "tqv12-v1"; 302 is also GSQ_Q2_0 (minimax_convert), so the reader maps 302 to this id only
-    // when that key is present (gguf_open_shard).
-    GGML_TQV12 = 305,
+    GGML_TQV12 = 305,     // TQV-12 (rotated 4-D vector codebook, 66 B per 128, docs/reference/formats.md); valid only with the
+                          // key tqllm.tqv.codebook = "tqv12-v1" (gguf_open_shard)
 };
 
 

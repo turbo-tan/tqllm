@@ -8,7 +8,7 @@
 
 namespace tqllm::formats {
 namespace {
-// TQV-12 (docs/reference/formats.md; files: GGUF type 302 + tqllm.tqv.codebook = "tqv12-v1", which the GGUF reader maps to engine id
+// TQV-12 (docs/reference/formats.md; files: GGUF type 305 + tqllm.tqv.codebook = "tqv12-v1", the engine id
 // 305): TQ4's rotated basis, per 128 weights an FP16 scale + 32 groups of 4 weights, each a 12-bit index into the official
 // int8 codebook (tqv12_codebook.inc) + 4 sign bits; 66 bytes as TQ4. Split at load into codes [rows][cols / 2] (the file's
 // 16-byte units unchanged) and scales [rows][cols / 128], the TQ4 layout, so row ranges and the scale handling match TQ4.

@@ -42,7 +42,7 @@ file with the [TQV-12 guide](../guides/tqv12.md), which also lists the measureme
 
 | | |
 |---|---|
-| GGUF tensor type | 302, valid only together with the metadata key `tqllm.tqv.codebook = "tqv12-v1"` |
+| GGUF tensor type | 305, valid only together with the metadata key `tqllm.tqv.codebook = "tqv12-v1"` |
 | Block | 128 weights along the row (rows must be a multiple of 128): FP16 scale (2 B) + 4 units of 16 B |
 | Unit j (weights 32j .. 32j+31) | 4 little-endian uint32 x, y, z, w. x, y, z: a 96-bit stream (x = bits 0-31) of 8 12-bit codebook indices, group u (weights 4u .. 4u+3 of the unit) at bits 12u .. 12u+11. w: the 32 sign bits, weight 4u at bit 15-u, 4u+1 at 31-u, 4u+2 at 7-u, 4u+3 at 23-u (set = negative) |
 | Weight 4u + e | scale x table[index_u][e] x (sign ? -1 : +1), in the rotated basis |
@@ -56,9 +56,8 @@ definition, not the procedure (k-means does not reproduce bit for bit across lib
 compiled into the engine as `src/formats/weight/tqv12_codebook.inc`. Rounding the FP32 centroids to int8 costs 0.3 % in
 quantisation MSE; an int8 table lets the kernel keep it in shared memory and feed the products to integer-exact FP16 MMA.
 
-**Type 302 and the key.** tqLLM also reads type 302 as GSQ_Q2_0 (`tools/minimax_convert.cpp` writes it into MiniMax
-files). The reader maps 302 to TQV-12 (engine id 305) only when the file has `tqllm.tqv.codebook`; it refuses any value
-other than `tqv12-v1` (a future codebook gets a new tag), and a TQV-12 tensor without the key does not load.
+**Type 305 and the key.** A type-305 tensor loads only when the file has `tqllm.tqv.codebook = "tqv12-v1"`; the reader
+refuses any other value (a future codebook gets a new tag), and a type-305 tensor without the key does not load.
 
 **Reading a TQV-12 file.** Exactly as TQ4: the matrix input is rotated with the 128-point rotation, and the dense
 matrices beside TQV-12 matrices (`ssm_alpha` / `ssm_beta` in BF16) are stored pre-rotated. The quantiser takes every
