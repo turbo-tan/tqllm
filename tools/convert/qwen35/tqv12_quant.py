@@ -352,6 +352,30 @@ def cmd_capture(a, layers=None):
 
 
 # ---------------- quantize ----------------
+def role_damp(a, role):
+    """GPTQ dampening for an input role: --damp-role mix:0.1,gu:0.3,... overrides --damp"""
+    spec = getattr(a, "damp_role", None)
+    if spec:
+        m = dict(kv.split(":") for kv in spec.split(","))
+        bad = set(m) - set(ROLES)
+        if bad:
+            raise SystemExit(f"--damp-role: unknown role(s) {sorted(bad)} (roles: {', '.join(ROLES)})")
+        if role in m:
+            return float(m[role])
+    return a.damp
+
+
+def encoder_args(p):
+    p.add_argument("--damp-role", help="per input role GPTQ dampening, e.g. mix:0.1,gu:0.3,down:0.3,out:0.1 "
+                   "(held-out-tuned; the plain --damp applies to roles not listed)")
+    p.add_argument("--damp-form", choices=tqv12.DAMP_FORMS, default="mean",
+                   help="unit of the dampening: mean (GPTQ) or median of diag(H) (robust to massive activations)")
+    p.add_argument("--refit", action="store_true", help="closed-form block-scale refit inside GPTQ")
+    p.add_argument("--order", action="store_true", help="block act-order: 128-blocks in descending tr(H_bb)")
+    p.add_argument("--icm", type=int, default=0, help="local-search sweeps after GPTQ (0 = off)")
+    p.add_argument("--icm-damp", type=float, default=None, help="dampening of H inside ICM (default: the role's)")
+
+
 def cmd_quantize(a, layers=None):
     import torch  # noqa: PLC0415
     layers = layers or parse_layers(a.layers)
@@ -385,7 +409,12 @@ def cmd_quantize(a, layers=None):
             Wr = tqv12.rot_last(torch.cat(Ws, 0))
             del Ws
             t0 = time.time()
-            s, idx, neg, Q = tqv12.gptq(Wr, Hr, cb, damp=a.damp)
+            damp = role_damp(a, role)
+            s, idx, neg, Q = tqv12.gptq(Wr, Hr, cb, damp=damp, refit=getattr(a, "refit", False),
+                                        order=getattr(a, "order", False), damp_form=getattr(a, "damp_form", "mean"))
+            if getattr(a, "icm", 0):
+                Q = tqv12.icm(Wr, Hr, cb, s, idx, neg, sweeps=a.icm, damp=a.icm_damp if a.icm_damp is not None else damp,
+                              damp_form=getattr(a, "damp_form", "mean"))
             if Q.is_cuda:
                 torch.cuda.synchronize()
             tg = time.time() - t0
@@ -411,7 +440,9 @@ def cmd_quantize(a, layers=None):
                 if not exact:
                     raise SystemExit(f"{n}: the written blocks do not decode to the quantised weights")
                 plan["done"][n] = dict(rel_out_err=err, rel_w_mse=wmse, h_tokens=ntok, gptq_s=round(tg, 1),
-                                       decode_exact=exact)
+                                       decode_exact=exact, damp=damp, refit=bool(getattr(a, "refit", False)),
+                                       order=bool(getattr(a, "order", False)), icm=getattr(a, "icm", 0),
+                                       damp_form=getattr(a, "damp_form", "mean"))
                 log(f"L{L} {n} [{p['rows']}x{p['cols']}] output error {err:.5f}, weight MSE {wmse:.5f}, GPTQ {tg:.0f} s")
                 r0 = r1
             del s, idx, neg, Q, Wr, Hr
@@ -437,7 +468,9 @@ def cmd_run(a):
         chunk = todo[i:i + a.per_run]
         if not all((Path(a.dir) / f"L{L}_{r}.h32").exists() for L in chunk for r in ROLES):
             cmd_capture(a, chunk)
-        cmd_quantize(argparse.Namespace(out=a.out, bf16=a.bf16, hdir=a.dir, keep_h=False, damp=a.damp), chunk)
+        cmd_quantize(argparse.Namespace(out=a.out, bf16=a.bf16, hdir=a.dir, keep_h=False, damp=a.damp,
+                                        damp_role=a.damp_role, damp_form=a.damp_form, refit=a.refit, order=a.order, icm=a.icm,
+                                        icm_damp=a.icm_damp), chunk)
     log("all layers quantised; next: verify")
 
 
@@ -556,6 +589,7 @@ def main(argv=None):
     p.add_argument("--keep-h", action="store_true")
     p.add_argument("--damp", type=float, default=0.01)
     p.add_argument("--device", default="cuda", help="torch device (cpu: slow, for tests)")
+    encoder_args(p)
     p = sub.add_parser("run", help="capture + quantize every layer, PER_RUN layers per tqserve run (resumable)")
     capture_args(p)
     p.add_argument("--out", required=True)
@@ -563,6 +597,7 @@ def main(argv=None):
     p.add_argument("--layers", help="default: every layer with TQV-12 tensors")
     p.add_argument("--per-run", type=int, default=4)
     p.add_argument("--damp", type=float, default=0.01)
+    encoder_args(p)
     p = sub.add_parser("verify", help="check the finished file")
     p.add_argument("--out", required=True)
     p.add_argument("--bf16", required=True)

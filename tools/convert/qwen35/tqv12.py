@@ -224,19 +224,24 @@ def block_scale(w, cb):
     return best_s
 
 
-def gptq(W, H, cb, damp=0.01):
-    """Vector GPTQ (Frantar et al., 4 columns = one codebook group at a time) in the rotated basis.
-    W [N, K] float32 (rotated weights), H [K, K] float32 (rotated, undamped) on one device.
-    Returns scales fp16 [N, K/128], idx int32 [N, K/4], neg bool [N, K], Q float32 [N, K] (the decoded weights)."""
+DAMP_FORMS = ("mean", "median")
+
+
+def _damped(H, damp, form="mean"):
+    """H + damp * m * I with m the mean (GPTQ's choice) or the median of diag(H). The median is robust to the few
+    massive-activation channels that dominate the mean of some inputs (attention q/k/v of early layers)."""
     torch = _torch()
-    N, K = W.shape
-    assert K % BLOCK == 0
-    W = W.clone()
     H = H.clone()
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
-    W[:, dead] = 0
-    H += damp * torch.mean(torch.diag(H)) * torch.eye(K, device=H.device, dtype=H.dtype)
+    m = torch.median(torch.diag(H)) if form == "median" else torch.mean(torch.diag(H))
+    H += damp * m * torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+    return H, dead
+
+
+def _chol_u(H):
+    """upper Cholesky factor of H^-1 (H damped)"""
+    torch = _torch()
     L, info = torch.linalg.cholesky_ex(H)
     if info.item() != 0:
         L = torch.linalg.cholesky(H.double()).float()
@@ -245,35 +250,148 @@ def gptq(W, H, cb, damp=0.01):
     U, info = torch.linalg.cholesky_ex(Hinv, upper=True)
     if info.item() != 0:
         U = torch.linalg.cholesky(Hinv.double(), upper=True).float()
-    del Hinv, H
+    return U
+
+
+def gptq(W, H, cb, damp=0.01, refit=False, order=False, damp_form="mean"):
+    """Vector GPTQ (Frantar et al., 4 columns = one codebook group at a time) in the rotated basis.
+    W [N, K] float32 (rotated weights), H [K, K] float32 (rotated, undamped) on one device.
+    Encoder options (the stored format is unchanged; the defaults reproduce the PR #56 encoder exactly):
+      refit  after a 128-block's codes are chosen, refit its FP16 scale in closed form under GPTQ's effective block
+             metric (U_bb^T U_bb)^-1 and propagate the block's exact residual
+      damp_form  "mean" (GPTQ) or "median" of diag(H) as the unit of `damp`
+      order  process the 128-blocks in descending tr(H_bb) ("block act-order"; 4-groups and scales stay intact)
+    Returns scales fp16 [N, K/128], idx int32 [N, K/4], neg bool [N, K], Q float32 [N, K] (the decoded weights)."""
+    torch = _torch()
+    N, K = W.shape
+    assert K % BLOCK == 0
+    nb = K // BLOCK
+    W = W.clone()
+    H, dead = _damped(H, damp, damp_form)
+    W[:, dead] = 0
+    if order:
+        bo = torch.diag(H).reshape(nb, BLOCK).sum(1).argsort(descending=True)
+        perm = (bo[:, None] * BLOCK + torch.arange(BLOCK, device=H.device)).reshape(-1)
+        W = W[:, perm].contiguous()
+        H = H[perm][:, perm].contiguous()
+    U = _chol_u(H)
+    del H
     Ad = torch.linalg.inv(torch.stack([U[i:i + 4, i:i + 4] for i in range(0, K, 4)]).double()).float()  # 4x4 blocks
-    scales = torch.empty(N, K // BLOCK, dtype=torch.float16, device=W.device)
+    scales = torch.empty(N, nb, dtype=torch.float16, device=W.device)
     idx = torch.empty(N, K // 4, dtype=torch.int32, device=W.device)
     Q = torch.empty_like(W)
     neg = torch.empty(N, K, dtype=torch.bool, device=W.device)
     C = cb.C
     for i1 in range(0, K, BLOCK):
         i2 = i1 + BLOCK
-        W1 = W[:, i1:i2].clone()
+        W0 = W[:, i1:i2].clone()
+        W1 = W0.clone()
         E1 = torch.empty_like(W1)
         Ui = U[i1:i2, i1:i2]
         s = block_scale(W1, cb)
-        scales[:, i1 // BLOCK] = s.half()
         sc = s[:, None]
+        cd = torch.empty_like(W1)  # signed codewords (grid units)
         for i in range(0, BLOCK, 4):
             w = W1[:, i:i + 4]
             ix, _ = cb.nearest(w.abs() / sc)
             ng = w < 0
-            q = C[ix] * torch.where(ng, -1.0, 1.0) * sc
+            c = C[ix] * torch.where(ng, -1.0, 1.0)
+            q = c * sc
             idx[:, (i1 + i) // 4] = ix
             neg[:, i1 + i:i1 + i + 4] = ng
-            Q[:, i1 + i:i1 + i + 4] = q
+            cd[:, i:i + 4] = c
             e = (w - q) @ Ad[(i1 + i) // 4]
             W1[:, i:] -= e @ Ui[i:i + 4, i:]
             E1[:, i:i + 4] = e
+        if refit:
+            M = torch.cholesky_inverse(Ui, upper=True)  # (Ui^T Ui)^-1
+            cM = cd @ M
+            num = (cM * W0).sum(1)
+            den = (cM * cd).sum(1)
+            s2 = (num / den.clamp_min(1e-30)).half().float()
+            s = torch.where((den > 1e-20) & (s2 > 0) & torch.isfinite(s2), s2, s)
+            sc = s[:, None]
+            E1 = torch.linalg.solve_triangular(Ui, W0 - cd * sc, upper=True, left=False)
+        scales[:, i1 // BLOCK] = s.half()
+        Q[:, i1:i2] = cd * sc
         if i2 < K:
             W[:, i2:] -= E1 @ U[i1:i2, i2:]
+    if order:
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(K, device=perm.device)
+        binv = torch.empty_like(bo)
+        binv[bo] = torch.arange(nb, device=bo.device)
+        ginv = inv.reshape(-1, 4)[:, 0] // 4
+        Q, neg = Q[:, inv].contiguous(), neg[:, inv].contiguous()
+        scales, idx = scales[:, binv].contiguous(), idx[:, ginv].contiguous()
     return scales, idx, neg, Q
+
+
+_KNN = {}
+
+
+def icm(W, H, cb, scales, idx, neg, sweeps=2, damp=0.1, M=32, damp_form="mean"):
+    """local search after GPTQ (iterated conditional modes: coordinate descent over the 4-groups) on
+    (W - Q) H_d (W - Q)^T, H_d = H damped by `damp` (the regulariser against calibration noise): per 4-group, move to
+    the best of the codeword nearest to the group's unconstrained optimum and its M-1 codebook neighbours (signs of the
+    optimum), then a closed-form FP16 refit of every block scale. Rows are independent and run in parallel.
+    In-place on scales / idx / neg; returns Q (decoded, exactly what the file decodes to)."""
+    torch = _torch()
+    N, K = W.shape
+    nb = K // BLOCK
+    C = cb.C
+    if M not in _KNN:
+        _KNN[M] = torch.cdist(C, C).topk(M, largest=False).indices
+    nn = _KNN[M]
+    H, _ = _damped(H, damp, damp_form)
+    sgn = torch.where(neg, -1.0, 1.0)
+    codes = (C[idx.long()].reshape(N, K) * sgn).contiguous()
+    sf = scales.float()
+    S = sf.repeat_interleave(BLOCK, 1)
+    Q = codes * S
+    R = (W - Q) @ H
+    Hgg = torch.stack([H[i:i + 4, i:i + 4] for i in range(0, K, 4)])
+    Hgi = torch.linalg.inv(Hgg.double()).float()
+    ar = torch.arange(N, device=W.device)
+    for _ in range(sweeps):
+        for gi in range(K // 4):
+            i = 4 * gi
+            s = S[:, i]
+            q = Q[:, i:i + 4]
+            tg = (q + R[:, i:i + 4] @ Hgi[gi]) / s[:, None]
+            ix, _ = cb.nearest(tg.abs())
+            cand = nn[ix.long()]
+            sg = torch.where(tg < 0, -1.0, 1.0)
+            cv = torch.cat([codes[:, None, i:i + 4], C[cand] * sg[:, None, :]], 1)
+            dq = cv * s[:, None, None] - q[:, None, :]
+            dE = -2 * (dq * R[:, None, i:i + 4]).sum(-1) + ((dq @ Hgg[gi]) * dq).sum(-1)
+            j = dE.argmin(1)
+            ok = dE[ar, j] < 0
+            if not bool(ok.any()):
+                continue
+            jj = torch.where(ok, j, torch.zeros_like(j))
+            delta = dq[ar, jj]
+            codes[:, i:i + 4] = cv[ar, jj]
+            newix = cand[ar, (jj - 1).clamp_min(0)].int()
+            idx[:, gi] = torch.where(ok, newix, idx[:, gi])
+            neg[:, i:i + 4] = torch.where(ok[:, None], sg < 0, neg[:, i:i + 4])
+            Q[:, i:i + 4] += delta
+            R -= delta @ H[i:i + 4, :]
+        for b in range(nb):
+            i1, i2 = b * BLOCK, (b + 1) * BLOCK
+            c = codes[:, i1:i2]
+            Hb = H[i1:i2, i1:i2]
+            snew = (sf[:, b] + (c * R[:, i1:i2]).sum(1) / ((c @ Hb) * c).sum(1).clamp_min(1e-30)).half().float()
+            snew = torch.where((snew > 0) & torch.isfinite(snew), snew, sf[:, b])
+            dq = c * (snew - sf[:, b])[:, None]
+            ok = (-2 * (dq * R[:, i1:i2]).sum(1) + ((dq @ Hb) * dq).sum(1)) < 0
+            dq = torch.where(ok[:, None], dq, torch.zeros_like(dq))
+            sf[:, b] = torch.where(ok, snew, sf[:, b])
+            Q[:, i1:i2] += dq
+            R -= dq @ H[i1:i2, :]
+        S = sf.repeat_interleave(BLOCK, 1)
+    scales.copy_(sf.half())
+    return codes * S
 
 
 def rel_err(Wq, W, H):
