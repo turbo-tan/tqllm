@@ -20,6 +20,8 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Window GEMV design for X3 decode (one decode per tile into the mma, no grid barrier) | TRUSS (trellis-kernel) |
 | GPTQ (Hessian-based error-compensating rounding; vector variant in the TQV-12 quantiser) | Frantar, Ashkboos, Hoefler, Alistarh, [GPTQ](https://github.com/IST-DASLab/gptq) ([arXiv 2210.17323](https://arxiv.org/abs/2210.17323)) |
 | Incoherence by Hadamard rotation plus vector codebooks for weights, the idea behind TQV-12 (our codebook, layout and kernels) | Tseng, Chee, Sun, Kuleshov, De Sa, QuIP# ([arXiv 2402.04396](https://arxiv.org/abs/2402.04396)) |
+| Bitshift trellis code with computed (table-free) codes, incoherence processing and BlockLDLQ, demonstrated on Llama 2 / 3: the method behind TQT (our c2 code, 18-bit window, layout, encoder and kernels) | Tseng, Sun, Hou, De Sa, QTIP ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235)) |
+| Trellis weight types in a llama.cpp-family engine (IQ2_KT / IQ3_KT / IQ4_KT), prior engine implementation of QTIP-style weights | Iwan Kawrakow, [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) |
 | FlashAttention tiling | Tri Dao et al., [flash-attention](https://github.com/Dao-AILab/flash-attention) |
 | Speculative sampling | Leviathan, Kalman, Matias ([arXiv 2211.17192](https://arxiv.org/abs/2211.17192)); Chen et al. ([arXiv 2302.01318](https://arxiv.org/abs/2302.01318)) |
 | Token-tree verification (our hybrid Gated DeltaNet tree kernels build on it) | SpecInfer, Miao et al. ([arXiv 2305.09781](https://arxiv.org/abs/2305.09781)); [Medusa](https://github.com/FasterDecoding/Medusa), Cai et al.; [EAGLE](https://github.com/SafeAILab/EAGLE), Li et al. |

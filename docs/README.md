@@ -16,6 +16,7 @@
 | Serve contextual embeddings (pplx-embed-v2-context, `POST /v1/embeddings`) | [Embeddings](guides/embeddings.md) |
 | Choose model weight formats | [Formats](reference/formats.md), [illustrated](reference/formats.html) |
 | Make a TQV-12 model (vector-codebook GPTQ, TQ4's size) | [TQV-12](guides/tqv12.md) |
+| Make a TQT model (trellis code, TQ4's size, most accurate at 4.125 bpw) | [TQT](guides/tqt.md) |
 | Configure serving, sampling and memory | [Options](reference/options.md) |
 | Reproduce performance measurements | [Benchmarks](BENCHMARKS.md) |
 | Understand source layout | [Architecture](ARCHITECTURE.md) |
