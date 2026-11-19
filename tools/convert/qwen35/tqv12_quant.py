@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""TQV-12 quantiser for Qwen3.5 / Qwen3.8 dense models (qwen35 GGUF): BF16 GGUF + a stock TQ file of the same model as
-the layout template + calibration text -> a TQV-12 GGUF that tqserve loads. Step by step: docs/guides/tqv12.md.
+"""TQV-12 / TQT quantiser for Qwen3.5 / Qwen3.8 dense models (qwen35 GGUF): BF16 GGUF + a stock TQ file of the same
+model as the layout template + calibration text -> a TQV-12 (or, with skeleton --format tqt, a TQT trellis-code) GGUF
+that tqserve loads. Step by step: docs/guides/tqv12.md (TQT: docs/guides/tqt.md).
 
   prompts    calibration prompts from text files
   skeleton   the output file with the template's tensor list and metadata: every TQ4 tensor becomes TQV-12 (written
@@ -27,6 +28,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1]))  # tools/: gguf_truncate (GGUF header reader / writer)
+import tqt  # noqa: E402
 import tqv12  # noqa: E402
 from gguf_truncate import T_STRING, read_header, w_string, w_value  # noqa: E402
 
@@ -60,7 +62,7 @@ def layer_spec(layers):
 # ---------------- GGUF helpers ----------------
 def block_layout(typ):
     """(weights, bytes) per block of a GGUF type, tqLLM's own ids included"""
-    if typ in (TQ4, tqv12.GGUF_TYPE):
+    if typ in (TQ4, tqv12.GGUF_TYPE, tqt.GGUF_TYPE):
         return 128, 66
     if typ == 301:  # TQ3
         return 128, 50
@@ -154,6 +156,17 @@ def tqv_tensors(plan):
     return out
 
 
+# ---------------- formats ----------------
+FORMATS = {  # skeleton --format: GGUF type, metadata key = tag (the engine refuses the type without it)
+    "tqv12": dict(type=tqv12.GGUF_TYPE, key="tqllm.tqv.codebook", tag=tqv12.CODEBOOK_TAG, label="TQV-12"),
+    "tqt": dict(type=tqt.GGUF_TYPE, key=tqt.CODE_KEY, tag=tqt.CODE_TAG, label="TQT"),
+}
+
+
+def plan_format(plan):
+    return plan.get("format", "tqv12")
+
+
 # ---------------- prompts ----------------
 def cmd_prompts(a):
     texts = [Path(t).read_text(errors="replace") for t in a.text]
@@ -176,14 +189,15 @@ def cmd_prompts(a):
 def cmd_skeleton(a):
     kv, tensors, align = read_header(a.template)
     src = Source(a.bf16)
-    kv = [list(e) for e in kv if e[0] != b"tqllm.tqv.codebook"]
+    fmt = FORMATS[a.format]
+    kv = [list(e) for e in kv if e[0] not in (b"tqllm.tqv.codebook", tqt.CODE_KEY.encode())]
     name = (a.name or Path(a.out).stem).encode()
     if not any(e[0] == b"general.name" for e in kv):
         kv.append([b"general.name", T_STRING, name])
     for e in kv:
         if e[0] == b"general.name":
             e[1], e[2] = T_STRING, name
-    kv.append([b"tqllm.tqv.codebook", T_STRING, tqv12.CODEBOOK_TAG.encode()])
+    kv.append([fmt["key"].encode(), T_STRING, fmt["tag"].encode()])
     plan, report, bad = [], {}, []
     for tname, dims, typ, _f, start, _size in tensors:
         n = tname.decode()
@@ -197,7 +211,7 @@ def cmd_skeleton(a):
         if typ == TQ4:
             if cols % tqv12.BLOCK:
                 raise SystemExit(f"{n}: row length {cols} is not a multiple of 128")
-            e.update(type=tqv12.GGUF_TYPE, kind="tqv")
+            e.update(type=fmt["type"], kind="tqv")
         elif typ == BF16 and len(dims) == 2:  # dense matrices beside TQ ones: stored in the input basis the template uses
             e.update(type=typ, kind="bf16", src=start)
         else:
@@ -252,8 +266,9 @@ def cmd_skeleton(a):
             o.write(data)
     nq = sum(p["kind"] == "tqv" for p in plan)
     nrot = sum(p.get("rotated", False) for p in plan)
-    save_plan(a.out, dict(tensors=plan, total=total, template=str(a.template), source=str(a.bf16), report=report, done={}))
-    log(f"wrote {a.out} ({total / 1e9:.2f} GB): {nq} TQV-12 tensors to quantise, {len(plan) - nq} written "
+    save_plan(a.out, dict(tensors=plan, total=total, template=str(a.template), source=str(a.bf16), report=report, done={},
+                          format=a.format))
+    log(f"wrote {a.out} ({total / 1e9:.2f} GB): {nq} {fmt['label']} tensors to quantise, {len(plan) - nq} written "
         f"({nrot} BF16 matrices rotated like the template)")
     if bad:
         raise SystemExit("tensors that do not match the BF16 source (template from another model?): " + ", ".join(bad))
@@ -374,6 +389,8 @@ def encoder_args(p):
     p.add_argument("--order", action="store_true", help="block act-order: 128-blocks in descending tr(H_bb)")
     p.add_argument("--icm", type=int, default=0, help="local-search sweeps after GPTQ (0 = off)")
     p.add_argument("--icm-damp", type=float, default=None, help="dampening of H inside ICM (default: the role's)")
+    p.add_argument("--tqt-scales", type=int, default=3, help="TQT: scale candidates per block (1..5; each is one more "
+                   "Viterbi pass: RTX 3090 Qwen3.8-27B layer 87 / 173 / 259 s at 1 / 2 / 3)")
 
 
 def cmd_quantize(a, layers=None):
@@ -384,7 +401,8 @@ def cmd_quantize(a, layers=None):
     groups = tqv_tensors(plan)
     src = Source(a.bf16)
     dev = getattr(a, "device", "cuda")
-    cb = tqv12.Codebook(dev)
+    use_tqt = plan_format(plan) == "tqt"
+    cb = None if use_tqt else tqv12.Codebook(dev)
     fo = open(a.out, "r+b")
     for L in layers:
         t_l = time.time()
@@ -410,22 +428,28 @@ def cmd_quantize(a, layers=None):
             del Ws
             t0 = time.time()
             damp = role_damp(a, role)
-            s, idx, neg, Q = tqv12.gptq(Wr, Hr, cb, damp=damp, refit=getattr(a, "refit", False),
-                                        order=getattr(a, "order", False), damp_form=getattr(a, "damp_form", "mean"))
-            if getattr(a, "icm", 0):
-                Q = tqv12.icm(Wr, Hr, cb, s, idx, neg, sweeps=a.icm, damp=a.icm_damp if a.icm_damp is not None else damp,
-                              damp_form=getattr(a, "damp_form", "mean"))
+            if use_tqt:
+                s, st, Q = tqt.gptq(Wr, Hr, damp=damp, gammas=tqt.gammas(getattr(a, "tqt_scales", 3)),
+                                    damp_form=getattr(a, "damp_form", "mean"), order=getattr(a, "order", False),
+                                    refit=getattr(a, "refit", False))
+                s_np, st_np = s.cpu().numpy(), st.cpu().numpy()
+            else:
+                s, idx, neg, Q = tqv12.gptq(Wr, Hr, cb, damp=damp, refit=getattr(a, "refit", False),
+                                            order=getattr(a, "order", False), damp_form=getattr(a, "damp_form", "mean"))
+                if getattr(a, "icm", 0):
+                    Q = tqv12.icm(Wr, Hr, cb, s, idx, neg, sweeps=a.icm, damp=a.icm_damp if a.icm_damp is not None else damp,
+                                  damp_form=getattr(a, "damp_form", "mean"))
+                s_np, idx_np, neg_np = s.cpu().numpy(), idx.cpu().numpy(), neg.cpu().numpy()
             if Q.is_cuda:
                 torch.cuda.synchronize()
             tg = time.time() - t0
-            s_np, idx_np, neg_np = s.cpu().numpy(), idx.cpu().numpy(), neg.cpu().numpy()
             r0 = 0
             for n in names:
                 p = by_name[n]
                 r1 = r0 + p["rows"]
                 err = tqv12.rel_err(Q[r0:r1], Wr[r0:r1], Hr)
                 wmse = float(((Q[r0:r1] - Wr[r0:r1]) ** 2).sum() / (Wr[r0:r1] ** 2).sum())
-                raw = tqv12.pack(s_np[r0:r1], idx_np[r0:r1], neg_np[r0:r1])
+                raw = tqt.pack(s_np[r0:r1], st_np[r0:r1]) if use_tqt else tqv12.pack(s_np[r0:r1], idx_np[r0:r1], neg_np[r0:r1])
                 assert raw.nbytes == p["nbytes"], (n, raw.nbytes, p["nbytes"])
                 fo.seek(p["offset"])
                 fo.write(raw.tobytes())
@@ -435,7 +459,10 @@ def cmd_quantize(a, layers=None):
                 rb = p["cols"] // tqv12.BLOCK * tqv12.BLOCK_BYTES
                 fo.seek(p["offset"])
                 back = np.frombuffer(fo.read(p["nbytes"]), np.uint8).reshape(p["rows"], rb)
-                dec = tqv12.decode(back[rs].tobytes(), len(rs), p["cols"], cb.table)
+                if use_tqt:
+                    dec = tqt.decode(back[rs].tobytes(), len(rs), p["cols"])
+                else:
+                    dec = tqv12.decode(back[rs].tobytes(), len(rs), p["cols"], cb.table)
                 exact = bool(np.array_equal(dec, Q[r0:r1][torch.from_numpy(rs).to(dev)].cpu().numpy()))
                 if not exact:
                     raise SystemExit(f"{n}: the written blocks do not decode to the quantised weights")
@@ -445,7 +472,7 @@ def cmd_quantize(a, layers=None):
                                        damp_form=getattr(a, "damp_form", "mean"))
                 log(f"L{L} {n} [{p['rows']}x{p['cols']}] output error {err:.5f}, weight MSE {wmse:.5f}, GPTQ {tg:.0f} s")
                 r0 = r1
-            del s, idx, neg, Q, Wr, Hr
+            del s, Q, Wr, Hr
             if dev != "cpu":
                 torch.cuda.empty_cache()
             save_plan(a.out, plan)
@@ -470,7 +497,7 @@ def cmd_run(a):
             cmd_capture(a, chunk)
         cmd_quantize(argparse.Namespace(out=a.out, bf16=a.bf16, hdir=a.dir, keep_h=False, damp=a.damp,
                                         damp_role=a.damp_role, damp_form=a.damp_form, refit=a.refit, order=a.order, icm=a.icm,
-                                        icm_damp=a.icm_damp), chunk)
+                                        icm_damp=a.icm_damp, tqt_scales=a.tqt_scales), chunk)
     log("all layers quantised; next: verify")
 
 
@@ -487,12 +514,14 @@ def cmd_verify(a):
     kv_o, t_o, _ = read_header(a.out)
     kv_t, t_t, _ = read_header(a.template)
     src = Source(a.bf16)
-    table = tqv12.load_codebook()
+    fmt = FORMATS[plan_format(plan)]
+    use_tqt = plan_format(plan) == "tqt"
+    table = None if use_tqt else tqv12.load_codebook()
     if len(t_o) != len(t_t):
         fail(f"{len(t_o)} tensors, template {len(t_t)}")
     meta = {k.decode(): v for k, _, v in kv_o}
-    if meta.get("tqllm.tqv.codebook") != tqv12.CODEBOOK_TAG.encode():
-        fail("tqllm.tqv.codebook is not", tqv12.CODEBOOK_TAG)
+    if meta.get(fmt["key"]) != fmt["tag"].encode():
+        fail(fmt["key"], "is not", fmt["tag"])
     tmeta = {k.decode(): v for k, _, v in kv_t}
     for k in tmeta:
         if k not in meta:
@@ -511,13 +540,13 @@ def cmd_verify(a):
         tdims, ttyp, tf, tstart = t_by_name[n]
         if list(dims) != list(tdims):
             fail("shape", n)
-        if typ != (tqv12.GGUF_TYPE if ttyp == TQ4 else ttyp):
+        if typ != (fmt["type"] if ttyp == TQ4 else ttyp):
             fail("type", n, typ, ttyp)
             continue
         p = by_name[n]
         fo.seek(start)
         raw = fo.read(p["nbytes"])
-        if typ == tqv12.GGUF_TYPE:
+        if typ == fmt["type"]:
             rec = plan["done"].get(n)
             if not rec or not rec.get("decode_exact"):
                 fail("not quantised:", n)
@@ -527,7 +556,7 @@ def cmd_verify(a):
             if (sc == 0).any() or not np.isfinite(sc).all():
                 fail("zero or non-finite scales:", n, int((sc == 0).sum()))
             rs = sample_rows(p["rows"], 16)
-            dec = tqv12.decode(b[rs].tobytes(), len(rs), p["cols"], table)
+            dec = tqt.decode(b[rs].tobytes(), len(rs), p["cols"]) if use_tqt else tqv12.decode(b[rs].tobytes(), len(rs), p["cols"], table)
             back = (dec.reshape(len(rs), -1, 128) @ tqv12.rot_matrix_np()).reshape(len(rs), p["cols"])  # un-rotate
             e = rel(back, src.rows(n, rs))
             errs.append(e)
@@ -545,9 +574,9 @@ def cmd_verify(a):
                 fail("bytes differ from the template:", n)
             ncopy += 1
     nq = len(errs)
-    print(f"tensors: {len(t_o)} (TQV-12 {nq}, byte-identical to the template {ncopy}, BF16 from the source {nrot})")
+    print(f"tensors: {len(t_o)} ({fmt['label']} {nq}, byte-identical to the template {ncopy}, BF16 from the source {nrot})")
     if errs:
-        print(f"TQV-12 decoded and un-rotated vs the BF16 source, relative RMS: mean {np.mean(errs):.4f} "
+        print(f"{fmt['label']} decoded and un-rotated vs the BF16 source, relative RMS: mean {np.mean(errs):.4f} "
               f"min {np.min(errs):.4f} max {np.max(errs):.4f}")
         out_err = [r["rel_out_err"] for r in plan["done"].values()]
         print(f"GPTQ relative output error on the calibration inputs: mean {np.mean(out_err):.5f} max {np.max(out_err):.5f}")
@@ -568,6 +597,7 @@ def main(argv=None):
     p.add_argument("--template", required=True, help="stock TQ file of the same model (Qwen3.8-27B-TQ_L.gguf)")
     p.add_argument("--out", required=True)
     p.add_argument("--name", help="general.name (default: the output file name)")
+    p.add_argument("--format", choices=sorted(FORMATS), default="tqv12", help="TQ4 tensors become this format")
 
     def capture_args(p):
         p.add_argument("--tqserve", required=True, help="tqserve binary of this tree")
@@ -588,7 +618,7 @@ def main(argv=None):
     p.add_argument("--layers", required=True)
     p.add_argument("--keep-h", action="store_true")
     p.add_argument("--damp", type=float, default=0.01)
-    p.add_argument("--device", default="cuda", help="torch device (cpu: slow, for tests)")
+    p.add_argument("--device", default="cuda", help="torch device (cpu: slow, for tests; not for TQT)")
     encoder_args(p)
     p = sub.add_parser("run", help="capture + quantize every layer, PER_RUN layers per tqserve run (resumable)")
     capture_args(p)
