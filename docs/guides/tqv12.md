@@ -164,6 +164,32 @@ RTX 3090, one session, same build:
   drafter TQV-12 decodes within 0.6 % of TQ4; with the drafter the numbers move with the acceptance, which changes
   because the two files generate different text (TQV-12 is not token-identical to TQ_L).
 
+## Encoder options: a better TQV-12 file, same format
+
+Step 5 above uses plain GPTQ (damping 0.01), the encoder the numbers in the table come from. Five options of
+`quantize` / `run` lower the error on text other than the calibration set without changing the file format (same type,
+codebook and decoder; without them the encoder is unchanged bit for bit):
+
+```sh
+python3 $Q run ... --damp-form median --damp-role mix:0.1,gu:0.3,down:0.3,out:0.1 --order --refit --icm 4
+```
+
+| option | what it does |
+|---|---|
+| `--damp-form median` | dampening in units of the median of diag(H) instead of the mean (the mean is dominated by a few massive-activation channels on some inputs) |
+| `--damp-role R:D,...` | dampening per input role (`mix`, `gu`, `down`, `out`); `--damp` for the roles not listed |
+| `--order` | block act-order: the 128-blocks in descending tr(H_bb); 4-groups and block scales stay intact |
+| `--refit` | closed-form refit of each block scale under GPTQ's block metric, exact residual fed forward |
+| `--icm N` | N sweeps of local search after GPTQ (codeword / sign moves per 4-group, then a scale refit) on a dampened H |
+
+Held-out H (39 tensors of 6 layers, inputs from prompts not in the calibration set): 0.911x the plain encoder's output
+error with all five, every tensor better (worst 0.945x). Full model, Qwen3.8-27B, same calibration and BF16 base as the
+table above: KLD 0.0168 (99 % 0.194, same top 95.00 %, PPL 4.959) against 0.0184, GSM8K 250 242 (same), decode
+speed unchanged. Step 5 then takes about 3 h 40 min on an RTX 3090 (6 layers per run; ~190 s per layer instead of 92 s,
+most of it ICM). The log's per-matrix output error
+is measured on the calibration inputs and comes out higher with these options (they regularise); judge by the KLD.
+The [TQT guide](tqt.md) uses the same options for the TQT format.
+
 ## Troubleshooting
 
 - **CUDA out of memory in step 5.** Something else holds GPU memory (another tqserve, a desktop session using much

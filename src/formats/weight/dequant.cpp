@@ -433,6 +433,27 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         }
+        case GGML_TQT: {  // docs/reference/formats.md "TQT" (tqt-c2-v1), in TQ4's rotated basis (the values the TQT kernels decode)
+            if (n < 0 || n % 128) break;
+            auto h16 = [](uint32_t v) { return half_to_float(uint16_t(v)); };
+            for (int64_t b = 0; b < n / 128; ++b) {
+                const uint8_t * blk = s + b * 66;
+                uint16_t hs; std::memcpy(&hs, blk, 2);
+                const float d = half_to_float(hs);
+                const uint8_t * B = blk + 2;
+                for (int p = 0; p < 64; ++p) {
+                    const uint32_t w = (uint32_t(B[p]) | uint32_t(B[(p + 1) % 64]) << 8 | uint32_t(B[(p + 2) % 64]) << 16) & 0x3FFFFu;
+                    const uint32_t x = (w * 0x9E3779B1u + 0x7F4A7C15u) << 14, y = (x << 16) | (x >> 16);
+                    const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
+                    const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                    for (int e = 0; e < 2; ++e) {  // FP16 sum (exact in FP32, one rounding) times the scale (FP32, as the matvec)
+                        const float v = half_to_float(float_to_half(h16(h1 >> (16 * e)) + h16(h2 >> (16 * e))));
+                        dst[b * 128 + 2 * p + e] = v * d;
+                    }
+                }
+            }
+            return;
+        }
         case GGML_GSQ_Q2_0:
             if (n < 0 || n % 64) break;
             for (int64_t b = 0; b < n / 64; ++b) {

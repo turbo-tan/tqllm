@@ -33,6 +33,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   weights, a stock TQ file as layout template and calibration text with vector GPTQ (docs/guides/tqv12.md; about 2 h on
   an RTX 3090), using the new `TQLLM_DEBUG=calib_dump` capture. Qwen3.8-27B, same size as TQ_L (14.72 GB): KLD against
   BF16 0.0184 vs TQ_L 0.0245 (WikiText-2, 8 x 2048 tokens); GSM8K 250 (low effort, greedy) 242 vs 245 (paired p = 0.45).
+- TQT weight format (GGUF type 306 with `tqllm.tqt.code = tqt-c2-v1`): TQ4's size (4.125 bits per weight) and rotated
+  basis, each 128-weight block a tail-biting bitshift-trellis code (QTIP-style, 18-bit window, table-free code), decode
+  matvec 1-16 columns, native prefill GEMM, FP16 / int8 prefill. Made with `tqv12_quant.py skeleton --format tqt` and a
+  CUDA Viterbi encoder (docs/guides/tqt.md; about 5 h 40 min on an RTX 3090). Qwen3.8-27B, 14.72 GB: KLD against BF16
+  0.0134 vs TQV-12 0.0184 and TQ_L 0.0245 (WikiText-2, 8 x 2048 tokens); GSM8K 250 243 vs 242 / 245.
+- TQV-12 / TQT quantiser encoder options `--damp-form median`, `--damp-role`, `--order`, `--refit`, `--icm N` (same file
+  format): Qwen3.8-27B TQV-12 KLD 0.0184 -> 0.0168.
 - Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
   pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
   chunk's vector sees the rest of the document; `"task": "query"` embeds queries; `encoding_format` `float`, `base64`

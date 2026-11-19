@@ -8,6 +8,9 @@
   stored rotated in the template is written rotated; a template from another model is refused.
 - With PyTorch: H from a capture dump equals X^T X; quantize (vector GPTQ, CPU) beats nearest rounding on the calibration
   inputs and its blocks decode to the GPTQ weights; verify passes on the result and fails on a corrupted copy.
+- Encoder options (with PyTorch): --order / --refit / --damp-form median give blocks that decode exactly to the returned
+  weights (the block permutation is undone) and keep the error below nearest rounding; --icm lowers the dampened
+  objective it minimises and stays exact; --damp-role overrides --damp per role and refuses an unknown role.
 Runs on the CPU in a few seconds; the PyTorch cases are skipped when it is not installed."""
 import hashlib
 import importlib.util
@@ -221,6 +224,42 @@ class Pipeline(unittest.TestCase):
             f.seek(p["offset"])
             f.write(bytes(66))
         self.assertEqual(tq.main(["verify", "--out", str(self.out), "--bf16", str(self.src), "--template", str(self.tpl)]), 1)
+
+
+class EncoderOptions(unittest.TestCase):
+    def test_damp_role(self):
+        import argparse
+        a = argparse.Namespace(damp=0.01, damp_role="mix:0.1,down:0.3")
+        self.assertEqual((tq.role_damp(a, "mix"), tq.role_damp(a, "down"), tq.role_damp(a, "gu")), (0.1, 0.3, 0.01))
+        with self.assertRaises(SystemExit):
+            tq.role_damp(argparse.Namespace(damp=0.01, damp_role="mlp:0.1"), "mix")
+
+    @unittest.skipUnless(HAVE_TORCH, "needs PyTorch")
+    def test_options_decode_exactly(self):
+        import torch
+        torch.manual_seed(5)
+        N, K = 48, 512
+        cb = tqv12.Codebook("cpu")
+        X = torch.randn(900, K) * torch.linspace(0.1, 4, K)[torch.randperm(K)]
+        X[:, 7] *= 40  # one massive-activation channel: the median and the mean of diag(H) differ
+        H = X.T @ X
+        W = torch.randn(N, K)
+        s0, i0, n0, Q0 = tqv12.gptq(W, H, cb)
+        e0 = tqv12.rel_err(Q0, W, H)
+        for kw in (dict(order=True), dict(refit=True), dict(damp_form="median", damp=0.1),
+                   dict(order=True, refit=True, damp_form="median", damp=0.1)):
+            s, idx, neg, Q = tqv12.gptq(W, H, cb, **kw)
+            dec = tqv12.decode(tqv12.pack(s.numpy(), idx.numpy(), neg.numpy()).tobytes(), N, K, cb.table)
+            self.assertTrue(np.array_equal(dec, Q.numpy()), kw)
+            self.assertLess(tqv12.rel_err(Q, W, H), 1.5 * e0, kw)
+        s, idx, neg, Q = tqv12.gptq(W, H, cb, order=True, refit=True, damp_form="median", damp=0.1)
+        Hd, _ = tqv12._damped(H, 0.1, "median")
+        before = float(torch.einsum("nk,kl,nl->", W - Q, Hd, W - Q))
+        Q2 = tqv12.icm(W, H, cb, s, idx, neg, sweeps=2, damp=0.1, damp_form="median")
+        after = float(torch.einsum("nk,kl,nl->", W - Q2, Hd, W - Q2))
+        self.assertLess(after, before)
+        dec = tqv12.decode(tqv12.pack(s.numpy(), idx.numpy(), neg.numpy()).tobytes(), N, K, cb.table)
+        self.assertTrue(np.array_equal(dec, Q2.numpy()))
 
 
 if __name__ == "__main__":

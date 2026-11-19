@@ -39,6 +39,9 @@ enum GgmlType : uint32_t {
     GGML_X3 = 320,        // X3 (EXL3 mul1 trellis): X3Record row groups of trellis / suh / svh (303 / 304 are TQ4S / TQ3S)
     GGML_TQV12 = 305,     // TQV-12 (rotated 4-D vector codebook, 66 B per 128, docs/reference/formats.md); valid only with the
                           // key tqllm.tqv.codebook = "tqv12-v1" (gguf_open_shard)
+    // TQT (tail-biting bitshift-trellis code c2, 66 B per 128, docs/reference/formats.md): file type 306, only together with
+    // the key tqllm.tqt.code = "tqt-c2-v1" (gguf_open_shard refuses 306 without it and any other code tag).
+    GGML_TQT = 306,
 };
 
 
