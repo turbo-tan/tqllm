@@ -13,6 +13,7 @@ int main() {
     std::vector<uint32_t> types;
     for (uint32_t type = 0; type < 64; ++type) types.push_back(type);
     types.push_back(tqllm::GGML_TQV12);  // TQLLM-only ids with a CPU reference
+    types.push_back(tqllm::GGML_TQT);
     for (const uint32_t type : types) {
         const auto * f = tqllm::weight_format(type);
         if (!f) continue;
