@@ -260,6 +260,22 @@ void tq4_matvec_variant(const uint8_t * w4, const __half * sc, const __half * xh
 // y rows ldy apart ([ncols][ldy]; the first `rows` of each written): matvec straight into a wider row layout
 void tq4_matvec_bf16_ld(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k,
                         int ncols, int ldy, cudaStream_t);
+// TQV-12 (GGUF 302 + tqllm.tqv.codebook = tqv12-v1, engine id 305; src/formats/weight/tqv.cu): codes [rows][k / 32] x
+// 16 B (8 x 12-bit codebook index + 32 permuted sign bits), FP16 scales [rows][k / 128]; x in the TQ4 rotated basis.
+// 1..16 columns; y rows ldy apart. Same numbers for every variant and column count.
+void tqv12_matvec_bf16(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
+                       int ldy, cudaStream_t);
+void tqv12_matvec(const uint8_t * w, const __half * sc, const __half * xh, float * y, int rows, int k, int ncols, cudaStream_t);
+// variant 0: the per-shape pick; 1..8: forced (variant - 1 = mt2 * 4 + pf * 2 + persistent grid), tests / benches
+void tqv12_matvec_variant(const uint8_t * w, const __half * sc, const __half * xh, float * y, int rows, int k, int ncols,
+                          int variant, cudaStream_t);
+void tqv12_dequant_h(const uint8_t * w, const __half * sc, __half * out, int rows, int k, cudaStream_t);
+// prefill GEMM on the codes (no FP16 copy): y[c][r] (row stride ldy) = W xh[c], c < n (tq4_gemm_h's kernel, TQV decode)
+void tqv12_gemm_h(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
+                  cudaStream_t);
+// int8 prefill: straight to int8 [rows][k] + row scales amax/127 (= tqv12_dequant_h, then int8_quant_rows)
+void tqv12_dequant_i8(const uint8_t * w, const __half * sc, int8_t * out, float * scale, int rows, int k, cudaStream_t,
+                      const float * cm = nullptr);
 // NVFP4 (modelopt, Qwen3.8-Flash-Next experts): codes [rows][k / 2] (E2M1, low nibble = even column), E4M3 scale per
 // 16 [rows][k / 16], FP32 global scale. x: [ncols][k] BF16 -> y: [ncols][rows] FP32. Reference kernel (not tuned).
 void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __nv_bfloat16 * x, float * y, int rows,
