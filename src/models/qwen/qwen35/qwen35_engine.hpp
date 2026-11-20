@@ -1044,6 +1044,11 @@ public:
 
     const bf16 * bf16_table(const GgufFile & f, const std::string & name, uint64_t n);
 
+    // DFlash2 selector table [cfg.vocab][rank]: the file's Q4_K blocks as they are (the lattice decodes the ~17 rows per
+    // position it reads; 71.5 MB instead of 254 MB of BF16 for the 248320 x 256 pair), else expanded to BF16.
+    bool q4k_rows(const GgufFile & f, const std::string & name, int rank);
+    tqllm_cuda::SelTable sel_table(const GgufFile & f, const std::string & name, int rank, bool q4k);
+
     // [rows][rank] table (GGUF ne = {rank, rows}) as BF16 [cfg.vocab][rank], rows past the file's vocabulary zero
     const bf16 * vocab_table(const GgufFile & f, const std::string & name, int rank);
 

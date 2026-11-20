@@ -5,6 +5,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Changed
+- DFlash2 drafter: the two Q4_K selector tables (248320 x 256) stay in their Q4_K blocks on the GPU and the lattice
+  decodes the rows it reads, instead of expanding them to BF16 at load: 0.18 GB less VRAM (RTX 3090, Qwen3.8-27B TQT +
+  DFlash2-TQ3, 144K context, q8/q4 K/V: 20826 -> 20654 MiB after load). The decoded values are the BF16 ones the
+  expansion produced, so drafts, acceptance and output are identical.
+
 ### Fixed
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
