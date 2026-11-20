@@ -1468,6 +1468,18 @@ const bf16 * Qwen35Engine::bf16_table(const GgufFile & f, const std::string & na
     return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
 }
 
+bool Qwen35Engine::q4k_rows(const GgufFile & f, const std::string & name, int rank) {
+    const auto & t = gt(f, name);
+    return t.type == GGML_Q4_K && rank % 256 == 0 && t.ne.size() == 2 && t.ne[0] == uint64_t(rank) &&
+           t.ne[1] == uint64_t(cfg.vocab);
+}
+
+tqllm_cuda::SelTable Qwen35Engine::sel_table(const GgufFile & f, const std::string & name, int rank, bool q4k) {
+    if (!q4k) return {bf16_table(f, name, uint64_t(cfg.vocab) * rank)};
+    const auto raw = f.read(gt(f, name));
+    return {put(raw.data(), raw.size()), true};
+}
+
 const bf16 * Qwen35Engine::vocab_table(const GgufFile & f, const std::string & name, int rank) {
     const auto & t = gt(f, name);
     if (int(t.ne[0]) != rank || t.ne[1] > cfg.vocab) throw std::runtime_error(name + ": unexpected shape");

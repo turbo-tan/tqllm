@@ -1,5 +1,6 @@
 #include "zero_copy_guard.hpp"
 #include <cstdlib>
+#include <stdexcept>
 #include "dflash_kernels.cuh"
 
 #include <math_constants.h>
@@ -139,17 +140,46 @@ __global__ void topk16_k(const float * x, int len, float * vals, uint32_t * idx)
     }
 }
 
+// Element r of vocabulary row `row` of a [vocab][rank] selector table, as the BF16 value the drafter scores with.
+// Q4_K rows stay in their 144-byte blocks (one per 256 values) and are decoded here with the operations of the host
+// reference (dequant.cpp q4k: d * sc, dmin * m, then d1 * q - m1, no FMA) and rounded to BF16, so the values are the
+// ones the BF16 table expanded at load held.
+template <bool Q4K>
+__device__ __forceinline__ float sel_at(const void * t, uint32_t row, int rank, int r) {
+    if constexpr (!Q4K) {
+        return __bfloat162float(static_cast<const __nv_bfloat16 *>(t)[int64_t(row) * rank + r]);
+    } else {
+        const uint8_t * b = static_cast<const uint8_t *>(t) + (int64_t(row) * (rank / 256) + r / 256) * 144;
+        const int e = r % 256, j = e / 32;
+        const float d = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t *>(b)));
+        const float mn = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t *>(b + 2)));
+        const uint8_t * sc = b + 4;
+        int s, m;
+        if (j < 4) {
+            s = sc[j] & 63;
+            m = sc[j + 4] & 63;
+        } else {
+            s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+            m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+        }
+        const int q = (b[16 + (e / 64) * 32 + e % 32] >> ((j & 1) * 4)) & 0xF;
+        const float v = __fsub_rn(__fmul_rn(__fmul_rn(d, float(s)), float(q)), __fmul_rn(mn, float(m)));
+        return __bfloat162float(__float2bfloat16_rn(v));
+    }
+}
+
 // grid (n - 1 positions, 16 predecessors), block = rank threads (256). Writes score[i][j][k] for positions i >= 1.
+template <bool Q4K>
 __global__ void dflash_lattice_k(const uint32_t * cand, const float * unary, const __nv_bfloat16 * gate, int gs,
-                                 const __nv_bfloat16 * next, const __nv_bfloat16 * prev, uint32_t anchor,
+                                 const void * next, const void * prev, uint32_t anchor,
                                  const uint32_t * anchor_dev, int rank,
                                  float * score) {
     __shared__ float red[32];
     const int i = blockIdx.x + 1, j = blockIdx.y, r = threadIdx.x;
     const uint32_t p = i == 1 ? (anchor_dev ? *anchor_dev : anchor) : cand[(i - 1) * 16 + j];
-    const float cond = __bfloat162float(prev[int64_t(p) * rank + r]) * __bfloat162float(gate[int64_t(i) * gs + r]);
+    const float cond = sel_at<Q4K>(prev, p, rank, r) * __bfloat162float(gate[int64_t(i) * gs + r]);
     for (int k = 0; k < 16; ++k) {
-        float v = __bfloat162float(next[int64_t(cand[i * 16 + k]) * rank + r]) * cond;
+        float v = sel_at<Q4K>(next, cand[i * 16 + k], rank, r) * cond;
         for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
         if (r % 32 == 0) red[r / 32] = v;
         __syncthreads();
@@ -193,11 +223,17 @@ void topk16(const float * x, int len, int rows, float * vals, uint32_t * idx, cu
 }
 
 void dflash_lattice(const uint32_t * cand, const float * unary, const __nv_bfloat16 * gate, int gate_stride,
-                    const __nv_bfloat16 * next, const __nv_bfloat16 * prev, uint32_t anchor, int n, int rank,
+                    SelTable next, SelTable prev, uint32_t anchor, int n, int rank,
                     float * score, cudaStream_t s, const uint32_t * anchor_dev) {
     if (n < 2) return;
-    dflash_lattice_k<<<dim3(n - 1, 16), rank, 0, s>>>(cand, unary, gate, gate_stride, next, prev, anchor, anchor_dev, rank,
-                                                      score);
+    if (next.q4k != prev.q4k) throw std::runtime_error("dflash_lattice: selector tables in different formats");
+    const dim3 grid(n - 1, 16);
+    if (next.q4k)
+        dflash_lattice_k<true><<<grid, rank, 0, s>>>(cand, unary, gate, gate_stride, next.p, prev.p, anchor, anchor_dev,
+                                                     rank, score);
+    else
+        dflash_lattice_k<false><<<grid, rank, 0, s>>>(cand, unary, gate, gate_stride, next.p, prev.p, anchor, anchor_dev,
+                                                      rank, score);
 }
 
 namespace {
