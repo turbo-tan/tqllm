@@ -485,8 +485,11 @@ private:
 
     void load_gguf(const GgufFile & f);
 
-    // Gated DeltaNet state is double-buffered per layer: the current state is slot `cur`; verify() writes the state
-    // after all n tokens to the other slot and commit(k) either flips `cur` (k == n) or replays k tokens into it.
+    // Gated DeltaNet conv state is double-buffered per layer: the current state is slot `cur`; verify() writes the state
+    // after all n tokens to the other slot and commit(k) flips `cur` (replaying k tokens into it when k < n).
+    // The recurrent state (3.1 MB per layer in FP32) has one buffer: verify() updates it in place only when its block is
+    // always committed whole (gdn_whole); otherwise it leaves it untouched and commit(k) replays the k accepted tokens
+    // in place, from the inputs kept in v_stash (the same kernel arithmetic, so the same bits as the verify's own state).
     static constexpr int NVER = TQLLM_VERIFY_COLUMNS, NSLOT = 2;
     // prefill chunk: the verify graph over NPF prompt tokens, projections as one GEMM (weights read once per chunk).
     // Larger chunks amortise the per-chunk FP16 weight dequant; the size follows the context budget (buffer memory).
@@ -495,7 +498,9 @@ private:
     static_assert(NVER >= 8 && NVER <= 16);
     int cur = 0;
     bf16 * conv_slot(uint32_t lin, int slot) { return conv_state[lin * NSLOT + (slot % NSLOT)].as<bf16>(); }
-    float * rec_slot(uint32_t lin, int slot) { return rec_state[lin * NSLOT + (slot % NSLOT)].as<float>(); }
+    float * rec_buf(uint32_t lin) { return rec_state[lin].as<float>(); }
+    // blocks committed whole: one token (decode) and prefill chunks (no stash to replay from)
+    static bool gdn_whole(int n) { return n == 1 || n > NVER; }
 
     size_t conv_bytes() const { return size_t(cfg.conv_k - 1) * (2 * cfg.lin_kheads * cfg.lin_dk + cfg.lin_vheads * cfg.lin_dv) * 2; }
     size_t rec_bytes() const { return size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4; }
@@ -1682,18 +1687,20 @@ public:
     const bf16 * step_hidden() const { return x.as<bf16>(); }
 
 private:
-    // verify() stored only the state after all n tokens (slot cur + 1). Accepting fewer replays the recurrent
-    // layers over the accepted prefix from slot cur, using the inputs kept in v_stash.
+    // verify() stored only the conv state after all n tokens (slot cur + 1) and, for gdn_whole blocks, the recurrent
+    // state. Otherwise commit replays the recurrent layers over the accepted prefix (conv from slot cur, recurrent
+    // state in place), using the inputs kept in v_stash.
     void set_pending(int k) {
         pend_k = k;
         ck(cudaMemcpyAsync(d_pend.p, &pend_k, sizeof(int), cudaMemcpyHostToDevice, stream));  // pageable: staged now
     }
-    // Deferred commit -> real state: replay the pending path (as commit(k < n) does) from slot cur into cur + 1.
+    // Deferred commit -> real state: replay the pending path (as commit(k < n) does): conv slot cur into cur + 1,
+    // recurrent state in place.
     void flush_pending();
 
     void commit(int k) override {
         if (k < 1 || k > last_n) throw std::runtime_error("commit: accepted count out of range");
-        if (k < last_n) {
+        if (k < last_n || !gdn_whole(last_n)) {
             // TQLLM_DEBUG=commit_overlap (opt-in until test-native-mtp covers --np > 1): replay on a side stream so it overlaps the MTP repair pass that follows (that pass
             // reads neither the recurrent states nor the replay's scratch); the next verify waits for it (join_commit)
             static const bool overlap = tqllm::debug_on("commit_overlap");
