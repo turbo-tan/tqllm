@@ -94,14 +94,15 @@ void fn_gdn_set_kh(int on);
 void fn_gdn_set_vpw(int v);
 void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);
 // the FP16 image of fn_gated_rms / fn_attention_gate's output (the input of a quantised projection; same values)
-void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t);
-void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t);
+void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t, bool silu = false);
+void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t, bool silu = false);
 // ple_conv on FP16 input rows (the GDN qkv projection's FP16 output in prefill); history and output stay fp32
 void ple_conv(const __half * x, const float * history, const float * kernel, float * out, float * next_history,
               int channels, int tokens, int taps, int dilation, cudaStream_t);
 void fn_attention_gate_h(const float * in, const float * qg, __half * out, int heads, int dim, int tokens, cudaStream_t);
+// output gate sigmoid(z) (Flash-Next) or, with silu, z * sigmoid(z) (Qwen3.5 / Qwen3.8 dense)
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
-                  int heads, int dim, int tokens, float epsilon, cudaStream_t);
+                  int heads, int dim, int tokens, float epsilon, cudaStream_t, bool silu = false);
 // Text-only positions. An interleaved query input stores [q|gate] per head.
 void fn_norm_rope(const float * x, const float * weight, float * out, int heads, int dim,
                   int tokens, int position, int rotary, float theta, float epsilon, bool interleaved, cudaStream_t);

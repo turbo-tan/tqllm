@@ -18,6 +18,18 @@ namespace {
 float neg_exp(float v) { return -std::exp(v); }
 }  // namespace
 
+// The PLE n-gram tables are read as MLX affine 4-bit (U32 words of 8 weights). An FP8 table (config ple_quant_scheme fp8)
+// would give a row width 4x too small and no scales: it is refused by name instead of loading wrong rows.
+uint64_t hf_ple_row_width(const HfFolder & h, const std::string & table) {
+    const auto & t = h.at(table);
+    if (t.dtype == "U32" && t.shape.size() == 2) return t.shape[1] * 8;
+    const Json * tc = h.root().get("text_config");
+    const Json * qs = h.root().get("ple_quant_scheme"); if (!qs && tc) qs = tc->get("ple_quant_scheme");
+    throw std::runtime_error("hf: PLE n-gram table " + table + " stored as " + t.dtype +
+                             (qs && qs->kind == Json::String ? " (ple_quant_scheme " + qs->str + ")" : std::string()) +
+                             ": only MLX affine 4-bit tables are read");
+}
+
 void hf_map_qwen4_exp(const HfFolder & h, GgufFile & f) {
     const std::string A = "qwen4exp.";
     auto key = [&](const std::string & k, double v) { f.kv[A + k].num = v; };
@@ -81,7 +93,7 @@ void hf_map_qwen4_exp(const HfFolder & h, GgufFile & f) {
             for (size_t i = 0; i < v.size(); ++i) { int64_t x; std::memcpy(&x, raw.data() + 8 * i, 8); v[i] = double(x); }
             return v;
         };
-        key("embedding_length_per_layer_input", double(h.at(e + "ngram_embedding.shard_0.weight").shape[1] * 8));  // the table's row width
+        key("embedding_length_per_layer_input", double(hf_ple_row_width(h, e + "ngram_embedding.shard_0.weight")));
         arr("ple.layer_multipliers", ints("layer_multipliers"));
         arr("ple.head_offsets", ints("ngram_heads_offsets"));
         arr("ple.head_vocab_sizes", ints("ngram_heads_vocab_sizes"));
