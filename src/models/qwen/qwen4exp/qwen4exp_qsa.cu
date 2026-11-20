@@ -216,16 +216,16 @@ __global__ void score_pack_batch(const float * pooled_keys, const float * query,
     }
 }
 
-// score_pack_batch for 4 indexer heads of 128: a CTA of W warps scores W * RB blocks for QT consecutive queries, the
+// score_pack_batch for H = 4 or 8 indexer heads of 128 (RB = 16 / H blocks per warp): a CTA of W warps scores W * RB blocks for QT consecutive queries, the
 // blocks' keys in registers and the queries staged once in shared memory (one key read per QT queries and one query read
 // per W * RB blocks instead of one each per (query, block): at 128K the re-reads made this kernel 13 s of a 74 s prefill);
 // the RB * 4 dots of a query reduce in a transposing butterfly (the pairs of the shfl_down tree; a + b == b + a) instead
 // of 5 shuffles each. Same keys bit for bit.
-template<int RB, int QT, int W>
+template<int H, int QT, int W>
 __global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * pooled_keys, const float * query, uint64_t * keys,
                                                             int blocks, int tokens, int first_position, int ratio) {
-    constexpr int H = 4, DIM = 128, J = DIM / 32;
-    static_assert(RB == 4, "lane mapping below assumes 16 values per lane");
+    constexpr int RB = 16 / H, DIM = 128, J = DIM / 32, HB = H == 4 ? 2 : 3;  // HB: log2(H)
+    static_assert(H == 4 || H == 8, "lane mapping below assumes 16 values per lane");
     __shared__ float4 qs[QT][H][32];  // [query][head][lane] = the lane's 4 dims (lane + 32 j), one 16-byte read per head
     const int lane = threadIdx.x, t0 = blockIdx.y * QT, block0 = (blockIdx.x * W + threadIdx.y) * RB;
     const int nq = min(QT, tokens - t0);
@@ -245,7 +245,7 @@ __global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * poole
         #pragma unroll
         for (int j = 0; j < J; ++j) kv[b][j] = k[lane + 32 * j];
     }
-    const int ob = block0 + (((lane >> 4) << 1) | ((lane >> 3) & 1));  // the block whose total lands on this lane
+    const int ob = block0 + ((lane >> (1 + HB)) & (RB - 1));  // the block whose total lands on this lane
     int complete = (first_position + t0 + 1) / ratio, rem = (first_position + t0 + 1) % ratio;  // complete blocks of query t
     #pragma unroll 1
     for (int qi = 0; qi < QT; ++qi, complete += ++rem == ratio ? (rem = 0, 1) : 0) {
@@ -253,7 +253,7 @@ __global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * poole
         if (t >= tokens) return;
         uint64_t * out = keys + int64_t(t) * blocks;
         if (block0 >= complete) {  // no block of the group complete for this query: every key 0
-            if ((lane & 7) == 0 && ob < blocks) out[ob] = 0;
+            if ((lane & (2 * H - 1)) == 0 && ob < blocks) out[ob] = 0;
             continue;
         }
         float a[RB * H];
@@ -269,15 +269,18 @@ __global__ void __launch_bounds__(32 * W) score_pack_fixed_k(const float * poole
                 a[b * H + h] = dot;
             }
         }
-        // 16 values: halve at offsets 16, 8, 4, 2; lane bits 4..1 then name (block, head) = (bit4 bit3, bit2 bit1)
+        // 16 values: halve at offsets 16, 8, 4, 2; lane bits 4..1 then name value b * H + h (block high bits, head low)
         butterfly_fold<16, RB * H>(a, lane);
         const float dot = a[0] + __shfl_xor_sync(0xffffffffu, a[0], 1);
-        // heads 1..3 of this lane's block sit 2, 4, 6 lanes up; the total adds them in head order as score_pack_batch does
-        const float d1 = __shfl_down_sync(0xffffffffu, dot, 2), d2 = __shfl_down_sync(0xffffffffu, dot, 4), d3 = __shfl_down_sync(0xffffffffu, dot, 6);
-        if ((lane & 7) == 0 && ob < blocks) {
+        // head h of this lane's block sits 2h lanes up; the total adds them in head order as score_pack_batch does
+        float d[H];
+        #pragma unroll
+        for (int h = 0; h < H; ++h) d[h] = h ? __shfl_down_sync(0xffffffffu, dot, 2 * h) : dot;
+        if ((lane & (2 * H - 1)) == 0 && ob < blocks) {
             if (ob >= complete) { out[ob] = 0; continue; }
             float total = 0.f;
-            total += fmaxf(dot, 0.f); total += fmaxf(d1, 0.f); total += fmaxf(d2, 0.f); total += fmaxf(d3, 0.f);
+            #pragma unroll
+            for (int h = 0; h < H; ++h) total += fmaxf(d[h], 0.f);
             const float score = total == 0.f ? 0.f : total;
             out[ob] = (uint64_t(__float_as_uint(score)) << 32) | uint32_t(~uint32_t(ob));
         }
@@ -538,6 +541,8 @@ void qsa_score_pack(const float * pooled_keys, const float * query, uint64_t * k
     if (fixed < 0) fixed = 1;  // fixed-shape kernels (bitwise equal to the generic ones, test-qsa-pack-exact)
     if (fixed && heads == 4 && dim == 128)
         score_pack_fixed_k<4, 16, 8><<<dim3(unsigned((blocks + 31) / 32), unsigned((tokens + 15) / 16)), dim3(32, 8), 0, stream>>>(pooled_keys, query, keys, blocks, tokens, first_position, ratio);
+    else if (fixed && heads == 8 && dim == 128)  // 8-head indexers: 2 blocks per warp, 8 queries per CTA (32 KB of staged queries)
+        score_pack_fixed_k<8, 8, 8><<<dim3(unsigned((blocks + 15) / 16), unsigned((tokens + 7) / 8)), dim3(32, 8), 0, stream>>>(pooled_keys, query, keys, blocks, tokens, first_position, ratio);
     else
         score_pack_batch<<<dim3((blocks + 3) / 4, tokens), dim3(32, 4), 0, stream>>>(pooled_keys, query, keys, blocks, first_position, ratio, heads, dim);
     ck(cudaPeekAtLastError());
