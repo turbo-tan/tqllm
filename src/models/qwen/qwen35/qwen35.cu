@@ -377,7 +377,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
         }
         __syncthreads();  // qs / ks / coef are refilled by the next group
     }
-    if (rp.smid) return;  // deferred-commit mode: the state after the tree is never used (the next step replays)
+    // deferred-commit mode: the state after the tree is never used (the next step replays); sout == nullptr: the caller
+    // replays the accepted prefix at commit instead (single state buffer: `sin` must keep the state before the block)
+    if (rp.smid || !sout) return;
     float * So = sout + (int64_t(h) * DK + sl * R) * dv + j;
 #pragma unroll
     for (int i = 0; i < R; ++i) So[int64_t(i) * dv] = S[i];

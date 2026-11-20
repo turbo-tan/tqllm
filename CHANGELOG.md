@@ -19,6 +19,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
   two cases now keep separate graphs.
 
+### Changed
+- Qwen3.5 / 3.8: the Gated DeltaNet recurrent state has one buffer per layer instead of two (updated in place; a
+  partly accepted draft is replayed from the verify inputs as before). Qwen3.8-27B on an RTX 3090: 192 MiB less VRAM
+  per slot, greedy tokens identical (tree, chain, no drafter, `--np 2`).
+
 ### Docs
 - [Choose a setup](docs/guides/choose-your-setup.md): which model, drafter and flags for 16 / 24 / 32 GB cards and GB10,
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).

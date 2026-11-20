@@ -485,10 +485,8 @@ void Qwen35Engine::alloc_seq_state() {
             value_cache.push_back({own ? kv_seq->base(int(a), false) : nullptr});
             a += own ? 1 : 0;
         } else {
-            for (int sl = 0; sl < NSLOT; ++sl) {
-                conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
-                rec_state.emplace_back(own ? size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4 : 0);
-            }
+            for (int sl = 0; sl < NSLOT; ++sl) conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
+            rec_state.emplace_back(own ? rec_bytes() : 0);  // one buffer, updated in place (see gdn_whole)
         }
     }
 }

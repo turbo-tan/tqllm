@@ -122,7 +122,7 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
                 mm(L.w_a, np, a);
             }
             tqllm_cuda::conv_step(qkv, conv_slot(lin_i, cur), L.conv_w, qkvc, qkv_dim, stream);
-            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), core, lkh, lvh, dk, dv,
+            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_buf(lin_i), core, lkh, lvh, dk, dv,
                                  cfg.tiled, stream);
             tqllm_cuda::gated_rms(core, z, L.gnorm_w, gn, lvh, dv, cfg.eps, stream);
             prep(gn, zdim);
@@ -228,7 +228,7 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                            cb, cudaMemcpyDefault, stream));
-        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
+        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_buf(l)), save ? static_cast<void *>(rec_buf(l)) : h + cb,
                            rb, cudaMemcpyDefault, stream));
     }
 }
@@ -457,7 +457,7 @@ void Qwen35Engine::reset_state() {
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
-        ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
+        ck(cudaMemsetAsync(rec_buf(l), 0, rec_bytes, stream));
     }
 }
 
@@ -1683,8 +1683,8 @@ void Qwen35Engine::flush_pending() {
         tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
                                v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
         const bf16 * B0 = T + qkv_dim + zdim;
-        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                              rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
+        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
+                              rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
                               d_chain.as<int>());
         ++lin_i;
     }

@@ -127,7 +127,9 @@ void conv_multi(const __nv_bfloat16 * xin, int x_stride, int n, const __nv_bfloa
                 const float * w, __nv_bfloat16 * y, int channels, cudaStream_t, const int * par = nullptr,
                 const ConvReplay & rp = {});
 // Gated delta rule over n tokens: qkv [n][qkv_dim] (conv output), a[i] = a0 + i * ab_stride, b likewise; state read
-// from `in`, final state written to `out` (may alias); y [n][vh * dv]. Each thread keeps one state column in registers.
+// from `in`, final state written to `out` (may alias: each thread reads its state elements before it writes them;
+// nullptr: not written); y [n][vh * dv]. Each thread keeps one state column in registers. GdnReplay::smid may alias
+// `in` likewise.
 void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const __nv_bfloat16 * b0, int ab_stride,
                const float * neg_a, const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads,
                int vheads, int dk, int dv, bool tiled, cudaStream_t, const int * par = nullptr,
