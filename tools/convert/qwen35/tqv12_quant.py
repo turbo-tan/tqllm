@@ -3,7 +3,7 @@
 model as the layout template + calibration text -> a TQV-12 (or, with skeleton --format tqt, a TQT trellis-code) GGUF
 that tqserve loads. Step by step: docs/guides/tqv12.md (TQT: docs/guides/tqt.md).
 
-  prompts    calibration prompts from text files
+  prompts    calibration prompts: the pinned set (WikiText-2 train + this repository's code at a fixed tag) or any text
   skeleton   the output file with the template's tensor list and metadata: every TQ4 tensor becomes TQV-12 (written
              later), the other tensors are copied from the template (checked against the BF16 source)
   capture    one tqserve run with TQLLM_DEBUG=calib_dump: the prefill inputs of some layers, then H = X^T X per input
@@ -13,6 +13,7 @@ that tqserve loads. Step by step: docs/guides/tqv12.md (TQT: docs/guides/tqt.md)
 
 Needs numpy and gguf (pip install numpy gguf); capture / quantize / run also need PyTorch with CUDA and Triton."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -168,21 +169,106 @@ def plan_format(plan):
 
 
 # ---------------- prompts ----------------
-def cmd_prompts(a):
-    texts = [Path(t).read_text(errors="replace") for t in a.text]
-    per = [a.count // len(texts) + (i < a.count % len(texts)) for i in range(len(texts))]
+# The pinned calibration text, so every TQV-12 / TQT rebuild starts from the same prompts.json: WikiText-2 train
+# (downloaded, CC BY-SA, so checked by hash rather than committed) and the source files listed in calib_code_files.txt
+# as they are at CALIB_REV (read from git, not from the working tree). The GPU steps after it are not bit-reproducible,
+# so the guides state the expected KLD of a rebuild, not a file hash.
+WIKI_URL = "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+WIKI_SHA256 = "6707892fa3788b5ab9ed78ab5ff37d9fe825f6011a2ad4fcd6a6d467f0e7da57"  # wikitext-2-raw/wiki.train.raw
+CALIB_REV = "v1.6.0"
+CALIB_COMMIT = "933dc6f8c432d1cabaca954d1ed892f5343e0674"  # the commit the tag names; read by id, so no tag is needed
+CALIB_FILES = HERE / "calib_code_files.txt"
+CODE_SHA256 = "22564035e27a0e64efce2000b7d48afebcde284d8779fa8268a57b692aab2083"
+CALIB_COUNT, CALIB_CHARS = 64, 6500
+PROMPTS_SHA256 = "bc3e6cb00d03f44bdbe8cca902e9b3470916f116cb72e984b76e7d60d0bb5a89"
+
+
+def sha256(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def decode_text(raw):
+    """UTF-8 with replacement and universal newlines, independent of the locale"""
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def calib_files(path=None):
+    lines = Path(path or CALIB_FILES).read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def code_text(repo, rev, files):
+    """the files at rev, concatenated in the given order (git cat-file: committed bytes, no working tree, no filters)"""
+    try:
+        p = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"], capture_output=True, check=True,
+                           input="".join(f"{rev}:{f}\n" for f in files).encode())
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise SystemExit(f"git cat-file in {repo} failed ({e}): the code half needs a git clone of tqLLM (--repo)")
+    out, pos = [], 0
+    data = p.stdout
+    for f in files:
+        nl = data.index(b"\n", pos)
+        head = data[pos:nl].split()
+        if len(head) != 3 or head[1] != b"blob":
+            hint = (f" (the pinned commit {CALIB_COMMIT[:7]} is not in this clone: git fetch origin tag "
+                    f"{CALIB_REV}, or git fetch --unshallow)" if rev == CALIB_COMMIT else "")
+            raise SystemExit(f"{rev}:{f} is not a file in {repo}{hint}")
+        n = int(head[2])
+        out.append(data[nl + 1:nl + 1 + n])
+        pos = nl + 1 + n + 1
+    return b"".join(out)
+
+
+def make_prompts(texts, count, chars):
+    """count prompts of about chars characters, split evenly between the texts, evenly spaced in each"""
+    per = [count // len(texts) + (i < count % len(texts)) for i in range(len(texts))]
     prompts = []
     for t, n in zip(texts, per):
-        if len(t) < a.chars * n:
-            raise SystemExit(f"a text has {len(t)} characters, {n} prompts of {a.chars} need {a.chars * n}")
-        step = (len(t) - a.chars) // max(1, n - 1) if n > 1 else 0
+        if len(t) < chars * n:
+            raise SystemExit(f"a text has {len(t)} characters, {n} prompts of {chars} need {chars * n}")
+        step = (len(t) - chars) // max(1, n - 1) if n > 1 else 0
         for i in range(n):
             s = i * step
             s = t.find(" ", s) + 1 if s else 0  # start and end on a word boundary
-            e = t.rfind(" ", s, s + a.chars)
-            prompts.append(t[s:e if e > s else s + a.chars])
-    json.dump(prompts, open(a.out, "w"))
+            e = t.rfind(" ", s, s + chars)
+            prompts.append(t[s:e if e > s else s + chars])
+    return prompts
+
+
+def cmd_prompts(a):
+    if a.text:  # any text: allowed, but not the pinned set the guides' numbers refer to
+        texts = [decode_text(Path(t).read_bytes()) for t in a.text]
+        pinned = False
+        log("custom --text: UNPINNED calibration text (not the guides' prompts.json)")
+    else:
+        raw = Path(a.wiki).read_bytes()
+        got = sha256(raw)
+        if got != WIKI_SHA256:
+            raise SystemExit(f"{a.wiki}: sha256 {got}, expected {WIKI_SHA256} (wikitext-2-raw/wiki.train.raw from "
+                             f"{WIKI_URL}). Refused: another file gives other prompts. For your own text use --text.")
+        default_rev = a.code_rev == CALIB_REV
+        rev = CALIB_COMMIT if default_rev else a.code_rev
+        code = code_text(a.repo, rev, calib_files(a.code_files))
+        log(f"WikiText-2 train sha256 {got} (pinned); code: {len(code)} bytes from {a.code_rev}"
+            + (f" ({CALIB_COMMIT[:12]})" if default_rev else ""))
+        pinned = default_rev and a.code_files is None and (a.count, a.chars) == (CALIB_COUNT, CALIB_CHARS)
+        if pinned and sha256(code) != CODE_SHA256:
+            raise SystemExit(f"code text sha256 {sha256(code)}, expected {CODE_SHA256} (calib_code_files.txt or the "
+                             f"commit {CALIB_COMMIT[:12]} differ from the pinned ones)")
+        texts = [decode_text(raw), decode_text(code)]
+    prompts = make_prompts(texts, a.count, a.chars)
+    out = json.dumps(prompts).encode()
+    h = sha256(out)
+    if pinned and h != PROMPTS_SHA256 and not a.force:
+        raise SystemExit(f"prompts.json sha256 {h}, expected {PROMPTS_SHA256}: not written (--force writes it anyway)")
+    with open(a.out, "wb") as f:
+        f.write(out)
     log(f"wrote {len(prompts)} prompts ({sum(map(len, prompts))} characters) to {a.out}")
+    if pinned:
+        state = "the pinned prompts" if h == PROMPTS_SHA256 else f"NOT the pinned prompts ({PROMPTS_SHA256}), --force"
+    else:
+        state = "unpinned: options or text differ from the pinned set"
+    print(f"prompts.json sha256 {h} ({state})", flush=True)
 
 
 # ---------------- skeleton ----------------
@@ -587,10 +673,19 @@ def cmd_verify(a):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("prompts", help="calibration prompts from text files")
-    p.add_argument("--text", action="append", required=True, help="text file (repeat: the prompts are split evenly)")
-    p.add_argument("--count", type=int, default=64)
-    p.add_argument("--chars", type=int, default=6500, help="characters per prompt (~1,600-2,200 tokens)")
+    p = sub.add_parser("prompts", help="calibration prompts: the pinned set (--wiki) or your own text files (--text)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--wiki", help="wikitext-2-raw/wiki.train.raw (sha256-checked); with the code at --code-rev it "
+                     "gives the pinned prompts.json")
+    src.add_argument("--text", action="append", help="UNPINNED: any text file instead (repeat: the prompts are split "
+                     "evenly)")
+    p.add_argument("--code-rev", default=CALIB_REV,
+                   help=f"git revision of the code half (default: the pinned {CALIB_REV})")
+    p.add_argument("--code-files", help="file list instead of calib_code_files.txt (unpinned)")
+    p.add_argument("--repo", default=str(HERE.parents[2]), help="git clone to read the code from (default: this one)")
+    p.add_argument("--count", type=int, default=CALIB_COUNT)
+    p.add_argument("--chars", type=int, default=CALIB_CHARS, help="characters per prompt (~1,600-2,200 tokens)")
+    p.add_argument("--force", action="store_true", help="write prompts.json even if its sha256 is not the pinned one")
     p.add_argument("--out", required=True)
     p = sub.add_parser("skeleton", help="output file with the template's layout, TQ4 -> TQV-12 placeholders")
     p.add_argument("--bf16", required=True, help="BF16 GGUF of the model (llama.cpp convert_hf_to_gguf.py)")

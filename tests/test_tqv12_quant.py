@@ -11,14 +11,23 @@
 - Encoder options (with PyTorch): --order / --refit / --damp-form median give blocks that decode exactly to the returned
   weights (the block permutation is undone) and keep the error below nearest rounding; --icm lowers the dampened
   objective it minimises and stays exact; --damp-role overrides --damp per role and refuses an unknown role.
+- Calibration text (needs git): the code half is the listed files at a fixed revision (not the working tree, not later
+  commits); a WikiText file with another sha256 is refused; prompts.json's sha256 is printed, and for the pinned set a
+  mismatch is refused unless --force; --text gives the same prompts but is reported as unpinned; the shipped
+  calib_code_files.txt at the pinned commit has the pinned hash.
 Runs on the CPU in a few seconds; the PyTorch cases are skipped when it is not installed."""
 import hashlib
 import importlib.util
+import io
 import json
+import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -260,6 +269,123 @@ class EncoderOptions(unittest.TestCase):
         self.assertLess(after, before)
         dec = tqv12.decode(tqv12.pack(s.numpy(), idx.numpy(), neg.numpy()).tobytes(), N, K, cb.table)
         self.assertTrue(np.array_equal(dec, Q2.numpy()))
+
+
+HAVE_GIT = shutil.which("git") is not None
+
+
+def git(repo, *args):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env).stdout
+
+
+def words(seed, n):
+    rng = np.random.default_rng(seed)
+    vocab = ["alpha", "beta", "gamma", "delta", "kernel", "matrix", "token", "layer", "the", "of"]
+    return " ".join(vocab[i] for i in rng.integers(0, len(vocab), n))
+
+
+@unittest.skipUnless(HAVE_GIT, "needs git")
+class CalibrationText(unittest.TestCase):
+    """prompts: the pinned set is WikiText-2 train (sha256-checked) + the listed files at a fixed revision (git, not the
+    working tree); prompts.json's sha256 is printed and, for the pinned set, checked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.repo = self.d / "repo"
+        (self.repo / "src").mkdir(parents=True)
+        git(self.repo, "init", "-q")
+        self.files = ["src/a.cpp", "src/b.hpp", "tools/c.py"]
+        (self.repo / "tools").mkdir()
+        for i, f in enumerate(self.files):
+            (self.repo / f).write_text(words(10 + i, 20000) + "\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-q", "-m", "pinned")
+        git(self.repo, "tag", "t1")
+        self.commit = git(self.repo, "rev-parse", "t1^{commit}").decode().strip()
+        self.manifest = self.d / "files.txt"
+        self.manifest.write_text("# comment\n" + "\n".join(self.files) + "\n")
+        self.wiki = self.d / "wiki.train.raw"
+        self.wiki.write_bytes((words(20, 60000) + "\n").encode())
+        self.out = self.d / "prompts.json"
+        self.saved = {k: getattr(tq, k) for k in ("WIKI_SHA256", "CALIB_REV", "CALIB_COMMIT", "CALIB_FILES",
+                                                  "CODE_SHA256", "PROMPTS_SHA256")}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(tq, k, v)
+        self.tmp.cleanup()
+
+    def pin(self, prompts_sha):
+        want = b"".join((self.repo / f).read_bytes() for f in self.files)
+        tq.WIKI_SHA256 = hashlib.sha256(self.wiki.read_bytes()).hexdigest()
+        tq.CALIB_REV, tq.CALIB_COMMIT, tq.CALIB_FILES = "t1", self.commit, self.manifest
+        tq.CODE_SHA256, tq.PROMPTS_SHA256 = hashlib.sha256(want).hexdigest(), prompts_sha
+
+    def prompts(self, *extra):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            tq.main(["prompts", "--repo", str(self.repo), "--out", str(self.out), *extra])
+        return buf.getvalue()
+
+    def test_code_text_is_the_revision_not_the_working_tree(self):
+        files = tq.calib_files(self.manifest)
+        self.assertEqual(files, self.files)
+        want = b"".join((self.repo / f).read_bytes() for f in self.files)
+        self.assertEqual(tq.code_text(self.repo, "t1", files), want)
+        (self.repo / "src/a.cpp").write_text("edited, not committed\n")  # the working tree does not matter
+        git(self.repo, "commit", "-q", "-am", "later")  # nor later commits
+        self.assertEqual(tq.code_text(self.repo, self.commit, files), want)
+        self.assertNotEqual(tq.code_text(self.repo, "HEAD", files), want)
+        with self.assertRaises(SystemExit):
+            tq.code_text(self.repo, "t1", files + ["src/missing.cpp"])
+
+    def test_pinned_prompts_hash_printed_and_checked(self):
+        self.pin("0" * 64)
+        with self.assertRaises(SystemExit):  # wrong expected hash: refused, nothing written
+            self.prompts("--wiki", str(self.wiki))
+        self.assertFalse(self.out.exists())
+        log = self.prompts("--wiki", str(self.wiki), "--force")
+        h = hashlib.sha256(self.out.read_bytes()).hexdigest()
+        self.assertIn(f"prompts.json sha256 {h} (NOT the pinned", log)
+        self.pin(h)
+        self.out.unlink()
+        log = self.prompts("--wiki", str(self.wiki))
+        self.assertIn(f"prompts.json sha256 {h} (the pinned prompts)", log)
+        self.assertEqual(hashlib.sha256(self.out.read_bytes()).hexdigest(), h)
+        prompts = json.loads(self.out.read_text())
+        self.assertEqual(len(prompts), 64)
+        self.assertIn(prompts[0][:200], self.wiki.read_text())  # half WikiText, half code
+        self.assertIn(prompts[32][:200], (self.repo / "src/a.cpp").read_text())
+        # the same text through --text gives the same prompts, but is reported as unpinned
+        code = self.d / "code.txt"
+        code.write_bytes(tq.code_text(self.repo, "t1", self.files))
+        log = self.prompts("--text", str(self.wiki), "--text", str(code))
+        self.assertIn(f"prompts.json sha256 {h} (unpinned", log)
+        log = self.prompts("--wiki", str(self.wiki), "--count", "32")  # other options: written, not checked
+        self.assertIn("(unpinned", log)
+
+    def test_wiki_hash_mismatch_is_refused(self):
+        self.pin("0" * 64)
+        self.wiki.write_bytes(self.wiki.read_bytes() + b" one more word")
+        with self.assertRaises(SystemExit) as cm:
+            self.prompts("--wiki", str(self.wiki), "--force")
+        self.assertIn("sha256", str(cm.exception))
+        self.assertFalse(self.out.exists())
+
+    def test_pinned_code_text_of_this_repository(self):
+        """the shipped pins agree: calib_code_files.txt at CALIB_COMMIT has CODE_SHA256 (needs the full history)"""
+        if not (ROOT / ".git").exists():
+            self.skipTest("not a git checkout")
+        try:
+            git(ROOT, "cat-file", "-e", tq.CALIB_COMMIT + "^{commit}")
+        except subprocess.CalledProcessError:
+            self.skipTest(f"{tq.CALIB_REV} not in this clone (shallow)")
+        code = tq.code_text(ROOT, tq.CALIB_COMMIT, tq.calib_files())
+        self.assertEqual(hashlib.sha256(code).hexdigest(), tq.CODE_SHA256)
+        self.assertEqual(tq.calib_files(), sorted(tq.calib_files()))
 
 
 if __name__ == "__main__":

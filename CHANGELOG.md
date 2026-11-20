@@ -52,6 +52,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
+  WikiText-2 train against its sha256 and takes the code half from the files in
+  `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step
+  prints the sha256 of `prompts.json` and refuses a different one unless `--force`. `--text` still takes any files and
+  is reported as unpinned. The guides state the expected KLD of a rebuild instead of a file hash (GPU GPTQ is not
+  bit-reproducible).
 - 27B on an RTX 3090, 9-16 verify rows (copy passes): the TQ3 gate/up and GDN mixer matvecs read two 16-row tiles per
   block (same numbers). TQ_S + DFlash2-TQ3, greedy, same session: editing code 392.9 -> 402.9 tok/s, editing JSONL
   417.1 -> 428.8; text identical.

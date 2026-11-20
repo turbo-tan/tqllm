@@ -68,17 +68,27 @@ is kept in `models/Qwen3.8-27B-TQV12.gguf.plan.json`.
 ## 4. Calibration text (~110K tokens)
 
 64 prompts of ~6,500 characters: half WikiText-2 *train* (not the test split that the KLD below is measured on), half
-this repository's source code.
+this repository's source code as of the tag `v1.6.0`. Both halves are pinned, so every rebuild starts from the same
+`prompts.json`:
 
 ```sh
 mkdir -p calib
 curl -fsSL -o calib/wt.zip https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 unzip -o -j -q calib/wt.zip wikitext-2-raw/wiki.train.raw -d calib && rm calib/wt.zip
-git ls-files 'src/*.cpp' 'src/*.cu' 'src/*.hpp' 'tools/*.py' | xargs cat > calib/code.txt
-python3 $Q prompts --text calib/wiki.train.raw --text calib/code.txt --out calib/prompts.json
+python3 $Q prompts --wiki calib/wiki.train.raw --out calib/prompts.json
 ```
 
-Other text works too (`--text` takes any files; the prompts are split evenly between them). Text close to how the
+- WikiText-2 is CC BY-SA, so it is downloaded, not committed. `prompts` checks `wiki.train.raw` against its sha256
+  (`6707892fa3788b5ab9ed78ab5ff37d9fe825f6011a2ad4fcd6a6d467f0e7da57`) and refuses another file.
+- The code half is the files listed in `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (commit
+  `933dc6f`), read from git (`git cat-file`, the bytes `git show v1.6.0:<path>` prints), not from the working tree, so
+  it does not change with your checkout. It needs a clone that has that commit: a full clone does; in a shallow clone
+  run `git fetch origin tag v1.6.0` first.
+- It ends with `prompts.json sha256 bc3e6cb00d03f44bdbe8cca902e9b3470916f116cb72e984b76e7d60d0bb5a89 (the pinned
+  prompts)`. A different result is not written (`--force` writes it anyway).
+
+Other text works too: `--text FILE` instead of `--wiki` (repeat it; the prompts are split evenly between the files).
+That text is unpinned (the tool says so), and the numbers on this page were not made with it. Text close to how the
 model will be used is better calibration.
 
 ## 5. Capture and quantise (GPU, the long step)
@@ -163,6 +173,13 @@ RTX 3090, one session, same build:
 - Speed: `bench/relbench.py` defaults (greedy, 400 output tokens, `--kv tq3`, 40,960 context, median of 3). Without a
   drafter TQV-12 decodes within 0.6 % of TQ4; with the drafter the numbers move with the acceptance, which changes
   because the two files generate different text (TQV-12 is not token-identical to TQ_L).
+
+**Checking a rebuild.** Your file will not be byte-identical to the one above, even from the pinned `prompts.json`:
+H and GPTQ run in floating point on the GPU, which is not bit-reproducible, so there is no file hash to compare. Judge it
+by the KLD, measured as above: expect a mean KLD vs BF16 of about 0.018, within 0.0173-0.0195 (the file above: 0.0184
+± 0.0011, the ± being the uncertainty `tqkld` prints). The file in the table was made before the calibration text was
+pinned: the same WikiText-2 half, the code half from the TQV-12 branch's working tree instead of `v1.6.0` (34 of the 64
+prompts are identical).
 
 ## Encoder options: a better TQV-12 file, same format
 
