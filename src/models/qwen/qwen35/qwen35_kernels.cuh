@@ -218,7 +218,10 @@ void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q,
                         const KvCompactSeg * cs = nullptr,
                         // QSA rows of a two-part verify block (qwen35_qsa.cuh): selected blocks [nq][512]; a row whose
                         // split point is >= qsa_from attends to them; qsa_mixed: the block crosses qsa_from
-                        const int32_t * qsa_sel = nullptr, int qsa_from = 0, bool qsa_mixed = false);
+                        const int32_t * qsa_sel = nullptr, int qsa_from = 0, bool qsa_mixed = false,
+                        size_t part_cap = 0);  // floats at part; prefill chunks split long prefixes when it has room
+// floats of attention partials that prefill chunks of up to nbuf tokens use for key splits (attention_kv_split part_cap)
+size_t kv_prefill_partial_floats(int nbuf, int heads, int kvheads);
 void cache_write_kv_side(KvCodec codec, const __nv_bfloat16 * x0, int ts, int n, void * c, const int * dpos0, int kvheads,
                          int dim, cudaStream_t);
 void cache_write_multi_t4kv(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, int ts, int n, Turbo4K256 * kc,

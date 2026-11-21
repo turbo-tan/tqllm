@@ -610,7 +610,8 @@ void Qwen35Engine::allocate() {
     v_qkvc = Buf(NBUF * (2 * lk + lv) * 2);
     part_floats = std::max({!kvf->needs_context_scratch() ? size_t(0) : size_t(NVER) * tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd)),
                             size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NVER, kv_cmp ? 257 : 256)),
-                            size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NBUF, kv_cmp ? 2 : 1))});  // + stand-in slot
+                            size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NBUF, kv_cmp ? 2 : 1)),  // + stand-in slot
+                            kvf->prefill_partial_floats(NBUF, int(cfg.heads), int(cfg.kvheads))});
     if (!cfg.gated_attention) {
         if (std::string(kvf->name()) != "bf16") throw std::invalid_argument("Qwen3 currently requires --kv bf16");
         part_floats = std::max(part_floats, size_t(tqllm_cuda::attention_gen_partial_floats(int(cfg.heads), int(context_), NBUF)));

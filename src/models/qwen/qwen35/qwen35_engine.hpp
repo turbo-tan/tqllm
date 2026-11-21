@@ -1004,6 +1004,7 @@ public:
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
         KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
                     1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr};
+        if (part == v_part.as<float>() && segs.size() <= 1) step.part_floats = part_floats;  // concurrent segments share v_part
         if (qsa.cur && (par || kvf->qsa_one_part())) step.qsa_sel = qsa.cur, step.qsa_from = qsa.from, step.qsa_mixed = qsa.mode == 2;
         kvf->write_and_attend(step);
         if (!cfg.gated_attention) return;

@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
                                                            int heads, int kvheads, float scale, int nsplit,
                                                            const int * dep, int pstride, int zoff, const int * dstart,
                                                            int cstride, const float * kbias, int flat, int poff,
-                                                           const int32_t * sel = nullptr, int from = 0) {
+                                                           const int32_t * sel = nullptr, int from = 0, int pf_keys = 0) {
     constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
     if constexpr (SEL) {
         const int z = blockIdx.y;
@@ -302,6 +302,11 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     const int g = heads / kvheads, rows = nq * g;
     const int r0 = SEL ? 0 : (gridDim.y - 1 - blockIdx.y) * ROWS;
     const int seq0 = *dseq0;
+    // pf_keys > 0 (prefill chunk, nsplit = the most splits): the chunk's prefix (seq0 - 1 keys) is split over
+    // ns = clamp(prefix / pf_keys, 1, nsplit) key ranges, so a long prefix fills the GPU; ns depends on the chunk start
+    // only. ns == 1 is the unsplit kernel (normalised output written here, same arithmetic); else partials, pf_merge_k.
+    const int ns = pf_keys ? max(1, min(nsplit, (seq0 - 1) / pf_keys)) : nsplit;
+    if (split >= ns) return;
     const int q_lo = r0 / g, q_hi = min(r0 + ROWS - 1, rows - 1) / g;
     // pstride > 0 (two-part tree verify): query z at depth dep[z] (zoff + z for a chain) takes the keys below
     // tq_split_point(qpos) and writes a partial with stride pstride; attn_blk_codec_k adds the rest and merges
@@ -311,7 +316,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
         for (int z = q_lo; z <= q_hi; ++z) key_end = max(key_end, qlim(z)), mask_from = min(mask_from, qlim(z));
     // tiles interleaved over the splits (tile i -> split i % nsplit): a query's result does not depend on nq
     // dstart (TqCache): keys below it are served by a compact stand-in segment (attn_compact_k); multiple of TILE
-    const int stride = nsplit * TILE, kbeg = (dstart ? *dstart : 0) + split * TILE, kend = key_end;
+    const int stride = ns * TILE, kbeg = (dstart ? *dstart : 0) + split * TILE, kend = key_end;
     const int ntile = kbeg < kend ? (kend - kbeg + stride - 1) / stride : 0;
 
     // Q -> TQ3_0 rotation per 32 (signs, WHT / sqrt(32)) -> int8 per (row, 128)
@@ -498,7 +503,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     l_b += __shfl_xor_sync(0xffffffffu, l_b, 2);
     const int ga = r0 + ra, gb = r0 + rb;
     const int64_t ha = int64_t(ga / g) * heads + kh * g + ga % g, hb = int64_t(gb / g) * heads + kh * g + gb % g;
-    if (nsplit == 1 && !pstride && !cstride) {
+    if (ns == 1 && !pstride && !cstride) {
         const float ia = l_a > 0.f ? 1.f / l_a : 0.f, ib = l_b > 0.f ? 1.f / l_b : 0.f;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
@@ -633,6 +638,27 @@ template <class VC> static void inverse_v(__nv_bfloat16 * y, int nq, int h, cuda
     }
 }
 
+// prefill split partials -> BF16 rows (the split count of the chunk, see pf_keys in attn_tq3kv_k; ns == 1: written by
+// the attention kernel). Natural-log maxima as attn_gen_merge_k; one reciprocal per row as the unsplit kernel.
+__global__ void __launch_bounds__(256) pf_merge_k(const float * part, __nv_bfloat16 * y, int nsplit, int heads,
+                                                  const int * dseq0, int pf_keys) {
+    const int ns = max(1, min(nsplit, (*dseq0 - 1) / pf_keys));
+    if (ns == 1) return;
+    const int h = blockIdx.x, d = threadIdx.x, qz = blockIdx.y;
+    const float * base = part + (int64_t(qz) * heads + h) * nsplit * (tq3a::DIM + 2);
+    float m = -CUDART_INF_F;
+    for (int s = 0; s < ns; ++s) m = fmaxf(m, base[s * (tq3a::DIM + 2) + tq3a::DIM]);
+    float zz = 0.f, acc = 0.f;
+    for (int s = 0; s < ns; ++s) {
+        const float * pp = base + s * (tq3a::DIM + 2);
+        if (!(pp[tq3a::DIM + 1] > 0.f)) continue;
+        const float w = expf(pp[tq3a::DIM] - m);
+        zz += pp[tq3a::DIM + 1] * w;
+        acc += pp[d] * w;
+    }
+    y[(int64_t(qz) * heads + h) * tq3a::DIM + d] = __float2bfloat16_rn(acc * (zz > 0.f ? 1.f / zz : 0.f));
+}
+
 // pstride > 0: tree verify cache part only (partials, no merge / inverse; see attn_blk_codec_k)
 template <int NW, class KC, class VC, int NB = 2>
 static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc, __nv_bfloat16 * y,
@@ -649,6 +675,46 @@ static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_
         q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, dep, pstride, zoff, dstart, cstride, kbias, flat, poff);
     if (pstride || cstride) return;
     if (nsplit > 1) attention_merge256(part, y, nsplit, h, nq, s);
+    inverse_v<VC>(y, nq, h, s);
+}
+
+// Prefill chunk (more than 64 rows): 128 rows per block, one block per SM, every block walks the whole prefix. A chunk of
+// a few hundred queries gives only kh * blocks equal blocks (512 queries x 6 heads: 96 on an 82-SM card, two waves with
+// the second one 17 % full), so a long prefix is split over up to PF_MAXS key ranges to fill about PF_WAVES waves.
+constexpr int PF_MAXS = 8, PF_WAVES = 4, PF_KEYS = 4096;  // PF_KEYS: prefix keys per split (fewer: no split)
+static int sm_count() {
+    static int sms = 0;
+    if (!sms) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        sms = sms > 0 ? sms : 32;
+    }
+    return sms;
+}
+static int pf_splits(int nq, int h, int kh) {
+    const int units = kh * (((h / kh) * nq + 127) / 128);
+    return std::clamp((PF_WAVES * sm_count() + units - 1) / units, 1, PF_MAXS);
+}
+size_t kv_prefill_partial_floats(int nbuf, int heads, int kvheads) {
+    size_t most = 0;
+    for (int nq = 1; nq <= nbuf; ++nq)
+        if ((heads / kvheads) * nq > 64) most = std::max(most, size_t(nq) * heads * (tq3a::DIM + 2) * pf_splits(nq, heads, kvheads));
+    return most;
+}
+template <class KC, class VC>
+static void tq3_prefill(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc, __nv_bfloat16 * y, float * part,
+                        size_t part_cap, const int * dseq0, int nq, int h, int kh, float scale, cudaStream_t s) {
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(attn_tq3kv_k<8, KC, VC, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tq3a::smem<8, 2>()));
+        configured = true;
+    }
+    const size_t room = part_cap / (size_t(nq) * h * (tq3a::DIM + 2));  // splits the partials buffer holds
+    const int ns = std::max(1, int(std::min<size_t>(pf_splits(nq, h, kh), room))), blocks = ((h / kh) * nq + 127) / 128;
+    attn_tq3kv_k<8, KC, VC, 2><<<dim3(kh, blocks, ns), 256, tq3a::smem<8, 2>(), s>>>(
+        q, kc, vc, y, part, dseq0, nq, h, kh, scale, ns, nullptr, 0, 0, nullptr, 0, nullptr, 0, 0, nullptr, 0, PF_KEYS);
+    if (ns > 1) pf_merge_k<<<dim3(h, nq), 256, 0, s>>>(part, y, ns, h, dseq0, PF_KEYS);
     inverse_v<VC>(y, nq, h, s);
 }
 
@@ -869,7 +935,7 @@ template <class KC, class VC>
 static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void * vc, __nv_bfloat16 * y, float * part,
                             const int * dseq0, int nq, int h, int kh, float scale, int nsplit, cudaStream_t s,
                             const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel, int qsa_from,
-                            bool qsa_mixed) {
+                            bool qsa_mixed, size_t part_cap) {
     const int * d0 = cs ? cs->start : nullptr;
     if (h % kh) throw std::invalid_argument("attention_kv_split: heads % kvheads");
     const auto * k = static_cast<const uint8_t *>(kc);
@@ -920,21 +986,21 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
     if ((h / kh) * nq <= 64) {
         tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, s);
     }
-    else tq3_launch<8, KC, VC>(q, k, v, y, part, dseq0, nq, h, kh, scale, 1, s);
+    else tq3_prefill<KC, VC>(q, k, v, y, part, part_cap, dseq0, nq, h, kh, scale, s);
 }
 
 void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q, const void * kc, const void * vc,
                         __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit,
                         cudaStream_t s, const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel,
-                        int qsa_from, bool qsa_mixed) {
+                        int qsa_from, bool qsa_mixed, size_t part_cap) {
     auto with_v = [&](auto kt) {
         using KC = decltype(kt);
         switch (vcodec) {
-            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
         }
         throw std::invalid_argument("attention_kv_split: unsupported V codec");
     };
