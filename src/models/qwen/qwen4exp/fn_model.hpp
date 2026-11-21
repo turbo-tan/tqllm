@@ -245,17 +245,21 @@ inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
         pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
     }
     pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
-    std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
-    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
-        for (int64_t i; (i = next++) < total;) {
-            const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e, false); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
-            for (int k = 0; k < 6; ++k) {
-                require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
-                std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
+    // one layer at a time, dropping its file pages after the copy, so the page cache never holds the whole
+    // trunk beside the pinned pack (on a 64 GB host that doubling pushed other programs to swap at start-up)
+    for (int l = 0; l < c.layers; ++l) {
+        std::atomic<int> next{0}; std::vector<std::thread> pool;
+        for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&, l] {
+            for (int e; (e = next++) < c.experts;) {
+                const auto parts = repack_expert(checkpoint, l, e, false); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+                for (int k = 0; k < 6; ++k) {
+                    require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
+                    std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
+                }
             }
-        }
-    });
-    for (auto & t : pool) t.join();
+        });
+        for (auto & t : pool) t.join();
+        checkpoint.release_layer_expert_pages(l);
+    }
     pe.map = host; pe.tiled = false; return pe;
 }
