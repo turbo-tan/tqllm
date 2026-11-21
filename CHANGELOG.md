@@ -6,6 +6,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Fixed
+- Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
+  them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
