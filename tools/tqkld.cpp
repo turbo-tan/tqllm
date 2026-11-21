@@ -110,7 +110,7 @@ int llama_base_mode(const std::string & model_path, const std::string & tok_path
     tqllm::Model model(model_path, tok_path, n_ctx + 64, 1, kld_engine());
     model.set_full_logits(true);  // KLD needs every logit, not the two-stage top-16
     if (int(model.vocab_size()) != n_vocab)
-        std::fprintf(stderr, "tqkld: vocabulary %zu vs base %d (the extra rows are ignored)\n", model.vocab_size(), n_vocab);
+        std::fprintf(stderr, "tqkld: vocabulary %zu vs base %d (the extra rows are ignored)\n", size_t(model.vocab_size()), n_vocab);
     const size_t V = model.vocab_size();
     const int nv = 2 * ((n_vocab + 1) / 2) + 4, first = int(n_ctx) / 2, nscore = int(n_ctx) - 1 - first;
     const int B = std::clamp(block, 1, 8);
