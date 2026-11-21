@@ -52,6 +52,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- Faster 8-column verify (DFlash2 tree steps), same output bit for bit: the TQT / TQ4 matvec at 5-8 columns and the 4-bit
+  head at 8 / 16 columns now ask for a 32 KB shared-memory carveout instead of the driver's 64 KB, so the activations
+  every 16-row block re-reads stay in L1 more often (ncu at a locked 1.38 GHz, ffn gate+up at 8 columns: 136 -> 129 us,
+  L1 hit rate 62 -> 66 %, L2 throughput 78 -> 75 %, DRAM 77 -> 81 %; the decode runs at the 350 W cap, SM ~1.65 GHz).
+  a Qwen3.8-27B fine-tune in TQT + DFlash2-TQ3, RTX 3090, `--kv q8/q4`, int8 prefill, host embed / head: gate+up 130 -> 120 us
+  per call in the verify, all target matvecs -6 % per step; 5-code needle replies decode 203.8 / 166.1 / 152.9 ->
+  207.7 / 169.7 / 157.3 tok/s at 35K / 109K / 137K, relbench DFlash2 +3-5 % at 2K / 8K, +3 % at 32K; identical replies
+  and accepted / drafted counts. Decode without a drafter (1 column) keeps the old launch configuration.
 - TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
   WikiText-2 train against its sha256 and takes the code half from the files in
   `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step
