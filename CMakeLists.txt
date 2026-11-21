@@ -60,7 +60,9 @@ if(MSVC)
   target_compile_options(tqllm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3 /utf-8 /permissive- /Zc:__cplusplus>)
   target_compile_definitions(tqllm PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
 else()
-  target_compile_options(tqllm PRIVATE -Wall -Wextra -Wpedantic)
+  # -Wpedantic for C++ only: nvcc hands it to the host compiler, which then flags every GNU line marker
+  # (`# 1 "file"`) in nvcc's generated .cudafe1 files.
+  target_compile_options(tqllm PRIVATE -Wall -Wextra $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>)
 endif()
 if(TQLLM_MLX)
   include(cmake/mlx.cmake)
