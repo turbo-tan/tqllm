@@ -594,8 +594,7 @@ void Qwen35Engine::allocate() {
     s_id = Buf(size_t(NB) * 16 * 4);
     s_lg = Buf(size_t(NB) * 16 * 4);
     s_scr = Buf(size_t(NB) * 64 * 16 * 8);
-    h_sid.resize(size_t(NB) * 16);
-    h_slg.resize(size_t(NB) * 16);
+    hs.init(lm_head.rows, int(cfg.hidden), NB, head_fp(), head4s.p, stream);
     v_amax = Buf(size_t(NB) * 128 * 8);
     v_mix_rows = mix_rows;
     const bool bf16_ba = std::any_of(layer.begin(), layer.end(), [](const Layer & L) { return L.w_ba.p; });
@@ -1133,6 +1132,7 @@ void Qwen35Engine::build_head4() {
     h2_vals = Buf(size_t(NB) * 16 * 4);
     h2_idx = Buf(size_t(NB) * 16 * 4);
     h2_scr = Buf(size_t(NB) * 64 * 16 * 8);
+    hs.init(lm_head.rows, int(cfg.hidden), NB, head_fp(), head4s.p, stream);  // first-pass error table (exact sampling)
     sync_ck();
 }
 

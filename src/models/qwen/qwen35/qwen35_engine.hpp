@@ -76,6 +76,7 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
 #include "token_sampling.hpp"
+#include "head_sampler.hpp"
 #include "layer_split.hpp"
 #include "../../../kv/prompt_park.hpp"
 #include "tp_comm.hpp"
@@ -560,10 +561,19 @@ private:
     const __half * h8_dev_s = nullptr;
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
     Buf sp_norm, sp_codes, sp_packed, sp_message, sp_delta, sp_raw, sp_rms, sp_predcodes, sp_predpv, sp_refmsg, sp_refdelta, sp_refined, sp_part;
-    Buf head4, head4s;  // draft-only 4-bit copy of head8 (DFlash2 full-vocabulary draft head)
+    Buf head4, head4s;  // first-pass 4-bit u4h copy of head8 (codes, (scale, min) pairs)
+    HeadSampler::FirstPass head_fp() const { return head4.p ? HeadSampler::FirstPass::U4h : HeadSampler::FirstPass::Exact; }
+    // first-pass logits of rows [0, rows) (or the rows rid[0 .. rows)) of head4 for n FP16 inputs
+    void head4_mv(const __half * x, float * y, int rows, int n, const uint32_t * rid = nullptr) {
+        const int H = int(cfg.hidden);
+        if (rid) tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), rid, x, y, rows, H, n, stream);
+        else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), x, y, rows, H, n, stream);
+    }
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
-    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (token_sampling.hpp)
+    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; HeadSampler turns them,
+    // the first-pass logits and their error bounds into exact draws over the whole vocabulary (head_sampler.hpp)
     SamplingParams samp;
+    HeadSampler hs;
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
@@ -622,8 +632,6 @@ private:
     void swap_seq(SeqState & s);
     std::mt19937_64 rng{0};
     Buf s_id, s_lg, s_scr;
-    std::vector<uint32_t> h_sid;
-    std::vector<float> h_slg;
     bool sampling() const { return samp.temperature > 0.f; }
     bool batch_topk = false;  // batched verify with at least one sampling slot: every column returns its top-16
     bool want_topk() const { return batch_topk || sampling(); }
@@ -1020,9 +1028,26 @@ public:
     // Head on columns [col0, col0 + n) of v_x; writes v_tok (and the sampling top-16) at the same columns.
     void head_argmax(const float * norm_w, int n, int col0 = 0);
 
-    // Column col's sampling distribution (token_sampling.hpp top_dist); recent: the last output tokens before this column
-    TopDist dist(int col, const std::vector<uint32_t> & recent = {}) const {
-        return top_dist(h_slg.data() + size_t(col) * 16, h_sid.data() + size_t(col) * 16, samp, recent);
+    // the head pass ran as 4-bit first pass + int8 re-score (head_argmax's two-stage branch)
+    bool head_two_stage() const { return !lm_head.fmt && !full_logits && head4.p && has_head8(); }
+    // After a head pass with sampling columns [c0, c0 + n) at temperature t, before the stream sync: the screen statistics
+    // and the top-16 to the host.
+    void queue_sample(int c0, int n, float t) {
+        if (full_logits || n <= 0) return;  // the reference reads every logit after the sync
+        std::vector<float> temps(size_t(n), t);
+        hs.queue_stats(v_logits.as<float>(), s_id.as<uint32_t>(), s_lg.as<float>(), c0, n, temps.data(), stream);
+    }
+    // After the sync: the exact draws of the active slot's columns (token_sampling.hpp)
+    std::vector<uint32_t> sample_cols(const std::vector<HeadSampleCol> & cols) {
+        if (full_logits) return hs.sample_full(cols, samp, v_logits.as<float>(), stream);
+        const bool two = head_two_stage();
+        return hs.sample(cols, samp, v_logits.as<float>(), two ? w8() : nullptr, two ? s8() : nullptr, stream);
+    }
+    // the penalty window before the active slot's next token (empty without penalties)
+    std::vector<uint32_t> recent_out() const {
+        if (!samp.penalized()) return {};
+        const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
+        return {gen.out.begin() + long(r0), gen.out.end()};
     }
 
     // token embeddings of n device-resident ids -> Y [n][hidden] (BF16)
@@ -1188,8 +1213,7 @@ public:
                     const __half * xc = v_xh.as<__half>() + size_t(c0) * H;
                     float * yc = v_logits.as<float>() + size_t(c0) * head_rows;
                     if (dsub_rows) dsub_matvec(xc, yc, std::min(32, DB - c0));
-                    else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), xc, yc, head_rows, H,
-                                                std::min(32, DB - c0), stream);
+                    else head4_mv(xc, yc, head_rows, std::min(32, DB - c0));
                 }
             } else {  // LM head (or its draft-vocabulary rows) in a registered weight format (TQ4, W4A16, ...)
                 const Mat & hm = dsub_mat.p ? dsub_mat : lm_head;
@@ -1355,8 +1379,7 @@ public:
             head_rows = lm_head.rows;
             tqllm_cuda::bf16_to_h(TE, v_xh.as<__half>(), B * H, stream);
             if (head4.p)
-                tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(),
-                                       head_rows, H, B, stream);
+                head4_mv(v_xh.as<__half>(), v_logits.as<float>(), head_rows, B);
             else if (lm_head.fmt)
                 head_mv(TE, B);
             else
@@ -1427,7 +1450,7 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D);
 
     // Accepted draft count j for the active slot; res[j] becomes the token after them. Column col0 + i of the verify
-    // holds the target's prediction after draft token i - 1 (greedy: res[i]; sampling: h_sid / h_slg top-16).
+    // holds the target's prediction after draft token i - 1 (greedy: res[i]; sampling: its exact draw, sample_cols).
     int accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0);
 
     // Batched decode step: each slot drafts, one verify runs every slot's columns (weights read once), then each

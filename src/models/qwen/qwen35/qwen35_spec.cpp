@@ -18,10 +18,7 @@ void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t
     h_pos[0] = int(pos);
     h_pos[1] = int(pos) + 1;
     verify_async(h_tok, h_pos, n, pos, next, true);
-    if (sampling()) {
-        ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-        ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-    }
+    if (sampling()) queue_sample(0, n, samp.temperature);
     sync_ck();
 }
 
@@ -284,11 +281,11 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                         sync_ck();
                         next = h_tok[0];
                         if (sampling()) {  // sample the first token now: the first MTP draft below must follow it, and
-                                           // the draft's head pass may overwrite column 0's top-16 on the device
-                            const size_t tc = final_top16(m);
-                            ck(cudaMemcpy(h_sid.data(), s_id.as<uint32_t>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
-                            ck(cudaMemcpy(h_slg.data(), s_lg.as<float>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
-                            next = draw(dist(0), rng);
+                                           // the draft's head pass overwrites the head's logits on the device
+                            const int tc = int(final_top16(m) / 16);
+                            queue_sample(tc, 1, samp.temperature);
+                            sync_ck();
+                            next = sample_cols({HeadSampleCol{tc, P, {}}})[0];
                         }
                     }
                     const int pairs = int(std::min<uint32_t>(uint32_t(m), P - t - 1));
@@ -330,10 +327,10 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         }
         if (!use_mtp) next = h_tok[0];
         if (sampling() && !use_mtp) {  // the last prompt position's top-16 (MTP: sampled in the loop)
-            const size_t tc = final_top16(m_last);
-            ck(cudaMemcpy(h_sid.data(), s_id.as<uint32_t>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
-            ck(cudaMemcpy(h_slg.data(), s_lg.as<float>() + tc, 16 * 4, cudaMemcpyDeviceToHost));
-            next = draw(dist(0), rng);
+            const int tc = int(final_top16(m_last) / 16);
+            queue_sample(tc, 1, samp.temperature);
+            sync_ck();
+            next = sample_cols({HeadSampleCol{tc, P, {}}})[0];
         }
         if (kv_cmp && opt.kv_compact_turn) {  // refit the old blocks on this request's queries before decoding
             const auto tc = std::chrono::steady_clock::now();
@@ -364,14 +361,19 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
 
 int Qwen35Engine::accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0) {
     int j = 0;
-    if (sampling()) {  // speculative sampling with a deterministic draft: exact samples of the target's p
-        std::vector<uint32_t> recent;  // penalty window: the output so far, then each draft token as it is accepted
-        if (samp.penalized()) {
-            const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
-            recent.assign(gen.out.begin() + long(r0), gen.out.end());
+    if (sampling()) {
+        // Every column's exact draw (Gumbel noise keyed by the sampled token's position, token_sampling.hpp); a draft is
+        // accepted while it equals the draw at its position, the first other draw is the next token. Each output token
+        // is thereby an exact sample of the target at its own prefix, and the reply does not depend on the drafts.
+        std::vector<HeadSampleCol> cols(draft.size() + 1);
+        std::vector<uint32_t> recent = recent_out();  // penalty window: the output so far, then the drafts before the column
+        for (size_t i = 0; i < cols.size(); ++i) {
+            cols[i] = HeadSampleCol{col0 + int(i), gen.pos + 1 + uint32_t(i), recent};
+            if (samp.penalized() && i < draft.size()) recent.push_back(draft[i]);
         }
-        j = accept_drafts(draft.data(), int(draft.size()), [&](int i, const std::vector<uint32_t> & r) { return dist(col0 + i, r); },
-                          rng, res, recent, samp.penalized());
+        const auto tok = sample_cols(cols);
+        while (j < int(draft.size()) && draft[size_t(j)] == tok[size_t(j)]) ++j;
+        res[j] = tok[size_t(j)];
     } else {
         while (j < int(draft.size()) && draft[j] == res[j]) ++j;
     }
@@ -463,10 +465,11 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
-    if (batch_topk) {
-        ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(col) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-        ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(col) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-    }
+    if (batch_topk)
+        for (const auto & g : segs) {  // each sampling slot's columns at its own temperature
+            const float t = g.slot == active ? samp.temperature : parked[size_t(g.slot)].samp.temperature;
+            if (t > 0.f) queue_sample(g.col0, g.n, t);
+        }
     sync_ck();
     const auto p2 = std::chrono::steady_clock::now();
     const auto batch = segs;
@@ -589,10 +592,7 @@ bool Qwen35Engine::dflash_advance() {
         in.resize(size_t(n));
         ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
         ck(cudaMemcpyAsync(tpar.data(), d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
-        if (sampling()) {  // every node's top-16: the walk below draws from them
-            ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-            ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
-        }
+        if (sampling()) queue_sample(0, n, samp.temperature);  // every node's draw: the walk below follows them
         sync_ck();
         const auto t2 = now();
         gen.t_draft += ms(t0, t1);
@@ -602,24 +602,35 @@ bool Qwen35Engine::dflash_advance() {
         uint32_t drawn = 0;  // sampled walk: the draw that left the tree (the next token)
         if (sampling()) {
             // Sampled tree walk: at each node on the path the next token is drawn from the target's distribution there
-            // (top-16, penalties, temperature, top-k, top-p: the same dist() as chain verification). A child that holds
+            // (penalties, temperature, top-k, top-p: the same exact draw as chain verification). A child that holds
             // the drawn token continues the path; otherwise the draw itself is the next token. Every output token is
             // therefore a plain sample of the target at its own prefix: exact, whatever the tree proposed. With siblings
             // that repeat a token (a lookup / copy chain beside the tree) the last one is taken, a choice by position only
             // (by depth would look at later draws): the chains sit after the tree columns, so a drafter sibling equal to
             // the copy's first token no longer cuts the copy off.
-            std::vector<uint32_t> recent;  // penalty window: the output so far, then each accepted token
-            if (samp.penalized()) {
-                const size_t no = gen.out.size(), r0 = no > size_t(kPresenceLastN) ? no - kPresenceLastN : 0;
-                recent.assign(gen.out.begin() + long(r0), gen.out.end());
+            // Every node's draw is computed up front: node c samples the token at position pos + depth(c) + 1 with the
+            // penalty window of its own path (the output so far, then the tokens from the root to c).
+            std::vector<int> dep(static_cast<size_t>(n), 0);
+            std::vector<HeadSampleCol> cols(static_cast<size_t>(n));
+            const auto base = recent_out();
+            for (int c = 0; c < n; ++c) {
+                if (c) dep[size_t(c)] = dep[size_t(tpar[size_t(c)])] + 1;
+                cols[size_t(c)].col = c;
+                cols[size_t(c)].pos = pos + 1 + uint32_t(dep[size_t(c)]);
+                if (samp.penalized()) {
+                    std::vector<uint32_t> up;
+                    for (int a = c; a > 0; a = tpar[size_t(a)]) up.push_back(in[size_t(a)]);
+                    cols[size_t(c)].recent = base;
+                    cols[size_t(c)].recent.insert(cols[size_t(c)].recent.end(), up.rbegin(), up.rend());
+                }
             }
+            const auto tok = sample_cols(cols);
             for (int node = 0;;) {
-                drawn = draw(dist(node, recent), rng);
+                drawn = tok[size_t(node)];
                 int next = -1;
                 for (int c = n - 1; c > node && next < 0; --c)
                     if (tpar[size_t(c)] == node && in[size_t(c)] == drawn) next = c;
                 if (next < 0) break;
-                if (samp.penalized()) recent.push_back(drawn);
                 path.push_back(next);
                 node = next;
             }
@@ -777,6 +788,20 @@ std::vector<uint32_t> Qwen35Engine::dflash_finish(uint64_t * stats) {
     }
     auto out = std::move(gen.out);
     gen = Gen{};
+    if (tqllm::debug_on("sample_stats") && hs.stats.cols) {
+        const auto & h = hs.stats;
+        std::fprintf(stderr, "exact sampling: %llu columns, %llu decided by the top-16, re-score rounds: %llu x 64 rows, "
+                     "%llu x 1024 rows, %llu x 8192 rows, %llu Gumbel screens, %llu full int8 passes\n", (unsigned long long) h.cols,
+                     (unsigned long long) h.round1, (unsigned long long) h.rounds64, (unsigned long long) h.rounds1024,
+                     (unsigned long long) h.rounds8192,
+                     (unsigned long long) h.gumbel, (unsigned long long) h.full);
+        if (h.chk_cols)
+            std::fprintf(stderr, "head check: %llu columns, %llu draws differ from the every-row reference; first-pass errors "
+                         "over %llu rows: > 3 sigma %llu, > 4 %llu, > 5 %llu, > 6 %llu, largest %.2f sigma\n",
+                         (unsigned long long) h.chk_cols, (unsigned long long) h.chk_diff, (unsigned long long) h.chk_rows,
+                         (unsigned long long) h.chk_over[0], (unsigned long long) h.chk_over[1],
+                         (unsigned long long) h.chk_over[2], (unsigned long long) h.chk_over[3], h.chk_max);
+    }
     if (tqllm::debug_on("steps"))
         std::fprintf(stderr, "finish prompt %u out %zu steps %llu drafted %llu accepted %llu\n", P, out.size(),
                      (unsigned long long) steps, (unsigned long long) drafted, (unsigned long long) accepted);

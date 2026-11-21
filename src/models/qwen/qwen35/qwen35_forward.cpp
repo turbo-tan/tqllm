@@ -927,6 +927,7 @@ void Qwen35Engine::set_sampling(float temperature, float top_p, int top_k, uint6
     samp.presence = presence > 0.f ? presence : 0.f;
     samp.top_p = top_p > 0.f && top_p <= 1.f ? top_p : 1.f;
     samp.top_k = top_k;
+    samp.seed = seed;
     rng.seed(seed);
 }
 
@@ -1295,22 +1296,26 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
     if (two_stage && head4.p && has_head8() && (n <= NVER || !segs.empty())) {  // same head path for decode and verify
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
         for (int c0 = 0; c0 < n; c0 += 32)  // batched verify: every slot's columns in one pass per 32
-            tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>() + size_t(c0) * H,
-                                   v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows, H,
-                                   std::min(32, n - c0), stream);
+            head4_mv(v_xh.as<__half>() + size_t(c0) * H, v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows,
+                     std::min(32, n - c0));
         tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, h2_vals.as<float>(), h2_idx.as<uint32_t>(),
                                h2_scr.p, stream);
         tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(),
                                        h2_idx.as<uint32_t>(), H, n, tok_out, stream,
                                        want_topk() ? lg_out : nullptr);
-        if (want_topk())
+        if (want_topk()) {
             ck(cudaMemcpyAsync(id_out, h2_idx.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToDevice, stream));
+            if (col0 == 0) hs.save_x(v_xh.as<__half>(), n, stream);  // later re-scores of these columns (HeadSampler)
+        }
         return;
     }
     if (has_head8()) {  // int8 + FP16-scale copy of the Q6_K head on FP16 tensor cores
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
-        tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>(), v_logits.as<float>(),
-                               lm_head.rows, H, n, stream);
+        if (full_logits && want_topk())  // TQLLM_DEBUG=full_head sampling reference: the re-score's arithmetic on every row
+            hs.rescore_all(w8(), s8(), v_xh.as<__half>(), n, v_logits.as<float>(), stream);
+        else
+            tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>(), v_logits.as<float>(),
+                                   lm_head.rows, H, n, stream);
     } else {
         tqllm_cuda::bf16_to_f32(NP, v_xf.as<float>(), n * H, stream);
         tqllm_cuda::q6k_matvec(lm_head.p, v_xf.as<float>(), v_logits.as<float>(), lm_head.rows, H, n, stream);
@@ -1482,8 +1487,7 @@ const bf16 * Qwen35Engine::vocab_table(const GgufFile & f, const std::string & n
 
 void Qwen35Engine::dsub_matvec(const __half * x, float * y, int n) {
     if (dsub_in_head4)
-        tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), dsub_ids.as<uint32_t>(), x, y, dsub_rows,
-                                   int(cfg.hidden), n, stream);
+        head4_mv(x, y, dsub_rows, n, dsub_ids.as<uint32_t>());
     else
         tqllm_cuda::u4h_matvec(dsub_w.as<uint8_t>(), dsub_s.as<__half2>(), x, y, dsub_rows, int(cfg.hidden), n, stream);
 }
@@ -1588,8 +1592,7 @@ void Qwen35Engine::dspark_forward(uint32_t pos) {
     const int head_rows = lm_head.rows;
     tqllm_cuda::bf16_to_h(TE, v_xh.as<__half>(), NB * H, stream);
     if (head4.p)
-        tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(),
-                               head_rows, H, NB, stream);
+        head4_mv(v_xh.as<__half>(), v_logits.as<float>(), head_rows, NB);
     else if (lm_head.fmt)
         head_mv(TE, NB);
     else
