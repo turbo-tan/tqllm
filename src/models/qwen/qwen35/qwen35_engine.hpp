@@ -498,12 +498,13 @@ private:
     static_assert(NVER >= 8 && NVER <= 16);
     int cur = 0;
     bf16 * conv_slot(uint32_t lin, int slot) { return conv_state[lin * NSLOT + (slot % NSLOT)].as<bf16>(); }
-    float * rec_buf(uint32_t lin) { return rec_state[lin].as<float>(); }
+    void * rec_buf(uint32_t lin) { return rec_state[lin].p; }
+    bool gdn_f16() const { return opt.gdn_state_f16; }  // --gdn-state f16
     // blocks committed whole: one token (decode) and prefill chunks (no stash to replay from)
     static bool gdn_whole(int n) { return n == 1 || n > NVER; }
 
     size_t conv_bytes() const { return size_t(cfg.conv_k - 1) * (2 * cfg.lin_kheads * cfg.lin_dk + cfg.lin_vheads * cfg.lin_dv) * 2; }
-    size_t rec_bytes() const { return size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4; }
+    size_t rec_bytes() const { return size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * (gdn_f16() ? 2 : 4); }
     void reset_state();
 
     // RoPE scaling from the CLI, else the GGUF; the tables are global to the qwen35 kernels (one model per process).

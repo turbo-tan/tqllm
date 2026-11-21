@@ -123,7 +123,7 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
             }
             tqllm_cuda::conv_step(qkv, conv_slot(lin_i, cur), L.conv_w, qkvc, qkv_dim, stream);
             tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_buf(lin_i), core, lkh, lvh, dk, dv,
-                                 cfg.tiled, stream);
+                                 cfg.tiled, stream, gdn_f16());
             tqllm_cuda::gated_rms(core, z, L.gnorm_w, gn, lvh, dv, cfg.eps, stream);
             prep(gn, zdim);
             mm(L.w_out, gn, mp);
@@ -1685,7 +1685,7 @@ void Qwen35Engine::flush_pending() {
         const bf16 * B0 = T + qkv_dim + zdim;
         tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
                               rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                              d_chain.as<int>());
+                              d_chain.as<int>(), {}, gdn_f16());
         ++lin_i;
     }
     cur = (cur + 1) % NSLOT;

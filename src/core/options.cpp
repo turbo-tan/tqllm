@@ -35,6 +35,7 @@ std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext
     std::vector<std::string> out;
     if (!o.exact) return out;
     if (o.prefill_int8 == 1) out.push_back("--prefill-int8 on: int8 prefill GEMMs (KLD 0.003-0.007 vs FP16 prefill)");
+    if (o.gdn_state_f16) out.push_back("--gdn-state f16: FP16 Gated DeltaNet state (KLD +0.0006 vs FP32)");
     if (o.prefill_fp8 == 1) out.push_back("--prefill-fp8 on: FP8 prefill GEMMs (KLD 0.003-0.005 vs FP16 prefill)");
     if (const std::string kv = o.kv_format(); kv != "bf16") out.push_back("KV " + kv + " (-ctk / -ctv / --kv): a lossy KV cache");
     if (flashnext)
@@ -104,6 +105,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         const std::string v = value();
         if (v != "on" && v != "off") throw std::invalid_argument(a + " must be on or off");
         (a == "--embed-host" ? o.embed_host : o.head_host) = v == "on";
+    }
+    else if (a == "--gdn-state") {
+        const std::string v = value();
+        if (v != "f32" && v != "f16") throw std::invalid_argument("--gdn-state must be f32 or f16");
+        o.gdn_state_f16 = v == "f16";
     }
     else if (a == "--prefill-int8") {
         const std::string v = value();
@@ -180,7 +186,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--gdn-state f32|f16] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
            "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
