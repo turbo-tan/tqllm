@@ -96,9 +96,10 @@ void conv_step2(const __nv_bfloat16 * x, const __nv_bfloat16 * in, __nv_bfloat16
 // Gated delta rule decode step. qkv: conv output [q(kh*dk) | k(kh*dk) | v(vh*dv)]; a, b: [vh]; neg_a = -exp(A_log),
 // dt_bias: [vh] FP32; state: [vh][dk][dv] FP32. Value head h reads key head h / (vh/kh) (HF "grouped" order) or
 // h % kh ("tiled" order, as written by llama.cpp's GGUF converter).
+// f16_state: the state is stored as FP16 (__half), else FP32 (see gdn_multi)
 void gdn_step(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, const __nv_bfloat16 * b, const float * neg_a,
-              const float * dt_bias, float * state, __nv_bfloat16 * out, int kheads, int vheads, int dk, int dv,
-              bool tiled, cudaStream_t);
+              const float * dt_bias, void * state, __nv_bfloat16 * out, int kheads, int vheads, int dk, int dv,
+              bool tiled, cudaStream_t, bool f16_state = false);
 // Same, reading the recurrent state from `in` and writing the updated state to `out`.
 void gdn_step2(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, const __nv_bfloat16 * b, const float * neg_a,
                const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads, int vheads, int dk,
@@ -121,7 +122,7 @@ struct GdnReplay {
     const __nv_bfloat16 * b0 = nullptr;
     int abs_ = 0;
     const int * pend = nullptr;
-    float * smid = nullptr;               // recurrent state after the replay
+    void * smid = nullptr;                // recurrent state after the replay (the state's storage type)
 };
 void conv_multi(const __nv_bfloat16 * xin, int x_stride, int n, const __nv_bfloat16 * in, __nv_bfloat16 * out,
                 const float * w, __nv_bfloat16 * y, int channels, cudaStream_t, const int * par = nullptr,
@@ -129,11 +130,12 @@ void conv_multi(const __nv_bfloat16 * xin, int x_stride, int n, const __nv_bfloa
 // Gated delta rule over n tokens: qkv [n][qkv_dim] (conv output), a[i] = a0 + i * ab_stride, b likewise; state read
 // from `in`, final state written to `out` (may alias: each thread reads its state elements before it writes them;
 // nullptr: not written); y [n][vh * dv]. Each thread keeps one state column in registers. GdnReplay::smid may alias
-// `in` likewise.
+// `in` likewise. f16_state: the state is stored as FP16 (__half) and rounded to it after every token (the math stays
+// FP32), else FP32.
 void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const __nv_bfloat16 * b0, int ab_stride,
-               const float * neg_a, const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads,
+               const float * neg_a, const float * dt_bias, const void * in, void * out, __nv_bfloat16 * y, int kheads,
                int vheads, int dk, int dv, bool tiled, cudaStream_t, const int * par = nullptr,
-               const GdnReplay & rp = {});
+               const GdnReplay & rp = {}, bool f16_state = false);
 // Batched helpers for n tokens whose vectors sit `ts` elements apart ("token stride").
 // RMSNorm of `rows` vectors (length len) per token: x of token i, row r at x + i*xts + r*xrs; y at y + i*yts + r*yrs.
 void rms_f_multi(const __nv_bfloat16 * x, int xts, int xrs, const float * w, __nv_bfloat16 * y, int yts, int yrs,

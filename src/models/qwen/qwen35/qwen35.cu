@@ -1,6 +1,8 @@
 #include "zero_copy_guard.hpp"
 #include <cstdlib>
 #include "qwen35_kernels.cuh"
+#include <cuda_fp16.h>
+#include <type_traits>
 
 #include <algorithm>
 #include <cstdint>
@@ -78,8 +80,20 @@ __global__ void conv_step_k(const __nv_bfloat16 * x, const __nv_bfloat16 * sin, 
 }
 
 // One block per value head, one thread per value column j (dv threads). State layout [vh][dk][dv].
+// Gated DeltaNet recurrent state storage: float, or __half (--gdn-state f16). The recurrence runs in FP32 registers;
+// with FP16 storage the state is rounded to FP16 after every token, so every path (decode, verify, replay, prefill)
+// sees the same values and speculative decoding still equals plain decoding.
+template <class TS> __device__ __forceinline__ float gdn_ld(TS v) {
+    if constexpr (std::is_same_v<TS, float>) return v; else return __half2float(v);
+}
+template <class TS> __device__ __forceinline__ TS gdn_to(float v) {
+    if constexpr (std::is_same_v<TS, float>) return v; else return __float2half_rn(v);
+}
+template <class TS> __device__ __forceinline__ float gdn_round(float v) { return gdn_ld(gdn_to<TS>(v)); }
+
+template <class TS>
 __global__ void gdn_step_k(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, const __nv_bfloat16 * b,
-                           const float * neg_a, const float * dt_bias, const float * sin, float * state,
+                           const float * neg_a, const float * dt_bias, const TS * sin, TS * state,
                            __nv_bfloat16 * out, int kheads, int vheads, int dk, int dv, bool tiled) {
     extern __shared__ float smem[];
     float * qs = smem;           // [dk]
@@ -113,17 +127,17 @@ __global__ void gdn_step_k(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, c
     const float decay = expf(neg_a[h] * softplus);
 
     if (j < dv) {
-        const float * Si = sin + int64_t(h) * dk * dv + j;
-        float * S = state + int64_t(h) * dk * dv + j;
+        const TS * Si = sin + int64_t(h) * dk * dv + j;
+        TS * S = state + int64_t(h) * dk * dv + j;
         float kv_mem = 0.f, sq_out = 0.f, kq = 0.f;
         for (int i = 0; i < dk; ++i) {
-            const float s = Si[int64_t(i) * dv] * decay;
+            const float s = gdn_ld(Si[int64_t(i) * dv]) * decay;
             kv_mem += s * ks[i];
             sq_out += s * qs[i];
             kq += ks[i] * qs[i];
         }
         const float delta = (__bfloat162float(vp[j]) - kv_mem) * beta;
-        for (int i = 0; i < dk; ++i) S[int64_t(i) * dv] = Si[int64_t(i) * dv] * decay + ks[i] * delta;
+        for (int i = 0; i < dk; ++i) S[int64_t(i) * dv] = gdn_to<TS>(gdn_ld(Si[int64_t(i) * dv]) * decay + ks[i] * delta);
         out[h * dv + j] = __float2bfloat16_rn(sq_out + delta * kq);
     }
 }
@@ -239,10 +253,10 @@ __global__ void conv_long_k(const __nv_bfloat16 * xin, int xs_, int n, const __n
 // q / k / v and gates are fetched up front and the norms computed in one pass, so the recurrence itself only reads
 // shared memory and registers (no block barriers between tokens).
 constexpr int GDN_SL = 4, GDN_CPB = 4 * (32 / GDN_SL);
-template <int DK>
+template <int DK, class TS>
 __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0,
                                                    const __nv_bfloat16 * b0, int abs_, const float * neg_a,
-                                                   const float * dt_bias, const float * sin, float * sout,
+                                                   const float * dt_bias, const TS * sin, TS * sout,
                                                    __nv_bfloat16 * y, int kheads, int vheads, int dv, bool tiled,
                                                    const int * par = nullptr, const tqllm_cuda::GdnReplay rp = {}) {
     static_assert(DK == 128, "one element per thread for the q / k loads");
@@ -258,9 +272,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
     const int kh = tiled ? h % kheads : h / (vheads / kheads);
     const int qkv_dim = 2 * kheads * DK + vheads * dv;
     float S[R];
-    const float * Si = sin + (int64_t(h) * DK + sl * R) * dv + j;
+    const TS * Si = sin + (int64_t(h) * DK + sl * R) * dv + j;
 #pragma unroll
-    for (int i = 0; i < R; ++i) S[i] = Si[int64_t(i) * dv];
+    for (int i = 0; i < R; ++i) S[i] = gdn_ld(Si[int64_t(i) * dv]);
     // tree: parents and the initial state in shared memory (branch points rebuild from them without global loads)
     __shared__ int spar[NMAX];
     __shared__ float S0[R][128];
@@ -344,17 +358,17 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
                              k23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&k4.y));
                 const float kr[4] = {k01.x, k01.y, k23.x, k23.y};
 #pragma unroll
-                for (int e = 0; e < 4; ++e) S[i + e] += kr[e] * nk * delta;
+                for (int e = 0; e < 4; ++e) S[i + e] = gdn_round<TS>(S[i + e] + kr[e] * nk * delta);
             }
             if (write && sl == 0) y[int64_t(g0 + tkn - pend) * vheads * dv + h * dv + j] = __float2bfloat16_rn(sq_out * nq + delta * kq);
         };
         if (par && g0 < pend) {  // deferred commit of the previous step's path, then its state -> rp.smid and S0
             for (int tkn = 0; tkn < ng; ++tkn) step(tkn, false);
             if (g0 + ng == pend) {
-                float * Sm = rp.smid + (int64_t(h) * DK + sl * R) * dv + j;
+                TS * Sm = static_cast<TS *>(rp.smid) + (int64_t(h) * DK + sl * R) * dv + j;
 #pragma unroll
                 for (int i = 0; i < R; ++i) {
-                    Sm[int64_t(i) * dv] = S[i];
+                    Sm[int64_t(i) * dv] = gdn_to<TS>(S[i]);
                     S0[i][t] = S[i];
                 }
             }
@@ -380,9 +394,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
     // deferred-commit mode: the state after the tree is never used (the next step replays); sout == nullptr: the caller
     // replays the accepted prefix at commit instead (single state buffer: `sin` must keep the state before the block)
     if (rp.smid || !sout) return;
-    float * So = sout + (int64_t(h) * DK + sl * R) * dv + j;
+    TS * So = sout + (int64_t(h) * DK + sl * R) * dv + j;
 #pragma unroll
-    for (int i = 0; i < R; ++i) So[int64_t(i) * dv] = S[i];
+    for (int i = 0; i < R; ++i) So[int64_t(i) * dv] = gdn_to<TS>(S[i]);
 }
 
 __global__ void gated_rms_multi_k(const __nv_bfloat16 * x, const __nv_bfloat16 * z0, int zs, int heads, const float * w,
@@ -845,11 +859,16 @@ void conv_step(const __nv_bfloat16 * x, __nv_bfloat16 * state, const float * w, 
 }
 
 void gdn_step(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, const __nv_bfloat16 * b, const float * neg_a,
-              const float * dt_bias, float * state, __nv_bfloat16 * out, int kheads, int vheads, int dk, int dv,
-              bool tiled, cudaStream_t s) {
+              const float * dt_bias, void * state, __nv_bfloat16 * out, int kheads, int vheads, int dk, int dv,
+              bool tiled, cudaStream_t s, bool f16_state) {
     const int threads = dv < 32 ? 32 : dv;
-    gdn_step_k<<<vheads, threads, (2 * dk + 32) * sizeof(float), s>>>(qkv, a, b, neg_a, dt_bias, state, state, out,
-                                                                      kheads, vheads, dk, dv, tiled);
+    const size_t sh = (2 * dk + 32) * sizeof(float);
+    if (f16_state)
+        gdn_step_k<__half><<<vheads, threads, sh, s>>>(qkv, a, b, neg_a, dt_bias, static_cast<__half *>(state),
+                                                       static_cast<__half *>(state), out, kheads, vheads, dk, dv, tiled);
+    else
+        gdn_step_k<float><<<vheads, threads, sh, s>>>(qkv, a, b, neg_a, dt_bias, static_cast<float *>(state),
+                                                      static_cast<float *>(state), out, kheads, vheads, dk, dv, tiled);
 }
 
 void conv_step2(const __nv_bfloat16 * x, const __nv_bfloat16 * in, __nv_bfloat16 * out, const float * w,
@@ -861,7 +880,7 @@ void gdn_step2(const __nv_bfloat16 * qkv, const __nv_bfloat16 * a, const __nv_bf
                const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads, int vheads, int dk,
                int dv, bool tiled, cudaStream_t s) {
     const int threads = dv < 32 ? 32 : dv;
-    gdn_step_k<<<vheads, threads, (2 * dk + 32) * sizeof(float), s>>>(qkv, a, b, neg_a, dt_bias, in, out, y, kheads,
+    gdn_step_k<float><<<vheads, threads, (2 * dk + 32) * sizeof(float), s>>>(qkv, a, b, neg_a, dt_bias, in, out, y, kheads,
                                                                        vheads, dk, dv, tiled);
 }
 
@@ -882,14 +901,20 @@ void conv_multi(const __nv_bfloat16 * xin, int x_stride, int n, const __nv_bfloa
 }
 
 void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const __nv_bfloat16 * b0, int ab_stride,
-               const float * neg_a, const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads,
-               int vheads, int dk, int dv, bool tiled, cudaStream_t s, const int * par, const GdnReplay & rp) {
+               const float * neg_a, const float * dt_bias, const void * in, void * out, __nv_bfloat16 * y, int kheads,
+               int vheads, int dk, int dv, bool tiled, cudaStream_t s, const int * par, const GdnReplay & rp,
+               bool f16_state) {
     if (dk != 128 || dv % 32) throw std::invalid_argument("gdn_multi: dk 128, dv % 32 == 0");
     if (par && n > 16) throw std::invalid_argument("gdn_multi: tree mode needs n <= 16");
     if (rp.smid && !par) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode");
     if (dv % GDN_CPB) throw std::invalid_argument("gdn_multi: dv % columns per block");
-    gdn_multi_k<128><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
-                                                          vheads, dv, tiled, par, rp);
+    const dim3 grid(vheads, dv / GDN_CPB);
+    if (f16_state)
+        gdn_multi_k<128, __half><<<grid, 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, static_cast<const __half *>(in),
+                                                      static_cast<__half *>(out), y, kheads, vheads, dv, tiled, par, rp);
+    else
+        gdn_multi_k<128, float><<<grid, 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, static_cast<const float *>(in),
+                                                     static_cast<float *>(out), y, kheads, vheads, dv, tiled, par, rp);
 }
 
 void gated_rms_multi(const __nv_bfloat16 * x, const __nv_bfloat16 * z0, int z_stride, int n, const float * w,

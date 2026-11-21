@@ -21,6 +21,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- `--gdn-state f16` (Qwen3.5 / 3.8): store the Gated DeltaNet recurrent state as FP16 (opt-in, not exact). Qwen3.8-27B on
+  an RTX 3090: 96 MiB less VRAM per slot, KLD vs BF16 0.013443 -> 0.013861 (TQT file, WikiText-2 8 x 2048), 5/5 on a
+  5-code needle at 109K and 140K tokens; speculative and plain decoding still give the same tokens.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /

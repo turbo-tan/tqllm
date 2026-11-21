@@ -100,7 +100,8 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
                 st("gdn_conv");
                 const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
                 tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
-                                      gdn_whole(n) ? rec_buf(lin_i) : nullptr, CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp);
+                                      gdn_whole(n) ? rec_buf(lin_i) : nullptr, CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp,
+                                      gdn_f16());
             } else {  // batched verify: the recurrence runs per segment on that slot's state
                 for_segs([&](size_t i) {
                     const auto & g = segs[i];
@@ -114,9 +115,9 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
                     tqllm_cuda::conv_multi(Tg, rows, g.n, cs[b + c % NSLOT].as<bf16>(), cs[b + (c + 1) % NSLOT].as<bf16>(),
                                            L.conv_w, Qg, qkv_dim, stream, gp);
                     const bf16 * B0 = Tg + qkv_dim + zdim;
-                    float * rg = rs[lin_i].as<float>();
+                    void * rg = rs[lin_i].p;
                     tqllm_cuda::gdn_multi(Qg, g.n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rg, gdn_whole(g.n) ? rg : nullptr, CORE + size_t(g.col0) * zdim, lkh, lvh,
-                                          dk, dv, cfg.tiled, stream, gp);
+                                          dk, dv, cfg.tiled, stream, gp, {}, gdn_f16());
                 });
             }
             st("gdn_recurrence");
@@ -1027,7 +1028,7 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens: 
             const bf16 * B0 = T + qkv_dim + zdim;
             tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
                                   rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                                  chain);
+                                  chain, {}, gdn_f16());
             ++lin_i;
         }
     }
