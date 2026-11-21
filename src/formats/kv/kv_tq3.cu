@@ -258,6 +258,23 @@ struct Tcq3 {  // K: 2 x (128-value 512-state trellis group: 390 stream bits + f
         }
         ks = __half2float(s) * tcq::CB3K_INV_SCALE;
     }
+    // the same levels from a pair table: entry x (a 12-bit stream window) = the levels of states x & 0x1FF and x >> 3,
+    // so one lookup per two values (half the shared-memory reads of store_k; prefill blocks, where they are the limit)
+    __device__ static void store_k_pairs(const uint32_t (&w)[NW], __half s, int8_t * kd, float & ks, const uint16_t * pt) {
+#pragma unroll
+        for (int j = 0; j < 32; j += 16) {
+            uint32_t p[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int b0 = 3 * (j + 4 * e), b1 = b0 + 6;
+                const uint32_t x0 = __funnelshift_r(w[b0 / 32], w[b0 / 32 + 1], b0 % 32) & 0xFFFu;
+                const uint32_t x1 = __funnelshift_r(w[b1 / 32], w[b1 / 32 + 1], b1 % 32) & 0xFFFu;
+                p[e] = uint32_t(pt[x0]) | (uint32_t(pt[x1]) << 16);
+            }
+            *reinterpret_cast<uint4 *>(kd + j) = make_uint4(p[0], p[1], p[2], p[3]);
+        }
+        ks = __half2float(s) * tcq::CB3K_INV_SCALE;
+    }
 };
 }  // namespace kvc
 
@@ -285,9 +302,14 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     constexpr int ROWS = NW * 16, NT = NW * 32, KRB = KC::RB, VRB = VC::RB, UPT = TILE * 8 / NT;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     // trellis codebooks staged in shared memory (the per-value lookups are data dependent gathers)
-    constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>;
-    __shared__ float s_cbk[KT ? 128 : 1], s_cbv[VT ? 128 : 1];  // s_cbk: 512 int8 levels; s_cbv: 256 FP16 values
-    if constexpr (KT)
+    // KP (8-warp prefill blocks): Tcq3 K levels from a 4096-entry pair table (Tcq3::store_k_pairs) instead
+    constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>, KP = KT && NW == 8;
+    __shared__ float s_cbk[KP ? 2048 : KT ? 128 : 1], s_cbv[VT ? 128 : 1];  // s_cbk: 512 int8 levels (KP: 4096 pairs); s_cbv: 256 FP16 values
+    if constexpr (KP) {
+        auto lv = [](uint32_t st) { return uint32_t(uint8_t(int8_t(__float2int_rn(tcq::CB3K[st] * tcq::CB3K_SCALE)))); };
+        for (int i = threadIdx.x; i < 4096; i += NW * 32)
+            reinterpret_cast<uint16_t *>(s_cbk)[i] = uint16_t(lv(i & 0x1FFu) | (lv(uint32_t(i) >> 3) << 8));
+    } else if constexpr (KT)
         for (int i = threadIdx.x; i < 512; i += NW * 32)
             reinterpret_cast<int8_t *>(s_cbk)[i] = int8_t(__float2int_rn(tcq::CB3K[i] * tcq::CB3K_SCALE));
     if constexpr (VT)
@@ -383,7 +405,9 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
 #pragma unroll
         for (int i = 0; i < UPT; ++i) {
             const int u = t + i * NT, lk = u % 32, b = u / 32;
-            KC::store_k(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk], s_cbk);
+            if constexpr (KP) KC::store_k_pairs(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk],
+                                                reinterpret_cast<const uint16_t *>(s_cbk));
+            else KC::store_k(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk], s_cbk);
             VC::store_v(vw[i], vr[i], vh + (buf * TILE + lk) * VS + b * 32, s_cbv);
         }
     };
