@@ -52,8 +52,6 @@ std::vector<T> down(T* d, size_t n) {
     return h;
 }
 
-std::string fname(const char* n, int nv) { return std::string(n) + "=" + std::to_string(nv); }
-
 void col_identity(const x3::X3Codec* c, int rows, int cols) {
     const int tiles = (rows / 16) * (cols / 16);
     std::vector<uint16_t> trellis(size_t(tiles) * c->words);
