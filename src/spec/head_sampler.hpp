@@ -49,8 +49,8 @@ public:
     HeadSampler & operator=(const HeadSampler &) = delete;
 
     // rows x k head, at most max_cols columns per head pass; the first pass's scales: u4h (scale, min) pairs per 32
-    // weights; Exact: the first-pass logits are exact
-    enum class FirstPass { Exact, U4h };
+    // weights, or k3 records (FP16 d + 16 int8 scales per 256 weights); neither: the first-pass logits are exact
+    enum class FirstPass { Exact, U4h, K3 };
     void init(int rows, int k, int max_cols, FirstPass fp, const void * scales, cudaStream_t s);
     bool ready() const { return rows_ > 0; }
     bool screened() const { return sig_ != nullptr; }

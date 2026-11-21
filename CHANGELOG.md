@@ -25,6 +25,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- `TQLLM_DEBUG=head3` (experimental): the LM head's first pass in 3 bits (Q3_K grid, 0.58 GB instead of 0.80 GB of
+  VRAM for Qwen3.8). Sampling stays exact through the re-score screen; greedy keeps the top-16 shortlist (argmax equal to
+  the full int8 head at 6,308 of 6,308 WikiText-2 positions). Qwen3.8-27B TQT, RTX 3090: 198 MiB less VRAM, greedy decode
+  +1.2 % (51.5 vs 50.9 tok/s, 121.4 vs 119.8 with DFlash2), sampled decode with DFlash2 -5 % (102.0 vs 107.4 tok/s:
+  more re-score rounds), so it stays off by default.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /

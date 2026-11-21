@@ -1112,8 +1112,17 @@ void Qwen35Engine::load_dflash(const std::string & path) {
 
 void Qwen35Engine::build_head4() {
     const int64_t n = int64_t(lm_head.rows) * cfg.hidden;
-    head4 = Buf(size_t(n / 2));
-    head4s = Buf(size_t(n / 32) * 4);
+    if (head_k3 && cfg.hidden % 256) head_k3 = false;
+    head4 = Buf(head_k3 ? size_t(n / 256) * 96 : size_t(n / 2));
+    head4s = Buf(head_k3 ? size_t(n / 256) * 20 : size_t(n / 32) * 4);
+    auto convert = [&](const int8_t * w, const __half * s, int64_t r0, int64_t nr) {
+        const int64_t H = cfg.hidden;
+        if (head_k3)
+            tqllm_cuda::k3_from_i8h(w, s, head4.as<uint8_t>() + r0 * H / 256 * 96, head4s.as<uint8_t>() + r0 * H / 256 * 20,
+                                    nr * H, stream);
+        else
+            tqllm_cuda::u4h_from_i8h(w, s, head4.as<uint8_t>() + r0 * H / 2, head4s.as<__half2>() + r0 * H / 32, nr * H, stream);
+    };
     if (h8_host) {  // the int8 rows come back a chunk at a time by the copy engine: no kernel reads host memory
         const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
         Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
@@ -1123,12 +1132,12 @@ void Qwen35Engine::build_head4() {
             const int nr = std::min(chunk, rows - r0);
             ck(cudaMemcpyAsync(w.p, hw + size_t(r0) * H, size_t(nr) * H, cudaMemcpyHostToDevice, stream));
             ck(cudaMemcpyAsync(s.p, hs + size_t(r0) * H / 16 * 2, size_t(nr) * H / 16 * 2, cudaMemcpyHostToDevice, stream));
-            tqllm_cuda::u4h_from_i8h(w.as<int8_t>(), s.as<__half>(), head4.as<uint8_t>() + size_t(r0) * H / 2,
-                                     head4s.as<__half2>() + size_t(r0) * H / 32, int64_t(nr) * H, stream);
+            convert(w.as<int8_t>(), s.as<__half>(), r0, nr);
         }
         sync_ck();  // the staging is freed with this scope
-    } else tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
-    tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
+    } else convert(w8(), s8(), 0, lm_head.rows);
+    if (head_k3) tqllm_cuda::k3_tune(head4.as<uint8_t>(), head4s.as<uint8_t>(), lm_head.rows, int(cfg.hidden), stream);
+    else tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
     h2_vals = Buf(size_t(NB) * 16 * 4);
     h2_idx = Buf(size_t(NB) * 16 * 4);
     h2_scr = Buf(size_t(NB) * 64 * 16 * 8);

@@ -89,6 +89,20 @@ __global__ void sig_build_k(const __half2 * sm, int rows, int ng, int per, __hal
     }
 }
 
+// k3: sig[r][s] = (largest |d * scale| of the segment's 16-weight sub-blocks) / sqrt(12), rounded up
+__global__ void sig_build_k3_k(const uint8_t * kr, int rows, int k, int seg_len, __half * sig) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    for (int g = 0; g < HeadSampler::kSegs; ++g) {
+        float m = 0.f;
+        for (int t = g * seg_len / 16; t < min(k, (g + 1) * seg_len) / 16; ++t) {
+            const uint8_t * rc = kr + (int64_t(r) * (k / 256) + t / 16) * 20;
+            m = fmaxf(m, fabsf(__half2float(*reinterpret_cast<const __half *>(rc + 16)) * float(int8_t(rc[t % 16]))));
+        }
+        sig[int64_t(r) * HeadSampler::kSegs + g] = __float2half_ru(m * 0.28867514f * 1.001f);
+    }
+}
+
 // xg[c][s] = |x_c|^2 over segment s (one warp per segment)
 __global__ void xg_k(const __half * xh, int k, int seg_len, float * xg) {
     const int c = blockIdx.x, g = threadIdx.x / 32, l = threadIdx.x % 32;
@@ -335,7 +349,10 @@ void HeadSampler::init(int rows, int k, int max_cols, FirstPass fp, const void *
     sig_ = nullptr;
     if (fp != FirstPass::Exact && scales) {
         sig_ = static_cast<__half *>(dalloc(size_t(rows) * kSegs * 2));
-        sig_build_k<<<(rows + 255) / 256, 256, 0, s>>>(static_cast<const __half2 *>(scales), rows, ng, per_, sig_);
+        if (fp == FirstPass::U4h)
+            sig_build_k<<<(rows + 255) / 256, 256, 0, s>>>(static_cast<const __half2 *>(scales), rows, ng, per_, sig_);
+        else
+            sig_build_k3_k<<<(rows + 255) / 256, 256, 0, s>>>(static_cast<const uint8_t *>(scales), rows, k, per_ * 32, sig_);
         ck(cudaGetLastError());
     }
     xh_ = static_cast<__half *>(dalloc(size_t(max_cols) * k * 2));

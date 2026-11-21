@@ -1,5 +1,5 @@
-// HeadSampler (src/spec/head_sampler.hpp) on a synthetic two-stage head: a random int8 head, its 4-bit copy (u4h_from_i8h)
-// as the first pass, the engine's top-16 + int8 re-score. Every screened draw must equal sample_reference on all logits
+// HeadSampler (src/spec/head_sampler.hpp) on a synthetic two-stage head: a random int8 head, its 4-bit (u4h_from_i8h) or
+// 3-bit (k3_from_i8h) copy as the first pass, the engine's top-16 + int8 re-score. Every screened draw must equal sample_reference on all logits
 // (computed with rescore_all, whose bits must match i8h_rescore_argmax's), for greedy-like, top-p, top-k, whole-vocabulary
 // and penalised parameters; also with an exact first pass (no error table, logits read instead of re-scored).
 #include "formats/weight/quant_kernels.cuh"
@@ -28,10 +28,31 @@ int main() {
     cudaMemcpy(dw8, w8.data(), w8.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dsc, sc.data(), sc.size() * 2, cudaMemcpyHostToDevice);
     tqllm_cuda::u4h_from_i8h(dw8, dsc, dw4, dsm, int64_t(rows) * k, nullptr);
+    uint8_t * dw3, * dkr; float * da3, * dex3; uint32_t * did3;
+    cudaMalloc(&dw3, size_t(rows) * k / 256 * 96); cudaMalloc(&dkr, size_t(rows) * k / 256 * 20);
+    cudaMalloc(&da3, size_t(nc) * rows * 4); cudaMalloc(&dex3, nc * 16 * 4); cudaMalloc(&did3, nc * 16 * 4);
+    tqllm_cuda::k3_from_i8h(dw8, dsc, dw3, dkr, int64_t(rows) * k, nullptr);
+    {  // the k3 copy dequantises to within half a step of the int8 head
+        __half * dq; cudaMalloc(&dq, size_t(rows) * k * 2);
+        tqllm_cuda::k3_dequant_h(dw3, dkr, dq, rows, k, nullptr);
+        std::vector<__half> h(size_t(rows) * k);
+        cudaMemcpy(h.data(), dq, h.size() * 2, cudaMemcpyDeviceToHost);
+        cudaFree(dq);
+        double se = 0, sw = 0;
+        for (size_t i = 0; i < h.size(); ++i) {
+            const double w = double(w8[i]) * __half2float(sc[i / 16]), d = __half2float(h[i]) - w;
+            se += d * d, sw += w * w;
+        }
+        // RTN with 8 levels on Gaussian rows: ~0.03; a packing error gives ~1
+        if (!(se / sw < 0.05)) { std::printf("FAIL: k3 copy relative MSE %.4f\n", se / sw); return 1; }
+        std::printf("k3 first pass: relative MSE %.4f\n", se / sw);
+        std::fflush(stdout);
+    }
     cudaStream_t st;
     cudaStreamCreate(&st);
-    tqllm::HeadSampler screened, exact;
+    tqllm::HeadSampler screened, screened3, exact;
     screened.init(rows, k, nc, tqllm::HeadSampler::FirstPass::U4h, dsm, st);
+    screened3.init(rows, k, nc, tqllm::HeadSampler::FirstPass::K3, dkr, st);
     exact.init(rows, k, nc, tqllm::HeadSampler::FirstPass::Exact, nullptr, st);
     int fails = 0, cases = 0;
     const float temps[] = {0.2f, 0.7f, 1.f, 1.5f};
@@ -46,7 +67,11 @@ int main() {
         tqllm_cuda::u4h_matvec(dw4, dsm, dx, da, rows, k, nc, st);
         tqllm_cuda::topk16_big(da, rows, nc, dvals, did, scr, st);
         tqllm_cuda::i8h_rescore_argmax(dw8, dsc, dx, did, k, nc, dtok, st, dex);
+        tqllm_cuda::k3_matvec(dw3, dkr, dx, da3, rows, k, nc, st);
+        tqllm_cuda::topk16_big(da3, rows, nc, dvals, did3, scr, st);
+        tqllm_cuda::i8h_rescore_argmax(dw8, dsc, dx, did3, k, nc, dtok, st, dex3);
         screened.save_x(dx, nc, st);
+        screened3.save_x(dx, nc, st);
         screened.rescore_all(dw8, dsc, dx, nc, dfull, st);
         std::vector<float> full(size_t(nc) * rows), ex16(nc * 16);
         std::vector<uint32_t> id16(nc * 16);
@@ -80,6 +105,7 @@ int main() {
             sp.seed = rng();
             std::vector<float> tv(nc, t);
             screened.queue_stats(da, did, dex, 0, nc, tv.data(), st);
+            screened3.queue_stats(da3, did3, dex3, 0, nc, tv.data(), st);
             exact.queue_stats(dfull, deid, deex, 0, nc, tv.data(), st);
             cudaStreamSynchronize(st);
             std::vector<tqllm::HeadSampleCol> cols;
@@ -90,24 +116,25 @@ int main() {
             }
             const auto a = screened.sample(cols, sp, da, dw8, dsc, st);
             const auto b = exact.sample(cols, sp, dfull, nullptr, nullptr, st);
+            const auto a3 = screened3.sample(cols, sp, da3, dw8, dsc, st);
             for (int c = 0; c < nc; ++c) {
                 const uint32_t want = tqllm::sample_reference(full.data() + size_t(c) * rows, rows, sp, cols[size_t(c)].recent,
                                                               tqllm::gumbel_key(sp.seed, cols[size_t(c)].pos));
-                cases += 2;
-                if (a[size_t(c)] != want || b[size_t(c)] != want) {
+                cases += 3;
+                if (a[size_t(c)] != want || b[size_t(c)] != want || a3[size_t(c)] != want) {
                     ++fails;
-                    std::printf("FAIL: T %.1f top_p %.2f top_k %d pen %d col %d: screened %u exact %u reference %u\n", t, tp,
-                                tk, pen, c, a[size_t(c)], b[size_t(c)], want);
+                    std::printf("FAIL: T %.1f top_p %.2f top_k %d pen %d col %d: screened %u k3 %u exact %u reference %u\n", t,
+                                tp, tk, pen, c, a[size_t(c)], a3[size_t(c)], b[size_t(c)], want);
                 }
             }
         }
         cudaFree(deid); cudaFree(deex);
     }
     if (cudaGetLastError() != cudaSuccess) { std::puts("FAIL: CUDA error"); ++fails; }
-    for (const auto * h : {&screened}) {
+    for (const auto * h : {&screened, &screened3}) {
         const auto & s = h->stats;
         std::printf("  %s first pass: %llu columns, %llu by the top-16, %llu x 64, %llu x 1024, %llu x 8192, %llu Gumbel, %llu full\n",
-                    "u4h", (unsigned long long) s.cols, (unsigned long long) s.round1,
+                    h == &screened ? "u4h" : "k3", (unsigned long long) s.cols, (unsigned long long) s.round1,
                     (unsigned long long) s.rounds64, (unsigned long long) s.rounds1024, (unsigned long long) s.rounds8192,
                     (unsigned long long) s.gumbel, (unsigned long long) s.full);
     }

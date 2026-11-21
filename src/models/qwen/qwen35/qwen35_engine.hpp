@@ -561,13 +561,23 @@ private:
     const __half * h8_dev_s = nullptr;
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
     Buf sp_norm, sp_codes, sp_packed, sp_message, sp_delta, sp_raw, sp_rms, sp_predcodes, sp_predpv, sp_refmsg, sp_refdelta, sp_refined, sp_part;
-    Buf head4, head4s;  // first-pass 4-bit u4h copy of head8 (codes, (scale, min) pairs)
-    HeadSampler::FirstPass head_fp() const { return head4.p ? HeadSampler::FirstPass::U4h : HeadSampler::FirstPass::Exact; }
+    Buf head4, head4s;  // first-pass copy of head8: 4-bit u4h (codes, (scale, min) pairs), or k3 with head_k3 (codes, records)
+    // TQLLM_DEBUG=head3: the first pass in 3 bits (k3, 0.58 GB instead of 0.80 GB for Qwen3.8); sampling stays exact
+    // through HeadSampler's screen, greedy keeps the top-16 shortlist
+    bool head_k3 = tqllm::debug_on("head3");
+    HeadSampler::FirstPass head_fp() const {
+        return !head4.p ? HeadSampler::FirstPass::Exact : head_k3 ? HeadSampler::FirstPass::K3 : HeadSampler::FirstPass::U4h;
+    }
     // first-pass logits of rows [0, rows) (or the rows rid[0 .. rows)) of head4 for n FP16 inputs
     void head4_mv(const __half * x, float * y, int rows, int n, const uint32_t * rid = nullptr) {
         const int H = int(cfg.hidden);
-        if (rid) tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), rid, x, y, rows, H, n, stream);
-        else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), x, y, rows, H, n, stream);
+        if (head_k3) {
+            if (rid) tqllm_cuda::k3_matvec_ids(head4.as<uint8_t>(), head4s.as<uint8_t>(), rid, x, y, rows, H, n, stream);
+            else tqllm_cuda::k3_matvec(head4.as<uint8_t>(), head4s.as<uint8_t>(), x, y, rows, H, n, stream);
+        } else {
+            if (rid) tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), rid, x, y, rows, H, n, stream);
+            else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), x, y, rows, H, n, stream);
+        }
     }
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
     // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; HeadSampler turns them,
