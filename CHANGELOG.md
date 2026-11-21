@@ -52,6 +52,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- Faster verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit: one query
+  (decode without a drafter), 2-5 queries and 11-16 queries (one pass over the cache instead of two) use a new kernel
+  that streams the raw records through a cp.async ring and spreads a query over four warps; the merge kernel overlaps its
+  reads and applies the inverse rotation itself. Qwen3.8-27B TQT, RTX 3090, `--kv q8/q4`, per layer, attention at 1 /
+  4 / 8 / 16 verify columns: 140K context 565 / 628 / 597 / 1190 us -> 301 / 510 / 593 / 1106 us, 32K 154 / 162 / 190 /
+  383 us -> 89 / 127 / 175 / 344 us. Decode without a drafter at 137K: 35.6 -> 41.2 tok/s (32K: 46.0 -> 48.7); with
+  DFlash2 (8 verify columns) unchanged; greedy replies identical.
 - TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
   WikiText-2 train against its sha256 and takes the code half from the files in
   `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step

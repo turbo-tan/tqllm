@@ -1312,8 +1312,8 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
         const int ps = nsplit + 1;
         constexpr bool VQ = std::is_same_v<KC, kvc::Q8> && (std::is_same_v<VC, kvc::Q4> || std::is_same_v<VC, kvc::Q8>);
         if constexpr (VQ) {
-            // q8 K: one query (<= 16 rows) and 65-96 rows (11-16 queries at 6 heads per KV head: one pass instead of
-            // two) take the raw-record ring kernel (attn_vq_k); 17-64 rows stay on attn_tq3kv_k, which is as fast there
+            // q8 K: up to 32 rows (1-5 queries at 6 heads per KV head) and 65-96 rows (11-16 queries: one pass instead of
+            // two) take the raw-record ring kernel (attn_vq_k); 33-64 rows stay on attn_tq3kv_k, which is as fast there
             if (h / kh <= 16) {
                 constexpr int S = std::is_same_v<VC, kvc::Q4> ? 3 : 2;  // ring depth that fits in 99 KB with the decoded V tile
                 const int qmax = 96 / (h / kh);
@@ -1324,6 +1324,7 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
                     const int * dz = dep ? dep + z0 : nullptr;
                     if (rows <= 16) vq_launch<1, 4, VC, 2, false>(qz, k, v, pz, dseq0, nz, h, kh, scale, nsplit, s, dz, ps, z0, d0);
                     else if (rows > 64) vq_launch<6, 2, VC, S, true>(qz, k, v, pz, dseq0, nz, h, kh, scale, nsplit, s, dz, ps, z0, d0);
+                    else if (rows <= 32) vq_launch<3, 4, VC, 2, true>(qz, k, v, pz, dseq0, nz, h, kh, scale, nsplit, s, dz, ps, z0, d0);
                     else tq3_launch<4, KC, VC, 1>(qz, k, v, y, pz, dseq0, nz, h, kh, scale, nsplit, s, dz, ps, z0, d0);
                 }
                 if (cs) compact_partial(q, *cs, part, nq, h, kh, scale, ps, nsplit, s);
