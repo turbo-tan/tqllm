@@ -1314,8 +1314,10 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
         if (full_logits && want_topk())  // TQLLM_DEBUG=full_head sampling reference: the re-score's arithmetic on every row
             hs.rescore_all(w8(), s8(), v_xh.as<__half>(), n, v_logits.as<float>(), stream);
         else
-            tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>(), v_logits.as<float>(),
-                                   lm_head.rows, H, n, stream);
+            for (int c0 = 0; c0 < n; c0 += 8)  // i8h_matvec takes at most 15 columns (a 16-column verify / prefill chunk)
+                tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>() + size_t(c0) * H,
+                                       v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows, H, std::min(8, n - c0),
+                                       stream);
     } else {
         tqllm_cuda::bf16_to_f32(NP, v_xf.as<float>(), n * H, stream);
         tqllm_cuda::q6k_matvec(lm_head.p, v_xf.as<float>(), v_logits.as<float>(), lm_head.rows, H, n, stream);
