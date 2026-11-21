@@ -262,9 +262,8 @@ void attention_mq256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __
 }
 
 void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
-                             __nv_bfloat16 * y, float * part, size_t part_floats, const int * dseq0, int nq, int h, int kh,
-                             float scale, int nsplit, cudaStream_t s) {
-    constexpr int DIM = 256;
+                             __nv_bfloat16 * y, float * /*part*/, size_t /*part_floats*/, const int * dseq0, int nq, int h,
+                             int kh, float scale, int /*nsplit*/, cudaStream_t s) {
     static bool configured = false;
     if (!configured) {
         if (cudaFuncSetAttribute(attn_bf16_prefill_k<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
@@ -331,8 +330,8 @@ void attention_mq256_t4kv(const __nv_bfloat16 * q, const Turbo4K256 * kc, const 
 }
 
 void attention_mq256_t4kv_prefill(const __nv_bfloat16 * q, const Turbo4K256 * kc, const Turbo4K256 * vc,
-                                  __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale,
-                                  int nsplit, cudaStream_t s) {
+                                  __nv_bfloat16 * y, float * /*part*/, const int * dseq0, int nq, int h, int kh, float scale,
+                                  int /*nsplit*/, cudaStream_t s) {
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(attn_t4kv_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fap::smem()));

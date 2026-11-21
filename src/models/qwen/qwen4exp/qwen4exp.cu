@@ -8,8 +8,6 @@
 #include <stdexcept>
 #include <vector>
 #include "gdn_seq_fast.cuh"
-// TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
-static inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); return !v || (v[0] && v[0] != '0'); }
 
 namespace tqllm_cuda {
 namespace {
@@ -236,7 +234,8 @@ __global__ void ple_apply_k(const float * hidden, const float * gated, const flo
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], conv[i]));
 }
-__global__ void fn_gdn_k(const float * qkv, const float * alpha, const float * beta,
+// not launched: the reference the TQFN_GDN_FAST kernels below reproduce bit for bit
+[[maybe_unused]] __global__ void fn_gdn_k(const float * qkv, const float * alpha, const float * beta,
                          const float * neg_a, const float * bias, const float * state, float * next,
                          float * out, int kh, int vh, int dim, int n, float eps, float * states = nullptr) {
     const int head = blockIdx.x, value = blockIdx.y * 4 + threadIdx.y, lane = threadIdx.x;
