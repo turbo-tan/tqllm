@@ -74,6 +74,7 @@ struct PluginPatch final : WeightFormat {
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows, const int * ids, int n, int topk, bool per,
                        cudaStream_t s) const override { base->expert_matvec(m, x, y, rows, ids, n, topk, per, s); }
     int u4h_id() const override { return base->u4h_id(); }
+    int expert_kernel_id() const override { return base->expert_kernel_id(); }
     void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
         if (d.gpu_dequant_f16) call(d.gpu_dequant_f16(m.p, m.aux, m.rows, m.cols, out, s), d, "dequant");
         else base->dequant_h(m, out, s);

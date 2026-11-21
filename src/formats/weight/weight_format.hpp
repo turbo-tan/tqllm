@@ -63,6 +63,9 @@ struct WeightFormat {
                                const int *, int n, int topk, bool per_expert_input, cudaStream_t) const;
     // u4h-family kernel id (-1: none). Dedup: one block per unique expert, map layout in quant_kernels.cuh.
     virtual int u4h_id() const { return -1; }
+    // kernel format the grouped expert kernels (k_expert_matvec / k_expert_gemm) run this format's banks with: u4h_id, or
+    // the UD types' fmt 8..12 (no u4h_id); a TQFN_TILED bank is tiled by this id (packed_experts.hpp expert_tile_bpb)
+    virtual int expert_kernel_id() const { return u4h_id(); }
     virtual bool has_expert_dedup() const { return u4h_id() >= 0; }
     virtual void expert_matvec_dedup(const Mat &, const __half *, __nv_bfloat16 *, int rows, const int * dmap, int groups, cudaStream_t) const;
     // two matrices of this format (gate, up) over the same dedup map in one launch

@@ -1,5 +1,8 @@
 // Grouped expert GEMM (prefill) on plain and TQFN_TILED banks: every u4h expert format must implement it, the tiled bank
 // must give the same bytes as the plain one, and the result must match the dedup matvec within FP16 / BF16 rounding.
+// The bank is tiled by the engines' own rule (expert_tile_bpb, as a pinned pack / resident banks are tiled) and every
+// format then runs with the tiled flag on: a format the rule leaves plain must still read its plain bank correctly.
+#include "packed_experts.hpp"
 #include "weight_format.hpp"
 #include "gguf.hpp"
 #include "quant_kernels.cuh"
@@ -62,7 +65,7 @@ static void run(uint32_t type, int rows, int cols, bool per_expert) {
     // reference: the dedup matvec, or the per-assignment expert matvec for formats without one (IQ1_S, IQ2_XXS)
     const bool dedup = m.fmt->has_expert_dedup();
     require(dedup || m.fmt->has_expert_matvec(), std::string(m.fmt->name()) + ": no expert matvec kernel");
-    const int bpb = tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id());
+    const int bpb = tqllm::expert_tile_bpb(m.fmt);  // what the engines tile (Flash-Next pack, resident banks)
 
     // skewed routing: expert 0 gets more than 64 tokens (two column tiles), expert 5 a few
     std::vector<int> slots(A);
@@ -108,25 +111,36 @@ static void run(uint32_t type, int rows, int cols, bool per_expert) {
         require(rel_mmq < 3e-2, std::string(m.fmt->name()) + ": MMQ vs grouped GEMM rel err " + std::to_string(rel_mmq));
     }
 
+    // the engine's flow: the bank tiled where expert_tile_bpb says so, then the decode matvec and the prefill GEMM with the
+    // tiled flag on (set for the whole process once any bank is tiled) must give the plain bank's bytes
     bool tiled = false;
-    if (bpb && rows % 16 == 0 && (cols / 32) % 4 == 0) {  // same bank, code bytes in the TQFN_TILED layout
-        const size_t code = size_t(experts) * rows * (cols / 32) * bpb;
-        std::vector<char> plain(code), t(code);
-        check(cudaMemcpy(plain.data(), m.p, code, cudaMemcpyDeviceToHost));
-        for (int e = 0; e < experts; ++e)
-            tqllm_cuda::tile_expert_rows(plain.data() + size_t(e) * rows * (cols / 32) * bpb, t.data() + size_t(e) * rows * (cols / 32) * bpb, rows, cols, bpb);
-        Device<char> dt(code); check(cudaMemcpy(dt.p, t.data(), code, cudaMemcpyHostToDevice));
-        Mat mt = m; mt.p = dt.p;
+    {
+        const size_t code = size_t(experts) * rows * (cols / 32) * (bpb ? bpb : 1);
+        Mat mt = m; std::unique_ptr<Device<char>> dt;
+        if (bpb) {
+            require(rows % 16 == 0 && (cols / 32) % 4 == 0, std::string(m.fmt->name()) + ": tileable bank with an untileable shape");
+            std::vector<char> plain(code), t(code);
+            check(cudaMemcpy(plain.data(), m.p, code, cudaMemcpyDeviceToHost));
+            for (int e = 0; e < experts; ++e)
+                tqllm_cuda::tile_expert_rows(plain.data() + size_t(e) * rows * (cols / 32) * bpb, t.data() + size_t(e) * rows * (cols / 32) * bpb, rows, cols, bpb);
+            dt = std::make_unique<Device<char>>(code); check(cudaMemcpy(dt->p, t.data(), code, cudaMemcpyHostToDevice));
+            mt.p = dt->p; tiled = true;
+        }
+        Device<__nv_bfloat16> ym(size_t(A) * rows), ymt(size_t(A) * rows);
+        m.fmt->expert_matvec(m, dx.p, ym.p, rows, dids.p, n, topk, per_expert, nullptr);
         tqllm_cuda::set_tiled_experts(true);
         mt.fmt->expert_gemm(mt, dx.p, yt.p, rows, dcnt.p, dgrp.p, cap, experts, topk, per_expert, nullptr);
+        mt.fmt->expert_matvec(mt, dx.p, ymt.p, rows, dids.p, n, topk, per_expert, nullptr);
         check(cudaDeviceSynchronize());
         tqllm_cuda::set_tiled_experts(false);
-        const auto tt = yt.get(size_t(A) * rows);
-        require(std::memcmp(tt.data(), g.data(), g.size() * sizeof(g[0])) == 0, std::string(m.fmt->name()) + ": tiled grouped GEMM differs from plain");
-        tiled = true;
+        const auto tt = yt.get(size_t(A) * rows), mv = ym.get(size_t(A) * rows), mvt = ymt.get(size_t(A) * rows);
+        require(std::memcmp(tt.data(), g.data(), g.size() * sizeof(g[0])) == 0,
+                std::string(m.fmt->name()) + (tiled ? ": tiled" : ": plain (untiled) bank under the tiled flag:") + " grouped GEMM differs from plain");
+        require(std::memcmp(mvt.data(), mv.data(), mv.size() * sizeof(mv[0])) == 0,
+                std::string(m.fmt->name()) + (tiled ? ": tiled" : ": plain (untiled) bank under the tiled flag:") + " expert matvec differs from plain");
     }
     std::printf("expert gemm %s (u4h %d) rows %d cols %d per_expert %d: rel err vs dedup %.2e%s", m.fmt->name(), m.fmt->u4h_id(),
-                rows, cols, per_expert, rel, tiled ? ", tiled bit-identical" : "");
+                rows, cols, per_expert, rel, tiled ? ", tiled bit-identical" : ", plain under the tiled flag bit-identical");
     if (rel_mmq >= 0) std::printf(", MMQ vs grouped %.2e", rel_mmq);
     std::printf("\n");
 }
@@ -140,7 +154,8 @@ int main() {
             run(GGML_IQ3_S, 64, 512, pe);
             run(GGML_IQ2_S, 48, 256, pe);
             run(GGML_IQ1_S, 64, 512, pe);    // MiniMax-M3.1-Flash experts (layers 8-54), batched prefill
-            run(GGML_IQ2_XXS, 64, 512, pe);  // MiniMax experts (layers 3-7, 55-59)
+            run(GGML_IQ2_XXS, 64, 512, pe);  // MiniMax experts (layers 3-7, 55-59); Flash-Next GSQ-RCO gate/up
+            run(GGML_IQ2_XS, 64, 512, pe);   // Flash-Next GSQ-RCO gate/up (layers 0, 2, 4, 5, 9, ...)
             run(GGML_Q4_K, 64, 512, pe);
             run(GGML_NVFP4G, 64, 512, pe);  // NVIDIA's Flash-Next NVFP4 experts (NVF4)
         }
