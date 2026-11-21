@@ -52,6 +52,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- CUDA library built without relocatable device code (`CUDA_SEPARABLE_COMPILATION` off; no kernel calls device code of
+  another file). Same greedy tokens. Quantized matvecs at 16 columns up to 10 % faster (TQT 34816 x 5120: 181.9 -> 166.5
+  us on an RTX 3090; TQV-12 and most llama.cpp types 3-5 %), 1-8 columns unchanged: DFlash2 decodes 8-11 % faster with
+  `--draft 15`, at its default 7 drafts at the same speed (+0.3-0.8 %). A clean build takes 27 % less wall time and
+  half the disk. Binaries now carry PTX for the built architectures (tqserve 44 -> 59 MB).
 - TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
   WikiText-2 train against its sha256 and takes the code half from the files in
   `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step
