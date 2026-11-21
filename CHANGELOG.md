@@ -5,6 +5,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Performance
+- Long-context prefill on the split KV caches (`--kv q8/q4`, `tcq3/q4`, ...): a prefix of 4096 keys or more is split over
+  up to 8 key ranges and merged (a 512-token chunk was 96 equal blocks, two waves on an 82-SM card), the tcq3 K decode
+  in prefill blocks takes one table lookup per two values, and 24 GB cards with 2 GB or more left after the KV cache
+  prefill in chunks of at least 1024 tokens at any context. RTX 3090, Qwen3.8-27B TQT + DFlash2, 256K context, VRAM
+  only, 250K-token prompt: q8/q4 590-644 -> 966 tok/s, tcq3/q4 582 -> 856 tok/s; greedy replies identical to the base.
+
 ### Fixed
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
