@@ -107,6 +107,8 @@ struct DecodeModel {
         int * ids_host = nullptr; size_t ids_cap = 0;
         const MixedExpertCache * cache = nullptr; int layer = -1; std::vector<int> plan; int issued = 0;  // copies queued ahead
         double copy_bytes = 0;
+        char * bounce[2] = {nullptr, nullptr}; size_t bounce_bytes = 0;  // pinned host blocks per half: experts read on demand (rt.expert_blocks)
+        const std::function<void(int, const int *, size_t, char *, size_t)> * blocks = nullptr;  // rt.expert_blocks of the running prefill
     };
     static PrefillStage & stage() { static PrefillStage st; return st; }
     std::unique_ptr<Device<float>> pf_inject, pf_weights, pf_sw, pf_sd; std::unique_ptr<Device<__half>> pf_xr, pf_ax;

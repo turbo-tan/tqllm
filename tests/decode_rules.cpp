@@ -419,6 +419,13 @@ int main() {
         check(n == 48, "Flash-Next profile: one entry per layer");
         check(std::string(flashnext_layer_profile(40, 512)).empty() && std::string(flashnext_layer_profile(48, 256)).empty(), "only for 48 layers x 512 experts");
     }
+    {   // layer-major prefill without a pack: the bank only while the routed experts fit, else streamed (on-demand GGUF)
+        check(!prefill_through_bank(true, false, true, 10, 200), "pack: only resident experts through the bank");
+        check(prefill_through_bank(false, false, true, 512, 512) && prefill_through_bank(false, false, false, 512, 512), "no pack, no host blocks (all resident): the bank");
+        check(prefill_through_bank(false, true, true, 180, 206), "on demand, routed experts fit the bank: the bank (short prompts unchanged)");
+        check(!prefill_through_bank(false, true, true, 512, 206), "on demand, 28K prompt routing to every expert: streamed, not 'active set exceeds slots'");
+        check(!prefill_through_bank(false, true, false, 10, 206), "on demand, borrowed layer (no bank): streamed");
+    }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

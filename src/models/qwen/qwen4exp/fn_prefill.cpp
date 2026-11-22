@@ -34,6 +34,27 @@ void DecodeModel::stage_upload(PrefillStage & st, const MixedExpertCache & cache
     const auto lay = cache.bank_layout(layer); size_t off[6]; stage_offsets(lay, st.K, off);
     const int b = g & 1; ck(cudaStreamWaitEvent(st.copy, st.done[b], 0));
     const size_t g0 = size_t(g) * st.K, g1 = std::min(st.plan.size(), g0 + size_t(st.K));
+    if (!lay.src0) {  // experts read from the GGUF on demand: the group's blocks are assembled in this half's pinned buffer
+        require(st.blocks && *st.blocks, "layer-major prefill: experts to stream but no expert source");
+        if (st.bounce_bytes < size_t(st.K) * lay.block) {
+            ck(cudaStreamSynchronize(st.copy));
+            for (auto & hb : st.bounce) if (hb) { ck(cudaFreeHost(hb)); hb = nullptr; }
+            st.bounce_bytes = size_t(st.K) * lay.block;
+            for (auto & hb : st.bounce) ck(cudaMallocHost(reinterpret_cast<void **>(&hb), st.bounce_bytes));
+        }
+        ck(cudaEventSynchronize(st.ready[b]));  // this half's previous upload has read its host blocks
+        const size_t n = g1 - g0;
+        if (n) (*st.blocks)(layer, st.plan.data() + g0, n, st.bounce[b], lay.block);
+        size_t po = 0;
+        for (int i = 0; i < 6; ++i) {
+            if (lay.piece[i] && n) ck(cudaMemcpy2DAsync(st.half[b] + off[i], lay.piece[i], st.bounce[b] + po, lay.block,
+                                                        lay.piece[i], n, cudaMemcpyHostToDevice, st.copy));
+            po += lay.piece[i];
+        }
+        st.copy_bytes += double(n) * lay.block;
+        ck(cudaEventRecord(st.ready[b], st.copy));
+        return;
+    }
     for (size_t r0 = g0; r0 < g1;) {
         size_t r1 = r0 + 1; while (r1 < g1 && st.plan[r1] == st.plan[r1 - 1] + 1) ++r1;
         const char * src = lay.src0 + size_t(st.plan[r0]) * lay.block; size_t po = 0;
@@ -71,6 +92,8 @@ void DecodeModel::release_prefill() {
     }
     auto & st = stage();
     if (!keep) { for (auto & hp : st.half) if (hp) { ck(cudaFree(hp)); hp = nullptr; } st.half_bytes = 0; st.K = 0; }
+    for (auto & hb : st.bounce) if (hb) { ck(cudaFreeHost(hb)); hb = nullptr; }
+    st.bounce_bytes = 0;
     st.layer = -1; st.cache = nullptr; st.plan.clear(); st.issued = 0;
     if (!keep) { cp.rt.qsa_batch.reset(); tqllm_cuda::fn_gdn_release_workspaces(); }
     ++cp.rt.prefill_epoch;
@@ -86,6 +109,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
               stage_k = std::max(1, cp.rt.prefill_stage > 0 ? cp.rt.prefill_stage : cp.run.tune.stage);
     const int K = c.topk, A = n * K, E = c.experts, ff = c.expert_ff;
     auto & st = stage();
+    st.blocks = cp.rt.expert_blocks ? &cp.rt.expert_blocks : nullptr;
     if (!st.copy || st.K != stage_k) {  // staging banks sized for the largest expert block of any layer
         size_t need = 0;
         for (int l = 0; l < c.layers; ++l) {
@@ -158,9 +182,13 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     st.plan.resize(std::min(st.plan.size(), size_t(st.issued) * size_t(st.K)));
     std::vector<char> planned(size_t(E), 0); for (int e : st.plan) planned[size_t(e)] = 1;
     std::vector<int> hot;
-    // without a prepacked file every routed expert goes through the bank (prepare loads the missing ones)
-    for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) || !lay.src0 ? hot : st.plan).push_back(e);
-    require(st.plan.empty() || lay.src0, "layer-major prefill: experts to stream but no prepacked expert file (--experts)");
+    // without a prepacked file the routed experts go through the bank while they fit in it; experts read from the GGUF
+    // on demand stream otherwise, through staging like a pack's (rt.expert_blocks)
+    int routed = 0; for (int e = 0; e < E; ++e) routed += cnt[size_t(e)] > 0;
+    const bool through_bank = tqllm::flashnext::prefill_through_bank(lay.src0 != nullptr, bool(cp.rt.expert_blocks), cache.bank_ready(layer),
+                                                                     routed, cache.slots(layer));  // decode_rules.hpp
+    for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) || through_bank ? hot : st.plan).push_back(e);
+    require(st.plan.empty() || lay.src0 || cp.rt.expert_blocks, "layer-major prefill: experts to stream but no prepacked expert file (--experts)");
     const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
     for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
     // per-slot assignment lists of every pass, uploaded once: [counts W][groups W x cap]

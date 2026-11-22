@@ -6,6 +6,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Fixed
+- Flash-Next with experts read from the GGUF on demand (no pinned pack, e.g. a 64 GB host): a prompt whose layer-major
+  prefill routed to more experts of a layer than its bank has slots failed with "mixed cache: active set exceeds slots"
+  (a 4K prompt already does on a 24 GB card; a 28K prompt routes to all 512 experts of a layer with ~200 slots; a layer
+  whose bank was lent to the prefill has no bank at all). Those experts now stream through the prefill staging like a pack's, assembled on the host from the GGUF;
+  prompts whose routed experts fit the bank keep the bank path. A prefill that fails now also gives back the expert banks
+  it borrowed (before, every later long prompt planned with ~9 GB of banks missing and failed the same way). RTX 3090,
+  59 GiB host, Flash-Next IQ3_XXS, 32K context: 4K- and 28K-token 5-code needles 5/5 (28K: two seeds) instead of the
+  error, greedy replies identical to the pinned pack's; short prompts identical to before; 28K prefill on demand ~1.4K
+  tok/s.
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with

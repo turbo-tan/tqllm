@@ -272,6 +272,24 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots, slots_.size() > 1 ? int(slots_.size()) * c.topk : 0);
+    // experts read from the GGUF on demand: a long prompt's layer-major prefill streams the routed experts its banks do
+    // not hold (a borrowed layer: all of them) in the bank layout, assembled on the host from the GGUF payloads (the
+    // bytes a pinned pack holds, untiled as the banks are here)
+    if (f.experts.empty() && !integrated && !pack_in_memory && f.hot_map_path.empty())
+        rt.expert_blocks = [&checkpoint](int layer, const int * ids, size_t n, char * dst, size_t block) {
+            std::atomic<size_t> next{0}; std::atomic<bool> bad{false};
+            auto work = [&] {
+                for (size_t i; (i = next++) < n;) {
+                    const auto parts = repack_expert(checkpoint, layer, ids[i], false); char * d = dst + i * block; size_t at = 0;
+                    for (const auto & p : parts) { if (at + p.size() > block) { bad = true; break; } std::memcpy(d + at, p.data(), p.size()); at += p.size(); }
+                    if (at != block) bad = true;
+                }
+            };
+            const size_t threads = std::min<size_t>(n, std::max(2u, std::min(16u, std::thread::hardware_concurrency() / 2)));
+            std::vector<std::thread> pool; for (size_t t = 1; t < threads; ++t) pool.emplace_back(work);
+            work(); for (auto & t : pool) t.join();
+            require(!bad, "on-demand experts: an expert's repacked size differs from its bank layout");
+        };
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
