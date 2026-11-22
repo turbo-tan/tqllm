@@ -33,6 +33,7 @@ struct KvStep {  // one attention layer, n new tokens (verify: n <= nver; prefil
     const int32_t * qsa_sel = nullptr;
     int qsa_from = 0;
     bool qsa_mixed = false;
+    size_t part_floats = 0;  // capacity of part (0: unknown; a prefill chunk then keeps its prefix in one key range)
 };
 
 // One layer of sparse attention: each query attends to its `width` selected positions (valid[i] == 0: padding).
@@ -71,6 +72,8 @@ struct KvFormat {
     virtual size_t key_bytes(int64_t context, int kvheads, int head_dim) const = 0;
     virtual size_t value_bytes(int64_t context, int kvheads, int head_dim) const = 0;
     virtual int split_factor() const { return 1; }    // verify key splits per SM and KV head
+    // floats of KvStep::part that prefill chunks of up to nbuf tokens use for key splits (0: none)
+    virtual size_t prefill_partial_floats(int nbuf, int heads, int kvheads) const { (void)nbuf, (void)heads, (void)kvheads; return 0; }
     // reads a TqCache stand-in segment (KvStep::compact); k / v: the tqllm_cuda::KvCodec ids the compactor decodes
     virtual bool compact_codecs(int & k, int & v) const { (void)k, (void)v; return false; }
     bool compact_ok() const { int k = 0, v = 0; return compact_codecs(k, v); }

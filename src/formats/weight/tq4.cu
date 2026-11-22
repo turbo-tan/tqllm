@@ -114,7 +114,8 @@ __device__ __forceinline__ uint32_t expand_u(uint32_t c) {
 // 2 = next block's weights in flight, activations loaded just in time (they are L2 resident and shared by all rows);
 // 3 = two k blocks per iteration with all their weight loads issued first (four 16-byte loads in flight per lane, no
 // buffer carried across iterations). PF >= 2 run under a 2 (MT 2) / 3 (MT 1) blocks-per-SM register bound.
-template <int NCOL, int MT, class OUT = __nv_bfloat16, int PF = 0, int BITS = 4>
+// L1: the same code as a second instance that prefers L1 over shared memory (prefer_l1; TQ4 at 5-8 columns).
+template <int NCOL, int MT, class OUT = __nv_bfloat16, int PF = 0, int BITS = 4, bool L1 = false>
 __global__ void __launch_bounds__(256, BITS == 3 ? TQ3_MINB : PF >= 2 ? (MT == 1 ? 3 : 2) : (NCOL <= 8 && MT <= 2 && PF != 1) ? TQ4_MINB : 1) tq4_matvec_k(const uint8_t * w4, const __half * sc, const __half * xh, OUT * y,
                                                     int rows, int k, int nc, int ldy, int nw) {
     // PF: the next k block's weights, scales and activations are loaded while the current one computes. Per row and
@@ -821,6 +822,14 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
     auto go = [&](auto ncol_c, auto mt_c, auto pf_c) {
         constexpr int NCOL = decltype(ncol_c)::value, MT = decltype(mt_c)::value;
         constexpr int PF = decltype(pf_c)::value;
+        if constexpr (NCOL <= 8 && BITS == 4) {
+            if (ncols > 4) {  // 5-8 columns: the re-read activations stay in L1 (1-column decode keeps the default carveout)
+                prefer_l1(reinterpret_cast<const void *>(tq4_matvec_k<NCOL, MT, OUT, PF, BITS, true>), 256);
+                tq4_matvec_k<NCOL, MT, OUT, PF, BITS, true><<<(rows + 16 * MT - 1) / (16 * MT), 32 * nw, 0, s>>>(
+                    w4, sc, xh, y, rows, k, ncols, ldy, nw);
+                return;
+            }
+        }
         tq4_matvec_k<NCOL, MT, OUT, PF, BITS><<<(rows + 16 * MT - 1) / (16 * MT), 32 * nw, 0, s>>>(w4, sc, xh, y, rows, k, ncols,
                                                                                                 ldy, nw);
     };

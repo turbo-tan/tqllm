@@ -39,6 +39,9 @@ struct KvSplit final : KvFormat {
                 "llama.cpp-tq3 / tqllm", "Apache-2.0", "idea (trellis KV: spiritbuun/buun-llama-cpp)"};
     }
     int split_factor() const override { return 2; }
+    size_t prefill_partial_floats(int nbuf, int heads, int kvheads) const override {
+        return tqllm_cuda::kv_prefill_partial_floats(nbuf, heads, kvheads);
+    }
     bool tree_ok() const override { return true; }
     bool qsa_ok() const override { return true; }
     bool qsa_host_ok() const override { return true; }
@@ -61,7 +64,7 @@ struct KvSplit final : KvFormat {
         tqllm_cuda::attention_kv_split(k.id, v.id, a.q, a.kc, a.vc, a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale,
                                        a.n > a.nver ? 1 : a.split, a.stream, a.par, a.dep,
                                        static_cast<const tqllm_cuda::KvCompactSeg *>(a.compact), a.par ? a.qsa_sel : nullptr, a.qsa_from,
-                                       a.qsa_mixed);
+                                       a.qsa_mixed, a.part_floats);
     }
 };
 }  // namespace

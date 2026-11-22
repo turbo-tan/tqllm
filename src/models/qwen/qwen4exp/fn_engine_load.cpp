@@ -309,10 +309,10 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     if (!f.packed.tiled) {
         for (int l = 0; l < f.packed.layers; ++l) {
-            size_t off = 0; const auto ids = expert_u4h_ids(checkpoint, l);
+            size_t off = 0; const auto bpbs = expert_tile_bpbs(checkpoint, l);  // the grouped kernels' id, not u4h_id (UD types)
             for (int pp = 0; pp < 3; ++pp) {
                 const int cols = pp == 2 ? c.expert_ff : c.hidden, rows = pp == 2 ? c.hidden : c.expert_ff;
-                const int bpb = tqllm_cuda::tiled_block_bytes(ids[pp]); const size_t dsz = f.packed.sizes[l][2 * pp];
+                const int bpb = bpbs[size_t(pp)]; const size_t dsz = f.packed.sizes[l][2 * pp];
                 if (bpb) {
                     require(rows % 16 == 0 && (cols / 32) % 4 == 0 && dsz == size_t(rows) * (cols / 32) * bpb, "tileable expert part with an unexpected layout");
                     std::vector<std::thread> th;
@@ -552,7 +552,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               // the grouped u4h kernels of tileable formats (quant_u4h.inc: GROUPED && tiled_bpb(FMT) && c_tiled_experts)
               int tiled = 0, kept = 0;
               banks([&](const tqllm::Mat & m, int rows, int k) {  // m: the bank, its slots stacked (m.rows = slots x rows); data only
-                  const int bpb = m.fmt ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;
+                  const int bpb = tqllm::expert_tile_bpb(m.fmt);
                   if (bpb > 0) {  // a tileable format must be tiled: the kernels read every bank of it as tiles once the flag is on
                       require(rows % 16 == 0 && (k / 32) % 4 == 0 && m.cols == k && m.rows % rows == 0, "tileable expert bank with an unexpected layout");
                       tqllm_cuda::tile_expert_rows_device(static_cast<char *>(const_cast<void *>(m.p)), m.rows / rows, rows, k, bpb, nullptr);

@@ -1022,6 +1022,7 @@ struct Q5_K final : WeightFormat {
 struct Udq final : WeightFormat {
     int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return fmt == 10 ? 10 : -1; }
+    int expert_kernel_id() const override { return fmt; }  // expert_matvec / expert_gemm below run fmt
     int gemm_f32_id() const override { return fmt; }
     bool has_expert_matvec() const override { return true; }  // every UD format (grouped kernels cover u4h fmt 0..15)
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,

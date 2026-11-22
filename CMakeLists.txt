@@ -224,7 +224,7 @@ if(TQLLM_CUDA)
     src/backends/cuda/qwen2_engine.cpp src/backends/cuda/load_fitted.cpp src/backends/cuda/model_capture.cpp src/models/qwen/qwen35/qwen35.cpp src/models/qwen/qwen35/qwen35_load.cpp src/models/qwen/qwen35/qwen35_forward.cpp src/models/qwen/qwen35/qwen35_spec.cpp src/models/qwen/qwen35/qwen35_dspine.cpp
     src/experts/tq3_expert_cache.cpp src/experts/mixed_expert_cache.cpp src/experts/cpu_kquant.cpp
     src/models/qwen/qwen2/qwen2.cu src/models/qwen/qwen35/qwen35.cu src/experts/moe.cu src/models/qwen/qwen4exp/qwen4exp.cu src/models/qwen/qwen4exp/qwen4exp_qsa.cu src/models/qwen/qwen35/attention.cu src/models/qwen/qwen35/qwen35_qsa.cu src/models/qwen/qwen35/pplx_embed.cu
-    src/spec/dflash.cu src/spec/dspine.cu src/spec/suffix_copy.cpp src/vision/vision.cpp src/vision/vision.cu
+    src/spec/dflash.cu src/spec/dspine.cu src/spec/head_sampler.cu src/spec/suffix_copy.cpp src/vision/vision.cpp src/vision/vision.cu
     src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu src/experts/mmq_runtime.cpp)
   # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
   # weights through MappedGguf, which moves here from the per-tool source lists (tqserve, tqfn-stage).
@@ -440,6 +440,10 @@ if(TQLLM_CUDA)
   target_include_directories(test-u4h-columns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-u4h-columns PRIVATE tqllm CUDA::cudart)
   add_test(NAME u4h_columns COMMAND test-u4h-columns)
+  add_executable(test-head-sampler tests/head_sampler.cu)  # exact sampling through the screened two-stage head == every-logit reference
+  target_include_directories(test-head-sampler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test-head-sampler PRIVATE tqllm CUDA::cudart)
+  add_test(NAME head_sampler COMMAND test-head-sampler)
   add_executable(test-qsa-append-multi tests/qsa_append_multi.cu)
   target_include_directories(test-qsa-append-multi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp)
   target_link_libraries(test-qsa-append-multi PRIVATE tqllm CUDA::cudart)
@@ -727,6 +731,10 @@ if(TQLLM_CUDA)
   target_include_directories(test-kv-tcq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-kv-tcq PRIVATE tqllm CUDA::cudart)
   add_test(NAME kv_tcq COMMAND test-kv-tcq)
+  add_executable(test-kv-prefill tests/kv_prefill.cu)
+  target_include_directories(test-kv-prefill PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test-kv-prefill PRIVATE tqllm CUDA::cudart)
+  add_test(NAME kv_prefill COMMAND test-kv-prefill)
   add_executable(test-kv-host tests/kv_host.cu)
   target_include_directories(test-kv-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test-kv-host PRIVATE tqllm CUDA::cudart)
