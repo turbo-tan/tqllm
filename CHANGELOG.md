@@ -6,6 +6,10 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Fixed
+- Flash-Next: the first decode step past the QSA indexer budget (2048 positions; every decode after a long prompt)
+  built the selection scratch inside the attention layers' graph capture, whose device sync failed the capture of every
+  attention layer: each reran without a graph and the link trace was dumped to the log as if a GPU error had occurred.
+  The scratch is now made before decode (and before the bank refill sizes the banks). Replies are unchanged.
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
