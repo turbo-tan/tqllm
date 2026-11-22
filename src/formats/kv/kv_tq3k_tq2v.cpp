@@ -13,6 +13,9 @@ struct KvTq3kTq2v final : KvFormat {
                 "turbo-tan (TQ3_0 layout); TQLLM (2-bit V extension)", "llama.cpp-tq3 / tqllm", "Apache-2.0", "see NOTICE"};
     }
     int split_factor() const override { return 2; }
+    size_t prefill_partial_floats(int nbuf, int heads, int kvheads) const override {
+        return tqllm_cuda::kv_prefill_partial_floats(nbuf, heads, kvheads);
+    }
     bool tree_ok() const override { return true; }
     size_t key_bytes(int64_t c, int kvh, int hd) const override {
         if (hd != 256) throw std::runtime_error("KV format tq3k-tq2v requires head_dim 256");
@@ -28,7 +31,8 @@ struct KvTq3kTq2v final : KvFormat {
         tqllm_cuda::cache_write_multi_tq3k_tq2v(a.k0, a.k0 + a.kvheads * a.head_dim, a.ts, a.n, k3, v2, a.dpos,
                                                 a.kvheads, a.head_dim, a.stream);
         tqllm_cuda::attention_kv_split(tqllm_cuda::KvCodec::Tq3, tqllm_cuda::KvCodec::Tq2s, a.q, k3, v2,
-                                       a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.n > a.nver ? 1 : a.split, a.stream, a.par, a.dep);
+                                       a.o, a.part, a.dpos + 1, a.n, a.heads, a.kvheads, a.scale, a.n > a.nver ? 1 : a.split, a.stream, a.par, a.dep,
+                                       nullptr, nullptr, 0, false, a.part_floats);
     }
 };
 }  // namespace

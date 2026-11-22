@@ -11,6 +11,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   DFlash2-TQ3, 144K context, q8/q4 K/V: 20826 -> 20654 MiB after load). The decoded values are the BF16 ones the
   expansion produced, so drafts, acceptance and output are identical.
 
+### Performance
+- Long-context prefill on the split KV caches (`--kv q8/q4`, `tcq3/q4`, ...): a prefix of 4096 keys or more is split over
+  up to 8 key ranges and merged (a 512-token chunk was 96 equal blocks, two waves on an 82-SM card), the tcq3 K decode
+  in prefill blocks takes one table lookup per two values, and 24 GB cards with 2 GB or more left after the KV cache
+  prefill in chunks of at least 1024 tokens at any context. RTX 3090, Qwen3.8-27B TQT + DFlash2, 256K context, VRAM
+  only, 250K-token prompt: q8/q4 590-644 -> 966 tok/s, tcq3/q4 582 -> 856 tok/s; greedy replies identical to the base.
+
 ### Fixed
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.

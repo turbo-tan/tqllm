@@ -513,6 +513,7 @@ void Qwen35Engine::allocate() {
         prefill_room = fr > kv_dev ? fr - kv_dev : 0;
     }
     if (opt.ubatch) NPF = NBUF = std::max(NVER, opt.ubatch);
+    std::fprintf(stderr, "tqllm: prefill chunk %d tokens (%.2f GB free after the KV cache)\n", NPF, prefill_room / 1073741824.0);
     // A trained draft block can be wider than the requested prefill micro-batch or verify capacity.
     if (!opt.draft_model.empty()) NBUF = std::max(NBUF, 16 * nslots);
     x = Buf(H * 2);
@@ -607,7 +608,8 @@ void Qwen35Engine::allocate() {
     v_qkvc = Buf(NBUF * (2 * lk + lv) * 2);
     part_floats = std::max({!kvf->needs_context_scratch() ? size_t(0) : size_t(NVER) * tqllm_cuda::attention_partial_floats(int(cfg.heads), int(context_), int(hd)),
                             size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NVER, kv_cmp ? 257 : 256)),
-                            size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NBUF, kv_cmp ? 2 : 1))});  // + stand-in slot
+                            size_t(tqllm_cuda::attention_mq_partial_floats(int(cfg.heads), NBUF, kv_cmp ? 2 : 1)),  // + stand-in slot
+                            kvf->prefill_partial_floats(NBUF, int(cfg.heads), int(cfg.kvheads))});
     if (!cfg.gated_attention) {
         if (std::string(kvf->name()) != "bf16") throw std::invalid_argument("Qwen3 currently requires --kv bf16");
         part_floats = std::max(part_floats, size_t(tqllm_cuda::attention_gen_partial_floats(int(cfg.heads), int(context_), NBUF)));
