@@ -8,6 +8,7 @@
 #include "dequant.hpp"
 #include "gguf.hpp"
 #include "gguf_mapped.hpp"
+#include "hf_arch.hpp"
 #include "hf_folder.hpp"
 
 #include <cmath>
@@ -136,8 +137,9 @@ int main() try {
     add(ts, "m", mat); add(ts, "bank", bank); add(ts, "t.shard_0", sh0); add(ts, "t.shard_1", sh1);
     std::vector<uint16_t> vec(8); for (size_t i = 0; i < vec.size(); ++i) vec[i] = uint16_t(0x3f80 + 0x10 * i);  // BF16 1.0 ...
     ts["v"] = {"BF16", {8}, std::vector<char>(reinterpret_cast<char *>(vec.data()), reinterpret_cast<char *>(vec.data()) + 16)};
+    ts["f8.weight"] = {"F8_E4M3", {5, 64}, std::vector<char>(5 * 64, 0x38)};  // an FP8 PLE n-gram table
     write_safetensors(dir / "model.safetensors", ts);
-    { std::ofstream c(dir / "config.json"); c << "{\"architectures\":[\"none\"]}"; }
+    { std::ofstream c(dir / "config.json"); c << "{\"architectures\":[\"none\"],\"text_config\":{\"ple_quant_scheme\":\"fp8\"}}"; }
     const HfFolder h(dir.string());
 
     // q4: Q4_1 bytes dequantise to exactly the MLX values
@@ -176,6 +178,10 @@ int main() try {
         for (uint64_t c = 0; c < 64; ++c) exact &= got[i * 64 + c] == (want[i] < 5 ? value(sh0, want[i] * 64 + c) : value(sh1, (want[i] - 5) * 64 + c));
     check(exact, "q4_rows gathers across the shard boundary");
     check(rt.warm(2) > 0, "q4_rows warm reads the shards");
+    // PLE table row width: 8 weights per U32 word; an FP8 table is refused by name (it read as 64 * 8 before)
+    check(hf_ple_row_width(h, "t.shard_0.weight") == 64, "PLE row width of a 4-bit table");
+    std::string why; try { (void) hf_ple_row_width(h, "f8.weight"); } catch (const std::exception & x) { why = x.what(); }
+    check(why.find("F8_E4M3") != std::string::npos && why.find("ple_quant_scheme fp8") != std::string::npos, "FP8 PLE table refused: " + why);
     // values: transform and order
     const GgufTensor vt = h.values("v", GGML_F32, {8}, [](float x) { return -x; }, [] { HfBlockOrder o; o.order = {1, 0}; o.block = 4; return o; }());
     const auto vb = vt.make(); float vf[8]; std::memcpy(vf, vb.data(), 32);

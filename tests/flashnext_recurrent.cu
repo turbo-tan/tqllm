@@ -65,6 +65,50 @@ static void gate_test(bool legacy) {
     tqllm_cuda::fn_gated_rms(dx.p, dz.p, dw.p, dx.p, heads, dim, tokens, eps, nullptr);
     require(dx.get() == got, "in-place gated RMS differs");
     std::puts("Flash-Next sigmoid output gate (zero/saturated/mixed/in-place): PASS");
+    for (int r = 0; r < heads * tokens; ++r) for (int j = 0; j < dim; ++j) expected[r * dim + j] *= z[r * dim + j];
+    dx.put(x);
+    tqllm_cuda::fn_gated_rms(dx.p, dz.p, dw.p, dy.p, heads, dim, tokens, eps, nullptr, true);
+    compare(dy.get(), expected);
+    std::puts("Qwen dense SiLU output gate z * sigmoid(z): PASS");
+}
+// prefill blocks (>= 64 tokens) take the 8-row kernel, and the FP16 image kernels feed quantised projections: both gate
+// activations must match the reference there too
+static void gate_prefill_test() {
+    constexpr int dim = 128, heads = 3, tokens = 70, count = dim * heads * tokens;
+    const float eps = 1e-6f;
+    std::vector<float> x(count), z(count), w(dim); std::vector<double> sig(count), slu(count);
+    for (int i = 0; i < count; ++i) { x[i] = 1.f + .05f * std::sin(float(i)); z[i] = 3.f * std::cos(.37f * float(i)); }
+    for (int i = 0; i < dim; ++i) w[i] = .7f + .03f * std::cos(float(i));
+    for (int r = 0; r < heads * tokens; ++r) {
+        double ss = 0.; for (int j = 0; j < dim; ++j) ss += double(x[r * dim + j]) * x[r * dim + j];
+        for (int j = 0; j < dim; ++j) {
+            const int i = r * dim + j; const double g = 1. / (1. + std::exp(-double(z[i])));
+            sig[i] = x[i] / std::sqrt(ss / dim + eps) * w[j] * g; slu[i] = sig[i] * z[i];
+        }
+    }
+    Device<float> dx(count), dz(count), dw(dim), dy(count); dx.put(x); dz.put(z); dw.put(w);
+    Device<__half> dh(count), dzh(count);
+    std::vector<__half> zh(count); for (int i = 0; i < count; ++i) zh[i] = __float2half_rn(z[i]); dzh.put(zh);
+    for (bool silu : {false, true}) {
+        const auto & want = silu ? slu : sig;
+        tqllm_cuda::fn_gated_rms(dx.p, dz.p, dw.p, dy.p, heads, dim, tokens, eps, nullptr, silu);
+        const auto got = dy.get(); compare(got, want);
+        tqllm_cuda::fn_gated_rms_h(dx.p, dz.p, dw.p, dh.p, heads, dim, tokens, eps, nullptr, silu);
+        const auto h = dh.get();
+        for (int i = 0; i < count; ++i) { const __half e = __float2half_rn(got[i]); require(std::memcmp(&h[i], &e, 2) == 0, "FP16 gated RMS is not the FP16 image of the fp32 output"); }
+        std::vector<double> want_h(count);  // FP16 gate input: the reference with the rounded gate
+        for (int r = 0; r < heads * tokens; ++r) {
+            double ss = 0.; for (int j = 0; j < dim; ++j) ss += double(x[r * dim + j]) * x[r * dim + j];
+            for (int j = 0; j < dim; ++j) {
+                const int i = r * dim + j; const double zz = __half2float(zh[i]), g = 1. / (1. + std::exp(-zz));
+                want_h[i] = x[i] / std::sqrt(ss / dim + eps) * w[j] * (silu ? zz * g : g);
+            }
+        }
+        tqllm_cuda::fn_gated_rms_h(dx.p, dzh.p, dw.p, dh.p, heads, dim, tokens, eps, nullptr, silu);
+        const auto h2 = dh.get(); std::vector<float> h2f(count); for (int i = 0; i < count; ++i) h2f[i] = __half2float(h2[i]);
+        compare(h2f, want_h, 2e-3, 2e-3);
+    }
+    std::puts("gated RMS 8-row + FP16 kernels, sigmoid and SiLU gate (70 tokens): PASS");
 }
 static void legacy_normalization_test() {
     constexpr int dim = 128;
@@ -245,6 +289,7 @@ int main(int argc, char ** argv) {
         if (argc == 2 && std::string(argv[1]) == "--legacy-normalization") { legacy_normalization_test(); return 0; }
         const bool legacy = argc == 2 && std::string(argv[1]) == "--legacy-gate";
         gate_test(legacy); if (legacy) return 0;
+        gate_prefill_test();
         shape_overflow_test();
         for (int n : {1, 5, 17}) for (float scale : {0.f, 1e-8f, .4f}) recurrence_test(2, 6, 32, n, scale);
         recurrence_test(4, 12, 256, 5, .4f);

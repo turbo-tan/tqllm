@@ -1,4 +1,4 @@
-// QSA indexer block scores (qsa_score_pack): the fixed 4-head x 128 kernel vs the generic one, sort keys bitwise equal,
+// QSA indexer block scores (qsa_score_pack): the fixed 4- and 8-head x 128 kernels vs the generic one, sort keys bitwise equal,
 // including blocks not yet complete for a query (key 0), a last group of fewer than 16 blocks, a partial group of
 // queries and negative dots.
 #include "qwen4exp_kernels.cuh"
@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <vector>
 static void check(cudaError_t x) { if (x != cudaSuccess) throw std::runtime_error(cudaGetErrorString(x)); }
-static bool run(int blocks, int tokens, int first_position, int ratio) {
-    constexpr int heads = 4, dim = 128;
+static bool run(int blocks, int tokens, int first_position, int ratio, int heads = 4) {
+    constexpr int dim = 128;
     std::mt19937 rng(blocks + tokens * 3 + first_position); std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> k(size_t(blocks) * dim), q(size_t(tokens) * heads * dim);
     for (auto & x : k) x = nd(rng);
@@ -37,17 +37,24 @@ static bool run(int blocks, int tokens, int first_position, int ratio) {
     size_t diff = 0, zero = 0;
     for (size_t i = 0; i < ha.size(); ++i) { diff += ha[i] != hb[i]; zero += ha[i] == 0; }
     cudaFree(dk); cudaFree(dq); cudaFree(a); cudaFree(b);
-    std::printf("blocks %d tokens %d first %d: %zu of %zu keys differ (%zu incomplete)\n", blocks, tokens, first_position, diff, ha.size(), zero);
+    std::printf("heads %d blocks %d tokens %d first %d: %zu of %zu keys differ (%zu incomplete)\n", heads, blocks, tokens, first_position, diff, ha.size(), zero);
     return diff == 0;
 }
 int main() {
-    if (std::getenv("QSA_BENCH")) return run(23413, 1024, 92631, 4) ? 0 : 1;
+    if (std::getenv("QSA_BENCH")) return run(23413, 1024, 92631, 4) && run(23413, 1024, 92631, 4, 8) ? 0 : 1;
     bool ok = run(23413, 64, 93590, 4);   // 93.7K prompt, last chunk
     ok = run(1000, 64, 3970, 4) && ok;    // early blocks incomplete for the first queries
     ok = run(23413, 37, 93590, 4) && ok;  // a partial group of 16 queries
     ok = run(5000, 100, 1000, 4) && ok;   // a query group that crosses the completion boundary of many block groups
     ok = run(37, 16, 120, 4) && ok;       // last group of 5 blocks
     ok = run(1, 4, 3, 4) && ok;
+    // 8-head indexers (2 blocks per warp, 8 queries per CTA): the same cases
+    ok = run(23413, 64, 93590, 4, 8) && ok;
+    ok = run(1000, 64, 3970, 4, 8) && ok;
+    ok = run(23413, 37, 93590, 4, 8) && ok;
+    ok = run(5000, 100, 1000, 4, 8) && ok;
+    ok = run(37, 16, 120, 4, 8) && ok;
+    ok = run(1, 4, 3, 4, 8) && ok;
     std::puts(ok ? "qsa_pack_exact PASS" : "qsa_pack_exact FAIL");
     return ok ? 0 : 1;
 }

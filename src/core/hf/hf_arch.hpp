@@ -17,6 +17,7 @@ const HfArch * hf_arch(const std::string & hf_name);
 void hf_map_minimax_m3(const HfFolder & h, GgufFile & f);
 void hf_map_minimax_m3_dspark(const HfFolder & h, GgufFile & f);
 void hf_map_qwen4_exp(const HfFolder & h, GgufFile & f);  // arch_qwen4_exp.cpp
+uint64_t hf_ple_row_width(const HfFolder & h, const std::string & table);  // arch_qwen4_exp.cpp: MLX 4-bit PLE tables only
 void hf_map_qwen35(const HfFolder & h, GgufFile & f);     // arch_qwen35.cpp
 
 }  // namespace tqllm

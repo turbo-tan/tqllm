@@ -16,6 +16,9 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- Qwen4.0 preparation: a dense Qwen4 graph built on the Flash-Next block (hyper-connection mixer, gated attention with
+  QSA, GDN) with a dense SwiGLU feed-forward, and per-layer embeddings shared with Flash-Next. Ready for the Qwen4 27B
+  weights when they are published; Flash-Next output is unchanged.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /

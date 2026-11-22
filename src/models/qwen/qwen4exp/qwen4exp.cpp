@@ -14,13 +14,14 @@ uint64_t exact_integer(double x, const std::string & key, bool positive = false)
     return uint64_t(x);
 }
 int scalar(const GgufFile & f, const std::string & key, bool positive = true, double fallback = -1.) {
-    const double value = fallback >= 0. ? f.num("qwen4exp." + key, fallback) : f.num("qwen4exp." + key);
+    const std::string k = qwen4exp_prefix(f) + key;
+    const double value = fallback >= 0. ? f.num(k, fallback) : f.num(k);
     const uint64_t x = exact_integer(value, key, positive);
     if (x > uint64_t(std::numeric_limits<int>::max())) throw std::runtime_error("qwen4exp: integer too large for " + key);
     return int(x);
 }
 std::vector<uint64_t> array(const GgufFile & f, const std::string & key, size_t minimum) {
-    const auto it = f.kv.find("qwen4exp." + key);
+    const auto it = f.kv.find(qwen4exp_prefix(f) + key);
     if (it == f.kv.end() || it->second.arr.size() < minimum)
         throw std::runtime_error("qwen4exp: missing or short array " + key);
     std::vector<uint64_t> result;
@@ -37,6 +38,12 @@ std::vector<int> int_array(const std::vector<uint64_t> & values, const char * na
 }
 } // namespace
 
+std::string qwen4exp_prefix(const GgufFile & f) {
+    const std::string arch = f.str("general.architecture");
+    if (arch != "qwen4exp" && arch != "qwen4") throw std::runtime_error("qwen4exp: wrong architecture " + arch);
+    return arch + ".";
+}
+
 void PleHashConfig::validate() const {
     if (ngram < 2 || ngram > 8 || heads_per_ngram <= 0 || int64_t(ngram - 1) * heads_per_ngram > 64 ||
         eos < 0 || image < 0 || multipliers.size() != size_t(ngram))
@@ -52,15 +59,23 @@ void PleHashConfig::validate() const {
 }
 
 Qwen4ExpConfig qwen4exp_config(const GgufFile & f) {
-    if (f.str("general.architecture") != "qwen4exp") throw std::runtime_error("qwen4exp: wrong architecture");
+    const std::string pre = qwen4exp_prefix(f);
     Qwen4ExpConfig c;
     c.layers = scalar(f, "block_count"); c.hidden = scalar(f, "embedding_length");
-    c.experts = scalar(f, "expert_count"); c.topk = scalar(f, "expert_used_count");
-    c.expert_ff = scalar(f, "expert_feed_forward_length"); c.shared_ff = scalar(f, "expert_shared_feed_forward_length");
+    c.experts = scalar(f, "expert_count", false, 0.);
+    if (c.experts) {
+        c.topk = scalar(f, "expert_used_count");
+        c.expert_ff = scalar(f, "expert_feed_forward_length"); c.shared_ff = scalar(f, "expert_shared_feed_forward_length");
+    } else c.dense_ff = scalar(f, "feed_forward_length");  // dense FFN (Qwen4-27B)
+    if (f.has(pre + "ssm.gate_activation")) {
+        const std::string act = f.str(pre + "ssm.gate_activation");
+        if (act != "silu" && act != "sigmoid") throw std::runtime_error("qwen4exp: unknown GDN gate activation " + act);
+        c.gdn_silu_gate = act == "silu";
+    }
     c.hc = scalar(f, "hyper_connection.count"); c.hc_low_rank = scalar(f, "hyper_connection.low_rank");
     if (c.topk > c.experts || int64_t(c.hc) * c.hidden > std::numeric_limits<int>::max())
         throw std::runtime_error("qwen4exp: invalid expert or hyperconnection dimensions");
-    if (f.has("qwen4exp.attention.compress_ratios")) {
+    if (f.has(pre + "attention.compress_ratios")) {
         c.compress_ratios = int_array(array(f, "attention.compress_ratios", c.layers), "compression ratios");
         if (c.compress_ratios.size() != size_t(c.layers)) throw std::runtime_error("qwen4exp: compression array length mismatch");
     } else c.compress_ratios.assign(c.layers, 0);
@@ -73,7 +88,7 @@ Qwen4ExpConfig qwen4exp_config(const GgufFile & f) {
         if (int64_t(c.index_heads) * c.index_dim > std::numeric_limits<int>::max())
             throw std::runtime_error("qwen4exp: oversized indexer query");
     }
-    if (!f.has("qwen4exp.ple.layers") || f.kv.at("qwen4exp.ple.layers").arr.empty()) return c;
+    if (!f.has(pre + "ple.layers") || f.kv.at(pre + "ple.layers").arr.empty()) return c;
     c.ple_layers = int_array(array(f, "ple.layers", 1), "PLE layers");
     if (c.ple_layers.size() != 1 || c.ple_layers[0] >= c.layers)
         throw std::runtime_error("qwen4exp: only one in-range PLE layer is supported");
@@ -87,13 +102,13 @@ Qwen4ExpConfig qwen4exp_config(const GgufFile & f) {
     c.ple.offsets = array(f, "ple.head_offsets", heads);
     c.ple.vocab_sizes = array(f, "ple.head_vocab_sizes", heads);
     c.ple.validate();
-    const auto & mask_key = f.kv.find("qwen4exp.attention.recurrent_layers");
+    const auto & mask_key = f.kv.find(pre + "attention.recurrent_layers");
     if (mask_key != f.kv.end()) {
         const auto mask = array(f, "attention.recurrent_layers", c.layers);
         if (mask.size() != size_t(c.layers) || mask[c.ple_layers[0]] != 1)
             throw std::runtime_error("qwen4exp: PLE requires a recurrent layer");
     } else {
-        const int interval = f.has("qwen4exp.full_attention_interval") ? scalar(f, "full_attention_interval") : 4;
+        const int interval = f.has(pre + "full_attention_interval") ? scalar(f, "full_attention_interval") : 4;
         if ((c.ple_layers[0] + 1) % interval == 0) throw std::runtime_error("qwen4exp: PLE requires a recurrent layer");
     }
     return c;
