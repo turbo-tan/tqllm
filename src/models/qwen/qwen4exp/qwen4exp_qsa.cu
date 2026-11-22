@@ -569,7 +569,7 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
 QsaRawKeyCache::QsaRawKeyCache(int max_cells, int ratio, int dim, int ring)
     : max_cells_(max_cells), ratio_(ratio), dim_(dim) {
     if (max_cells <= 0 || ratio <= 0 || ratio > 64 || dim <= 0 ||
-        int64_t(max_cells) * dim > std::numeric_limits<size_t>::max() / sizeof(float))
+        size_t(int64_t(max_cells) * dim) > std::numeric_limits<size_t>::max() / sizeof(float))
         throw std::invalid_argument("QSA raw-key cache: invalid dimensions");
     try {
         ring_ = std::min(max_cells, ring > 0 ? ring : 4096 + 2 * ratio + kRollback);

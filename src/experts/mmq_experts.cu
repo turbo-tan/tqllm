@@ -4,8 +4,12 @@
 // assignment) and gathered per tile, and the output is bf16 in the pass's [assignment][rows] buffers.
 #define TQ_MMQ 1
 #include "quant_kernels.cuh"
+// ggml-impl.h defines static helpers this unit does not call (-Wunused-function from the host compiler)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "ggml_mmq/common.cuh"
 #include "ggml_mmq/mmq.cuh"
+#pragma GCC diagnostic pop
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

@@ -5,6 +5,7 @@
 #include "qwen35_kernels.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -218,6 +219,110 @@ void test_replay() {  // deferred commit: replay + tree in one kernel == replay 
             cudaFree(p2);
     }
     report("deferred replay + tree == replay then tree", ok);
+}
+
+// Single recurrent-state buffer (qwen35 engine): the state updated in place (out == in, and the deferred replay's smid
+// == in) gives the same bits as writing it to a second buffer, for a chain, a long causal block and a tree with replay;
+// out == nullptr leaves the state untouched and gives the same outputs; replaying the first k tokens of a chain in place
+// equals the state after a k-token block (what commit(k) relies on).
+void test_gdn_in_place() {
+    const int n = 8, k = 5, kh = 16, vh = 48, dk = 128, dv = 128, qkv = 2 * kh * dk + vh * dv, ab = 2 * vh;
+    const size_t ns = size_t(vh) * dk * dv;
+    bool ok = true;
+    for (int trial = 0; trial < 3; ++trial) {
+        const int m = trial == 1 ? 40 : n;  // trial 1: a block longer than one token group (prefill-like, no parents)
+        const auto x = randb(size_t(m) * qkv, 0.5f), ba = randb(size_t(m) * ab), xr = randb(size_t(k) * qkv, 0.5f),
+                   bar = randb(size_t(k) * ab);
+        const auto neg_a = randf(vh, -1.f, -0.1f), dt = randf(vh, -0.5f, 0.5f), st = randf(ns, -0.1f, 0.1f);
+        auto *dx = dev(x), *dba = dev(ba), *dxr = dev(xr), *dbar = dev(bar);
+        auto *dna = dev(neg_a), *ddt = dev(dt), *dst = dev(st), *dsi = dev(st), *dmid = dev(st);
+        float * dso = nullptr;
+        cudaMalloc(&dso, ns * 4);
+        bf16 *dy1 = nullptr, *dy2 = nullptr;
+        cudaMalloc(&dy1, size_t(m) * vh * dv * 2), cudaMalloc(&dy2, size_t(m) * vh * dv * 2);
+        const int * par = nullptr;
+        int * dch = trial == 1 ? nullptr : dev(chain(m));
+        par = dch;
+        // out of place vs in place
+        tqllm_cuda::gdn_multi(dx, m, dba + vh, dba, ab, dna, ddt, dst, dso, dy1, kh, vh, dk, dv, true, nullptr, par);
+        tqllm_cuda::gdn_multi(dx, m, dba + vh, dba, ab, dna, ddt, dsi, dsi, dy2, kh, vh, dk, dv, true, nullptr, par);
+        ok &= std::memcmp(host(dso, ns).data(), host(dsi, ns).data(), ns * 4) == 0;
+        ok &= same(host(dy1, size_t(m) * vh * dv).data(), host(dy2, size_t(m) * vh * dv).data(), size_t(m) * vh * dv);
+        // no state write: outputs unchanged, state untouched
+        tqllm_cuda::gdn_multi(dx, m, dba + vh, dba, ab, dna, ddt, dst, nullptr, dy2, kh, vh, dk, dv, true, nullptr, par);
+        ok &= std::memcmp(host(dst, ns).data(), st.data(), ns * 4) == 0;
+        ok &= same(host(dy1, size_t(m) * vh * dv).data(), host(dy2, size_t(m) * vh * dv).data(), size_t(m) * vh * dv);
+        if (trial != 1) {
+            // commit(k): the first k tokens replayed in place == a k-token block written elsewhere
+            tqllm_cuda::gdn_multi(dx, k, dba + vh, dba, ab, dna, ddt, dst, dso, dy1, kh, vh, dk, dv, true, nullptr, par);
+            cudaMemcpy(dsi, st.data(), ns * 4, cudaMemcpyHostToDevice);
+            tqllm_cuda::gdn_multi(dx, k, dba + vh, dba, ab, dna, ddt, dsi, dsi, dy2, kh, vh, dk, dv, true, nullptr, nullptr);
+            ok &= std::memcmp(host(dso, ns).data(), host(dsi, ns).data(), ns * 4) == 0;
+            // deferred replay with smid == in, then the tree: same outputs and mid state as a separate smid buffer
+            const auto tpar = random_tree(n);
+            auto * dpar = dev(tpar);
+            const std::vector<int> pk{k};
+            auto * dpk = dev(pk);
+            tqllm_cuda::GdnReplay rp;
+            rp.qkv = dxr, rp.a0 = dbar + vh, rp.b0 = dbar, rp.abs_ = ab, rp.pend = dpk, rp.smid = dmid;
+            tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dst, dso, dy1, kh, vh, dk, dv, true, nullptr, dpar, rp);
+            cudaMemcpy(dsi, st.data(), ns * 4, cudaMemcpyHostToDevice);
+            rp.smid = dsi;
+            tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dsi, dsi, dy2, kh, vh, dk, dv, true, nullptr, dpar, rp);
+            ok &= std::memcmp(host(dmid, ns).data(), host(dsi, ns).data(), ns * 4) == 0;
+            ok &= same(host(dy1, size_t(n) * vh * dv).data(), host(dy2, size_t(n) * vh * dv).data(), size_t(n) * vh * dv);
+            cudaFree(dpar), cudaFree(dpk);
+        }
+        for (void * p2 : std::initializer_list<void *>{dx, dba, dxr, dbar, dna, ddt, dst, dsi, dmid, dso, dy1, dy2, dch})
+            cudaFree(p2);
+    }
+    report("gdn state in place == two buffers", ok);
+}
+
+// --gdn-state f16: the state is rounded to FP16 after every token, so a block of n tokens gives the same state and
+// outputs as n one-token blocks in place (speculative decoding still equals plain decoding), with and without parents;
+// and the FP16 outputs stay close to the FP32-state outputs.
+void test_gdn_f16() {
+    const int n = 8, kh = 16, vh = 48, dk = 128, dv = 128, qkv = 2 * kh * dk + vh * dv, ab = 2 * vh;
+    const size_t ns = size_t(vh) * dk * dv;
+    bool ok = true;
+    float worst = 0.f;
+    for (int trial = 0; trial < 2; ++trial) {
+        const auto x = randb(size_t(n) * qkv, 0.5f), ba = randb(size_t(n) * ab);
+        const auto neg_a = randf(vh, -1.f, -0.1f), dt = randf(vh, -0.5f, 0.5f), stf = randf(ns, -0.1f, 0.1f);
+        std::vector<__half> sth(ns);
+        for (size_t i = 0; i < ns; ++i) sth[i] = __float2half_rn(stf[i]);
+        auto *dx = dev(x), *dba = dev(ba);
+        auto *dna = dev(neg_a), *ddt = dev(dt);
+        auto *dsa = dev(sth), *dsb = dev(sth);
+        float * dsf = nullptr;
+        cudaMalloc(&dsf, ns * 4);
+        std::vector<float> sf(ns);
+        for (size_t i = 0; i < ns; ++i) sf[i] = __half2float(sth[i]);
+        cudaMemcpy(dsf, sf.data(), ns * 4, cudaMemcpyHostToDevice);
+        bf16 *dy1 = nullptr, *dy2 = nullptr, *dy3 = nullptr;
+        cudaMalloc(&dy1, size_t(n) * vh * dv * 2), cudaMalloc(&dy2, size_t(n) * vh * dv * 2), cudaMalloc(&dy3, size_t(n) * vh * dv * 2);
+        int * dch = trial ? dev(chain(n)) : nullptr;
+        tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dsa, dsa, dy1, kh, vh, dk, dv, true, nullptr, dch, {}, true);
+        for (int i = 0; i < n; ++i)
+            tqllm_cuda::gdn_multi(dx + size_t(i) * qkv, 1, dba + size_t(i) * ab + vh, dba + size_t(i) * ab, ab, dna, ddt, dsb, dsb,
+                                  dy2 + size_t(i) * vh * dv, kh, vh, dk, dv, true, nullptr, dch, {}, true);
+        ok &= std::memcmp(host(dsa, ns).data(), host(dsb, ns).data(), ns * 2) == 0;
+        const auto y1 = host(dy1, size_t(n) * vh * dv), y2 = host(dy2, size_t(n) * vh * dv);
+        ok &= same(y1.data(), y2.data(), y1.size());
+        tqllm_cuda::gdn_multi(dx, n, dba + vh, dba, ab, dna, ddt, dsf, dsf, dy3, kh, vh, dk, dv, true, nullptr, dch);
+        const auto y3 = host(dy3, size_t(n) * vh * dv);
+        double num = 0, den = 0;
+        for (size_t i = 0; i < y1.size(); ++i) {
+            const double a = __bfloat162float(y1[i]), b = __bfloat162float(y3[i]);
+            num += (a - b) * (a - b), den += b * b;
+        }
+        worst = std::max(worst, float(std::sqrt(num / std::max(den, 1e-30))));
+        for (void * p2 : std::initializer_list<void *>{dx, dba, dna, ddt, dsa, dsb, dsf, dy1, dy2, dy3, dch}) cudaFree(p2);
+    }
+    ok &= worst < 1e-2f;
+    std::printf("gdn f16 state: relative output error vs FP32 state %.2e\n", worst);
+    report("gdn f16 state block == one-token steps", ok);
 }
 
 void test_rope() {
@@ -610,6 +715,8 @@ int main(int argc, char ** argv) {
     test_conv();
     test_conv_long();
     test_replay();
+    test_gdn_in_place();
+    test_gdn_f16();
     test_rope();
     test_attention(8, 333);
     test_attention(12, 333);  // > 8 queries: tiled part in chunks

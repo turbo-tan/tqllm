@@ -102,11 +102,11 @@ static void run(uint32_t type, int rows, int cols, bool per_expert, const std::v
     }
     if (std::string(m.fmt->name()) == "I8H") {  // grouped fmt 15 vs the per-assignment row-sliced matvec MTP used before
         Device<__nv_bfloat16> sl(size_t(A) * rows);
-        for (int a = 0; a < A; ++a) {
+        for (int j = 0; j < A; ++j) {
             Mat v = m; v.rows = rows;
-            v.p = static_cast<const char *>(m.p) + size_t(slots[a]) * rows * m.fmt->row_bytes(cols);
-            v.aux = static_cast<const char *>(m.aux) + size_t(slots[a]) * rows * m.fmt->aux_row_bytes(cols);
-            v.fmt->matvec(v, dx.p + size_t(per_expert ? a : a / topk) * cols, sl.p + size_t(a) * rows, 1, nullptr);
+            v.p = static_cast<const char *>(m.p) + size_t(slots[j]) * rows * m.fmt->row_bytes(cols);
+            v.aux = static_cast<const char *>(m.aux) + size_t(slots[j]) * rows * m.fmt->aux_row_bytes(cols);
+            v.fmt->matvec(v, dx.p + size_t(per_expert ? j : j / topk) * cols, sl.p + size_t(j) * rows, 1, nullptr);
         }
         check(cudaDeviceSynchronize()); const auto c = sl.get(size_t(A) * rows);
         require(std::memcmp(a.data(), c.data(), a.size() * sizeof(a[0])) == 0, "grouped I8H differs from the row-sliced matvec");

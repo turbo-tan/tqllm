@@ -164,10 +164,21 @@ struct Q4 {  // rotated 4-bit per 32 values, fp16 scale, value (q - 8) * d (144 
         ks = kscale(s);
     }
 
+    // FP16 (q - 8) * d straight from the nibbles: 1024 + q as FP16 bits, minus 1032 (exact), one rounded multiply; the
+    // same values as levels() + store_levels_h with about half the integer work
     __device__ static void store_v(const uint32_t (&w)[NW], __half s, __half * vd, const float * cb) {
-        uint32_t l[8];
-        levels(w, l);
-        tq3a::store_levels_h(l, s, vd);
+        const __half2 s2h = __halves2half2(s, s);
+        const uint32_t s2 = *reinterpret_cast<const uint32_t *>(&s2h), NEG = 0xE408E408u;  // -1032
+#pragma unroll
+        for (int k = 0; k < NW; ++k) {
+            const uint32_t lo = w[k] & 0x0F0F0F0Fu, hi = (w[k] >> 4) & 0x0F0F0F0Fu;  // nibbles 0 2 4 6 | 1 3 5 7
+            const uint32_t a = __byte_perm(lo, hi, 0x5140), b = __byte_perm(lo, hi, 0x7362);  // values 0-3 | 4-7 as bytes
+            const uint32_t h0 = hmul2u(hadd2u(__byte_perm(a, 0x64646464u, 0x5140), NEG), s2);
+            const uint32_t h1 = hmul2u(hadd2u(__byte_perm(a, 0x64646464u, 0x5342), NEG), s2);
+            const uint32_t h2 = hmul2u(hadd2u(__byte_perm(b, 0x64646464u, 0x5140), NEG), s2);
+            const uint32_t h3 = hmul2u(hadd2u(__byte_perm(b, 0x64646464u, 0x5342), NEG), s2);
+            *reinterpret_cast<uint4 *>(vd + 8 * k) = make_uint4(h0, h1, h2, h3);
+        }
     }
 };
 struct Tcq2;
@@ -1373,6 +1384,7 @@ void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q,
             case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
             case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
             case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Tcq3: break;  // K only
         }
         throw std::invalid_argument("attention_kv_split: unsupported V codec");
     };

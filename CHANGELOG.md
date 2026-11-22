@@ -5,17 +5,33 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Changed
+- DFlash2 drafter: the two Q4_K selector tables (248320 x 256) stay in their Q4_K blocks on the GPU and the lattice
+  decodes the rows it reads, instead of expanding them to BF16 at load: 0.18 GB less VRAM (RTX 3090, Qwen3.8-27B TQT +
+  DFlash2-TQ3, 144K context, q8/q4 K/V: 20826 -> 20654 MiB after load). The decoded values are the BF16 ones the
+  expansion produced, so drafts, acceptance and output are identical.
+
 ### Fixed
+- Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
+  them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
   two cases now keep separate graphs.
+
+### Changed
+- Qwen3.5 / 3.8: the Gated DeltaNet recurrent state has one buffer per layer instead of two (updated in place; a
+  partly accepted draft is replayed from the verify inputs as before). Qwen3.8-27B on an RTX 3090: 192 MiB less VRAM
+  per slot, greedy tokens identical (tree, chain, no drafter, `--np 2`).
 
 ### Docs
 - [Choose a setup](docs/guides/choose-your-setup.md): which model, drafter and flags for 16 / 24 / 32 GB cards and GB10,
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- `--gdn-state f16` (Qwen3.5 / 3.8): store the Gated DeltaNet recurrent state as FP16 (opt-in, not exact). Qwen3.8-27B on
+  an RTX 3090: 96 MiB less VRAM per slot, KLD vs BF16 0.013443 -> 0.013861 (TQT file, WikiText-2 8 x 2048), 5/5 on a
+  5-code needle at 109K and 140K tokens; speculative and plain decoding still give the same tokens.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /
@@ -52,6 +68,19 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- CUDA library built without relocatable device code (`CUDA_SEPARABLE_COMPILATION` off; no kernel calls device code of
+  another file). Same greedy tokens. Quantized matvecs at 16 columns up to 10 % faster (TQT 34816 x 5120: 181.9 -> 166.5
+  us on an RTX 3090; TQV-12 and most llama.cpp types 3-5 %), 1-8 columns unchanged: DFlash2 decodes 8-11 % faster with
+  `--draft 15`, at its default 7 drafts at the same speed (+0.3-0.8 %). A clean build takes 27 % less wall time and
+  half the disk. Binaries now carry PTX for the built architectures (tqserve 44 -> 59 MB).
+- Faster 8-column verify (DFlash2 tree steps), same output bit for bit: the TQT / TQ4 matvec at 5-8 columns and the 4-bit
+  head at 8 / 16 columns now ask for a 32 KB shared-memory carveout instead of the driver's 64 KB, so the activations
+  every 16-row block re-reads stay in L1 more often (ncu at a locked 1.38 GHz, ffn gate+up at 8 columns: 136 -> 129 us,
+  L1 hit rate 62 -> 66 %, L2 throughput 78 -> 75 %, DRAM 77 -> 81 %; the decode runs at the 350 W cap, SM ~1.65 GHz).
+  a Qwen3.8-27B fine-tune in TQT + DFlash2-TQ3, RTX 3090, `--kv q8/q4`, int8 prefill, host embed / head: gate+up 130 -> 120 us
+  per call in the verify, all target matvecs -6 % per step; 5-code needle replies decode 203.8 / 166.1 / 152.9 ->
+  207.7 / 169.7 / 157.3 tok/s at 35K / 109K / 137K, relbench DFlash2 +3-5 % at 2K / 8K, +3 % at 32K; identical replies
+  and accepted / drafted counts. Decode without a drafter (1 column) keeps the old launch configuration.
 - Faster verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit: one query
   (decode without a drafter), 2-5 queries and 11-16 queries (one pass over the cache instead of two) use a new kernel
   that streams the raw records through a cp.async ring and spreads a query over four warps; the merge kernel overlaps its
