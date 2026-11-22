@@ -454,6 +454,13 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
         }
     }
+    // a decode that passes the indexer budget (2048 positions) selects through the QSA scratch: made here, outside any
+    // graph capture and before the refill sizes the banks (made at that step, its device sync failed the attention layers'
+    // captures, each step rerun without a graph)
+    if (P + int(count) > 2048 && !f_.cp->rt.qsa_batch && f_.cp->rt.kv_capacity > 2048) {
+        int attn = 0; for (int l = 0; l < c.layers; ++l) attn += checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight");
+        if (attn) { PersistentAlloc keep; f_.cp->rt.qsa_batch = std::make_unique<tqllm_cuda::QsaBatchScratch>(16, f_.cp->rt.kv_capacity, 4, 2048); }
+    }
     stamp("before the bank refill"); refill_borrowed(); f_.cp->rt.trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);
     ck(cudaDeviceSynchronize()); S().t_decode_ = std::chrono::steady_clock::now();

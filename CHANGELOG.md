@@ -19,6 +19,19 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   only, 250K-token prompt: q8/q4 590-644 -> 966 tok/s, tcq3/q4 582 -> 856 tok/s; greedy replies identical to the base.
 
 ### Fixed
+- Flash-Next long-context attention broke for the rest of the process after the first decode that passed 2048 positions
+  before any prompt did (a long reasoning answer to a short prompt): the QSA indexer's query norm is first used there,
+  inside a layer's graph capture, where its upload fails; the step reran without a graph but the weight cache kept the
+  buffer it had allocated, never written. Every later prompt or answer past 2048 positions then selected its attended
+  positions from garbage scores. First-use weight caches now keep a buffer only once uploaded (the FP16 weight copies are
+  never made inside a capture), and the norm is uploaded at start. RTX 3090, 59 GiB host, Flash-Next IQ3_XXS, experts
+  on demand (with #75 so long prompts run), fresh server, one 3000-token answer to a short prompt, then 5-code needles at
+  temperature 0: 4K 3/5 and 28K 0/5 ("here are the extracted signals for each index") -> 5/5, replies identical to a
+  fresh server's. Long answers in such a session change too (they were degraded).
+- Flash-Next: the first decode step past the QSA indexer budget (2048 positions; every decode after a long prompt)
+  built the selection scratch inside the attention layers' graph capture, whose device sync failed the capture of every
+  attention layer: each reran without a graph and the link trace was dumped to the log as if a GPU error had occurred.
+  The scratch is now made before decode (and before the bank refill sizes the banks). Replies are unchanged.
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
 - Flash-Next with experts in the UD low-bit types IQ2_XXS / IQ2_XS (also IQ1_S, Q2_K) gave wrong replies whenever the
