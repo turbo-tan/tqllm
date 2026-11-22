@@ -52,6 +52,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- Faster DFlash2 verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit:
+  7-8 verify columns (33-48 (query, head) rows at 6 heads per KV head) run on a new kernel with three score warps (scores,
+  online softmax, FP16 P) handing P to four PV warps through shared memory, no 64-row padding, one block per SM taking
+  two (KV head, split) items through its cp.async rings. Qwen3.8-27B, RTX 3090, `--kv q8/q4`, 8 columns, ncu at a
+  locked 1.39 GHz: cache part at 140K 608 -> 453 us per layer (32K 188 -> 203 us).
 - Faster 8-column verify (DFlash2 tree steps), same output bit for bit: the TQT / TQ4 matvec at 5-8 columns and the 4-bit
   head at 8 / 16 columns now ask for a 32 KB shared-memory carveout instead of the driver's 64 KB, so the activations
   every 16-row block re-reads stay in L1 more often (ncu at a locked 1.38 GHz, ffn gate+up at 8 columns: 136 -> 129 us,
