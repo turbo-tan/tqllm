@@ -67,8 +67,9 @@ template <class OUT> __device__ __forceinline__ OUT out_cast(float v) {
 
 // y[n][r] (row stride ldy) = sum_k W[r][k] xh[n][k]; NCOL 8 / 16 column capacity, nc <= NCOL present.
 // Grid: any number of CTAs; each loops over the 16 x MT row tiles blockIdx.x, + gridDim.x, ... (persistent when the grid
-// is smaller than the tile count).
-template <int NCOL, int MT, int PF, class OUT>
+// is smaller than the tile count). L1: the same code as a second instance that prefers L1 over shared memory (prefer_l1,
+// 5-8 columns); the carveout is per function, so 1-column decode keeps the driver default on the plain instance.
+template <int NCOL, int MT, int PF, class OUT, bool L1 = false>
 __global__ void __launch_bounds__(256, 2) tqt_matvec_k(const uint4 * __restrict__ w, const __half * __restrict__ sc,
                                                          const __half * __restrict__ xh, OUT * __restrict__ y, int rows,
                                                          int k, int nc, int ldy) {
@@ -203,6 +204,9 @@ template <int NCOL, int MT, int PF, class OUT>
 void tqt_go(const uint4 * w, const __half * sc, const __half * xh, OUT * y, int rows, int k, int nc, int ldy, bool persist,
               cudaStream_t s) {
     auto kern = tqt_matvec_k<NCOL, MT, PF, OUT>;
+    // 5-8 columns: the activations every 16-row block re-reads (80-280 KB) stay in L1 (16 columns: no gain measured)
+    const bool l1 = NCOL <= 8 && nc > 4;
+    if (l1) prefer_l1(reinterpret_cast<const void *>(tqt_matvec_k<NCOL, MT, PF, OUT, true>), 256);
     static const int cap = [&] {
         int per_sm = 0, nsm = 0, dev = 0;
         cudaGetDevice(&dev);
@@ -212,7 +216,8 @@ void tqt_go(const uint4 * w, const __half * sc, const __half * xh, OUT * y, int 
     }();
     const int ntiles = (rows + 16 * MT - 1) / (16 * MT);
     const int grid = persist ? std::min(ntiles, cap) : ntiles;
-    kern<<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, nc, ldy);
+    if (l1) tqt_matvec_k<NCOL, MT, PF, OUT, true><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, nc, ldy);
+    else kern<<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, nc, ldy);
 }
 
 template <class OUT>

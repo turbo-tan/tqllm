@@ -485,10 +485,8 @@ void Qwen35Engine::alloc_seq_state() {
             value_cache.push_back({own ? kv_seq->base(int(a), false) : nullptr});
             a += own ? 1 : 0;
         } else {
-            for (int sl = 0; sl < NSLOT; ++sl) {
-                conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
-                rec_state.emplace_back(own ? size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4 : 0);
-            }
+            for (int sl = 0; sl < NSLOT; ++sl) conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
+            rec_state.emplace_back(own ? rec_bytes() : 0);  // one buffer, updated in place (see gdn_whole)
         }
     }
 }
@@ -595,8 +593,7 @@ void Qwen35Engine::allocate() {
     s_id = Buf(size_t(NB) * 16 * 4);
     s_lg = Buf(size_t(NB) * 16 * 4);
     s_scr = Buf(size_t(NB) * 64 * 16 * 8);
-    h_sid.resize(size_t(NB) * 16);
-    h_slg.resize(size_t(NB) * 16);
+    hs.init(lm_head.rows, int(cfg.hidden), NB, head_fp(), head4s.p, stream);
     v_amax = Buf(size_t(NB) * 128 * 8);
     v_mix_rows = mix_rows;
     const bool bf16_ba = std::any_of(layer.begin(), layer.end(), [](const Layer & L) { return L.w_ba.p; });
@@ -972,12 +969,14 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     dfl.enc_norm = f32_of(f, "enc.output_norm.weight", H);
     dfl.out_norm = f32_of(f, "output_norm.weight", H);
     if (dfl.dspark) {
-        dfl.sel_prev = vocab_table(f, "markov_w1.weight", dfl.rank);
-        dfl.sel_next = vocab_table(f, "markov_w2.weight", dfl.rank);
+        dfl.sel_prev = {vocab_table(f, "markov_w1.weight", dfl.rank)};
+        dfl.sel_next = {vocab_table(f, "markov_w2.weight", dfl.rank)};
     } else if (!dfl.dspine) {
         dfl.sel_hidden = to_tq3(f, {"selector_hidden.weight"}, H);
-        dfl.sel_prev = bf16_table(f, "selector_predecessor.weight", uint64_t(cfg.vocab) * dfl.rank);
-        dfl.sel_next = bf16_table(f, "selector_successor.weight", uint64_t(cfg.vocab) * dfl.rank);
+        const std::string sp = "selector_predecessor.weight", ss = "selector_successor.weight";
+        const bool q4k = q4k_rows(f, sp, dfl.rank) && q4k_rows(f, ss, dfl.rank);
+        dfl.sel_prev = sel_table(f, sp, dfl.rank, q4k);
+        dfl.sel_next = sel_table(f, ss, dfl.rank, q4k);
     }
     std::vector<std::string> kv_names;
     for (int l = 0; l < nl; ++l) {
@@ -1115,8 +1114,17 @@ void Qwen35Engine::load_dflash(const std::string & path) {
 
 void Qwen35Engine::build_head4() {
     const int64_t n = int64_t(lm_head.rows) * cfg.hidden;
-    head4 = Buf(size_t(n / 2));
-    head4s = Buf(size_t(n / 32) * 4);
+    if (head_k3 && cfg.hidden % 256) head_k3 = false;
+    head4 = Buf(head_k3 ? size_t(n / 256) * 96 : size_t(n / 2));
+    head4s = Buf(head_k3 ? size_t(n / 256) * 20 : size_t(n / 32) * 4);
+    auto convert = [&](const int8_t * w, const __half * s, int64_t r0, int64_t nr) {
+        const int64_t H = cfg.hidden;
+        if (head_k3)
+            tqllm_cuda::k3_from_i8h(w, s, head4.as<uint8_t>() + r0 * H / 256 * 96, head4s.as<uint8_t>() + r0 * H / 256 * 20,
+                                    nr * H, stream);
+        else
+            tqllm_cuda::u4h_from_i8h(w, s, head4.as<uint8_t>() + r0 * H / 2, head4s.as<__half2>() + r0 * H / 32, nr * H, stream);
+    };
     if (h8_host) {  // the int8 rows come back a chunk at a time by the copy engine: no kernel reads host memory
         const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
         Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
@@ -1126,15 +1134,16 @@ void Qwen35Engine::build_head4() {
             const int nr = std::min(chunk, rows - r0);
             ck(cudaMemcpyAsync(w.p, hw + size_t(r0) * H, size_t(nr) * H, cudaMemcpyHostToDevice, stream));
             ck(cudaMemcpyAsync(s.p, hs + size_t(r0) * H / 16 * 2, size_t(nr) * H / 16 * 2, cudaMemcpyHostToDevice, stream));
-            tqllm_cuda::u4h_from_i8h(w.as<int8_t>(), s.as<__half>(), head4.as<uint8_t>() + size_t(r0) * H / 2,
-                                     head4s.as<__half2>() + size_t(r0) * H / 32, int64_t(nr) * H, stream);
+            convert(w.as<int8_t>(), s.as<__half>(), r0, nr);
         }
         sync_ck();  // the staging is freed with this scope
-    } else tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
-    tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
+    } else convert(w8(), s8(), 0, lm_head.rows);
+    if (head_k3) tqllm_cuda::k3_tune(head4.as<uint8_t>(), head4s.as<uint8_t>(), lm_head.rows, int(cfg.hidden), stream);
+    else tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
     h2_vals = Buf(size_t(NB) * 16 * 4);
     h2_idx = Buf(size_t(NB) * 16 * 4);
     h2_scr = Buf(size_t(NB) * 64 * 16 * 8);
+    hs.init(lm_head.rows, int(cfg.hidden), NB, head_fp(), head4s.p, stream);  // first-pass error table (exact sampling)
     sync_ck();
 }
 

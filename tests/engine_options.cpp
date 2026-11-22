@@ -71,6 +71,10 @@ int main() {
     expect(parse({"--embed-host", "on"}).embed_host && !parse({"--embed-host", "off"}).embed_host, "--embed-host on|off");
     expect(parse({"--head-host", "on"}).head_host && !parse({"--head-host", "off"}).head_host, "--head-host on|off");
     expect(throws({"--head-host", "yes"}) && throws({"--embed-host"}), "--head-host / --embed-host need on or off");
+    expect(!d.gdn_state_f16 && parse({"--gdn-state", "f16"}).gdn_state_f16 && !parse({"--gdn-state", "f32"}).gdn_state_f16,
+           "--gdn-state f32|f16 (f32 default)");
+    expect(throws({"--gdn-state", "bf16"}), "--gdn-state needs f32 or f16");
+    expect(!tqllm::exact_conflicts(parse({"--gdn-state", "f16"}), false, false, no_env).empty(), "--gdn-state f16 is not exact");
     expect(throws({"--prefill-reserve-mb", "-5"}), "negative --prefill-reserve-mb rejected");
     expect(throws({"--prefill-chunk"}), "missing value rejected");
     std::printf(fail ? "ENGINE_OPTIONS FAIL\n" : "ENGINE_OPTIONS PASS\n");

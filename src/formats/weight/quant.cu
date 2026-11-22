@@ -8,6 +8,7 @@
 #include <map>
 #include <cstdlib>
 #include "quant_kernels.cuh"
+#include "common.cuh"
 
 #include <cuda_fp16.h>
 
@@ -1349,12 +1350,15 @@ static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh
         case 5: u4h_matvec_k<5, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 5, rid, ldy); break;
         case 6: u4h_matvec_k<6, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 6, rid, ldy); break;
         case 7: u4h_matvec_k<7, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 7, rid, ldy); break;
-        case 8: u4h_matvec_k<8, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
+        case 8: tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<8, OUT, 1, FMT>), 256);
+                u4h_matvec_k<8, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
         default:
             if (ncols > 8 && ncols <= 16) {
                 // 9..16 columns: shared activation loads pay off (3090: head 248320 x 5120 MT 1 / 2 / 4 = 1478 / 1156 /
                 // 982 us, 5120 x 17408 116 / 81 / 93 us)
                 if (mt < 0) mt = rows >= 65536 ? 4 : 2;
+                if (mt >= 4) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 4, FMT>), 256);
+                else if (mt == 2) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 2, FMT>), 256);
                 if (mt >= 4) u4h_matvec_k<16, OUT, 4, FMT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
                 else if (mt == 2) u4h_matvec_k<16, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
                 else u4h_matvec_k<16, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
@@ -1559,6 +1563,57 @@ void k5_tune(const uint8_t * w5, const uint8_t * kh, int rows, int k, cudaStream
 }
 void k3_tune(const uint8_t * w3, const uint8_t * kr, int rows, int k, cudaStream_t s) {
     tune_impl<2>(w3, reinterpret_cast<const __half2 *>(kr), rows, k, s);
+}
+
+// i8h -> k3 (the 3-bit LM-head first pass): per 256 weights an FP16 d and 16 int8 sub-block scales (Q3_K's grid,
+// symmetric codes -4 .. 3 per 16 weights), round to nearest; codes packed in the k3 planes (see the Q3_K loader in q4.cpp).
+__global__ void k3_from_i8h_k(const int8_t * w8, const __half * sc, uint8_t * w3, uint8_t * kr, int64_t nblk) {
+    const int64_t b = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (b >= nblk) return;
+    float scl[16], dmax = 0.f;
+    for (int j = 0; j < 16; ++j) {
+        float lo = 0.f, hi = 0.f;
+        for (int i = 0; i < 16; ++i) {
+            const int e = j * 16 + i;
+            const float v = float(w8[b * 256 + e]) * __half2float(sc[b * 16 + e / 16]);
+            lo = fminf(lo, v), hi = fmaxf(hi, v);
+        }
+        scl[j] = fmaxf(hi / 3.f, -lo / 4.f);
+        dmax = fmaxf(dmax, scl[j]);
+    }
+    const __half hd = __float2half_rn(dmax / 31.f);
+    const float d = __half2float(hd);
+    uint8_t * o = w3 + b * 96;
+    uint8_t * r = kr + b * 20;
+    for (int i = 0; i < 96; ++i) o[i] = 0;
+    for (int j = 0; j < 16; ++j) {
+        const int sj = d > 0.f ? max(scl[j] > 0.f ? 1 : 0, min(31, __float2int_rn(scl[j] / d))) : 0;
+        r[(j / 2) * 2 + j % 2] = uint8_t(int8_t(sj));  // index (32-block % 8) * 2 + half == j
+        const float s = d * float(sj);
+        for (int i = 0; i < 16; ++i) {
+            const int e = j * 16 + i;
+            const float v = float(w8[b * 256 + e]) * __half2float(sc[b * 16 + e / 16]);
+            const int q = s > 0.f ? max(-4, min(3, __float2int_rn(v / s))) : 0;
+            const int code = q + 4;
+            uint8_t * ob = o + (e / 32) * 12;
+            const int g = (e % 32) / 16, ei = e % 16, u = ei / 4, jj = ei % 4;
+            ob[g * 4 + jj] |= uint8_t((code & 3) << (2 * u));
+            ob[8 + jj] |= uint8_t((code >> 2) << (u + 4 * g));
+        }
+    }
+    *reinterpret_cast<__half *>(r + 16) = hd;
+    r[18] = r[19] = 0;
+}
+
+void k3_from_i8h(const int8_t * w8, const __half * sc, uint8_t * w3, uint8_t * kr, int64_t n, cudaStream_t s) {
+    require_device_memory(w8, "k3_from_i8h int8 rows"); require_device_memory(sc, "k3_from_i8h scales");
+    const int64_t nblk = n / 256;
+    k3_from_i8h_k<<<unsigned((nblk + 127) / 128), 128, 0, s>>>(w8, sc, w3, kr, nblk);
+}
+
+void k3_matvec_ids(const uint8_t * w3, const uint8_t * kr, const uint32_t * rid, const __half * xh, float * y, int rows, int k,
+                   int ncols, cudaStream_t s) {
+    u4h_launch<float, 2>(w3, reinterpret_cast<const __half2 *>(kr), xh, y, rows, k, ncols, s, -1, rid);
 }
 
 void u4h_from_i8h(const int8_t * w8, const __half * sc, uint8_t * w4, __half2 * sm, int64_t n, cudaStream_t s) {
