@@ -21,6 +21,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   IQ3_XXS (mixed IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S / IQ3_XXS gate/up per layer), RTX 3090, pinned pack: five greedy
   replies (up to 400 tokens) identical to the on-demand path, which was already correct. Pack files written by
   `tqfn-pack` from such models before this fix hold those parts untiled and must be written again.
+- Sampling (temperature > 0) on Qwen3.5 / 3.8 drew only from the 16 rows the LM head's 4-bit first pass ranked highest,
+  so top-p was cut short at some positions (simulated: mean total variation 1.2 % against the int8 head's top-p
+  distribution, nonzero at 12 % of positions; top-k above 16 was ignored). Every sampled token is now an exact draw of
+  the int8 head's whole-vocabulary distribution: the first pass carries per-row error bounds, and rows that could still
+  matter are re-scored exactly (64 / 1024 / 8192 rows, rarely all of them). The Gumbel noise is tied to the seed and the
+  token's position, so the same seed gives the same reply with or without a drafter, tree or MTP. Qwen3.8-27B TQT +
+  DFlash2, RTX 3090, temperature 0.7 / top-p 0.8: 89 % of tokens need no extra re-score, decode 107.4 tok/s vs 106.0
+  before (50.8 vs 50.9 without a drafter); greedy unchanged. `TQLLM_DEBUG=full_head` is the every-logit reference:
+  20 of 20 sampled and greedy replies identical to it, with and without the drafter.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
@@ -39,6 +48,11 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - `--gdn-state f16` (Qwen3.5 / 3.8): store the Gated DeltaNet recurrent state as FP16 (opt-in, not exact). Qwen3.8-27B on
   an RTX 3090: 96 MiB less VRAM per slot, KLD vs BF16 0.013443 -> 0.013861 (TQT file, WikiText-2 8 x 2048), 5/5 on a
   5-code needle at 109K and 140K tokens; speculative and plain decoding still give the same tokens.
+- `TQLLM_DEBUG=head3` (experimental): the LM head's first pass in 3 bits (Q3_K grid, 0.58 GB instead of 0.80 GB of
+  VRAM for Qwen3.8). Sampling stays exact through the re-score screen; greedy keeps the top-16 shortlist (argmax equal to
+  the full int8 head at 6,308 of 6,308 WikiText-2 positions). Qwen3.8-27B TQT, RTX 3090: 198 MiB less VRAM, greedy decode
+  +1.2 % (51.5 vs 50.9 tok/s, 121.4 vs 119.8 with DFlash2), sampled decode with DFlash2 -5 % (102.0 vs 107.4 tok/s:
+  more re-score rounds), so it stays off by default.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /
