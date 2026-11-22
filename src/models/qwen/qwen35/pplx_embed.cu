@@ -346,7 +346,8 @@ public:
         for (int i = 0; i < rot_ / 2; ++i) inv[i] = float(1.0 / std::pow(theta, double(2 * i) / rot_));
         inv_freq_ = upload(inv);
 
-        const auto & te = tensor(f, "token_embd.weight");
+        const std::string embd_name = "token_embd.weight";  // a named string: no -Wdangling-reference on te
+        const auto & te = tensor(f, embd_name);
         if ((te.type != kBF16 && te.type != kF32 && te.type != kQ8) || te.ne[0] != uint64_t(H_))
             throw std::runtime_error("pplx embed: token_embd must be BF16, F32 or Q8_0 [H, vocab]");
         if (te.type == kQ8 && !fast_) throw std::runtime_error("pplx embed: a Q8_0 model runs in the fast mode only");

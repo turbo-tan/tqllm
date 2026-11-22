@@ -77,6 +77,7 @@ struct EngineOptions {
     // memory placement; the fit (Model) sets them when the device is short
     bool embed_host = false;   // token embeddings in host memory
     bool head_host = false;    // int8 LM head in host memory
+    bool gdn_state_f16 = false;  // --gdn-state f16: Gated DeltaNet recurrent state stored as FP16 (half the bytes, not exact)
     int gemm_rows = 0;         // prefill FP16 weight blocks of this many rows (0: whole matrices)
     int n_cpu_moe = 0;         // -ncmoe N: MoE expert weights of the first N layers in pinned host memory
                                //   (llama.cpp --n-cpu-moe parity; read over PCIe by the decode kernels)

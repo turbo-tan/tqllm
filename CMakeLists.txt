@@ -60,7 +60,9 @@ if(MSVC)
   target_compile_options(tqllm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3 /utf-8 /permissive- /Zc:__cplusplus>)
   target_compile_definitions(tqllm PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
 else()
-  target_compile_options(tqllm PRIVATE -Wall -Wextra -Wpedantic)
+  # -Wpedantic for C++ only: nvcc hands it to the host compiler, which then flags every GNU line marker
+  # (`# 1 "file"`) in nvcc's generated .cudafe1 files.
+  target_compile_options(tqllm PRIVATE -Wall -Wextra $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>)
 endif()
 if(TQLLM_MLX)
   include(cmake/mlx.cmake)
@@ -265,7 +267,9 @@ if(TQLLM_CUDA)
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml_mmq/ggml
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-use_fast_math>")
   target_compile_definitions(tqrun PRIVATE TQLLM_HAS_CUDA=1)
-  set_target_properties(tqllm PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  # Whole-program device code (no -rdc): no kernel calls a __device__ function or variable of another .cu file, and
+  # relocatable device code costs the 16-column quantized matvecs ~8 % (same kernel, -rdc vs whole-program code)
+  set_target_properties(tqllm PROPERTIES CUDA_SEPARABLE_COMPILATION OFF CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   add_executable(tqgolden tools/tqgolden.cpp)
   target_link_libraries(tqgolden PRIVATE tqllm)
   add_executable(tqbench tools/tqbench.cpp)
