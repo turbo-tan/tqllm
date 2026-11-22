@@ -228,6 +228,9 @@ void ep_stop(const Checkpoint & cp);
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
     return tqllm::expert_u4h_ids(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
 }
+inline std::array<int, 3> expert_tile_bpbs(const Checkpoint & checkpoint, int layer) {
+    return tqllm::expert_tile_bpbs(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
+}
 inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id, bool tiled) {
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
                                 tiled);

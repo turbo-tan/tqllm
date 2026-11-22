@@ -8,6 +8,7 @@
 #include <map>
 #include <cstdlib>
 #include "quant_kernels.cuh"
+#include "common.cuh"
 
 #include <cuda_fp16.h>
 
@@ -1349,12 +1350,15 @@ static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh
         case 5: u4h_matvec_k<5, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 5, rid, ldy); break;
         case 6: u4h_matvec_k<6, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 6, rid, ldy); break;
         case 7: u4h_matvec_k<7, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 7, rid, ldy); break;
-        case 8: u4h_matvec_k<8, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
+        case 8: tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<8, OUT, 1, FMT>), 256);
+                u4h_matvec_k<8, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
         default:
             if (ncols > 8 && ncols <= 16) {
                 // 9..16 columns: shared activation loads pay off (3090: head 248320 x 5120 MT 1 / 2 / 4 = 1478 / 1156 /
                 // 982 us, 5120 x 17408 116 / 81 / 93 us)
                 if (mt < 0) mt = rows >= 65536 ? 4 : 2;
+                if (mt >= 4) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 4, FMT>), 256);
+                else if (mt == 2) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 2, FMT>), 256);
                 if (mt >= 4) u4h_matvec_k<16, OUT, 4, FMT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
                 else if (mt == 2) u4h_matvec_k<16, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
                 else u4h_matvec_k<16, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);

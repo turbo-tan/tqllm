@@ -90,14 +90,15 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
                     crp.x = RT, crp.pend = d_pend.as<int>(), crp.smid = conv_slot(lin_i, cur + 1);
                     crp.y = d_rep_qkvc.as<bf16>();
                     grp.qkv = d_rep_qkvc.as<bf16>(), grp.b0 = RT + qkv_dim + zdim, grp.a0 = grp.b0 + lvh;
-                    grp.abs_ = rows, grp.pend = d_pend.as<int>(), grp.smid = rec_slot(lin_i, cur + 1);
+                    grp.abs_ = rows, grp.pend = d_pend.as<int>(), grp.smid = rec_buf(lin_i);  // in place
                 }
                 tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC,
                                        qkv_dim, stream, vpar, crp);
                 st("gdn_conv");
                 const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
-                tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                                      rec_slot(lin_i, cur + 1), CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp);
+                tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
+                                      gdn_whole(n) ? rec_buf(lin_i) : nullptr, CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp,
+                                      gdn_f16());
             } else {  // batched verify: the recurrence runs per segment on that slot's state
                 for_segs([&](size_t i) {
                     const auto & g = segs[i];
@@ -111,9 +112,9 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
                     tqllm_cuda::conv_multi(Tg, rows, g.n, cs[b + c % NSLOT].as<bf16>(), cs[b + (c + 1) % NSLOT].as<bf16>(),
                                            L.conv_w, Qg, qkv_dim, stream, gp);
                     const bf16 * B0 = Tg + qkv_dim + zdim;
-                    tqllm_cuda::gdn_multi(Qg, g.n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rs[b + c % NSLOT].as<float>(),
-                                          rs[b + (c + 1) % NSLOT].as<float>(), CORE + size_t(g.col0) * zdim, lkh, lvh,
-                                          dk, dv, cfg.tiled, stream, gp);
+                    void * rg = rs[lin_i].p;
+                    tqllm_cuda::gdn_multi(Qg, g.n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rg, gdn_whole(g.n) ? rg : nullptr, CORE + size_t(g.col0) * zdim, lkh, lvh,
+                                          dk, dv, cfg.tiled, stream, gp, {}, gdn_f16());
                 });
             }
             st("gdn_recurrence");
@@ -712,10 +713,11 @@ bool Qwen35Engine::dflash_advance() {
             const int k = j + 1;
             if (k > last_n) throw std::runtime_error("commit: accepted count out of range");
             set_dpos(pos);
-            const uint64_t key = uint64_t(k) | (uint64_t(k < last_n) << 8) | (uint64_t(cur) << 16) |
+            const bool replay = k < last_n || !gdn_whole(last_n);
+            const uint64_t key = uint64_t(k) | (uint64_t(replay) << 8) | (uint64_t(cur) << 16) |
                                  (uint64_t(sp) << 24) | (uint64_t(active) << 32);
             ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, [&] {
-                if (k < last_n) commit_body(k);
+                if (replay) commit_body(k);
                 dflash_inject_body(v_feat.as<bf16>(), k);
             }), stream));
             cur = (cur + 1) % NSLOT;
@@ -1034,7 +1036,7 @@ int Qwen35Engine::drafter_features(const std::vector<uint32_t> & tokens, std::ve
     return nf;
 }
 
-void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens into the next state slot
+void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens: conv into the next slot, recurrent in place
     {
         const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
         const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
@@ -1049,9 +1051,9 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
             tqllm_cuda::conv_multi(T, rows, k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
                                    v_qkvc.as<bf16>(), qkv_dim, stream, chain);
             const bf16 * B0 = T + qkv_dim + zdim;
-            tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                                  rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                                  chain);
+            tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
+                                  rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
+                                  chain, {}, gdn_f16());
             ++lin_i;
         }
     }

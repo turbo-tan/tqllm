@@ -122,8 +122,8 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
                 mm(L.w_a, np, a);
             }
             tqllm_cuda::conv_step(qkv, conv_slot(lin_i, cur), L.conv_w, qkvc, qkv_dim, stream);
-            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), core, lkh, lvh, dk, dv,
-                                 cfg.tiled, stream);
+            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_buf(lin_i), core, lkh, lvh, dk, dv,
+                                 cfg.tiled, stream, gdn_f16());
             tqllm_cuda::gated_rms(core, z, L.gnorm_w, gn, lvh, dv, cfg.eps, stream);
             prep(gn, zdim);
             mm(L.w_out, gn, mp);
@@ -228,7 +228,7 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                            cb, cudaMemcpyDefault, stream));
-        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
+        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_buf(l)), save ? static_cast<void *>(rec_buf(l)) : h + cb,
                            rb, cudaMemcpyDefault, stream));
     }
 }
@@ -457,7 +457,7 @@ void Qwen35Engine::reset_state() {
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
-        ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
+        ck(cudaMemsetAsync(rec_buf(l), 0, rec_bytes, stream));
     }
 }
 
@@ -1475,6 +1475,18 @@ const bf16 * Qwen35Engine::bf16_table(const GgufFile & f, const std::string & na
     return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
 }
 
+bool Qwen35Engine::q4k_rows(const GgufFile & f, const std::string & name, int rank) {
+    const auto & t = gt(f, name);
+    return t.type == GGML_Q4_K && rank % 256 == 0 && t.ne.size() == 2 && t.ne[0] == uint64_t(rank) &&
+           t.ne[1] == uint64_t(cfg.vocab);
+}
+
+tqllm_cuda::SelTable Qwen35Engine::sel_table(const GgufFile & f, const std::string & name, int rank, bool q4k) {
+    if (!q4k) return {bf16_table(f, name, uint64_t(cfg.vocab) * rank)};
+    const auto raw = f.read(gt(f, name));
+    return {put(raw.data(), raw.size()), true};
+}
+
 const bf16 * Qwen35Engine::vocab_table(const GgufFile & f, const std::string & name, int rank) {
     const auto & t = gt(f, name);
     if (int(t.ne[0]) != rank || t.ne[1] > cfg.vocab) throw std::runtime_error(name + ": unexpected shape");
@@ -1676,9 +1688,9 @@ void Qwen35Engine::flush_pending() {
         tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
                                v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
         const bf16 * B0 = T + qkv_dim + zdim;
-        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                              rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                              d_chain.as<int>());
+        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
+                              rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
+                              d_chain.as<int>(), {}, gdn_f16());
         ++lin_i;
     }
     cur = (cur + 1) % NSLOT;

@@ -439,7 +439,7 @@ void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const
 // gathered 32 rows at a time into shared memory; S = Q K^T and O += P V are mma.m16n8k16 (bf16 in, fp32 out) with an
 // online softmax between them (scores never leave the block). Numeric (bf16 Q and P), not bit-identical to the grouped path.
 namespace qsatc {
-constexpr int G = 12, D = 256, TK = 32, QP = D + 8, KP = D + 8, PP = TK + 8, NT = 128;
+constexpr int G = 12, D = 256, TK = 32, QP = D + 8, KP = D + 8, PP = TK + 8;
 __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));

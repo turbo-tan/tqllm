@@ -388,11 +388,6 @@ __device__ __forceinline__ uint32_t pack_bf16(float x, float y) {
     return *reinterpret_cast<const uint32_t *>(&h);
 }
 
-__device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 x, __nv_bfloat16 y) {
-    const __nv_bfloat162 h(x, y);
-    return *reinterpret_cast<const uint32_t *>(&h);
-}
-
 __device__ __forceinline__ void cp_async16(void * dst, const void * src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src));
 }
@@ -441,7 +436,6 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
     float * sc = lut + (TURBO3V ? 8 : 0);                                        // [MAXROWS][SCS]
     const auto * kc = static_cast<const __nv_bfloat16 *>(kc_), * vc = static_cast<const __nv_bfloat16 *>(vc_);
     const auto * kq = static_cast<const int8_t *>(kc_), * vq = static_cast<const int8_t *>(vc_);
-    const auto * v3 = static_cast<const uint8_t *>(vc_);
     // per-row running max / sum / rescale live in the 4 padding columns of each score row
     auto mrow_ = [&](int r) -> float & { return sc[r * SCS + MQ_TILE]; };
     auto lrow_ = [&](int r) -> float & { return sc[r * SCS + MQ_TILE + 1]; };
@@ -480,23 +474,23 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
                 if constexpr (Q8V) cp_async16(vss + (buf * MQ_TILE + t) * (DIM / 32), vsc + si);
             }
             asm volatile("cp.async.commit_group;\n" ::);
-            return;
-        }
-        for (int i = t; i < MQ_TILE * (DIM / 8); i += blockDim.x) {
-            const int p = i / (DIM / 8), c = i % (DIM / 8);
-            __nv_bfloat16 * dk = kbuf + (buf * MQ_TILE + p) * KS + c * 8, * dv = vbuf + (buf * MQ_TILE + p) * KS + c * 8;
-            if (p < n) {
-                int key = t0 + p;
-                if constexpr (SEL) key = sel[key / 4] * 4 + key % 4;
-                const int64_t src = (int64_t(key) * kvheads + kh) * DIM + c * 8;
-                cp_async16(dk, kc + src);
-                cp_async16(dv, vc + src);
-            } else {  // zero tail: 0 * stale NaN in the MMA
-                *reinterpret_cast<uint4 *>(dk) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
+        } else {
+            for (int i = t; i < MQ_TILE * (DIM / 8); i += blockDim.x) {
+                const int p = i / (DIM / 8), c = i % (DIM / 8);
+                __nv_bfloat16 * dk = kbuf + (buf * MQ_TILE + p) * KS + c * 8, * dv = vbuf + (buf * MQ_TILE + p) * KS + c * 8;
+                if (p < n) {
+                    int key = t0 + p;
+                    if constexpr (SEL) key = sel[key / 4] * 4 + key % 4;
+                    const int64_t src = (int64_t(key) * kvheads + kh) * DIM + c * 8;
+                    cp_async16(dk, kc + src);
+                    cp_async16(dv, vc + src);
+                } else {  // zero tail: 0 * stale NaN in the MMA
+                    *reinterpret_cast<uint4 *>(dk) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
+                }
             }
+            asm volatile("cp.async.commit_group;\n" ::);
         }
-        asm volatile("cp.async.commit_group;\n" ::);
     };
     if (beg < end) stage(0, beg);
 
