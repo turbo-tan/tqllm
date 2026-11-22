@@ -422,8 +422,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // the indexer's query projection runs only past the QSA budget (2048 positions), which no warm-up step reaches: upload
       // it now, not inside the first long prompt (GB10: 13 x 2.6 MB from the mapped file, 0.3 s of a 3.4K prompt)
       for (int l = 0; l <= c.layers; ++l)
+      {
           if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_proj.weight"; checkpoint.has_tensor(name) && checkpoint.is_bf16(name))
               (void) checkpoint.bf16_device(name);
+          // its norm too: first used inside a decode step's graph capture, its upload failed the capture
+          if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_norm.weight"; checkpoint.has_tensor(name))
+              (void) checkpoint.dense_device(name);
+      }
       // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
       // whole trunk bank in the refill): size them now, the steady state every later request already has
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();

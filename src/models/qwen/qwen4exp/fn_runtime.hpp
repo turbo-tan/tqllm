@@ -239,6 +239,11 @@ template<class T> struct Device {
         std::vector<T> values(count); ck(cudaMemcpy(values.data(), p, count * sizeof(T), cudaMemcpyDeviceToHost)); return values;
     }
 };
+// a device copy of v, handed over only once uploaded: a put inside a graph capture throws and leaves nothing behind for a
+// cache to keep (Checkpoint::dense_device; tests/graph_capture_alloc.cpp)
+template<class T> std::unique_ptr<Device<T>> device_copy(const std::vector<T> & v) {
+    auto d = std::make_unique<Device<T>>(v.size()); d->put(v); return d;
+}
 inline void validate_round(const Device<__half> & actual, std::vector<float> expected, bool q8k, const std::string & name) {
     if (q8k) cpu_q8k_round(expected); else cpu_q8_round(expected);
     const auto output = actual.get();
