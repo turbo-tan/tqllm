@@ -1257,16 +1257,19 @@ __global__ void tq3_inverse_k(__nv_bfloat16 * y, int64_t nblocks) {
 // cache partials (attn_blk_k arithmetic, block partial last); y stays in the V basis for the inverse rotation.
 // A node's result depends only on its path, so it equals that path verified as a chain.
 template <class KC, class VC>
-__global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc,
+__global__ void __launch_bounds__(256, 3) attn_blk_codec_k(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc,
                                                         const float * part, const int * dseq0, const int * par, int heads,
                                                         int kvheads, float scale, int nsplit, int pstride,
                                                         __nv_bfloat16 * y, bool inv = false) {
     constexpr int DIM = 256, MAXK = TREE_MAX_DEPTH + 33, MAXS = 264;  // split count (<= 256) + the stand-in slot
     constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>;
     __shared__ float s_cbk[KT ? 128 : 1], s_cbv[VT ? 128 : 1];
-    __shared__ __align__(16) int8_t k8[MAXK * DIM];
-    __shared__ __align__(16) __half vh[MAXK * DIM];
-    __shared__ float ksf[MAXK * 8], qr[DIM], sc[MAXK];
+    // one buffer for the decoded K (int8, until the scores are done) and then the decoded V (FP16): 31 KB of shared
+    // memory in all, so three blocks share an SM and the 8-column verify grid (24 x 8 blocks) runs in one wave
+    __shared__ __align__(16) unsigned char kvbuf[MAXK * DIM * 2];
+    int8_t * k8 = reinterpret_cast<int8_t *>(kvbuf);
+    __half * vh = reinterpret_cast<__half *>(kvbuf);
+    __shared__ float ksf[MAXK * 8], qr[DIM], sc[MAXK], s_pr[MAXK];
     __shared__ int slot[MAXK];
     const int h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, lane = d % 32, wid = d / 32;
     if constexpr (KT)
@@ -1307,14 +1310,19 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
     }
     __syncthreads();
     qr[d] *= KC::ROT128 ? tcq::INV_SQRT_128 * tcq::S2[d % 128] : 0.17677669529663687f;
-    for (int u = d; u < nk * 8; u += DIM) {  // decode (key, 32-value block) units
-        const int i = u / 8, b = u % 8;
-        uint32_t kw[KC::NW], vw[VC::NW];
-        __half ks, vs;
-        KC::load(kc + (int64_t(slot[i]) * kvheads + kh) * KC::RB, b, kw, ks);
-        KC::store_k(kw, ks, k8 + i * DIM + b * 32, ksf[i * 8 + b], s_cbk);
-        VC::load(vc + (int64_t(slot[i]) * kvheads + kh) * VC::RB, b, vw, vs);
-        VC::store_v(vw, vs, vh + i * DIM + b * 32, s_cbv);
+    static_assert(MAXK * 8 <= 2 * DIM, "two (key, block) units per thread");
+    uint32_t vw[2][VC::NW];  // a thread's V units, loaded with K and decoded once the scores are done
+    __half vs[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {  // decode (key, 32-value block) units
+        const int u = d + j * DIM, i = u / 8, b = u % 8;
+        if (u < nk * 8) {
+            uint32_t kw[KC::NW];
+            __half ks;
+            KC::load(kc + (int64_t(slot[i]) * kvheads + kh) * KC::RB, b, kw, ks);
+            KC::store_k(kw, ks, k8 + i * DIM + b * 32, ksf[i * 8 + b], s_cbk);
+            VC::load(vc + (int64_t(slot[i]) * kvheads + kh) * VC::RB, b, vw[j], vs[j]);
+        }
     }
     __syncthreads();
     for (int i = wid; i < nk; i += DIM / 32) {  // one warp per key, 8 dims per lane, fixed-order reduction
@@ -1326,12 +1334,19 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
         for (int w = 16; w; w >>= 1) v += __shfl_xor_sync(0xffffffffu, v, w);
         if (lane == 0) sc[i] = v * scale;
     }
-    __syncthreads();
+    __syncthreads();  // scores done, K buffer free
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int u = d + j * DIM, i = u / 8, b = u % 8;
+        if (u < nk * 8) VC::store_v(vw[j], vs[j], vh + i * DIM + b * 32, s_cbv);
+    }
     float m = -CUDART_INF_F;
     for (int i = 0; i < nk; ++i) m = fmaxf(m, sc[i]);
+    if (d < nk) s_pr[d] = __expf(sc[d] - m);  // each key's weight once (the same expression every thread used)
+    __syncthreads();
     float l = 0.f, o = 0.f;
     for (int i = 0; i < nk; ++i) {
-        const float pr = __expf(sc[i] - m);
+        const float pr = s_pr[i];
         l += pr;
         o += pr * __half2float(vh[i * DIM + d]);
     }
