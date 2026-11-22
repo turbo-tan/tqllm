@@ -25,6 +25,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQFN_MTP_SLOTS` | 256 | MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards) |  |
 | `TQFN_PREFILL_INT8` | 0 | 1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales) |  |
 | `TQFN_TAIL_SKIP` | - | R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate) |  |
+| `TQLLM_PACK_RAM_FRAC` | 0.6 | share of host RAM the pinned Flash-Next expert pack may take (0..1]; above it experts are read from the GGUF on demand |  |
 
 ## Debug
 

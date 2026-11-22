@@ -252,3 +252,7 @@ flags:
     kind: user
     default: "-"
     doc: "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)"
+  - name: TQLLM_PACK_RAM_FRAC
+    kind: user
+    default: "0.6"
+    doc: "share of host RAM the pinned Flash-Next expert pack may take (0..1]; above it experts are read from the GGUF on demand"

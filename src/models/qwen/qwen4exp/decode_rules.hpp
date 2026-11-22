@@ -454,10 +454,12 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 // discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
 // keeps every expert resident and needs no pack.
 // Build the packed experts in pinned memory only on a discrete GPU without a pack file, outside hot/cold (its tiers manage
-// expert memory) and when the pack fits in 60 % of the machine's RAM; otherwise the cache reads experts from the GGUF on
-// demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB.
-inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes) {
-    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= 0.6 * host_ram_bytes;
+// expert memory) and when the pack fits in ram_frac (default 60 %) of the machine's RAM; otherwise the cache reads experts
+// from the GGUF on demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB. TQLLM_PACK_RAM_FRAC sets ram_frac (a 64 GB
+// host holds the 44 GB IQ3_XXS pack at 0.8; fn_engine_load.cpp).
+inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes,
+                                 double ram_frac = 0.6) {
+    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= ram_frac * host_ram_bytes;
 }
 // Pages that may be dropped once the experts sit in pinned memory: the trunk expert tensors only. The per-layer token
 // embedding (Flash-Next: 28.8 GB, one 90-byte row per token and layer) is read from the file at every token; with its

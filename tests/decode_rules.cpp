@@ -270,6 +270,8 @@ int main() {
     check(!build_pack_in_memory(false, false, true, 51 * GB, 128 * GB), "hot/cold manages expert memory: no pack built");
     check(!build_pack_in_memory(false, false, false, 51 * GB, 64 * GB) && !build_pack_in_memory(false, false, false, 51 * GB, 24 * GB),
           "a 51 GB pack is not pinned on a 64 GB or 24 GB machine");
+    check(build_pack_in_memory(false, false, false, 44.5 * GB, 63.3 * GB, 0.8) && !build_pack_in_memory(false, false, false, 44.5 * GB, 63.3 * GB),
+          "TQLLM_PACK_RAM_FRAC=0.8: a 44.5 GB pack is pinned on a 64 GB machine (not at the default 0.6)");
 
     {   // the HF manifest's 3090 plan on a GB10 (512 slots = every expert): no layer below 512
         const std::vector<int> plan{314, 291, 269, 160, 189, 219, 248, 239, 208, 135, 212, 160, 128, 145};

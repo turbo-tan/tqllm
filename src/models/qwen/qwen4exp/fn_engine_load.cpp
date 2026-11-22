@@ -133,7 +133,12 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
     for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
     const double host_ram = double(tqllm::host_ram_bytes());  // physical RAM capped by the container limit
-    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
+    // TQLLM_PACK_RAM_FRAC: the share of RAM the pinned pack may take (default 0.6; values outside (0, 1] are ignored)
+    double pack_frac = 0.6;
+    if (const char * v = std::getenv("TQLLM_PACK_RAM_FRAC")) { const double x = std::atof(v); if (x > 0 && x <= 1) pack_frac = x; }
+    std::fprintf(stderr, "tqllm: expert pack %.1f GB, host RAM limit %.1f GB, pinned pack allowed up to %.0f %% of it\n",
+                 pack_bytes * 1.02 / 1e9, host_ram / 1e9, pack_frac * 100);
+    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram, pack_frac);
     if (f.experts.empty() && !integrated && !pack_in_memory)
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
                      "a pinned pack would not fit this machine's RAM");

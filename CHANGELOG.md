@@ -59,6 +59,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
 
 ### Changed
+- Flash-Next on 64 GB hosts: `TQLLM_PACK_RAM_FRAC` (default 0.6) sets the share of RAM the expert pack pinned at start-up
+  may take, so a 64 GB host can pin the 44 GB IQ3_XXS pack (0.8) instead of reading experts from the GGUF on demand; the
+  pack is built one layer at a time and each layer's file pages are dropped after its copy, so the page cache no longer
+  holds the trunk beside the pack (start-up swap writes on a 64 GB host 6.4 GB -> 128 MB). RTX 3090, 59 GiB RAM,
+  Flash-Next GSQ-RCO IQ3_XXS, 32K context, pinned vs on demand: 400-token reply 31 -> 79 tok/s on the first request, 88
+  -> 179 tok/s repeated; GSM8K 244/250, MMLU-Pro 115/140 (reasoning medium) and 28K-token needles 5/5 pinned. The
+  default is unchanged.
 - TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
   WikiText-2 train against its sha256 and takes the code half from the files in
   `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step

@@ -64,7 +64,8 @@ inline constexpr Flag ALL[] = {
     {"TQFN_LAYER_SLOTS", Kind::User, "-", "comma list of expert slots per layer (overrides the packed file's .slots profile)", ""},
     {"TQFN_MTP_SLOTS", Kind::User, "256", "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)", ""},
     {"TQFN_PREFILL_INT8", Kind::User, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
-    {"TQFN_TAIL_SKIP", Kind::User, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""}
+    {"TQFN_TAIL_SKIP", Kind::User, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""},
+    {"TQLLM_PACK_RAM_FRAC", Kind::User, "0.6", "share of host RAM the pinned Flash-Next expert pack may take (0..1]; above it experts are read from the GGUF on demand", ""}
 };
 inline const Flag * find(const char * name) {
     for (const auto & f : ALL)
