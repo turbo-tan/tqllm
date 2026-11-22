@@ -485,10 +485,8 @@ void Qwen35Engine::alloc_seq_state() {
             value_cache.push_back({own ? kv_seq->base(int(a), false) : nullptr});
             a += own ? 1 : 0;
         } else {
-            for (int sl = 0; sl < NSLOT; ++sl) {
-                conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
-                rec_state.emplace_back(own ? size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4 : 0);
-            }
+            for (int sl = 0; sl < NSLOT; ++sl) conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
+            rec_state.emplace_back(own ? rec_bytes() : 0);  // one buffer, updated in place (see gdn_whole)
         }
     }
 }
@@ -970,12 +968,14 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     dfl.enc_norm = f32_of(f, "enc.output_norm.weight", H);
     dfl.out_norm = f32_of(f, "output_norm.weight", H);
     if (dfl.dspark) {
-        dfl.sel_prev = vocab_table(f, "markov_w1.weight", dfl.rank);
-        dfl.sel_next = vocab_table(f, "markov_w2.weight", dfl.rank);
+        dfl.sel_prev = {vocab_table(f, "markov_w1.weight", dfl.rank)};
+        dfl.sel_next = {vocab_table(f, "markov_w2.weight", dfl.rank)};
     } else if (!dfl.dspine) {
         dfl.sel_hidden = to_tq3(f, {"selector_hidden.weight"}, H);
-        dfl.sel_prev = bf16_table(f, "selector_predecessor.weight", uint64_t(cfg.vocab) * dfl.rank);
-        dfl.sel_next = bf16_table(f, "selector_successor.weight", uint64_t(cfg.vocab) * dfl.rank);
+        const std::string sp = "selector_predecessor.weight", ss = "selector_successor.weight";
+        const bool q4k = q4k_rows(f, sp, dfl.rank) && q4k_rows(f, ss, dfl.rank);
+        dfl.sel_prev = sel_table(f, sp, dfl.rank, q4k);
+        dfl.sel_next = sel_table(f, ss, dfl.rank, q4k);
     }
     std::vector<std::string> kv_names;
     for (int l = 0; l < nl; ++l) {

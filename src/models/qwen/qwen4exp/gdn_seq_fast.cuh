@@ -25,7 +25,6 @@ __global__ void __launch_bounds__(512) cand_gdn_seq_fast(
 {
     extern __shared__ float sm[];
 
-    constexpr int P   = DIM + 1;
     constexpr int PK  = DIM + 4;
     constexpr int VS4 = VS >> 2;
     constexpr int DIM4 = DIM >> 2;
@@ -98,7 +97,6 @@ __global__ void __launch_bounds__(512) cand_gdn_seq_fast(
             for (int i = tid; i < C * VS4; i += blockDim.x) {
                 const int t = i / VS4;
                 const int v4x = i - t * VS4;
-                const int v = v4x << 2;
                 const float4 uv = __ldg(reinterpret_cast<const float4*>(Ug + t * DIM + v0) + v4x);
 
                 reinterpret_cast<float4*>(E + t * (VS + 4))[v4x] = uv;

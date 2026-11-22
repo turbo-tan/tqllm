@@ -482,7 +482,8 @@ GgufTensor HfFolder::q4_rows(const std::vector<std::string> & ms) const {
                 const SafeTensor & p = *parts[j]; const tqllm::os::ReadFile f(p.file); if (!f.ok()) continue;
                 for (uint64_t at = 0; at < p.bytes; at += buf.size()) {
                     const int64_t r = f.read_at(buf.data(), size_t(std::min<uint64_t>(buf.size(), p.bytes - at)), p.begin + at);
-                    if (r <= 0) break; done += size_t(r);
+                    if (r <= 0) break;
+                    done += size_t(r);
                 }
             }
         });

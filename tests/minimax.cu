@@ -171,7 +171,7 @@ int main() try {
        // overlapping per-token block picks, dense and sparse, FP16 and FP8 KV; a token alone == the token in the chunk
         const int D = 128, B = 128, K = 16, hq = 32, hk = 2;
         for (const int dense : {0, 1}) {
-            const int n = 21, pos0 = dense ? 100 : 2600, rows = pos0 + n, nb = (rows + B - 1) / B;
+            const int n = 21, pos0 = dense ? 100 : 2600, rows = pos0 + n;
             std::vector<float> q(size_t(n) * hq * D);
             std::vector<__half> kc(size_t(rows) * hk * D), vc(kc.size());
             for (auto & x : q) x = nd(rng) * 0.1f;

@@ -34,7 +34,6 @@ namespace tqvk {
 __device__ const uint32_t TABLE[4096] = {
 #include "tqv12_codebook.inc"
 };
-constexpr int kTableBytes = 4096 * 4;
 
 // group u's 12-bit index from the 3 index words of a segment (u compile-time after unrolling)
 __device__ __forceinline__ uint32_t idx12(uint32_t w0, uint32_t w1, uint32_t w2, int u) {

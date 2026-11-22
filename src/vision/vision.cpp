@@ -69,9 +69,9 @@ uint16_t f32_to_f16_bits(float f) {
     return b;
 }
 float f16_bits_to_f32(uint16_t b) {
-    __half h;
-    std::memcpy(&h, &b, 2);
-    return __half2float(h);
+    __half_raw r;
+    r.x = b;
+    return __half2float(__half(r));
 }
 
 // host FP32 copy of a tensor (F32, F16, or any type with a CPU reference: Q8_0, Q5_0 / Q5_1, K-quants)
