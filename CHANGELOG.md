@@ -101,6 +101,15 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   us on an RTX 3090; TQV-12 and most llama.cpp types 3-5 %), 1-8 columns unchanged: DFlash2 decodes 8-11 % faster with
   `--draft 15`, at its default 7 drafts at the same speed (+0.3-0.8 %). A clean build takes 27 % less wall time and
   half the disk. Binaries now carry PTX for the built architectures (tqserve 44 -> 59 MB).
+- Faster DFlash2 verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit:
+  7-8 verify columns (33-48 (query, head) rows at 6 heads per KV head) run on a new kernel with three score warps (scores,
+  online softmax, FP16 P) handing P to four PV warps through shared memory, no 64-row padding, one block per SM taking
+  two (KV head, split) items through its cp.async rings; the in-block + merge kernel shares one buffer for the decoded K
+  and V and computes each key weight once (31 instead of 43 KB of shared memory: the 24 x 8 block grid in one wave, 42 ->
+  31 us at a locked 1.39 GHz). Qwen3.8-27B, RTX 3090, `--kv q8/q4`, attention per layer at 8 columns: 32K / 100K / 140K
+  context 184 / 434 / 588 -> 172 / 306 / 400 us. Production flags (144K, DFlash2, int8 prefill, host embed / head),
+  5-code needle replies: decode at 109K / 137K 162.4 / 150.7 -> 174.8 / 164.9 tok/s, identical replies and accepted /
+  drafted counts; 32K within noise.
 - Faster 8-column verify (DFlash2 tree steps), same output bit for bit: the TQT / TQ4 matvec at 5-8 columns and the 4-bit
   head at 8 / 16 columns now ask for a 32 KB shared-memory carveout instead of the driver's 64 KB, so the activations
   every 16-row block re-reads stay in L1 more often (ncu at a locked 1.38 GHz, ffn gate+up at 8 columns: 136 -> 129 us,

@@ -523,8 +523,8 @@ size_t codec_bytes(KvCodec c) {
 }
 // Split-cache two-part attention: node z == its path verified as a chain (rows moved like the commit's gather_path),
 // with 0 or c path tokens already committed; and close to the plain (non-tree) attention of that chain.
-void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, int pos) {
-    const int heads = 24, kvh = 4, dim = 256, ctx = 512, nsplit = 18;
+void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, int pos, int ctx = 512) {
+    const int heads = 24, kvh = 4, dim = 256, nsplit = 18;
     const size_t kr = kvh * codec_bytes(kcod), vr = kvh * codec_bytes(vcod), qw = size_t(heads) * dim;
     bool ok = true;
     float maxdiff = 0.f;
@@ -732,9 +732,16 @@ int main(int argc, char ** argv) {
     test_attention_codec("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 12, 350);
     test_attention_codec("tcq3/tcq2", KvCodec::Tcq3, KvCodec::Tcq2, 12, 350);
     test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 5, 333);   // the q8 K ring kernel (attn_vq_k), <= 32 rows
-    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 8, 333);   // attn_tq3kv_k (33-64 rows)
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 7, 333);   // the role-split kernel (attn_v48_k), 33-48 rows
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 8, 333);
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 10, 340);  // 49-64 rows: attn_tq3kv_k
     test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 16, 350);  // 16 columns = 96 rows in one pass
     test_attention_codec("q8/q8", KvCodec::Q8, KvCodec::Q8, 16, 350);
+    // Multiple cache tiles per split exercise ring wrap and P-buffer recycling.
+    for (int n : {7, 8}) {
+        test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, n, 8003, 8192);
+        test_attention_codec("q8/q8", KvCodec::Q8, KvCodec::Q8, n, 8003, 8192);
+    }
     test_codec_chain_vs_causal("q4/tcq2", KvCodec::Q4, KvCodec::Tcq2, 8, 333);
     test_codec_chain_vs_causal("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 8, 333);
     const auto err = cudaGetLastError();
