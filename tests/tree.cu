@@ -627,7 +627,90 @@ void test_codec_chain_vs_causal(const char * name, KvCodec kcod, KvCodec vcod, i
     cudaFree(dkv), cudaFree(dq), cudaFree(d0), cudaFree(dk), cudaFree(dv), cudaFree(dy), cudaFree(part), cudaFree(dp), cudaFree(dch), cudaFree(ddep);
 }
 
-int main() {
+// --bench: production-shaped two-part verify attention (24 heads, 4 KV heads, head_dim 256, the engine's split count
+// 2 x SMs / KV heads) over a long synthetic cache; time per call and effective KV read bandwidth, plus an FNV hash of
+// the output so two builds can be compared bit for bit.
+int bench_attention(int argc, char ** argv) {
+    const int heads = 24, kvh = 4, dim = 256, chunk = 4096;
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    const int nsplit = std::clamp(2 * sms / kvh, 1, 256);
+    KvCodec kcod = KvCodec::Q8, vcod = KvCodec::Q4;
+    std::vector<int> ctxs = {8192, 32768, 102400, 143360}, cols = {1, 8, 16};
+    for (int i = 2; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) {
+            ctxs.clear();
+            for (char * t = std::strtok(argv[++i], ","); t; t = std::strtok(nullptr, ",")) ctxs.push_back(std::atoi(t));
+        } else if (!std::strcmp(argv[i], "--cols") && i + 1 < argc) {
+            cols.clear();
+            for (char * t = std::strtok(argv[++i], ","); t; t = std::strtok(nullptr, ",")) cols.push_back(std::atoi(t));
+        } else if (!std::strcmp(argv[i], "--tq3")) {
+            kcod = vcod = KvCodec::Tq3;
+        }
+    }
+    const int cmax = *std::max_element(ctxs.begin(), ctxs.end()) + 32;
+    const size_t kr = kvh * codec_bytes(kcod), vr = kvh * codec_bytes(vcod), qw = size_t(heads) * dim;
+    uint8_t *dk = nullptr, *dv = nullptr;
+    cudaMalloc(&dk, size_t(cmax) * kr), cudaMalloc(&dv, size_t(cmax) * vr);
+    auto * dkv = dev(randb(size_t(chunk) * 2 * kvh * dim));
+    for (int p0 = 0; p0 < cmax; p0 += chunk) {
+        const int n = std::min(chunk, cmax - p0);
+        auto * dp0 = dev(std::vector<int>{p0});
+        tqllm_cuda::cache_write_kv_side(kcod, dkv, 2 * kvh * dim, n, dk, dp0, kvh, dim, nullptr);
+        tqllm_cuda::cache_write_kv_side(vcod, dkv + kvh * dim, 2 * kvh * dim, n, dv, dp0, kvh, dim, nullptr);
+        cudaFree(dp0);
+    }
+    const int nmax = 16;
+    auto * dq = dev(randb(size_t(nmax) * qw));
+    bf16 * dy = nullptr;
+    float * part = nullptr;
+    cudaMalloc(&dy, size_t(nmax) * qw * 2);
+    cudaMalloc(&part, size_t(nmax) * heads * (nsplit + 1) * (dim + 2) * 4);
+    std::vector<int> depth(nmax);
+    for (int i = 0; i < nmax; ++i) depth[i] = i;
+    auto *dch = dev(chain(nmax)), *ddep = dev(depth);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0), cudaEventCreate(&e1);
+    std::printf("attention bench: K %s V %s, nsplit %d, %d SMs\n", kcod == KvCodec::Q8 ? "q8" : "tq3",
+                vcod == KvCodec::Q4 ? "q4" : "tq3", nsplit, sms);
+    for (int ctx : ctxs)
+        for (int n : cols) {
+            auto * dp = dev(std::vector<int>{ctx - 1, ctx});  // the block's first column sits at ctx - 1
+            auto run = [&] {
+                tqllm_cuda::attention_kv_split(kcod, vcod, dq, dk, dv, dy, part, dp + 1, n, heads, kvh, 1.f / 16.f, nsplit,
+                                               nullptr, dch, ddep);
+            };
+            run();
+            cudaDeviceSynchronize();
+            const int reps = std::max(20, int(2e8 / (double(ctx) * (kr + vr))));
+            cudaEventRecord(e0);
+            for (int r = 0; r < reps; ++r) run();
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1e3 * ms / reps, gbs = double(ctx) * (kr + vr) / (us * 1e3);
+            const auto y = host(dy, size_t(n) * qw);
+            uint64_t hsh = 1469598103934665603ull;
+            for (const auto & b : y) {
+                uint16_t u;
+                std::memcpy(&u, &b, 2);
+                hsh = (hsh ^ u) * 1099511628211ull;
+            }
+            std::printf("ctx %6d cols %2d  %8.1f us  %6.1f GB/s  hash %016llx\n", ctx, n, us, gbs, (unsigned long long) hsh);
+            cudaFree(dp);
+        }
+    const auto err = cudaGetLastError();
+    cudaFree(dk), cudaFree(dv), cudaFree(dkv), cudaFree(dq), cudaFree(dy), cudaFree(part), cudaFree(dch), cudaFree(ddep);
+    if (err != cudaSuccess) {
+        std::printf("CUDA error: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "--bench")) return bench_attention(argc, argv);
     test_gdn();
     test_conv();
     test_conv_long();
@@ -648,6 +731,10 @@ int main() {
     for (const auto & c : codecs) test_attention_codec(c.name, c.k, c.v, 8, 333);
     test_attention_codec("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 12, 350);
     test_attention_codec("tcq3/tcq2", KvCodec::Tcq3, KvCodec::Tcq2, 12, 350);
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 5, 333);   // the q8 K ring kernel (attn_vq_k), <= 32 rows
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 8, 333);   // attn_tq3kv_k (33-64 rows)
+    test_attention_codec("q8/q4", KvCodec::Q8, KvCodec::Q4, 16, 350);  // 16 columns = 96 rows in one pass
+    test_attention_codec("q8/q8", KvCodec::Q8, KvCodec::Q8, 16, 350);
     test_codec_chain_vs_causal("q4/tcq2", KvCodec::Q4, KvCodec::Tcq2, 8, 333);
     test_codec_chain_vs_causal("tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, 8, 333);
     const auto err = cudaGetLastError();
