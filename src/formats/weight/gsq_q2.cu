@@ -287,8 +287,7 @@ template<bool WIDE, bool STAGE = false> __global__ void __launch_bounds__(256) d
             }
         }
         __syncwarp();
-        continue;
-    }
+    } else {
     for (int rr = 0; rr < (WIDE ? 1 : 8); ++rr) {
     const int row = WIDE ? blockIdx.x * 8 + warp : blockIdx.x * 64 + warp * 8 + rr;
     if (row >= rows) break;
@@ -338,6 +337,7 @@ template<bool WIDE, bool STAGE = false> __global__ void __launch_bounds__(256) d
         if (!lane) y[int64_t(e[2 + DC + c]) * rows + row] = __float2bfloat16_rn(v);
     }
     }
+    }  // if constexpr (STAGE)
     }
 }
 }

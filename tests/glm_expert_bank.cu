@@ -193,11 +193,6 @@ double rel_err(const std::vector<float> & got, const std::vector<float> & want) 
     }
     return worst;
 }
-bool finite(const std::vector<float> & v) {
-    for (float x : v)
-        if (!std::isfinite(x)) return false;
-    return true;
-}
 bool same_bits(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }

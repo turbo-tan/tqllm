@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         lrun[r] = 0.f;
     }
     const int nt = warp % 4, m_lo = warp < 4 ? 0 : 2, m_n = warp < 4 ? 2 : 1;  // QK ownership
-    const int d0 = warp * 32, vsub = d0 / 128, vj0 = d0 % 128;                 // PV ownership (one Turbo3 block)
+    const int d0 = warp * 32, vsub = d0 / 128;                                 // PV ownership (one Turbo3 block)
     float o[MT][4][4];
 #pragma unroll
     for (int m = 0; m < MT; ++m)

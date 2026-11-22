@@ -34,8 +34,13 @@ void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anc
 void dflash_chain(const uint32_t * idx, const float * score, int want, uint32_t * tok, cudaStream_t);
 // idx[i] = ids[idx[i]] (draft-vocabulary row -> token id, on the device).
 void map_ids(uint32_t * idx, const uint32_t * ids, int n, cudaStream_t);
+// A [vocab][rank] selector table: BF16 values, or the file's Q4_K blocks (rank a multiple of 256) decoded per row read.
+struct SelTable {
+    const void * p = nullptr;
+    bool q4k = false;
+};
 void dflash_lattice(const uint32_t * cand, const float * unary, const __nv_bfloat16 * gate, int gate_stride,
-                    const __nv_bfloat16 * next, const __nv_bfloat16 * prev, uint32_t anchor, int n, int rank,
+                    SelTable next, SelTable prev, uint32_t anchor, int n, int rank,
                     float * score, cudaStream_t, const uint32_t * anchor_dev = nullptr);
 
 } // namespace tqllm_cuda

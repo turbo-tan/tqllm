@@ -76,6 +76,7 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
 #include "token_sampling.hpp"
+#include "head_sampler.hpp"
 #include "layer_split.hpp"
 #include "../../../kv/prompt_park.hpp"
 #include "tp_comm.hpp"
@@ -485,8 +486,11 @@ private:
 
     void load_gguf(const GgufFile & f);
 
-    // Gated DeltaNet state is double-buffered per layer: the current state is slot `cur`; verify() writes the state
-    // after all n tokens to the other slot and commit(k) either flips `cur` (k == n) or replays k tokens into it.
+    // Gated DeltaNet conv state is double-buffered per layer: the current state is slot `cur`; verify() writes the state
+    // after all n tokens to the other slot and commit(k) flips `cur` (replaying k tokens into it when k < n).
+    // The recurrent state (3.1 MB per layer in FP32) has one buffer: verify() updates it in place only when its block is
+    // always committed whole (gdn_whole); otherwise it leaves it untouched and commit(k) replays the k accepted tokens
+    // in place, from the inputs kept in v_stash (the same kernel arithmetic, so the same bits as the verify's own state).
     static constexpr int NVER = TQLLM_VERIFY_COLUMNS, NSLOT = 2;
     // prefill chunk: the verify graph over NPF prompt tokens, projections as one GEMM (weights read once per chunk).
     // Larger chunks amortise the per-chunk FP16 weight dequant; the size follows the context budget (buffer memory).
@@ -495,10 +499,13 @@ private:
     static_assert(NVER >= 8 && NVER <= 16);
     int cur = 0;
     bf16 * conv_slot(uint32_t lin, int slot) { return conv_state[lin * NSLOT + (slot % NSLOT)].as<bf16>(); }
-    float * rec_slot(uint32_t lin, int slot) { return rec_state[lin * NSLOT + (slot % NSLOT)].as<float>(); }
+    void * rec_buf(uint32_t lin) { return rec_state[lin].p; }
+    bool gdn_f16() const { return opt.gdn_state_f16; }  // --gdn-state f16
+    // blocks committed whole: one token (decode) and prefill chunks (no stash to replay from)
+    static bool gdn_whole(int n) { return n == 1 || n > NVER; }
 
     size_t conv_bytes() const { return size_t(cfg.conv_k - 1) * (2 * cfg.lin_kheads * cfg.lin_dk + cfg.lin_vheads * cfg.lin_dv) * 2; }
-    size_t rec_bytes() const { return size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4; }
+    size_t rec_bytes() const { return size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * (gdn_f16() ? 2 : 4); }
     void reset_state();
 
     // RoPE scaling from the CLI, else the GGUF; the tables are global to the qwen35 kernels (one model per process).
@@ -560,10 +567,29 @@ private:
     const __half * h8_dev_s = nullptr;
     cudaGraphExec_t dfl_graph = nullptr;  // captured dflash_draft body (K/V ring mode)
     Buf sp_norm, sp_codes, sp_packed, sp_message, sp_delta, sp_raw, sp_rms, sp_predcodes, sp_predpv, sp_refmsg, sp_refdelta, sp_refined, sp_part;
-    Buf head4, head4s;  // draft-only 4-bit copy of head8 (DFlash2 full-vocabulary draft head)
+    Buf head4, head4s;  // first-pass copy of head8: 4-bit u4h (codes, (scale, min) pairs), or k3 with head_k3 (codes, records)
+    // TQLLM_DEBUG=head3: the first pass in 3 bits (k3, 0.58 GB instead of 0.80 GB for Qwen3.8); sampling stays exact
+    // through HeadSampler's screen, greedy keeps the top-16 shortlist
+    bool head_k3 = tqllm::debug_on("head3");
+    HeadSampler::FirstPass head_fp() const {
+        return !head4.p ? HeadSampler::FirstPass::Exact : head_k3 ? HeadSampler::FirstPass::K3 : HeadSampler::FirstPass::U4h;
+    }
+    // first-pass logits of rows [0, rows) (or the rows rid[0 .. rows)) of head4 for n FP16 inputs
+    void head4_mv(const __half * x, float * y, int rows, int n, const uint32_t * rid = nullptr) {
+        const int H = int(cfg.hidden);
+        if (head_k3) {
+            if (rid) tqllm_cuda::k3_matvec_ids(head4.as<uint8_t>(), head4s.as<uint8_t>(), rid, x, y, rows, H, n, stream);
+            else tqllm_cuda::k3_matvec(head4.as<uint8_t>(), head4s.as<uint8_t>(), x, y, rows, H, n, stream);
+        } else {
+            if (rid) tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), rid, x, y, rows, H, n, stream);
+            else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), x, y, rows, H, n, stream);
+        }
+    }
     Buf h2_vals, h2_idx, h2_scr;  // two-stage verify head (default; TQLLM_HEAD8=1 opts out)
-    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits (token_sampling.hpp)
+    // Sampling (temperature > 0): the head also returns each column's top-16 ids with exact logits; HeadSampler turns them,
+    // the first-pass logits and their error bounds into exact draws over the whole vocabulary (head_sampler.hpp)
     SamplingParams samp;
+    HeadSampler hs;
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
@@ -622,8 +648,6 @@ private:
     void swap_seq(SeqState & s);
     std::mt19937_64 rng{0};
     Buf s_id, s_lg, s_scr;
-    std::vector<uint32_t> h_sid;
-    std::vector<float> h_slg;
     bool sampling() const { return samp.temperature > 0.f; }
     bool batch_topk = false;  // batched verify with at least one sampling slot: every column returns its top-16
     bool want_topk() const { return batch_topk || sampling(); }
@@ -1004,6 +1028,7 @@ public:
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
         KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
                     1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr};
+        if (part == v_part.as<float>() && segs.size() <= 1) step.part_floats = part_floats;  // concurrent segments share v_part
         if (qsa.cur && (par || kvf->qsa_one_part())) step.qsa_sel = qsa.cur, step.qsa_from = qsa.from, step.qsa_mixed = qsa.mode == 2;
         kvf->write_and_attend(step);
         if (!cfg.gated_attention) return;
@@ -1020,9 +1045,26 @@ public:
     // Head on columns [col0, col0 + n) of v_x; writes v_tok (and the sampling top-16) at the same columns.
     void head_argmax(const float * norm_w, int n, int col0 = 0);
 
-    // Column col's sampling distribution (token_sampling.hpp top_dist); recent: the last output tokens before this column
-    TopDist dist(int col, const std::vector<uint32_t> & recent = {}) const {
-        return top_dist(h_slg.data() + size_t(col) * 16, h_sid.data() + size_t(col) * 16, samp, recent);
+    // the head pass ran as 4-bit first pass + int8 re-score (head_argmax's two-stage branch)
+    bool head_two_stage() const { return !lm_head.fmt && !full_logits && head4.p && has_head8(); }
+    // After a head pass with sampling columns [c0, c0 + n) at temperature t, before the stream sync: the screen statistics
+    // and the top-16 to the host.
+    void queue_sample(int c0, int n, float t) {
+        if (full_logits || n <= 0) return;  // the reference reads every logit after the sync
+        std::vector<float> temps(size_t(n), t);
+        hs.queue_stats(v_logits.as<float>(), s_id.as<uint32_t>(), s_lg.as<float>(), c0, n, temps.data(), stream);
+    }
+    // After the sync: the exact draws of the active slot's columns (token_sampling.hpp)
+    std::vector<uint32_t> sample_cols(const std::vector<HeadSampleCol> & cols) {
+        if (full_logits) return hs.sample_full(cols, samp, v_logits.as<float>(), stream);
+        const bool two = head_two_stage();
+        return hs.sample(cols, samp, v_logits.as<float>(), two ? w8() : nullptr, two ? s8() : nullptr, stream);
+    }
+    // the penalty window before the active slot's next token (empty without penalties)
+    std::vector<uint32_t> recent_out() const {
+        if (!samp.penalized()) return {};
+        const size_t n = gen.out.size(), r0 = n > size_t(kPresenceLastN) ? n - kPresenceLastN : 0;
+        return {gen.out.begin() + long(r0), gen.out.end()};
     }
 
     // token embeddings of n device-resident ids -> Y [n][hidden] (BF16)
@@ -1043,6 +1085,11 @@ public:
     const float * f32_of(const GgufFile & f, const std::string & name, uint64_t n);
 
     const bf16 * bf16_table(const GgufFile & f, const std::string & name, uint64_t n);
+
+    // DFlash2 selector table [cfg.vocab][rank]: the file's Q4_K blocks as they are (the lattice decodes the ~17 rows per
+    // position it reads; 71.5 MB instead of 254 MB of BF16 for the 248320 x 256 pair), else expanded to BF16.
+    bool q4k_rows(const GgufFile & f, const std::string & name, int rank);
+    tqllm_cuda::SelTable sel_table(const GgufFile & f, const std::string & name, int rank, bool q4k);
 
     // [rows][rank] table (GGUF ne = {rank, rows}) as BF16 [cfg.vocab][rank], rows past the file's vocabulary zero
     const bf16 * vocab_table(const GgufFile & f, const std::string & name, int rank);
@@ -1188,8 +1235,7 @@ public:
                     const __half * xc = v_xh.as<__half>() + size_t(c0) * H;
                     float * yc = v_logits.as<float>() + size_t(c0) * head_rows;
                     if (dsub_rows) dsub_matvec(xc, yc, std::min(32, DB - c0));
-                    else tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), xc, yc, head_rows, H,
-                                                std::min(32, DB - c0), stream);
+                    else head4_mv(xc, yc, head_rows, std::min(32, DB - c0));
                 }
             } else {  // LM head (or its draft-vocabulary rows) in a registered weight format (TQ4, W4A16, ...)
                 const Mat & hm = dsub_mat.p ? dsub_mat : lm_head;
@@ -1355,8 +1401,7 @@ public:
             head_rows = lm_head.rows;
             tqllm_cuda::bf16_to_h(TE, v_xh.as<__half>(), B * H, stream);
             if (head4.p)
-                tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(),
-                                       head_rows, H, B, stream);
+                head4_mv(v_xh.as<__half>(), v_logits.as<float>(), head_rows, B);
             else if (lm_head.fmt)
                 head_mv(TE, B);
             else
@@ -1427,7 +1472,7 @@ public:
     void dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D);
 
     // Accepted draft count j for the active slot; res[j] becomes the token after them. Column col0 + i of the verify
-    // holds the target's prediction after draft token i - 1 (greedy: res[i]; sampling: h_sid / h_slg top-16).
+    // holds the target's prediction after draft token i - 1 (greedy: res[i]; sampling: its exact draw, sample_cols).
     int accept(const std::vector<uint32_t> & draft, uint32_t * res, int col0);
 
     // Batched decode step: each slot drafts, one verify runs every slot's columns (weights read once), then each
@@ -1682,18 +1727,20 @@ public:
     const bf16 * step_hidden() const { return x.as<bf16>(); }
 
 private:
-    // verify() stored only the state after all n tokens (slot cur + 1). Accepting fewer replays the recurrent
-    // layers over the accepted prefix from slot cur, using the inputs kept in v_stash.
+    // verify() stored only the conv state after all n tokens (slot cur + 1) and, for gdn_whole blocks, the recurrent
+    // state. Otherwise commit replays the recurrent layers over the accepted prefix (conv from slot cur, recurrent
+    // state in place), using the inputs kept in v_stash.
     void set_pending(int k) {
         pend_k = k;
         ck(cudaMemcpyAsync(d_pend.p, &pend_k, sizeof(int), cudaMemcpyHostToDevice, stream));  // pageable: staged now
     }
-    // Deferred commit -> real state: replay the pending path (as commit(k < n) does) from slot cur into cur + 1.
+    // Deferred commit -> real state: replay the pending path (as commit(k < n) does): conv slot cur into cur + 1,
+    // recurrent state in place.
     void flush_pending();
 
     void commit(int k) override {
         if (k < 1 || k > last_n) throw std::runtime_error("commit: accepted count out of range");
-        if (k < last_n) {
+        if (k < last_n || !gdn_whole(last_n)) {
             // TQLLM_DEBUG=commit_overlap (opt-in until test-native-mtp covers --np > 1): replay on a side stream so it overlaps the MTP repair pass that follows (that pass
             // reads neither the recurrent states nor the replay's scratch); the next verify waits for it (join_commit)
             static const bool overlap = tqllm::debug_on("commit_overlap");

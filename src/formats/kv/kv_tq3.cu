@@ -164,10 +164,21 @@ struct Q4 {  // rotated 4-bit per 32 values, fp16 scale, value (q - 8) * d (144 
         ks = kscale(s);
     }
 
+    // FP16 (q - 8) * d straight from the nibbles: 1024 + q as FP16 bits, minus 1032 (exact), one rounded multiply; the
+    // same values as levels() + store_levels_h with about half the integer work
     __device__ static void store_v(const uint32_t (&w)[NW], __half s, __half * vd, const float * cb) {
-        uint32_t l[8];
-        levels(w, l);
-        tq3a::store_levels_h(l, s, vd);
+        const __half2 s2h = __halves2half2(s, s);
+        const uint32_t s2 = *reinterpret_cast<const uint32_t *>(&s2h), NEG = 0xE408E408u;  // -1032
+#pragma unroll
+        for (int k = 0; k < NW; ++k) {
+            const uint32_t lo = w[k] & 0x0F0F0F0Fu, hi = (w[k] >> 4) & 0x0F0F0F0Fu;  // nibbles 0 2 4 6 | 1 3 5 7
+            const uint32_t a = __byte_perm(lo, hi, 0x5140), b = __byte_perm(lo, hi, 0x7362);  // values 0-3 | 4-7 as bytes
+            const uint32_t h0 = hmul2u(hadd2u(__byte_perm(a, 0x64646464u, 0x5140), NEG), s2);
+            const uint32_t h1 = hmul2u(hadd2u(__byte_perm(a, 0x64646464u, 0x5342), NEG), s2);
+            const uint32_t h2 = hmul2u(hadd2u(__byte_perm(b, 0x64646464u, 0x5140), NEG), s2);
+            const uint32_t h3 = hmul2u(hadd2u(__byte_perm(b, 0x64646464u, 0x5342), NEG), s2);
+            *reinterpret_cast<uint4 *>(vd + 8 * k) = make_uint4(h0, h1, h2, h3);
+        }
     }
 };
 struct Tcq2;
@@ -258,6 +269,23 @@ struct Tcq3 {  // K: 2 x (128-value 512-state trellis group: 390 stream bits + f
         }
         ks = __half2float(s) * tcq::CB3K_INV_SCALE;
     }
+    // the same levels from a pair table: entry x (a 12-bit stream window) = the levels of states x & 0x1FF and x >> 3,
+    // so one lookup per two values (half the shared-memory reads of store_k; prefill blocks, where they are the limit)
+    __device__ static void store_k_pairs(const uint32_t (&w)[NW], __half s, int8_t * kd, float & ks, const uint16_t * pt) {
+#pragma unroll
+        for (int j = 0; j < 32; j += 16) {
+            uint32_t p[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int b0 = 3 * (j + 4 * e), b1 = b0 + 6;
+                const uint32_t x0 = __funnelshift_r(w[b0 / 32], w[b0 / 32 + 1], b0 % 32) & 0xFFFu;
+                const uint32_t x1 = __funnelshift_r(w[b1 / 32], w[b1 / 32 + 1], b1 % 32) & 0xFFFu;
+                p[e] = uint32_t(pt[x0]) | (uint32_t(pt[x1]) << 16);
+            }
+            *reinterpret_cast<uint4 *>(kd + j) = make_uint4(p[0], p[1], p[2], p[3]);
+        }
+        ks = __half2float(s) * tcq::CB3K_INV_SCALE;
+    }
 };
 }  // namespace kvc
 
@@ -271,7 +299,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
                                                            int heads, int kvheads, float scale, int nsplit,
                                                            const int * dep, int pstride, int zoff, const int * dstart,
                                                            int cstride, const float * kbias, int flat, int poff,
-                                                           const int32_t * sel = nullptr, int from = 0) {
+                                                           const int32_t * sel = nullptr, int from = 0, int pf_keys = 0) {
     constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
     if constexpr (SEL) {
         const int z = blockIdx.y;
@@ -285,9 +313,14 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     constexpr int ROWS = NW * 16, NT = NW * 32, KRB = KC::RB, VRB = VC::RB, UPT = TILE * 8 / NT;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     // trellis codebooks staged in shared memory (the per-value lookups are data dependent gathers)
-    constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>;
-    __shared__ float s_cbk[KT ? 128 : 1], s_cbv[VT ? 128 : 1];  // s_cbk: 512 int8 levels; s_cbv: 256 FP16 values
-    if constexpr (KT)
+    // KP (8-warp prefill blocks): Tcq3 K levels from a 4096-entry pair table (Tcq3::store_k_pairs) instead
+    constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>, KP = KT && NW == 8;
+    __shared__ float s_cbk[KP ? 2048 : KT ? 128 : 1], s_cbv[VT ? 128 : 1];  // s_cbk: 512 int8 levels (KP: 4096 pairs); s_cbv: 256 FP16 values
+    if constexpr (KP) {
+        auto lv = [](uint32_t st) { return uint32_t(uint8_t(int8_t(__float2int_rn(tcq::CB3K[st] * tcq::CB3K_SCALE)))); };
+        for (int i = threadIdx.x; i < 4096; i += NW * 32)
+            reinterpret_cast<uint16_t *>(s_cbk)[i] = uint16_t(lv(i & 0x1FFu) | (lv(uint32_t(i) >> 3) << 8));
+    } else if constexpr (KT)
         for (int i = threadIdx.x; i < 512; i += NW * 32)
             reinterpret_cast<int8_t *>(s_cbk)[i] = int8_t(__float2int_rn(tcq::CB3K[i] * tcq::CB3K_SCALE));
     if constexpr (VT)
@@ -302,6 +335,11 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     const int g = heads / kvheads, rows = nq * g;
     const int r0 = SEL ? 0 : (gridDim.y - 1 - blockIdx.y) * ROWS;
     const int seq0 = *dseq0;
+    // pf_keys > 0 (prefill chunk, nsplit = the most splits): the chunk's prefix (seq0 - 1 keys) is split over
+    // ns = clamp(prefix / pf_keys, 1, nsplit) key ranges, so a long prefix fills the GPU; ns depends on the chunk start
+    // only. ns == 1 is the unsplit kernel (normalised output written here, same arithmetic); else partials, pf_merge_k.
+    const int ns = pf_keys ? max(1, min(nsplit, (seq0 - 1) / pf_keys)) : nsplit;
+    if (split >= ns) return;
     const int q_lo = r0 / g, q_hi = min(r0 + ROWS - 1, rows - 1) / g;
     // pstride > 0 (two-part tree verify): query z at depth dep[z] (zoff + z for a chain) takes the keys below
     // tq_split_point(qpos) and writes a partial with stride pstride; attn_blk_codec_k adds the rest and merges
@@ -311,7 +349,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
         for (int z = q_lo; z <= q_hi; ++z) key_end = max(key_end, qlim(z)), mask_from = min(mask_from, qlim(z));
     // tiles interleaved over the splits (tile i -> split i % nsplit): a query's result does not depend on nq
     // dstart (TqCache): keys below it are served by a compact stand-in segment (attn_compact_k); multiple of TILE
-    const int stride = nsplit * TILE, kbeg = (dstart ? *dstart : 0) + split * TILE, kend = key_end;
+    const int stride = ns * TILE, kbeg = (dstart ? *dstart : 0) + split * TILE, kend = key_end;
     const int ntile = kbeg < kend ? (kend - kbeg + stride - 1) / stride : 0;
 
     // Q -> TQ3_0 rotation per 32 (signs, WHT / sqrt(32)) -> int8 per (row, 128)
@@ -378,7 +416,9 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
 #pragma unroll
         for (int i = 0; i < UPT; ++i) {
             const int u = t + i * NT, lk = u % 32, b = u / 32;
-            KC::store_k(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk], s_cbk);
+            if constexpr (KP) KC::store_k_pairs(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk],
+                                                reinterpret_cast<const uint16_t *>(s_cbk));
+            else KC::store_k(kw[i], kr[i], k8 + (buf * TILE + lk) * KS + b * 32, ksf[(buf * 8 + b) * TILE + lk], s_cbk);
             VC::store_v(vw[i], vr[i], vh + (buf * TILE + lk) * VS + b * 32, s_cbv);
         }
     };
@@ -498,7 +538,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     l_b += __shfl_xor_sync(0xffffffffu, l_b, 2);
     const int ga = r0 + ra, gb = r0 + rb;
     const int64_t ha = int64_t(ga / g) * heads + kh * g + ga % g, hb = int64_t(gb / g) * heads + kh * g + gb % g;
-    if (nsplit == 1 && !pstride && !cstride) {
+    if (ns == 1 && !pstride && !cstride) {
         const float ia = l_a > 0.f ? 1.f / l_a : 0.f, ib = l_b > 0.f ? 1.f / l_b : 0.f;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
@@ -1410,6 +1450,27 @@ static void blk_merge(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t
     if (VT) inverse_v<VC>(y, nq, h, s);
 }
 
+// prefill split partials -> BF16 rows (the split count of the chunk, see pf_keys in attn_tq3kv_k; ns == 1: written by
+// the attention kernel). Natural-log maxima as attn_gen_merge_k; one reciprocal per row as the unsplit kernel.
+__global__ void __launch_bounds__(256) pf_merge_k(const float * part, __nv_bfloat16 * y, int nsplit, int heads,
+                                                  const int * dseq0, int pf_keys) {
+    const int ns = max(1, min(nsplit, (*dseq0 - 1) / pf_keys));
+    if (ns == 1) return;
+    const int h = blockIdx.x, d = threadIdx.x, qz = blockIdx.y;
+    const float * base = part + (int64_t(qz) * heads + h) * nsplit * (tq3a::DIM + 2);
+    float m = -CUDART_INF_F;
+    for (int s = 0; s < ns; ++s) m = fmaxf(m, base[s * (tq3a::DIM + 2) + tq3a::DIM]);
+    float zz = 0.f, acc = 0.f;
+    for (int s = 0; s < ns; ++s) {
+        const float * pp = base + s * (tq3a::DIM + 2);
+        if (!(pp[tq3a::DIM + 1] > 0.f)) continue;
+        const float w = expf(pp[tq3a::DIM] - m);
+        zz += pp[tq3a::DIM + 1] * w;
+        acc += pp[d] * w;
+    }
+    y[(int64_t(qz) * heads + h) * tq3a::DIM + d] = __float2bfloat16_rn(acc * (zz > 0.f ? 1.f / zz : 0.f));
+}
+
 // pstride > 0: tree verify cache part only (partials, no merge / inverse; see attn_blk_codec_k)
 template <int NW, class KC, class VC, int NB = 2>
 static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc, __nv_bfloat16 * y,
@@ -1426,6 +1487,46 @@ static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_
         q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, dep, pstride, zoff, dstart, cstride, kbias, flat, poff);
     if (pstride || cstride) return;
     if (nsplit > 1) attention_merge256(part, y, nsplit, h, nq, s);
+    inverse_v<VC>(y, nq, h, s);
+}
+
+// Prefill chunk (more than 64 rows): 128 rows per block, one block per SM, every block walks the whole prefix. A chunk of
+// a few hundred queries gives only kh * blocks equal blocks (512 queries x 6 heads: 96 on an 82-SM card, two waves with
+// the second one 17 % full), so a long prefix is split over up to PF_MAXS key ranges to fill about PF_WAVES waves.
+constexpr int PF_MAXS = 8, PF_WAVES = 4, PF_KEYS = 4096;  // PF_KEYS: prefix keys per split (fewer: no split)
+static int sm_count() {
+    static int sms = 0;
+    if (!sms) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        sms = sms > 0 ? sms : 32;
+    }
+    return sms;
+}
+static int pf_splits(int nq, int h, int kh) {
+    const int units = kh * (((h / kh) * nq + 127) / 128);
+    return std::clamp((PF_WAVES * sm_count() + units - 1) / units, 1, PF_MAXS);
+}
+size_t kv_prefill_partial_floats(int nbuf, int heads, int kvheads) {
+    size_t most = 0;
+    for (int nq = 1; nq <= nbuf; ++nq)
+        if ((heads / kvheads) * nq > 64) most = std::max(most, size_t(nq) * heads * (tq3a::DIM + 2) * pf_splits(nq, heads, kvheads));
+    return most;
+}
+template <class KC, class VC>
+static void tq3_prefill(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc, __nv_bfloat16 * y, float * part,
+                        size_t part_cap, const int * dseq0, int nq, int h, int kh, float scale, cudaStream_t s) {
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(attn_tq3kv_k<8, KC, VC, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tq3a::smem<8, 2>()));
+        configured = true;
+    }
+    const size_t room = part_cap / (size_t(nq) * h * (tq3a::DIM + 2));  // splits the partials buffer holds
+    const int ns = std::max(1, int(std::min<size_t>(pf_splits(nq, h, kh), room))), blocks = ((h / kh) * nq + 127) / 128;
+    attn_tq3kv_k<8, KC, VC, 2><<<dim3(kh, blocks, ns), 256, tq3a::smem<8, 2>(), s>>>(
+        q, kc, vc, y, part, dseq0, nq, h, kh, scale, ns, nullptr, 0, 0, nullptr, 0, nullptr, 0, 0, nullptr, 0, PF_KEYS);
+    if (ns > 1) pf_merge_k<<<dim3(h, nq), 256, 0, s>>>(part, y, ns, h, dseq0, PF_KEYS);
     inverse_v<VC>(y, nq, h, s);
 }
 
@@ -1646,7 +1747,7 @@ template <class KC, class VC>
 static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void * vc, __nv_bfloat16 * y, float * part,
                             const int * dseq0, int nq, int h, int kh, float scale, int nsplit, cudaStream_t s,
                             const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel, int qsa_from,
-                            bool qsa_mixed) {
+                            bool qsa_mixed, size_t part_cap) {
     const int * d0 = cs ? cs->start : nullptr;
     if (h % kh) throw std::invalid_argument("attention_kv_split: heads % kvheads");
     const auto * k = static_cast<const uint8_t *>(kc);
@@ -1722,21 +1823,22 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
     if ((h / kh) * nq <= 64) {
         tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, s);
     }
-    else tq3_launch<8, KC, VC>(q, k, v, y, part, dseq0, nq, h, kh, scale, 1, s);
+    else tq3_prefill<KC, VC>(q, k, v, y, part, part_cap, dseq0, nq, h, kh, scale, s);
 }
 
 void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q, const void * kc, const void * vc,
                         __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit,
                         cudaStream_t s, const int * par, const int * dep, const KvCompactSeg * cs, const int32_t * qsa_sel,
-                        int qsa_from, bool qsa_mixed) {
+                        int qsa_from, bool qsa_mixed, size_t part_cap) {
     auto with_v = [&](auto kt) {
         using KC = decltype(kt);
         switch (vcodec) {
-            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
-            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed); return;
+            case KvCodec::Tq3: attention_kc_vc<KC, kvc::Tq3>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Tq2s: attention_kc_vc<KC, kvc::Tq2s>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Q8: attention_kc_vc<KC, kvc::Q8>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Q4: attention_kc_vc<KC, kvc::Q4>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Tcq2: attention_kc_vc<KC, kvc::Tcq2>(q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, s, par, dep, cs, qsa_sel, qsa_from, qsa_mixed, part_cap); return;
+            case KvCodec::Tcq3: break;  // K only
         }
         throw std::invalid_argument("attention_kv_split: unsupported V codec");
     };

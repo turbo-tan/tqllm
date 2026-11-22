@@ -122,8 +122,8 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
                 mm(L.w_a, np, a);
             }
             tqllm_cuda::conv_step(qkv, conv_slot(lin_i, cur), L.conv_w, qkvc, qkv_dim, stream);
-            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), core, lkh, lvh, dk, dv,
-                                 cfg.tiled, stream);
+            tqllm_cuda::gdn_step(qkvc, a, b, L.neg_a, L.dt_bias, rec_buf(lin_i), core, lkh, lvh, dk, dv,
+                                 cfg.tiled, stream, gdn_f16());
             tqllm_cuda::gated_rms(core, z, L.gnorm_w, gn, lvh, dv, cfg.eps, stream);
             prep(gn, zdim);
             mm(L.w_out, gn, mp);
@@ -228,7 +228,7 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                            cb, cudaMemcpyDefault, stream));
-        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
+        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_buf(l)), save ? static_cast<void *>(rec_buf(l)) : h + cb,
                            rb, cudaMemcpyDefault, stream));
     }
 }
@@ -457,7 +457,7 @@ void Qwen35Engine::reset_state() {
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
-        ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
+        ck(cudaMemsetAsync(rec_buf(l), 0, rec_bytes, stream));
     }
 }
 
@@ -927,6 +927,7 @@ void Qwen35Engine::set_sampling(float temperature, float top_p, int top_k, uint6
     samp.presence = presence > 0.f ? presence : 0.f;
     samp.top_p = top_p > 0.f && top_p <= 1.f ? top_p : 1.f;
     samp.top_k = top_k;
+    samp.seed = seed;
     rng.seed(seed);
 }
 
@@ -1295,22 +1296,28 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
     if (two_stage && head4.p && has_head8() && (n <= NVER || !segs.empty())) {  // same head path for decode and verify
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
         for (int c0 = 0; c0 < n; c0 += 32)  // batched verify: every slot's columns in one pass per 32
-            tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>() + size_t(c0) * H,
-                                   v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows, H,
-                                   std::min(32, n - c0), stream);
+            head4_mv(v_xh.as<__half>() + size_t(c0) * H, v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows,
+                     std::min(32, n - c0));
         tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, h2_vals.as<float>(), h2_idx.as<uint32_t>(),
                                h2_scr.p, stream);
         tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(),
                                        h2_idx.as<uint32_t>(), H, n, tok_out, stream,
                                        want_topk() ? lg_out : nullptr);
-        if (want_topk())
+        if (want_topk()) {
             ck(cudaMemcpyAsync(id_out, h2_idx.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToDevice, stream));
+            if (col0 == 0) hs.save_x(v_xh.as<__half>(), n, stream);  // later re-scores of these columns (HeadSampler)
+        }
         return;
     }
     if (has_head8()) {  // int8 + FP16-scale copy of the Q6_K head on FP16 tensor cores
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
-        tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>(), v_logits.as<float>(),
-                               lm_head.rows, H, n, stream);
+        if (full_logits && want_topk())  // TQLLM_DEBUG=full_head sampling reference: the re-score's arithmetic on every row
+            hs.rescore_all(w8(), s8(), v_xh.as<__half>(), n, v_logits.as<float>(), stream);
+        else
+            for (int c0 = 0; c0 < n; c0 += 8)  // i8h_matvec takes at most 15 columns (a 16-column verify / prefill chunk)
+                tqllm_cuda::i8h_matvec(w8(), s8(), v_xh.as<__half>() + size_t(c0) * H,
+                                       v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows, H, std::min(8, n - c0),
+                                       stream);
     } else {
         tqllm_cuda::bf16_to_f32(NP, v_xf.as<float>(), n * H, stream);
         tqllm_cuda::q6k_matvec(lm_head.p, v_xf.as<float>(), v_logits.as<float>(), lm_head.rows, H, n, stream);
@@ -1468,6 +1475,18 @@ const bf16 * Qwen35Engine::bf16_table(const GgufFile & f, const std::string & na
     return static_cast<const bf16 *>(put(b.data(), b.size() * 2));
 }
 
+bool Qwen35Engine::q4k_rows(const GgufFile & f, const std::string & name, int rank) {
+    const auto & t = gt(f, name);
+    return t.type == GGML_Q4_K && rank % 256 == 0 && t.ne.size() == 2 && t.ne[0] == uint64_t(rank) &&
+           t.ne[1] == uint64_t(cfg.vocab);
+}
+
+tqllm_cuda::SelTable Qwen35Engine::sel_table(const GgufFile & f, const std::string & name, int rank, bool q4k) {
+    if (!q4k) return {bf16_table(f, name, uint64_t(cfg.vocab) * rank)};
+    const auto raw = f.read(gt(f, name));
+    return {put(raw.data(), raw.size()), true};
+}
+
 const bf16 * Qwen35Engine::vocab_table(const GgufFile & f, const std::string & name, int rank) {
     const auto & t = gt(f, name);
     if (int(t.ne[0]) != rank || t.ne[1] > cfg.vocab) throw std::runtime_error(name + ": unexpected shape");
@@ -1482,8 +1501,7 @@ const bf16 * Qwen35Engine::vocab_table(const GgufFile & f, const std::string & n
 
 void Qwen35Engine::dsub_matvec(const __half * x, float * y, int n) {
     if (dsub_in_head4)
-        tqllm_cuda::u4h_matvec_ids(head4.as<uint8_t>(), head4s.as<__half2>(), dsub_ids.as<uint32_t>(), x, y, dsub_rows,
-                                   int(cfg.hidden), n, stream);
+        head4_mv(x, y, dsub_rows, n, dsub_ids.as<uint32_t>());
     else
         tqllm_cuda::u4h_matvec(dsub_w.as<uint8_t>(), dsub_s.as<__half2>(), x, y, dsub_rows, int(cfg.hidden), n, stream);
 }
@@ -1588,8 +1606,7 @@ void Qwen35Engine::dspark_forward(uint32_t pos) {
     const int head_rows = lm_head.rows;
     tqllm_cuda::bf16_to_h(TE, v_xh.as<__half>(), NB * H, stream);
     if (head4.p)
-        tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(),
-                               head_rows, H, NB, stream);
+        head4_mv(v_xh.as<__half>(), v_logits.as<float>(), head_rows, NB);
     else if (lm_head.fmt)
         head_mv(TE, NB);
     else
@@ -1671,9 +1688,9 @@ void Qwen35Engine::flush_pending() {
         tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
                                v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
         const bf16 * B0 = T + qkv_dim + zdim;
-        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                              rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                              d_chain.as<int>());
+        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_buf(lin_i),
+                              rec_buf(lin_i), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
+                              d_chain.as<int>(), {}, gdn_f16());
         ++lin_i;
     }
     cur = (cur + 1) % NSLOT;

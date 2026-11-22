@@ -67,9 +67,9 @@ inline PackedExperts open_packed(const std::string & path) {
     return pe;
 }
 
-// u4h kernel id of each projection's device format (what the grouped kernels see), from one expert's payload
-inline std::array<int, 3> expert_u4h_ids(const std::array<ExpertPayload, 3> & payload, int hidden, int ff) {
-    std::array<int, 3> ids{};
+// Each projection's device format (what the grouped kernels see), from one expert's payload
+inline std::array<const WeightFormat *, 3> expert_device_formats(const std::array<ExpertPayload, 3> & payload, int hidden, int ff) {
+    std::array<const WeightFormat *, 3> f{};
     for (int p = 0; p < 3; ++p) {
         const int cols = p == 2 ? ff : hidden, rows = p == 2 ? hidden : ff;
         std::vector<std::vector<char>> keep_bytes;
@@ -77,12 +77,28 @@ inline std::array<int, 3> expert_u4h_ids(const std::array<ExpertPayload, 3> & pa
             keep_bytes.emplace_back(static_cast<const char *>(data), static_cast<const char *>(data) + bytes);
             return keep_bytes.back().data();
         };
-        ids[p] = weight_format(payload[p].type)
-                     ->load(std::vector<char>(payload[p].bytes.data, payload[p].bytes.data + payload[p].bytes.size), rows, cols, keep,
-                            nullptr)
-                     .fmt->u4h_id();
+        f[p] = weight_format(payload[p].type)
+                   ->load(std::vector<char>(payload[p].bytes.data, payload[p].bytes.data + payload[p].bytes.size), rows, cols, keep, nullptr)
+                   .fmt;
     }
-    return ids;
+    return f;
+}
+// u4h kernel id of each projection's device format
+inline std::array<int, 3> expert_u4h_ids(const std::array<ExpertPayload, 3> & payload, int hidden, int ff) {
+    const auto f = expert_device_formats(payload, hidden, ff);
+    return {f[0]->u4h_id(), f[1]->u4h_id(), f[2]->u4h_id()};
+}
+
+// Code bytes per 32 weights of a format's expert banks in the TQFN_TILED layout (0: kept plain). The grouped expert kernels
+// read a bank as tiles whenever their kernel format has a tiled layout and set_tiled_experts is on, so every place that
+// tiles a pack or a bank must decide with the same id the kernels run (expert_kernel_id), not u4h_id: the UD types
+// IQ2_XXS / IQ2_XS / IQ1_S / Q2_K have no u4h_id but run the grouped kernels as fmt 8..12 (tiled reads).
+inline int expert_tile_bpb(const WeightFormat * f) { return f ? tqllm_cuda::tiled_block_bytes(f->expert_kernel_id()) : 0; }
+
+// expert_tile_bpb of each projection's device format, from one expert's payload
+inline std::array<int, 3> expert_tile_bpbs(const std::array<ExpertPayload, 3> & payload, int hidden, int ff) {
+    const auto f = expert_device_formats(payload, hidden, ff);
+    return {expert_tile_bpb(f[0]), expert_tile_bpb(f[1]), expert_tile_bpb(f[2])};
 }
 
 // What one projection's loaded device format can do, reported by repack_expert: the grouped-kernel id, the widest matvec
@@ -124,7 +140,7 @@ inline std::array<std::vector<char>, 6> repack_expert(const std::array<ExpertPay
             (*fmt)[p].max_batch_cols = m.fmt->max_batch_cols();
             (*fmt)[p].bank_row_layout = m.fmt->has_expert_matvec() && m.fmt->basis() == Basis::Plain && m.fmt->row_bytes(cols);
         }
-        const int bpb = tile ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;
+        const int bpb = tile ? expert_tile_bpb(m.fmt) : 0;
         if (bpb && rows % 16 == 0 && (cols / 32) % 4 == 0 && parts[size_t(2 * p)].size() == size_t(rows) * (cols / 32) * bpb) {
             std::vector<char> t(parts[size_t(2 * p)].size());
             tqllm_cuda::tile_expert_rows(parts[size_t(2 * p)].data(), t.data(), rows, cols, bpb);
