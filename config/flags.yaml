@@ -252,3 +252,15 @@ flags:
     kind: user
     default: "-"
     doc: "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)"
+  - name: TQFN_SHORT_CHUNK
+    kind: user
+    default: "1"
+    doc: "0: a prompt shorter than the prefill chunk plans the full engine chunk (24 GB cards; 1 plans its own length, same text)"
+  - name: TQFN_SHORT_STAGE
+    kind: user
+    default: "-"
+    doc: "K: staging slices of K experts for a one-chunk prompt on 24 GB cards (experiment)"
+  - name: TQLLM_GATHER_IO
+    kind: user
+    default: "3"
+    doc: "row gathers from mapped tables of 1 GB or more: bit 1 random-access hint, bit 2 request a call's rows together (0: off)"

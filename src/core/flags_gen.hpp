@@ -64,7 +64,10 @@ inline constexpr Flag ALL[] = {
     {"TQFN_LAYER_SLOTS", Kind::User, "-", "comma list of expert slots per layer (overrides the packed file's .slots profile)", ""},
     {"TQFN_MTP_SLOTS", Kind::User, "256", "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)", ""},
     {"TQFN_PREFILL_INT8", Kind::User, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
-    {"TQFN_TAIL_SKIP", Kind::User, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""}
+    {"TQFN_TAIL_SKIP", Kind::User, "-", "R: in decode, skip non-resident experts ranked R-th or lower for every token of a call (approximate)", ""},
+    {"TQFN_SHORT_CHUNK", Kind::User, "1", "0: a prompt shorter than the prefill chunk plans the full engine chunk (24 GB cards; 1 plans its own length, same text)", ""},
+    {"TQFN_SHORT_STAGE", Kind::User, "-", "K: staging slices of K experts for a one-chunk prompt on 24 GB cards (experiment)", ""},
+    {"TQLLM_GATHER_IO", Kind::User, "3", "row gathers from mapped tables of 1 GB or more: bit 1 random-access hint, bit 2 request a call's rows together (0: off)", ""}
 };
 inline const Flag * find(const char * name) {
     for (const auto & f : ALL)

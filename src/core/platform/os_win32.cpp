@@ -90,6 +90,8 @@ bool MappedFile::drop(size_t offset, size_t bytes) const noexcept {
     return true;
 }
 void MappedFile::advise_random() const noexcept {}
+void MappedFile::advise_random(size_t, size_t) const noexcept {}
+void MappedFile::prefetch(size_t, size_t) const noexcept {}
 
 struct ReadFile::Impl { HANDLE file = INVALID_HANDLE_VALUE; };
 ReadFile::ReadFile(const std::string & path) : impl_(std::make_unique<Impl>()) { impl_->file = open_read(path); }

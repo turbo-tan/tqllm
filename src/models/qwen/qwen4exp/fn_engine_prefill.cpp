@@ -210,7 +210,10 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // engine chunk gets its own length: the same experts stream either way, but the activation and staging buffers of a
     // 16K chunk cost 6.5 GB there, and giving up banks for them only adds the refill (11-11: 1.2K prompt 2.38 -> 2.16 s).
     constexpr int kMaxChunk = 32768;
-    const int chunk0 = f_.cp->run.tune.chunk_set || !f_.cp->run.small_card ? f_.chunk : tqllm::flashnext::small_card_chunk(T, kMaxChunk);
+    static const bool short_chunk = [] { const char * v = std::getenv("TQFN_SHORT_CHUNK"); return !v || std::atoi(v) != 0; }();
+    const int chunk0 = f_.cp->run.tune.chunk_set ? f_.chunk
+                     : f_.cp->run.small_card ? tqllm::flashnext::small_card_chunk(T, kMaxChunk)
+                     : short_chunk ? tqllm::flashnext::short_prompt_chunk(T, f_.chunk) : f_.chunk;
     int chunk = chunk0, block = 0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
@@ -227,6 +230,10 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         }
         f_.cp->rt.prefill_stage = tqllm::flashnext::small_card_stage(f_.cp->run.small_card, f_.cp->run.tune.stage_set,
                                                                   f_.cp->run.tune.stage, T, f_.chunk);
+        // TQFN_SHORT_STAGE=K (24 GB cards, experiment): staging slices of K experts for a one-chunk prompt (small cards: 64)
+        static const int short_stage = std::getenv("TQFN_SHORT_STAGE") ? std::atoi(std::getenv("TQFN_SHORT_STAGE")) : 0;
+        if (!f_.cp->run.small_card && !f_.cp->run.tune.stage_set && short_stage > 0 && T <= f_.chunk)
+            f_.cp->rt.prefill_stage = std::min(f_.cp->rt.prefill_stage, short_stage);
         tqllm::PrefillTuning tu; tu.sub = f_.cp->run.tune.sub; tu.stage = f_.cp->rt.prefill_stage;
         tu.dense_cache_bytes = dense_half_pool_bytes(f_.cp->run.tune); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
         tu.workspace_bytes = size_t(1024 + std::max(0L, f_.cp->run.tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
@@ -253,7 +260,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         auto tune_for = [&](int chunk, int block) {
             tqllm::PrefillTuning t = tu;
             t.chunk = chunk; t.sub = std::min(f_.cp->run.tune.sub, block); t.context_bytes = context_term(block);
-            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, block, checkpoint.attention_heads);
+            // the QSA score scratch holds one block of queries: a prompt shorter than the block has only its own (sizing only)
+            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, short_chunk ? std::min(block, T) : block, checkpoint.attention_heads);
             return t;
         };
         const tqllm::PlanRoom base_room = room_for(0, 0);

@@ -27,6 +27,11 @@ public:
     bool drop(size_t offset, size_t bytes) const noexcept;
     // Random-access hint for the whole mapping (no-op where unsupported).
     void advise_random() const noexcept;
+    // The same hint for [offset, offset + bytes) only (pages touched by the range; no-op where unsupported).
+    void advise_random(size_t offset, size_t bytes) const noexcept;
+    // Start reading [offset, offset + bytes) into the page cache without waiting (MADV_WILLNEED; no-op where unsupported):
+    // several scattered rows then fault in together instead of one disk wait after another.
+    void prefetch(size_t offset, size_t bytes) const noexcept;
 
 private:
     std::string path_;

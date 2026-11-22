@@ -483,6 +483,15 @@ inline int small_card_chunk(int prompt_tokens, int max_chunk) {
     const int up = (prompt_tokens + 1023) / 1024 * 1024;
     return std::min(max_chunk, std::max(up, 1024));
 }
+// A 24 GB card's prefill chunk for a prompt shorter than the engine chunk: the prompt's length rounded up to 1 KiB (at
+// least min_chunk, prefill_choice's floor), so its plan sizes the scratch arena for the prompt and not for a 16K chunk.
+// The prompt is one chunk either way (same chunk boundaries, same selection block), so the text does not change; the plan
+// borrows fewer expert banks (3090, 59 GiB host, IQ3_XXS file: a 300-token prompt released 19 banks / 6.5 GB and refilled
+// them in 350 ms every request). Prompts longer than the engine chunk keep it.
+inline int short_prompt_chunk(int prompt_tokens, int engine_chunk, int min_chunk = 2048) {
+    if (prompt_tokens <= 0 || prompt_tokens > engine_chunk) return engine_chunk;
+    return std::min(engine_chunk, std::max(min_chunk, (prompt_tokens + 1023) / 1024 * 1024));
+}
 // Byte cap of the expert banks. slots=auto sizes the banks from free device memory itself, so its cap is the device; a
 // fixed budget_gb (taken from one card) capped a GB10's 512 resident slots at 18 GB and evicted layers mid-prompt.
 inline size_t bank_budget_bytes(bool slots_auto, double budget_gb, size_t device_total) {
