@@ -14,6 +14,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ### Fixed
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
+- Flash-Next with experts in the UD low-bit types IQ2_XXS / IQ2_XS (also IQ1_S, Q2_K) gave wrong replies whenever the
+  expert pack was tiled (the pinned pack built in memory, a `--experts` pack file, or every bank resident on a GB10): the
+  tiling followed `u4h_id()`, which these types do not have, so their banks stayed plain while the grouped expert kernels
+  read them as tiles. The tiling now follows the id the grouped kernels run (`expert_kernel_id()`). ISTA-DASLab GSQ-RCO
+  IQ3_XXS (mixed IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S / IQ3_XXS gate/up per layer), RTX 3090, pinned pack: five greedy
+  replies (up to 400 tokens) identical to the on-demand path, which was already correct. Pack files written by
+  `tqfn-pack` from such models before this fix hold those parts untiled and must be written again.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
