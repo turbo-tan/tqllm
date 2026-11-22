@@ -1,4 +1,5 @@
-// src/spec/token_sampling.hpp against the engines' previous private copies (Qwen35Engine::dist / draw / accept, 10-31): the same
+// src/spec/token_sampling.hpp: exact sampling (sample_bounded on screened bounds == sample_reference on all logits), and
+// the top-16 helpers against the engines' previous private copies (Qwen35Engine::dist / draw / accept, 10-31): the same
 // distributions, the same tokens and the same RNG draws for random top-16 logits, every parameter combination.
 #include "spec/token_sampling.hpp"
 #include <cmath>
@@ -47,6 +48,86 @@ uint32_t old_draw(const OldDist & d, std::mt19937_64 & rng, uint32_t exclude = U
     }
     for (int i = d.n - 1; i >= 0; --i) if (d.id[i] != exclude) return d.id[i];
     return d.id[0];
+}
+
+// Exact sampling: a noisy first pass a = l + e (|e_r| <= b_r) screened like HeadSampler (top-16 by a, then the rows with the
+// largest a + b), against sample_reference on the exact logits. sample_bounded must either abstain or give the reference's
+// token; with every row known it must always decide.
+int exact_sampling_cases(int & cases) {
+    int fails = 0;
+    std::mt19937 gen(11);
+    const int V = 3000;
+    const float temps[] = {0.3f, 0.7f, 1.f}, top_ps[] = {1.f, 0.95f, 0.8f, 0.3f};
+    const int top_ks[] = {0, 1, 7, 40};
+    int decided_first = 0, total = 0;
+    for (float t : temps) for (float tp : top_ps) for (int tk : top_ks) for (int pen = 0; pen < 2; ++pen) for (int rep = 0; rep < 12; ++rep) {
+        tqllm::SamplingParams s{t, tp, pen ? 0.7f : 0.f, tk};
+        if (pen && rep % 2) s.repeat = 1.3f;
+        std::normal_distribution<float> nd(0.f, rep % 3 == 0 ? 1.f : 4.f);  // flat and peaked positions
+        std::vector<float> l(V), a(V), b(V);
+        for (int r = 0; r < V; ++r) {
+            l[size_t(r)] = nd(gen);
+            b[size_t(r)] = 0.05f + 0.3f * float(gen() % 1000) / 1000.f;
+            a[size_t(r)] = l[size_t(r)] + b[size_t(r)] * (2.f * float(gen() % 1001) / 1000.f - 1.f);
+        }
+        std::vector<uint32_t> recent;
+        for (int i = 0; i < 70; ++i) recent.push_back(uint32_t(gen() % 60));  // ids near the top after the boost below
+        for (int r = 0; r < 60; ++r) l[size_t(r)] += 3.f, a[size_t(r)] += 3.f;
+        const auto pc = tqllm::penalty_counts(s, recent);
+        for (int step = 0; step < 3; ++step) {
+            const uint64_t key = tqllm::gumbel_key(gen(), uint32_t(step));
+            const uint32_t want = tqllm::sample_reference(l.data(), V, s, recent, key);
+            const bool full = tqllm::full_vocab_draw(s, V);
+            // screened rounds: K rows by U = a + b (round 1: top-16 by a), plus every penalised id
+            bool done = false;
+            for (int K : {16, 64, 1024, V}) {
+                std::vector<uint32_t> ord(V);
+                std::iota(ord.begin(), ord.end(), 0u);
+                std::vector<double> key_v(V);
+                for (int r = 0; r < V; ++r) key_v[size_t(r)] = K == 16 ? a[size_t(r)] : a[size_t(r)] + b[size_t(r)];
+                if (full)  // Gumbel screen: rows whose upper score reaches the best lower score
+                    for (int r = 0; r < V; ++r) key_v[size_t(r)] = a[size_t(r)] + b[size_t(r)] + t * tqllm::gumbel(key, uint32_t(r));
+                std::sort(ord.begin(), ord.end(), [&](uint32_t x, uint32_t y) { return key_v[x] > key_v[y]; });
+                std::vector<char> in(V, 0);
+                tqllm::ExactRows e;
+                e.rows = V;
+                int take = std::min(K, V);
+                if (full) {
+                    double maxl = -1e30;
+                    for (int r = 0; r < V; ++r)
+                        if (!tqllm::penalty_count(pc, uint32_t(r)))
+                            maxl = std::max(maxl, a[size_t(r)] - b[size_t(r)] + t * tqllm::gumbel(key, uint32_t(r)));
+                    take = 0;
+                    while (take < V && key_v[ord[size_t(take)]] >= maxl) ++take;
+                    e.gumbel_closed = true;
+                }
+                for (int i = 0; i < take; ++i) in[ord[size_t(i)]] = 1;
+                for (const auto & p : pc) in[p.first] = 1;
+                float ref = -1e30f;
+                for (int r = 0; r < V; ++r) if (in[size_t(r)]) e.id.push_back(uint32_t(r)), e.lg.push_back(l[size_t(r)]), ref = std::max(ref, l[size_t(r)]);
+                e.z_ref = ref;
+                for (int r = 0; r < V; ++r) {
+                    if (in[size_t(r)]) continue;
+                    e.m_out = std::max(e.m_out, a[size_t(r)] + b[size_t(r)]);
+                    e.z_hi += std::exp((double(a[size_t(r)] + b[size_t(r)]) - ref) / t);
+                    e.z_lo += std::exp((double(a[size_t(r)] - b[size_t(r)]) - ref) / t);
+                }
+                uint32_t tok = 0;
+                if (tqllm::sample_bounded(e, s, pc, key, tok)) {
+                    ++cases;
+                    if (tok != want) { ++fails; std::printf("EXACT FAIL: T %.2f top_p %.2f top_k %d pen %d K %d: %u vs %u\n", t, tp, tk, pen, K, tok, want); }
+                    decided_first += K == 16;
+                    done = true;
+                    break;
+                }
+                if (K == V) break;
+            }
+            ++total;
+            if (!done) { ++fails; std::printf("EXACT FAIL: undecided with every row known (T %.2f top_p %.2f top_k %d)\n", t, tp, tk); }
+        }
+    }
+    std::printf("exact sampling: %d positions, %d decided by the first round\n", total, decided_first);
+    return fails;
 }
 }  // namespace
 
@@ -114,6 +195,7 @@ int main() {
         tqllm::SamplingParams off = base; off.repeat = 1.f; off.frequency = 0.f;
         expect(!off.penalized() && rep.penalized() && frq.penalized(), "penalized() flags only active penalties");
     }
+    fails += exact_sampling_cases(cases);
     std::printf("SAMPLING %s (%d cases, %d mismatches)\n", fails ? "FAIL" : "PASS", cases, fails);
     return fails ? 1 : 0;
 }

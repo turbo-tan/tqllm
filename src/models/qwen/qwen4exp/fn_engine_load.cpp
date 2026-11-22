@@ -14,6 +14,7 @@
 #include "hot_cold_policy.hpp"
 #include "gsq_q2_host.hpp"
 #include "expert_prediction.hpp"
+#include "expert_block_batch.hpp"
 
 namespace tqllm::flashnext {
 namespace {
@@ -277,18 +278,9 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     // bytes a pinned pack holds, untiled as the banks are here)
     if (f.experts.empty() && !integrated && !pack_in_memory && f.hot_map_path.empty())
         rt.expert_blocks = [&checkpoint](int layer, const int * ids, size_t n, char * dst, size_t block) {
-            std::atomic<size_t> next{0}; std::atomic<bool> bad{false};
-            auto work = [&] {
-                for (size_t i; (i = next++) < n;) {
-                    const auto parts = repack_expert(checkpoint, layer, ids[i], false); char * d = dst + i * block; size_t at = 0;
-                    for (const auto & p : parts) { if (at + p.size() > block) { bad = true; break; } std::memcpy(d + at, p.data(), p.size()); at += p.size(); }
-                    if (at != block) bad = true;
-                }
-            };
-            const size_t threads = std::min<size_t>(n, std::max(2u, std::min(16u, std::thread::hardware_concurrency() / 2)));
-            std::vector<std::thread> pool; for (size_t t = 1; t < threads; ++t) pool.emplace_back(work);
-            work(); for (auto & t : pool) t.join();
-            require(!bad, "on-demand experts: an expert's repacked size differs from its bank layout");
+            expert_block_batch(ids, n, dst, block, [&](int expert) {
+                return repack_expert(checkpoint, layer, expert, false);
+            });
         };
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
@@ -327,10 +319,10 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     }
     if (!f.packed.tiled) {
         for (int l = 0; l < f.packed.layers; ++l) {
-            size_t off = 0; const auto ids = expert_u4h_ids(checkpoint, l);
+            size_t off = 0; const auto bpbs = expert_tile_bpbs(checkpoint, l);  // the grouped kernels' id, not u4h_id (UD types)
             for (int pp = 0; pp < 3; ++pp) {
                 const int cols = pp == 2 ? c.expert_ff : c.hidden, rows = pp == 2 ? c.hidden : c.expert_ff;
-                const int bpb = tqllm_cuda::tiled_block_bytes(ids[pp]); const size_t dsz = f.packed.sizes[l][2 * pp];
+                const int bpb = bpbs[size_t(pp)]; const size_t dsz = f.packed.sizes[l][2 * pp];
                 if (bpb) {
                     require(rows % 16 == 0 && (cols / 32) % 4 == 0 && dsz == size_t(rows) * (cols / 32) * bpb, "tileable expert part with an unexpected layout");
                     std::vector<std::thread> th;
@@ -440,8 +432,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // the indexer's query projection runs only past the QSA budget (2048 positions), which no warm-up step reaches: upload
       // it now, not inside the first long prompt (GB10: 13 x 2.6 MB from the mapped file, 0.3 s of a 3.4K prompt)
       for (int l = 0; l <= c.layers; ++l)
+      {
           if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_proj.weight"; checkpoint.has_tensor(name) && checkpoint.is_bf16(name))
               (void) checkpoint.bf16_device(name);
+          // its norm too: first used inside a decode step's graph capture, its upload failed the capture
+          if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_norm.weight"; checkpoint.has_tensor(name))
+              (void) checkpoint.dense_device(name);
+      }
       // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
       // whole trunk bank in the refill): size them now, the steady state every later request already has
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();
@@ -565,7 +562,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
               // the grouped u4h kernels of tileable formats (quant_u4h.inc: GROUPED && tiled_bpb(FMT) && c_tiled_experts)
               int tiled = 0, kept = 0;
               banks([&](const tqllm::Mat & m, int rows, int k) {  // m: the bank, its slots stacked (m.rows = slots x rows); data only
-                  const int bpb = m.fmt ? tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id()) : 0;
+                  const int bpb = tqllm::expert_tile_bpb(m.fmt);
                   if (bpb > 0) {  // a tileable format must be tiled: the kernels read every bank of it as tiles once the flag is on
                       require(rows % 16 == 0 && (k / 32) % 4 == 0 && m.cols == k && m.rows % rows == 0, "tileable expert bank with an unexpected layout");
                       tqllm_cuda::tile_expert_rows_device(static_cast<char *>(const_cast<void *>(m.p)), m.rows / rows, rows, k, bpb, nullptr);

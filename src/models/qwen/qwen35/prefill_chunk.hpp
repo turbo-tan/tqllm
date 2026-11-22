@@ -1,6 +1,7 @@
 #pragma once
 // Prefill chunk length (tokens per GEMM pass). The context rule keeps 24 GB cards within memory at long contexts;
-// devices with >= 16 GB left after the device-resident KV take 4096 at any context, >= 32 GB (GB10, 128 GB unified) 8192.
+// 24 GB cards with >= 2 GB left after the device-resident KV take at least 1024, devices with >= 16 GB left 4096 at any
+// context, >= 32 GB (GB10, 128 GB unified) 8192.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,10 @@ inline int prefill_chunk(int64_t context, size_t total_bytes, size_t free_bytes,
     if (context <= 65536 && total_bytes >= (size_t(20) << 30)) n = 4096;  // 27B on the 3090: +4-5%, peak +1 GB at 32K
     // GB10 TQ_XS prefill, 4096 -> 8192: 8K 1170 -> 1208, 32K 1068 -> 1136, 128K 818 -> 863, 262K 629 -> 659 tok/s
     const size_t room = free_bytes > kv_device_bytes ? free_bytes - kv_device_bytes : 0;
+    // 24 GB cards with >= 2 GB left: 1024 at any context (not tried on 16 GB cards). RTX 3090, 27B TQT, 256K context,
+    // q8/q4 KV, embeddings and head in host memory (2.51 GB left): 250K-token prefill 590-643 -> 966 tok/s (every chunk
+    // re-reads the whole prefix and dequantises the weights once); 2048 runs out of memory there.
+    if (total_bytes >= (size_t(20) << 30) && room >= (size_t(2) << 30)) n = std::max(n, 1024);
     if (room >= (size_t(16) << 30)) n = std::max(n, 4096);
     if (room >= (size_t(32) << 30)) n = std::max(n, 8192);
     return n;
