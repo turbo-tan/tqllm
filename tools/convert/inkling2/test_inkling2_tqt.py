@@ -1,0 +1,112 @@
+"""Unit tests of the Inkling expert Hessian accumulator (CPU, toy sizes): python3 -m pytest test_inkling2_tqt.py"""
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+import inkling2_tqt as Q  # noqa: E402
+
+d, i, e, k = 8, 4, 5, 2
+
+
+def act(gu):
+    g, u = gu.chunk(2, -1)
+    return torch.tanh(g) * u
+
+
+def naive(hs, idx, wts, w_gu, w_dn):
+    Hgu = torch.zeros(e, d, d)
+    Hdn = torch.zeros(e, i, i)
+    S = torch.zeros(e, dtype=torch.float64)
+    n = torch.zeros(e, dtype=torch.int64)
+    for t in range(hs.shape[0]):
+        for p in range(k):
+            x, w, ex = hs[t], wts[t, p], int(idx[t, p])
+            a = act(w_gu[ex] @ x)
+            Hgu[ex] += w * w * torch.outer(x, x)
+            Hdn[ex] += w * w * torch.outer(a, a)
+            S[ex] += float(w) ** 2
+            n[ex] += 1
+    return Hgu, Hdn, S, n
+
+
+def test_accumulate_two_visits_matches_naive():
+    torch.manual_seed(1)
+    w_gu, w_dn = torch.randn(e, 2 * i, d), torch.randn(e, d, i)
+    st = Q.ExpertStats("cpu", d, i, e)
+    visits = []
+    for T in (7, 5):  # two visits of the same layer sum into one Hessian
+        hs = torch.randn(T, d)
+        idx = torch.stack([torch.randperm(e)[:k] for _ in range(T)])
+        wts = torch.rand(T, k) + 0.5
+        visits.append((hs, idx, wts))
+        st.add(hs, idx, wts, w_gu, w_dn, act)
+    ref = [naive(*v, w_gu, w_dn) for v in visits]
+    for j, name in enumerate(("Hgu", "Hdn", "S", "n")):
+        want = ref[0][j] + ref[1][j]
+        torch.testing.assert_close(getattr(st, name).to(want.dtype), want, rtol=1e-4, atol=1e-4)
+    assert st.N == 12
+    x = torch.cat([v[0] for v in visits])
+    torch.testing.assert_close(st.Hg, x.T @ x, rtol=1e-4, atol=1e-4)
+
+
+def test_blend_and_fallbacks():
+    Hg = torch.eye(d) * 3
+    He = torch.eye(d) * 10  # S = 5 -> mean 2
+    assert torch.allclose(Q.blend_gu(He, 0.0, Hg, 100.0), Hg)
+    b = Q.blend_gu(He, 5.0, Hg, 5.0)  # half own (2), half global (3)
+    assert torch.allclose(b, torch.eye(d) * 2.5)
+    assert torch.allclose(Q.final_dn(torch.ones(i, i), 10.0, 64), torch.eye(i))  # too few tokens: identity
+    assert torch.allclose(Q.final_dn(torch.ones(i, i) * 8, 4.0, 1), torch.ones(i, i) * 2)
+
+
+def test_overlay_layout(tmp_path, monkeypatch):
+    """the overlay GGUF: names, [cols, rows, E] extents, type 306, aligned offsets, gate / up split of the encoded gu rows"""
+    monkeypatch.setattr(Q, "E", 2)
+    monkeypatch.setattr(Q, "D", 256)
+    monkeypatch.setattr(Q, "I", 128)
+    rng = np.random.RandomState(0)
+    gu = rng.randint(0, 256, (2, 256, 2 * 66), dtype=np.uint8)  # rows 0..127 gate, 128..255 up
+    dn = rng.randint(0, 256, (2, 256, 1 * 66), dtype=np.uint8)
+    gu.tofile(tmp_path / "L05_gu.bin")
+    dn.tofile(tmp_path / "L05_dn.bin")
+    path = tmp_path / "o.gguf"
+    Q.write_overlay(tmp_path, path, [5])
+    b = path.read_bytes()
+    assert b[:4] == b"GGUF"
+    ver, nt, nkv = (int.from_bytes(b[4:8], "little"), int.from_bytes(b[8:16], "little"), int.from_bytes(b[16:24], "little"))
+    assert (ver, nt, nkv) == (3, 3, 2)
+    pos = 24
+
+    def rstr():
+        nonlocal pos
+        n = int.from_bytes(b[pos:pos + 8], "little")
+        s = b[pos + 8:pos + 8 + n]
+        pos += 8 + n
+        return s.decode()
+
+    kv = {}
+    for _ in range(nkv):
+        k = rstr()
+        assert int.from_bytes(b[pos:pos + 4], "little") == 8
+        pos += 4
+        kv[k] = rstr()
+    assert kv["tqllm.tqt.code"] == "tqt-c2-v1"
+    infos = []
+    for _ in range(nt):
+        name = rstr()
+        nd = int.from_bytes(b[pos:pos + 4], "little")
+        pos += 4
+        ne = [int.from_bytes(b[pos + 8 * i:pos + 8 * i + 8], "little") for i in range(nd)]
+        pos += 8 * nd
+        typ = int.from_bytes(b[pos:pos + 4], "little")
+        off = int.from_bytes(b[pos + 4:pos + 12], "little")
+        pos += 12
+        infos.append((name, ne, typ, off))
+    data = (pos + 31) // 32 * 32
+    names = [i[0] for i in infos]
+    assert names == ["blk.5.ffn_gate_exps.weight", "blk.5.ffn_up_exps.weight", "blk.5.ffn_down_exps.weight"]
+    assert [i[1] for i in infos] == [[256, 128, 2], [256, 128, 2], [128, 256, 2]] and all(i[2] == 306 for i in infos)
+    assert all(i[3] % 32 == 0 for i in infos)
+    gate = np.frombuffer(b[data + infos[0][3]:data + infos[0][3] + 2 * 128 * 132], np.uint8).reshape(2, 128, 132)
+    up = np.frombuffer(b[data + infos[1][3]:data + infos[1][3] + 2 * 128 * 132], np.uint8).reshape(2, 128, 132)
+    assert (gate == gu[:, :128]).all() and (up == gu[:, 128:]).all()
