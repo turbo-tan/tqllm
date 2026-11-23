@@ -33,7 +33,7 @@ with an OpenAI-compatible HTTP server.
   ([multi-GPU guide](docs/guides/multi-gpu.md)).
 - Runtime LoRA adapters, an embeddings server, `--embed-host` / `--head-host`, a prompt cache that follows a
   conversation across slots, and Flash-Next on 64 GB hosts.
-- 18 pull requests by @Scoobylolo: faster verify attention and long-context prefill, a warning-free build, exact
+- 22 pull requests by @Scoobylolo: faster verify attention and long-context prefill, a warning-free build, exact
   sampling from the int8 head, and more ([changelog](CHANGELOG.md)).
 - **Known issue:** on 16 GB cards Inkling-2-Mini's 20 GB checkpoint streams part of its experts from RAM; a 14.5 GB
   file is planned for 1.7.1.
