@@ -98,7 +98,7 @@ template <class T> __device__ __forceinline__ T out_cast(float v) {
 // 32t .. 32t + 31) of each 128-block; MMA u takes pairs 2u, 2u + 1 (TQT's k order, the inputs loaded to match).
 // Per row and column: the 5 blocks of a group in one FP32 MMA accumulator, c = s * tmp + c per group, the k-parts summed
 // in part order through shared memory: the same numbers for every kernel, column set and grid (tests/fnt_format.cu).
-constexpr int kCols = 8, kXPad = 8;  // columns per pass (one MMA n tile); FP16 row padding of the staged inputs
+constexpr int kCols = 4, kXPad = 8;  // columns per pass (half an MMA n tile: 3 CTAs per SM); FP16 row padding of the staged inputs
 __device__ __forceinline__ int kparts(int cols) { return cols >= 4 * kGroup ? 4 : cols >= 2 * kGroup ? 2 : 1; }
 // 5 stream words of row-block blk starting at segment t's first bit (pre-shifted when it is mid-word)
 template <int KB> __device__ __forceinline__ void seg_words(const uint32_t * __restrict__ blk, int t, uint32_t (&E)[5]) {
@@ -141,10 +141,10 @@ __device__ __forceinline__ void mma_pass(const uint32_t * __restrict__ w, const 
             uint32_t Ea[5], Eb[5];
             seg_words<KB>(wa + b * NW, t, Ea);
             seg_words<KB>(wb + b * NW, t, Eb);
-            const uint4 * xp = reinterpret_cast<const uint4 *>(xs + g * xstride + b * 128 + t * 32);
+            const uint4 * xp = reinterpret_cast<const uint4 *>(xs + min(g, kCols - 1) * xstride + b * 128 + t * 32);
             uint4 x4[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) x4[i] = xp[i];
+            for (int i = 0; i < 4; ++i) x4[i] = g < kCols ? xp[i] : make_uint4(0, 0, 0, 0);
             const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
 #pragma unroll
             for (int u = 0; u < 8; ++u)
@@ -189,7 +189,7 @@ __device__ __forceinline__ void stage_cols(__half * xs, const __half * x, const 
 // work item -> (expert, up to 8 (input row, output row) pairs); MODE 0: assignment a = blockIdx.y (ids, topk);
 // 1: dedup map entry; 2: moe_group lists (the expert's tokens 8 at a time)
 template <int KB, int MODE, class T>
-__global__ void __launch_bounds__(256, 2) k_mma(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
+__global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
                                                 const __half * __restrict__ x, T * __restrict__ y, int rows, int cols,
                                                 int experts, const int * __restrict__ ids, int topk, bool per_expert,
                                                 const int * __restrict__ dmap, int ngroups, const int * __restrict__ counts,
