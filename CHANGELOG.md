@@ -3,7 +3,7 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.7.0 (2026-11-23)
 
 ### Changed
 - Flash-Next `--exact off` (CUDA) now includes route-tail skip at rank 8: a non-resident expert that every token of a decode
