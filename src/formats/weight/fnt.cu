@@ -152,8 +152,8 @@ __device__ __forceinline__ void mma_pass(const uint32_t * __restrict__ w, const 
                         seg_pair<KB>(Eb, 2 * u + 1), xw[2 * u], xw[2 * u + 1]);
         }
         const float sa = __half2float(sc[(erow0 + ra) * ng + gi]), sb = __half2float(sc[(erow0 + rb) * ng + gi]);
-        c[0] = fmaf(sa, tmp[0], c[0]); c[1] = fmaf(sa, tmp[1], c[1]);
-        c[2] = fmaf(sb, tmp[2], c[2]); c[3] = fmaf(sb, tmp[3], c[3]);
+        c[0] = __fadd_rn(c[0], __fmul_rn(sa, tmp[0])); c[1] = __fadd_rn(c[1], __fmul_rn(sa, tmp[1]));  // product, then sum:
+        c[2] = __fadd_rn(c[2], __fmul_rn(sb, tmp[2])); c[3] = __fadd_rn(c[3], __fmul_rn(sb, tmp[3]));  // k_gemm's order
     }
     if (KG > 1) {
         __syncthreads();  // red is free (the previous pass read it)
@@ -235,6 +235,86 @@ __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __
         }
     }
 }
+// Prefill grouped GEMM (moe_group lists): CTA = 8 warps x one 16-row tile each (128 rows), the expert's tokens 32 at a
+// time (4 MMA n tiles), the 640-groups in order with the inputs staged per group. Per row and token the numbers of
+// k_mma: the same block MMAs per group, product s * tmp per group, the groups summed in order (cols 640 and 2560).
+constexpr int kGemmTok = 32;
+__host__ __device__ constexpr size_t gemm_smem() { return size_t(kGemmTok) * (kGroup + kXPad) * 2; }
+template <int KB>
+__global__ void __launch_bounds__(256, 2) k_gemm(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
+                                                 const __half * __restrict__ x, __nv_bfloat16 * __restrict__ y, int rows,
+                                                 int cols, const int * __restrict__ counts, const int * __restrict__ groups,
+                                                 int capacity, int topk, bool per_expert) {
+    constexpr int NW = 2 * KB, NT = kGemmTok / 8, XS = kGroup + kXPad;
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half * xs = reinterpret_cast<__half *>(smem);
+    __shared__ int in_rows[kGemmTok], out_rows[kGemmTok];
+    const int expert = blockIdx.z, count = counts[expert];
+    const int c0 = blockIdx.y * kGemmTok;
+    if (c0 >= count) return;
+    const int nc = min(kGemmTok, count - c0);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+    const int row0 = blockIdx.x * 128 + warp * 16, ng = cols / kGroup, nb = cols / 128;
+    if (threadIdx.x < kGemmTok) {
+        const int a = threadIdx.x < nc ? groups[int64_t(expert) * capacity + c0 + threadIdx.x] : 0;
+        out_rows[threadIdx.x] = a; in_rows[threadIdx.x] = per_expert ? a : a / topk;
+    }
+    const int ra = min(row0 + g, rows - 1), rb = min(row0 + g + 8, rows - 1);
+    const uint32_t * wa = w + (int64_t(expert) * rows + ra) * int64_t(nb) * NW;
+    const uint32_t * wb = w + (int64_t(expert) * rows + rb) * int64_t(nb) * NW;
+    float c[NT][4] = {};
+    for (int gi = 0; gi < ng; ++gi) {
+        __syncthreads();  // in_rows written / the previous group's inputs read
+        for (int q = warp; q < kGemmTok * 5; q += 8) {  // stage the group's 5 blocks of every token, rotated
+            const int tok = q / 5, b = q % 5;
+            __half2 * dst = reinterpret_cast<__half2 *>(xs + tok * XS + b * 128 + 4 * lane);
+            if (tok >= nc) { dst[0] = dst[1] = __floats2half2_rn(0.f, 0.f); continue; }
+            const __half2 * src = reinterpret_cast<const __half2 *>(x + int64_t(in_rows[tok]) * cols + gi * kGroup + b * 128 + 4 * lane);
+            const float2 p0 = __half22float2(src[0]), p1 = __half22float2(src[1]);
+            float v[4] = {p0.x, p0.y, p1.x, p1.y};
+            rot128(v, lane);
+            dst[0] = __floats2half2_rn(v[0], v[1]);
+            dst[1] = __floats2half2_rn(v[2], v[3]);
+        }
+        __syncthreads();
+        float tmp[NT][4] = {};
+#pragma unroll
+        for (int bb = 0; bb < 5; ++bb) {
+            const int b = gi * 5 + bb;
+            uint32_t Ea[5], Eb[5];
+            seg_words<KB>(wa + b * NW, t, Ea);
+            seg_words<KB>(wb + b * NW, t, Eb);
+            uint32_t A[8][4];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                A[u][0] = seg_pair<KB>(Ea, 2 * u); A[u][1] = seg_pair<KB>(Eb, 2 * u);
+                A[u][2] = seg_pair<KB>(Ea, 2 * u + 1); A[u][3] = seg_pair<KB>(Eb, 2 * u + 1);
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const uint4 * xp = reinterpret_cast<const uint4 *>(xs + (nt * 8 + g) * XS + bb * 128 + t * 32);
+                uint4 x4[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) x4[i] = xp[i];
+                const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) mma_f16(tmp[nt], A[u][0], A[u][1], A[u][2], A[u][3], xw[2 * u], xw[2 * u + 1]);
+            }
+        }
+        const float sa = __half2float(sc[(int64_t(expert) * rows + ra) * ng + gi]), sb = __half2float(sc[(int64_t(expert) * rows + rb) * ng + gi]);
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            c[nt][0] = __fadd_rn(c[nt][0], __fmul_rn(sa, tmp[nt][0])); c[nt][1] = __fadd_rn(c[nt][1], __fmul_rn(sa, tmp[nt][1]));
+            c[nt][2] = __fadd_rn(c[nt][2], __fmul_rn(sb, tmp[nt][2])); c[nt][3] = __fadd_rn(c[nt][3], __fmul_rn(sb, tmp[nt][3]));
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int col = nt * 8 + 2 * t;
+        const auto put = [&](int cc, int r, float v) { if (cc < nc && r < rows) y[int64_t(out_rows[cc]) * rows + r] = __float2bfloat16_rn(v); };
+        put(col, row0 + g, c[nt][0]); put(col + 1, row0 + g, c[nt][1]); put(col, row0 + g + 8, c[nt][2]); put(col + 1, row0 + g + 8, c[nt][3]);
+    }
+}
 // FP16 weights in the plain basis: warp per (row, block): decode, scale (FP32 product), unrotate, round
 template <int KB>
 __global__ void k_dequant(const uint32_t * __restrict__ w, const __half * __restrict__ sc, __half * __restrict__ out,
@@ -305,8 +385,12 @@ void fnt_expert_grouped(int kb, const void * w, const __half * sc, const __half 
     fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * rows > INT_MAX)
         throw std::invalid_argument("FNT: invalid grouped expert dimensions");
-    launch_mma<2>(kb, w, sc, x, y, rows, cols, experts, nullptr, topk, per_expert, nullptr, 0, counts, groups, capacity,
-                  unsigned(std::min(experts, 65535)), s);
+    const unsigned ty = unsigned((capacity + fntk::kGemmTok - 1) / fntk::kGemmTok);
+    if (ty > 65535) throw std::invalid_argument("FNT: grouped capacity too large");
+    const dim3 grid(unsigned((rows + 127) / 128), ty, unsigned(experts));
+#define L(K) fntk::k_gemm<K><<<grid, 256, fntk::gemm_smem(), s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, counts, groups, capacity, topk, per_expert)
+    FNT_KB(kb, L)
+#undef L
 }
 void fnt_dequant_h(int kb, const void * w, const __half * sc, __half * out, int rows, int cols, cudaStream_t s) {
     fntk::check(kb, w, sc, out, out, rows, cols);

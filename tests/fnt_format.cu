@@ -195,6 +195,8 @@ int main() {
             run(kb, 130, 640, 2, true);
         }
         run(5, 640, 2560, 9, false);
+        run(6, 640, 2560, 60, false);  // > 32 tokens per expert: two prefill GEMM chunks
+        run(7, 2560, 640, 40, true);
         std::printf("fnt_format: all passed\n");
         return 0;
     } catch (const std::exception & e) {
