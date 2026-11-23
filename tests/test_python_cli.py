@@ -54,6 +54,14 @@ class Cli(unittest.TestCase):
         self.assertEqual(a.count("--model"), 1)
         self.assertEqual(a[a.index("--context") + 1], "8192")
 
+    def test_given_model_folder_gets_no_default_drafter(self):
+        # a checkpoint folder (Inkling-2-Mini) is not a Qwen3.8-27B GGUF: the Qwen DFlash2 drafter would be refused
+        a = cli.serve_args(["--model", self.tmp.name], ram=48, download=self.fake, exists=self.published)
+        self.assertEqual(self.asked, [])
+        self.assertNotIn("-md", a)
+        a = cli.serve_args(["--model=" + self.tmp.name], ram=48, download=self.fake, exists=self.published)
+        self.assertNotIn("-md", a)
+
     def test_present_files_are_not_downloaded(self):
         d = cli.models_dir(); d.mkdir(parents=True)
         for f in (cli.MODEL, cli.DRAFTER): (d / f).write_bytes(b"x")
