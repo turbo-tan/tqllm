@@ -32,7 +32,8 @@ void FlashNextEngine::refill_borrowed() {
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     if (all) S().refilled_ = true;
-    S().model_->pf_refill.clear(); led.reset();
+    if (S().model_) S().model_->pf_refill.clear();
+    led.reset();
 }
 
 void FlashNextEngine::arena_resize(size_t bytes) {
@@ -101,7 +102,23 @@ void FlashNextEngine::pc_verify(const std::vector<int> & ids, int p) {
     ref.reset(); bind();
 }
 
+void FlashNextEngine::abort_prefill() {
+    const auto lk = ep_lock();
+    try {
+        (void) cudaDeviceSynchronize(); (void) cudaGetLastError();
+        if (auto & m = S().model_) { m->release_prefill(); m->pf_borrowed.clear(); m->prompt_emb.clear(); m->keep_embeddings = false; }
+        arena_resize(f_.arena_decode);
+        refill_borrowed();
+    } catch (const std::exception & e) { std::fprintf(stderr, "tqllm: cleanup after a failed prefill: %s\n", e.what()); }
+    f_.cp->rt.trim_below = SIZE_MAX;
+}
+
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
+    try { spec_begin_impl(prompt, count); }
+    catch (...) { abort_prefill(); throw; }
+}
+
+void FlashNextEngine::spec_begin_impl(const std::vector<uint32_t> & prompt, uint32_t count) {
     if (ep_gate_) ep_reclaim(*f_.cp, *ep_gate_);  // before the lock: rank 0's forwards already sent finish first
     const auto lk = ep_lock(); S().serving_ = true; if (ep_gate_) ++ep_gate_->served;
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt

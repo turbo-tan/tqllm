@@ -34,6 +34,16 @@ public:
     size_t size() const { return calls_.size(); }
 };
 
+// Layer-major prefill without a prepacked pack: the routed experts of a layer go through its bank (prepare loads the
+// missing ones) only while they fit in it. Experts read from the GGUF on demand (host_blocks) stream the rest through the
+// prefill staging like a pack does: a bank cannot take more experts than its slots (a 28K prompt routes to all 512
+// experts of a layer with ~200 slots: "mixed cache: active set exceeds slots"), and a borrowed layer has no bank at all.
+// Without either (GB10, every expert resident) the bank holds them all. With a pack only the resident ones use the bank.
+inline bool prefill_through_bank(bool prepacked, bool host_blocks, bool bank_ready, int routed, int slots) {
+    if (prepacked) return false;
+    if (!host_blocks) return true;
+    return bank_ready && routed <= slots;
+}
 // Expert path of one trunk layer call: true = waves (several prepares, grouped per wave), false = one split prepare.
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
 // distinct experts fit the layer's slots: the waves path sums the down projection in another order, so choosing it by

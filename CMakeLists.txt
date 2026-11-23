@@ -93,6 +93,11 @@ add_executable(test-cpu-kquant tests/cpu_kquant.cpp src/experts/cpu_kquant.cpp s
 target_include_directories(test-cpu-kquant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
 add_test(NAME cpu-kquant COMMAND test-cpu-kquant)
 set_tests_properties(cpu-kquant PROPERTIES LABELS cpu)
+add_executable(test-expert-block-batch tests/expert_block_batch.cpp)
+target_include_directories(test-expert-block-batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/experts)
+target_link_libraries(test-expert-block-batch PRIVATE Threads::Threads)
+add_test(NAME expert-block-batch COMMAND test-expert-block-batch)
+set_tests_properties(expert-block-batch PROPERTIES LABELS cpu TIMEOUT 30)
 add_executable(test-load-guard tests/load_guard.cpp)  # unified-memory start-up guard (GB10): model sizes + refusal rule
 target_include_directories(test-load-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
 add_test(NAME load-guard COMMAND test-load-guard)

@@ -14,6 +14,7 @@
 #include "hot_cold_policy.hpp"
 #include "gsq_q2_host.hpp"
 #include "expert_prediction.hpp"
+#include "expert_block_batch.hpp"
 
 namespace tqllm::flashnext {
 namespace {
@@ -272,6 +273,15 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots, slots_.size() > 1 ? int(slots_.size()) * c.topk : 0);
+    // experts read from the GGUF on demand: a long prompt's layer-major prefill streams the routed experts its banks do
+    // not hold (a borrowed layer: all of them) in the bank layout, assembled on the host from the GGUF payloads (the
+    // bytes a pinned pack holds, untiled as the banks are here)
+    if (f.experts.empty() && !integrated && !pack_in_memory && f.hot_map_path.empty())
+        rt.expert_blocks = [&checkpoint](int layer, const int * ids, size_t n, char * dst, size_t block) {
+            expert_block_batch(ids, n, dst, block, [&](int expert) {
+                return repack_expert(checkpoint, layer, expert, false);
+            });
+        };
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {

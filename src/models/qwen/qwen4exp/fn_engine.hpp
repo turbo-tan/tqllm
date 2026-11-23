@@ -112,6 +112,10 @@ public:
     void refill_borrowed();
     void arena_resize(size_t bytes);
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) override;
+    void spec_begin_impl(const std::vector<uint32_t> & prompt, uint32_t count);
+    // a prefill that threw: its buffers go and the banks it borrowed come back (else every later long prompt plans with
+    // the banks missing and fails the same way)
+    void abort_prefill();
     bool spec_advance() override;
     void remember_copy(SlotState & sl);
     void spec_abort(int s) override {  // a failed request: the slot no longer counts as running, its state is dropped

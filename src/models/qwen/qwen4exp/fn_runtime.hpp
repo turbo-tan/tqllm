@@ -2,6 +2,7 @@
 // Flash-Next engine runtime: CUDA error checks, scratch arena, prefill tuning and the shared per-process state.
 #include <unordered_map>
 #include <memory>
+#include <functional>
 namespace tqllm { class TpComm; }
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
@@ -181,6 +182,9 @@ struct FnRuntime {
     const std::vector<int32_t> * hot_map = nullptr;
     MixedExpertCache * cold_cache = nullptr;
     const float * keep_mask = nullptr;
+    // experts read from the GGUF on demand (no pinned pack): writes n experts of a layer in the bank layout, one block of
+    // `block` bytes each, to host memory (layer-major prefill streams the routed experts its bank does not hold through it)
+    std::function<void(int layer, const int * ids, size_t n, char * dst, size_t block)> expert_blocks;
 };
 inline size_t dense_half_pool_bytes(const FnTune & tune) { return size_t(std::max(0L, tune.dense_cache_mb)) << 20; }
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)
