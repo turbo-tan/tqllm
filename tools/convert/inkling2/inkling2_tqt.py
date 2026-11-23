@@ -6,6 +6,7 @@
            every expert's gate+up and down into enc/L<layer>_gu.bin / _dn.bin (66 B per 128 weights, rotated basis)
   pack     the encoded layers as one overlay GGUF (tqt_experts.gguf, engine names blk.<l>.ffn_{gate,up,down}_exps.weight, type
            306) that the engine loads next to the checkpoint folder
+  sweep    each layer alone in one code against the gate (the sensitivity behind the 16 GB tier's mix of 4-bit and 2-bit layers)
   eval     fake-quant gate: the encoded experts decoded into the reference in memory, scored against
            golden/mt/lp_bf16.f16 (full-vocabulary KLD, top-1)
 
@@ -117,10 +118,8 @@ def encode_matrix(W, H, damp, nscales, codec, order=True, refit=True):
     return codec.pack(s.cpu().numpy(), st.cpu().numpy()), err
 
 
-def encode_layer(stats, w_gu, w_dn, args):
-    import torch
+def encode_layer(stats, w_gu, w_dn, args, codec, damp_gu, damp_dn):
     Hg_norm = stats.Hg / max(stats.N, 1)
-    codec = CODECS[args.codec]
     gu = np.empty((E, 2 * I, (D // BLOCK) * codec.BLOCK_BYTES), np.uint8)
     dn = np.empty((E, D, (I // BLOCK) * codec.BLOCK_BYTES), np.uint8)
     errs = []
@@ -128,12 +127,12 @@ def encode_layer(stats, w_gu, w_dn, args):
     for e in range(E):
         Se = float(stats.S[e])
         H = blend_gu(stats.Hgu[e], Se, Hg_norm, args.n0)
-        gu[e], eg = encode_matrix(w_gu[e].float(), H, args.damp_gu, args.scales, codec)
+        gu[e], eg = encode_matrix(w_gu[e].float(), H, damp_gu, args.scales, codec)
         H = final_dn(stats.Hdn[e], Se, args.nmin)
-        dn[e], ed = encode_matrix(w_dn[e].float(), H, args.damp_dn, args.scales, codec)
+        dn[e], ed = encode_matrix(w_dn[e].float(), H, damp_dn, args.scales, codec)
         errs.append((eg, ed))
-        if e % 16 == 15:
-            log(f"  expert {e + 1}/{E}: {time.time() - t0:.0f} s, rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
+        if e % 32 == 31:
+            log(f"  {codec.__name__} expert {e + 1}/{E}: {time.time() - t0:.0f} s, rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
     return gu, dn, errs
 
 
@@ -192,10 +191,15 @@ def cmd_encode(args):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = False
     outdir = Path(args.out)
-    encdir = outdir / ("enc" if args.codec == "tqt" else "enc2")
-    encdir.mkdir(parents=True, exist_ok=True)
-    todo = [l for l in parse_layers(args.layers) if not (encdir / f"L{l:02d}_dn.bin").exists()]
-    log("layers to encode:", todo)
+    names = args.codec.split(",")
+    dgu, ddn = [float(x) for x in args.damp_gu.split(",")], [float(x) for x in args.damp_dn.split(",")]
+    assert len(names) == len(dgu) == len(ddn), "one --damp-gu / --damp-dn value per codec"
+    encdirs = {n: outdir / ("enc" if n == "tqt" else "enc2") for n in names}
+    for d in encdirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    need = {l: [n for n in names if not (encdirs[n] / f"L{l:02d}_dn.bin").exists()] for l in parse_layers(args.layers)}
+    todo = [l for l, v in need.items() if v]
+    log("layers to encode:", {l: need[l] for l in todo})
     if not todo:
         return
     model, mods = load_model(args.model)
@@ -228,68 +232,113 @@ def cmd_encode(args):
             s = stats[l]
             log(f"layer {l}: tokens {s.N}, expert tokens min {int(s.n.min())} median {int(s.n.median())} max {int(s.n.max())}, "
                 f"experts below 256: {int((s.n < 256).sum())}")
-            t0 = time.time()
-            with torch.no_grad():
-                gu, dn, errs = encode_layer(s, mods[l].gate_up_proj, mods[l].down_proj, args)
-            for name, arr in (("gu", gu), ("dn", dn)):
-                p = encdir / f"L{l:02d}_{name}.bin"
-                arr.tofile(str(p) + ".tmp")
-                if name == "gu":
-                    json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(encdir / f"L{l:02d}.json", "w"))
-                os.replace(str(p) + ".tmp", p)
-            log(f"layer {l} done in {time.time() - t0:.0f} s, mean rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
+            for ci, n in enumerate(names):
+                if n not in need[l]:
+                    continue
+                t0 = time.time()
+                with torch.no_grad():
+                    gu, dn, errs = encode_layer(s, mods[l].gate_up_proj, mods[l].down_proj, args, CODECS[n], dgu[ci], ddn[ci])
+                for name, arr in (("gu", gu), ("dn", dn)):
+                    p = encdirs[n] / f"L{l:02d}_{name}.bin"
+                    arr.tofile(str(p) + ".tmp")
+                    if name == "gu":
+                        json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(encdirs[n] / f"L{l:02d}.json", "w"))
+                    os.replace(str(p) + ".tmp", p)
+                log(f"layer {l} {n} done in {time.time() - t0:.0f} s, mean rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
         del stats
         torch.cuda.empty_cache()
 
 
 # ---------------- eval ----------------
+def decode_rows_t(raw, N, K, codec, dev="cuda"):
+    """encoded rows (uint8 numpy [n, N, K/128 * bytes]) -> BF16 CUDA tensor [n, N, K] in the original basis; the GPU twin of
+    codec.decode followed by the un-rotation (w = q R)"""
+    import torch
+    nb, bb = K // BLOCK, codec.BLOCK_BYTES
+    R = torch.from_numpy(tqv12.rot_matrix_np().astype(np.float32)).to(dev)
+    tab = codec._table_t(dev)  # noqa: SLF001
+    b = torch.from_numpy(np.ascontiguousarray(raw)).to(dev).reshape(raw.shape[0], N, nb, bb)
+    sc = b[..., :2].contiguous().view(torch.float16).float()  # [n, N, nb, 1]
+    v = tab[codec.windows_t(b[..., 2:])]  # [n, N, nb, 64, 2]
+    q = (v.reshape(raw.shape[0], N, nb, BLOCK) * sc)
+    return (q @ R).reshape(raw.shape[0], N, K).to(torch.bfloat16)
+
+
 def decode_layer(encdir, l, codec=tqt):
-    """-> (gate_up [E, 2I, D], down [E, D, I]) float32 in the original basis, from the encoded files"""
-    R = tqv12.rot_matrix_np().astype(np.float32)
+    """-> (gate_up [E, 2I, D], down [E, D, I]) BF16 CUDA tensors in the original basis, from the encoded files"""
+    import torch
     out = []
     for name, (N, K) in (("gu", (2 * I, D)), ("dn", (D, I))):
         raw = np.fromfile(Path(encdir) / f"L{l:02d}_{name}.bin", np.uint8).reshape(E, N, -1)
-        w = np.empty((E, N, K), np.float32)
-        for e in range(E):
-            q = codec.decode(raw[e].tobytes(), N, K).reshape(N, K // BLOCK, BLOCK)
-            w[e] = (q @ R).reshape(N, K)  # rotated rows w R^T -> w
-        out.append(w)
+        out.append(torch.cat([decode_rows_t(raw[e0:e0 + 16], N, K, codec) for e0 in range(0, E, 16)]))
     return out
 
 
-def cmd_eval(args):
-    import torch
-    model, mods = load_model(args.model)
-    layers = [(l, tqt, "enc") for l in parse_layers(args.layers)] + [(l, tqt2, "enc2") for l in (parse_layers(args.layers2) if args.layers2 else [])]
-    texts = json.load(open(Path(args.model) / "golden/mt/texts.json"))
-    top1_ref = np.fromfile(Path(args.model) / "golden/mt/top1_bf16.i32", np.int32)
-    V = 200058
-    lp_ref = np.memmap(Path(args.model) / "golden/mt/lp_bf16.f16", np.float16, "r")
-    saved = {}
-    for l, codec, sub in layers:
-        gu, dn = decode_layer(Path(args.out) / sub, l, codec)
-        m = mods[l]
-        saved[l] = (m.gate_up_proj.data.clone(), m.down_proj.data.clone())
-        m.gate_up_proj.data.copy_(torch.from_numpy(gu).to("cuda", torch.bfloat16))
-        m.down_proj.data.copy_(torch.from_numpy(dn).to("cuda", torch.bfloat16))
-        log("substituted layer", l)
-    pos = 0
-    kl_sum = agree = n = 0
-    with torch.no_grad():
-        for t in texts:
-            ids = torch.tensor([t["ids"]], device="cuda")
-            T = ids.shape[1]
-            lp = torch.log_softmax(model(input_ids=ids, use_cache=False).logits[0].float(), -1)
-            assert lp.shape[-1] == V, lp.shape
-            ref = torch.from_numpy(np.array(lp_ref[pos * V:(pos + T) * V]).reshape(T, V)).to("cuda").float()
-            kl = (ref.exp() * (ref - lp)).sum(-1)
-            kl_sum += kl.sum().item()
-            agree += (lp.argmax(-1).cpu().numpy() == top1_ref[pos:pos + T]).sum()
-            n += T
-            pos += T
-            log(f"{t['name']:14s} T {T:4d} KLD {kl.mean().item():.5f}")
-    log(f"ALL {n} positions: KLD vs lp_bf16 {kl_sum / n:.5f}, top-1 {100 * agree / n:.2f} %, layers {args.layers} (tqt) {args.layers2 or '-'} (tqt2)")
+class Gate:
+    """the held-out gate: golden/mt texts, the reference's full-vocabulary log-probabilities (lp_bf16.f16) and top-1 ids"""
 
+    def __init__(self, model_dir):
+        self.texts = json.load(open(Path(model_dir) / "golden/mt/texts.json"))
+        self.top1 = np.fromfile(Path(model_dir) / "golden/mt/top1_bf16.i32", np.int32)
+        self.lp = np.memmap(Path(model_dir) / "golden/mt/lp_bf16.f16", np.float16, "r")
+        self.V = 200058
+
+    def score(self, model, verbose=True):
+        import torch
+        pos = kl_sum = agree = n = 0
+        with torch.no_grad():
+            for t in self.texts:
+                ids = torch.tensor([t["ids"]], device="cuda")
+                T = ids.shape[1]
+                lp = torch.log_softmax(model(input_ids=ids, use_cache=False).logits[0].float(), -1)
+                assert lp.shape[-1] == self.V, lp.shape
+                ref = torch.from_numpy(np.array(self.lp[pos * self.V:(pos + T) * self.V]).reshape(T, self.V)).to("cuda").float()
+                kl = (ref.exp() * (ref - lp)).sum(-1)
+                kl_sum += kl.sum().item()
+                agree += (lp.argmax(-1).cpu().numpy() == self.top1[pos:pos + T]).sum()
+                n += T
+                pos += T
+                if verbose:
+                    log(f"{t['name']:14s} T {T:4d} KLD {kl.mean().item():.5f}")
+        return kl_sum / n, 100.0 * agree / n, n
+
+
+def substitute(mods, l, codec, encdir):
+    """decoded experts of layer l into the reference in memory; returns the originals"""
+    import torch
+    gu, dn = decode_layer(encdir, l, codec)
+    m = mods[l]
+    saved = (m.gate_up_proj.data.clone(), m.down_proj.data.clone())
+    m.gate_up_proj.data.copy_(gu)
+    m.down_proj.data.copy_(dn)
+    return saved
+
+
+def cmd_eval(args):
+    model, mods = load_model(args.model)
+    gate = Gate(args.model)
+    layers = [(l, tqt, "enc") for l in parse_layers(args.layers)] + [(l, tqt2, "enc2") for l in (parse_layers(args.layers2) if args.layers2 else [])]
+    for l, codec, sub in layers:
+        substitute(mods, l, codec, Path(args.out) / sub)
+        log("substituted layer", l, codec.__name__)
+    kld, top1, n = gate.score(model)
+    log(f"ALL {n} positions: KLD vs lp_bf16 {kld:.5f}, top-1 {top1:.2f} %, layers {args.layers} (tqt) {args.layers2 or '-'} (tqt2)")
+
+
+def cmd_sweep(args):
+    """KLD / top-1 of each layer alone in the given code (the rest as the checkpoint): the sensitivity of the tiers' allocation"""
+    model, mods = load_model(args.model)
+    gate = Gate(args.model)
+    codec, sub = (tqt2, "enc2") if args.code == "tqt2" else (tqt, "enc")
+    res = {}
+    for l in parse_layers(args.layers):
+        saved = substitute(mods, l, codec, Path(args.out) / sub)
+        kld, top1, _ = gate.score(model, verbose=False)
+        mods[l].gate_up_proj.data.copy_(saved[0])
+        mods[l].down_proj.data.copy_(saved[1])
+        res[l] = (kld, top1)
+        log(f"layer {l} alone in {args.code}: KLD {kld:.5f}, top-1 {top1:.2f} %")
+        json.dump(res, open(Path(args.out) / f"sweep_{args.code}.json", "w"))
 
 # ---------------- pack ----------------
 def _gstr(b):
@@ -379,11 +428,13 @@ def cmd_pack(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("encode", "eval", "pack"):
+    for name in ("encode", "eval", "pack", "sweep"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="the official checkpoint folder")
         p.add_argument("--out", required=True)
         p.add_argument("--layers", default="0-23", help="layers of the 4-bit code (pack / eval) or of this encode run")
+        if name == "sweep":
+            p.add_argument("--code", choices=("tqt", "tqt2"), required=True)
         if name in ("pack", "eval"):
             p.add_argument("--layers2", default="", help="layers of the 2-bit code TQT2 (their enc2 files)")
         if name == "pack":
@@ -396,13 +447,13 @@ def main():
             p.add_argument("--seqlen", type=int, default=1000)
             p.add_argument("--group", type=int, default=6)
             p.add_argument("--scales", type=int, default=3)
-            p.add_argument("--codec", choices=sorted(CODECS), default="tqt")
-            p.add_argument("--damp-gu", type=float, required=True)
-            p.add_argument("--damp-dn", type=float, required=True)
+            p.add_argument("--codec", default="tqt", help="comma list of tqt (4-bit, enc/) and tqt2 (2-bit, enc2/): one calibration pass feeds all")
+            p.add_argument("--damp-gu", required=True, help="one value per codec, comma separated")
+            p.add_argument("--damp-dn", required=True, help="one value per codec, comma separated")
             p.add_argument("--n0", type=float, required=True)
             p.add_argument("--nmin", type=float, default=64)
     args = ap.parse_args()
-    {"encode": cmd_encode, "eval": cmd_eval, "pack": cmd_pack}[args.cmd](args)
+    {"encode": cmd_encode, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep}[args.cmd](args)
 
 
 if __name__ == "__main__":

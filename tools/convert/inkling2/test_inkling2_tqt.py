@@ -198,3 +198,23 @@ def test_q8_0_layout_and_error():
     y = (d[:, None] * q).reshape(3, 64)
     assert np.abs(y - x).max() <= np.abs(x).reshape(6, 32).max(1).max() / 127 * 0.51 + 1e-3
     assert (np.abs(q).max(1) == 127).all()
+
+
+@pytest.mark.skipif(not _cuda_ok(), reason="needs CUDA and nvcc")
+@pytest.mark.parametrize("codec_name", ["tqt", "tqt2"])
+def test_gpu_decode_matches_numpy(codec_name):
+    """decode_rows_t (GPU, un-rotated BF16) == codec.decode (numpy, rotated basis) @ R, to BF16 rounding"""
+    codec = Q.CODECS[codec_name]
+    rng = np.random.RandomState(5)
+    N, K = 8, 256
+    bb = codec.BLOCK_BYTES
+    raw = np.zeros((2, N, K // 128 * bb), np.uint8)
+    for e in range(2):
+        st = rng.randint(0, 256, (N, K // 128, bb - 2), dtype=np.uint8)
+        sc = (rng.rand(N, K // 128) * 0.1 + 0.01).astype(np.float16)
+        raw[e] = codec.pack(sc, st)
+    got = Q.decode_rows_t(raw, N, K, codec).float().cpu().numpy()
+    R = Q.tqv12.rot_matrix_np().astype(np.float32)
+    for e in range(2):
+        ref = (codec.decode(raw[e].tobytes(), N, K).reshape(N, K // 128, 128) @ R).reshape(N, K)
+        assert np.abs(got[e] - ref).max() <= np.abs(ref).max() * 2 ** -7
