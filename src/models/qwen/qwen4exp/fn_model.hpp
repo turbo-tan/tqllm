@@ -3,6 +3,7 @@
 #include "fn_layers.hpp"
 #include "decode_rules.hpp"
 #include "fn_cpu_experts.hpp"
+#include "cpu_pool.hpp"
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -107,6 +108,8 @@ struct DecodeModel {
         int * ids_host = nullptr; size_t ids_cap = 0;
         const MixedExpertCache * cache = nullptr; int layer = -1; std::vector<int> plan; int issued = 0;  // copies queued ahead
         double copy_bytes = 0;
+        char * bounce[2] = {nullptr, nullptr}; size_t bounce_bytes = 0;  // pinned host blocks per half: experts read on demand (rt.expert_blocks)
+        const std::function<void(int, const int *, size_t, char *, size_t)> * blocks = nullptr;  // rt.expert_blocks of the running prefill
     };
     static PrefillStage & stage() { static PrefillStage st; return st; }
     std::unique_ptr<Device<float>> pf_inject, pf_weights, pf_sw, pf_sd; std::unique_ptr<Device<__half>> pf_xr, pf_ax;
@@ -228,6 +231,9 @@ void ep_stop(const Checkpoint & cp);
 inline std::array<int, 3> expert_u4h_ids(const Checkpoint & checkpoint, int layer) {
     return tqllm::expert_u4h_ids(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
 }
+inline std::array<int, 3> expert_tile_bpbs(const Checkpoint & checkpoint, int layer) {
+    return tqllm::expert_tile_bpbs(checkpoint.expert_payload(layer, 0), checkpoint.config.hidden, checkpoint.config.expert_ff);
+}
 inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpoint, int layer, int id, bool tiled) {
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
                                 tiled);
@@ -242,17 +248,20 @@ inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
         pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
     }
     pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
-    std::atomic<int64_t> next{0}; const int64_t total = int64_t(c.layers) * c.experts; std::vector<std::thread> pool;
-    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
-        for (int64_t i; (i = next++) < total;) {
-            const int l = int(i / c.experts), e = int(i % c.experts);
-            const auto parts = repack_expert(checkpoint, l, e, false); char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+    // Release pinned storage if a loader or layout check fails; workers finish before the storage is freed.
+    std::unique_ptr<char, decltype(&cudaFreeHost)> pinned(host, &cudaFreeHost);
+    CpuPool pool(std::max(1, threads));
+    for (int l = 0; l < c.layers; ++l) {
+        pool.run(c.experts, [&](int e) {
+            const auto parts = repack_expert(checkpoint, l, e, false);
+            char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
             for (int k = 0; k < 6; ++k) {
                 require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
                 std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
             }
-        }
-    });
-    for (auto & t : pool) t.join();
+        });
+        checkpoint.release_layer_expert_pages(l);
+    }
+    pinned.release();
     pe.map = host; pe.tiled = false; return pe;
 }

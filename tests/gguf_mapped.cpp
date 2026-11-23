@@ -1,6 +1,9 @@
 #include "gguf_mapped.hpp"
 #include "qwen4exp.hpp"
 #include "dequant.hpp"
+#include "platform/os_file.hpp"
+#include <array>
+#include <limits>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -124,6 +127,45 @@ static void gsq_dialect_test() {
     require(rejected, "truncated GSQ payload accepted");
     std::puts("explicit GSQ dialect, type42 fail closed, Q2_0 code/scale/slice/truncation: PASS");
 }
+static void large_row_hint_test() {
+    // Sparse 1 GiB table: exercise the actual hint path without materializing the table in RAM.
+    const uint64_t nrows = uint64_t(1) << 26;
+    std::vector<char> header = {'G', 'G', 'U', 'F'};
+    put<uint32_t>(header, 3); put<uint64_t>(header, 1); put<uint64_t>(header, 0);
+    text(header, "embeddings"); put<uint32_t>(header, 2);
+    put<uint64_t>(header, 4); put<uint64_t>(header, nrows);
+    put<uint32_t>(header, 0); put<uint64_t>(header, 0);
+    header.resize((header.size() + 31) / 32 * 32);
+    const auto path = std::filesystem::temp_directory_path() / ("tqllm-row-hints-" + std::to_string(getpid()) + ".gguf");
+    struct Cleanup { std::filesystem::path p; ~Cleanup() { std::filesystem::remove(p); } } cleanup{path};
+    const std::array<float, 4> first{-3.f, 2.f, 7.f, 4.f}, last{9.f, 5.f, -4.f, 11.f};
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(header.data(), header.size());
+        out.write(reinterpret_cast<const char *>(first.data()), sizeof(first));
+        out.seekp(std::streamoff(header.size() + (nrows - 1) * sizeof(last)));
+        out.write(reinterpret_cast<const char *>(last.data()), sizeof(last));
+        require(bool(out), "sparse embedding fixture write failed");
+    }
+    for (int reopen = 0; reopen < 3; ++reopen) {
+        MappedGguf mapped(path.string());
+        const auto got = mapped.gather_rows("embeddings", {nrows - 1, 0, nrows - 1, 1});
+        for (int i = 0; i < 4; ++i) {
+            require(got[i] == last[i] && got[4 + i] == first[i] && got[8 + i] == last[i] && got[12 + i] == 0.f,
+                    "large hinted gather lost rows or duplicates after reopen");
+        }
+        bool rejected = false;
+        try { mapped.gather_rows("embeddings", {nrows}); } catch (const std::exception &) { rejected = true; }
+        require(rejected, "large gather accepted an out-of-range row");
+    }
+    os::MappedFile raw(path.string());
+    raw.advise_random(1, 3);
+    raw.prefetch(raw.size() - 1, std::numeric_limits<size_t>::max());
+    raw.prefetch(std::numeric_limits<size_t>::max(), 1);
+    raw.advise_random(0, 0);
+    require(std::memcmp(raw.data() + header.size(), first.data(), sizeof(first)) == 0, "mapping hints changed file bytes");
+    std::puts("large sparse gathers, mapping reopen, duplicates and hint bounds: PASS");
+}
 static void checkpoint_probe(int argc, char ** argv) {
     std::vector<std::unique_ptr<MappedGguf>> files;
     for (int i = 1; i < argc; ++i) files.push_back(std::make_unique<MappedGguf>(argv[i]));
@@ -168,7 +210,7 @@ static void checkpoint_probe(int argc, char ** argv) {
 }
 int main(int argc, char ** argv) {
     try {
-        if (argc > 1) checkpoint_probe(argc, argv); else { unit_test(); gsq_dialect_test(); }
+        if (argc > 1) checkpoint_probe(argc, argv); else { unit_test(); gsq_dialect_test(); large_row_hint_test(); }
         return 0;
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

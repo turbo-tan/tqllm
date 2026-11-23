@@ -5,19 +5,86 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Changed
+- Flash-Next pinned expert packs are assembled one layer at a time; completed expert pages are released before
+  copying the next layer. Loader errors propagate after workers finish and failed builds free pinned storage.
+  The existing 60% host-RAM limit remains unchanged.
+- DFlash2 drafter: the two Q4_K selector tables (248320 x 256) stay in their Q4_K blocks on the GPU and the lattice
+  decodes the rows it reads, instead of expanding them to BF16 at load: 0.18 GB less VRAM (RTX 3090, Qwen3.8-27B TQT +
+  DFlash2-TQ3, 144K context, q8/q4 K/V: 20826 -> 20654 MiB after load). The decoded values are the BF16 ones the
+  expansion produced, so drafts, acceptance and output are identical.
+
+### Performance
+- Long-context prefill on the split KV caches (`--kv q8/q4`, `tcq3/q4`, ...): a prefix of 4096 keys or more is split over
+  up to 8 key ranges and merged (a 512-token chunk was 96 equal blocks, two waves on an 82-SM card), the tcq3 K decode
+  in prefill blocks takes one table lookup per two values, and 24 GB cards with 2 GB or more left after the KV cache
+  prefill in chunks of at least 1024 tokens at any context. RTX 3090, Qwen3.8-27B TQT + DFlash2, 256K context, VRAM
+  only, 250K-token prompt: q8/q4 590-644 -> 966 tok/s, tcq3/q4 582 -> 856 tok/s; greedy replies identical to the base.
+
 ### Fixed
+- Flash-Next long-context attention broke for the rest of the process after the first decode that passed 2048 positions
+  before any prompt did (a long reasoning answer to a short prompt): the QSA indexer's query norm is first used there,
+  inside a layer's graph capture, where its upload fails; the step reran without a graph but the weight cache kept the
+  buffer it had allocated, never written. Every later prompt or answer past 2048 positions then selected its attended
+  positions from garbage scores. First-use weight caches now keep a buffer only once uploaded (the FP16 weight copies are
+  never made inside a capture), and the norm is uploaded at start. RTX 3090, 59 GiB host, Flash-Next IQ3_XXS, experts
+  on demand (with #75 so long prompts run), fresh server, one 3000-token answer to a short prompt, then 5-code needles at
+  temperature 0: 4K 3/5 and 28K 0/5 ("here are the extracted signals for each index") -> 5/5, replies identical to a
+  fresh server's. Long answers in such a session change too (they were degraded).
+- Flash-Next: the first decode step past the QSA indexer budget (2048 positions; every decode after a long prompt)
+  built the selection scratch inside the attention layers' graph capture, whose device sync failed the capture of every
+  attention layer: each reran without a graph and the link trace was dumped to the log as if a GPU error had occurred.
+  The scratch is now made before decode (and before the bank refill sizes the banks). Replies are unchanged.
+- Flash-Next with experts read from the GGUF on demand (no pinned pack, e.g. a 64 GB host): a prompt whose layer-major
+  prefill routed to more experts of a layer than its bank has slots failed with "mixed cache: active set exceeds slots"
+  (a 4K prompt already does on a 24 GB card; a 28K prompt routes to all 512 experts of a layer with ~200 slots; a layer
+  whose bank was lent to the prefill has no bank at all). Those experts now stream through the prefill staging like a pack's, assembled on the host from the GGUF;
+  prompts whose routed experts fit the bank keep the bank path. A prefill that fails now also gives back the expert banks
+  it borrowed (before, every later long prompt planned with ~9 GB of banks missing and failed the same way). RTX 3090,
+  59 GiB host, Flash-Next IQ3_XXS, 32K context: 4K- and 28K-token 5-code needles 5/5 (28K: two seeds) instead of the
+  error, greedy replies identical to the pinned pack's; short prompts identical to before; 28K prefill on demand ~1.4K
+  tok/s.
 - Build: a full build (library, tools, tests) compiles without warnings; it printed 21,578 warning lines, 21,310 of
   them from -Wpedantic reaching the host compiler of CUDA sources. Generated GPU code is unchanged.
+- Flash-Next with experts in the UD low-bit types IQ2_XXS / IQ2_XS (also IQ1_S, Q2_K) gave wrong replies whenever the
+  expert pack was tiled (the pinned pack built in memory, a `--experts` pack file, or every bank resident on a GB10): the
+  tiling followed `u4h_id()`, which these types do not have, so their banks stayed plain while the grouped expert kernels
+  read them as tiles. The tiling now follows the id the grouped kernels run (`expert_kernel_id()`). ISTA-DASLab GSQ-RCO
+  IQ3_XXS (mixed IQ2_XXS / IQ2_XS / IQ2_S / IQ3_S / IQ3_XXS gate/up per layer), RTX 3090, pinned pack: five greedy
+  replies (up to 400 tokens) identical to the on-demand path, which was already correct. Pack files written by
+  `tqfn-pack` from such models before this fix hold those parts untiled and must be written again.
+- Sampling (temperature > 0) on Qwen3.5 / 3.8 drew only from the 16 rows the LM head's 4-bit first pass ranked highest,
+  so top-p was cut short at some positions (simulated: mean total variation 1.2 % against the int8 head's top-p
+  distribution, nonzero at 12 % of positions; top-k above 16 was ignored). Every sampled token is now an exact draw of
+  the int8 head's whole-vocabulary distribution: the first pass carries per-row error bounds, and rows that could still
+  matter are re-scored exactly (64 / 1024 / 8192 rows, rarely all of them). The Gumbel noise is tied to the seed and the
+  token's position, so the same seed gives the same reply with or without a drafter, tree or MTP. Qwen3.8-27B TQT +
+  DFlash2, RTX 3090, temperature 0.7 / top-p 0.8: 89 % of tokens need no extra re-score, decode 107.4 tok/s vs 106.0
+  before (50.8 vs 50.9 without a drafter); greedy unchanged. `TQLLM_DEBUG=full_head` is the every-logit reference:
+  20 of 20 sampled and greedy replies identical to it, with and without the drafter.
 - Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
   `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
   argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
   two cases now keep separate graphs.
+
+### Changed
+- Qwen3.5 / 3.8: the Gated DeltaNet recurrent state has one buffer per layer instead of two (updated in place; a
+  partly accepted draft is replayed from the verify inputs as before). Qwen3.8-27B on an RTX 3090: 192 MiB less VRAM
+  per slot, greedy tokens identical (tree, chain, no drafter, `--np 2`).
 
 ### Docs
 - [Choose a setup](docs/guides/choose-your-setup.md): which model, drafter and flags for 16 / 24 / 32 GB cards and GB10,
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- `--gdn-state f16` (Qwen3.5 / 3.8): store the Gated DeltaNet recurrent state as FP16 (opt-in, not exact). Qwen3.8-27B on
+  an RTX 3090: 96 MiB less VRAM per slot, KLD vs BF16 0.013443 -> 0.013861 (TQT file, WikiText-2 8 x 2048), 5/5 on a
+  5-code needle at 109K and 140K tokens; speculative and plain decoding still give the same tokens.
+- `TQLLM_DEBUG=head3` (experimental): the LM head's first pass in 3 bits (Q3_K grid, 0.58 GB instead of 0.80 GB of
+  VRAM for Qwen3.8). Sampling stays exact through the re-score screen; greedy keeps the top-16 shortlist (argmax equal to
+  the full int8 head at 6,308 of 6,308 WikiText-2 positions). Qwen3.8-27B TQT, RTX 3090: 198 MiB less VRAM, greedy decode
+  +1.2 % (51.5 vs 50.9 tok/s, 121.4 vs 119.8 with DFlash2), sampled decode with DFlash2 -5 % (102.0 vs 107.4 tok/s:
+  more re-score rounds), so it stays off by default.
 - Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
   `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
   `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /
@@ -55,8 +122,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ### Changed
 - Flash-Next on hosts whose RAM cannot cache the 28.8 GB per-layer token embedding beside the pinned expert pack (64 GB):
-  a decode step asks for all its embedding rows at once with a random-access hint (`TQLLM_GATHER_IO`), and a prompt
-  shorter than the prefill chunk plans its own length (`TQFN_SHORT_CHUNK`), so it lends fewer expert banks. RTX 3090,
+  a decode step asks for all its embedding rows at once with a random-access hint, and a prompt
+  shorter than the prefill chunk plans its own length, so it lends fewer expert banks. RTX 3090,
   59 GiB RAM, ISTA IQ3_XXS: cold-server mixed prompts 79.5 -> 101.3 tok/s, GSM8K-50 208.7 -> 188.5 s (49/50 both), the
   same greedy text (md5 of every reply).
 - CUDA library built without relocatable device code (`CUDA_SEPARABLE_COMPILATION` off; no kernel calls device code of
@@ -64,6 +131,30 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   us on an RTX 3090; TQV-12 and most llama.cpp types 3-5 %), 1-8 columns unchanged: DFlash2 decodes 8-11 % faster with
   `--draft 15`, at its default 7 drafts at the same speed (+0.3-0.8 %). A clean build takes 27 % less wall time and
   half the disk. Binaries now carry PTX for the built architectures (tqserve 44 -> 59 MB).
+- Faster DFlash2 verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit:
+  7-8 verify columns (33-48 (query, head) rows at 6 heads per KV head) run on a new kernel with three score warps (scores,
+  online softmax, FP16 P) handing P to four PV warps through shared memory, no 64-row padding, one block per SM taking
+  two (KV head, split) items through its cp.async rings; the in-block + merge kernel shares one buffer for the decoded K
+  and V and computes each key weight once (31 instead of 43 KB of shared memory: the 24 x 8 block grid in one wave, 42 ->
+  31 us at a locked 1.39 GHz). Qwen3.8-27B, RTX 3090, `--kv q8/q4`, attention per layer at 8 columns: 32K / 100K / 140K
+  context 184 / 434 / 588 -> 172 / 306 / 400 us. Production flags (144K, DFlash2, int8 prefill, host embed / head),
+  5-code needle replies: decode at 109K / 137K 162.4 / 150.7 -> 174.8 / 164.9 tok/s, identical replies and accepted /
+  drafted counts; 32K within noise.
+- Faster 8-column verify (DFlash2 tree steps), same output bit for bit: the TQT / TQ4 matvec at 5-8 columns and the 4-bit
+  head at 8 / 16 columns now ask for a 32 KB shared-memory carveout instead of the driver's 64 KB, so the activations
+  every 16-row block re-reads stay in L1 more often (ncu at a locked 1.38 GHz, ffn gate+up at 8 columns: 136 -> 129 us,
+  L1 hit rate 62 -> 66 %, L2 throughput 78 -> 75 %, DRAM 77 -> 81 %; the decode runs at the 350 W cap, SM ~1.65 GHz).
+  a Qwen3.8-27B fine-tune in TQT + DFlash2-TQ3, RTX 3090, `--kv q8/q4`, int8 prefill, host embed / head: gate+up 130 -> 120 us
+  per call in the verify, all target matvecs -6 % per step; 5-code needle replies decode 203.8 / 166.1 / 152.9 ->
+  207.7 / 169.7 / 157.3 tok/s at 35K / 109K / 137K, relbench DFlash2 +3-5 % at 2K / 8K, +3 % at 32K; identical replies
+  and accepted / drafted counts. Decode without a drafter (1 column) keeps the old launch configuration.
+- Faster verify attention on the split K/V cache with q8 K (`--kv q8/q4`, `q8/q8`), same output bit for bit: one query
+  (decode without a drafter), 2-5 queries and 11-16 queries (one pass over the cache instead of two) use a new kernel
+  that streams the raw records through a cp.async ring and spreads a query over four warps; the merge kernel overlaps its
+  reads and applies the inverse rotation itself. Qwen3.8-27B TQT, RTX 3090, `--kv q8/q4`, per layer, attention at 1 /
+  4 / 8 / 16 verify columns: 140K context 565 / 628 / 597 / 1190 us -> 301 / 510 / 593 / 1106 us, 32K 154 / 162 / 190 /
+  383 us -> 89 / 127 / 175 / 344 us. Decode without a drafter at 137K: 35.6 -> 41.2 tok/s (32K: 46.0 -> 48.7); with
+  DFlash2 (8 verify columns) unchanged; greedy replies identical.
 - TQV-12 / TQT calibration text pinned (`tqv12_quant.py prompts`, step 4 of both guides): `--wiki FILE` checks
   WikiText-2 train against its sha256 and takes the code half from the files in
   `tools/convert/qwen35/calib_code_files.txt` as committed at `v1.6.0` (read from git, not the working tree); the step

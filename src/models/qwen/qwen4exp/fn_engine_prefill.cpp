@@ -32,7 +32,8 @@ void FlashNextEngine::refill_borrowed() {
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     if (all) S().refilled_ = true;
-    S().model_->pf_refill.clear(); led.reset();
+    if (S().model_) S().model_->pf_refill.clear();
+    led.reset();
 }
 
 void FlashNextEngine::arena_resize(size_t bytes) {
@@ -101,7 +102,23 @@ void FlashNextEngine::pc_verify(const std::vector<int> & ids, int p) {
     ref.reset(); bind();
 }
 
+void FlashNextEngine::abort_prefill() {
+    const auto lk = ep_lock();
+    try {
+        (void) cudaDeviceSynchronize(); (void) cudaGetLastError();
+        if (auto & m = S().model_) { m->release_prefill(); m->pf_borrowed.clear(); m->prompt_emb.clear(); m->keep_embeddings = false; }
+        arena_resize(f_.arena_decode);
+        refill_borrowed();
+    } catch (const std::exception & e) { std::fprintf(stderr, "tqllm: cleanup after a failed prefill: %s\n", e.what()); }
+    f_.cp->rt.trim_below = SIZE_MAX;
+}
+
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
+    try { spec_begin_impl(prompt, count); }
+    catch (...) { abort_prefill(); throw; }
+}
+
+void FlashNextEngine::spec_begin_impl(const std::vector<uint32_t> & prompt, uint32_t count) {
     if (ep_gate_) ep_reclaim(*f_.cp, *ep_gate_);  // before the lock: rank 0's forwards already sent finish first
     const auto lk = ep_lock(); S().serving_ = true; if (ep_gate_) ++ep_gate_->served;
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
@@ -210,10 +227,9 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // engine chunk gets its own length: the same experts stream either way, but the activation and staging buffers of a
     // 16K chunk cost 6.5 GB there, and giving up banks for them only adds the refill (11-11: 1.2K prompt 2.38 -> 2.16 s).
     constexpr int kMaxChunk = 32768;
-    static const bool short_chunk = [] { const char * v = std::getenv("TQFN_SHORT_CHUNK"); return !v || std::atoi(v) != 0; }();
     const int chunk0 = f_.cp->run.tune.chunk_set ? f_.chunk
                      : f_.cp->run.small_card ? tqllm::flashnext::small_card_chunk(T, kMaxChunk)
-                     : short_chunk ? tqllm::flashnext::short_prompt_chunk(T, f_.chunk) : f_.chunk;
+                     : tqllm::flashnext::short_prompt_chunk(T, f_.chunk);
     int chunk = chunk0, block = 0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
@@ -230,10 +246,6 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         }
         f_.cp->rt.prefill_stage = tqllm::flashnext::small_card_stage(f_.cp->run.small_card, f_.cp->run.tune.stage_set,
                                                                   f_.cp->run.tune.stage, T, f_.chunk);
-        // TQFN_SHORT_STAGE=K (24 GB cards, experiment): staging slices of K experts for a one-chunk prompt (small cards: 64)
-        static const int short_stage = std::getenv("TQFN_SHORT_STAGE") ? std::atoi(std::getenv("TQFN_SHORT_STAGE")) : 0;
-        if (!f_.cp->run.small_card && !f_.cp->run.tune.stage_set && short_stage > 0 && T <= f_.chunk)
-            f_.cp->rt.prefill_stage = std::min(f_.cp->rt.prefill_stage, short_stage);
         tqllm::PrefillTuning tu; tu.sub = f_.cp->run.tune.sub; tu.stage = f_.cp->rt.prefill_stage;
         tu.dense_cache_bytes = dense_half_pool_bytes(f_.cp->run.tune); tu.mtp_bank_bytes = f_.mtp_cache->peak_device_bytes();
         tu.workspace_bytes = size_t(1024 + std::max(0L, f_.cp->run.tune.reserve_mb)) << 20;  // --prefill-reserve-mb: headroom for the kernels' own scratch
@@ -261,7 +273,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             tqllm::PrefillTuning t = tu;
             t.chunk = chunk; t.sub = std::min(f_.cp->run.tune.sub, block); t.context_bytes = context_term(block);
             // the QSA score scratch holds one block of queries: a prompt shorter than the block has only its own (sizing only)
-            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, short_chunk ? std::min(block, T) : block, checkpoint.attention_heads);
+            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, std::min(block, T), checkpoint.attention_heads);
             return t;
         };
         const tqllm::PlanRoom base_room = room_for(0, 0);
@@ -461,6 +473,13 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             // banks an earlier long prompt left below their slot target grow back into the freed memory with the refill
             if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
         }
+    }
+    // a decode that passes the indexer budget (2048 positions) selects through the QSA scratch: made here, outside any
+    // graph capture and before the refill sizes the banks (made at that step, its device sync failed the attention layers'
+    // captures, each step rerun without a graph)
+    if (P + int(count) > 2048 && !f_.cp->rt.qsa_batch && f_.cp->rt.kv_capacity > 2048) {
+        int attn = 0; for (int l = 0; l < c.layers; ++l) attn += checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight");
+        if (attn) { PersistentAlloc keep; f_.cp->rt.qsa_batch = std::make_unique<tqllm_cuda::QsaBatchScratch>(16, f_.cp->rt.kv_capacity, 4, 2048); }
     }
     stamp("before the bank refill"); refill_borrowed(); f_.cp->rt.trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);

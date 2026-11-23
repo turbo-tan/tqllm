@@ -285,6 +285,11 @@ int main() {
     check(bank_budget_bytes(false, 18.0, size_t(120) << 30) == size_t(18) << 30, "fixed slots: budget_gb as given");
     check(prefill_chunk(16384, 8) == 16384 && prefill_chunk(16384, 8192) == 16384, "prefill chunk: the engine setting, manifest key or not");
     check(prefill_chunk(0, 8192) == 8192, "prefill chunk: the manifest value only when the setting is off");
+    check(drop_layer_after_pack("blk.7.ffn_gate_exps.weight", 7), "copied layer expert pages may be dropped");
+    check(!drop_layer_after_pack("blk.70.ffn_gate_exps.weight", 7) &&
+          !drop_layer_after_pack("blk.8.ffn_gate_exps.weight", 7), "other layers remain cached");
+    check(!drop_layer_after_pack("blk.7.attn_qkv.weight", 7) &&
+          !drop_layer_after_pack("per_layer_token_embd.weight", 7), "dense and embedding pages remain cached");
     check(drop_after_pack("blk.7.ffn_gate_exps.weight") && drop_after_pack("blk.47.ffn_down_exps.weight"), "trunk expert pages may be dropped after the pack");
     check(!drop_after_pack("per_layer_token_embd.weight") && !drop_after_pack("token_embd.weight") && !drop_after_pack("blk.0.attn_qkv.weight"),
           "the per-layer token embedding and dense tensors stay cached");
@@ -421,6 +426,13 @@ int main() {
         int n = prof.empty() ? 0 : 1; for (char ch : prof) n += ch == ',';
         check(n == 48, "Flash-Next profile: one entry per layer");
         check(std::string(flashnext_layer_profile(40, 512)).empty() && std::string(flashnext_layer_profile(48, 256)).empty(), "only for 48 layers x 512 experts");
+    }
+    {   // layer-major prefill without a pack: the bank only while the routed experts fit, else streamed (on-demand GGUF)
+        check(!prefill_through_bank(true, false, true, 10, 200), "pack: only resident experts through the bank");
+        check(prefill_through_bank(false, false, true, 512, 512) && prefill_through_bank(false, false, false, 512, 512), "no pack, no host blocks (all resident): the bank");
+        check(prefill_through_bank(false, true, true, 180, 206), "on demand, routed experts fit the bank: the bank (short prompts unchanged)");
+        check(!prefill_through_bank(false, true, true, 512, 206), "on demand, 28K prompt routing to every expert: streamed, not 'active set exceeds slots'");
+        check(!prefill_through_bank(false, true, false, 10, 206), "on demand, borrowed layer (no bank): streamed");
     }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

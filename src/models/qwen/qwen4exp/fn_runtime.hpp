@@ -2,6 +2,7 @@
 // Flash-Next engine runtime: CUDA error checks, scratch arena, prefill tuning and the shared per-process state.
 #include <unordered_map>
 #include <memory>
+#include <functional>
 namespace tqllm { class TpComm; }
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
@@ -181,6 +182,9 @@ struct FnRuntime {
     const std::vector<int32_t> * hot_map = nullptr;
     MixedExpertCache * cold_cache = nullptr;
     const float * keep_mask = nullptr;
+    // experts read from the GGUF on demand (no pinned pack): writes n experts of a layer in the bank layout, one block of
+    // `block` bytes each, to host memory (layer-major prefill streams the routed experts its bank does not hold through it)
+    std::function<void(int layer, const int * ids, size_t n, char * dst, size_t block)> expert_blocks;
 };
 inline size_t dense_half_pool_bytes(const FnTune & tune) { return size_t(std::max(0L, tune.dense_cache_mb)) << 20; }
 // hands back the arena temporaries of a scope (anything allocated before it stays valid)
@@ -239,6 +243,11 @@ template<class T> struct Device {
         std::vector<T> values(count); ck(cudaMemcpy(values.data(), p, count * sizeof(T), cudaMemcpyDeviceToHost)); return values;
     }
 };
+// a device copy of v, handed over only once uploaded: a put inside a graph capture throws and leaves nothing behind for a
+// cache to keep (Checkpoint::dense_device; tests/graph_capture_alloc.cpp)
+template<class T> std::unique_ptr<Device<T>> device_copy(const std::vector<T> & v) {
+    auto d = std::make_unique<Device<T>>(v.size()); d->put(v); return d;
+}
 inline void validate_round(const Device<__half> & actual, std::vector<float> expected, bool q8k, const std::string & name) {
     if (q8k) cpu_q8k_round(expected); else cpu_q8_round(expected);
     const auto output = actual.get();

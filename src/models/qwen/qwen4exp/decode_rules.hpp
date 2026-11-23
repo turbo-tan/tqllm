@@ -34,6 +34,16 @@ public:
     size_t size() const { return calls_.size(); }
 };
 
+// Layer-major prefill without a prepacked pack: the routed experts of a layer go through its bank (prepare loads the
+// missing ones) only while they fit in it. Experts read from the GGUF on demand (host_blocks) stream the rest through the
+// prefill staging like a pack does: a bank cannot take more experts than its slots (a 28K prompt routes to all 512
+// experts of a layer with ~200 slots: "mixed cache: active set exceeds slots"), and a borrowed layer has no bank at all.
+// Without either (GB10, every expert resident) the bank holds them all. With a pack only the resident ones use the bank.
+inline bool prefill_through_bank(bool prepacked, bool host_blocks, bool bank_ready, int routed, int slots) {
+    if (prepacked) return false;
+    if (!host_blocks) return true;
+    return bank_ready && routed <= slots;
+}
 // Expert path of one trunk layer call: true = waves (several prepares, grouped per wave), false = one split prepare.
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
 // distinct experts fit the layer's slots: the waves path sums the down projection in another order, so choosing it by
@@ -465,6 +475,9 @@ inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool h
 inline bool drop_after_pack(const std::string & tensor) {
     const auto exps = tensor.find("_exps.weight");
     return tensor.rfind("blk.", 0) == 0 && exps != std::string::npos && exps + 12 == tensor.size();
+}
+inline bool drop_layer_after_pack(const std::string & tensor, int layer) {
+    return tensor.rfind("blk." + std::to_string(layer) + ".", 0) == 0 && drop_after_pack(tensor);
 }
 // Read at start-up so the first requests do not fault it in from the disk, when it fits half the RAM: on a small host
 // (.231: 23 GiB, 28.8 GB embedding) the read only cycles the page cache and evicts the cold experts.

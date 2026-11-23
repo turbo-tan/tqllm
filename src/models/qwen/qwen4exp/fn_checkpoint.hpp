@@ -54,6 +54,10 @@ class Checkpoint {
     std::map<std::string, size_t> owners_;
 public:
     // after the experts are in pinned memory: drop the trunk expert pages, keep every tensor read per token cached
+    // the same, for one layer's trunk experts (build_packed drops each layer once it is copied)
+    void release_layer_expert_pages(int layer) const {
+        for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_layer_after_pack(name, layer)) files_[i]->release_tensor(name);
+    }
     void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
     size_t warm_tensors(int threads, double host_ram_bytes) const {
         size_t n = 0;
@@ -397,6 +401,11 @@ public:
         const __nv_bfloat16 * b = bf16_device(name);
         auto & r = resident_[name + "#f16"]; if (!r) r = std::make_unique<Resident>();
         if (r->mem.empty()) {
+            // the FP16 copy is made by a kernel: inside a graph capture it would only run if the capture succeeds, and a
+            // failed capture left the copy cached unwritten. Made outside captures only (the layer reruns plain)
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone)
+                throw std::runtime_error("FP16 weight copy of " + name + " on its first use inside a graph capture");
             PersistentAlloc keep; auto buffer = std::make_unique<Device<char>>(size_t(rows) * cols * sizeof(__half));
             tqllm_cuda::bf16_to_h(b, reinterpret_cast<__half *>(buffer->p), rows * cols, nullptr); r->mem.push_back(std::move(buffer));
         }
@@ -419,7 +428,10 @@ public:
     bool is_bf16(const std::string & name) const { return file(name).file().tensors.at(name).type == GGML_BF16; }
     const float * dense_device(const std::string & name) const {
         auto & d = dense_dev_[name];
-        if (!d) { PersistentAlloc keep; const auto v = dense(name); d = std::make_unique<Device<float>>(v.size()); d->put(v); }
+        // cached only once uploaded: a first use inside a decode graph capture fails its put (the step reruns plain), and a
+        // buffer kept from that attempt held uninitialised weights for the rest of the process (the QSA indexer's q_norm,
+        // first used by a decode past 2048 positions: every later long prompt attended to the wrong positions)
+        if (!d) { PersistentAlloc keep; d = device_copy(dense(name)); }
         return d->p;
     }
     // Greedy head for the last row of a device [count][hidden] F32 block; the matrix stays resident.
@@ -714,7 +726,7 @@ public:
             const float * matrix = reinterpret_cast<const float *>(weights.p);
             if (resident) {
                 auto & r = resident_[name]; if (!r) r = std::make_unique<Resident>();
-                if (!r->dense) { PersistentAlloc keep; r->dense = std::make_unique<Device<float>>(size_t(rows) * cols); r->dense->put(dense(name, 512 * 1024 * 1024)); }
+                if (!r->dense) { PersistentAlloc keep; r->dense = device_copy(dense(name, 512 * 1024 * 1024)); }  // cached once uploaded (dense_device)
                 matrix = r->dense->p;
             } else if (t.type != GGML_F32) {
                 expanded = std::make_unique<Device<float>>(size_t(rows) * cols);

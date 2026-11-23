@@ -43,6 +43,18 @@ int main() {
         lazy.reset();
         check(cudaGetLastError() == cudaSuccess, "buffer created inside a capture frees cleanly");
     }
+    {   // a first-use upload inside a capture (Checkpoint::dense_device): the put fails, the cache stays empty, and the
+        // plain rerun uploads the real values (a cached buffer from the failed attempt held uninitialised weights)
+        std::unique_ptr<Device<float>> cache;
+        const std::vector<float> w{1.f, 2.f, 3.f, 4.f};
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        bool threw = false;
+        try { cache = device_copy(w); } catch (const std::exception &) { threw = true; }
+        cudaGraph_t g = nullptr; (void) cudaStreamEndCapture(s, &g); if (g) cudaGraphDestroy(g); cudaGetLastError();
+        check(threw && !cache, "upload inside a capture throws and caches nothing");
+        if (!cache) cache = device_copy(w);
+        check(cache && cache->get() == w, "the plain rerun caches the uploaded values");
+    }
     std::printf("graph capture alloc: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

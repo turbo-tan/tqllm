@@ -3,6 +3,7 @@
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
 #include "quant_kernels.cuh"
+#include "dequant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -696,7 +697,7 @@ int main() {
         auto * du = dev(unary);
         auto *dg = dev(gate), *dn = dev(nx), *dpv = dev(pv);
         auto * ds = dev(std::vector<float>(size_t(n) * 256, 0.f));
-        tqllm_cuda::dflash_lattice(dc, du, dg, rank, dn, dpv, anchor, n, rank, ds, nullptr);
+        tqllm_cuda::dflash_lattice(dc, du, dg, rank, {dn}, {dpv}, anchor, n, rank, ds, nullptr);
         const auto got = host(ds, size_t(n) * 256);
         double worst = 0;
         for (int i = 1; i < n; ++i)
@@ -712,6 +713,47 @@ int main() {
         char d[64];
         std::snprintf(d, sizeof(d), "max abs %.2e", worst);
         verdict("dflash_lattice", worst < 1e-3, d);
+    }
+    { // lattice on Q4_K selector tables: scores bit-identical to the lattice on the BF16 tables the host reference
+      // dequantisation (dequantize_host, rounded to BF16) expands them to, as the engine did at load before
+        const int n = 16, rank = 256, vocab = 3000;
+        std::vector<uint8_t> qn(size_t(vocab) * 144), qp(qn.size());
+        std::uniform_int_distribution<int> byte(0, 255);
+        for (auto * q : {&qn, &qp})
+            for (int r = 0; r < vocab; ++r) {
+                uint8_t * b = q->data() + size_t(r) * 144;
+                for (int i = 4; i < 144; ++i) b[i] = uint8_t(byte(g));
+                const uint16_t d = tqllm::float_to_half(std::fabs(nd(g)) * 2e-3f);
+                const uint16_t m = tqllm::float_to_half(std::fabs(nd(g)) * 4e-3f);
+                std::memcpy(b, &d, 2);
+                std::memcpy(b + 2, &m, 2);
+            }
+        auto expand = [&](const std::vector<uint8_t> & q) {
+            std::vector<float> f(size_t(vocab) * rank);
+            tqllm::dequantize_host(12, q.data(), f.data(), int64_t(f.size()));
+            std::vector<bf16> b(f.size());
+            for (size_t i = 0; i < f.size(); ++i) b[i] = __float2bfloat16_rn(f[i]);
+            return b;
+        };
+        std::vector<uint32_t> cand(size_t(n) * 16);
+        for (auto & c : cand) c = g() % vocab;
+        std::vector<float> unary(size_t(n) * 16);
+        for (auto & u : unary) u = nd(g);
+        std::vector<bf16> gate(size_t(n) * rank);
+        for (auto & v : gate) v = __float2bfloat16_rn(nd(g));
+        auto *dc = dev(cand), *dan = dev(std::vector<uint32_t>{11});
+        auto * du = dev(unary);
+        auto *dg = dev(gate), *dbn = dev(expand(qn)), *dbp = dev(expand(qp));
+        auto *dqn = dev(qn), *dqp = dev(qp);
+        auto *s_bf = dev(std::vector<float>(size_t(n) * 256, 0.f)), *s_q = dev(std::vector<float>(size_t(n) * 256, 0.f));
+        tqllm_cuda::dflash_lattice(dc, du, dg, rank, {dbn}, {dbp}, 0, n, rank, s_bf, nullptr, dan);
+        tqllm_cuda::dflash_lattice(dc, du, dg, rank, {dqn, true}, {dqp, true}, 0, n, rank, s_q, nullptr, dan);
+        const auto a = host(s_bf, size_t(n) * 256), b = host(s_q, size_t(n) * 256);
+        int diff = 0;
+        for (int i = 256; i < n * 256; ++i) diff += std::memcmp(&a[i], &b[i], 4) != 0;
+        char d[64];
+        std::snprintf(d, sizeof(d), "%d of %d scores differ", diff, (n - 1) * 256);
+        verdict("dflash_lattice_q4k", diff == 0, d);
     }
     { // device greedy chain == the host chain in dflash_draft_batch (first maximum on ties)
         const int B = 16, want = 15;
