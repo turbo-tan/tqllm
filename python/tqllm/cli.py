@@ -205,7 +205,8 @@ def serve_args(args, ram=None, download=fetch, exists=remote_exists):
             if local:
                 out[i] = local
     if has_option(out, "--model", "-m"):
-        need = [(MLX_REPO, DRAFTER)]
+        given = option(out, "--model") or option(out, "-m") or ""
+        need = [(MLX_REPO, DRAFTER)] if given.endswith(".gguf") else []  # the drafter is for Qwen3.8-27B GGUFs only
     else:
         need = plan("--qsa" in args, ram, exists)
     if has_option(out, "-md", "--model-draft"):
