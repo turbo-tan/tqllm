@@ -130,4 +130,12 @@ weights (+0.025 bits per weight). On Gaussian data the MSE is 0.0715 / 0.0364 / 
 | Basis | TQ4's per 128 weights (H D / sqrt(128)); the engine sees a plain-basis matrix: every FNT kernel rotates its input itself |
 
 The encoder (BlockLDLQ with a tail-biting Viterbi search per 128 weights, per-expert Hessians from captured routed
-inputs) and the measurements are in the FNT notes of the Flash-Next quantiser.
+inputs, `tools/convert/qwen4exp/fnt_quant.py`) and the measurements are in the [FNT guide](../guides/fnt.md). On
+Qwen3.8-Flash-Next the routed experts at 2.48 bits per weight (shard 1 41.52 GB instead of 47.04 GB) have a KLD of
+0.145 against a Q8_0-expert reference, against 0.198 for the ISTA-DASLab GSQ-RCO IQ3_XXS experts they replace.
+
+**Kernels.** Expert matvec, dedup (one read per distinct expert of a verify block) and the prefill grouped GEMM run on
+tensor cores with TQT's k order and give the same bits per row and column (tests/fnt_format.cu, which also checks the
+FP16 dequantisation and `dequantize_host` bit for bit against an independent decoder). `expert-dedup-bench`, RTX 3090,
+16 experts x 2 columns, us per call (the ISTA format each replaces in brackets): gate / up FNT4 22.3 (IQ2_XS 23.5), FNT6
+30.0 (IQ3_S 25.3); down FNT4 17.8 (GSQ Q2_0 32.4), FNT7 24.6 (IQ4_NL 24.7).

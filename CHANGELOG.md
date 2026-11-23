@@ -43,6 +43,13 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - `tqllm serve` on a Mac with `--model` set to a model folder (Inkling-2-Mini) no longer adds the default Qwen3.8-27B
   drafter, which tqserve refused (the server exited at start).
 
+### Added
+- FNT, a trellis-coded routed-expert format (GGUF types 330-333: 2, 2.5, 3 and 3.5 bits per weight, 16-bit window, TQT's
+  code c2, one FP16 scale per 640 weights, docs/reference/formats.md), its tensor-core expert kernels (matvec, dedup,
+  prefill GEMM: the same bits), `TQLLM_DEBUG=moe_dump` (routed-expert calibration capture) and the quantiser
+  `tools/convert/qwen4exp/fnt_quant.py` (docs/guides/fnt.md). Qwen3.8-Flash-Next with FNT experts (2.48 bpw) instead of
+  the ISTA-DASLab GSQ-RCO IQ3_XXS ones (2.84 bpw): shard 1 47.04 -> 41.52 GB, KLD vs a Q8_0-expert reference 0.198 ->
+  0.145 (WikiText-2, 8 x 2048), same top token 88.98 -> 90.60 %.
 ### Changed
 - Flash-Next `--exact off` (CUDA) now includes route-tail skip at rank 8: a non-resident expert that every token of a decode
   call ranks 8th or lower is not copied or computed (weight 0). KLD vs `--exact on` 0.022, GSM8K-200 0.965 -> 0.975. `--exact on`
