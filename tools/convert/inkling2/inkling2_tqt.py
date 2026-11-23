@@ -25,10 +25,12 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "qwen35"))
 import tqt  # noqa: E402
+import tqt2  # noqa: E402
 import tqv12  # noqa: E402
 
 D, I, E = 2304, 1152, 128
 BLOCK = 128
+CODECS = {"tqt": tqt, "tqt2": tqt2}
 
 
 def log(*a):
@@ -106,28 +108,29 @@ def final_dn(Hd, Se, nmin):
 
 
 # ---------------- encode ----------------
-def encode_matrix(W, H, damp, nscales, order=True, refit=True):
-    """W [N, K] float32 CUDA (original basis), H [K, K] float32 (original basis) -> packed rows uint8 [N, K/128*66], rel err"""
+def encode_matrix(W, H, damp, nscales, codec, order=True, refit=True):
+    """W [N, K] float32 CUDA (original basis), H [K, K] float32 (original basis) -> packed rows uint8 [N, K/128*bytes], rel err"""
     Wr = tqv12.rot_last(W)
     Hr = tqv12.rotate_h(H)
-    s, st, Q = tqt.gptq(Wr, Hr, damp=damp, gammas=tqt.gammas(nscales), damp_form="median", order=order, refit=refit)
+    s, st, Q = tqt.gptq(Wr, Hr, damp=damp, gammas=codec.gammas(nscales), damp_form="median", order=order, refit=refit, codec=codec)
     err = tqv12.rel_err(Q, Wr, Hr)
-    return tqt.pack(s.cpu().numpy(), st.cpu().numpy()), err
+    return codec.pack(s.cpu().numpy(), st.cpu().numpy()), err
 
 
 def encode_layer(stats, w_gu, w_dn, args):
     import torch
     Hg_norm = stats.Hg / max(stats.N, 1)
-    gu = np.empty((E, 2 * I, (D // BLOCK) * tqt.BLOCK_BYTES), np.uint8)
-    dn = np.empty((E, D, (I // BLOCK) * tqt.BLOCK_BYTES), np.uint8)
+    codec = CODECS[args.codec]
+    gu = np.empty((E, 2 * I, (D // BLOCK) * codec.BLOCK_BYTES), np.uint8)
+    dn = np.empty((E, D, (I // BLOCK) * codec.BLOCK_BYTES), np.uint8)
     errs = []
     t0 = time.time()
     for e in range(E):
         Se = float(stats.S[e])
         H = blend_gu(stats.Hgu[e], Se, Hg_norm, args.n0)
-        gu[e], eg = encode_matrix(w_gu[e].float(), H, args.damp_gu, args.scales)
+        gu[e], eg = encode_matrix(w_gu[e].float(), H, args.damp_gu, args.scales, codec)
         H = final_dn(stats.Hdn[e], Se, args.nmin)
-        dn[e], ed = encode_matrix(w_dn[e].float(), H, args.damp_dn, args.scales)
+        dn[e], ed = encode_matrix(w_dn[e].float(), H, args.damp_dn, args.scales, codec)
         errs.append((eg, ed))
         if e % 16 == 15:
             log(f"  expert {e + 1}/{E}: {time.time() - t0:.0f} s, rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
@@ -189,8 +192,9 @@ def cmd_encode(args):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = False
     outdir = Path(args.out)
-    (outdir / "enc").mkdir(parents=True, exist_ok=True)
-    todo = [l for l in parse_layers(args.layers) if not (outdir / "enc" / f"L{l:02d}_dn.bin").exists()]
+    encdir = outdir / ("enc" if args.codec == "tqt" else "enc2")
+    encdir.mkdir(parents=True, exist_ok=True)
+    todo = [l for l in parse_layers(args.layers) if not (encdir / f"L{l:02d}_dn.bin").exists()]
     log("layers to encode:", todo)
     if not todo:
         return
@@ -228,10 +232,10 @@ def cmd_encode(args):
             with torch.no_grad():
                 gu, dn, errs = encode_layer(s, mods[l].gate_up_proj, mods[l].down_proj, args)
             for name, arr in (("gu", gu), ("dn", dn)):
-                p = outdir / "enc" / f"L{l:02d}_{name}.bin"
+                p = encdir / f"L{l:02d}_{name}.bin"
                 arr.tofile(str(p) + ".tmp")
                 if name == "gu":
-                    json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(outdir / "enc" / f"L{l:02d}.json", "w"))
+                    json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(encdir / f"L{l:02d}.json", "w"))
                 os.replace(str(p) + ".tmp", p)
             log(f"layer {l} done in {time.time() - t0:.0f} s, mean rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
         del stats
@@ -239,7 +243,7 @@ def cmd_encode(args):
 
 
 # ---------------- eval ----------------
-def decode_layer(encdir, l):
+def decode_layer(encdir, l, codec=tqt):
     """-> (gate_up [E, 2I, D], down [E, D, I]) float32 in the original basis, from the encoded files"""
     R = tqv12.rot_matrix_np().astype(np.float32)
     out = []
@@ -247,7 +251,7 @@ def decode_layer(encdir, l):
         raw = np.fromfile(Path(encdir) / f"L{l:02d}_{name}.bin", np.uint8).reshape(E, N, -1)
         w = np.empty((E, N, K), np.float32)
         for e in range(E):
-            q = tqt.decode(raw[e].tobytes(), N, K).reshape(N, K // BLOCK, BLOCK)
+            q = codec.decode(raw[e].tobytes(), N, K).reshape(N, K // BLOCK, BLOCK)
             w[e] = (q @ R).reshape(N, K)  # rotated rows w R^T -> w
         out.append(w)
     return out
@@ -256,14 +260,14 @@ def decode_layer(encdir, l):
 def cmd_eval(args):
     import torch
     model, mods = load_model(args.model)
-    layers = parse_layers(args.layers)
+    layers = [(l, tqt, "enc") for l in parse_layers(args.layers)] + [(l, tqt2, "enc2") for l in (parse_layers(args.layers2) if args.layers2 else [])]
     texts = json.load(open(Path(args.model) / "golden/mt/texts.json"))
     top1_ref = np.fromfile(Path(args.model) / "golden/mt/top1_bf16.i32", np.int32)
     V = 200058
     lp_ref = np.memmap(Path(args.model) / "golden/mt/lp_bf16.f16", np.float16, "r")
     saved = {}
-    for l in layers:
-        gu, dn = decode_layer(Path(args.out) / "enc", l)
+    for l, codec, sub in layers:
+        gu, dn = decode_layer(Path(args.out) / sub, l, codec)
         m = mods[l]
         saved[l] = (m.gate_up_proj.data.clone(), m.down_proj.data.clone())
         m.gate_up_proj.data.copy_(torch.from_numpy(gu).to("cuda", torch.bfloat16))
@@ -284,7 +288,7 @@ def cmd_eval(args):
             n += T
             pos += T
             log(f"{t['name']:14s} T {T:4d} KLD {kl.mean().item():.5f}")
-    log(f"ALL {n} positions: KLD vs lp_bf16 {kl_sum / n:.5f}, top-1 {100 * agree / n:.2f} %, layers {args.layers}")
+    log(f"ALL {n} positions: KLD vs lp_bf16 {kl_sum / n:.5f}, top-1 {100 * agree / n:.2f} %, layers {args.layers} (tqt) {args.layers2 or '-'} (tqt2)")
 
 
 # ---------------- pack ----------------
@@ -292,25 +296,65 @@ def _gstr(b):
     return np.uint64(len(b)).tobytes() + b
 
 
-def write_overlay(encdir, path, layers):
-    """GGUF v3, alignment 32: tensors [cols, rows, E] of type 306 per layer and projection (stream bytes as encoded)"""
+def q8_0(x):
+    """float32 [rows, cols] (cols % 32 == 0) -> bytes of ggml Q8_0 blocks (FP16 scale + 32 int8 per 32 values, row-major)"""
+    xb = np.ascontiguousarray(x, np.float32).reshape(-1, 32)
+    amax = np.abs(xb).max(1)
+    d = amax / 127.0
+    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
+    q = np.clip(np.sign(xb) * np.floor(np.abs(xb * inv[:, None]) + 0.5), -127, 127).astype(np.int8)
+    return np.concatenate([d.astype("<f2").view(np.uint8).reshape(-1, 2), q.view(np.uint8)], 1).tobytes()
+
+
+def dense_q8_tensors(model_dir, layers=24, out_vocab=200058):
+    """[(engine name, ne, Q8_0 bytes)] of the embedding, the LM head and the attention q / k / v / o matrices of the checkpoint"""
+    sys.path.insert(0, str(Path(model_dir) / "pylib"))
+    import torch
+    from safetensors import safe_open
+    f = safe_open(str(Path(model_dir) / "model-00001-of-00001.safetensors"), "pt")
+    names = [("token_embd.weight", "model.llm.embed.weight", None), ("output.weight", "model.llm.unembed.weight", out_vocab)]
+    for l in range(layers):
+        for en, hn in (("attn_q", "wq_du"), ("attn_k", "wk_dv"), ("attn_v", "wv_dv"), ("attn_output", "wo_ud")):
+            names.append((f"blk.{l}.{en}.weight", f"model.llm.layers.{l}.attn.{hn}.weight", None))
+    out = []
+    for en, hn, rows in names:
+        t = f.get_tensor(hn)
+        if rows:
+            t = t[:rows]
+        assert t.dtype == torch.bfloat16 and t.shape[1] % 32 == 0, (hn, t.dtype, t.shape)
+        out.append((en, (t.shape[1], t.shape[0]), q8_0(t.float().numpy())))
+    return out
+
+
+def write_overlay(path, layers, dense=()):
+    """GGUF v3, alignment 32: tensors [cols, rows, E] per layer and projection, type 306 (tqt, enc dir) or 307 (tqt2, enc2 dir);
+    layers = [(layer, encdir, codec)] (stream bytes as encoded)"""
     infos, blobs, off = [], [], 0
-    for l in layers:
+    for l, encdir, codec in layers:
         gu = np.fromfile(Path(encdir) / f"L{l:02d}_gu.bin", np.uint8).reshape(E, 2 * I, -1)
         dn = np.fromfile(Path(encdir) / f"L{l:02d}_dn.bin", np.uint8).reshape(E, D, -1)
         for name, arr, ne in ((f"blk.{l}.ffn_gate_exps.weight", gu[:, :I], (D, I, E)), (f"blk.{l}.ffn_up_exps.weight", gu[:, I:], (D, I, E)),
                               (f"blk.{l}.ffn_down_exps.weight", dn, (I, D, E))):
             b = np.ascontiguousarray(arr).tobytes()
-            assert len(b) == ne[0] // BLOCK * tqt.BLOCK_BYTES * ne[1] * ne[2], (name, len(b))
-            infos.append((name, ne, off))
+            assert len(b) == ne[0] // BLOCK * codec.BLOCK_BYTES * ne[1] * ne[2], (name, len(b))
+            infos.append((name, ne, codec.GGUF_TYPE, off))
             pad = (-len(b)) % 32
             blobs.append(b + bytes(pad))
             off += len(b) + pad
-    head = b"GGUF" + np.uint32(3).tobytes() + np.uint64(len(infos)).tobytes() + np.uint64(2).tobytes()
-    for k, v in (("general.architecture", b"inkling2-tqt-experts"), (tqt.CODE_KEY, tqt.CODE_TAG.encode())):
+    for name, ne, b in dense:
+        infos.append((name, ne, 8, off))
+        pad = (-len(b)) % 32
+        blobs.append(b + bytes(pad))
+        off += len(b) + pad
+    kvs = [("general.architecture", b"inkling2-tqt-experts")]
+    for codec in (tqt, tqt2):
+        if any(c is codec for _, _, c in layers):
+            kvs.append((codec.CODE_KEY, codec.CODE_TAG.encode()))
+    head = b"GGUF" + np.uint32(3).tobytes() + np.uint64(len(infos)).tobytes() + np.uint64(len(kvs)).tobytes()
+    for k, v in kvs:
         head += _gstr(k.encode()) + np.uint32(8).tobytes() + _gstr(v)
-    for name, ne, o in infos:
-        head += _gstr(name.encode()) + np.uint32(3).tobytes() + b"".join(np.uint64(x).tobytes() for x in ne) + np.uint32(tqt.GGUF_TYPE).tobytes() + np.uint64(o).tobytes()
+    for name, ne, typ, o in infos:
+        head += _gstr(name.encode()) + np.uint32(3).tobytes() + b"".join(np.uint64(x).tobytes() for x in ne) + np.uint32(typ).tobytes() + np.uint64(o).tobytes()
     head += bytes((-len(head)) % 32)
     tmp = str(path) + ".tmp"
     with open(tmp, "wb") as f:
@@ -322,9 +366,14 @@ def write_overlay(encdir, path, layers):
 
 
 def cmd_pack(args):
-    layers = [l for l in parse_layers(args.layers) if (Path(args.out) / "enc" / f"L{l:02d}_dn.bin").exists()]
-    n = write_overlay(Path(args.out) / "enc", args.gguf, layers)
-    log(f"{args.gguf}: layers {layers}, {n / 1e9:.3f} GB")
+    out = Path(args.out)
+    layers = [(l, out / "enc", tqt) for l in parse_layers(args.layers) if (out / "enc" / f"L{l:02d}_dn.bin").exists()]
+    layers += [(l, out / "enc2", tqt2) for l in (parse_layers(args.layers2) if args.layers2 else []) if (out / "enc2" / f"L{l:02d}_dn.bin").exists()]
+    if len({l for l, _, _ in layers}) != len(layers):
+        raise SystemExit("a layer is in both --layers (tqt) and --layers2 (tqt2)")
+    dense = dense_q8_tensors(args.model) if args.dense_q8 else ()
+    n = write_overlay(args.gguf, sorted(layers, key=lambda x: x[0]), dense)
+    log(f"{args.gguf}: {len(layers)} layers ({[l for l, _, c in layers if c is tqt]} tqt, {[l for l, _, c in layers if c is tqt2]} tqt2), {n / 1e9:.3f} GB")
 
 
 def main():
@@ -334,9 +383,12 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="the official checkpoint folder")
         p.add_argument("--out", required=True)
-        p.add_argument("--layers", default="0-23")
+        p.add_argument("--layers", default="0-23", help="layers of the 4-bit code (pack / eval) or of this encode run")
+        if name in ("pack", "eval"):
+            p.add_argument("--layers2", default="", help="layers of the 2-bit code TQT2 (their enc2 files)")
         if name == "pack":
             p.add_argument("--gguf", required=True)
+            p.add_argument("--dense-q8", action="store_true", help="also the embedding, head and attention q / k / v / o as Q8_0")
         if name == "encode":
             p.add_argument("--wiki", required=True)
             p.add_argument("--srcdir", required=True)
@@ -344,6 +396,7 @@ def main():
             p.add_argument("--seqlen", type=int, default=1000)
             p.add_argument("--group", type=int, default=6)
             p.add_argument("--scales", type=int, default=3)
+            p.add_argument("--codec", choices=sorted(CODECS), default="tqt")
             p.add_argument("--damp-gu", type=float, required=True)
             p.add_argument("--damp-dn", type=float, required=True)
             p.add_argument("--n0", type=float, required=True)

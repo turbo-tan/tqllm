@@ -41,6 +41,17 @@ void cb(cublasStatus_t e, const char * what) {
     if (e != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("inkling2: cuBLAS ") + what + " " + std::to_string(int(e)));
 }
 float bf16_f(uint16_t v) { uint32_t u = uint32_t(v) << 16; float f; std::memcpy(&f, &u, 4); return f; }
+float half_f(uint16_t h) {  // IEEE binary16 -> float (Q8_0 block scales)
+    const uint32_t s = uint32_t(h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u;
+    float v;
+    if (e == 0) v = std::ldexp(float(m), -24);
+    else if (e == 31) v = m ? NAN : INFINITY;
+    else v = std::ldexp(float(m | 1024u), int(e) - 25);
+    uint32_t u; std::memcpy(&u, &v, 4);
+    u |= s;
+    std::memcpy(&v, &u, 4);
+    return v;
+}
 
 struct Dev {
     void * p = nullptr;
@@ -162,6 +173,21 @@ struct Inkling2Model::Impl {
     Dev f32(const std::string & n) { const auto v = host_f32(n); return upload(v.data(), v.size() * 4); }
     Dev raw(const std::string & n, uint32_t type) {
         const auto & t = T(n);
+        if (t.type == GGML_Q8_0 && type == GGML_BF16) {  // 8-bit dense tensors of a TQT overlay (blocks of 32: FP16 scale + 32 int8) -> BF16
+            const auto b = f.read(t);
+            const size_t nel = size_t(t.bytes) / 34 * 32;
+            std::vector<uint16_t> h(nel);
+            for (size_t blk = 0; blk < nel / 32; ++blk) {
+                uint16_t d16; std::memcpy(&d16, b.data() + blk * 34, 2);
+                const float d = half_f(d16);
+                for (size_t j = 0; j < 32; ++j) {
+                    const float v = d * float(static_cast<int8_t>(b[blk * 34 + 2 + j]));
+                    uint32_t u; std::memcpy(&u, &v, 4);
+                    h[blk * 32 + j] = uint16_t((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+                }
+            }
+            return upload(h.data(), h.size() * 2);
+        }
         if (t.type != type) throw std::runtime_error("inkling2: " + n + " type " + std::to_string(t.type));
         const auto b = f.read(t);
         return upload(b.data(), b.size());

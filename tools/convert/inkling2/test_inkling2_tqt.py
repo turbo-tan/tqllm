@@ -75,7 +75,7 @@ def test_overlay_layout(tmp_path, monkeypatch):
     gu.tofile(tmp_path / "L05_gu.bin")
     dn.tofile(tmp_path / "L05_dn.bin")
     path = tmp_path / "o.gguf"
-    Q.write_overlay(tmp_path, path, [5])
+    Q.write_overlay(path, [(5, tmp_path, Q.tqt)])
     b = path.read_bytes()
     assert b[:4] == b"GGUF"
     ver, nt, nkv = (int.from_bytes(b[4:8], "little"), int.from_bytes(b[8:16], "little"), int.from_bytes(b[16:24], "little"))
@@ -165,3 +165,36 @@ def test_tqt2_pack_decode_roundtrip():
     for p in (0, 1, 15, 61, 62, 63):
         w = ((bits | bits << 256) >> (4 * p)) & 0xFFFF
         assert tqt2.windows(st[0, 0])[p] == w
+
+
+def test_overlay_mixed_codecs(tmp_path, monkeypatch):
+    """a 4-bit layer and a 2-bit layer in one overlay: types 306 / 307 and both code tags"""
+    monkeypatch.setattr(Q, "E", 2)
+    monkeypatch.setattr(Q, "D", 256)
+    monkeypatch.setattr(Q, "I", 128)
+    rng = np.random.RandomState(1)
+    for sub, bb in (("enc", 66), ("enc2", 34)):
+        (tmp_path / sub).mkdir()
+        rng.randint(0, 256, (2, 256, 2 * bb), dtype=np.uint8).tofile(tmp_path / sub / "L01_gu.bin")
+        rng.randint(0, 256, (2, 256, 1 * bb), dtype=np.uint8).tofile(tmp_path / sub / "L01_dn.bin")
+    for l, sub in ((1, "enc"),):
+        pass
+    import shutil
+    shutil.copy(tmp_path / "enc2" / "L01_gu.bin", tmp_path / "enc2" / "L02_gu.bin")
+    shutil.copy(tmp_path / "enc2" / "L01_dn.bin", tmp_path / "enc2" / "L02_dn.bin")
+    path = tmp_path / "m.gguf"
+    n = Q.write_overlay(path, [(1, tmp_path / "enc", Q.tqt), (2, tmp_path / "enc2", Q.tqt2)])
+    b = path.read_bytes()
+    assert len(b) == n and b"tqllm.tqt.code" in b and b"tqllm.tqt2.code" in b and b"tqt2-c1-v1" in b
+    assert int.from_bytes(b[16:24], "little") == 3 and int.from_bytes(b[8:16], "little") == 6
+
+
+def test_q8_0_layout_and_error():
+    x = np.random.RandomState(2).randn(3, 64).astype(np.float32)
+    b = np.frombuffer(Q.q8_0(x), np.uint8).reshape(-1, 34)
+    assert b.shape == (6, 34)
+    d = b[:, :2].copy().view("<f2")[:, 0].astype(np.float32)
+    q = b[:, 2:].view(np.int8).astype(np.float32)
+    y = (d[:, None] * q).reshape(3, 64)
+    assert np.abs(y - x).max() <= np.abs(x).reshape(6, 32).max(1).max() / 127 * 0.51 + 1e-3
+    assert (np.abs(q).max(1) == 127).all()
