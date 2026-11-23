@@ -11,6 +11,7 @@
 #include "inkling2_fp4_mma.cuh"
 
 #include <stdexcept>
+#include <string>
 
 namespace tqllm_cuda::inkling2 {
 namespace {
