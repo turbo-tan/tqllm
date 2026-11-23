@@ -276,8 +276,8 @@ void test_experts(int fmt) {
 // (written from the format description: tools/convert/qwen35/tqt.py code_values) un-rotated per 128 (R^-1 = D H / sqrt(128))
 const uint32_t kS1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
 float tqt_sign(int c) { return (kS1[c / 32] >> (c % 32)) & 1u ? -1.0f : 1.0f; }
-void tqt_pair(uint32_t w, float & lo, float & hi) {
-    const uint32_t x = (w * 0x9E3779B1u + 0x7F4A7C15u) << 14, y = (x << 16) | (x >> 16);
+void tqt_pair(uint32_t w, float & lo, float & hi, int L = 18) {
+    const uint32_t x = (w * 0x9E3779B1u + 0x7F4A7C15u) << (32 - L), y = (x << 16) | (x >> 16);
     const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
     const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
     auto f16 = [](uint32_t b) { __half h; std::memcpy(&h, &b, 2); return __half2float(h); };
@@ -295,9 +295,9 @@ void rot128(const float * x, float * y) {  // R x
     fwht128(v);
     for (int c = 0; c < 128; ++c) y[c] = float(v[c] / std::sqrt(128.0));
 }
-void make_bank_tqt(ExpertBank & b, int E, int rows, int cols) {
-    b.m.fmt = 3;
-    const size_t rb = size_t(cols) / 2, nb = size_t(cols) / 128;
+void make_bank_tqt(ExpertBank & b, int E, int rows, int cols, int fmt = 3) {
+    b.m.fmt = fmt;
+    const size_t rb = size_t(cols) / (fmt == 4 ? 4 : 2), nb = size_t(cols) / 128;
     b.m.stride = rb * rows; b.m.aux_stride = nb * 2 * rows;
     b.bytes.resize(b.m.stride * E); b.aux.resize(b.m.aux_stride * E);
     b.w.resize(size_t(E) * rows * cols);
@@ -310,9 +310,16 @@ void make_bank_tqt(ExpertBank & b, int E, int rows, int cols) {
                 std::memcpy(b.aux.data() + e * b.m.aux_stride + (size_t(r) * nb + k) * 2, &sc, 2);
                 double q[128];
                 for (int p = 0; p < 64; ++p) {
-                    const uint8_t * s = row + k * 64;
                     float lo, hi;
-                    tqt_pair((uint32_t(s[p]) | uint32_t(s[(p + 1) & 63]) << 8 | uint32_t(s[(p + 2) & 63]) << 16) & 0x3FFFF, lo, hi);
+                    if (fmt == 4) {
+                        const uint8_t * s = row + k * 32;
+                        uint32_t w = 0;
+                        for (int j = 0; j < 4; ++j) { const int i = (p + j) & 63; w |= uint32_t((s[i >> 1] >> (4 * (i & 1))) & 15) << (4 * j); }
+                        tqt_pair(w, lo, hi, 16);
+                    } else {
+                        const uint8_t * s = row + k * 64;
+                        tqt_pair((uint32_t(s[p]) | uint32_t(s[(p + 1) & 63]) << 8 | uint32_t(s[(p + 2) & 63]) << 16) & 0x3FFFF, lo, hi);
+                    }
                     q[2 * p] = double(lo) * __half2float(sc); q[2 * p + 1] = double(hi) * __half2float(sc);
                 }
                 fwht128(q);
@@ -333,11 +340,11 @@ std::vector<__half> rot_half(const std::vector<float> & x, size_t rows, size_t c
     return o;
 }
 
-void test_experts_tqt() {
+void test_experts_tqt(int fmt) {
     const int E = 16, topk = 8, D = 2304, I = 1152, NMAX = 4;
     const float gc = 4.0f, uc = 25.0f;
     ExpertBank G, U, Dn;
-    make_bank_tqt(G, E, I, D); make_bank_tqt(U, E, I, D); make_bank_tqt(Dn, E, D, I);
+    make_bank_tqt(G, E, I, D, fmt); make_bank_tqt(U, E, I, D, fmt); make_bank_tqt(Dn, E, D, I, fmt);
     {   // the BF16 decode (original basis) against the reference weights, one expert of each stack
         bf16 * dd = nullptr;
         ck(cudaMalloc(&dd, size_t(E) * I * D * 2), "dec");
@@ -346,7 +353,7 @@ void test_experts_tqt() {
         const auto h = from_bf(down(dd, size_t(E) * I * D));
         double worst = 0;
         for (size_t i = 0; i < h.size(); ++i) worst = std::max(worst, std::fabs(h[i] - bf(G.w[i])) / (std::fabs(G.w[i]) + 1e-3));
-        report("experts TQT decode to BF16 (un-rotated)", worst, 1e-2, true);
+        report(fmt == 4 ? "experts TQT2 decode to BF16 (un-rotated)" : "experts TQT decode to BF16 (un-rotated)", worst, 1e-2, true);
         cudaFree(dd);
     }
     const auto X = randv(size_t(NMAX) * D, 1.0f);
@@ -417,8 +424,8 @@ void test_experts_tqt() {
         bit = bit && std::memcmp(a1.data(), act.data() + size_t(t) * topk * I, a1.size() * 4) == 0;
         bit = bit && std::memcmp(o1.data(), out.data() + size_t(t) * D, o1.size() * 4) == 0;
     }
-    report("experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
-    report("experts TQT down + combine", eo, 3e-2, bit);
+    report(fmt == 4 ? "experts TQT2 gate/up + SwiGLU" : "experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
+    report(fmt == 4 ? "experts TQT2 down + combine" : "experts TQT down + combine", eo, 3e-2, bit);
     cudaFree(dxh); cudaFree(dah); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
 }
 
@@ -864,7 +871,8 @@ int main() {
     test_gemv_i8();
     test_experts(2);
     test_experts(1);
-    test_experts_tqt();
+    test_experts_tqt(3);
+    test_experts_tqt(4);
     test_route();
     test_attn_res_capture(1);
     test_attn_res_capture(5);

@@ -229,6 +229,20 @@ struct Inkling2Model::Impl {
             });
             x.m.fmt = 3; x.m.stride = size_t(x.rows) * C / 2; x.m.aux_stride = size_t(x.rows) * nb * 2;
             tqt_experts = true;
+        } else if (t.type == GGML_TQT2) {  // 34 B records (FP16 scale + 32 stream bytes per 128) -> planes [rows][cols / 4] + scales [rows][cols / 128]
+            const size_t nb = C / 128;
+            if (C % 128 || b.size() != R * nb * 34) throw std::runtime_error("inkling2: " + n + " bytes");
+            x.hw = Pinned(R * C / 4); x.ha = Pinned(R * nb * 2);
+            uint8_t * codes = x.hw.as<uint8_t>(), * sc = x.ha.as<uint8_t>();
+            parallel_blocks(int64_t(R), [&](int64_t r) {
+                const auto * row = reinterpret_cast<const uint8_t *>(b.data()) + size_t(r) * nb * 34;
+                for (size_t k = 0; k < nb; ++k) {
+                    std::memcpy(sc + (size_t(r) * nb + k) * 2, row + k * 34, 2);
+                    std::memcpy(codes + size_t(r) * C / 4 + k * 32, row + k * 34 + 2, 32);
+                }
+            });
+            x.m.fmt = 4; x.m.stride = size_t(x.rows) * C / 4; x.m.aux_stride = size_t(x.rows) * nb * 2;
+            tqt_experts = true;
         } else {
             throw std::runtime_error("inkling2: " + n + " expert type " + std::to_string(t.type));
         }
@@ -680,7 +694,7 @@ struct Inkling2Model::Impl {
             ck(cudaMemcpyAsync(route_log->back().data(), eids.p, size_t(n) * topk * 4, cudaMemcpyDeviceToHost, s), "route log");
             ck(cudaStreamSynchronize(s), "route log");
         }
-        if (small && Y.eg.m.fmt == 3) {  // TQT: the weights live in TQ4's rotated basis, so the activations rotate per 128 (FP16)
+        if (small && Y.eg.m.fmt >= 3) {  // TQT: the weights live in TQ4's rotated basis, so the activations rotate per 128 (FP16)
             K::rotate_h(xb.as<bf16>(), xh16.as<__half>(), D, n, s);
             K::expert_gate_up(Y.eg.m, Y.eu.m, I, D, xb.as<bf16>(), eids.as<int>(), act.as<bf16>(), n, topk, gcap, ucap, s, xh16.as<__half>());
             K::rotate_h(act.as<bf16>(), acth16.as<__half>(), I, n * topk, s);
@@ -695,7 +709,7 @@ struct Inkling2Model::Impl {
             const int A = n * topk;
             int * go = gorder.as<int>(), * gc = gcounts.as<int>(), * gf = goffsets.as<int>(), * gt_ = gtile.as<int>();
             K::group_assignments(eids.as<int>(), A, E, go, gc, gf, gt_, s);
-            if (Y.eg.m.fmt == 3) {  // TQT: BF16 copies of the original-basis weights (resident, or this visit's decode), cuBLAS per expert
+            if (Y.eg.m.fmt >= 3) {  // TQT / TQT2: BF16 copies of the original-basis weights (resident, or this visit's decode), cuBLAS per expert
                 const bf16 * Wgu = bf16_experts ? Y.eg.bgu.as<bf16>() : tqt_bgu.as<bf16>(), * Wdn = bf16_experts ? Y.ed.bdn.as<bf16>() : tqt_bdn.as<bf16>();
                 if (!bf16_experts) {
                     K::experts_decode_bf16(Y.eg.m, E, I, D, 2 * I, tqt_bgu.as<bf16>(), s);

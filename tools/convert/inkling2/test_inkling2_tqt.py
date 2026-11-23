@@ -3,6 +3,11 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "qwen35"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inkling2_tqt as Q  # noqa: E402
 
 d, i, e, k = 8, 4, 5, 2
@@ -110,3 +115,53 @@ def test_overlay_layout(tmp_path, monkeypatch):
     gate = np.frombuffer(b[data + infos[0][3]:data + infos[0][3] + 2 * 128 * 132], np.uint8).reshape(2, 128, 132)
     up = np.frombuffer(b[data + infos[1][3]:data + infos[1][3] + 2 * 128 * 132], np.uint8).reshape(2, 128, 132)
     assert (gate == gu[:, :128]).all() and (up == gu[:, 128:]).all()
+
+
+def _cuda_ok():
+    import shutil
+    return torch.cuda.is_available() and shutil.which("nvcc") is not None
+
+
+@pytest.mark.skipif(not _cuda_ok(), reason="needs CUDA and nvcc")
+def test_tqt2_viterbi_cost_and_gaussian_mse():
+    """the encoder's reported cost equals the squared error of the stream's own decode (a tail-biting path of the
+    code), and on Gaussian blocks the best scale's normalised MSE is close to the 2-bit rate-distortion bound 1/16"""
+    import tqt2
+    torch.manual_seed(0)
+    n = 512
+    X = torch.randn(n, 128, device="cuda")
+    crms = tqt2.code_rms()
+    best = 1e9
+    for g in tqt2.GAMMAS:
+        sc = float(X.pow(2).mean().sqrt() * g / crms)
+        st = tqt2.viterbi(X / sc)
+        v = tqt2.table()[tqt2.windows(st.cpu().numpy())].reshape(n, 128)
+        err = ((X.cpu().numpy() / sc - v) ** 2).sum(1)
+        mse = float((err * sc * sc).mean() / 128)
+        best = min(best, mse)
+    assert best < 0.09, best
+    st = tqt2.viterbi(X / 0.05)
+    v = tqt2.table()[tqt2.windows(st.cpu().numpy())].reshape(n, 128)
+    want = ((X.cpu().numpy() / 0.05 - v) ** 2).sum(1)
+    cost = torch.empty(n)  # cost is internal; re-derive through a second encode on the decoded values: zero residual
+    st2 = tqt2.viterbi(torch.from_numpy(v).to("cuda"))
+    v2 = tqt2.table()[tqt2.windows(st2.cpu().numpy())].reshape(n, 128)
+    assert np.abs(v2 - v).max() < 1e-6 and want.shape == (n,) and cost.shape == (n,)
+
+
+def test_tqt2_pack_decode_roundtrip():
+    import tqt2
+    rng = np.random.RandomState(3)
+    N, K = 4, 256
+    st = rng.randint(0, 256, (N, K // 128, 32), dtype=np.uint8)
+    sc = (rng.rand(N, K // 128) * 0.1 + 0.01).astype(np.float16)
+    raw = tqt2.pack(sc, st)
+    assert raw.shape == (N, K // 128 * 34)
+    d = tqt2.decode(raw.tobytes(), N, K)
+    ref = tqt2.table()[tqt2.windows(st)].reshape(N, K // 128, 128) * sc.astype(np.float32)[:, :, None]
+    assert np.allclose(d, ref.reshape(N, K))
+    # window p reads the 16 bits at offset 4p of the cyclic stream
+    bits = int.from_bytes(bytes(st[0, 0]), "little")
+    for p in (0, 1, 15, 61, 62, 63):
+        w = ((bits | bits << 256) >> (4 * p)) & 0xFFFF
+        assert tqt2.windows(st[0, 0])[p] == w

@@ -603,10 +603,45 @@ __global__ void __launch_bounds__(64) decode_tqt_bf16_k(ExpertMat m, int rows, i
     }
 }
 
+// TQT2 (fmt 4): the same block layout as decode_tqt_bf16_k, the stream is 64 nibbles and window p = nibbles p .. p + 3 (mod 64)
+__global__ void __launch_bounds__(64) decode_tqt2_bf16_k(ExpertMat m, int rows, int cols, int ldrows, __nv_bfloat16 * out) {
+    const int b = blockIdx.x, row = blockIdx.y, e = blockIdx.z, t = threadIdx.x;
+    const uint8_t * codes = (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (cols / 4) + size_t(b) * 32;
+    const __half * sc = reinterpret_cast<const __half *>(m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) + b;
+    __shared__ float v[128];
+    uint32_t win = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = (t + j) & 63;
+        win |= uint32_t((codes[i >> 1] >> (4 * (i & 1))) & 0xFu) << (4 * j);
+    }
+    const uint32_t pr = tqllm_cuda::tqtk::pair_win16(win);
+    const float s = __half2float(*sc);
+    const float2 w = __half22float2(*reinterpret_cast<const __half2 *>(&pr));
+    v[2 * t] = w.x * s;
+    v[2 * t + 1] = w.y * s;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int i = (t / h) * 2 * h + t % h;
+        const float a = v[i], c = v[i + h];
+        v[i] = a + c;
+        v[i + h] = a - c;
+        __syncthreads();
+    }
+    __nv_bfloat16 * o = out + (size_t(e) * ldrows + row) * cols + size_t(b) * 128;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int c = t + 64 * j;
+        const float x = v[c] * 0.08838834764831845f;
+        o[c] = __float2bfloat16((kTqtS1[c / 32] >> (c % 32)) & 1u ? -x : x);
+    }
+}
+
 void experts_decode_bf16(const ExpertMat & m, int E, int rows, int cols, int ldrows, __nv_bfloat16 * out, cudaStream_t s) {
     if (rows % BM || cols % BK) throw std::runtime_error("inkling2 experts_decode_bf16: rows % 64 or cols % 64");
-    if (m.fmt == 3) {
-        decode_tqt_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+    if (m.fmt == 3 || m.fmt == 4) {
+        if (m.fmt == 3) decode_tqt_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+        else decode_tqt2_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
         return;
     }
     const dim3 grid(cols / BK, rows / BM, E);

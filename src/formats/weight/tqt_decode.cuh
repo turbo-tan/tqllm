@@ -15,6 +15,13 @@ __device__ __forceinline__ uint32_t pair_win(uint32_t v) {
     const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
     return tqllm_dev::hadd2u((z & 0x8FFF8FFFu) ^ 0x3B603B60u, (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u);
 }
+// the same hash at L = 16 (TQT2, tqt2-c1-v1): the 16-bit window in bits 0-15 of v
+__device__ __forceinline__ uint32_t pair_win16(uint32_t v) {
+    const uint32_t x = v * 0x79B10000u + 0x7C150000u;  // (w * HA + HB) << 16
+    const uint32_t y = __funnelshift_l(x, x, 16);
+    const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
+    return tqllm_dev::hadd2u((z & 0x8FFF8FFFu) ^ 0x3B603B60u, (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u);
+}
 // pair p (0..15) of a segment: E = {x, y, z, w, first word of the next segment}
 __device__ __forceinline__ uint32_t pair(const uint32_t (&E)[5], int p) {
     const int i = p / 4, o = p % 4;

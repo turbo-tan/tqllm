@@ -2,7 +2,7 @@
 // Experts stay in their stored formats: NVFP4 (modelopt, per-expert amax / 2688) as GGML_NVFP4G and MXFP8 as GGML_MXFP8,
 // w13 split into gate (even rows) and up (odd rows). Everything else is BF16 / F32 as stored; the unembedding keeps its
 // first unpadded_vocab_size rows. Reference: transformers PR #51050 (models/inkling2_loop).
-// tqt_experts.gguf in the folder (optional): TQT expert stacks (type 306, tqllm.tqt.code) with the engine names below that
+// tqt_experts.gguf in the folder (optional): TQT / TQT2 expert stacks (types 306 / 307, tqllm.tqt.code / tqllm.tqt2.code) with the engine names below that
 // replace the folder's NVFP4 / MXFP8 stacks layer by layer (a partial file keeps the other layers as stored).
 #include "hf_arch.hpp"
 
@@ -125,12 +125,13 @@ void hf_map_inkling2_loop(const HfFolder & h, GgufFile & f) {
         for (const auto & [name, t] : o.tensors) {
             auto it = T.find(name);
             if (it == T.end() || name.find("_exps.weight") == std::string::npos) throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " is not an expert stack");
-            if (t.type != GGML_TQT || t.ne != it->second.ne) throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " has another type or shape");
+            if ((t.type != GGML_TQT && t.type != GGML_TQT2) || t.ne != it->second.ne) throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " has another type or shape");
             GgufTensor g = t;
             g.file = overlay.string();
             it->second = g;
         }
-        f.kv["tqllm.tqt.code"] = o.kv.at("tqllm.tqt.code");
+        for (const char * k : {"tqllm.tqt.code", "tqllm.tqt2.code"})
+            if (o.kv.count(k)) f.kv[k] = o.kv.at(k);
     }
     f.kv[A + "attention.full_layers"].str = full;
     h.tokenizer(f, "inkling2", vocab);
