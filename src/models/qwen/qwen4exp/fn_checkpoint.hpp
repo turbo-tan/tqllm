@@ -59,11 +59,13 @@ public:
         for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_layer_after_pack(name, layer)) files_[i]->release_tensor(name);
     }
     void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
-    size_t warm_tensors(int threads, double host_ram_bytes) const {
+    size_t warm_tensors(int threads, double host_ram_bytes, double available = 0) const {
         size_t n = 0;
         for (const auto & [name, i] : owners_)
-            if (tqllm::flashnext::warm_at_start(name, double(files_[i]->file().tensors.at(name).bytes), host_ram_bytes))  // the size, not a read
+            if (tqllm::flashnext::warm_at_start(name, double(files_[i]->file().tensors.at(name).bytes), host_ram_bytes, available))  // the size, not a read
                 n += files_[i]->warm_tensor(name, threads);
+            else if (tqllm::flashnext::read_rows_randomly(name, double(files_[i]->file().tensors.at(name).bytes), host_ram_bytes, available))
+                files_[i]->advise_random(name);
         return n;
     }
     Qwen4ExpConfig config;
@@ -149,6 +151,14 @@ public:
         SharedBf16(const Checkpoint & c, const float * x, size_t count, const __nv_bfloat16 * img) : cp(c) { c.bf16_src_ = x; c.bf16_count_ = count; c.bf16_img_ = img; }
         ~SharedBf16() { cp.bf16_src_ = nullptr; cp.bf16_img_ = nullptr; }
     };
+    // decode projections (up to 64 tokens) launch on this stream while an OnStream is alive (a SideBranch); other paths keep the
+    // calling stream
+    mutable cudaStream_t stream_ = nullptr;
+    struct OnStream {
+        const Checkpoint & cp; cudaStream_t prev;
+        OnStream(const Checkpoint & c, cudaStream_t s) : cp(c), prev(c.stream_) { c.stream_ = s; }
+        ~OnStream() { cp.stream_ = prev; }
+    };
     struct SharedInput {
         const Checkpoint & cp; std::unique_ptr<Device<__half>> buf; bool set = false;
         // have: x already converted to FP16 by the caller (same conversion), reused instead of converting again
@@ -222,6 +232,34 @@ public:
             files_.push_back(std::move(m)); has_mtp = true;
         }
         mtp_files_.clear();
+    }
+    // --exact off: the BF16 hyper-connection mixers' down / up (1.26 of ~4.9 GB a decode step reads) requantised to Q8_0 in
+    // memory (llama.cpp's Q8_0 rounding of the same BF16 values); they then take the quantised
+    // mixer path. Returns the tensors replaced.
+    int requant_hc_mixers_q8() {
+        int count = 0;
+        for (const auto & [name, idx] : owners_) {
+            const bool mixer = name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0 &&
+                               (name.find("hc_attn_down") != std::string::npos || name.find("hc_attn_up") != std::string::npos ||
+                                name.find("hc_ffn_down") != std::string::npos || name.find("hc_ffn_up") != std::string::npos ||
+                                name.rfind("output_hc_down", 0) == 0 || name.rfind("output_hc_up", 0) == 0);
+            if (!mixer) continue;
+            auto & f = *files_[idx]; const auto & t = f.file().tensors.at(name);
+            if (t.type != GGML_BF16 || t.ne.empty() || t.ne[0] % 32) continue;
+            const auto raw = f.tensor(name); const size_t n = raw.size / 2;
+            std::vector<char> q(n / 32 * 34);
+            const auto * w = reinterpret_cast<const uint16_t *>(raw.data);
+            for (size_t b = 0; b < n / 32; ++b) {
+                float v[32], amax = 0.f;
+                for (int i = 0; i < 32; ++i) { const uint32_t u = uint32_t(w[b * 32 + i]) << 16; std::memcpy(&v[i], &u, 4); amax = std::max(amax, std::fabs(v[i])); }
+                const float d = amax / 127.f, id = d ? 1.f / d : 0.f;
+                const __half dh = __float2half_rn(d);
+                char * o = q.data() + b * 34; std::memcpy(o, &dh, 2);
+                for (int i = 0; i < 32; ++i) o[2 + i] = char(int8_t(std::lround(v[i] * id)));
+            }
+            f.replace_tensor(name, GGML_Q8_0, std::move(q)); ++count;
+        }
+        return count;
     }
     bool has_mtp = false;
     std::vector<std::unique_ptr<MappedGguf>> mtp_files_;
@@ -338,6 +376,7 @@ public:
         };
         const auto raw = f.tensor(name);
         slot.m = format->load(std::vector<char>(raw.data, raw.data + raw.size), rows, cols, upload, nullptr);
+        if (resident) tqllm::tile_dense(slot.m);  // K6 / K5: tiled loads, same bits
     }
     // a resident weight the FP16 prefill GEMMs read through an FP16 copy: quantised (dequantised), BF16 or F32 (rounded
     // to nearest; mixer weights sit far inside FP16's range)
@@ -426,6 +465,9 @@ public:
         return reinterpret_cast<const __nv_bfloat16 *>(r->mem[0]->p);
     }
     bool is_bf16(const std::string & name) const { return file(name).file().tensors.at(name).type == GGML_BF16; }
+    // a decode projection of `name` (up to 64 tokens) runs project()'s BF16 GEMV kernels on the calling stream: a fused
+    // launch that reproduces those kernels (bit-identical) may take its place
+    bool bf16_gemv(const std::string & name) const { return resident && !exact_f32() && !bf16_act() && !stream_ && is_bf16(name); }
     const float * dense_device(const std::string & name) const {
         auto & d = dense_dev_[name];
         // cached only once uploaded: a first use inside a decode graph capture fails its put (the step reruns plain), and a
@@ -478,6 +520,16 @@ public:
             r->m.fmt->matvec_f32(r->m, input.p + size_t(b) * H, output.p + size_t(b) * V, std::min(step, count - b), nullptr);
         return output.get();
     }
+    // full-vocabulary logits of `count` BF16 rows on the device (the DFlash2 drafter's head), into logits [count][vocab]
+    int vocab_rows() const { return int(head_resident().m.rows); }
+    void head_logits_bf16(const __nv_bfloat16 * rows, int count, float * logits, cudaStream_t s) const {
+        const auto & r = head_resident(); const size_t V = r.m.rows, H = config.hidden;
+        Device<__half> input(size_t(count) * H);
+        tqllm_cuda::bf16_to_h(rows, input.p, int(size_t(count) * H), s);
+        const int step = std::max(1, r.m.fmt->max_matvec_cols());
+        for (int b = 0; b < count; b += step)
+            r.m.fmt->matvec_f32(r.m, input.p + size_t(b) * H, logits + size_t(b) * V, std::min(step, count - b), s);
+    }
     int head_argmax_device(const float * rows, int count) const {
         const auto & r = head_resident();
         const size_t V = r.m.rows;
@@ -521,6 +573,7 @@ public:
                 const void * ptr = buffer->p; r->mem.push_back(std::move(buffer)); return ptr;
             };
             r->m = weight_format(t.type)->load(sub, int(ids->size()), config.hidden, upload, nullptr);
+            tqllm::tile_dense(r->m);
         }
         Device<__half> input(config.hidden); Device<float> output(ids->size());
         tqllm_cuda::vis_f32_to_h(rows + size_t(count - 1) * config.hidden, input.p, config.hidden, nullptr);
@@ -564,6 +617,7 @@ public:
             };
             const auto raw = f.tensor("output.weight");
             r->m = format->load(std::vector<char>(raw.data, raw.data + raw.size), int(t.ne[1]), config.hidden, upload, nullptr);
+            tqllm::tile_dense(r->m);
             if (req_log) std::fprintf(stderr, "tqllm: head_resident: rebuilt in %.0f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
         return *r;
@@ -655,7 +709,7 @@ public:
                     validate_round(x, std::move(values), cols % 256 == 0 && t.type != GGML_IQ4_NL, name);
                 }
             } else {
-                tqllm_cuda::vis_f32_to_h(input, x.p, int64_t(x.count), nullptr);
+                tqllm_cuda::vis_f32_to_h(input, x.p, int64_t(x.count), tokens <= 64 ? stream_ : nullptr);
             }
             // TQFN_PROJ_GEMM (default on): prefill chunks above 64 tokens use the u4h-family GEMM (weights once per 64 tokens);
             // decode, verify and short chunks keep the exact matvec path
@@ -692,7 +746,7 @@ public:
             // projections 32 ms of a 210 ms step on GB10 vs 9 ms for 32 rows (11-07)
             const int step = std::min(tokens, matrix.fmt->max_exact_cols()); require(step > 0, "invalid native matvec width");
             for (int base = 0; base < tokens; base += step)
-                matrix.fmt->matvec_f32(matrix, xp + size_t(base) * cols, output + size_t(base) * rows, std::min(step, tokens - base), nullptr);
+                matrix.fmt->matvec_f32(matrix, xp + size_t(base) * cols, output + size_t(base) * rows, std::min(step, tokens - base), tokens <= 64 ? stream_ : nullptr);
             if (!resident) ck(cudaDeviceSynchronize());
             return;
         }
@@ -707,7 +761,10 @@ public:
                     ck(cudaMemcpy(buffer->p, raw.data, raw.size, cudaMemcpyHostToDevice)); r->mem.push_back(std::move(buffer));
                 }
                 if (cols % 8 == 0 && tokens <= 64) {  // decode, verify blocks and short prefill chunks: one weight read per 4 tokens
-                    tqllm_cuda::fn_gemv_bf16_tokens(reinterpret_cast<const __nv_bfloat16 *>(r->mem[0]->p), input, output, rows, cols, tokens, nullptr);
+                    if (bf16_img_ && bf16_src_ == input && bf16_count_ == size_t(cols) * tokens &&
+                        tqllm_cuda::fn_gemv_bf16x_tokens(reinterpret_cast<const __nv_bfloat16 *>(r->mem[0]->p), bf16_img_, output, rows, cols, tokens, stream_))
+                        return;  // the input's BF16 image (same bits)
+                    tqllm_cuda::fn_gemv_bf16_tokens(reinterpret_cast<const __nv_bfloat16 *>(r->mem[0]->p), input, output, rows, cols, tokens, stream_);
                     return;
                 }
                 const bool have_img = bf16_img_ && bf16_src_ == input && bf16_count_ == size_t(cols) * tokens;

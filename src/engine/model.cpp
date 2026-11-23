@@ -2,6 +2,7 @@
 // every method forwards to it. No backend headers here: CUDA and Metal builds share this file.
 #include "tqllm/model.hpp"
 #include "engine.hpp"
+#include "lockstep.hpp"
 #include "model_impl.hpp"
 #include "registry.hpp"
 
@@ -39,6 +40,11 @@ Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots
     impl_->e = engine->make(w, t, c, slots, o);
     if (!o.lora.empty() && impl_->e->lora_count() != int(o.lora.size()))
         throw std::invalid_argument("--lora: this model's engine does not support runtime LoRA adapters");
+    if (auto ch = impl_->e->lockstep_channel) {  // one rank of --split layer: rank 0 serves, the other follows
+        const int rank = impl_->e->lockstep_rank; std::string load_note = impl_->e->note;
+        impl_->e = std::make_unique<LockstepEngine>(std::move(impl_->e), ch, rank);
+        impl_->e->note = load_note;
+    }
     auto & note = impl_->e->note;
     if (!mode_note.empty()) note = note.empty() ? mode_note : mode_note + " " + note;
 }
@@ -57,6 +63,7 @@ bool Model::kv_idle_pending() const { return impl_->e->kv_idle_pending(); }
 bool Model::kv_idle_step() { return impl_->e->kv_idle_step(); }
 bool Model::has_drafter() const { return impl_->e->has_drafter(); }
 bool Model::native_mtp() const { return impl_->e->native_mtp(); }
+bool Model::adaptive_depth() const { return impl_->e->adaptive_depth(); }
 std::string Model::fit_note() const { return impl_->e->note; }
 void Model::select_slot(int slot) { impl_->e->select_slot(slot); }
 void Model::set_prompt_images(const std::vector<PromptImage> & images) { impl_->e->set_prompt_images(images); }
@@ -72,6 +79,12 @@ void Model::spec_step(const std::vector<int> & slots, std::vector<char> & done) 
 std::vector<uint32_t> Model::spec_finish(uint64_t * stats) { return impl_->e->spec_finish(stats); }
 const std::vector<uint32_t> & Model::spec_tokens(int slot) const { return impl_->e->spec_tokens(slot); }
 uint32_t Model::prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const { return impl_->e->prefix_reuse(slot, prompt); }
+bool Model::share_kept(int slot, const std::vector<uint32_t> & prompt) { select_slot(slot); return impl_->e->share_kept(prompt); }
+std::unique_ptr<StateBlob> Model::export_state(int slot) { return impl_->e->export_state(slot); }
+std::string Model::import_state(int slot, const StateBlob & blob) { return impl_->e->import_state(slot, blob); }
+std::unique_ptr<StateBlob> Model::export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity) { return impl_->e->export_state_for(prompt, entity); }
+std::string Model::adopt_state(StateBlob blob) { return impl_->e->adopt_state(std::move(blob)); }
+void Model::release_state(uint64_t conv) { impl_->e->release_state(conv); }
 bool Model::prefill_ahead(int slot, const std::vector<uint32_t> & prefix) { return impl_->e->prefill_ahead(slot, prefix); }
 int Model::drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) {
     return impl_->e->drafter_features(tokens, feats);

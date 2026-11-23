@@ -32,6 +32,7 @@ public:
     // Start reading [offset, offset + bytes) into the page cache without waiting (MADV_WILLNEED; no-op where unsupported):
     // several scattered rows then fault in together instead of one disk wait after another.
     void prefetch(size_t offset, size_t bytes) const noexcept;
+    void advise_willneed(size_t offset, size_t bytes) const noexcept;  // = prefetch()
 
 private:
     std::string path_;

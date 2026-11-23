@@ -67,6 +67,7 @@ static void advise_range(const char * data, size_t size, size_t offset, size_t b
 }
 void MappedFile::advise_random(size_t offset, size_t bytes) const noexcept { advise_range(data_, size_, offset, bytes, MADV_RANDOM); }
 void MappedFile::prefetch(size_t offset, size_t bytes) const noexcept { advise_range(data_, size_, offset, bytes, MADV_WILLNEED); }
+void MappedFile::advise_willneed(size_t offset, size_t bytes) const noexcept { prefetch(offset, bytes); }
 
 struct ReadFile::Impl { int fd = -1; };
 ReadFile::ReadFile(const std::string & path) : impl_(std::make_unique<Impl>()) {

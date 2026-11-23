@@ -49,6 +49,29 @@ static void route_test() {
         for (int j = 0; j < h; ++j) ref += double(r == e ? shared[j] : w[r * h + j]) * __half2float(x[t * h + j]);
         require(std::abs(got[t * (e + 1) + r] - ref) < 3e-6, "F32 router dot differs from reference");
     }
+    // A verify block routes n tokens in one launch (one block per router row); every logit must equal the single-token
+    // launch bit for bit, or a spec step's routing could differ from plain decode.
+    {
+        const int h2 = 2048, n2 = 19;  // Qwen3.6-35B-A3B width; 19 tokens: two full groups of 8 and a partial one
+        std::vector<float> w2(size_t(e) * h2), s2(h2);
+        std::vector<__half> x2(size_t(n2) * h2);
+        for (int j = 0; j < h2; ++j) {
+            s2[j] = std::sin(float(j) * .7f) * .03f;
+            for (int t = 0; t < n2; ++t) x2[size_t(t) * h2 + j] = __float2half(std::cos(float(j * 13 + t * 7)) * 1.7f);
+            for (int r = 0; r < e; ++r) w2[size_t(r) * h2 + j] = std::sin(float(j * 3 + r * 11)) * .05f;
+        }
+        Device<float> dw2(w2.size()), ds2(h2), all(size_t(n2) * (e + 1)), one(size_t(e) + 1);
+        Device<__half> dx2(x2.size());
+        dw2.put(w2); ds2.put(s2); dx2.put(x2);
+        tqllm_cuda::moe_router(dw2.p, ds2.p, dx2.p, all.p, h2, e, n2, nullptr);
+        const auto multi = all.get(size_t(n2) * (e + 1));
+        for (int t = 0; t < n2; ++t) {
+            tqllm_cuda::moe_router(dw2.p, ds2.p, dx2.p + size_t(t) * h2, one.p, h2, e, 1, nullptr);
+            const auto single = one.get(size_t(e) + 1);
+            require(std::memcmp(single.data(), multi.data() + size_t(t) * (e + 1), single.size() * sizeof(float)) == 0,
+                    "multi-token router logits differ from the single-token launch");
+        }
+    }
     // Ties, extreme finite logits, and nontrivial ordinary rows.
     for (int r = 0; r < e; ++r) got[r] = 0.f;
     for (int r = 0; r < e; ++r) got[e + 1 + r] = r == 99 ? 10000.f : -10000.f;
@@ -669,9 +692,35 @@ static void fused_shared_test() {
     std::printf("fused shared expert: widened ids and strided sum == moe_sum, bit-identical\n");
 }
 
+// moe_skip_weights: skipped assignments get 0; without renorm the others are bit-identical, with renorm each token's sum
+// is unchanged (top-k weights sum to the router scale)
+static void skip_weights_test() {
+    const int n = 3, k = 4;
+    const std::vector<float> w = {.4f, .3f, .2f, .1f, .25f, .25f, .25f, .25f, .7f, .1f, .1f, .1f};
+    const std::vector<int> m = {0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1};
+    for (bool renorm : {false, true}) {
+        Device<float> dw(w.size()); Device<int> dm(m.size()); dw.put(w); dm.put(m);
+        tqllm_cuda::moe_skip_weights(dw.p, dm.p, n, k, renorm, nullptr);
+        const auto o = dw.get(w.size());
+        for (int t = 0; t < n; ++t) {
+            float before = 0, after = 0, kept = 0;
+            for (int i = 0; i < k; ++i) { before += w[t * k + i]; after += o[t * k + i]; if (!m[t * k + i]) kept += w[t * k + i]; }
+            for (int i = 0; i < k; ++i) {
+                const float v = o[t * k + i], x = w[t * k + i];
+                if (m[t * k + i]) require(v == 0.f, "skip_weights: a skipped weight is not 0");
+                else if (!renorm) require(std::memcmp(&v, &x, 4) == 0, "skip_weights: a kept weight changed without renorm");
+                else require(std::fabs(v - x * before / kept) < 1e-6f, "skip_weights: renorm scale");
+            }
+            if (renorm) require(std::fabs(after - before) < 1e-6f, "skip_weights: renorm keeps the token's sum");
+        }
+    }
+    std::printf("skip weights: zero (others bit-identical) and renorm (sum kept)\n");
+}
+
 int main() {
     try {
         fused_shared_test();
+        skip_weights_test();
         route_test();
         // Decode (grouped matvec) and prefill (grouped GEMM) for every format with grouped-expert
         // support -- not just the three that were wired first.

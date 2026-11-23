@@ -15,13 +15,13 @@ int main(int argc, char ** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 200;
     struct Shape { int rows, cols; const char * what; };
     const Shape shapes[] = {{10240, 2560, "GDN qkv"}, {6144, 2560, "GDN gate z"}, {2560, 6144, "GDN out"},
-                            {12288, 2560, "attn q"}, {640, 2560, "shared gate/up"}, {2560, 640, "shared down"}};
-    const uint32_t types[] = {14 /* Q6_K */, 12 /* Q4_K */, 23 /* IQ4_XS */, 20 /* IQ4_NL */, 3 /* Q4_1 */};
+                            {12288, 2560, "attn q"}, {640, 2560, "shared gate/up"}, {2560, 640, "shared down"}, {10240, 320, "hc up"}, {320, 10240, "hc down"}};
+    const uint32_t types[] = {13 /* Q5_K */, 8 /* Q8_0 */, 14 /* Q6_K */, 12 /* Q4_K */, 23 /* IQ4_XS */, 20 /* IQ4_NL */};
     std::mt19937 rng(1);
     __half * dx; float * dy; cudaMalloc(&dx, size_t(12288) * 32 * 2); cudaMalloc(&dy, size_t(12288) * 32 * 4);
     std::vector<__half> xh(size_t(12288) * 32, __float2half(0.01f)); cudaMemcpy(dx, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice);
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    std::printf("%-16s %-8s", "shape", "format"); for (int n : {1, 4, 8, 16, 32}) std::printf("  n=%d us   GB/s", n); std::printf("\n");
+    std::printf("%-16s %-8s", "shape", "format"); for (int n : {1, 4, 8, 16, 24, 32}) std::printf("  n=%d us   GB/s", n); std::printf("\n");
     for (const auto & sh : shapes)
         for (uint32_t ty : types) {
             const auto * f = weight_format(ty); if (!f) continue;
@@ -37,7 +37,7 @@ int main(int argc, char ** argv) {
             const Mat & m = ms[0];
             const double bytes = double(m.fmt->row_bytes(sh.cols) + m.fmt->aux_row_bytes(sh.cols)) * sh.rows;
             std::printf("%-16s %-8s", sh.what, f->name());
-            for (int n : {1, 4, 8, 16, 32}) {
+            for (int n : {1, 4, 8, 16, 24, 32}) {
                 for (int i = 0; i < 10; ++i) ms[size_t(i) % ms.size()].fmt->matvec_f32(ms[size_t(i) % ms.size()], dx, dy, n, nullptr);
                 cudaEventRecord(a);
                 for (int i = 0; i < iters; ++i) { const Mat & mi = ms[size_t(i) % ms.size()]; mi.fmt->matvec_f32(mi, dx, dy, n, nullptr); }

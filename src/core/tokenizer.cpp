@@ -82,7 +82,7 @@ void Tokenizer::load_gguf(const std::string & path) {
         return it->second;
     };
     const auto & pre = key("tokenizer.ggml.pre").str;
-    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35" && pre != "minimax-m3" && pre != "glm4"))
+    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35" && pre != "minimax-m3" && pre != "inkling2" && pre != "glm4"))
         throw std::runtime_error("GGUF tokenizer differs from the implemented Qwen byte-level BPE (pre " + pre + "); pass --tokenizer");
     const auto & tokens = key("tokenizer.ggml.tokens").strs;
     const auto & types = key("tokenizer.ggml.token_type").arr;
@@ -109,7 +109,7 @@ void Tokenizer::load_gguf(const std::string & path) {
     if (g.has("tokenizer.ggml.eom_token_id")) eom_id_ = uint32_t(g.num("tokenizer.ggml.eom_token_id"));
     unicode_ranges_.assign(std::begin(ranges), std::end(ranges));
     marks_in_letters_ = pre == "qwen35";
-    o200k_ = pre == "minimax-m3";
+    o200k_ = pre == "minimax-m3" || pre == "inkling2";  // Inkling-2's tokenizer.json Split regex is the same (Isolated, ByteLevel without its own)
     digits3_ = pre == "glm4";
     static const std::tuple<uint32_t, uint32_t, uint8_t> cases[] = {
 #include "unicode_case_ranges.inc"

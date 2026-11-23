@@ -8,6 +8,9 @@
 // flight.
 #include "decode_rules.hpp"
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -21,6 +24,7 @@ class DecodeGraphs {
     struct Slot { cudaGraphExec_t exec = nullptr; cudaEvent_t done = nullptr; };
     GraphWarmup warm_;
     std::map<Key, std::vector<Slot>> pools_;
+    size_t launched_ = 0, instantiated_ = 0;
     static void ck(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(std::string("decode graphs: ") + cudaGetErrorString(e)); }
 public:
     static constexpr size_t kExecsPerShape = 8;
@@ -39,8 +43,12 @@ public:
             cudaGraphExecUpdateResultInfo info;
             if (cudaGraphExecUpdate(slot->exec, cg, &info) != cudaSuccess) { cudaGetLastError(); ck(cudaGraphExecDestroy(slot->exec)); slot->exec = nullptr; }
         }
-        if (!slot->exec) ck(cudaGraphInstantiate(&slot->exec, cg, 0));
+        if (!slot->exec) { ck(cudaGraphInstantiate(&slot->exec, cg, 0)); ++instantiated_; }
         ck(cudaGraphDestroy(cg));
+        // TQLLM_DEBUG=graphs: launches and instantiations (an exec that cannot be updated in place is built again)
+        static const bool log = std::getenv("TQLLM_DEBUG") && std::strstr(std::getenv("TQLLM_DEBUG"), "graphs");
+        if (log && ++launched_ % 4096 == 0)
+            std::fprintf(stderr, "tqllm: decode graphs: %zu launches, %zu instantiated, %zu execs\n", launched_, instantiated_, execs());
         ck(cudaGraphLaunch(slot->exec, stream));
         ck(cudaEventRecord(slot->done, stream));
     }
@@ -57,6 +65,7 @@ public:
     }
     size_t execs() const { size_t k = 0; for (const auto & [key, pool] : pools_) for (const auto & g : pool) k += g.exec != nullptr; return k; }
     size_t warm_entries() const { return warm_.size(); }
+    size_t instantiated() const { return instantiated_; }
 };
 
 }  // namespace tqllm::flashnext

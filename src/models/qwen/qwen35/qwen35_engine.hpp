@@ -78,7 +78,7 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 #include "token_sampling.hpp"
 #include "head_sampler.hpp"
 #include "layer_split.hpp"
-#include "../../../kv/prompt_park.hpp"
+#include "../../../kv/conversation_state.hpp"
 #include "tp_comm.hpp"
 #include "qwen35_rules.hpp"
 namespace tqllm {
@@ -90,7 +90,7 @@ public:
     // `tp` (--split layer): this process is one rank of a layer split; it loads and runs only its own layers
     Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o,
                  std::shared_ptr<TpComm> tp = nullptr)
-        : opt(o), context_(ctx), tp_(std::move(tp)) {
+        : opt(o), context_(ctx), tp_(std::move(tp)), model_path_(path) {
         glru.set_cap(size_t(std::max(1, opt.graph_cache)));
         graph_keep = size_t(std::max(0L, opt.graph_keep_mb)) << 20;
         if (slots < 1 || slots > 64) throw std::invalid_argument("slots must be in 1..64");
@@ -112,12 +112,15 @@ public:
             if (cfg.hidden % 256) throw std::invalid_argument("--split layer: hidden size must be a multiple of 256");
             std::fprintf(stderr, "tqllm: --split layer: rank %d of %d runs layers %u..%u of %u\n", tp_->rank(), tp_->world(),
                          lr_.lo, lr_.hi - 1, cfg.layers);
+            for (int r = 0; r < tp_->world(); ++r) ranges_.push_back(layer_range(cfg.layers, r, tp_->world(), opt.split_at));
+            head_only_ = slots == 1;  // before any graph is captured: it decides what verify_body sends and runs
+            last_rank_ = tp_->rank() == tp_->world() - 1;
         }
         ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         set_rope();
         try {
             tokenizer.load(tokpath);
-            eos_ = tokenizer.eos_id();
+            eos_ = stop_ = tokenizer.eos_id();
             im_start_ = tokenizer.special_id("<|im_start|>");
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
@@ -144,7 +147,9 @@ public:
             calibrate_prefill();
             smooth_prebuild();
             memlog("calibrate");
-            pc_on = opt.prompt_cache || (kv_cmp && slots == 1);  // several slots: each keeps its own conversation
+            // several slots: each keeps its own conversation; on by default there (owner 11-18: race in the competitor's
+            // setup, cache on; GB10 32K x 8 shared prefix read nothing again without --prompt-cache on)
+            pc_on = opt.prompt_cache_set ? opt.prompt_cache : (slots > 1 || kv_cmp);
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
             parked.resize(size_t(slots));
             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
@@ -183,6 +188,8 @@ public:
     uint32_t hidden() const override { return cfg.hidden; }
     uint32_t vocab() const override { return cfg.vocab; }
     uint32_t eos() const override { return eos_; }
+    // ignore_eos: decode to max_tokens through end-of-sequence tokens (no token id is UINT32_MAX)
+    void set_ignore_eos(bool on) override { stop_ = on ? UINT32_MAX : eos_; }
     uint32_t context() const override { return context_; }
     size_t kv_token_bytes() const override { return size_t(nslots) * kv_pool_layers() * size_t(kv_row_bytes(true) + kv_row_bytes(false)); }
     size_t kv_host_bytes() const override { return kv_pool ? kv_pool->bytes(KvTier::host) : 0; }
@@ -199,8 +206,8 @@ public:
         cmp_pos = 0, ring_used = 0;
         cmp_upload();
     }
-    void pc_drop() { pc_live = false, pc_snap = 0; }
-    void pc_copy(bool save);
+    void pc_drop() { pc_live = false, pc_snap = 0, pc_sys = 0; }
+    void pc_copy(bool save, bool sys = false);
     // cache positions of prompt that can be kept (the recurrent state is set to match); the rest is prefilled
     uint32_t pc_match(const std::vector<uint32_t> & prompt);
     // prompt tokens slot s would keep (no state change): the scheduler sends an agent's next turn to its slot
@@ -212,20 +219,25 @@ public:
         if (live && shared(uint32_t(seq.size()))) return uint32_t(seq.size());
         return shared(snap) ? snap : 0;
     }
+    // with the system-message state too: the longer of the two that the prompt shares
+    static uint32_t pc_shared(const std::vector<uint32_t> & seq, bool live, uint32_t snap, uint32_t sys, const std::vector<uint32_t> & prompt) {
+        return std::max(pc_shared(seq, live, snap, prompt), pc_shared(seq, false, sys, prompt));
+    }
     // A failed request (tqserve): its slot's prompt cache may name tokens whose K/V or recurrent state a skipped kernel
     // never wrote, so nothing of it is reused; the slot's next request prefills from position 0
     void spec_abort(int s) override {
         if (s < 0 || s >= nslots) return;
         if (s == active) { pc_drop(); pc_seq.clear(); }
-        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); }
+        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_sys = 0; p.pc_seq.clear(); }
     }
+    bool share_kept(const std::vector<uint32_t> & prompt) override;
     int lora_count() const override { return lora_n; }
     void set_lora(const std::vector<float> & scales) override;
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
         if (!pc_on || s < 0 || s >= nslots) return 0;
-        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt)
+        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, prompt)
                                          : pc_shared(parked[size_t(s)].pc_seq, parked[size_t(s)].pc_live && !opt.exact,
-                                                     parked[size_t(s)].pc_snap, prompt);
+                                                     parked[size_t(s)].pc_snap, parked[size_t(s)].pc_sys, prompt);
         return std::max(own, park_best(prompt, nullptr));  // a parked state resumes in any slot
     }
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
@@ -233,7 +245,7 @@ public:
 private:
     Config cfg;
     const EngineOptions opt;
-    uint32_t context_, eos_ = 0;
+    uint32_t context_, eos_ = 0, stop_ = 0;  // stop_: the token that ends a reply (eos_, or none with ignore_eos)
     cudaStream_t stream{};
     cudaStream_t side{};                // parallel branch for small independent matvecs (GDN b / a), graph-captured
     cudaEvent_t ev_fork{}, ev_join{};
@@ -263,10 +275,30 @@ private:
     std::vector<Layer> layer;  // full size; a --split layer rank loads only lr_ (the others stay empty)
     std::shared_ptr<TpComm> tp_;
     LayerRange lr_;
-    // --split layer: hidden rows [n][H], their sum-of-squares partials and the drafter features cross the boundary;
-    // the last rank sends its final rows back, so every rank runs the same head and drafter on the same rows
-    void split_enter(bf16 * X, int n);
-    void split_leave(bf16 * X, int n);
+    // --split layer: hidden rows [n][H] and their sum-of-squares partials cross the boundary, each DFlash2 target layer's
+    // rows go from the rank that owns it; the ops are qwen35::split_step_ops (tests/qwen35_rules.cpp). With one sequence
+    // (head_only_) the head, MTP, drafter and sampling run on the last rank, which sends the block to verify and the picked
+    // tokens (from_last); otherwise (--np > 1, rows_all) the last rank's rows go back to every rank and all run the head.
+    std::vector<LayerRange> ranges_;  // every rank's
+    bool head_only_ = false, last_rank_ = true;
+    bool rows_all = false;  // this forward's head output is read on every rank (Engine::verify, step, drafter_features)
+    // the forward sends no feature rows: a head_only decode step (feats_to_last after the picks), or a prefill chunk whose
+    // rows the drafter's K/V ring never holds
+    bool feat_none = false;
+    Buf d_ctl;              // from_last's message
+    qwen35::HeadPlan split_head(qwen35::SplitStep s) const {
+        return tp_ ? qwen35::head_plan(s, tp_->rank(), tp_->world(), head_only_) : qwen35::HeadPlan{};
+    }
+    // the trunk ops before (`after` false) or after this rank's layers
+    void split_trunk(bf16 * X, int n, bool after);
+    // head_only decode: the first `rows` columns of each target layer's features, owner -> last rank (after the picks)
+    void feats_to_last(int rows);
+    // the last rank's ints on every rank (blocks to verify, picked tokens); the other ranks wait for them
+    void from_last(std::vector<uint32_t> & v);
+    // tree step: the last rank's n tree columns (tokens, parents, depths on the device) on every rank; returns n
+    int tree_from_last(int n);
+    // one verify forward for the spec loop: under head_only_ the head output is on the last rank only
+    void verify_tokens(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next);
     int split_min(int v);  // the smallest of every rank's v (sizes taken from free memory must agree)
     std::unique_ptr<KvMemory> kv_mem;  // declared before every KvStore so stores return their pages first
     std::unique_ptr<KvPool> kv_pool;
@@ -288,28 +320,45 @@ private:
     // holds the state at pc_snap, a prefill chunk boundary kTail tokens before the last prompt's end, for a prompt that
     // shares only that much (a chat template re-renders the previous answer without its think tags).
     static constexpr uint32_t kTail = 64;
+    static constexpr uint32_t kSysKeep = 4096;  // a system message this long keeps its own state (kept_state_sys)
     bool pc_on = false, pc_live = false;
     uint32_t pc_snap = 0;
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
+    // a second kept state at the end of a long system message (prefill_chunk.hpp kept_state_sys): requests that share the
+    // system prompt but not the user message resume there (GB10 27B, 8 x 32K system prompt: each read it again)
+    uint32_t pc_sys = 0;
+    std::unique_ptr<HostBuf> pc_sys_host;
     uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
+    std::set<uint64_t> shared_convs_;  // park entries lent by share_kept: a resume copies them and leaves them parked
     uint32_t im_start_ = ~0u;  // the chat template's message-start token (prefill chunks restart there)
-    // kept states parked outside the slots (PromptPark, the TPark rules): a slot handed to another conversation parks its
-    // kept state (KV rows [0, snap) of this rank's attention layers + the recurrent state at snap); the next turn of that
-    // conversation picks it up into whichever slot it gets
-    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0;
-                       std::vector<float> lora; };  // lora: the LoRA scales the state was built with
+    // kept states parked outside the slots (ConversationStateStore "local": the prompt park's rules): a slot handed to another
+    // conversation parks its kept state (KV rows [0, snap) of this rank's attention layers + the drafter's K/V in one part, the
+    // recurrent state at snap in another); the next turn of that conversation picks it up into whichever slot it gets
     // the drafter's K/V rows that go with a kept state: its whole ring, else positions [0, snap)
     size_t dfl_park_bytes(uint32_t snap) const {
         if (!dfl.present || dfl_kc.empty()) return 0;
         return size_t(dfl.ring ? uint32_t(dfl.ring) : snap) * size_t(dfl.kvheads) * dfl.hd * 2;
     }
-    std::unique_ptr<PromptPark> park_;
-    std::vector<ParkSpace> park_sp_;
+    // a part's host buffer: handed back to the engine (get_deleter) or, when the store drops it, to park_pool_ (KV) / freed
+    struct ParkBuf { size_t cap = 0; std::unique_ptr<HostBuf> buf; };
+    using ParkPool = std::vector<ParkBuf>;
+    struct ParkOwn {
+        HostBuf * buf = nullptr; size_t cap = 0; std::shared_ptr<ParkPool> pool;
+        void operator()(void *) { if (!buf) return; if (pool) pool->push_back({cap, std::unique_ptr<HostBuf>(buf)}); else delete buf; buf = nullptr; }
+    };
+    std::unique_ptr<ConversationStateStore> park_;
+    std::shared_ptr<ParkPool> park_pool_ = std::make_shared<ParkPool>();  // KV buffers of dropped states, reused by park_out
+    std::string model_path_;
+    std::string state_layout(uint32_t snap) const;
+    std::string lora_layout() const;  // "|lora=s0,s1,..." when runtime LoRA adapters are loaded, else empty
+    size_t kept_kv_bytes(uint32_t snap) const;
+    std::unique_ptr<StateBlob> kept_blob(bool move_state, bool sys = false);  // the active slot's kept state (sys: the system-message one); move_state: pc_host goes into it
+    void restore_kept(StateBlob & b, bool take_state);       // into the active slot; take_state: its pc_host part is taken back
     void park_init(int slots);
     void park_out();
     void park_swap(const std::vector<uint32_t> & prompt);
-    uint32_t park_best(const std::vector<uint32_t> & prompt, int * where) const;
+    uint32_t park_best(const std::vector<uint32_t> & prompt, uint64_t * conv) const;
     std::vector<Buf> q_ring, cmp_k, cmp_v, cmp_b;
     std::vector<tqllm_cuda::KvCompactSeg> cmp_seg;
     Buf d_cmp_i, d_stage_off, cmp_scratch, cmp_split;  // d_cmp_i: [start position, stand-in rows]; d_stage_off: [K, V] bytes
@@ -519,6 +568,8 @@ private:
     Buf v_x, v_m, v_r, v_np, v_in, v_o, v_core, v_act, v_xh, v_xf, v_px, v_pm, v_logits, v_tok, v_amax, v_q, v_qkvc, v_part;
     Buf moe_counts, moe_groups;
     Buf moe_logits, moe_ids, moe_weights, moe_shared_weights, moe_gate, moe_up, moe_act, moe_out, moe_shared;
+    static constexpr int kMoeDedupMax = 1024;  // assignments per moe_dedup_maps call
+    Buf moe_iota, moe_dgu, moe_ddn;            // verify-block dedup: identity slot map, gate/up and down group maps
     Buf moe_hot_ids, moe_cold_ids, moe_counts2, moe_groups2;  // --moe-host-mb split
     Buf moe_xids;  // decode ids widened by the fused shared expert (no split)
     // --moe-host-mb decode: routed cold experts copied to the device (gate, up, down; weights and scales) before their
@@ -542,6 +593,7 @@ private:
     void alloc_moe_stage();
     Buf moe_prof; std::string moe_prof_path;  // TQLLM_DEBUG=moe_profile: routing counts [L][E]
     void moe_profile_write();
+    void moe_dump(long layer, const char * what, const void * dev, size_t bytes, int n);
     // per Gated DeltaNet layer: [n][mix rows] projected inputs of a verify (replayed at commit), double-buffered so a
     // deferred commit (tree mode) can replay the previous step's path while the next verify writes the other buffer
     std::vector<Buf> v_stash2[2];
@@ -621,6 +673,8 @@ private:
         uint32_t pc_snap = 0;
         std::vector<uint32_t> pc_seq;
         std::unique_ptr<HostBuf> pc_host;
+        uint32_t pc_sys = 0;
+        std::unique_ptr<HostBuf> pc_sys_host;
         uint64_t pc_conv = 0;
     };
     std::vector<SeqState> parked;  // parked[s] holds slot s while it is not active
@@ -685,6 +739,8 @@ private:
     Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > NVER): run the LM head only on the final chunk
     Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_inj_g, d_inj_kv,
         d_topk;
+    Buf dd_t, dd_act, dd_q, dd_o, dd_part;  // DFlash2 drafter block scratch at the drafter's widths
+    size_t xh_cols = 0;  // columns per row of v_xh
     Buf dfl_part, ds_t, ds_act, ds_q, ds_o;  // DSpark drafter attention partials and block scratch
     uint32_t * h_tok = nullptr;  // pinned staging for the graph inputs
     int * h_pos = nullptr;
@@ -923,7 +979,8 @@ public:
         // captured graphs bake in the slot's cache and state pointers, so the slot is part of the key
         const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > NVER && prefill_final) << 63) |
                              (uint64_t(sampling()) << 62) | (uint64_t(active) << 54) | (uint64_t(tree_step) << 53) |
-                             (uint64_t(sp) << 52) | (uint64_t(qsa.mode) << 50);
+                             (uint64_t(sp) << 52) | (uint64_t(qsa.mode) << 50) | (uint64_t(rows_all) << 61) |
+                             (uint64_t(feat_none) << 46);
         if (qsa.mode && qsa.mass_left > 0) {
             verify_body(n, int(bucket));
         } else if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
@@ -1178,7 +1235,7 @@ public:
         ck(cudaMemcpyAsync(d_pos.p, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
         auto body = [&] {
             auto *X = d_x.as<bf16>(), *R = d_r.as<bf16>(), *A = d_a.as<bf16>(), *Bb = d_b.as<bf16>();
-            auto *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *Q = v_q.as<bf16>(), *ACT = v_act.as<bf16>();
+            auto *T = dd_t.as<bf16>(), *O = dd_o.as<bf16>(), *Q = dd_q.as<bf16>(), *ACT = dd_act.as<bf16>();
             auto *DYN = d_dyn.as<bf16>(), *DYNF = d_dynf.as<bf16>();
             const int * dp = d_pos.as<int>();
             embed_multi(d_tok.as<uint32_t>(), DB, X);
@@ -1209,7 +1266,7 @@ public:
                     bf16 *kc = dkc_of(sl)[l].as<bf16>(), *vc = dvc_of(sl)[l].as<bf16>();
                     tqllm_cuda::cache_write_multi(Ki, Ki + kd, rows, B, kc, vc, dp + 2 * i, dfl.kvheads, dfl.hd, stream,
                                                   dfl.ring);
-                    tqllm_cuda::attention_gen128(Qi, kc, vc, Oi, dfl.dspine ? sp_part.as<float>() : v_part.as<float>(), dp + 2 * i, B, int(context_),
+                    tqllm_cuda::attention_gen128(Qi, kc, vc, Oi, dfl.dspine ? sp_part.as<float>() : dd_part.as<float>(), dp + 2 * i, B, int(context_),
                                                  dfl.heads, dfl.kvheads, 1.f / std::sqrt(float(dfl.hd)), dfl.dspine,
                                                  dfl.window, stream, dfl.ring);
                 }
@@ -1220,7 +1277,7 @@ public:
                 if (!dfl.dspine) mmx(L.conv_ffn, A, DYNF, DB);
                 conv(A, DYNF, L.ffn_conv_base, 0, X);
                 mmx(L.w_gu, X, T, DB);
-                tqllm_cuda::swiglu_multi(T, DB, int(cfg.ffn), ACT, stream);
+                tqllm_cuda::swiglu_multi(T, DB, dfl.ffn, ACT, stream);
                 mmx(L.down, ACT, A, DB);
                 conv(A, DYNF, L.ffn_conv_base, 1, X);
                 tqllm_cuda::residual(X, Bb, DB * H, stream);
@@ -1322,7 +1379,7 @@ public:
             return;
         }
         auto *X = d_x.as<bf16>(), *R = d_r.as<bf16>(), *A = d_a.as<bf16>(), *Bb = d_b.as<bf16>();
-        auto *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *Q = v_q.as<bf16>(), *ACT = v_act.as<bf16>();
+        auto *T = dd_t.as<bf16>(), *O = dd_o.as<bf16>(), *Q = dd_q.as<bf16>(), *ACT = dd_act.as<bf16>();
         auto *DYN = d_dyn.as<bf16>(), *DYNF = d_dynf.as<bf16>();
         embed_multi(d_tok.as<uint32_t>(), B, X);
         uint32_t bucket = 256;
@@ -1357,11 +1414,11 @@ public:
                     ck(cudaMemcpyAsync(dfl_rpos.p, &retr_vpos, sizeof(int), cudaMemcpyHostToDevice, stream));
                 }
                 const int rows = rr + dfl.recent + B;
-                tqllm_cuda::attention_gen128(Q, dfl_rk.as<bf16>(), dfl_rv.as<bf16>(), O, v_part.as<float>(), dfl_rpos.as<int>(), B,
+                tqllm_cuda::attention_gen128(Q, dfl_rk.as<bf16>(), dfl_rv.as<bf16>(), O, dd_part.as<float>(), dfl_rpos.as<int>(), B,
                                              (rows + 63) / 64 * 64, dfl.heads, dfl.kvheads, 1.f / std::sqrt(float(dfl.hd)),
                                              false, rows, stream, 0);
             } else {
-                tqllm_cuda::attention_gen128(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), O, dfl.dspine ? sp_part.as<float>() : v_part.as<float>(),
+                tqllm_cuda::attention_gen128(Q, dfl_kc[l].as<bf16>(), dfl_vc[l].as<bf16>(), O, dfl.dspine ? sp_part.as<float>() : dd_part.as<float>(),
                                              d_pos.as<int>(), B, int(bucket), dfl.heads, dfl.kvheads,
                                              1.f / std::sqrt(float(dfl.hd)), dfl.dspine, dfl.window, stream, dfl.ring);
             }
@@ -1374,7 +1431,7 @@ public:
             if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
             else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 0, X, B, H, dfl.group, stream);
             mmx(L.w_gu, X, T, B);
-            tqllm_cuda::swiglu_multi(T, B, int(cfg.ffn), ACT, stream);
+            tqllm_cuda::swiglu_multi(T, B, dfl.ffn, ACT, stream);
             mmx(L.down, ACT, A, B);
             if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
             else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 1, X, B, H, dfl.group, stream);
@@ -1543,7 +1600,7 @@ public:
             bool hit_eos = false;
             for (int i = 1; i <= j && gen.out.size() < gen.count; ++i) {
                 gen.out.push_back(in[size_t(c0 + path[size_t(i)])]);
-                hit_eos |= in[size_t(c0 + path[size_t(i)])] == eos_;
+                hit_eos |= in[size_t(c0 + path[size_t(i)])] == stop_;
             }
             const uint32_t bonus = res[size_t(c0 + path.back())];
             if (gen.out.size() < gen.count) gen.out.push_back(bonus);
@@ -1582,7 +1639,7 @@ public:
             dflash_inject(v_feat.as<bf16>() + size_t(c0) * nf * H, j + 1, gen.pos);
             gen.pending = bonus;
             gen.pos += uint32_t(j + 1);
-            if (hit_eos || gen.out.size() >= gen.count || gen.pending == eos_) gen.done = true;
+            if (hit_eos || gen.out.size() >= gen.count || gen.pending == stop_) gen.done = true;
         }
         for (int i = 0; i < ns; ++i) {
             select_slot(slots[i]);
@@ -1627,6 +1684,12 @@ public:
     bool has_drafter() const override { return dfl.present; }
     bool native_mtp() const override { return opt.native_mtp && mtp.present && !dfl.present; }  // MTP only (no -md)
     void select_slot(int s) override;
+    // the slot's kept state (the prompt park's parts) as a conversation state blob, and back into a slot (qwen35_forward.cpp)
+    std::unique_ptr<StateBlob> export_state(int slot) override;
+    std::string import_state(int slot, const StateBlob & blob) override;
+    std::unique_ptr<StateBlob> export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity) override;
+    std::string adopt_state(StateBlob blob) override;
+    void release_state(uint64_t conv) override;
     // Without the DFlash drafter every step verifies one token per slot (verify-path numerics, batched over slots).
     void set_prompt_images(const std::vector<PromptImage> & ims) override;
     bool mtp_advance();
@@ -1687,7 +1750,7 @@ public:
         uint64_t steps = 0, drafted = 0, accepted = 0;
         uint32_t pos = P, pending = next;
         std::vector<uint32_t> in, res(NVER);
-        while (out.size() < count && pending != eos_) {
+        while (out.size() < count && pending != stop_) {
             while (int(draft.size()) < D) draft.push_back(mtp_run(&draft.back(), nullptr, 1, pos + uint32_t(draft.size())));
             in.assign(1, pending);
             in.insert(in.end(), draft.begin(), draft.end());
@@ -1705,7 +1768,7 @@ public:
             mt.push_back(res[j]);
             pending = res[j];
             pos += uint32_t(j + 1);
-            if (std::find(out.end() - (j + 1 < int(out.size()) ? j + 1 : int(out.size())), out.end(), eos_) != out.end())
+            if (std::find(out.end() - (j + 1 < int(out.size()) ? j + 1 : int(out.size())), out.end(), stop_) != out.end())
                 break;
             draft.assign(1, mtp_run(mt.data(), verify_hidden(), int(mt.size()), pos));
         }

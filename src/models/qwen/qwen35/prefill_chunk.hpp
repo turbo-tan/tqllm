@@ -48,6 +48,14 @@ inline uint32_t kept_state_msg(const std::vector<uint32_t> & starts, uint32_t pr
     const uint32_t last = *(it - 1);
     return last > from ? last : 0;
 }
+// A second kept state at the end of the first message when that message (the system prompt) is long: requests that share
+// it but not the user message resume there instead of reading it again. 0: no message start, the first message is
+// shorter than `min_tokens`, or the prefill resumes at or past it, or it is the last-message state already.
+inline uint32_t kept_state_sys(const std::vector<uint32_t> & starts, uint32_t prompt, uint32_t from, uint32_t snap, uint32_t min_tokens) {
+    if (starts.empty() || starts[0] >= prompt) return 0;
+    const uint32_t end = starts[0];
+    return end >= min_tokens && end > from && end != snap ? end : 0;
+}
 inline uint32_t kept_state_at(uint32_t prompt, uint32_t from, uint32_t chunk, uint32_t tail) {
     if (chunk == 0 || prompt < tail) return 0;
     const uint32_t grid = (prompt - tail) / chunk * chunk;

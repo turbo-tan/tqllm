@@ -19,6 +19,9 @@ struct SafeTensor {
 // Indexes every tensor in `dir` (model.safetensors or model.safetensors.index.json shards). Names are kept as-is.
 std::map<std::string, SafeTensor> safetensors_index(const std::filesystem::path & dir);
 
+// Indexes the tensors of one .safetensors file (a side file such as an MTP head's mtp.safetensors).
+std::map<std::string, SafeTensor> safetensors_index_file(const std::filesystem::path & file);
+
 // Reads one tensor's raw bytes.
 std::vector<char> safetensors_read(const SafeTensor & t);
 

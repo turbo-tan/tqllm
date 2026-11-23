@@ -58,6 +58,18 @@ static bool run(int rows, int cols) {
     const auto * format = weight_format(GGML_NVFP4G); require(format, "NVFP4G not registered");
     const Mat m = format->load(raw, experts * rows, cols, up, nullptr);
     require(m.fmt && m.fmt->has_expert_matvec() && m.fmt->u4h_id() == 16, "NVFP4G must load as NVF4 (u4h 16)");
+    {   // dense use (modelopt shared expert / LM head): dequant_h and a row range of it == FP16 of the file values
+        Device<__half> dh(w.size());
+        m.fmt->dequant_h(m, dh.p, nullptr);
+        Device<__half> dr(size_t(rows) * cols);
+        require(m.fmt->dequant_rows_h(m, dr.p, rows, rows, nullptr), "NVF4 dequant_rows_h missing");
+        check(cudaDeviceSynchronize());
+        const auto h = dh.get(w.size()), hr = dr.get(size_t(rows) * cols);
+        size_t bad = 0, badr = 0;
+        for (size_t i = 0; i < w.size(); ++i) bad += __half2float(h[i]) != __half2float(__float2half_rn(w[i]));
+        for (size_t i = 0; i < hr.size(); ++i) badr += __half2float(hr[i]) != __half2float(h[size_t(rows) * cols + i]);
+        require(bad == 0 && badr == 0, "NVF4 dequant_h differs from FP16 of the file values");
+    }
 
     std::vector<int> ids(A); for (int a = 0; a < A; ++a) ids[a] = (a % topk == 0) ? 0 : int(1 + rng() % (experts - 1));
     std::vector<__half> x(size_t(cols) * n); std::vector<float> xf(x.size());

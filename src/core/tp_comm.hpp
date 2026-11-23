@@ -1,6 +1,7 @@
 #pragma once
-// Two-box tensor parallelism (two GB10s linked by their ConnectX ports): one NCCL communicator over RoCE. Rank 0 makes
-// the NCCL unique id and hands it to rank 1 over TCP (peer = rank 0's address on the linked network).
+// Multi-GPU / multi-box ranks (one process per GPU): one NCCL communicator. Rank 0 makes the NCCL unique id and hands it
+// to every other rank over TCP (peer = rank 0's address; src/core/ctl_star.hpp); those connections stay open as the host
+// control channel.
 #include <cuda_runtime.h>
 #include <memory>
 #include <string>
@@ -8,7 +9,8 @@
 namespace tqllm {
 class TpComm {
 public:
-    // rank 0 listens on port; rank 1 connects to peer:port
+    static constexpr int kMaxRanks = 8;
+    // rank 0 listens on port; every other rank connects to peer:port
     TpComm(int rank, int world, const std::string & peer, int port);
     ~TpComm();
     TpComm(const TpComm &) = delete;
@@ -26,10 +28,14 @@ public:
     void group_begin();
     bool alive() const;  // false once the other rank went away (the communicator was aborted)
     void group_end();
-    // host control channel to the other rank (the bootstrap TCP connection, kept open): rank 0 sends each engine call
-    // to rank 1 (layer split, src/engine/lockstep.hpp)
+    // host control channel (the bootstrap TCP connections, kept open): rank 0's ctl_send goes to every other rank (layer
+    // split: each engine call, src/engine/lockstep.hpp), another rank's to rank 0; ctl_recv is the reverse (rank 0
+    // receives this way only with two ranks)
     void ctl_send(const void * buf, size_t bytes);
     void ctl_recv(void * buf, size_t bytes);
+    // every rank's `bytes` in rank order into `all` (world x bytes), on every rank
+    void ctl_all_gather(const void * mine, void * all, size_t bytes);
+    int local_ranks() const;  // ranks on this machine (they share its RAM)
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

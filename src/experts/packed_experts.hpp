@@ -5,6 +5,7 @@
 // same file with the code parts permuted into the grouped kernels' lane-contiguous tiles (values unchanged).
 #include "quant_kernels.cuh"
 #include "tq3_expert_cache.hpp"
+#include "packed_span.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -17,6 +18,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tqllm {
@@ -28,6 +30,8 @@ inline void need(bool ok, const std::string & why) { if (!ok) throw std::runtime
 struct PackedExperts {
     int layers = 0, experts = 0; std::vector<std::array<uint64_t, 6>> sizes; std::vector<uint64_t> base, block;
     const char * map = nullptr; size_t bytes = 0; bool tiled = false;
+    int lo = 0, hi = 1 << 30;  // layers held in memory (--split layer: this rank's); `map + base[l]` is valid for these only
+    bool has(int layer) const { return layer >= lo && layer < hi && layer < layers; }
     const char * at(int layer, int id) const { return map + base[layer] + uint64_t(id) * block[layer]; }
 };
 

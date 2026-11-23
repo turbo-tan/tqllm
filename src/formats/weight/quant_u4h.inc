@@ -24,13 +24,10 @@ __device__ __forceinline__ __half2 k4_sm(const uint8_t * hdr, int j) {
 // iq3 (native IQ3_S): per 32 weights 12 bytes (8 grid-index low bytes, 4 sign bytes); per row and 256 weights a 16-byte
 // record (FP16 d, qh[8] = index bit 8 per 32-block, scales[4] = 4-bit per 32-block). Grid word w of a 32-block is
 // elements 4w..4w+3 = one u4h code word; codes 16 +- magnitude, then the u4h HFMA with (db, -16 db), db = d (1 + 2 sc).
-__device__ const uint32_t iq3s_grid_d[512] = {
+__device__ __align__(16) const uint32_t iq3s_grid_d[512] = {
 #include "iq3s_grid.inc"
 };
-__device__ __forceinline__ uint32_t iq3_code(uint32_t g, uint32_t sbits) {  // 4 magnitudes, 4 sign bits -> 16 +- m
-    const uint32_t neg = ((sbits * 0x00204081u) & 0x01010101u) * 0xFFu;
-    return (__vadd4(0x10101010u, g) & ~neg) | (__vsub4(0x10101010u, g) & neg);
-}
+#include "iq_codes.cuh"
 __device__ __forceinline__ __half2 iq3_sm(const uint8_t * rec, int ib) {
     const float d = __half2float(__ldg(reinterpret_cast<const __half *>(rec)));
     const float db = d * float(1 + 2 * ((__ldg(rec + 10 + ib / 2) >> 4 * (ib % 2)) & 0xf));
@@ -39,13 +36,9 @@ __device__ __forceinline__ __half2 iq3_sm(const uint8_t * rec, int ib) {
 
 // iq3x (native IQ3_XXS): per 32 weights 12 bytes (8 grid-index bytes into a 256-entry grid, the scale / sign word);
 // per row and 256 weights a 4-byte record (FP16 d, pad). Signs: 7-bit index, 8th sign = parity. Codes 64 +- m.
-__device__ const uint32_t iq3xxs_grid_d[256] = {
+__device__ __align__(16) const uint32_t iq3xxs_grid_d[256] = {
 #include "iq3xxs_grid.inc"
 };
-__device__ __forceinline__ uint32_t iq3x_code(uint32_t g, uint32_t sbits) {  // 4 magnitudes, 4 sign bits -> 64 +- m
-    const uint32_t neg = ((sbits * 0x00204081u) & 0x01010101u) * 0xFFu;
-    return (__vadd4(0x40404040u, g) & ~neg) | (__vsub4(0x40404040u, g) & neg);
-}
 __device__ __forceinline__ uint32_t iq3x_signs(uint32_t a, int w) {  // sign bits of grid word w (0..7) of a 32-block
     const uint32_t i7 = (a >> (7 * (w / 2))) & 127, sg = i7 | ((__popc(i7) & 1) << 7);
     return (sg >> (4 * (w % 2))) & 0xF;
@@ -58,16 +51,16 @@ __device__ __forceinline__ __half2 iq3x_sm(const uint8_t * rec, uint32_t a) {
 // UD low-bit types on the u4h kernel (FMT 8 IQ2_XXS, 9 IQ2_XS, 10 IQ2_S, 11 IQ1_S, 12 Q2_K): per 32 weights 1-2 code
 // words as stored in the GGUF block, per row and 256 weights a record of the block's scalars. Grids: llama.cpp (MIT),
 // used only to read these files (see NOTICE).
-__device__ const uint64_t iq2xxs_grid_d[256] = {
+__device__ __align__(16) const uint64_t iq2xxs_grid_d[256] = {
 #include "iq2xxs_grid.inc"
 };
-__device__ const uint64_t iq2xs_grid_d[512] = {
+__device__ __align__(16) const uint64_t iq2xs_grid_d[512] = {
 #include "iq2xs_grid.inc"
 };
-__device__ const uint64_t iq2s_grid_d[1024] = {
+__device__ __align__(16) const uint64_t iq2s_grid_d[1024] = {
 #include "iq2s_grid.inc"
 };
-__device__ const uint64_t iq1s_grid_d[2048] = {
+__device__ __align__(16) const uint64_t iq1s_grid_d[2048] = {
 #include "iq1s_grid.inc"
 };
 __host__ __device__ constexpr int ud_bpb(int f) { return f == 11 ? 4 : 8; }    // code bytes per 32 weights
@@ -169,11 +162,15 @@ __device__ __forceinline__ uint32_t nvf4_codes(uint32_t c) {
 // block-in-quad), so the 32 lanes of a warp load one contiguous run instead of 8 strided row pieces. Same bytes, same math.
 __constant__ int c_tiled_experts = 0;
 __host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 || f == 16 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
+// dense matrices stored as the same 16-row x 4-block tiles (Q6_K / Q5_K: 24- / 20-byte blocks read 8 rows x 96 / 80 bytes per
+// warp load untiled: ~185 GB/s on a GB10, ~215 tiled); a tiled dense Mat has its own format (DenseTiled, q4.cpp)
+__host__ __device__ constexpr int dense_tiled_bpb(int f) { return f == 7 ? 24 : f == 6 ? 20 : 0; }
 __device__ __forceinline__ int64_t u4h_block_off(int r, int s, int nb, int bpb, bool tiled) {
     if (!tiled) return (int64_t(r) * nb + s) * bpb;
     return (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
 }
-template <int FMT, bool GROUPED = false>
+// DT: a dense matrix stored tiled (dense_tiled_bpb)
+template <int FMT, bool GROUPED = false, bool DT = false>
 struct U4hTile {
     uint4 wa = make_uint4(0, 0, 0, 0), wb = make_uint4(0, 0, 0, 0);
     uint32_t ha = 0, hb = 0, ha2 = 0, hb2 = 0;  // k5: the block's 32 high code bits; k6: 2 high bits per code (2 words)
@@ -187,7 +184,7 @@ struct U4hTile {
     }
     __device__ __forceinline__ void load(const uint8_t * w4, const __half2 * sm, int k, int ra, int rb, int s, int nb, bool ok) {
         if (ok) {
-            const bool tl = GROUPED && tiled_bpb(FMT) && c_tiled_experts;
+            const bool tl = DT || (GROUPED && tiled_bpb(FMT) && c_tiled_experts);
             if constexpr (FMT == 16) {  // NVF4: 16 B natural nibbles per 32 weights; aux row = k / 16 E4M3 scales, then the F32 global
                 wa = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(ra, s, nb, 16, tl)));
                 wb = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(rb, s, nb, 16, tl)));
@@ -276,26 +273,28 @@ struct U4hTile {
                 const auto * kh = reinterpret_cast<const uint8_t *>(sm);
                 ua = kh + (int64_t(ra) * (k / 256) + s / 8) * ud_rb(FMT);
                 ub = kh + (int64_t(rb) * (k / 256) + s / 8) * ud_rb(FMT);
-            } else if constexpr (FMT == 7) {
-                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 24);
-                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 24);
-                wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(wpa + 3));
-                wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(wpb + 3));
-                ha = __ldg(wpa + 4), ha2 = __ldg(wpa + 5), hb = __ldg(wpb + 4), hb2 = __ldg(wpb + 5);
+            } else if constexpr (FMT == 7) {  // 24-byte blocks are 8-byte aligned: three 64-bit loads per row
+                const auto * wpa = reinterpret_cast<const uint2 *>(w4 + u4h_block_off(ra, s, nb, 24, tl));
+                const auto * wpb = reinterpret_cast<const uint2 *>(w4 + u4h_block_off(rb, s, nb, 24, tl));
+                const uint2 a0 = __ldg(wpa), a1 = __ldg(wpa + 1), a2 = __ldg(wpa + 2), b0 = __ldg(wpb), b1 = __ldg(wpb + 1), b2 = __ldg(wpb + 2);
+                wa = make_uint4(a0.x, a0.y, a1.x, a1.y);
+                wb = make_uint4(b0.x, b0.y, b1.x, b1.y);
+                ha = a2.x, ha2 = a2.y, hb = b2.x, hb2 = b2.y;
                 const auto * kh = reinterpret_cast<const uint8_t *>(sm);
                 const uint8_t * rca = kh + (int64_t(ra) * (k / 256) + s / 8) * 20, * rcb = kh + (int64_t(rb) * (k / 256) + s / 8) * 20;
                 const float da = __half2float(__ldg(reinterpret_cast<const __half *>(rca + 16)));
                 const float db = __half2float(__ldg(reinterpret_cast<const __half *>(rcb + 16)));
+                const uint32_t sca = __ldg(reinterpret_cast<const uint16_t *>(rca + (s % 8) * 2)), scb = __ldg(reinterpret_cast<const uint16_t *>(rcb + (s % 8) * 2));
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const float fa = da * float(int8_t(__ldg(rca + (s % 8) * 2 + h)));
-                    const float fb = db * float(int8_t(__ldg(rcb + (s % 8) * 2 + h)));
+                    const float fa = da * float(int8_t(sca >> (8 * h)));
+                    const float fb = db * float(int8_t(scb >> (8 * h)));
                     pk(__floats2half2_rn(fa, -32.f * fa), sa[h], ma[h]);
                     pk(__floats2half2_rn(fb, -32.f * fb), sb[h], mb[h]);
                 }
             } else if constexpr (FMT == 6) {
-                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + (int64_t(ra) * (k / 32) + s) * 20);
-                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + (int64_t(rb) * (k / 32) + s) * 20);
+                const auto * wpa = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(ra, s, nb, 20, tl));
+                const auto * wpb = reinterpret_cast<const uint32_t *>(w4 + u4h_block_off(rb, s, nb, 20, tl));
                 wa = make_uint4(__ldg(wpa), __ldg(wpa + 1), __ldg(wpa + 2), __ldg(wpa + 3));
                 wb = make_uint4(__ldg(wpb), __ldg(wpb + 1), __ldg(wpb + 2), __ldg(wpb + 3));
                 ha = __ldg(wpa + 4), hb = __ldg(wpb + 4);
@@ -421,7 +420,7 @@ struct U4hTile {
 #endif
 // CT (dense): CT blocks of NCOL columns per row block, adjacent in blockIdx.x so they read the same weight rows together
 // (the second read hits L2); each column's math is unchanged.
-template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false, int CT = 1>
+template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false, int CT = 1, bool DT = false>
 __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) u4h_matvec_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                     OUT * y, int rows, int k, int nc, const uint32_t * rid = nullptr,
                                                     int ldy = 0, const int * expert_ids = nullptr, int topk = 1, bool per_expert_input = false,
@@ -456,24 +455,19 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
     // grids up to 8 KB are staged in shared memory once per CTA; IQ1_S's 16 KB grid is read through L1 instead (staging
     // it cost each 16-row CTA as many bytes as its weights: MiniMax IQ1_S experts ran at ~150 GB/s on a GB10). Same values.
     constexpr bool GRID_SMEM = ud_grid_words(FMT) <= 2048;
-    __shared__ uint32_t grid_sm[GRID_SMEM ? ud_grid_words(FMT) : 1];
+    __shared__ __align__(16) uint32_t grid_sm[GRID_SMEM ? ud_grid_words(FMT) : 1];
     const uint32_t * grid = grid_sm;
-    if constexpr (FMT == 4) {
-        for (int i = threadIdx.x; i < 512; i += blockDim.x) grid_sm[i] = iq3s_grid_d[i];
+    // 16-byte copies: a 2048-word grid is 2 loads per thread instead of 8 (the staging was ~10 % of an IQ2_S expert launch)
+    auto stage = [&](const uint32_t * src, int words) {
+        for (int i = threadIdx.x; i < words / 4; i += blockDim.x)
+            reinterpret_cast<uint4 *>(grid_sm)[i] = __ldg(reinterpret_cast<const uint4 *>(src) + i);
         __syncthreads();
-    }
-    if constexpr (FMT == 5) {
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) grid_sm[i] = iq3xxs_grid_d[i];
-        __syncthreads();
-    }
+    };
+    if constexpr (FMT == 4) stage(iq3s_grid_d, 512);
+    if constexpr (FMT == 5) stage(iq3xxs_grid_d, 256);
     if constexpr (FMT >= 8 && FMT <= 11) {
-        const uint32_t * src = ud_grid_src<FMT>();
-        if constexpr (GRID_SMEM) {
-            for (int i = threadIdx.x; i < ud_grid_words(FMT); i += blockDim.x) grid_sm[i] = src[i];
-            __syncthreads();
-        } else {
-            grid = src;
-        }
+        if constexpr (GRID_SMEM) stage(ud_grid_src<FMT>(), ud_grid_words(FMT));
+        else grid = ud_grid_src<FMT>();
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     static_assert(CT == 1 || !GROUPED, "u4h_matvec_k: CT is dense only");
@@ -511,7 +505,7 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
     };
     // PF (MT 1 only): the next block's codes and activations are loaded before this block computes (same math order)
     uint4 xn[PF ? NT : 1][4];
-    U4hTile<FMT, GROUPED> qn;
+    U4hTile<FMT, GROUPED, DT> qn;
     int ra0 = min(row0 + g, rows - 1), rb0 = min(row0 + g + 8, rows - 1);
     if (rid) ra0 = int(rid[ra0]), rb0 = int(rid[rb0]);
     ra0 += source_row;
@@ -525,7 +519,7 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
         const int s = s0 + t;
         const bool ok = s < nb;
         uint4 x[NT][4];
-        U4hTile<FMT, GROUPED> qpf;
+        U4hTile<FMT, GROUPED, DT> qpf;
         if constexpr (PF) {
 #pragma unroll
             for (int tt = 0; tt < NT; ++tt)
@@ -534,7 +528,7 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
             qpf = qn;
             const int sn = s + 32;
             loadx(sn, sn < nb, xn);
-            qn = U4hTile<FMT, GROUPED>();
+            qn = U4hTile<FMT, GROUPED, DT>();
             qn.load(w4, sm, k, ra0, rb0, sn, nb, sn < nb);
         } else {
             loadx(s, ok, x);
@@ -545,7 +539,7 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
             if (rid) ra = int(rid[ra]), rb = int(rid[rb]);
             ra += source_row;
             rb += source_row;
-            U4hTile<FMT, GROUPED> q;
+            U4hTile<FMT, GROUPED, DT> q;
             if constexpr (PF) q = qpf;
             else q.load(w4, sm, k, ra, rb, s, nb, ok);
             auto deq = [&](uint32_t w, uint32_t sel, uint32_t su, uint32_t mu) {
@@ -606,7 +600,7 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
 // Prefill GEMM on the u4h-family formats without a dequantised copy: 64 rows x 64 columns per CTA, warp w takes row tile
 // w & 3 and k half w >> 2. Each lane decodes its 32-weight block once (U4hTile, the matvec decode) and reuses the
 // fragments across 8 n-tiles, so the weights are read once per 64 columns. FP32 accumulate.
-template <int FMT, bool GROUPED = false, typename OUT = __nv_bfloat16, bool GATEUP = false>
+template <int FMT, bool GROUPED = false, typename OUT = __nv_bfloat16, bool GATEUP = false, bool DT = false>
 __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                   OUT * y, int rows, int k, int ncols, int ldy, const int * counts = nullptr, const int * groups = nullptr,
                                                   int capacity = 0, int topk = 1, bool per_expert_input = false,
@@ -666,7 +660,7 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
         __syncthreads();
         const int s = base + ks * 4 + t;
         const bool ok = s < nb;
-        U4hTile<FMT, GROUPED> qd;
+        U4hTile<FMT, GROUPED, DT> qd;
         qd.load(w4, sm, k, ra, rb, s, nb, ok);
         uint32_t af[8][4];
 #pragma unroll
@@ -692,7 +686,7 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
             for (int u = 0; u < 8; ++u) mma_f16(c[nt], af[u][0], af[u][1], af[u][2], af[u][3], xw[2 * u], xw[2 * u + 1]);
         }
         if constexpr (GATEUP) {  // the up tile of the same block, same x fragments
-            U4hTile<FMT, GROUPED> qu;
+            U4hTile<FMT, GROUPED, DT> qu;
             qu.load(w4b, smb, k, ra, rb, s, nb, ok);
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -772,12 +766,12 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
         }
     }
 }
-template <int FMT, typename OUT = __nv_bfloat16>
+template <int FMT, typename OUT = __nv_bfloat16, bool DT = false>
 static void u4h_gemm_launch(const uint8_t * w4, const void * sm, const __half * xh, OUT * y, int rows, int k,
                             int ncols, cudaStream_t s, int ldy) {
     if (k % 64) throw std::invalid_argument("u4h_gemm: k must be a multiple of 64");
     const dim3 grid((rows + 63) / 64, (ncols + 63) / 64);
-    u4h_gemm_k<FMT, false, OUT><<<grid, 256, 0, s>>>(w4, reinterpret_cast<const __half2 *>(sm), xh, y, rows, k, ncols, ldy ? ldy : rows);
+    u4h_gemm_k<FMT, false, OUT, false, DT><<<grid, 256, 0, s>>>(w4, reinterpret_cast<const __half2 *>(sm), xh, y, rows, k, ncols, ldy ? ldy : rows);
 }
 
 // ---- INT8-activation prefill GEMM (TQFN_PREFILL_INT8) ----

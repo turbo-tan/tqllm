@@ -12,6 +12,12 @@
 namespace tqllm_cuda {
 // F32 residual and norm tensors use [tokens][streams][hidden], matching reference HC math.
 void hc_init(const float * embedding, float * residual, int hidden, int streams, int tokens, cudaStream_t);
+// DFlash2 features: each token's residual [streams][hidden] averaged over the streams, BF16 rows y_stride apart
+void hc_mean_bf16(const float * x, int n, int streams, int hidden, __nv_bfloat16 * y, int64_t y_stride, cudaStream_t);
+void hc_mean_bf16(const __nv_bfloat16 * x, int n, int streams, int hidden, __nv_bfloat16 * y, int64_t y_stride, cudaStream_t);
+// hc_combine (out of place) followed by hc_norm_bf16 on its output in one launch: bit-identical to the pair
+void hc_combine_norm_bf16(const float * residual, const float * block_out, const float * inject_logits, const float * gamma, float * combined,
+                          float * normalized, __nv_bfloat16 * normalized_bf16, int hidden, int streams, int tokens, float epsilon, cudaStream_t);
 void hc_combine_norm(const float * residual, const float * block, const float * inject, const float * gamma, float * combined, float * normed,
                      int h, int c, int n, float eps, cudaStream_t s);
 void hc_norm(const float * residual, const float * gamma, float * normalized,
@@ -55,6 +61,16 @@ void hc_mix_rs_h(const __nv_bfloat16 * residual, const float * rs, const float *
                  int hidden, int streams, int tokens, cudaStream_t, __half * mixed_h = nullptr, __nv_bfloat16 * mixed_bf16 = nullptr);
 void hc_mix(const float * normalized, const float * gate_logits, float * mixed,
              int hidden, int streams, int tokens, cudaStream_t);
+// Decode blocks (1-8 rows) on BF16 mixer weights, bit-identical to the launches they replace (tests/glue_fuse.cu):
+// the down projection with hc_low_silu_bf16 on its rows and the inject projection, both on the norm's BF16 image, in one
+// launch (fn_gemv_bf16x_tokens' block-per-row shapes only; false: not taken, nothing launched)
+bool hc_down_inject_bf16x(const __nv_bfloat16 * w_down, const __nv_bfloat16 * w_inject, const __nv_bfloat16 * normalized_bf16,
+                          float * low_rank, __nv_bfloat16 * low_rank_bf16, float * inject, int low_rows, int streams, int cols,
+                          int tokens, int c, cudaStream_t);
+// the up projection (fn_gemv_bf16_tokens' short-row path) and hc_mix in one launch (4 streams); mixed_h / mixed_bf16: the
+// FP16 / BF16 images of the mixed rows (optional); false: not taken
+bool hc_up_mix_bf16(const __nv_bfloat16 * w_up, const float * low_rank, const float * normalized, float * mixed, __half * mixed_h,
+                    __nv_bfloat16 * mixed_bf16, int hidden, int streams, int low_rows, int tokens, cudaStream_t);
 // hc_combine followed by hc_norm_rs_bf16 in one kernel (out may alias residual): bit-identical to the pair
 void hc_combine_norm_rs_bf16(const float * residual, const float * block_out, const float * inject_logits, float * out, const float * gamma,
                              float * rs, __nv_bfloat16 * normalized_bf16, int h, int c, int tokens, float epsilon, cudaStream_t);
@@ -92,6 +108,9 @@ void fn_gdn_set_chunk_min(int n);
 void fn_gdn_set_kh(int on);
 // the per-token kernel's value columns per warp, 2 / 4 / 8 (tests; 0: by device)
 void fn_gdn_set_vpw(int v);
+// fn_gdn's first launch: q / k normalised ([n][2 kh][dim], q times 1 / sqrt(dim)) and the gates ([n][vh][decay, beta])
+void fn_gdn_prep_gates(const float * qkv, const float * alpha, const float * beta, const float * neg_a, const float * bias, float * qk,
+                       float * gates, int kh, int vh, int dim, int tokens, float eps, cudaStream_t);
 void h_to_f32(const __half * x, float * y, int64_t n, cudaStream_t);
 // the FP16 image of fn_gated_rms / fn_attention_gate's output (the input of a quantised projection; same values)
 void fn_gated_rms_h(const float * x, const float * gate, const float * weight, __half * out, int heads, int dim, int tokens, float eps, cudaStream_t);
@@ -100,11 +119,23 @@ void fn_gated_rms_h(const float * x, const __half * gate, const float * weight, 
 void ple_conv(const __half * x, const float * history, const float * kernel, float * out, float * next_history,
               int channels, int tokens, int taps, int dilation, cudaStream_t);
 void fn_attention_gate_h(const float * in, const float * qg, __half * out, int heads, int dim, int tokens, cudaStream_t);
+// out_h (decode blocks, < 64 rows): also the FP16 image of out (what a conversion of it gives)
 void fn_gated_rms(const float * x, const float * gate, const float * weight, float * out,
-                  int heads, int dim, int tokens, float epsilon, cudaStream_t);
+                  int heads, int dim, int tokens, float epsilon, cudaStream_t, __half * out_h = nullptr);
 // Text-only positions. An interleaved query input stores [q|gate] per head.
 void fn_norm_rope(const float * x, const float * weight, float * out, int heads, int dim,
                   int tokens, int position, int rotary, float theta, float epsilon, bool interleaved, cudaStream_t);
+// cosine / sine of every position 0 .. last (at least) for one (rotary, theta) on the current device, [position][rotary / 2]:
+// the double expressions of fn_norm_rope's per-element path, so the same floats. Built (grown) outside graph capture only:
+// nullptr inside a capture that would need a larger table, or with fn_set_rope_positions(false) (tests: the reference path).
+const float2 * fn_rope_positions(int64_t last, int rotary, float theta, cudaStream_t);
+void fn_set_rope_positions(bool on);
+// a decode block (< 64 rows) of one sequence: fn_norm_rope of q (interleaved) and of k, k written as BF16 to k_cache and v
+// converted to BF16 into v_cache (rows [n][kvheads][dim] from the sequence's position), in one launch; bit-identical to
+// fn_norm_rope + fn_norm_rope + f32_to_bf16 x 2 + the row copies. false (nothing launched): no position table (fn_rope_positions)
+bool fn_attention_prep(const float * qg, const float * k, const float * v, const float * q_weight, const float * k_weight, float * q,
+                       __nv_bfloat16 * k_cache, __nv_bfloat16 * v_cache, int heads, int kvheads, int dim, int tokens, int position,
+                       int rotary, float theta, float epsilon, cudaStream_t);
 // Correctness path below the indexer's budget; refuses longer contexts instead of omitting QSA.
 void fn_dense_attention(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,
                         float * out, int heads, int kvheads, int dim, int tokens, int position, cudaStream_t,
@@ -126,7 +157,7 @@ void fn_norm_rope_table(const float * x, const float * weight, float * out, cons
 size_t fn_dense_attention_multi_workspace(int heads, int dim, const AttnSeqs & seqs);
 void fn_dense_attention_multi(const float * query, const AttnSeqs & seqs, float * out, int heads, int kvheads, int dim,
                               float * workspace, cudaStream_t);
-void fn_attention_gate(float * out, const float * query_gate, int heads, int dim, int tokens, cudaStream_t);
+void fn_attention_gate(float * out, const float * query_gate, int heads, int dim, int tokens, cudaStream_t, __half * out_h = nullptr);
 // Decode elementwise ops (device-resident step): routed SwiGLU BF16 -> FP16, shared SwiGLU F32, and
 // out[t] = sum_k w[t][k] * routed[t][k] + shared_w[t] * shared[t].
 // Single-token BF16 GEMV: y[r] = sum_c W[r][c] * bf16(x[c]), F32 accumulate. One warp per row; cols % 8 == 0.
@@ -134,6 +165,9 @@ void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows,
 // tokens columns at once ([tokens][cols] -> [tokens][rows]); per-token sums as fn_gemv_bf16. rows_per_block: rows of one
 // weight block per CUDA block (x read once per block); 0 = the dispatch's rule, 1 = one row per block.
 void fn_gemv_bf16_tokens(const __nv_bfloat16 * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t, int rows_per_block = 0);
+// fn_gemv_bf16_tokens for a block-per-row shape (rows <= 1024, cols >= 1024) of at most 8 tokens on the input's BF16 image
+// (fn_round_bf16 of x): the same bits, half the activation bytes, half the rows per block; false: other shapes
+bool fn_gemv_bf16x_tokens(const __nv_bfloat16 * w, const __nv_bfloat16 * xb, float * y, int rows, int cols, int tokens, cudaStream_t);
 // F32 weights (Unsloth keeps the router, ssm_alpha / ssm_beta and hc_*_inject in F32): [tokens][cols] -> [tokens][rows], one
 // warp per row with up to 8 tokens per weight read, F32 sums; capturable in a CUDA graph (the cuBLAS SGEMM on the legacy stream is not)
 void fn_gemv_f32_tokens(const float * w, const float * x, float * y, int rows, int cols, int tokens, cudaStream_t);
@@ -156,7 +190,7 @@ void fn_swiglu_bf16_h(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __ha
 // fn_swiglu_bf16_h on the assignments listed per slot (counts[slots], groups[slots][capacity] of assignment indices, rows of ff)
 void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * up, __half * out, const int * counts, const int * groups,
                              int slots, int capacity, int ff, cudaStream_t);
-void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t);
+void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t, __half * out_h = nullptr);
 // fn_moe_combine + hc_combine in place over `wide` ([n][c][h]) in one pass (same values)
 void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * inject,
                        float * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
@@ -164,14 +198,22 @@ void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, cons
                        __nv_bfloat16 * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
 void fn_moe_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
                     float * out, int hidden, int topk, int tokens, cudaStream_t);
+// fn_moe_combine then hc_combine(residual, that, inject) -> out ([n][c][h], out != residual) in one pass (same values)
+void fn_moe_hc_combine_to(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
+                          const float * inject, const float * residual, float * out, int hidden, int topk, int streams, int tokens, cudaStream_t);
 
 // Keys and query are already normalized and rotated: [blocks][dim], [heads][dim].
 // Rectify each head's dot product before summing its contribution to a block.
+void qsa_score_bits(const float * pooled_keys, const float * query, uint32_t * scores, int blocks, int tokens, int first_position,
+                    int ratio, cudaStream_t stream, int tc = -1);
+void qsa_topk_bits(const uint32_t * scores, uint64_t * out, int blocks, int tokens, int first_position, int ratio, int need_cap,
+                   cudaStream_t stream);
 void qsa_score_blocks(const float * pooled_keys, const float * query, float * scores,
                       int blocks, int heads, int dim, cudaStream_t);
+// pooled_ring: block b of `pooled` at b % pooled_ring (0: linear)
 void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * normalized,
                           int first_block, int blocks, int ratio, int dim, int rotary,
-                          float theta, float epsilon, cudaStream_t);
+                          float theta, float epsilon, cudaStream_t, int pooled_ring = 0);
 
 // Raw indexer keys stay on device. Completed blocks are updated only when new
 // keys make them complete; truncate invalidates later blocks for speculative rollback.
@@ -181,7 +223,7 @@ void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * no
 // per cache: blocks [first, first + blocks) to pool (raw ring -> pooled) or to norm / RoPE (pooled -> normalized)
 struct QsaBlockJobs {
     static constexpr int kMax = 32;
-    int count = 0, first[kMax] = {}, blocks[kMax] = {}, ring[kMax] = {};
+    int count = 0, first[kMax] = {}, blocks[kMax] = {}, ring[kMax] = {}, pring[kMax] = {};  // pring: the pooled ring (0: linear)
     const float * in[kMax] = {};
     float * out[kMax] = {};
 };
@@ -203,19 +245,35 @@ public:
     int size() const { return size_; }
     int complete_blocks() const { return size_ / ratio_; }
     const float * raw() const { return raw_; }
-    const float * pooled() const { return pooled_; }
+    const float * pooled() const { return pooled_; }  // block b at (b % pooled_ring()) x dim
+    int pooled_ring() const { return pooled_ring_; }
     const float * normalized() const { return normalized_; }
 
     int ring() const { return ring_; }
+    int dim() const { return dim_; }
+    int ratio() const { return ratio_; }
+    int normalized_blocks() const { return normalized_blocks_; }
+    // the first `cells` cells as host rows (a kept conversation's state): raw keys [cells][dim], pooled [cells / ratio][dim],
+    // normalized [min(normalized_blocks, cells / ratio)][dim]; queued on `stream` (pinned destinations: no host wait)
+    void export_cells(int cells, float * raw, float * pooled, float * normalized, cudaStream_t stream) const;
+    // an empty cache takes those rows back: the same raw ring tail, host mirror, pooled and normalized blocks as the cache
+    // that wrote them had after a truncate to `cells` (the same keys and selections from there on)
+    void import_cells(int cells, int normalized_blocks, const float * raw, const float * pooled, const float * normalized, cudaStream_t stream);
+    // the same from another cache's first `cells` cells (a kept sequence grown to a larger capacity): its host mirror, or
+    // without one its ring, which then holds every cell from 0; the other cache's queued copies must have landed
+    void import_from(const QsaRawKeyCache & other, int cells, cudaStream_t stream);
     static constexpr int kRollback = 64;  // cells a truncate may go back (a verify block is <= 8)
 
 private:
     void reserve_ring(int cells, cudaStream_t stream);
+    void reserve_pooled(int blocks, cudaStream_t stream);
     // append / normalize_new with the ring copies and the kernels recorded instead of issued
     void append_deferred(const float * keys, int tokens, std::vector<std::pair<const float *, float *>> & runs, std::vector<size_t> & bytes,
                          QsaBlockJobs & pools, cudaStream_t stream);
     void normalize_deferred(QsaBlockJobs & norms);
-    int max_cells_, ratio_, dim_, size_ = 0, ring_ = 0;
+    // pooled blocks are read only to normalize them once: a ring of the blocks not yet normalized (it grows to a prefill
+    // chunk's blocks), not max_cells / ratio of them (3090 VRAM account 11-19: 58 MB at 32K, 203 MB at 128K)
+    int max_cells_, ratio_, dim_, size_ = 0, ring_ = 0, pooled_ring_ = 0;
     float * raw_ = nullptr;
     float * host_raw_ = nullptr;  // pinned, max_cells x dim
     float * pooled_ = nullptr;
@@ -295,6 +353,8 @@ public:
     static void append_multi(const std::vector<QsaIndexer *> & indexers, const float * raw_keys, const std::vector<int> & off,
                              const std::vector<int> & tokens, const float * key_norm, cudaStream_t stream);
     void truncate(int cells) { keys_.truncate(cells); }
+    QsaRawKeyCache & keys() { return keys_; }
+    const QsaRawKeyCache & keys() const { return keys_; }
     QsaDeviceSelection select(const float * raw_query, const float * query_norm,
                               int query_position, cudaStream_t stream);
     // Queries at first_position .. first_position + tokens - 1 in one pass; rows of the result are strided by its width.

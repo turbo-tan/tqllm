@@ -329,3 +329,82 @@ void map_ids(uint32_t * idx, const uint32_t * ids, int n, cudaStream_t s) {
 }
 
 } // namespace tqllm_cuda
+
+// ---- DFlash2 drafter layer primitives (src/spec/dflash2_drafter.cpp): the drafter's own copies of the norm / rope /
+// cache / activation steps, same arithmetic as the 27B's (no RoPE scaling: the drafter GGUF has none), so the module
+// depends on no model's kernels or constants ----
+namespace {
+__device__ float dfl_block_sum(float v, float * sh) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, nw = (blockDim.x + 31) / 32;
+    __syncthreads();
+    if (lane == 0) sh[warp] = v;
+    __syncthreads();
+    float t = 0.f;
+    for (int i = 0; i < nw; ++i) t += sh[i];
+    return t;
+}
+__global__ void dfl_rms_k(const __nv_bfloat16 * x, int xts, int xrs, const float * w, __nv_bfloat16 * y, int yts, int yrs,
+                          int len, int rows, float eps) {
+    __shared__ float sh[32];
+    const int i = blockIdx.x / rows, r = blockIdx.x % rows;
+    const __nv_bfloat16 * xr = x + int64_t(i) * xts + int64_t(r) * xrs;
+    __nv_bfloat16 * yr = y + int64_t(i) * yts + int64_t(r) * yrs;
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) { const float v = __bfloat162float(xr[j]); ss += v * v; }
+    const float inv = rsqrtf(dfl_block_sum(ss, sh) / len + eps);
+    for (int j = threadIdx.x; j < len; j += blockDim.x) yr[j] = __float2bfloat16_rn(__bfloat162float(xr[j]) * inv * w[j]);
+}
+__global__ void dfl_rope_k(__nv_bfloat16 * x, int ts, int heads, int dim, int rot, const int * dpos0, float theta) {
+    const int tkn = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, half = rot / 2;
+    if (i >= heads * half) return;
+    const int h = i / half, d = i % half;
+    const int p = *dpos0 + tkn;
+    const float ang = float(p) * (1.f / powf(theta, float(2 * d) / float(rot)) * (1.f + 0.f));
+    const float c = __bfloat162float(__float2bfloat16_rn(cosf(ang) * 1.f));
+    const float s = __bfloat162float(__float2bfloat16_rn(sinf(ang) * 1.f));
+    __nv_bfloat16 * xh = x + int64_t(tkn) * ts + int64_t(h) * dim;
+    const float a = __bfloat162float(xh[d]), b = __bfloat162float(xh[d + half]);
+    xh[d] = __float2bfloat16_rn(a * c - b * s);
+    xh[d + half] = __float2bfloat16_rn(b * c + a * s);
+}
+__global__ void dfl_cache_write_k(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, int ts, __nv_bfloat16 * kc,
+                                  __nv_bfloat16 * vc, const int * dpos0, int width, int ring) {
+    const int pos0 = *dpos0, tkn = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const int64_t dst = int64_t(ring ? (pos0 + tkn) % ring : pos0 + tkn) * width + i;
+    kc[dst] = k0[int64_t(tkn) * ts + i];
+    vc[dst] = v0[int64_t(tkn) * ts + i];
+}
+__global__ void dfl_swiglu_k(const __nv_bfloat16 * gu, int F, __nv_bfloat16 * act) {
+    const int tkn = blockIdx.y, f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= F) return;
+    const float a = __bfloat162float(gu[int64_t(tkn) * 2 * F + f]), u = __bfloat162float(gu[int64_t(tkn) * 2 * F + F + f]);
+    act[int64_t(tkn) * F + f] = __float2bfloat16_rn(a / (1.f + expf(-a)) * u);
+}
+__global__ void dfl_residual_k(__nv_bfloat16 * x, const __nv_bfloat16 * y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+}
+}  // namespace
+
+namespace tqllm_cuda {
+void dflash_rms(const __nv_bfloat16 * x, int xts, int xrs, const float * w, __nv_bfloat16 * y, int yts, int yrs, int len,
+                int rows, int n, float eps, cudaStream_t s) {
+    dfl_rms_k<<<rows * n, 256, 0, s>>>(x, xts, xrs, w, y, yts, yrs, len, rows, eps);
+}
+void dflash_rope(__nv_bfloat16 * x, int ts, int n, int heads, int dim, int rot, const int * dpos0, float theta, cudaStream_t s) {
+    dfl_rope_k<<<dim3((heads * rot / 2 + 127) / 128, n), 128, 0, s>>>(x, ts, heads, dim, rot, dpos0, theta);
+}
+void dflash_cache_write(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, int ts, int n, __nv_bfloat16 * kc,
+                        __nv_bfloat16 * vc, const int * dpos0, int kvheads, int dim, cudaStream_t s, int ring) {
+    const int width = kvheads * dim;
+    dfl_cache_write_k<<<dim3((width + 255) / 256, n), 256, 0, s>>>(k0, v0, ts, kc, vc, dpos0, width, ring);
+}
+void dflash_swiglu(const __nv_bfloat16 * gu, int n, int F, __nv_bfloat16 * act, cudaStream_t s) {
+    dfl_swiglu_k<<<dim3((F + 255) / 256, n), 256, 0, s>>>(gu, F, act);
+}
+void dflash_residual(__nv_bfloat16 * x, const __nv_bfloat16 * y, int n, cudaStream_t s) {
+    dfl_residual_k<<<(n + 255) / 256, 256, 0, s>>>(x, y, n);
+}
+}  // namespace tqllm_cuda

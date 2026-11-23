@@ -21,6 +21,8 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--max-tokens N` | 16384 | default output cap per request (also the cap for requests that ask for more; thinking counts against it) |
 | `--np N` | 1 | requests served at once (batched verify); `GET`/`POST /admin/slots` reads or changes the live limit |
 | `--peer URL` | none | repeatable, needs `--np` > 1: other tqserve boxes serving the same model; each chat request goes to the box expected to answer first (free slots, cached prompt prefix, measured rates; `POST /admin/route`), so N boxes serve as one endpoint |
+| `--state-listen HOST:PORT` | off | needs `--np` > 1 and `--prompt-cache on`: an internal listener on the box-to-box link address (never the API port) that lends this box's kept conversation states to its peers (`POST /v1/state/fetch`, `/v1/state/ack`); with it the `--peer` router balances follow-up turns by load and the box that takes one fetches the conversation's state instead of prefilling it again, when the transfer prices below the prefill (logged with the numbers) |
+| `--state-peer HOST:PORT` | none | repeatable: the other boxes' `--state-listen` addresses; a box fetches states only from these |
 | `--name NAME`, `--system TEXT` | | model name in the API; a default system prompt |
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
@@ -47,8 +49,8 @@ Long forms of short options: `-ctk` / `--cache-type-k`, `-ctv` / `--cache-type-v
 | `--moe-cache-mb C\|auto` | auto | VRAM cache of recently used host experts |
 | `--hot-map FILE` | none | MiniMax: routing counts; the busiest experts are preloaded, the rest stay on disk |
 | `--plugin PATH` | none | load a weight-format plugin (repeatable, CUDA builds): new GGUF types or kernel patches; each must pass the format contract at load ([plugins](../guides/plugins.md)) |
-| `--tp-rank R --tp-peer IP [--tp-port P]` | single box, port 29600 | MiniMax over two linked boxes (rank 0 serves; rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
-| `--split layer [--split-at N]` | off; half the layers per GPU | one model over two GPUs, one `tqserve` per GPU (`--tp-rank 0` serves, `--tp-rank 1 --tp-peer ADDR` follows); same output as one GPU; `--split-at N` puts layers N and up on rank 1. Dense Qwen3.5 / 3.6 / 3.8 GGUFs; see docs/guides/multi-gpu.md |
+| `--tp-rank R [--tp-world N] --tp-peer IP [--tp-port P]` | single box; 2 ranks; port 29600 | one process per GPU: this process's rank, the number of ranks (2 when only `--tp-rank` is given), rank 0's address (every other rank connects to it). MiniMax: two linked boxes (rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`) |
+| `--split layer [--split-at A,B,...]` | off; layers by each GPU's free memory | one model over N GPUs (one PC or several boxes), one `tqserve` per GPU (`--tp-rank 0` serves, the others `--tp-rank R --tp-world N --tp-peer ADDR` follow); same output as one GPU; `--split-at` gives the first layer of rank 1, 2, ... by hand. Dense Qwen3.5 / 3.6 / 3.8 GGUFs and Flash-Next; see docs/guides/multi-gpu.md |
 | `--split experts` | off | Flash-Next (`.tqfn`, every expert resident) over two linked boxes: `--tp-rank 0` and `--tp-rank 1 --tp-peer ADDR` both serve users (e.g. behind `--peer`); while rank 1 has no request of its own it computes the experts e % 2 == 1 of rank 0's decode steps (NCCL; build with `-DTQLLM_NCCL_DIR`). Same output as one box |
 | `--yarn-orig-ctx N` `--yarn-ext-factor F` `--yarn-attn-factor F` `--yarn-beta-fast F` `--yarn-beta-slow F` | model metadata | YaRN context extension, llama.cpp meanings (with `--rope-scaling yarn`) |
 | Flash-Next prefill: `--prefill-chunk N` `--prefill-sub N` `--prefill-stage N` | 16384, 2048, 192 | rows per prefill chunk, per sub-batch, and per expert stage |
@@ -62,7 +64,10 @@ Environment variables (`TQLLM_*`, `TQFN_*`) are listed with their defaults and s
 `--exact on` (default) runs every step at the reference precision: FP16 / BF16 activations and KV, no int8 / FP8 GEMMs,
 no CPU-served experts. Greedy output is then the same from build to build. `--exact off` lets each engine use its
 measured approximations (the middle column below): faster, with a small, measured change in the output. Published speed
-numbers say which one they ran.
+numbers say which one they ran. With the prompt cache (on by default for Flash-Next where memory fits) a long prompt's prefill is split at the point a
+later turn can reuse (64 tokens before its end), on the first read too, so long-prompt replies can differ from the same
+prompt with `--prompt-cache off` (one read in whole chunks); with the cache on, a reused turn gives the same text as its
+first read. `--prompt-cache off` reads every prompt afresh.
 
 If memory forces a smaller KV cache with `--exact on`, the server says so on stderr and in `/health`
 ("exact on: ..."). An approximation asked for explicitly with `--exact on` (the last column) is a conflict: the server
@@ -72,7 +77,7 @@ prints one `WARN --exact on with ...` line per option, runs the asked option, an
 | Engine | What `--exact off` changes | `--exact on`, and its conflicts |
 |---|---|---|
 | Qwen3.8 27B, CUDA | int8 prefill GEMMs on RTX 30 / 40 / 50, FP8 on GB10 | FP16 prefill; conflicts: `--prefill-int8 on`, `--prefill-fp8 on`, a lossy `-ctk` / `-ctv` / `--kv` |
-| Flash-Next (.tqfn), CUDA | the CPU miss pool on small cards (`TQFN_CPU_MISS`; route-tail skip `TQFN_TAIL_SKIP` stays opt-in) | no CPU miss pool; conflicts: `TQFN_CPU_MISS`, `TQFN_TAIL_SKIP`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
+| Flash-Next (.tqfn), CUDA | the CPU miss pool (`TQFN_CPU_MISS`) and route-tail skip: a non-resident expert that every token of a decode call ranks 8th or lower is not computed (weight 0; KLD 0.022 vs `--exact on`) | no CPU miss pool, no tail skip; conflicts: `TQFN_CPU_MISS`, `TQFN_PREFILL_INT8`, `TQFN_DENSE_INT8` |
 | Qwen3.8 27B, Metal | int8 KV from 32K keys, int8-query verify attention (KL 0.003-0.010 vs `--exact on` at 32K-128K) | BF16 KV while it fits; when memory forces int8 KV (one `WARN`), the int8-query attention, whose rows equal their single-row calls bit for bit, so greedy spec output still equals plain decoding |
 | MiniMax, GLM | (their only path) | no exact path yet: they run their approximate path with a WARN |
 
@@ -148,7 +153,7 @@ Changing a scale needs no graph recapture (the kernels read it from device memor
 | `--head-host on\|off` | memory fit | the int8 LM head in system RAM (exact): the 4-bit first pass stays on the GPU and only the re-scored rows cross PCIe (see `--embed-host` for measurements) |
 | `--kv-stage on\|off` | on | stream the RAM part back to the GPU layer by layer while decoding |
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
-| `--prompt-cache on\|off` | off | each slot keeps its conversation's KV so a follow-up does not re-read the document; replies are the same as with it off (on with `--kv-compact`). Mac (Metal): a follow-up turn resumes where the previous prompt ended even when the client drops the reasoning, and the server prefills the returned answer while idle, so a follow-up starts in about 0.3-0.4 s at 24-34K tokens; the kept conversation holds about 3-5 GB (34-51K tokens). Replies equal a cold prefill of the same prompt with the cache on; they can differ in the last digits from runs with it off (other prefill chunks). Off: the prompt is prefilled as one stream (faster for a chat that arrives with a long history of short messages) |
+| `--prompt-cache on\|off` | Flash-Next: on where memory fits (discrete cards: on; unified memory: when every slot's kept conversation leaves 20 GB available; the start-up log says which); other engines: off | each slot keeps its conversation's KV so a follow-up does not re-read the document; replies are the same as with it off (on with `--kv-compact`). Mac (Metal): a follow-up turn resumes where the previous prompt ended even when the client drops the reasoning, and the server prefills the returned answer while idle, so a follow-up starts in about 0.3-0.4 s at 24-34K tokens; the kept conversation holds about 3-5 GB (34-51K tokens). Replies equal a cold prefill of the same prompt with the cache on; they can differ in the last digits from runs with it off (other prefill chunks). Off: the prompt is prefilled as one stream (faster for a chat that arrives with a long history of short messages) |
 | `--prompt-park N` | from memory (a quarter of RAM on unified memory, up to 16 GB otherwise) | with `--prompt-cache on` and several slots: up to N conversations' kept states wait in host memory when their slot serves someone else, so their next turn still resumes; 0 = off |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |

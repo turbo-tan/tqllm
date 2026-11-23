@@ -16,12 +16,6 @@
 
 namespace tqllm {
 
-struct ByteChannel {
-    virtual ~ByteChannel() = default;
-    virtual void send(const void * p, size_t n) = 0;
-    virtual void recv(void * p, size_t n) = 0;
-};
-
 namespace lockstep {
 enum class Op : uint32_t {
     stop = 1, step, verify, commit, generate_spec, ignore_eos, continuation, penalties, sampling, select_slot, spec_begin,
@@ -214,6 +208,7 @@ public:
     }
     bool has_drafter() const override { return e_->has_drafter(); }
     bool native_mtp() const override { return e_->native_mtp(); }
+    bool adaptive_depth() const override { return e_->adaptive_depth(); }
     bool incremental() const override { return e_->incremental(); }
     void select_slot(int s) override { call(lockstep::Writer(lockstep::Op::select_slot).put(int32_t(s))); e_->select_slot(s); }
     void spec_begin(const std::vector<uint32_t> & p, uint32_t count, int d) override {

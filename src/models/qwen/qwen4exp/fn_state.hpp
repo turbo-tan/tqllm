@@ -25,24 +25,48 @@ struct KvBuf {
         return s;
     }
     char * at(size_t i) const { return reinterpret_cast<char *>(p) + i * page; }
-    explicit KvBuf(size_t n) : bytes(n) {
+    // most: the bytes a kept sequence may grow to (the slot context's rows; grow): VMM buffers reserve that address range
+    // and map only n bytes of it
+    size_t reserved = 0;
+    explicit KvBuf(size_t n, size_t most = 0) : bytes(n) {
         auto & m = mem(); const size_t g = m.granule();
         { static const bool log = tqllm::debug_on("seqmem"); if (log) std::fprintf(stderr, "SEQMEM kvbuf %zu KiB asked\n", n >> 10); }
         // host K/V (kv_host_enabled: discrete GPUs by default): VMM pages, so old ones can move to host memory; else
         // plain allocations
         if (g && kv_host_enabled()) {
             page = tqllm::flashnext::kv_page_bytes(n, g); span = (n + page - 1) / page * page;
-            if (void * va = m.reserve(span)) {
+            reserved = std::max(span, (most + page - 1) / page * page);
+            if (void * va = m.reserve(reserved)) {
                 p = static_cast<__nv_bfloat16 *>(va); vmm = true; on_host.assign(span / page, 0);
                 for (size_t i = 0; i < on_host.size(); ++i)
-                    if (!m.map(at(i), page, tqllm::KvTier::device)) { m.unreserve(p, span); throw std::runtime_error("out of memory: attention KV page"); }
+                    if (!m.map(at(i), page, tqllm::KvTier::device)) { m.unreserve(p, reserved); throw std::runtime_error("out of memory: attention KV page"); }
                 return;
             }
         }
         ck(cudaMalloc(reinterpret_cast<void **>(&p), n));
     }
-    ~KvBuf() { if (vmm) mem().unreserve(p, span); else if (p) cudaFree(p); }
+    ~KvBuf() { if (vmm) mem().unreserve(p, reserved); else if (p) cudaFree(p); }
     KvBuf(const KvBuf &) = delete; KvBuf & operator=(const KvBuf &) = delete;
+    // A kept sequence's buffer grown to n bytes with its first `keep` bytes: VMM maps device pages after the mapped ones
+    // inside the reserved range (same address, the host pages stay where they are); a plain buffer is copied into a new
+    // allocation. false (the buffer unchanged) when the memory or the reserved range does not hold it.
+    bool grow(size_t n, size_t keep) {
+        if (n <= bytes) return true;
+        if (vmm) {
+            const size_t want = (n + page - 1) / page * page;
+            if (want > reserved) return false;
+            auto & m = mem(); const size_t had = on_host.size();
+            for (size_t i = had; i < want / page; ++i)
+                if (!m.map(at(i), page, tqllm::KvTier::device)) { for (size_t j = had; j < i; ++j) m.unmap(at(j), page); return false; }
+            on_host.resize(want / page, 0); span = want; bytes = n;
+            return true;
+        }
+        void * q = nullptr;
+        if (cudaMalloc(&q, n) != cudaSuccess) { cudaGetLastError(); return false; }
+        ck(cudaMemcpy(q, p, std::min(keep, bytes), cudaMemcpyDeviceToDevice));
+        ck(cudaFree(p)); p = static_cast<__nv_bfloat16 *>(q); bytes = n;
+        return true;
+    }
     // page i to the other tier with its data; false (data and tier unchanged) when the target tier is out of memory
     bool move(size_t i, bool to_host) {
         if (!vmm || bool(on_host[i]) == to_host) return true;

@@ -144,6 +144,28 @@ void test_jinja_images() {
         R"({"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]},)"
         R"({"role":"user","content":"hi"}]})", 512, "", true, false, "xhigh", &stub);
     check(!bad.ok, "jinja path refuses images outside user messages");
+    {  // Inkling-2 (keep_high): the server default effort "high" with thinking on parses on the Jinja path
+        auto & so = tqserve::serve_options();
+        const bool kh = so.keep_high;
+        so.keep_high = true;
+        const auto ink = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}]})", 512, "", true, true, "high", &stub);
+        check(ink.ok, "keep_high: default effort high with thinking parses: " + ink.error);
+        const auto none = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})", 512, "", true, true, "high", &stub);
+        check(none.ok, "keep_high: the template's own level none parses: " + none.error);
+        {  // Inkling-2 tool calls: specials dropped, NAME{"name":"NAME","args":{...}} per call, prose before stays content
+            tqserve::DecodeResult d;
+            d.text = R"(Let me check.read_file{"name":"read_file","args":{"path":"a}b.txt"}}bash{"name":"bash","args":{"cmd":"ls -l"}})";
+            tqserve::extract_tool_calls(d);
+            check(d.tool_calls.size() == 2 && d.tool_calls[0].name == "read_file" && d.tool_calls[0].arguments == R"({"path":"a}b.txt"})" &&
+                  d.tool_calls[1].name == "bash" && d.tool_calls[1].arguments == R"({"cmd":"ls -l"})", "inkling tool calls parsed");
+            check(d.text == "Let me check." && d.finish_reason == "tool_calls", "inkling prose kept, finish tool_calls");
+            tqserve::DecodeResult e;  // no thinking message: the call landed in reasoning at the split
+            e.reasoning = R"(read{"name":"read","args":{"filePath":"/tmp/agent.md"}})";
+            tqserve::extract_tool_calls(e);
+            check(e.tool_calls.size() == 1 && e.tool_calls[0].name == "read" && e.reasoning.empty(), "inkling call without thinking parsed");
+        }
+        so.keep_high = kh;
+    }
     // an untrusted body nested deeper than the parser's limit is a request error, not a stack overflow
     const auto deep = tqserve::parse_request("{\"messages\":" + std::string(200000, '[') + std::string(200000, ']') + "}", 512, "", true);
     check(!deep.ok && deep.error.find("nesting") != std::string::npos, "deeply nested chat body refused (" + deep.error + ")");
@@ -377,6 +399,14 @@ void test_next_prompt_prefix() {
 
 int main(int argc, char ** argv) {
     test_next_prompt_prefix();
+    {  // finish_reason (GB10 27B 11-18): a reply that ended at end-of-sequence (engine drops the EOS id) said "length"
+        const std::vector<uint32_t> short_reply = {5, 6, 7};
+        check(tqserve::stopped_without_eos(short_reply, 512, false, 256), "short reply without EOS id stopped at end-of-sequence");
+        check(!tqserve::stopped_without_eos(std::vector<uint32_t>(512, 3), 512, false, 256), "max_tokens reached: length");
+        check(!tqserve::stopped_without_eos(short_reply, 512, true, 256), "ignore_eos: never a stop");
+        std::vector<uint32_t> loop(300, 9); loop.insert(loop.begin(), {1, 2});
+        check(!tqserve::stopped_without_eos(loop, 512, false, 256), "repeat guard cut stays length");
+    }
     {  // requests without sampling fields take the server defaults (--temperature / --top-p / --top-k); explicit values win
         const auto body = std::string(R"({"messages":[{"role":"user","content":"hi"}]})");
         const auto greedy = tqserve::parse_request(body, 64, "", true);

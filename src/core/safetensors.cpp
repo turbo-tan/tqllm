@@ -65,6 +65,12 @@ std::map<std::string, SafeTensor> safetensors_index(const std::filesystem::path 
     return out;
 }
 
+std::map<std::string, SafeTensor> safetensors_index_file(const std::filesystem::path & file) {
+    std::map<std::string, SafeTensor> out;
+    index_shard(file, out);
+    return out;
+}
+
 std::vector<char> safetensors_read(const SafeTensor & t) {
     std::ifstream in(t.file, std::ios::binary);
     std::vector<char> buf(t.bytes);

@@ -43,4 +43,12 @@ void dflash_lattice(const uint32_t * cand, const float * unary, const __nv_bfloa
                     SelTable next, SelTable prev, uint32_t anchor, int n, int rank,
                     float * score, cudaStream_t, const uint32_t * anchor_dev = nullptr);
 
+// DFlash2 drafter layer primitives (the drafter's own; same arithmetic as the 27B's, no RoPE scaling)
+void dflash_rms(const __nv_bfloat16 * x, int xts, int xrs, const float * w, __nv_bfloat16 * y, int yts, int yrs, int len,
+                int rows, int n, float eps, cudaStream_t);
+void dflash_rope(__nv_bfloat16 * x, int ts, int n, int heads, int dim, int rot, const int * dpos0, float theta, cudaStream_t);
+void dflash_cache_write(const __nv_bfloat16 * k0, const __nv_bfloat16 * v0, int ts, int n, __nv_bfloat16 * kc,
+                        __nv_bfloat16 * vc, const int * dpos0, int kvheads, int dim, cudaStream_t, int ring);
+void dflash_swiglu(const __nv_bfloat16 * gu, int n, int F, __nv_bfloat16 * act, cudaStream_t);
+void dflash_residual(__nv_bfloat16 * x, const __nv_bfloat16 * y, int n, cudaStream_t);
 } // namespace tqllm_cuda

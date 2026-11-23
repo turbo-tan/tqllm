@@ -27,8 +27,15 @@ void k_expert_gemm_gateup(int fmt, const uint8_t * wg, const void * auxg, const 
 constexpr int kDedupCols = 8, kDedupStride = 2 + 2 * kDedupCols;
 // most groups per dedup launch grid; a block walks the groups past it (empty padding groups then cost no blocks)
 constexpr int kDedupGridGroups = 128;
+// u4h family members with a dedup kernel (k_expert_matvec_dedup / _dedup2)
+inline bool k_expert_dedup_fmt(int fmt) {
+    return fmt == 0 || fmt == 1 || (fmt >= 4 && fmt <= 7) || fmt == 10 || (fmt >= 13 && fmt <= 16);
+}
 void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
                            int rows, int cols, const int * dmap, int groups, cudaStream_t stream);
+// row tiles per CTA of the dedup launches for one u4h format (same bits for every value): paired gate / up 1 or 2,
+// single 1, 2 or 4; 0 keeps the default (paired 1, single 2)
+void set_dedup_mt(int fmt, int paired_mt, int single_mt);
 // Layer-major prefill experts (src/experts/mmq_experts.cu): llama.cpp's MMQ on our expert banks. gate / act on the up
 // projection fuse the SwiGLU into its epilogue (act = half silu(gate) * up, nothing stored in y). Activations quantised to q8_1 tiles once per
 // input row (mmq_quantize_act: rows 0..rows-1; _rows: a pass's groups only); the GEMM reads slot z's columns
@@ -45,6 +52,19 @@ bool mmq_expert_gemm(int fmt, const uint8_t * codes, const void * rec, bool tile
                      const __nv_bfloat16 * gate = nullptr, __half * act = nullptr);
 // TQFN_TILED: grouped expert kernels read lane-contiguous tiles (16 rows x 4 blocks); tile_expert_rows writes them.
 void set_tiled_experts(bool on);
+// dense K6 / K5 matrices stored as 16-row x 4-block tiles (quant_u4h.inc dense_tiled_bpb): code bytes per 32 weights or 0
+int dense_tiled_block_bytes(int fmt);
+void u4h_dense_tile(void * w, int fmt, int rows, int k, cudaStream_t);  // in place; rows % 16 == 0, (k / 32) % 4 == 0
+void u4h_dense_tiled_matvec_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k, int ncols,
+                                cudaStream_t, int ldy = 0);
+void u4h_dense_tiled_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                                 int ncols, cudaStream_t, int ldy = 0);
+void u4h_dense_tiled_tune(int fmt, const uint8_t * w, const void * aux, int rows, int k, cudaStream_t);
+bool u4h_dense_tiled_gemm_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k, int ncols,
+                              cudaStream_t, int ldy);
+void u4h_dense_tiled_gemm(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
+                          cudaStream_t, int ldy);
+void u4h_dense_tiled_dequant_h(int fmt, const uint8_t * w, const void * aux, __half * out, int rows, int k, cudaStream_t);
 int tiled_block_bytes(int fmt);  // code bytes per 32 weights of a tileable u4h format, else 0
 void tile_expert_rows(const char * src, char * dst, int rows, int k, int bpb);
 // the same layout in place on the device for `count` experts stored back to back (rows x k each, data only)
@@ -294,6 +314,8 @@ void tqt_dequant_i8(const uint8_t * w, const __half * sc, int8_t * out, float * 
                     const float * cm = nullptr);
 // NVFP4 (modelopt, Qwen3.8-Flash-Next experts): codes [rows][k / 2] (E2M1, low nibble = even column), E4M3 scale per
 // 16 [rows][k / 16], FP32 global scale. x: [ncols][k] BF16 -> y: [ncols][rows] FP32. Reference kernel (not tuned).
+// NVF4 (q4.cpp layout) rows [row0, row0 + nrows) -> FP16 [nrows][k]
+void nvf4_dequant_h(const uint8_t * w, const void * aux, __half * out, int row0, int nrows, int k, cudaStream_t);
 void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __nv_bfloat16 * x, float * y, int rows,
                   int k, int ncols, cudaStream_t);
 void tq4_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t);
@@ -367,4 +389,17 @@ void fp_dequant_h(bool bf16, const void * w, __half * out, size_t n, cudaStream_
 // MXFP8: rows of k E4M3 bytes then the row's k / 32 E8M0 scales (k % 512 == 0); ldy 0 = rows
 void mxfp8_matvec(const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t, int ldy);
 void mxfp8_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t);
+// routed experts on a stacked MXFP8 bank [experts * rows][k + k / 32] (k % 32 == 0): y [n * topk][rows] for ids [n][topk]
+// (negative ids skipped); x [n][k], or [n * topk][k] with per_expert_input
+void mxfp8_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k, const int * ids, int n, int topk,
+                         bool per_expert_input, cudaStream_t);
+// prompt chunks, grouped by expert (moe_group: groups [experts][capacity] of assignment ids, counts [experts]): each
+// expert's rows decoded once per 64 assignments to FP16 tiles, FP16 tensor-core GEMM, F32 accumulate
+void mxfp8_expert_gemm(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k, const int * counts, const int * groups, int capacity,
+                       int experts, int topk, bool per_expert_input, cudaStream_t);
+// FP8T: rows of k E4M3 bytes, one F32 scale per row (k % 64 == 0); 1..16 columns, tensor cores; ldy 0 = rows
+void fp8t_matvec(const void * w, const float * scale, const __half * x, void * y, bool f32_out, int rows, int k, int n,
+                 cudaStream_t, int ldy);
+void fp8t_dequant_h(const void * w, const float * scale, __half * out, int rows, int k, cudaStream_t);
+int fp8t_split_k(int rows);  // warps that split K for a matrix of this many rows (fixed per shape)
 } // namespace tqllm_cuda

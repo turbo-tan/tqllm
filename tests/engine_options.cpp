@@ -38,6 +38,17 @@ int main() {
     expect(o.dense_cache_mb == 0, "--dense-cache-mb 0 turns the cache off");
     expect(parse({"--prefill-borrow", "auto"}).prefill_borrow == "auto" && parse({"--prefill-borrow", "12"}).prefill_borrow == "12", "--prefill-borrow all|auto|N");
     expect(throws({"--prefill-borrow", "some"}), "bad borrow value rejected");
+    expect(parse({"--kv", "q8"}).kv_format() == "q8/q8" && parse({"-ctk", "q8_0", "-ctv", "q8_0"}).kv_format() == "q8/q8",
+           "--kv q8 and -ctk/-ctv q8_0: the rotated int8 cache on K and V (QSA rows; issue #60)");
+    {   // --split layer over N ranks: --tp-world in any order with --tp-rank (alone: two ranks); --split-at takes a list
+        const auto a = parse({"--tp-world", "3", "--tp-rank", "2"}), b = parse({"--tp-rank", "2", "--tp-world", "3"}), c = parse({"--tp-rank", "1"});
+        expect(a.tp_world == 3 && a.tp_rank == 2 && b.tp_world == 3 && b.tp_rank == 2, "--tp-world before or after --tp-rank");
+        expect(c.tp_world == 2, "--tp-rank alone: two ranks");
+        expect(parse({"--split-at", "20,44"}).split_at == std::vector<uint32_t>({20, 44}) && parse({"--split-at", "40"}).split_at == std::vector<uint32_t>({40}),
+               "--split-at list");
+        expect(parse({}).split_at.empty(), "--split-at default: by free memory");
+        expect(throws({"--tp-world", "1"}) && throws({"--split-at", "20,x"}), "bad --tp-world / --split-at rejected");
+    }
     expect(throws({"--prefill-chunk", "100"}), "--prefill-chunk below 256 rejected");
     expect(throws({"--prefill-sub", "8"}), "--prefill-sub below 16 rejected");
     expect(throws({"--prefill-stage", "0"}), "--prefill-stage below 1 rejected");
@@ -53,9 +64,9 @@ int main() {
     expect(tqllm::exact_conflicts(parse({"-ctk", "q8"}), false, false, no_env).size() == 1, "exact + lossy KV");
     expect(tqllm::exact_conflicts(parse({}), true, false, cpu_miss).size() == 1 &&
            tqllm::exact_conflicts(parse({}), false, false, cpu_miss).empty(), "TQFN_* only for Flash-Next");
-    expect(tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 4).size() == 1 &&
-           tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 1).empty() &&
-           tqllm::exact_conflicts(parse({"--prompt-cache", "on", "--exact", "off"}), true, false, no_env, 4).empty(), "Flash-Next prompt cache: a conflict with several slots only");
+    expect(tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 4).empty() &&
+           tqllm::exact_conflicts(parse({"--prompt-cache", "on"}), true, false, no_env, 1).empty(),
+           "Flash-Next prompt cache: no --exact conflict (owner 11-18: a reused turn equals a fresh read up to the reuse point)");
     expect(tqllm::exact_conflicts(parse({}), false, true, no_env).size() == 1, "engine without an exact path");
     expect(!tqllm::tail_prefill_reuse(parse({})), "Metal tail prefill: off under --exact on");
     expect(tqllm::tail_prefill_reuse(parse({"--prompt-cache", "on"})), "Metal tail prefill: --prompt-cache on asks for it");

@@ -13,7 +13,9 @@ void FlashNextEngine::verify(const uint32_t * tokens, int n, uint32_t pos, uint3
     }
     require(S().model_->position == int(pos), "Flash-Next verify: blocks must follow each other");
     if (g_arena) g_arena->used = 0;
+    f_.cp->rt.rows_to_all = true;  // every rank reads the logits here
     auto rows = S().model_->step(std::vector<int>(tokens, tokens + n));
+    f_.cp->rt.rows_to_all = false;
     const auto lg = checkpoint.head_logits_device(rows->p, n); const size_t V = lg.size() / size_t(n);
     { PersistentAlloc keep; if (!verify_logits_ || verify_logits_->count < lg.size()) verify_logits_ = std::make_unique<Device<float>>(lg.size()); }
     ck(cudaMemcpy(verify_logits_->p, lg.data(), lg.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -46,13 +48,20 @@ std::vector<int> FlashNextEngine::pick(const float * rows, int n) {
 void FlashNextEngine::trace_step(int slots, int drafts, const std::vector<std::pair<size_t, std::vector<int>>> & per_slot, const std::vector<int> & slot_ids) {
     static const bool on = tqllm::debug_on("steptrace");
     if (on) {
-        static uint64_t n = 0;
+        static uint64_t n = 0; static size_t inst0 = 0;
+        static auto t_last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now(); const size_t inst = decode_graph_instantiations();
+        char ms[32]; std::snprintf(ms, sizeof ms, "%.2f", std::chrono::duration<double, std::milli>(now - t_last).count());
+        // ms: wall time since the previous trace line (the first step of a request includes the time before it); plain: graph-path
+        // layer calls run without a graph (warm-up); inst: graph execs instantiated
         std::string line = "STEPTRACE " + std::to_string(++n) + " slots " + std::to_string(slots) + " drafts " + std::to_string(drafts) +
-                           " waves " + std::to_string(f_.cp->rt.trace_waves) + " minslots " + std::to_string(f_.cp->rt.trace_min_slots);
+                           " waves " + std::to_string(f_.cp->rt.trace_waves) + " minslots " + std::to_string(f_.cp->rt.trace_min_slots) +
+                           " ms " + ms + " plain " + std::to_string(f_.cp->rt.trace_plain) + " inst " + std::to_string(inst - inst0);
+        t_last = now; inst0 = inst;
         for (size_t i = 0; i < per_slot.size(); ++i) { const auto & [len, toks] = per_slot[i]; line += " |s" + std::to_string(i < slot_ids.size() ? slot_ids[i] : -1) + ":" + std::to_string(len); for (int t : toks) line += " " + std::to_string(t); }
         std::fprintf(stderr, "%s\n", line.c_str());
     }
-    f_.cp->rt.trace_waves = 0; f_.cp->rt.trace_min_slots = 1 << 30;
+    f_.cp->rt.trace_waves = 0; f_.cp->rt.trace_min_slots = 1 << 30; f_.cp->rt.trace_plain = 0;
 }
 // a finished request's prompt + output becomes copy history for the next ones (the last 4, at most 32K tokens each)
 void FlashNextEngine::remember_copy(SlotState & sl) {
@@ -61,6 +70,28 @@ void FlashNextEngine::remember_copy(SlotState & sl) {
     copy_history_.push_back(std::move(c)); c.clear();
     if (copy_history_.size() > 4) copy_history_.erase(copy_history_.begin());
 }
+tqllm::Dflash2Drafter::EmbedFn FlashNextEngine::dfl_embed() {
+    return [this](const std::vector<uint32_t> & toks, __nv_bfloat16 * out, cudaStream_t s) {
+        const std::vector<uint64_t> rows(toks.begin(), toks.end());
+        const auto e = f_.cp->file("token_embd.weight").gather_rows("token_embd.weight", rows);
+        Device<float> d(e.size()); d.put(e);
+        tqllm_cuda::f32_to_bf16(d.p, out, int64_t(e.size()), s);
+    };
+}
+tqllm::Dflash2Drafter::HeadFn FlashNextEngine::dfl_head() {
+    return [this](const __nv_bfloat16 * x, int n, float * logits, cudaStream_t s) { f_.cp->head_logits_bf16(x, n, logits, s); };
+}
+namespace {
+// head_only (--split layer, one sequence): the last rank's ints (a draft block, picked tokens: at most 63) on every rank
+void from_head(FnConfig & run, std::vector<int> & v) {
+    int buf[64] = {};
+    buf[0] = int(v.size());
+    require(v.size() < 64, "--split layer: a block of more than 63 tokens");
+    std::copy(v.begin(), v.end(), buf + 1);
+    DecodeModel::split_from_last(*run.split, buf, 64);
+    v.assign(buf + 1, buf + 1 + buf[0]);
+}
+}  // namespace
 bool FlashNextEngine::spec_advance() {
     const auto lk = ep_lock();
     if (S().done_) return false;
@@ -69,31 +100,46 @@ bool FlashNextEngine::spec_advance() {
     refill_borrowed();  // no-op unless an earlier refill ran out of memory
     auto & checkpoint = *f_.cp; const int drafts = f_.drafts;
     const int y = S().out_.back();
+    const bool dfl_on = f_.drafter && slots_.size() == 1 && f_.dfl_feat;
+    // head_only: drafting, the head and the MTP layer run on the last rank; it sends the block and the picked tokens
+    auto & run = f_.cp->run; const bool head = run.head_here();
+    int which = dfl_on && head ? pick_drafter(S().pick_) : 1;
+    // --split layer, every rank drafting: the pick reads wall-clock rates, which differ per rank; rank 0's choice goes to the
+    // others so all run the same step (a rank-local pick made rank 0 verify 32 rows while rank 1 ran 8: "the ranks diverged")
+    if (dfl_on && run.split && !run.head_only) DecodeModel::split_agree(*run.split, &which, 1);
+    const bool dfl = dfl_on && which == 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t pos0 = uint32_t(S().model_->position);
     // copy drafts: a continuation of an earlier occurrence of the last 3 tokens (this request or the last few) that starts
     // with the MTP's own first draft replaces the MTP chain (exact either way: the verify keeps what the model emits)
     if (S().ctx_.size() < S().plen_ + S().out_.size()) S().ctx_.insert(S().ctx_.end(), S().out_.begin() + long(S().ctx_.size() - S().plen_), S().out_.end());
     std::vector<const std::vector<int> *> hist;
     for (auto it = copy_history_.rbegin(); it != copy_history_.rend(); ++it) hist.push_back(&*it);
-    std::vector<int> dr = drafts > 0 ? tqllm::flashnext::copy_draft(S().ctx_, hist, 3, drafts) : std::vector<int>{};
-    if (!dr.empty() && dr[0] == S().d1_) ++S().copied_;
-    else dr = S().model_->mtp_drafts(S().d1_, drafts);
+    std::vector<int> dr;
+    if (head) {
+        dr = drafts > 0 ? tqllm::flashnext::copy_draft(S().ctx_, hist, 3, drafts) : std::vector<int>{};
+        if (!dr.empty() && dr[0] == S().d1_) ++S().copied_;
+        else if (dfl) {  // one sequence with a DFlash2 drafter (manifest dflash=): its block chain instead of MTP drafts
+            const auto d = f_.drafter->draft(uint32_t(y), pos0, f_.drafter->block() - 1, dfl_embed(), dfl_head());
+            dr.assign(d.begin(), d.end());
+        } else dr = S().model_->mtp_drafts(S().d1_, drafts);
+    }
+    if (run.head_only) from_head(run, dr);
     std::vector<int> block{y}; block.insert(block.end(), dr.begin(), dr.end());
     auto rows = S().model_->step(block);
-    const auto v = pick(rows->p, int(block.size()));
+    std::vector<int> v = head ? pick(rows->p, int(block.size())) : std::vector<int>(block.size());
+    if (run.head_only) from_head(run, v);
     int m = 1; while (m <= int(dr.size()) && v[m - 1] == dr[m - 1]) ++m;
+    const size_t out0 = S().out_.size();
+    if (dfl_on && head) drafter_done(S().pick_, which, m, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     for (int i = 0; i < m && int(S().out_.size()) < S().generate_; ++i) { S().out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
+    m = committed_rows(m, int(S().out_.size()) - int(out0));  // a max_tokens cut keeps the state at the output's end
     S().model_->accept(m); ++S().steps_; S().toks_ += m; S().offered_ += dr.size(); ++S().taken_[size_t(std::min(m, 16))];
+    if (dfl_on && head) f_.drafter->inject(f_.dfl_feat->p, m, pos0);  // the target features of the committed rows (captured by the step)
     trace_step(1, int(dr.size()), {{S().out_.size(), std::vector<int>(v.begin(), v.begin() + m)}}, {-1});
-    // after the request's first step (decode's lazy buffers, e.g. the host-K/V gather, exist now): the banks grow into what
-    // is free beyond 1 GB; the start-up keep is sized for a prefill, which borrows the banks back anyway (10-28 128K: 3.6 GB
-    // idle in decode at 133 slots / layer vs Strata's ~172). Growing before the first step left that gather no room (OOM)
-    // only after a prompt that borrowed the banks: grown after a short request, the next long prefill had no room (OOM)
-    if (S().steps_ == 1 && S().refilled_ && slots_.size() == 1 && f_.slots_auto && !f_.cp->run.small_card && kv_host_enabled()) {
-        { cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
-        if (const int grown = f_.cache->grow_into(size_t(1024) << 20, f_.cp->config.experts))
-            std::fprintf(stderr, "tqllm: expert banks grown for decode: %d layers, up to %d slots\n", grown, f_.cache->slots());
-    }
-    S().d1_ = S().model_->mtp_batch(std::vector<int>(v.begin(), v.begin() + m), S().model_->res_keep->p);
+    // no decode-time bank growth: growing every bank at the first decode step rebuilt all 48 banks and cut the hit rate
+    // (3090 one card, 32K after short chats: 80 -> 88 % hit, 50.1 -> 80.9 tok/s without; 2x4090 split 8K: 26-36 -> 101)
+    if (head && mtp_after_step(drafts, bool(f_.drafter))) S().d1_ = S().model_->mtp_batch(std::vector<int>(v.begin(), v.begin() + m), S().model_->res_keep->p);
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());
     if (S().done_ && f_.cp->rt.profile_decode_req) { ck(cudaDeviceSynchronize()); ck(cudaProfilerStop()); f_.cp->rt.profile_decode_req = false; }
     if (S().done_) remember_copy(S());
@@ -174,7 +220,9 @@ void FlashNextEngine::spec_step(const int * ids, int n, bool * done) {
                               : pick(rows_d->p + off * size_t(f_.cp->config.hidden), int(blocks[a].size()));
         off += blocks[a].size();
         int m = 1; while (m <= int(drs[a].size()) && v[m - 1] == drs[a][m - 1]) ++m;
+        const size_t out0 = sl.out_.size();
         for (int i = 0; i < m && int(sl.out_.size()) < sl.generate_; ++i) { sl.out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
+        m = committed_rows(m, int(sl.out_.size()) - int(out0));
         accepts.push_back({sl.model_.get(), m}); ++sl.steps_; sl.toks_ += m; sl.offered_ += drs[a].size(); ++sl.taken_[size_t(std::min(m, 16))]; vs[a] = v; ms_acc[a] = m;
     }
     DecodeModel::accept_multi(accepts);

@@ -30,6 +30,41 @@ template<class Input> __global__ void router_k(const float * w, const float * sh
     }
 }
 
+// Several tokens: one block per router row, so the row is read from memory once and the other tokens hit the cache.
+// Each (row, token) sum keeps router_k's per-thread order and reduction tree: logits bit-identical to router_k.
+constexpr int kRouterTok = 8;
+template<class Input> __global__ void router_rows_k(const float * w, const float * shared, const Input * x, float * logits,
+                                                    int h, int e, int n) {
+    const int row = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float * wr = row == e ? shared : w + int64_t(row) * h;
+    __shared__ float partial[kRouterTok][8];
+    for (int t0 = 0; t0 < n; t0 += kRouterTok) {
+        const int nt = min(kRouterTok, n - t0);
+        float sum[kRouterTok];
+#pragma unroll
+        for (int t = 0; t < kRouterTok; ++t) sum[t] = 0.f;
+        for (int j = threadIdx.x; j < h; j += blockDim.x) {
+            const float wv = wr[j];
+#pragma unroll
+            for (int t = 0; t < kRouterTok; ++t)
+                if (t < nt) sum[t] += wv * router_value(x[int64_t(t0 + t) * h + j]);
+        }
+#pragma unroll
+        for (int t = 0; t < kRouterTok; ++t) {
+            float v = sum[t];
+            for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
+            if (!lane) partial[t][warp] = v;
+        }
+        __syncthreads();
+        for (int t = warp; t < nt; t += 8) {
+            float v = lane < 8 ? partial[t][lane] : 0.f;
+            for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
+            if (!lane) logits[int64_t(t0 + t) * (e + 1) + row] = v;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void topk_k(const float * logits, int * ids, float * weights, float * shared_weights,
                        int e, int k, float scale) {
     // 256 threads. Reductions use warp shuffles; the softmax sum keeps the same pairing order as a 256-wide tree
@@ -98,6 +133,7 @@ template <int R>
 __device__ __forceinline__ void topk_warp_body(const float * logits, int * ids, float * weights, float * shared_weights, int e, int k, float scale) {
     const int token = blockIdx.x, lane = threadIdx.x;
     const float * x = logits + int64_t(token) * (e + 1);
+    const float shared_logit = x[e];  // loaded with the row (read at the end)
     float p[8][R];
     float m = -CUDART_INF_F;
 #pragma unroll
@@ -124,6 +160,8 @@ __device__ __forceinline__ void topk_warp_body(const float * logits, int * ids, 
 #pragma unroll
         for (int r = 0; r < R; ++r) { const int j = lane + 32 * q + 256 * r; p[q][r] = j < e ? p[q][r] / sum : -2.f; }
     float selected = 0.f;
+    constexpr int KR = 32;  // lane 0 keeps up to KR selected weights in registers and writes each once, scaled (no reload)
+    float kept[KR];
     for (int i = 0; i < k; ++i) {
         float value = -CUDART_INF_F; int best = e;
 #pragma unroll
@@ -133,11 +171,22 @@ __device__ __forceinline__ void topk_warp_body(const float * logits, int * ids, 
                 const int j = lane + 32 * q + 256 * r;
                 if (j < e && (p[q][r] > value || (p[q][r] == value && j < best))) { value = p[q][r]; best = j; }
             }
+#if __CUDA_ARCH__ >= 800
+        // the same winner in two warp reductions: the largest value (its bits in an order-preserving unsigned form; a lane's
+        // value is never NaN), then the lowest index among the lanes that hold it
+        {
+            const unsigned bits = __float_as_uint(value), key = bits & 0x80000000u ? ~bits : bits | 0x80000000u;
+            const unsigned top = __reduce_max_sync(0xffffffffu, key);
+            best = int(__reduce_min_sync(0xffffffffu, key == top ? unsigned(best) : 0xffffffffu));
+            value = __uint_as_float(top & 0x80000000u ? top & 0x7fffffffu : ~top);
+        }
+#else
         for (int d = 16; d; d >>= 1) {
             const float v = __shfl_xor_sync(0xffffffffu, value, d); const int b = __shfl_xor_sync(0xffffffffu, best, d);
             if (v > value || (v == value && b < best)) { value = v; best = b; }
         }
-        if (!lane) { ids[int64_t(token) * k + i] = best; weights[int64_t(token) * k + i] = value; }
+#endif
+        if (!lane) { ids[int64_t(token) * k + i] = best; if (k <= KR) kept[i < KR ? i : 0] = value; else weights[int64_t(token) * k + i] = value; }
         selected += value;
 #pragma unroll
         for (int r = 0; r < R; ++r)
@@ -147,8 +196,11 @@ __device__ __forceinline__ void topk_warp_body(const float * logits, int * ids, 
     if (!lane) {
         const float total = fmaxf(selected, 6.103515625e-5f);
         const float factor = (scale == 0.f ? 1.f : scale) / total;
-        for (int i = 0; i < k; ++i) weights[int64_t(token) * k + i] *= factor;
-        shared_weights[token] = 1.f / (1.f + expf(-x[e]));
+        if (k <= KR) {
+#pragma unroll
+            for (int i = 0; i < KR; ++i) if (i < k) weights[int64_t(token) * k + i] = kept[i] * factor;
+        } else for (int i = 0; i < k; ++i) weights[int64_t(token) * k + i] *= factor;
+        shared_weights[token] = 1.f / (1.f + expf(-shared_logit));
     }
 }
 template <int R>
@@ -235,13 +287,27 @@ __global__ void sum_k(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared
 void moe_router(const float * router, const float * shared, const __half * x, float * logits,
                 int h, int e, int n, cudaStream_t stream) {
     if (h <= 0 || e <= 0 || n <= 0) throw std::invalid_argument("moe_router: invalid shape");
-    router_k<<<dim3(unsigned(e + 1), unsigned(n)), 256, 0, stream>>>(router, shared, x, logits, h, e);
+    if (n > 1) router_rows_k<<<unsigned(e + 1), 256, 0, stream>>>(router, shared, x, logits, h, e, n);
+    else router_k<<<dim3(unsigned(e + 1), 1u), 256, 0, stream>>>(router, shared, x, logits, h, e);
 }
 void moe_router_f32(const float * router, const float * shared, const float * x, float * logits,
                     int h, int e, int n, cudaStream_t stream) {
     if (h <= 0 || e <= 0 || n <= 0 || !router || !shared || !x || !logits)
         throw std::invalid_argument("moe_router_f32: invalid shape or pointer");
     router_k<<<dim3(unsigned(e + 1), unsigned(n)), 256, 0, stream>>>(router, shared, x, logits, h, e);
+}
+__global__ void skip_weights_k(float * w, const int * skip, int n, int topk, int renorm) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    float * r = w + int64_t(t) * topk; const int * m = skip + int64_t(t) * topk;
+    float all = 0.f, cut = 0.f;
+    for (int i = 0; i < topk; ++i) { all += r[i]; if (m[i]) cut += r[i]; }
+    const float f = renorm && all - cut > 0.f ? all / (all - cut) : 1.f;
+    for (int i = 0; i < topk; ++i) r[i] = m[i] ? 0.f : renorm ? r[i] * f : r[i];
+}
+void moe_skip_weights(float * weights, const int * skip, int n, int topk, bool renorm, cudaStream_t stream) {
+    if (n <= 0 || topk <= 0 || !weights || !skip) throw std::invalid_argument("moe_skip_weights: invalid shape or pointer");
+    skip_weights_k<<<(n + 127) / 128, 128, 0, stream>>>(weights, skip, n, topk, renorm ? 1 : 0);
 }
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,
               int e, int k, int n, float scale, cudaStream_t stream) {
@@ -448,12 +514,15 @@ void logits_mask(float * logits, const float * mask, int n, int ld, int experts,
 
 namespace {
 __device__ unsigned long long g_dedup_stats[3];  // calls, groups, distinct experts (TQLLM_DEBUG=mem LEDGER)
-__global__ void dedup_maps_k(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups) {
+__global__ void dedup_maps_k(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
+                             int extra) {
     constexpr int DS = tqllm_cuda::kDedupStride, DC = tqllm_cuda::kDedupCols;
     __shared__ int slot[1024]; __shared__ unsigned char opens[1024];
     const int a = threadIdx.x;
     for (int i = a; i < groups * DS; i += blockDim.x) { if (gu) gu[i] = -1; if (dn) dn[i] = -1; }
-    const int s = a < count && ids[a] >= 0 ? slot_of[ids[a]] : -1;
+    // extra >= 0: ids hold topk - 1 routed ids per token and every token's last assignment is expert `extra`
+    const int id = a >= count ? -1 : extra < 0 ? ids[a] : a % topk == topk - 1 ? extra : ids[a / topk * (topk - 1) + a % topk];
+    const int s = id >= 0 ? slot_of[id] : -1;
     if (a < count) { slot[a] = s; if (slots) slots[a] = s; }
     __syncthreads();
     int rank = 0, total = 0;
@@ -485,9 +554,10 @@ void moe_dedup_stats(unsigned long long out[3]) {
     cudaMemcpyFromSymbol(out, g_dedup_stats, sizeof(unsigned long long) * 3);
 }
 void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, int extra) {
     if (!ids || !slot_of || count <= 0 || count > 1024 || topk <= 0 || groups < count) throw std::invalid_argument("moe_dedup_maps: invalid shape");
-    dedup_maps_k<<<1, (count + 31) / 32 * 32, 0, stream>>>(ids, slot_of, count, topk, slots, gu, dn, groups);
+    if (extra >= 0 && topk < 2) throw std::invalid_argument("moe_dedup_maps: an extra expert needs topk >= 2");
+    dedup_maps_k<<<1, (count + 31) / 32 * 32, 0, stream>>>(ids, slot_of, count, topk, slots, gu, dn, groups, extra);
 }
 }
 

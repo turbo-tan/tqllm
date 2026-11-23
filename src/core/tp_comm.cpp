@@ -1,4 +1,5 @@
 #include "tp_comm.hpp"
+#include "ctl_star.hpp"
 
 #include <nccl.h>
 
@@ -13,74 +14,61 @@
 #include <atomic>
 #include <cstdio>
 #include <thread>
+#include <vector>
+
+#ifndef TQLLM_COMMIT
+#define TQLLM_COMMIT "dev"
+#endif
 
 namespace tqllm {
 namespace {
 void nck(ncclResult_t r, const char * what) {
     if (r != ncclSuccess) throw std::runtime_error(std::string("tp: ") + what + ": " + ncclGetErrorString(r));
 }
-void full_io(int fd, void * p, size_t n, bool send) {
-    auto * c = static_cast<char *>(p);
-    while (n) {
-        const ssize_t k = send ? ::send(fd, c, n, MSG_NOSIGNAL) : ::recv(fd, c, n, 0);
-        if (k <= 0) throw std::runtime_error("tp: control socket closed");
-        c += k; n -= size_t(k);
-    }
-}
 }  // namespace
 
 struct TpComm::Impl {
     ncclComm_t comm = nullptr;
-    int ctl = -1;
-    // a rank that dies (killed, out of memory) must not leave the other spinning in a collective: the watchdog sees the
-    // control connection hang up and aborts the communicator, so the pending NCCL call returns an error
+    std::unique_ptr<CtlStar> ctl;
+    // a rank that dies (killed, out of memory) must not leave the others spinning in a collective: the watchdog sees a
+    // control connection hang up, aborts the communicator (the pending NCCL call returns an error) and closes the other
+    // links, so every remaining rank sees it too
     std::atomic<bool> stop{false}, aborted{false};
     std::thread watchdog;
-    void live() const { if (aborted) throw std::runtime_error("tp: the other rank went away"); }
+    void live() const { if (aborted) throw std::runtime_error("tp: another rank went away"); }
 };
 
 TpComm::TpComm(int rank, int world, const std::string & peer, int port) : impl_(std::make_unique<Impl>()), rank_(rank), world_(world) {
-    if (world != 2 || rank < 0 || rank > 1) throw std::invalid_argument("tp: two ranks only");
+    if (world < 2 || world > kMaxRanks || rank < 0 || rank >= world)
+        throw std::invalid_argument("tp: rank " + std::to_string(rank) + " of " + std::to_string(world) + " (2 .. " + std::to_string(kMaxRanks) + " ranks)");
     ncclUniqueId id{};
+    std::vector<char> blob;
     if (rank == 0) {
         nck(ncclGetUniqueId(&id), "unique id");
-        const int ls = ::socket(AF_INET, SOCK_STREAM, 0);
-        int one = 1;
-        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(uint16_t(port)); a.sin_addr.s_addr = INADDR_ANY;
-        if (::bind(ls, reinterpret_cast<sockaddr *>(&a), sizeof a) || ::listen(ls, 1)) throw std::runtime_error("tp: cannot listen");
-        const int fd = ::accept(ls, nullptr, nullptr);
-        if (fd < 0) throw std::runtime_error("tp: accept failed");
-        full_io(fd, &id, sizeof id, true);
-        ::close(ls);
-        impl_->ctl = fd;
-    } else {
-        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(uint16_t(port));
-        if (inet_pton(AF_INET, peer.c_str(), &a.sin_addr) != 1) throw std::runtime_error("tp: bad peer address " + peer);
-        int tries = 0;
-        while (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof a)) {
-            if (++tries > 6000) throw std::runtime_error("tp: cannot reach rank 0 at " + peer + " in 10 minutes");
-            usleep(100000);
-        }
-        full_io(fd, &id, sizeof id, false);
-        impl_->ctl = fd;
+        blob.assign(reinterpret_cast<const char *>(&id), reinterpret_cast<const char *>(&id) + sizeof id);
     }
-    int one = 1;
-    setsockopt(impl_->ctl, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    int nv = 0; ncclGetVersion(&nv);
+    impl_->ctl = std::make_unique<CtlStar>(rank, world, peer, port, blob, std::string(TQLLM_COMMIT) + "/nccl" + std::to_string(nv));
+    if (blob.size() != sizeof id) throw std::runtime_error("tp: bad bootstrap id from rank 0");
+    std::memcpy(&id, blob.data(), sizeof id);
     nck(ncclCommInitRank(&impl_->comm, world, id, rank), "comm init");
     Impl * im = impl_.get();
     im->watchdog = std::thread([im] {
+        const std::vector<int> fds = im->ctl->fds();
+        std::vector<pollfd> p(fds.size());
         while (!im->stop) {
-            pollfd p{im->ctl, POLLRDHUP, 0};
-            if (::poll(&p, 1, 1000) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
-                if (im->stop) return;
-                std::fprintf(stderr, "tp: the other rank went away; aborting the communicator\n");
-                im->aborted = true;
-                ncclCommAbort(im->comm);
-                im->comm = nullptr;
-                return;
-            }
+            for (size_t i = 0; i < fds.size(); ++i) p[i] = {fds[i], POLLRDHUP, 0};
+            if (::poll(p.data(), p.size(), 1000) <= 0) continue;
+            for (const auto & x : p)
+                if (x.revents & (POLLRDHUP | POLLHUP | POLLERR)) {
+                    if (im->stop) return;
+                    std::fprintf(stderr, "tp: a rank went away; aborting the communicator\n");
+                    im->aborted = true;
+                    ncclCommAbort(im->comm);
+                    im->comm = nullptr;
+                    im->ctl->shutdown_all();
+                    return;
+                }
         }
     });
 }
@@ -89,7 +77,6 @@ TpComm::~TpComm() {
     impl_->stop = true;
     if (impl_->watchdog.joinable()) impl_->watchdog.join();
     if (impl_->comm) ncclCommDestroy(impl_->comm);
-    if (impl_->ctl >= 0) ::close(impl_->ctl);
 }
 void TpComm::all_reduce_sum(float * x, size_t n, cudaStream_t s) { impl_->live(); nck(ncclAllReduce(x, x, n, ncclFloat, ncclSum, impl_->comm, s), "all-reduce"); }
 void TpComm::broadcast(void * buf, size_t bytes, int root, cudaStream_t s) { impl_->live(); nck(ncclBroadcast(buf, buf, bytes, ncclUint8, root, impl_->comm, s), "broadcast"); }
@@ -99,6 +86,13 @@ void TpComm::recv(void * buf, size_t bytes, int peer, cudaStream_t s) { impl_->l
 bool TpComm::alive() const { return !impl_->aborted; }
 void TpComm::group_begin() { nck(ncclGroupStart(), "group start"); }
 void TpComm::group_end() { nck(ncclGroupEnd(), "group end"); }
-void TpComm::ctl_send(const void * buf, size_t bytes) { full_io(impl_->ctl, const_cast<void *>(buf), bytes, true); }
-void TpComm::ctl_recv(void * buf, size_t bytes) { full_io(impl_->ctl, buf, bytes, false); }
+void TpComm::ctl_send(const void * buf, size_t bytes) {
+    if (rank_ == 0) impl_->ctl->fan_out(buf, bytes); else impl_->ctl->send(0, buf, bytes);
+}
+void TpComm::ctl_recv(void * buf, size_t bytes) {
+    if (rank_ == 0 && world_ != 2) throw std::logic_error("tp: with more than two ranks rank 0 gathers (ctl_all_gather)");
+    impl_->ctl->recv(rank_ == 0 ? 1 : 0, buf, bytes);
+}
+void TpComm::ctl_all_gather(const void * mine, void * all, size_t bytes) { impl_->ctl->all_gather(mine, all, bytes); }
+int TpComm::local_ranks() const { return impl_->ctl->local_ranks(); }
 }  // namespace tqllm

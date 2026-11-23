@@ -1,4 +1,5 @@
 #include "tq3_expert_cache.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +42,7 @@ static void run() {
     const size_t budget = 32 * 1024 * 1024;
     MixedExpertCache cache(layers, experts, hidden, ff, slots, budget, source, nullptr);
     MixedExpertCache * selected = &cache;
+    size_t limit = budget;  // the selected cache's budget
     auto compare = [&](int l, const std::vector<int> & ids, bool per = false) {
         auto & current = *selected;
         const auto physical = current.prepare(l, ids); current.wait_misses(); Device<int> di(ids.size()); di.put(physical);
@@ -68,7 +70,7 @@ static void run() {
                 require(equal, "mixed cached grouped projection differs from independent native load");
             }
         }
-        require(current.stats().device_bytes <= budget && current.peak_device_bytes() <= budget, "mixed cache resident or staging budget exceeded");
+        require(current.stats().device_bytes <= limit && current.peak_device_bytes() <= limit, "mixed cache resident or staging budget exceeded");
     };
     for (int l = 0; l < layers; ++l) {
         compare(l, {0, 1, 1, 2}); const auto before = cache.stats(); const int fetches = calls;
@@ -383,7 +385,11 @@ static void run() {
         for (int l = 0; l < layers; ++l) grown.release_bank(l);  // lent to a long prompt, then refilled at the floor
         for (int l = 0; l < layers; ++l) { grown.prepare(l, {l % experts}); grown.wait_misses(); }
         for (int l = 0; l < layers; ++l) require(grown.slots(l) == 1, "regrow setup: banks must start at their floor");
+        const int reads0 = calls;
         const int n = grown.regrow(0);
+        // the held experts are copied on the device, not read and uploaded from the host again (11-16: the regrow after a
+        // 128K prompt re-uploaded every bank over PCIe, ~0.4 s before the second token)
+        require(calls == reads0, ("regrow read " + std::to_string(calls - reads0) + " held experts from the host again").c_str());
         std::string missing;
         for (int l = 0; l < layers; ++l) {
             if (!grown.bank_ready(l)) missing += " layer " + std::to_string(l) + " has no bank;";
@@ -395,16 +401,40 @@ static void run() {
         selected = &cache;
         std::puts("regrow: every floor bank grown to its target in place, experts kept, byte-exact PASS");
     }
+    {   // regrow after a shrink_to_free: a kept K/V grown for a longer prompt (32K then 128K on one sequence) gave slots back
+        // and lowered the targets; the next request with nothing kept regrows every bank to the plan (11-19: the targets
+        // stayed lowered and every later short request ran on 12.0 of 15.8 GB of banks, 3.7 GB free on an RTX 3090)
+        auto same = [&](int, int id) { return source(1, id); };
+        MixedExpertCache s(layers, experts, hidden, ff, slots, 2 * budget, same, nullptr);
+        s.set_layer_tiers(std::vector<int>(size_t(layers), 1), 0);
+        for (int l = 0; l < layers; ++l) { s.prepare(l, {0, 1, 2}); s.wait_misses(); }
+        for (int l = 0; l < layers; ++l) require(s.slots(l) == slots, "shrink setup: banks must start at the plan");
+        const size_t per = s.bank_bytes(0) / size_t(slots);
+        require(s.shrink_to_free(size_t(layers) * per * 2, 1) == layers, "shrink setup: every bank gives slots back");
+        for (int l = 0; l < layers; ++l) require(s.slots(l) < slots, "shrink setup: banks must be below the plan");
+        const int n = s.regrow(0);
+        std::string low;
+        for (int l = 0; l < layers; ++l) if (s.slots(l) != slots) low += " layer " + std::to_string(l) + " at " + std::to_string(s.slots(l)) + ";";
+        require(n == layers && low.empty(), ("regrow after shrink: " + std::to_string(n) + " of " + std::to_string(layers) + " back to the plan;" + low).c_str());
+        selected = &s; limit = 2 * budget; compare(1, {2, 1}, true); selected = &cache; limit = budget;
+        std::puts("regrow after shrink_to_free: every bank back at the plan's target PASS");
+    }
     {   // decode-time growth after a long prompt (10-28: 3.6 GB of VRAM stayed idle in a 128K decode at 133 slots / layer
         // while Strata held ~172): every bank grows into the free memory, keeps its experts, and takes the layer's most routed
         // missing experts into the new slots
         auto same = [&](int, int id) { return source(1, id); };
-        MixedExpertCache g(layers, experts, hidden, ff, 2, budget, same, nullptr);
+        MixedExpertCache g(layers, experts, hidden, ff, 2, 2 * budget, same, nullptr);  // room for a bank and its grown copy
         for (int l = 0; l < layers; ++l) { g.prepare(l, {0, 1}); g.wait_misses(); }
         for (int l = 0; l < layers; ++l) for (int r = 0; r < 3; ++r) { g.prepare(l, {4}); g.wait_misses(); }  // 4 is this prompt's hot expert
         std::vector<std::vector<int>> held(layers);
         for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) if (g.resident(l, e)) held[size_t(l)].push_back(e);
+        const int reads0 = calls;
         const int n = g.grow_into(0, 4);
+        int added = 0;
+        for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e)
+            if (g.resident(l, e) && std::find(held[size_t(l)].begin(), held[size_t(l)].end(), e) == held[size_t(l)].end()) ++added;
+        require(calls - reads0 == added, ("grow_into read " + std::to_string(calls - reads0) + " experts from the host for " +
+                                          std::to_string(added) + " new ones: held experts must be copied on the device").c_str());
         std::string bad;
         for (int l = 0; l < layers; ++l) {
             if (g.slots(l) != 4) bad += " layer " + std::to_string(l) + " at " + std::to_string(g.slots(l)) + " slots;";
@@ -413,10 +443,27 @@ static void run() {
         }
         require(n == layers && bad.empty(), ("grow_into: " + std::to_string(n) + " of " + std::to_string(layers) + " grown;" + bad).c_str());
         require(g.grow_into(0, 4) == 0, "grow_into at the cap grew again");
-        selected = &g; compare(1, {4, 0}, true); selected = &cache;
+        selected = &g; limit = 2 * budget; compare(1, {4, 0}, true); selected = &cache; limit = budget;
         for (int l = 0; l < layers; ++l) g.release_bank(l);  // the next long prompt borrows them back
         require(g.stats().device_bytes == 0, "grown banks did not release");
         std::puts("grow_into: banks grow into free memory with their experts and the hot ones, byte-exact, released by the next prompt PASS");
+    }
+    {   // victim on a PCIe card: experts hot in an earlier request leave once the new request's set is used (decayed count);
+        // the lifetime count kept them resident for ~90 calls of a 3-expert working set in 3 slots (one miss per call)
+        int dev = 0, coherent = 0; check(cudaGetDevice(&dev));
+        if (cudaDeviceGetAttribute(&coherent, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) coherent = 0;
+        if (!coherent) {
+            MixedExpertCache v(layers, experts, hidden, ff, slots, budget, source, nullptr);
+            for (int k = 0; k < 1000; ++k) (void) v.prepare(0, {0, 1});
+            const uint64_t before = v.stats().misses;
+            const std::vector<std::vector<int>> work{{2, 3}, {3, 4}, {2, 4}};
+            for (int k = 0; k < 60; ++k) (void) v.prepare(0, work[size_t(k % 3)]);
+            const uint64_t missed = v.stats().misses - before;
+            require(missed <= 25, ("stale hot experts held their slots: " + std::to_string(missed) + " misses in 60 calls").c_str());
+            selected = &v; compare(0, {2, 3, 4, 2}); selected = &cache;
+            for (int e : {2, 3, 4}) require(v.resident(0, e), "the new working set is not resident");
+            std::printf("victim: stale hot experts leave, %llu misses in 60 calls PASS\n", (unsigned long long) missed);
+        }
     }
     std::puts("mixed IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS + IQ4_NL/Q2_0 banks: cold/warm/grouped/duplicates/per-expert/eviction/budget/clear PASS");
 }

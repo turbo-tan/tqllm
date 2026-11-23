@@ -70,9 +70,11 @@ inline bool peer_send(int fd, const std::string & d) {
 }
 
 // The request as this server received it, for the peer; X-Tqllm-Routed stops the peer from routing it again.
-inline std::string forward_bytes(const Request & r, const Peer & p) {
+// state_owner (set by this front door only; a client's own header is never passed on): where the peer fetches the state.
+inline std::string forward_bytes(const Request & r, const Peer & p, const std::string & state_owner = "") {
     std::string h = r.method + " " + r.path + (r.query.empty() ? "" : "?" + r.query) + " HTTP/1.1\r\nHost: " + p.host + ":" +
                     std::to_string(p.port) + "\r\nX-Tqllm-Routed: 1\r\nConnection: close\r\n";
+    if (!state_owner.empty()) h += "X-Tqllm-State-Owner: " + state_owner + "\r\n";
     if (!r.content_type.empty()) h += "Content-Type: " + r.content_type + "\r\n";
     if (!r.authorization.empty()) h += "Authorization: " + r.authorization + "\r\n";
     h += "Content-Length: " + std::to_string(r.body.size()) + "\r\n\r\n";
@@ -82,9 +84,11 @@ inline std::string forward_bytes(const Request & r, const Peer & p) {
 
 inline std::string status_json(const BoxStatus & b) {
     char out[256];
-    std::snprintf(out, sizeof out, "{\"free\":%d,\"busy\":%d,\"queued\":%d,\"reuse\":%.0f,\"prefill_tps\":%.1f,\"decode_tps\":%.1f,\"hold_s\":%.2f}",
+    std::snprintf(out, sizeof out, "{\"free\":%d,\"busy\":%d,\"queued\":%d,\"reuse\":%.0f,\"prefill_tps\":%.1f,\"decode_tps\":%.1f,\"hold_s\":%.2f",
                   b.free, b.busy, b.queued, b.reuse, b.prefill_tps, b.decode_tps, b.hold_s);
-    return out;
+    std::string s = out;
+    if (!b.state.empty()) { s += ",\"state\":\""; for (char c : b.state) if (c != '"' && c != '\\') s += c; s += "\""; }
+    return s + "}";
 }
 
 // POST /admin/route on the peer with the rendered prompt; not ok when it does not answer within timeout_ms.
@@ -115,6 +119,7 @@ inline BoxStatus peer_status(const Peer & p, const std::string & prompt_text, co
         b.free = int(num("free")); b.busy = int(num("busy")); b.queued = int(num("queued"));
         b.reuse = num("reuse"); b.prefill_tps = num("prefill_tps"); b.decode_tps = num("decode_tps"); b.hold_s = num("hold_s");
         b.ok = j.get("free") != nullptr;
+        if (const auto * st = j.get("state"); st && st->kind == tqllm::Json::String) b.state = st->str;
     } catch (...) {}
     return b;
 }

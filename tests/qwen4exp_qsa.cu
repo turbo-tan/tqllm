@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void ck(cudaError_t rc) {
@@ -89,8 +90,11 @@ static void check_raw_cache(int cells, int ratio, int dim) {
             throw std::runtime_error("QSA raw-key cache size differs");
     }
     auto compare = [&](int complete) {
+        // pooled blocks live in a ring of pooled_ring() blocks: the newest pooled_ring() of them are still there
         std::vector<float> got(size_t(complete) * dim), norm(got.size());
-        if (!got.empty()) ck(cudaMemcpy(got.data(), cache.pooled(), got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        const int pr = cache.pooled_ring(), from = std::max(0, complete - pr);
+        for (int b = from; b < complete; ++b)
+            ck(cudaMemcpy(got.data() + int64_t(b) * dim, cache.pooled() + int64_t(b % pr) * dim, dim * sizeof(float), cudaMemcpyDeviceToHost));
         if (!norm.empty()) ck(cudaMemcpy(norm.data(), cache.normalized(), norm.size() * sizeof(float), cudaMemcpyDeviceToHost));
         for (int b = 0; b < complete; ++b) {
             std::vector<float> block(dim);
@@ -100,7 +104,7 @@ static void check_raw_cache(int cells, int ratio, int dim) {
                     expected += keys[(int64_t(b) * ratio + r) * dim + d];
                 expected *= 1.f / ratio;
                 block[d] = expected;
-                if (std::fabs(got[int64_t(b) * dim + d] - expected) > 1e-6f)
+                if (b >= from && std::fabs(got[int64_t(b) * dim + d] - expected) > 1e-6f)
                     throw std::runtime_error("QSA raw-key pooled value differs");
             }
             double squares = 0.;
@@ -196,6 +200,50 @@ static void check_indexer() {
     dk.put(keys);
     indexer.append(dk.p + int64_t(5) * dim, cells - 5, dkn.p, nullptr);
     check(13);
+}
+
+// A kept sequence grown to a larger capacity (Flash-Next prompt cache): an indexer filled from a smaller one (import_from,
+// its ring wrapped and its host mirror read) selects exactly what an indexer built at the larger size from the start
+// selects, after a cut back past the ring's rollback into a partial block (a snapshot restore) and further appends.
+static void check_grow(int cut) {
+    constexpr int small = 9000, big = 20000, ratio = 4, top_k = 2048, heads = 4, dim = 128, first = 8500, total = 12000;
+    std::vector<float> keys(size_t(total) * dim), query(size_t(heads) * dim), kn(dim), qn(dim);
+    for (size_t i = 0; i < keys.size(); ++i) keys[i] = std::sin(float(i % 100003) * 0.37f + float(i / 977) * 0.11f);
+    for (size_t i = 0; i < query.size(); ++i) query[i] = std::cos(float(i * 13 + 7) / 19.f);
+    for (int d = 0; d < dim; ++d) { kn[d] = 1.f + float(d % 11) / 20.f; qn[d] = 1.f + float(d % 7) / 10.f; }
+    Device<float> dk(keys.size()), dq(query.size()), dkn(kn.size()), dqn(qn.size());
+    dk.put(keys); dq.put(query); dkn.put(kn); dqn.put(qn);
+    tqllm_cuda::QsaIndexer a(small, ratio, top_k, heads, dim, dim, 10000.f, 1e-6f), b(big, ratio, top_k, heads, dim, dim, 10000.f, 1e-6f);
+    for (int at = 0; at < first;) {  // chunks of a prefill: the small one's ring wraps
+        const int n = std::min(first - at, 1500);
+        a.append(dk.p + int64_t(at) * dim, n, dkn.p, nullptr); b.append(dk.p + int64_t(at) * dim, n, dkn.p, nullptr); at += n;
+    }
+    ck(cudaDeviceSynchronize());
+    tqllm_cuda::QsaIndexer c(big, ratio, top_k, heads, dim, dim, 10000.f, 1e-6f);
+    c.keys().import_from(a.keys(), a.size(), nullptr);
+    ck(cudaDeviceSynchronize());
+    if (c.size() != b.size() || c.keys().normalized_blocks() != b.keys().normalized_blocks()) throw std::runtime_error("grown QSA indexer: size differs");
+    b.truncate(cut); c.truncate(cut);
+    for (int at = cut; at < total;) {  // decode-size and chunk appends
+        const int n = std::min(total - at, at < cut + 64 ? 3 : 700);
+        b.append(dk.p + int64_t(at) * dim, n, dkn.p, nullptr); c.append(dk.p + int64_t(at) * dim, n, dkn.p, nullptr); at += n;
+    }
+    for (int position : {cut, cut + 1, 9999, total - 2, total - 1}) {
+        const auto sb = b.select(dq.p, dqn.p, position, nullptr);
+        std::vector<int32_t> pb(sb.width); std::vector<uint8_t> vb(sb.width);
+        ck(cudaMemcpy(pb.data(), sb.positions, pb.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(vb.data(), sb.valid, vb.size(), cudaMemcpyDeviceToHost));
+        const auto sc = c.select(dq.p, dqn.p, position, nullptr);
+        std::vector<int32_t> pc(sc.width); std::vector<uint8_t> vc(sc.width);
+        ck(cudaMemcpy(pc.data(), sc.positions, pc.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(vc.data(), sc.valid, vc.size(), cudaMemcpyDeviceToHost));
+        if (pb != pc || vb != vc) throw std::runtime_error("grown QSA indexer selects differently at " + std::to_string(position) + " (cut " + std::to_string(cut) + ")");
+    }
+    const int nb = b.keys().normalized_blocks();
+    std::vector<float> nbv(size_t(nb) * dim), ncv(nbv.size());
+    ck(cudaMemcpy(nbv.data(), b.keys().normalized(), nbv.size() * 4, cudaMemcpyDeviceToHost));
+    ck(cudaMemcpy(ncv.data(), c.keys().normalized(), ncv.size() * 4, cudaMemcpyDeviceToHost));
+    if (nb != c.keys().normalized_blocks() || std::memcmp(nbv.data(), ncv.data(), nbv.size() * 4)) throw std::runtime_error("grown QSA indexer: normalized keys differ");
 }
 
 static void check_gather(int width) {
@@ -309,8 +357,14 @@ static void check_raw_ring() {
     if (ring.ring() >= full.ring() || ring.ring() < 700) throw std::runtime_error("QSA raw-key ring did not stay small or grow for the large append");
     const int blocks = full.complete_blocks();
     if (ring.complete_blocks() != blocks) throw std::runtime_error("QSA raw-key ring block count differs");
-    std::vector<float> p1(size_t(blocks) * dim), p2(p1.size()), n1(p1.size()), n2(p1.size());
-    ck(cudaMemcpy(p1.data(), full.pooled(), p1.size() * 4, cudaMemcpyDeviceToHost)); ck(cudaMemcpy(p2.data(), ring.pooled(), p2.size() * 4, cudaMemcpyDeviceToHost));
+    // every normalized block equal; the pooled blocks both rings still hold equal: the newest half of the smaller ring (a
+    // block pooled past the final size and cut again by a truncate may have reused the slot of an older, normalized one)
+    const int pr = std::min({full.pooled_ring(), ring.pooled_ring(), blocks}) / 2;
+    std::vector<float> p1(size_t(pr) * dim), p2(p1.size()), n1(size_t(blocks) * dim), n2(n1.size());
+    for (int b = blocks - pr, j = 0; b < blocks; ++b, ++j) {
+        ck(cudaMemcpy(p1.data() + int64_t(j) * dim, full.pooled() + int64_t(b % full.pooled_ring()) * dim, dim * 4, cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(p2.data() + int64_t(j) * dim, ring.pooled() + int64_t(b % ring.pooled_ring()) * dim, dim * 4, cudaMemcpyDeviceToHost));
+    }
     ck(cudaMemcpy(n1.data(), full.normalized(), n1.size() * 4, cudaMemcpyDeviceToHost)); ck(cudaMemcpy(n2.data(), ring.normalized(), n2.size() * 4, cudaMemcpyDeviceToHost));
     if (std::memcmp(p1.data(), p2.data(), p1.size() * 4) || std::memcmp(n1.data(), n2.data(), n1.size() * 4))
         throw std::runtime_error("QSA raw-key ring pooled / normalized keys differ from the full copy");
@@ -323,7 +377,20 @@ int main() {
         check_raw_cache(9, 4, 128);
         check_raw_cache(2051, 4, 128);
         check_raw_ring();
+        {   // 3090 VRAM account 11-19: the pooled keys held max_cells / ratio blocks (203 MB over 13 layers at 128K); they are
+            // read only to normalize each block once, so a ring of the pending blocks holds them (grown for a prefill chunk)
+            tqllm_cuda::QsaRawKeyCache big(131072, 4, 128);
+            Device<float> k(size_t(9000) * 128), w(128); std::vector<float> one(128, 1.f); w.put(one);
+            ck(cudaMemset(k.p, 0, size_t(9000) * 128 * sizeof(float)));
+            big.append(k.p, 8, nullptr); big.normalize_new(w.p, 64, 10000.f, 1e-6f, nullptr);
+            if (big.pooled_ring() > 1100) throw std::runtime_error("QSA pooled keys: the ring holds more than the raw ring's blocks");
+            big.append(k.p, 9000, nullptr);  // a prefill chunk: 2250 blocks pending at once
+            if (big.pooled_ring() < 2250 || big.pooled_ring() >= 131072 / 4) throw std::runtime_error("QSA pooled keys: the ring did not grow to a chunk's pending blocks");
+            big.normalize_new(w.p, 64, 10000.f, 1e-6f, nullptr); ck(cudaDeviceSynchronize());
+            std::printf("PASS pooled_ring (%d of %d blocks after a 9000-cell append)\n", big.pooled_ring(), 131072 / 4);
+        }
         check_indexer();
+        check_grow(8500); check_grow(8001); check_grow(8437);
         check_gather(7);
         check_gather(2051);
         check_dense_parity();

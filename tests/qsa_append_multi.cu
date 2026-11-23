@@ -38,7 +38,9 @@ int main() {
                 cudaMemcpy(ra.data() + size_t(j) * dim, a[i]->raw() + size_t(c % a[i]->ring()) * dim, dim * 4, cudaMemcpyDeviceToHost);
                 cudaMemcpy(rb.data() + size_t(j) * dim, b[i]->raw() + size_t(c % b[i]->ring()) * dim, dim * 4, cudaMemcpyDeviceToHost);
             }
-            const auto pa = get(a[i]->pooled(), size_t(blocks) * dim), pb = get(b[i]->pooled(), pa.size());
+            // pooled: a ring of the blocks not yet normalized (both caches' rings have the same size: compare them whole)
+            if (a[i]->pooled_ring() != b[i]->pooled_ring()) { std::printf("FAIL: round %d cache %d pooled rings differ\n", round, i); ok = false; break; }
+            const auto pa = get(a[i]->pooled(), size_t(std::min(blocks, a[i]->pooled_ring())) * dim), pb = get(b[i]->pooled(), pa.size());
             const auto na = get(a[i]->normalized(), size_t(blocks) * dim), nb = get(b[i]->normalized(), na.size());
             if (std::memcmp(ra.data(), rb.data(), ra.size() * 4) || std::memcmp(pa.data(), pb.data(), pa.size() * 4) || std::memcmp(na.data(), nb.data(), na.size() * 4)) {
                 std::printf("FAIL: round %d cache %d: raw / pooled / normalized differ from per-cache append\n", round, i); ok = false; break;

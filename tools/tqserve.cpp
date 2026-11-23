@@ -3,6 +3,7 @@
 #include "serve/monitor_server.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/peer.hpp"
+#include "serve/state_peer.hpp"
 #include "serve/net.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
@@ -136,7 +137,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--temperature|--temp T --top-p P --top-k K --presence-penalty X --repeat-penalty R --frequency-penalty F (defaults for requests that set none; default greedy, no penalty)] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--peer http://HOST:PORT ...] [--list-kv] [--list-flags]\n"
+                 "[--monitor-port N (optional separate dashboard port; default: API port)] [--repeat-limit N (default 256, 0 off)] [--peer http://HOST:PORT ...] [--state-listen HOST:PORT] [--state-peer HOST:PORT ...] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
                  "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n"
@@ -351,8 +352,12 @@ int main(int argc, char ** argv) {
     std::string system;  // none by default, like the Qwen3.5/3.8 chat template (--system sets one)
     std::string api_key;
     std::vector<tqserve::Peer> peers;  // --peer: other boxes this front door routes requests to
+    std::string state_host; uint16_t state_port = 0;  // --state-listen HOST:PORT: the internal conversation-state listener (link address)
+    std::vector<tqserve::Peer> state_peers;  // --state-peer HOST:PORT: the only listeners this box fetches states from
     uint32_t monitor_port = 0;
     bool reasoning = false;
+    bool reasoning_set = false;  // --reasoning given
+    bool effort_set = false;  // --reasoning-effort given (else a model may keep its own default)
     std::string effort = "xhigh";  // default reasoning_effort when a request does not set one
     int32_t thinking_budget = -1;  // default reasoning budget (llama.cpp --reasoning-budget): -1 unlimited, 0 end immediately, N tokens
     std::string budget_message;    // text forced before the end-of-thinking tag when the budget runs out (default none)
@@ -400,10 +405,11 @@ int main(int argc, char ** argv) {
                 const std::string setting = value();
                 if (setting != "on" && setting != "off") throw std::invalid_argument("--reasoning must be on or off");
                 reasoning = setting == "on";
+                reasoning_set = true;
             }
             else if (arg == "--system") system = value();
             else if (arg == "--name") name = value();
-            else if (arg == "--reasoning-effort") effort = value();
+            else if (arg == "--reasoning-effort") { effort = value(); effort_set = true; }
             else if (arg == "--reasoning-budget" || arg == "--thinking-budget") {
                 thinking_budget = std::stoi(value());
                 if (thinking_budget < -1) throw std::invalid_argument("reasoning budget must be >= -1");
@@ -435,6 +441,16 @@ int main(int argc, char ** argv) {
                 if (!tqserve::parse_peer(value(), p)) throw std::invalid_argument("--peer takes http://HOST:PORT");
                 peers.push_back(p);
             }
+            else if (arg == "--state-listen") {
+                tqserve::Peer p;
+                if (!tqserve::parse_peer(value(), p)) throw std::invalid_argument("--state-listen takes HOST:PORT (the link address, never the API port)");
+                state_host = p.host; state_port = p.port;
+            }
+            else if (arg == "--state-peer") {
+                tqserve::Peer p;
+                if (!tqserve::parse_peer(value(), p)) throw std::invalid_argument("--state-peer takes HOST:PORT");
+                state_peers.push_back(p);
+            }
             else if (arg == "--api-key") api_key = value();
             else if (arg == "--api-key-file") {
                 std::ifstream key_file(value());
@@ -453,6 +469,9 @@ int main(int argc, char ** argv) {
             return 2;
         }
         if (!peers.empty() && np < 2) throw std::invalid_argument("--peer needs --np N (N > 1): the router reads the slot scheduler");
+        if (state_port && (np < 2 || !engine.prompt_cache)) throw std::invalid_argument("--state-listen needs --np N (N > 1) and --prompt-cache on");
+        if (state_port && state_port == port && (state_host == host || state_host == "0.0.0.0" || host == "0.0.0.0"))
+            throw std::invalid_argument("--state-listen must not be the API address");
 
         std::cerr << "tqserve: loading model from " << model_path << "\n";
         tqllm::Tokenizer tokenizer;
@@ -463,6 +482,13 @@ int main(int argc, char ** argv) {
         if (tokenizer.encode("</mm:think>").size() == 1) {  // MiniMax-M3: its own thinking tags; the answer follows the end tag
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
+        }
+        if (tokenizer.encode("<|content_thinking|>").size() == 1) {  // Inkling-2: thinking message, then the answer message
+            auto & so = tqserve::serve_options();
+            so.think_open = "<|content_thinking|>"; so.think_close = "<|end_message|>"; so.think_off.clear();
+            if (!effort_set) effort = "high";  // the checkpoint's default level (0.9), not xhigh (0.99)
+            if (!reasoning_set) reasoning = true;  // the template always opens a thinking message
+            so.keep_high = true;
         }
         std::string plugins_json;  // /health "plugins" (only when --plugin was given)
 #if !TQLLM_WITH_CUDA
@@ -548,6 +574,76 @@ int main(int argc, char ** argv) {
         }
         std::unique_ptr<tqserve::Scheduler> scheduler;
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
+        // conversation states across boxes: the owner side (internal listener) and the fetch-vs-prefill rule of this box
+        const std::string state_addr = state_port ? state_host + ":" + std::to_string(state_port) : std::string();
+        static tqserve::LinkRate link_rate;
+        static const int fetch_stall_ms = tqllm::debug_int("state_fetch_stall");
+        if (state_port && scheduler) {
+            const int sfd = bind_socket(state_host, state_port);
+            if (sfd < 0) throw std::runtime_error("--state-listen: cannot bind " + state_addr);
+            std::cerr << "tqserve: conversation states on " << state_addr << " (internal: fetch / ack only)\n";
+            std::thread([sfd, &scheduler] {
+                for (;;) {
+                    const int c = tqnet::accept(sfd);
+                    if (c < 0) { if (!running) return; continue; }
+                    std::thread([c, &scheduler] {
+                        tqnet::set_recv_timeout(c, 10);
+                        tqserve::Request rq; std::string err; int st = 400;
+                        if (!receive_request(c, rq, err, st)) { send_all(c, response(st, tqserve::json_error(err))); tqnet::close(c); return; }
+                        try {
+                            const auto j = tqllm::parse_json(std::string(rq.body.begin(), rq.body.end()));
+                            if (rq.method == "POST" && rq.path == "/v1/state/fetch") {
+                                std::vector<uint32_t> tokens;
+                                if (const auto * t = j.get("tokens"); t && t->kind == tqllm::Json::Array) for (const auto & v : t->arr) tokens.push_back(uint32_t(v.num));
+                                const auto * e = j.get("entity"); const std::string entity = e && e->kind == tqllm::Json::String ? e->str : "";
+                                const auto * mb = j.get("max_bytes"); const size_t max_bytes = mb && mb->kind == tqllm::Json::Number ? size_t(mb->num) : tqserve::kStateFetchMax;
+                                const auto t0 = std::chrono::steady_clock::now();
+                                auto blob = scheduler->on_engine([&](tqllm::Model & m) { return m.export_state_for(tokens, entity); });  // entity checked there
+                                if (!blob) { send_all(c, response(404, tqserve::json_error("no kept state for this prompt"))); }
+                                else if (tqllm::encoded_size(*blob) > std::min(max_bytes, tqserve::kStateFetchMax)) { send_all(c, response(413, tqserve::json_error("state above the fetch ceiling"))); }
+                                else {
+                                    const bool ok = tqserve::send_state(c, *blob, fetch_stall_ms);
+                                    if (ok) scheduler->forget_held(blob->meta.tokens);  // the fetcher holds it now (its ack drops ours)
+                                    if (tqllm::debug_on("park")) std::fprintf(stderr, "tqserve: lent conv %llu (%u positions)%s\n",
+                                                                              (unsigned long long) blob->meta.conv, blob->meta.positions, ok ? "" : " NOT SENT");
+                                    std::fprintf(stderr, "tqserve: state served: %u positions, %.1f MB in %.0f ms%s\n", blob->meta.positions, double(tqllm::encoded_size(*blob)) / 1048576.0,
+                                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), ok ? "" : " (the fetcher went away)");
+                                }
+                            } else if (rq.method == "POST" && rq.path == "/v1/state/ack") {
+                                const auto * cv = j.get("conv");
+                                if (cv && cv->kind == tqllm::Json::Number) { const uint64_t conv = uint64_t(cv->num); scheduler->on_engine([conv](tqllm::Model & m) { m.release_state(conv); return 0; }); }
+                                send_all(c, response(200, "{}"));
+                            } else send_all(c, response(404, tqserve::json_error("not found")));
+                        } catch (const std::exception & ex) { send_all(c, response(400, tqserve::json_error(ex.what()))); }
+                        tqnet::close(c);
+                    }).detach();
+                }
+            }).detach();
+        }
+        // a follow-up whose kept state another box holds (owner = its state listener, positions = what it holds): fetch it
+        // into this box's park when that is cheaper than prefilling those positions here; logged either way
+        auto fetch_if_cheaper = [&](const tqserve::ChatRequest & req, const tqserve::Peer & owner, double held) {
+            if (!scheduler || held <= 0) return;
+            tqserve::DecodeResult tmp; uint32_t count = 0;
+            const auto tokens = tqserve::prepare(tokenizer, req, slot_context, tmp, count);
+            if (!tmp.error.empty()) return;
+            const uint32_t local = scheduler->on_engine([&](tqllm::Model & m) { uint32_t b = 0; for (int s = 0; s < m.slots(); ++s) b = std::max(b, m.prefix_reuse(s, tokens)); return b; });
+            const std::string who = owner.host + ":" + std::to_string(owner.port);
+            if (held <= double(local) + 64) { std::fprintf(stderr, "tqserve: state fetch from %s skipped: this box already holds %u of ~%.0f positions\n", who.c_str(), local, held); return; }
+            const double prefill = std::max(500.0, scheduler->prefill_tps());
+            auto decide = [&](uint32_t positions, size_t bytes) {
+                const double saved = positions > local ? double(positions - local) : 0.0, prefill_s = saved / prefill, fetch_s = double(bytes) / link_rate.get() + 0.02;
+                const bool go = fetch_s < prefill_s;
+                std::fprintf(stderr, "tqserve: state fetch from %s: %s (%u positions, local %u, %.1f MB at %.2f GB/s = %.0f ms vs prefill %.0f positions at %.0f tok/s = %.0f ms)\n",
+                             who.c_str(), go ? "fetch" : "prefill", positions, local, double(bytes) / 1048576.0, link_rate.get() / 1e9, fetch_s * 1e3, saved, prefill, prefill_s * 1e3);
+                return go;
+            };
+            auto adopt = [&](tqllm::StateBlob b) { return scheduler->on_engine([&](tqllm::Model & m) { return m.adopt_state(std::move(b)); }); };
+            const auto r = tqserve::fetch_state(owner, tokens, "", link_rate, decide, adopt);
+            if (r.ok) std::fprintf(stderr, "tqserve: state fetched from %s: %u positions, %.1f MB in %.0f ms (%.2f GB/s)\n", who.c_str(), r.positions,
+                                   double(r.bytes) / 1048576.0, r.seconds * 1e3, r.seconds > 0 ? double(r.bytes) / r.seconds / 1e9 : 0.0);
+            else if (r.why != "prefill is cheaper") std::fprintf(stderr, "tqserve: state fetch from %s failed: %s; prefilling here\n", who.c_str(), r.why.c_str());
+        };
         std::atomic<int> inflight{0};
         std::mutex generation_mutex;
         // one slot: after a chat reply the engine may prefill the reply as the client will return it (Engine::prefill_ahead).
@@ -745,7 +841,9 @@ int main(int argc, char ** argv) {
                     status = 400;
                     body = tqserve::json_error("routing needs --np N (N > 1)");
                 } else {
-                    body = tqserve::status_json(scheduler->route_status(std::string(request.body.begin(), request.body.end())));
+                    auto b = scheduler->route_status(std::string(request.body.begin(), request.body.end()));
+                    b.state = state_addr;
+                    body = tqserve::status_json(b);
                 }
             } else if (request.method == "GET" && (request.path == "/v1/models" || request.path == "/v1/models/" + name)) {
                 body = "{\"object\":\"list\",\"data\":[{\"id\":";
@@ -800,6 +898,7 @@ int main(int argc, char ** argv) {
                     for (size_t i = 0; i < peers.size(); ++i)
                         asks.emplace_back([&, i] { boxes[i + 1] = tqserve::peer_status(peers[i], parsed.prompt_text, request.authorization, 100); });
                     boxes[0] = scheduler->route_status(parsed.prompt_text);
+                    boxes[0].state = state_addr;
                     boxes[0].helped = engine.split_experts && engine.tp_rank == 0;
                     for (auto & t : asks) t.join();
                     const double prompt = double(parsed.prompt_text.size()) / scheduler->chars_per_token();
@@ -807,36 +906,62 @@ int main(int argc, char ** argv) {
                     static std::vector<std::atomic<int>> inflight(peers.size() + 1);  // routed here, not finished
                     static std::vector<tqserve::PeerMemory> memory(peers.size() + 1);  // last answer per peer (router.hpp)
                     static std::mutex route_mutex;
-                    int pick = 0;
+                    int pick = 0; tqserve::RoutePick rp;
                     {
                         std::lock_guard<std::mutex> lk(route_mutex);
                         for (size_t i = 0; i < boxes.size(); ++i) {
                             boxes[i].inflight = inflight[i].load();
                             if (i > 0) boxes[i] = tqserve::remembered_status(boxes[i], memory[i]);
                         }
-                        pick = tqserve::pick_box(boxes, prompt, gen);
+                        // the last known holder of this conversation survives a late status answer (router.hpp HolderMemory)
+                        static tqserve::HolderMemory holders;
+                        const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                        const size_t hkey = tqserve::HolderMemory::key(parsed.prompt_text);
+                        holders.note(boxes, hkey, now_s);
+                        holders.apply(boxes, hkey, now_s);
+                        rp = tqserve::pick_box_fetch(boxes, prompt, gen, link_rate.get());
+                        pick = rp.box;
+                        holders.served(hkey, pick, prompt, now_s);
+                        if (tqllm::debug_on("route"))
+                            std::fprintf(stderr, "tqserve: route key %zx -> box %d (reuse b0 %.0f b1 %.0f, fetch from %d)\n", hkey & 0xffffff, pick,
+                                         boxes[0].reuse, boxes.size() > 1 ? boxes[1].reuse : 0.0, rp.owner);
                         ++inflight[size_t(pick)];
                         if (tqllm::debug_on("route")) {
                             std::string line = "tqserve: route -> box " + std::to_string(pick) + " |";
                             for (size_t i = 0; i < boxes.size(); ++i) {
                                 const auto & b = boxes[i];
                                 char buf[160];
-                                std::snprintf(buf, sizeof buf, " b%zu ok %d free %d busy %d queued %d inflight %d cost %.2f", i, int(b.ok),
-                                              b.free, b.busy, b.queued, b.inflight, b.ok ? tqserve::route_cost(b, prompt, gen) : -1.0);
+                                std::snprintf(buf, sizeof buf, " b%zu ok %d free %d busy %d queued %d inflight %d reuse %.0f cost %.2f", i, int(b.ok),
+                                              b.free, b.busy, b.queued, b.inflight, b.reuse, b.ok ? tqserve::route_cost(b, prompt, gen) : -1.0);
                                 line += buf;
                             }
                             std::fprintf(stderr, "%s\n", line.c_str());
                         }
                     }
+                    // the state to fetch (router-set only): "owner state address;positions=N"
+                    const std::string owner_hint = rp.owner >= 0 ? boxes[size_t(rp.owner)].state + ";positions=" + std::to_string(int64_t(boxes[size_t(rp.owner)].reuse)) : std::string();
+                    if (rp.owner >= 0 && tqllm::debug_on("route")) std::fprintf(stderr, "tqserve: route -> box %d fetching from box %d (%s, %.0f ms priced)\n", pick, rp.owner, owner_hint.c_str(), rp.fetch_s * 1e3);
+                    if (pick == 0 && rp.owner > 0) {  // served here, from a peer's state
+                        tqserve::Peer o; double held = 0;
+                        if (tqserve::parse_state_owner(owner_hint, o, held)) fetch_if_cheaper(parsed, o, held);
+                    }
                     if (pick > 0) {
                         const auto & peer = peers[size_t(pick - 1)];
-                        const bool sent = tqserve::peer_proxy(peer, tqserve::forward_bytes(request, peer), client);
+                        const bool sent = tqserve::peer_proxy(peer, tqserve::forward_bytes(request, peer, owner_hint), client);
                         --inflight[size_t(pick)];
                         if (sent) { tqnet::close(client); return; }
                         std::fprintf(stderr, "tqserve: peer %s:%u did not take the request; serving it here\n", peer.host.c_str(), unsigned(peer.port));
                         ++inflight[0];
                     }
                     local_routed = &inflight[0];
+                } else if (parsed.ok && adapt_error.empty() && scheduler && request.routed && !request.state_owner.empty()) {
+                    // routed here with a state to fetch: only from a listener this box was told about (--state-peer)
+                    tqserve::Peer o; double held = 0;
+                    if (tqserve::parse_state_owner(request.state_owner, o, held)) {
+                        const bool known = std::any_of(state_peers.begin(), state_peers.end(), [&](const tqserve::Peer & p) { return p.host == o.host && p.port == o.port; });
+                        if (known) fetch_if_cheaper(parsed, o, held);
+                        else std::fprintf(stderr, "tqserve: state owner %s:%u is not a --state-peer: ignored\n", o.host.c_str(), unsigned(o.port));
+                    }
                 }
                 if (monitor && parsed.ok) parsed.observation = monitor->begin();
                 if (!adapt_error.empty()) { parsed.ok = false; parsed.error = adapt_error; }

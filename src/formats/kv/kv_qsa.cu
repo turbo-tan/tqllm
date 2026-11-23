@@ -149,6 +149,100 @@ __global__ void attention_split(const float * query, const __nv_bfloat16 * keys,
         out[d] = value;
     }
 }
+// attention_split for HG query heads of one kv head per block: the slice's K and V rows are staged in shared memory chunk by
+// chunk and serve all HG heads (attention_split reads them once per query head: 12 reads of each row at the Flash-Next shape).
+// Per head everything is attention_split's arithmetic: the same per-row dot (lane order, fmaf chain, shuffle-down sum), the
+// same 128-thread max and exp-sum trees and the same value chain per output element (rows in order; past-the-cache rows add
+// fmaf(w, 0, v) in the 8-row part and are skipped in the tail): bit-identical (test-qsa-split-grouped).
+constexpr int kGrpRows = 64;  // K / V rows per staged chunk
+template<int HG, int DIM>
+__global__ void __launch_bounds__(128 * HG) attention_split_grouped_k(const float * query, const __nv_bfloat16 * keys,
+        const __nv_bfloat16 * values, const int32_t * positions, const uint8_t * valid, float * part, int width, int first_cells,
+        int heads, int kv_heads, int splits) {
+    constexpr int ND = DIM / 32, NV = DIM / 128, V16 = DIM * 2 / 16;
+    const int group = heads / kv_heads, hgs = group / HG;
+    const int kv_head = blockIdx.x / hgs, t = blockIdx.y, sp = blockIdx.z, tid = threadIdx.x;
+    const int hl = tid >> 7, ht = tid & 127, lane = tid & 31, hw = ht >> 5;
+    const int head = kv_head * group + (blockIdx.x % hgs) * HG + hl, cells = first_cells + t;
+    const int per = (width + splits - 1) / splits, r0 = sp * per, r1 = min(width, r0 + per), nr = max(0, r1 - r0);
+    positions += int64_t(t) * width; valid += int64_t(t) * width;
+    extern __shared__ __align__(16) unsigned char grp_smem[];
+    __nv_bfloat16 * rows = reinterpret_cast<__nv_bfloat16 *>(grp_smem);
+    float * scores = reinterpret_cast<float *>(rows + kGrpRows * DIM);
+    float * reduction = scores + HG * per;
+    int * cell = reinterpret_cast<int *>(reduction + HG * 128);
+    unsigned char * ok = reinterpret_cast<unsigned char *>(cell + per);  // the slice's valid flags (read per row below)
+    float * sc = scores + hl * per, * red = reduction + hl * 128;
+    for (int i = tid; i < nr; i += 128 * HG) {
+        const int row = r0 + i, pos = positions[row]; const bool v = valid[row];
+        cell[i] = v && pos >= 0 && pos < cells ? pos : -1; ok[i] = v;
+    }
+    float qreg[ND];
+    const float * q = query + (int64_t(t) * heads + head) * DIM;
+#pragma unroll
+    for (int i = 0; i < ND; ++i) qreg[i] = q[lane + 32 * i];
+    __syncthreads();
+    auto stage = [&](const __nv_bfloat16 * src, int c0, int cn) {  // rows of the cache cells c0 .. c0 + cn - 1 (unread rows stay stale)
+        for (int i = tid; i < cn * V16; i += 128 * HG) {
+            const int r = i / V16, v = i % V16, cr = cell[c0 + r];
+            if (cr >= 0) reinterpret_cast<uint4 *>(rows + r * DIM)[v] = reinterpret_cast<const uint4 *>(src + (int64_t(cr) * kv_heads + kv_head) * DIM)[v];
+        }
+    };
+    for (int c0 = 0; c0 < nr; c0 += kGrpRows) {
+        const int cn = min(kGrpRows, nr - c0);
+        stage(keys, c0, cn);
+        __syncthreads();
+        for (int r = hw; r < cn; r += 4) {
+            const int i = c0 + r;
+            float dot = 0.f;
+            if (cell[i] >= 0) {
+                const __nv_bfloat16 * kr = rows + r * DIM;
+#pragma unroll
+                for (int k = 0; k < ND; ++k) dot = fmaf(qreg[k], __bfloat162float(kr[lane + 32 * k]), dot);
+            }
+            for (int delta = 16; delta; delta >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, delta);
+            if (lane == 0) sc[i] = ok[i] ? dot * rsqrtf(float(DIM)) : -INFINITY;
+        }
+        __syncthreads();
+    }
+    float maximum = -INFINITY;
+    for (int i = ht; i < nr; i += 128) maximum = fmaxf(maximum, sc[i]);
+    red[ht] = maximum;
+    __syncthreads();
+    for (int delta = 64; delta; delta >>= 1) { if (ht < delta) red[ht] = fmaxf(red[ht], red[ht + delta]); __syncthreads(); }
+    maximum = red[0];
+    __syncthreads();
+    float sum = 0.f;
+    const bool finite = isfinite(maximum);
+    if (finite)
+        for (int i = ht; i < nr; i += 128) { const float w = ok[i] ? expf(sc[i] - maximum) : 0.f; sc[i] = w; sum += w; }
+    red[ht] = sum;
+    __syncthreads();
+    for (int delta = 64; delta; delta >>= 1) { if (ht < delta) red[ht] += red[ht + delta]; __syncthreads(); }
+    float * out = part + ((int64_t(t) * heads + head) * splits + sp) * (DIM + 2);
+    if (ht == 0) { out[DIM] = maximum; out[DIM + 1] = red[0]; }
+    float acc[NV];
+#pragma unroll
+    for (int j = 0; j < NV; ++j) acc[j] = 0.f;
+    const int unrolled = nr - nr % 8;  // attention_split's 8-row part
+    for (int c0 = 0; c0 < nr; c0 += kGrpRows) {
+        const int cn = min(kGrpRows, nr - c0);
+        __syncthreads();  // the previous chunk is read
+        stage(values, c0, cn);
+        __syncthreads();
+        if (finite)
+            for (int r = 0; r < cn; ++r) {
+                const int i = c0 + r, cr = cell[i]; const float w = sc[i];
+#pragma unroll
+                for (int j = 0; j < NV; ++j) {
+                    if (i < unrolled) acc[j] = fmaf(w, cr >= 0 ? __bfloat162float(rows[r * DIM + ht + 128 * j]) : 0.f, acc[j]);
+                    else if (cr >= 0) acc[j] = fmaf(w, __bfloat162float(rows[r * DIM + ht + 128 * j]), acc[j]);
+                }
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < NV; ++j) out[ht + 128 * j] = acc[j];
+}
 __global__ void attention_merge(const float * part, float * output, int heads, int dim, int splits) {
     const int head = blockIdx.x, t = blockIdx.y;
     const float * p = part + (int64_t(t) * heads + head) * splits * (dim + 2);
@@ -396,6 +490,8 @@ __global__ void __launch_bounds__(DIM) grouped_values_fixed_k(const float * weig
 } // namespace
 
 static int g_qsa_split = -1;  // -1: TQFN_QSA_SPLIT, else qsa_set_split()
+static bool g_qsa_split_grouped = true;  // attention_split_grouped_k where the shape allows (tests compare it with attention_split)
+void qsa_set_split_grouped(bool on) { g_qsa_split_grouped = on; }
 constexpr int64_t kQsaSplitPart = int64_t(16) * 32 * 16 * (256 + 2);  // rows x heads x splits x (dim + 2)
 void qsa_set_split(int splits) { g_qsa_split = splits; }
 // TQFN_QSA_SPLIT (default 16; 0 or 1 = attention_direct): slices per decode attention row
@@ -423,6 +519,17 @@ void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const
     if (splits > 1 && dim <= 256 && int64_t(tokens) * heads * splits * (dim + 2) <= kQsaSplitPart) {
         float * part = qsa_split_scratch(stream);
         const int per = (selected.width + splits - 1) / splits;
+        constexpr int HG = 4;
+        const size_t smem = size_t(kGrpRows) * 256 * sizeof(__nv_bfloat16) + size_t(HG) * (per + 128) * sizeof(float) + size_t(per) * (sizeof(int) + 1);
+        if (g_qsa_split_grouped && dim == 256 && (heads / kv_heads) % HG == 0 && smem <= (size_t(64) << 10)) {
+            static bool attr = false;
+            if (!attr) { ck(cudaFuncSetAttribute(attention_split_grouped_k<HG, 256>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 << 10)); attr = true; }
+            attention_split_grouped_k<HG, 256><<<dim3(heads / HG, tokens, splits), 128 * HG, smem, stream>>>(
+                query, keys, values, selected.positions, selected.valid, part, selected.width, first_cells, heads, kv_heads, splits);
+            attention_merge<<<dim3(heads, tokens), 128, 0, stream>>>(part, output, heads, dim, splits);
+            ck(cudaPeekAtLastError());
+            return;
+        }
         attention_split<<<dim3(heads, tokens, splits), 128, size_t(per) * (sizeof(float) + sizeof(int)), stream>>>(
             query, keys, values, selected.positions, selected.valid, part, selected.width, first_cells, heads, kv_heads, dim, splits);
         attention_merge<<<dim3(heads, tokens), 128, 0, stream>>>(part, output, heads, dim, splits);

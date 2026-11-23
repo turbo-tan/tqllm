@@ -6,6 +6,35 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Changed
+- Flash-Next `--exact off` (CUDA) now includes route-tail skip at rank 8: a non-resident expert that every token of a decode
+  call ranks 8th or lower is not copied or computed (weight 0). KLD vs `--exact on` 0.022, GSM8K-200 0.965 -> 0.975. `--exact on`
+  (the default) is unchanged and byte-identical. The opt-in `TQFN_TAIL_SKIP` is removed.
+- `--kv q8` is now the rotated int8 cache on K and V (`q8/q8`, the same 272 bytes per 256 values as `-ctk q8_0 -ctv q8_0`):
+  it keeps QSA sparse attention and tree verify, which the plain int8 cache it replaces had neither of (issue #60: a QSA
+  file with `--kv q8` attended densely). 27B TQ_XS-QSA, 21K prompt, RTX 5060 Ti: prompt 986 -> 1,141 tok/s, decode 31.6 ->
+  32.8 tok/s. Texts with `--kv q8` change (a different lossy cache).
+- Flash-Next: the prompt cache is on by default where memory fits (owner 11-18: the same setup as Strata, which keeps the
+  conversation by default), `--exact on` too: discrete cards always, unified memory (GB10 / DGX Spark) when every slot's
+  kept conversation leaves 20 GB available. The prefill is split at the reuse point (64 tokens before a prompt's end),
+  so long-prompt texts differ from `--prompt-cache off` (also on the first read); a reused turn gives the first read's
+  text. First answer after a 128K prompt: 51.0 -> 47.9 tok/s with the cache on (GB10). `--prompt-cache off` turns it off. GB10, the same 32K / 128K prompt again: 16.1 / 65.5 s -> 0.21 / 0.25 s to the first token.
+- Flash-Next on unified memory (GB10): the prompt residual buffer (5.4 GB at 131K) is pinned at start-up when 20 GB stay
+  available; pinned inside the first long request it cost that request 2.2 s and slowed its first chunk (first 128K
+  prompt after start: TTFT 74.7-107.6 s -> 65.3 s).
+
+- Flash-Next QSA indexer: prefill block scores on tensor cores (keys and queries split into bf16 hi + lo, fp32
+  accumulate) instead of fp32 CUDA-core dots; decode keeps the fp32 kernel. GB10, 128K code prompt 1,848 -> 1,887 tok/s
+  (TTFT 65.5 -> 64.1 s), 128K prose 1,859 -> 1,901. 0.19 % of prefill queries (3,499 of 1.82M, 32K + 128K prompts) select
+  another top-k set (near ties, `TQLLM_DEBUG=qsa_tc_check`); long-context gate (3 facts at 30K / 94K / 114K tokens) 9 of 9.
+- Flash-Next prompt cache with one slot (from the 11-16 3090 race): the reply's own state stays for the next turn, a
+  reused prefix's short new part reads in decode-size steps, a restored tail reads with its snapshot's step size, lent
+  banks are rebuilt at their share. GB10 follow-up turn 0.35 / 0.38 s to the first token at 32K / 128K (was 1.99 / 2.65 s
+  on a 3090 before; Strata 0.2.15: 0.36 / 0.47 s).
+
+### Fixed
+- QSA gather: a growth that runs out of memory leaves the gather usable (the next request ran on freed buffers).
+- Flash-Next `--exact off` on arm64 (GB10): every request failed ("TQFN_CPU_MISS needs an x86 CPU with AVX2"); the CPU
+  miss pool now starts by default only where it is built (x86).
 - Flash-Next pinned expert packs are assembled one layer at a time; completed expert pages are released before
   copying the next layer. Loader errors propagate after workers finish and failed builds free pinned storage.
   The existing 60% host-RAM limit remains unchanged.
@@ -77,6 +106,36 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
 
 ### Added
+- Flash-Next on two GPUs or two boxes: `--split layer` (one tqserve per GPU, `--tp-rank 0 / 1 --tp-peer`, rank 0 serves).
+  Each rank runs its half of the layers and sizes its expert slots over those layers only (about twice the slots per
+  layer); the output is the same as one GPU. Two DGX Sparks (GB10) over the CX7 link, NVFP4 / GSQ IQ3_S, MTP, greedy:
+  decode at 32K / 64K / 128K 37.1 / 43.3 / 42.0 -> 48.8 / 53.0 / 44.8 tok/s; short prompts 3-5 % slower (one hop per
+  step); texts identical to one box.
+- Flash-Next with a DFlash2 drafter (`dflash=` in the manifest): an 8-token block drafter beside MTP, picked per request by
+  recent tok/s (both drafters stay fed); on `--split layer` each target layer's features cross to the other rank and rank
+  0's pick is used on both. Two RTX 4090s, GSQ IQ3_S, greedy, code prompts: MTP 181.1 / 170.9 / 156.7 -> DFlash2
+  224.1 / 202.4 / 179.5 tok/s (PENDING: measured with the full chain before the per-request pick; re-measure); prose and long prompts gain nothing (2.3-2.7 tokens per step either way). Texts
+  identical. On one RTX 3090 or one GB10 it does not pay (the drafter takes expert slots), so leave it off there.
+- Conversations follow the user across slots and boxes (`--prompt-cache on`): a slot taken by a new conversation parks
+  the old one's state in host memory (Flash-Next too; within a byte budget that shrinks as free memory falls), and with
+  `--state-listen` / `--state-peer` two boxes behind the router lend parked states to each other over their link, so a
+  follow-up that lands on the other box resumes instead of re-reading the prompt (the router sends it where the
+  conversation is, or fetches when that is cheaper than a re-prefill). If the box holding it stops mid-transfer, the
+  turn re-reads the prompt. DGX Spark, Flash-Next NVFP4, 12 conversations x 3 turns on 4 slots: follow-ups that resume
+  0 -> 24 of 24, follow-up prefill 1,151 -> 403 ms (median). Two Sparks behind the router, 16 conversations x 3 turns
+  under load: 32 of 32 follow-ups resume, 9 of them fetched from the other box (138 MB, ~0.6 s each); replies as on one
+  box. 16 users: 266.7 -> 271.3 tok/s (same session, inside run-to-run range). Same with the 27B.
+- DFlash2 drafters in K-quant files (Q4_K_M mixes Q4_K and Q6_K in one group): 581 MB on the device instead of 838 MB
+  for Q8_0, same tokens per step. The fused K/V injection projection of a mixed file was read with one type; fixed.
+- `--split layer` (two GPUs): the memory fit now runs across both GPUs. When the asked context does not fit one of them,
+  both load again at the largest context that leaves the `-fitt` margin free on each (a few loads; the startup log says
+  which), and when nothing fits even at `-fitc` the error names what each GPU had free. Until now both ranks failed with
+  a plain "out of memory". `-fit off` keeps one load at the asked context. Two RTX 4090s, unsloth Q8_0: 131K at one
+  user, 64K at four.
+- 27B `--split layer` across two PCs over plain Ethernet (one GPU each, `--tp-peer <other PC>`): two RTX 3090s over
+  1 GbE, TQ_L, greedy: plain decode 53.8 -> 53.9 tok/s, 4 users 129.8 -> 123.4, DFlash2 197.4 -> 153.8 (its 8-row step
+  crosses the link); at 128K the K/V stays on the GPUs (one card had to put all of it in host memory), decode level,
+  prefill 16-20 % slower (~330 MB of rows per 32K prompt cross 1 GbE). Texts identical to one GPU.
 - `--gdn-state f16` (Qwen3.5 / 3.8): store the Gated DeltaNet recurrent state as FP16 (opt-in, not exact). Qwen3.8-27B on
   an RTX 3090: 96 MiB less VRAM per slot, KLD vs BF16 0.013443 -> 0.013861 (TQT file, WikiText-2 8 x 2048), 5/5 on a
   5-code needle at 109K and 140K tokens; speculative and plain decoding still give the same tokens.
@@ -119,8 +178,18 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   the Hugging Face model in FP32 (RTX 3090): covid-qa nDCG@10 56.17 (HF 56.32); DGX Spark (GB10) 51.1K document
   tokens/s and ~2.3K queries/s (HF bf16 34.9K / 1,021), RTX 3090 75.2K / ~2.9K (HF 21.1K / 283). Limits per request:
   4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
+- README: a "GPU memory it actually uses" table: measured peak GPU memory per setup (RTX 3090 24 GB, a 16 GB budget,
+  GB10), each row with its context, users and the system RAM it spills to.
 
 ### Changed
+- Flash-Next `--split experts` (the second box computes half of each layer's experts while it has no request of its
+  own): the helper is now a model-independent component (ExpertParallel: lease, per-layer exchange, scratch built once),
+  and the GDN decode kernel fixes its head width at compile time. Two DGX Sparks, NVFP4, through the router, same
+  session: one user (32 unseen questions, median) 68.4 -> 71.1 tok/s; 16 users 262.2 -> 275.2 tok/s total. Replies
+  unchanged.
+- Flash-Next: expert banks no longer grow during decode. A bank grown after a short prompt rebuilt every layer at the
+  first step of the next long one. RTX 3090, five short chats then 32K: 50.1 -> 80.9 tok/s (expert hit 80 -> 88 %);
+  64K / 128K and short prompts unchanged; texts identical.
 - Flash-Next on hosts whose RAM cannot cache the 28.8 GB per-layer token embedding beside the pinned expert pack (64 GB):
   a decode step asks for all its embedding rows at once with a random-access hint, and a prompt
   shorter than the prefill chunk plans its own length, so it lends fewer expert banks. RTX 3090,
@@ -193,6 +262,10 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 - Sampled requests (temperature > 0) on the 27B use the DFlash2 token tree on CUDA too (it was greedy-only): the walk draws each node's token from the target's distribution and follows a matching child. RTX 4090, Qwen3.8-27B TQ4 + DFlash2-TQ3, temperature 0.6, 6 x 2,000 tokens: 146 -> 173 tok/s, accepted drafts 30 % -> 37 %. `TQLLM_DEBUG=sample_chain` keeps chain drafts.
 
 ### Fixed
+- Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
+  `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
+  argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
+  two cases now keep separate graphs.
 - A request that failed for lack of GPU memory could leave the server faulting the GPU on every later request ("illegal
   memory access", Xid 31; 27B on an RTX 3090 beside another GPU process). Moving the oldest K/V to host memory unmapped a
   granule before mapping its replacement; when that map failed, the granule stayed unmapped and the next request's

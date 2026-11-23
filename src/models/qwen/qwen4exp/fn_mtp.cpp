@@ -1,4 +1,5 @@
 // Flash-Next MTP drafting: the MTP layer on prompt rows (catch-up) and drafts from its own output.
+#include <cstring>
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
 
@@ -32,15 +33,28 @@ void DecodeModel::mtp_kv_prefill(const std::vector<int> & tokens, const float * 
     const std::string nx = "blk." + std::to_string(L) + ".nextn.", prefix = "blk." + std::to_string(L) + ".";
     const int kvh = cp.attention_kvheads, ad = cp.attention_dim; const size_t row = size_t(kvh) * ad;
     AttentionState & a = mtp_att;
-    if (!a.k) { PersistentAlloc keep; a.k = std::make_unique<KvBuf>(size_t(kv_cap(a, cp.rt.kv_capacity)) * row * sizeof(__nv_bfloat16)); a.v = std::make_unique<KvBuf>(size_t(kv_cap(a, cp.rt.kv_capacity)) * row * sizeof(__nv_bfloat16)); }
+    if (!a.k) { PersistentAlloc keep; const int cap = kv_cap(a, cp.rt.kv_capacity); const size_t most = size_t(std::max(cap, cp.rt.kv_capacity_full)) * row * sizeof(__nv_bfloat16);
+                a.k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most); a.v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most); }
     require(a.len + n <= kv_cap(a, cp.rt.kv_capacity), "MTP KV exceeds the attention KV capacity");
     const float * attn_gamma = cp.dense_device(prefix + "hc_attn_norm.weight");
     const bool qsa_keys = cp.has_tensor(prefix + "indexer.k_proj.weight");
     for (int d = 0; d < n; d += 2048) {
         const int m = std::min(2048, n - d); ArenaMark scratch;
         Device<float> de(size_t(m) * h), en(size_t(m) * h), hn(size_t(m) * width), cat(size_t(m) * c.hc * 2 * h), res(size_t(m) * width);
-        if (emb) ck(cudaMemcpy(de.p, emb + size_t(d) * h, size_t(m) * h * sizeof(float), cudaMemcpyHostToDevice));
-        else { std::vector<uint64_t> ids(tokens.begin() + d, tokens.begin() + d + m); de.put(cp.file("token_embd.weight").gather_rows("token_embd.weight", ids)); }
+        if (emb) {
+            // through a pinned double buffer, queued on the stream: a pageable cudaMemcpy of each 2048-row block held the host
+            // until the GPU drained (32K prompt: 16 x 7 ms of the 0.5 s between the first token and decode)
+            static float * pin[2] = {}; static cudaEvent_t done[2] = {};
+            if (!pin[0]) for (int i = 0; i < 2; ++i) {
+                ck(cudaHostAlloc(reinterpret_cast<void **>(&pin[i]), size_t(2048) * h * sizeof(float), cudaHostAllocDefault));
+                ck(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
+            }
+            const int b = (d / 2048) & 1;
+            ck(cudaEventSynchronize(done[b]));  // the copy that last read this buffer has finished
+            std::memcpy(pin[b], emb + size_t(d) * h, size_t(m) * h * sizeof(float));
+            ck(cudaMemcpyAsync(de.p, pin[b], size_t(m) * h * sizeof(float), cudaMemcpyHostToDevice, nullptr));
+            ck(cudaEventRecord(done[b], nullptr));
+        } else { std::vector<uint64_t> ids(tokens.begin() + d, tokens.begin() + d + m); de.put(cp.file("token_embd.weight").gather_rows("token_embd.weight", ids)); }
         tqllm_cuda::hc_norm(de.p, cp.dense_device(nx + "enorm.weight"), en.p, h, 1, m, float(cp.epsilon), nullptr);
         tqllm_cuda::hc_norm(h_rows + size_t(d) * width, cp.dense_device(nx + "hnorm.weight"), hn.p, h, c.hc, m, float(cp.epsilon), nullptr);
         for (int sidx = 0; sidx < c.hc; ++sidx)

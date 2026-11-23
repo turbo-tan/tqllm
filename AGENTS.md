@@ -79,6 +79,7 @@ component live in the same folder. Dependencies point down only, and `tests/test
         qwen/qwen2           the draft-model forward
         glm/glm5next         GLM-5.3-Flash (DSA attention, MoE)
         minimax/m3           MiniMax-M3.1-Flash (GLM kernels through src/experts)
+        inkling2/loop        Inkling-2-Mini (24 layers, core 6..17 looped three times, depth attention, NVFP4 / MXFP8 experts)
         deepseek/ gemma/ ...   next architectures, same shape
         |   a model may use any component below; it never includes another model
         v

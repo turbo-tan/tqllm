@@ -11,7 +11,8 @@
 
 namespace tqllm {
 // --exact on (default): every step at the reference precision (FP16 / BF16 activations and KV, no int8 / FP8 GEMMs, no
-// CPU-served experts) unless memory forces a smaller KV, which is logged. --exact off lets each engine take its measured
+// CPU-served experts) unless memory forces a smaller KV, which is logged. With the prompt cache (Flash-Next default where
+// memory fits) a long prompt's prefill is split at its reuse point, first read included. --exact off lets each engine take its measured
 // approximations (docs/reference/options.md, "Exact and speed")
 struct EngineOptions {
     std::string cache_k, cache_v;  // -ctk / -ctv KV codecs (tq3, q8, q4, tcq3 / tq3, tq2s, tcq2, q8, q4); only one set:
@@ -30,6 +31,8 @@ struct EngineOptions {
     int prefill_fp8 = -1;  // --prefill-fp8 on|off: prefill GEMMs in FP8 (E4M3, per-row x per-token scales); default on GB10 (validated), opt-in on other sm_89+ GPUs
     bool prompt_cache = false;  // --prompt-cache on|off: each slot keeps its conversation's cache and prefills only the
                                 // part of a new prompt past the shared prefix (on with --kv-compact)
+    bool prompt_cache_set = false;  // --prompt-cache given: without it an engine may choose by memory fit (Flash-Next on unified
+                                    // memory with --exact off, decode_rules.hpp prompt_cache_by_fit)
     int prompt_park = -1;       // --prompt-park N: kept conversation states parked outside the slots (host memory), so a
                                 // follow-up resumes after its slot served others; -1: from memory, 0: off
     bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
@@ -37,13 +40,13 @@ struct EngineOptions {
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit
                         // decides (0 when the context fits, else the fewest that do)
     std::string draft_model;   // -md / --model-draft: DFlash2 drafter GGUF (the MTP head is then not loaded)
-    int tp_rank = 0, tp_world = 1, tp_port = 29600;  // --tp-rank R --tp-peer IP [--tp-port P]: MiniMax over two linked boxes
+    int tp_rank = 0, tp_world = 1, tp_port = 29600;  // --tp-rank R [--tp-world N (2)] --tp-peer IP [--tp-port P]: one process per GPU
     std::string tp_peer;       // rank 0's address on the linked network (rank 1 runs `glm-gpu MODEL --tokens 1 --tp-rank 1 ...`)
     bool split_layers = false; // --split layer (with --tp-rank): each rank (GPU) holds a contiguous range of layers, the hidden
                                // rows go rank to rank (exact; capacity: two GPUs hold one model). docs/steering plans multi-gpu
     bool split_experts = false; // --split experts (with --tp-rank, Flash-Next): while rank 1 has no request of its own it computes
                                 // the experts e % 2 == 1 of rank 0's decode forwards (exact: same kernels, combine in one-box order)
-    int split_at = -1;         // --split-at N: first layer of rank 1 (-1: half the layers)
+    std::vector<uint32_t> split_at;  // --split-at A[,B,...]: first layer of rank 1 (2, ...); empty: sized by each GPU's free memory
     std::vector<std::string> plugins;          // --plugin PATH (repeatable): weight-format plugins, CUDA builds (docs/guides/plugins.md)
     std::vector<std::string> inexact_patches;  // set by the plugin loader: applied patches not byte-identical to the built-in
     std::string hot_map;       // --hot-map FILE: MiniMax routing counts; the busiest experts are preloaded, the rest stay on disk

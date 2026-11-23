@@ -6,6 +6,7 @@
 
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace tqllm_cuda {
@@ -42,7 +43,28 @@ __global__ void __launch_bounds__(256) nvfp4_matvec_k(const uint8_t * w, const u
         if (lane == 0) y[int64_t(c) * rows + row] = v * gscale;
     }
 }
+
+// NVF4 device layout (q4.cpp): codes [rows][k / 2] natural nibbles (low = even column); aux row = k / 16 E4M3 group scales,
+// then the row's F32 global. FP16 of the exact value e2m1 * scale * global.
+__global__ void nvf4_dequant_h_k(const uint8_t * __restrict__ w, const uint8_t * __restrict__ aux, __half * out, int64_t row0,
+                                 int64_t n, int k) {
+    const int64_t ab = k / 16 + 4;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t r = row0 + i / k, c = i % k;
+        const uint8_t * a = aux + r * ab;
+        __nv_fp8_e4m3 s8;
+        s8.__x = a[c / 16];
+        const float gl = *reinterpret_cast<const float *>(a + k / 16);
+        const uint8_t q = w[r * (k / 2) + c / 2];
+        out[i] = __float2half(E2M1[(c & 1) ? q >> 4 : q & 15] * float(s8) * gl);
+    }
+}
 }  // namespace
+
+void nvf4_dequant_h(const uint8_t * w, const void * aux, __half * out, int row0, int nrows, int k, cudaStream_t s) {
+    const int64_t n = int64_t(nrows) * k;
+    nvf4_dequant_h_k<<<int(std::min<int64_t>((n + 255) / 256, 4096)), 256, 0, s>>>(w, static_cast<const uint8_t *>(aux), out, row0, n, k);
+}
 
 void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __nv_bfloat16 * x, float * y, int rows,
                   int k, int ncols, cudaStream_t s) {

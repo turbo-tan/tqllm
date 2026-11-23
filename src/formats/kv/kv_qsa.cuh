@@ -13,6 +13,7 @@ struct QsaDeviceSelection {
 };
 
 void qsa_set_split(int splits);  // TQFN_QSA_SPLIT override: S > 1 splits decode attention over the selected positions (numeric)
+void qsa_set_split_grouped(bool on);  // false: the split decode attention per query head (tests: the grouped kernel's reference)
 void qsa_set_tc(int on);  // 0: scalar instead of tensor-core prefill selected attention (12 heads per kv head, dim 256)
 void qsa_reserve_split_scratch();  // allocate the split-attention scratch now (start-up)
 void qsa_attention_direct(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values,

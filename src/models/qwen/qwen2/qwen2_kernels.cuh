@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_fp16.h>
+#include "attention_gen.cuh"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -29,19 +30,6 @@ void attention_decode_multi(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, c
 void attention_decode_multi_dev(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
                                 __nv_bfloat16 * y, float * part, const int * dseq0, int max_seq, int nq, int heads,
                                 int kvheads, int dim, float scale, cudaStream_t);
-// head_dim 128 multi-query attention with per-query key ranges (see attention.cu): nq queries at positions
-// *dpos + z; causal or block-non-causal; sliding window (0 = none). `part`: attention_gen_partial_floats floats.
-// ring > 0 (needs a window): the cache holds position p at slot p % ring (ring a multiple of 64, >= window + nq + 64)
-// and only the window is scanned, so cost and memory do not grow with the context.
-int attention_gen_partial_floats(int heads, int context, int nq);
-void attention_gen128(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
-                      float * part, const int * dpos, int nq, int max_seq, int heads, int kvheads, float scale,
-                      bool causal, int window, cudaStream_t, int ring = 0);
-// The same for head_dim 256 (DSpark drafter), full context (no window / ring); part: attention_gen256_partial_floats.
-void attention_gen256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
-                      float * part, const int * dpos, int nq, int max_seq, int heads, int kvheads, float scale,
-                      bool causal, cudaStream_t);
-int attention_gen256_partial_floats(int heads, int context, int nq);
 // Multi-query attention for head_dim 256: query z sees keys [0, *dseq0 + z). Linear blocks are split to fit 48 rows.
 // K/V tiles are
 // loaded once per block for all queries; fixed split count (no context-dependent grid). part: attention_mq_partial_floats.

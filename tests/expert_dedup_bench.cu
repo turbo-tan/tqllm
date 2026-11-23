@@ -1,6 +1,6 @@
 // Bench only: grouped dedup expert matvec at the Flash-Next decode shape (G distinct experts of a 512-slot bank, the
 // calls rotating over disjoint expert sets so the weights stream from DRAM as in decode, not from L2), isolated from
-// copies; prints us and effective GB/s per format.
+// copies; prints us and effective GB/s per format. Qwen3.6-35B-A3B (UD-Q4_K_M) expert shapes: gate/up Q4_K, down Q5_K.
 // usage: expert-dedup-bench [groups=16] [cols_per_group=2] [iters=200] [pad=0] [case substring]
 #include <algorithm>
 #include "weight_format.hpp"
@@ -21,7 +21,8 @@ int main(int argc, char ** argv) {
     struct Case { unsigned ty; int bb, rows, cols; const char * what; };
     for (const Case cs : {Case{22, 82, 640, 2560, "gate/up IQ2_S"}, Case{18, 98, 640, 2560, "gate/up IQ3_XXS"}, Case{21, 110, 640, 2560, "gate/up IQ3_S"},
                           Case{20, 144, 2560, 640, "down IQ4_NL"},
-                          Case{323, 152, 640, 2560, "gate/up NVF4"}, Case{323, 152, 2560, 640, "down NVF4"}, Case{302, 72, 2560, 640, "down GSQ_Q2_0"}}) {
+                          Case{323, 152, 640, 2560, "gate/up NVF4"}, Case{323, 152, 2560, 640, "down NVF4"}, Case{302, 72, 2560, 640, "down GSQ_Q2_0"},
+                          Case{12, 144, 512, 2048, "gate/up Q4_K 35B"}, Case{13, 176, 2048, 512, "down Q5_K 35B"}}) {
         if (argc > 5 && !std::strstr(cs.what, argv[5])) continue;
         std::vector<char> raw(size_t(cs.rows) * slots * cs.cols / 256 * cs.bb);
         for (auto & c : raw) c = char(g() & 255);

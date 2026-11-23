@@ -1,4 +1,6 @@
 #pragma once
+#include <algorithm>
+#include <stdexcept>
 #include "gguf.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +35,9 @@ public:
     size_t size() const { return tokens_.size(); }
     void reset() { tokens_.clear(); }
     void rollback(size_t accepted_size);
+    const std::vector<int32_t> & tokens() const { return tokens_; }  // a kept conversation's state (export / import)
+    void reserve(size_t capacity) { capacity_ = std::max(capacity_, capacity); }  // a kept sequence grown to more positions
+    void assign(std::vector<int32_t> tokens) { if (tokens.size() > capacity_) throw std::invalid_argument("PLE history: more tokens than its capacity"); tokens_ = std::move(tokens); }
     std::vector<int32_t> append(int32_t token);
     std::vector<int32_t> append_image();
     std::vector<int32_t> append_batch(const std::vector<int32_t> &);
