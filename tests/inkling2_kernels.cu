@@ -869,6 +869,81 @@ void test_attn_res_capture(int n) {
 }
 }  // namespace
 
+// small cards: the TQT prompt path decodes and multiplies G experts at a time (expert_slice + grouped_gather +
+// grouped_gate_up_part_bf16 + grouped_down_bf16 on the group's hc / ho slices) == the whole layer at once, bitwise;
+// a group with no routed rows is skipped. choose_tqt_group keeps every expert resident when a smaller group allows it.
+void test_tqt_groups(int fmt) {
+    const int E = 16, G = 4, topk = 4, D = 256, I = 128, n = 96, A = n * topk;
+    const float gc = 4.0f, uc = 25.0f;
+    ExpertBank Gt, Ut, Dt;
+    make_bank_tqt(Gt, E, I, D, fmt); make_bank_tqt(Ut, E, I, D, fmt); make_bank_tqt(Dt, E, D, I, fmt);
+    const auto X = randv(size_t(n) * D, 1.0f);
+    std::vector<int> ids(A);
+    for (int t = 0; t < n; ++t) {  // experts 8-11 (one whole group) never routed, expert 2 never routed
+        std::vector<int> p;
+        for (int e = 0; e < E; ++e) if (e != 2 && (e < 8 || e > 11)) p.push_back(e);
+        std::shuffle(p.begin(), p.end(), rng);
+        for (int k = 0; k < topk; ++k) ids[t * topk + k] = p[k];
+    }
+    bf16 * dx = up(to_bf(X)), * dbgu = nullptr, * dbdn = nullptr, * sgu = nullptr, * sdn = nullptr;
+    bf16 * dxg = nullptr, * dgu = nullptr, * dact = nullptr, * dyg = nullptr, * dact2 = nullptr, * dyg2 = nullptr;
+    int * dids = up(ids), * order = nullptr, * counts = nullptr, * offsets = nullptr, * tiles = nullptr;
+    ck(cudaMalloc(&dbgu, size_t(E) * 2 * I * D * 2), "bgu"); ck(cudaMalloc(&dbdn, size_t(E) * D * I * 2), "bdn");
+    ck(cudaMalloc(&sgu, size_t(G) * 2 * I * D * 2), "sgu"); ck(cudaMalloc(&sdn, size_t(G) * D * I * 2), "sdn");
+    ck(cudaMalloc(&dxg, size_t(A) * D * 2), "xg"); ck(cudaMalloc(&dgu, size_t(A) * 2 * I * 2), "gu");
+    ck(cudaMalloc(&dact, size_t(A) * I * 2), "act"); ck(cudaMalloc(&dyg, size_t(A) * D * 2), "yg");
+    ck(cudaMalloc(&dact2, size_t(A) * I * 2), "act2"); ck(cudaMalloc(&dyg2, size_t(A) * D * 2), "yg2");
+    ck(cudaMalloc(&order, A * 4), "order"); ck(cudaMalloc(&counts, E * 4), "counts"); ck(cudaMalloc(&offsets, E * 4), "offsets");
+    ck(cudaMalloc(&tiles, (E + 1) * 4), "tiles");
+    cublasHandle_t blas = nullptr;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) { std::printf("cublasCreate failed\n"); ok = false; return; }
+    K::group_assignments(dids, A, E, order, counts, offsets, tiles, 0);
+    const auto hc = down(counts, size_t(E)), ho = down(offsets, size_t(E));
+    // whole layer
+    K::experts_decode_bf16(Gt.m, E, I, D, 2 * I, dbgu, 0);
+    K::experts_decode_bf16(Ut.m, E, I, D, 2 * I, dbgu + size_t(I) * D, 0);
+    K::experts_decode_bf16(Dt.m, E, D, I, D, dbdn, 0);
+    K::grouped_gate_up_bf16(dbgu, I, D, dx, A, E, topk, order, hc.data(), ho.data(), dxg, dgu, dact, gc, uc, blas, 0);
+    K::grouped_down_bf16(dbdn, D, I, dact, A, E, hc.data(), ho.data(), dyg, blas, 0);
+    ck(cudaDeviceSynchronize(), "whole");
+    // G experts at a time (the model's loop)
+    ck(cudaMemset(dact2, 0, size_t(A) * I * 2), "act2"); ck(cudaMemset(dyg2, 0, size_t(A) * D * 2), "yg2");
+    K::grouped_gather(dx, A, order, topk, dxg, D, 0);
+    int groups_run = 0;
+    for (int e0 = 0; e0 < E; e0 += G) {
+        int rows = 0;
+        for (int e = e0; e < e0 + G; ++e) rows += hc[e];
+        if (rows == 0) continue;
+        ++groups_run;
+        K::experts_decode_bf16(K::expert_slice(Gt.m, e0), G, I, D, 2 * I, sgu, 0);
+        K::experts_decode_bf16(K::expert_slice(Ut.m, e0), G, I, D, 2 * I, sgu + size_t(I) * D, 0);
+        K::experts_decode_bf16(K::expert_slice(Dt.m, e0), G, D, I, D, sdn, 0);
+        K::grouped_gate_up_part_bf16(sgu, I, D, dxg, G, hc.data() + e0, ho.data() + e0, dgu, dact2, gc, uc, blas, 0);
+        K::grouped_down_bf16(sdn, D, I, dact2, A, G, hc.data() + e0, ho.data() + e0, dyg2, blas, 0);
+        ck(cudaDeviceSynchronize(), "group");
+    }
+    const auto a1 = down(dact, size_t(A) * I), a2 = down(dact2, size_t(A) * I), y1 = down(dyg, size_t(A) * D), y2 = down(dyg2, size_t(A) * D);
+    const bool same = std::memcmp(a1.data(), a2.data(), a1.size() * 2) == 0 && std::memcmp(y1.data(), y2.data(), y1.size() * 2) == 0;
+    report(fmt == 3 ? "TQT prompt experts in groups == whole layer (bitwise)" : "TQT3 prompt experts in groups == whole layer (bitwise)", 0.0, 1.0,
+           same && groups_run == E / G - 1);
+    cublasDestroy(blas);
+    cudaFree(dx); cudaFree(dbgu); cudaFree(dbdn); cudaFree(sgu); cudaFree(sdn); cudaFree(dxg); cudaFree(dgu); cudaFree(dact); cudaFree(dyg);
+    cudaFree(dact2); cudaFree(dyg2); cudaFree(dids); cudaFree(order); cudaFree(counts); cudaFree(offsets); cudaFree(tiles);
+}
+
+void test_tqt_group_choice() {
+    const size_t GB = size_t(1) << 30, per = size_t(3) * 1152 * 2304 * 2;  // Inkling: gate + up + down of one expert in BF16 (15.9 MB)
+    // 16 GB card (5060 Ti): 15.2 GB free, 12.61 GB of TQT experts, 1.5 GB reserve + 0.23 GB chunk buffers:
+    // the whole layer (128 x 15.9 MB = 2.04 GB) would push experts out; 64 does not
+    const int g16 = K::choose_tqt_group(128, size_t(15.2 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);
+    const int g24 = K::choose_tqt_group(128, size_t(22.5 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);  // 24 GB card: whole layer
+    const int gmin = K::choose_tqt_group(128, size_t(13.0 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);  // nothing fits: 8
+    const bool fits16 = 12.61 * GB + 1.73 * GB + double(g16) * per <= 15.2 * GB;
+    report("TQT group choice (16 GB: smaller group, 24 GB: whole layer, too small: 8)", 0.0, 1.0,
+           g16 < 128 && g16 >= 8 && fits16 && g24 == 128 && gmin == 8);
+    std::printf("  groups: 16 GB -> %d, 24 GB -> %d, too small -> %d\n", g16, g24, gmin);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
@@ -889,6 +964,9 @@ int main() {
     test_grouped_bf16_threshold();
     test_grouped_bf16(2);
     test_grouped_bf16(1);
+    test_tqt_groups(3);
+    test_tqt_groups(5);
+    test_tqt_group_choice();
     test_conv();
     std::printf(ok ? "inkling2-kernels: PASS\n" : "inkling2-kernels: FAIL\n");
     return ok ? 0 : 1;

@@ -146,6 +146,7 @@ struct Inkling2Model::Impl {
     // BF16 expert prompt path (big cards): gathered inputs, gate+up GEMM out, down GEMM out, host counts / offsets
     Dev xg, guo, ygo, ginv;
     bool bf16_experts = false, fp4_experts = false;
+    int tqt_group = 0;  // small cards: TQT prompt experts decoded G at a time (chosen at load from free memory; 0: the whole layer)
     bool tqt_experts = false;  // some layer's experts are TQT (fmt 3): few-token kernels read the rotated FP16 activations xh16 / acth16
     Dev xh16, acth16, tqt_bgu, tqt_bdn;  // rotated activations; per-visit BF16 decode of a TQT layer (cards without the whole-model BF16 copies)
     Dev q4codes, q4scales, q4row, q4acodes, q4ascales;
@@ -337,9 +338,10 @@ struct Inkling2Model::Impl {
     size_t dev_mem = 0;
     int resident_share = 0;  // experts per 128 kept on the device (128: all)
     // TQT prompt path without whole-model BF16 copies: one layer's BF16 experts (gate+up, down) plus the grouped GEMM buffers
-    size_t tqt_scratch_bytes() const {
+    size_t tqt_per_expert_bytes() const { return (size_t(2) * I * D + size_t(D) * I) * 2; }  // one expert's gate + up + down in BF16
+    size_t tqt_fixed_bytes() const {  // the grouped GEMM buffers of one prompt chunk
         const size_t A = size_t(chunk) * topk;
-        return size_t(E) * 2 * I * D * 2 + size_t(E) * D * I * 2 + A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
+        return A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
     }
     void place_experts() {
         size_t total = 0;
@@ -348,7 +350,10 @@ struct Inkling2Model::Impl {
             size_t fr = 0, tot = 0;
             ck(cudaMemGetInfo(&fr, &tot), "mem info");
             size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
-            if (tqt_experts && dev_mem < (size_t(96) << 30)) keep += tqt_scratch_bytes();  // the per-visit BF16 decode of a TQT layer
+            if (tqt_experts && dev_mem < (size_t(96) << 30)) {  // the per-visit BF16 decode of a TQT layer, one group at a time
+                tqt_group = K::choose_tqt_group(E, fr, total, keep + tqt_fixed_bytes(), tqt_per_expert_bytes());
+                keep += tqt_fixed_bytes() + size_t(tqt_group) * tqt_per_expert_bytes();
+            }
             return std::min(expert_budget, fr > keep ? fr - keep : 0);
         };
         size_t b = budget();
@@ -364,6 +369,9 @@ struct Inkling2Model::Impl {
         resident_share = total <= b ? E_ : std::max(topk, int(double(b) / double(total) * E_));
         for (auto & Y : Ls) { place(Y.eg, resident_share); place(Y.eu, resident_share); place(Y.ed, resident_share); }
         ck(cudaStreamSynchronize(s), "place");
+        if (tqt_group)
+            std::fprintf(stderr, "inkling2: TQT prompt experts in groups of %d (%.2f GB BF16 scratch), %d of %d experts per layer resident\n", tqt_group,
+                         double(size_t(tqt_group) * tqt_per_expert_bytes()) / 1e9, resident_share, E_);
         // big cards (>= 96 GB): BF16 prompt copies for the cuBLAS path, allocated after the quantized stacks are placed
         // (the pinned host copies are free again then); a failed allocation keeps the WMMA path
         if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX) {
@@ -391,7 +399,8 @@ struct Inkling2Model::Impl {
         }
         if (tqt_experts && !bf16_experts) {  // TQT prompt path: one layer's BF16 decode per visit, then the cuBLAS per-expert GEMMs
             const size_t A = size_t(chunk) * topk;
-            tqt_bgu = Dev(size_t(E) * 2 * I * D * 2); tqt_bdn = Dev(size_t(E) * D * I * 2);
+            const int G = tqt_group ? tqt_group : E;
+            tqt_bgu = Dev(size_t(G) * 2 * I * D * 2); tqt_bdn = Dev(size_t(G) * D * I * 2);
             xg = Dev(A * D * 2); guo = Dev(A * 2 * I * 2); ygo = Dev(A * D * 2); ginv = Dev(A * 4);
             if (!h_gc) { ck(cudaMallocHost(&h_gc, size_t(E) * 4), "pinned"); ck(cudaMallocHost(&h_gf, size_t(E) * 4), "pinned"); }
         }
@@ -763,18 +772,31 @@ struct Inkling2Model::Impl {
             const int A = n * topk;
             int * go = gorder.as<int>(), * gc = gcounts.as<int>(), * gf = goffsets.as<int>(), * gt_ = gtile.as<int>();
             K::group_assignments(eids.as<int>(), A, E, go, gc, gf, gt_, s);
-            if (Y.eg.m.fmt >= 3) {  // TQT / TQT2: BF16 copies of the original-basis weights (resident, or this visit's decode), cuBLAS per expert
-                const bf16 * Wgu = bf16_experts ? Y.eg.bgu.as<bf16>() : tqt_bgu.as<bf16>(), * Wdn = bf16_experts ? Y.ed.bdn.as<bf16>() : tqt_bdn.as<bf16>();
-                if (!bf16_experts) {
-                    K::experts_decode_bf16(Y.eg.m, E, I, D, 2 * I, tqt_bgu.as<bf16>(), s);
-                    K::experts_decode_bf16(Y.eu.m, E, I, D, 2 * I, tqt_bgu.as<bf16>() + size_t(I) * D, s);
-                    K::experts_decode_bf16(Y.ed.m, E, D, I, D, tqt_bdn.as<bf16>(), s);
-                }
+            if (Y.eg.m.fmt >= 3) {  // TQT / TQT2: BF16 copies of the original-basis weights (resident, or decoded G experts at a time), cuBLAS per expert
                 ck(cudaMemcpyAsync(h_gc, gcounts.p, size_t(E) * 4, cudaMemcpyDeviceToHost, s), "counts");
                 ck(cudaMemcpyAsync(h_gf, goffsets.p, size_t(E) * 4, cudaMemcpyDeviceToHost, s), "offsets");
                 ck(cudaStreamSynchronize(s), "group");
-                K::grouped_gate_up_bf16(Wgu, I, D, xb.as<bf16>(), A, E, topk, go, h_gc, h_gf, xg.as<bf16>(), guo.as<bf16>(), act.as<bf16>(), gcap, ucap, blas, s);
-                K::grouped_down_bf16(Wdn, D, I, act.as<bf16>(), A, E, h_gc, h_gf, ygo.as<bf16>(), blas, s);
+                if (bf16_experts) {
+                    K::grouped_gate_up_bf16(Y.eg.bgu.as<bf16>(), I, D, xb.as<bf16>(), A, E, topk, go, h_gc, h_gf, xg.as<bf16>(), guo.as<bf16>(),
+                                            act.as<bf16>(), gcap, ucap, blas, s);
+                    K::grouped_down_bf16(Y.ed.bdn.as<bf16>(), D, I, act.as<bf16>(), A, E, h_gc, h_gf, ygo.as<bf16>(), blas, s);
+                } else {
+                    const int G = tqt_group ? tqt_group : E;
+                    K::grouped_gather(xb.as<bf16>(), A, go, topk, xg.as<bf16>(), D, s);
+                    for (int e0 = 0; e0 < E; e0 += G) {
+                        const int g = std::min(G, E - e0);
+                        int rows = 0;
+                        for (int e = e0; e < e0 + g; ++e) rows += h_gc[e];
+                        if (rows == 0) continue;
+                        K::experts_decode_bf16(K::expert_slice(Y.eg.m, e0), g, I, D, 2 * I, tqt_bgu.as<bf16>(), s);
+                        K::experts_decode_bf16(K::expert_slice(Y.eu.m, e0), g, I, D, 2 * I, tqt_bgu.as<bf16>() + size_t(I) * D, s);
+                        K::experts_decode_bf16(K::expert_slice(Y.ed.m, e0), g, D, I, D, tqt_bdn.as<bf16>(), s);
+                        K::grouped_gate_up_part_bf16(tqt_bgu.as<bf16>(), I, D, xg.as<bf16>(), g, h_gc + e0, h_gf + e0, guo.as<bf16>(), act.as<bf16>(),
+                                                     gcap, ucap, blas, s);
+                        K::grouped_down_bf16(tqt_bdn.as<bf16>(), D, I, act.as<bf16>(), A, g, h_gc + e0, h_gf + e0, ygo.as<bf16>(), blas, s);
+                        if (e0 + g < E) ck(cudaStreamSynchronize(s), "tqt group");  // the scratch and the GEMM descriptors are reused by the next group
+                    }
+                }
                 K::moe_combine_grouped(ygo.as<bf16>(), go, A, ewts.as<float>(), moe.as<bf16>(), n, D, topk, ginv.as<int>(), s);
             } else if (fp4_experts && Y.eg.m.fmt == 2 && Y.eu.m.fmt == 2 && Y.ed.m.fmt == 2 && I % 64 == 0 && D % 64 == 0) {
                 K::quantize_act_nvfp4(xb.as<bf16>(), n, D, q4codes.as<uint8_t>(), q4scales.as<uint8_t>(), q4row.as<float>(), s);

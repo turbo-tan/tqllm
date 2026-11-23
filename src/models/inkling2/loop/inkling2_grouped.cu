@@ -11,6 +11,7 @@
 
 #include "inkling2_fp4_mma.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -684,16 +685,34 @@ void experts_decode_bf16(const ExpertMat & m, int E, int rows, int cols, int ldr
     else throw std::runtime_error("inkling2 experts_decode_bf16: format");
 }
 
+void grouped_gather(const __nv_bfloat16 * x, int A, const int * order, int topk, __nv_bfloat16 * xg, int D, cudaStream_t s) {
+    if (A > 0) gather_rows_k<<<dim3(A, unsigned((D + 2047) / 2048)), 256, 0, s>>>(x, order, topk, xg, D);
+}
+
+void grouped_gate_up_part_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bfloat16 * xg, int G, const int * hc, const int * ho,
+                               __nv_bfloat16 * gu, __nv_bfloat16 * act, float gc, float uc, cublasHandle_t blas, cudaStream_t s) {
+    size_t rows = 0;
+    for (int e = 0; e < G; ++e) rows += size_t(std::max(hc[e], 0));
+    if (rows == 0) return;
+    if (!gemm_grouped_bf16(blas, Wgu, 2 * I, D, xg, gu, G, hc, ho, 0))
+        for (int e = 0; e < G; ++e)
+            if (hc[e] > 0) gemm_bf16(blas, Wgu + size_t(e) * 2 * I * D, 2 * I, D, xg + size_t(ho[e]) * D, gu + size_t(ho[e]) * 2 * I, hc[e]);
+    const size_t r0 = size_t(ho[0]), total = rows * I;
+    swiglu_k<<<unsigned((total / 2 + 255) / 256), 256, 0, s>>>(gu + r0 * 2 * I, act + r0 * I, I, gc, uc, total);
+}
+
 void grouped_gate_up_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bfloat16 * x, int A, int E, int topk, const int * order, const int * hc,
                           const int * ho, __nv_bfloat16 * xg, __nv_bfloat16 * gu, __nv_bfloat16 * act, float gc, float uc, cublasHandle_t blas,
                           cudaStream_t s) {
     if (A <= 0) return;
-    gather_rows_k<<<dim3(A, unsigned((D + 2047) / 2048)), 256, 0, s>>>(x, order, topk, xg, D);
-    if (!gemm_grouped_bf16(blas, Wgu, 2 * I, D, xg, gu, E, hc, ho, 0))
-        for (int e = 0; e < E; ++e)
-            if (hc[e] > 0) gemm_bf16(blas, Wgu + size_t(e) * 2 * I * D, 2 * I, D, xg + size_t(ho[e]) * D, gu + size_t(ho[e]) * 2 * I, hc[e]);
-    const size_t total = size_t(A) * I;
-    swiglu_k<<<unsigned((total / 2 + 255) / 256), 256, 0, s>>>(gu, act, I, gc, uc, total);
+    grouped_gather(x, A, order, topk, xg, D, s);
+    grouped_gate_up_part_bf16(Wgu, I, D, xg, E, hc, ho, gu, act, gc, uc, blas, s);
+}
+
+int choose_tqt_group(int E, size_t free_b, size_t experts_b, size_t keep_b, size_t per_expert_b) {
+    for (int g = E; g >= 8; g /= 2)
+        if (experts_b + keep_b + size_t(g) * per_expert_b <= free_b) return g;
+    return std::min(E, 8);
 }
 
 void grouped_down_bf16(const __nv_bfloat16 * Wd, int D, int I, const __nv_bfloat16 * act, int A, int E, const int * hc, const int * ho,
