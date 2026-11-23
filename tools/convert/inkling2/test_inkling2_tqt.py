@@ -238,3 +238,17 @@ def test_dequant_experts_nvfp4_and_mxfp8():
     s8 = torch.from_numpy(rng.randint(120, 125, (1, 2, 2), dtype=np.uint8))
     g8 = Q._dequant_experts(w8, s8).float()
     assert abs(g8[0, 1, 40] - float(w8[0, 1, 40].float()) * 2.0 ** (int(s8[0, 1, 1]) - 127)) < 1e-6
+
+
+def test_overlay_dense_q8_tensor_is_two_dimensional(tmp_path, monkeypatch):
+    monkeypatch.setattr(Q, "E", 1)
+    monkeypatch.setattr(Q, "D", 128)
+    monkeypatch.setattr(Q, "I", 128)
+    np.zeros((1, 256, 66), np.uint8).tofile(tmp_path / "L00_gu.bin")
+    np.zeros((1, 128, 66), np.uint8).tofile(tmp_path / "L00_dn.bin")
+    path = tmp_path / "d.gguf"
+    Q.write_overlay(path, [(0, tmp_path, Q.tqt)], [("token_embd.weight", (64, 3), Q.q8_0(np.ones((3, 64), np.float32)))])
+    b = path.read_bytes()
+    i = b.index(b"token_embd.weight") + len(b"token_embd.weight")
+    assert int.from_bytes(b[i:i + 4], "little") == 2  # n_dims
+    assert [int.from_bytes(b[i + 4 + 8 * k:i + 12 + 8 * k], "little") for k in range(2)] == [64, 3]

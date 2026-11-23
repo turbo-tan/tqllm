@@ -507,7 +507,7 @@ def write_overlay(path, layers, dense=()):
     for k, v in kvs:
         head += _gstr(k.encode()) + np.uint32(8).tobytes() + _gstr(v)
     for name, ne, typ, o in infos:
-        head += _gstr(name.encode()) + np.uint32(3).tobytes() + b"".join(np.uint64(x).tobytes() for x in ne) + np.uint32(typ).tobytes() + np.uint64(o).tobytes()
+        head += _gstr(name.encode()) + np.uint32(len(ne)).tobytes() + b"".join(np.uint64(x).tobytes() for x in ne) + np.uint32(typ).tobytes() + np.uint64(o).tobytes()
     head += bytes((-len(head)) % 32)
     tmp = str(path) + ".tmp"
     with open(tmp, "wb") as f:
