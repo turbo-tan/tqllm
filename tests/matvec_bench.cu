@@ -54,7 +54,7 @@ int main(int argc, char ** argv) {
             std::vector<__half> x(size_t(nc) * cols, __float2half(0.01f));
             __half * dx = nullptr; cudaMalloc(&dx, x.size() * 2); cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice);
             __nv_bfloat16 * dy = nullptr; cudaMalloc(&dy, size_t(nc) * rows * 2);
-            auto call = [&] {
+            auto call = [&, ty = ty, cols = cols] {  // copies: C++17 lambdas cannot capture bindings
                 if (ty == 300 && (var == 10 || var == 11)) tqllm_cuda::tq4_matvec_i8_bf16(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, nullptr, var == 11 ? 1 : 2);
                 else if (ty == 301 && var) tqllm_cuda::tq4b3_matvec_variant(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, var, nullptr);
                 else if (ty == 300 && var) tqllm_cuda::tq4_matvec_variant(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, dy, rows, cols, nc, var, nullptr);

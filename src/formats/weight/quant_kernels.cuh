@@ -347,6 +347,12 @@ void u4h_matvec_ids(const uint8_t * w4, const __half2 * sm, const uint32_t * rid
                     int k, int ncols, cudaStream_t);
 void u4h_matvec(const uint8_t * w4, const __half2 * sm, const __half * xh, float * y, int rows, int k, int ncols,
                 cudaStream_t);
+// i8h [n] -> k3 (Q3_K grid, symmetric 3-bit per 16 with int8 scales of an FP16 d per 256; lossy): the 3-bit LM-head
+// first pass. w3 [n / 256][96], kr [n / 256][20] as the k3 format.
+void k3_from_i8h(const int8_t * w8, const __half * sc, uint8_t * w3, uint8_t * kr, int64_t n, cudaStream_t);
+// rows rid[0 .. rows) of a larger k3 matrix
+void k3_matvec_ids(const uint8_t * w3, const uint8_t * kr, const uint32_t * rid, const __half * xh, float * y, int rows, int k,
+                   int ncols, cudaStream_t);
 // i8h [n] -> u4h (asymmetric 4-bit per 32; lossy, for draft-only copies).
 void u4h_from_i8h(const int8_t * w8, const __half * sc, uint8_t * w4, __half2 * sm, int64_t n, cudaStream_t);
 // BF16 -> FP16 copy.

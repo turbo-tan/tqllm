@@ -27,7 +27,9 @@ int main() {
     // RTX 3090 (24 GB, ~11 GB free after the model): unchanged
     expect(prefill_chunk(32768, 24 * GiB, 11 * GiB, 32768 * kv_tq3_per_pos), 4096, "3090 32K");
     expect(prefill_chunk(131072, 24 * GiB, 11 * GiB, 131072 * kv_tq3_per_pos), 2048, "3090 128K");
-    expect(prefill_chunk(262144, 24 * GiB, 11 * GiB, 262144 * kv_tq3_per_pos), 512, "3090 256K");
+    expect(prefill_chunk(262144, 24 * GiB, 11 * GiB, 262144 * kv_tq3_per_pos), 1024, "3090 256K, 9.9 GB left");
+    expect(prefill_chunk(262144, 24 * GiB, size_t(9.5 * GiB), size_t(7.0 * GiB)), 1024, "3090 256K q8/q4, 2.5 GB left");
+    expect(prefill_chunk(262144, 24 * GiB, size_t(8.5 * GiB), size_t(7.0 * GiB)), 512, "3090 256K q8/q4, 1.5 GB left");
     // RTX 5060 Ti (16 GB, ~3.5 GB free): unchanged
     expect(prefill_chunk(204800, 16 * GiB, size_t(3.5 * GiB), 204800 * kv_tq3_per_pos), 512, "5060 Ti 200K");
     expect(prefill_chunk(32768, 16 * GiB, size_t(3.5 * GiB), 32768 * kv_tq3_per_pos), 2048, "5060 Ti 32K");

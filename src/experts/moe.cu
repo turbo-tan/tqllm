@@ -7,8 +7,6 @@
 #include "formats/weight/quant_kernels.cuh"
 #include <stdexcept>
 #include <math_constants.h>
-// TQFN_* switches that won their A/Bs are on by default; set NAME=0 to turn one off
-static inline bool tqfn_default_on(const char * n) { const char * v = std::getenv(n); return !v || (v[0] && v[0] != '0'); }
 
 namespace tqllm_cuda {
 namespace {

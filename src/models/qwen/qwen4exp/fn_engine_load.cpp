@@ -14,6 +14,7 @@
 #include "hot_cold_policy.hpp"
 #include "gsq_q2_host.hpp"
 #include "expert_prediction.hpp"
+#include "expert_block_batch.hpp"
 
 namespace tqllm::flashnext {
 namespace {
@@ -133,12 +134,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     double pack_bytes = 0;  // the GGUF bytes of the trunk experts, about the pinned pack's size
     for (int l = 0; l < c.layers; ++l) for (const auto & p : checkpoint.expert_payload(l, 0)) pack_bytes += double(p.bytes.size) * c.experts;
     const double host_ram = double(tqllm::host_ram_bytes());  // physical RAM capped by the container limit
-    // TQLLM_PACK_RAM_FRAC: the share of RAM the pinned pack may take (default 0.6; values outside (0, 1] are ignored)
-    double pack_frac = 0.6;
-    if (const char * v = std::getenv("TQLLM_PACK_RAM_FRAC")) { const double x = std::atof(v); if (x > 0 && x <= 1) pack_frac = x; }
-    std::fprintf(stderr, "tqllm: expert pack %.1f GB, host RAM limit %.1f GB, pinned pack allowed up to %.0f %% of it\n",
-                 pack_bytes * 1.02 / 1e9, host_ram / 1e9, pack_frac * 100);
-    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram, pack_frac);
+    const bool pack_in_memory = build_pack_in_memory(!f.experts.empty(), integrated != 0, !f.hot_map_path.empty(), pack_bytes * 1.02, host_ram);
     if (f.experts.empty() && !integrated && !pack_in_memory)
         std::fprintf(stderr, "tqllm: experts read from the GGUF on demand (%s)\n", !f.hot_map_path.empty() ? "hot/cold tiers" :
                      "a pinned pack would not fit this machine's RAM");
@@ -277,6 +273,15 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
     f.cache = std::make_unique<MixedExpertCache>(c.layers, c.experts, c.hidden, c.expert_ff, f.slots, bank_budget_bytes(f.slots_auto, f.budget_gb, device_total),
                 [&checkpoint](int layer, int expert) { return checkpoint.expert_payload(layer, expert); }, nullptr);
     ::apply_layer_slots(*f.cache, f.experts, f.slots, f.layer_slots, slots_.size() > 1 ? int(slots_.size()) * c.topk : 0);
+    // experts read from the GGUF on demand: a long prompt's layer-major prefill streams the routed experts its banks do
+    // not hold (a borrowed layer: all of them) in the bank layout, assembled on the host from the GGUF payloads (the
+    // bytes a pinned pack holds, untiled as the banks are here)
+    if (f.experts.empty() && !integrated && !pack_in_memory && f.hot_map_path.empty())
+        rt.expert_blocks = [&checkpoint](int layer, const int * ids, size_t n, char * dst, size_t block) {
+            expert_block_batch(ids, n, dst, block, [&](int expert) {
+                return repack_expert(checkpoint, layer, expert, false);
+            });
+        };
     // packed experts in pinned memory, tiled in place (same steps as --decode). Without an experts file (a GB10 with
     // every expert resident) the cache loads experts from the GGUF once and keeps them.
     if (!f.experts.empty() || pack_in_memory) {
@@ -427,8 +432,13 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // the indexer's query projection runs only past the QSA budget (2048 positions), which no warm-up step reaches: upload
       // it now, not inside the first long prompt (GB10: 13 x 2.6 MB from the mapped file, 0.3 s of a 3.4K prompt)
       for (int l = 0; l <= c.layers; ++l)
+      {
           if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_proj.weight"; checkpoint.has_tensor(name) && checkpoint.is_bf16(name))
               (void) checkpoint.bf16_device(name);
+          // its norm too: first used inside a decode step's graph capture, its upload failed the capture
+          if (const std::string name = "blk." + std::to_string(l) + ".indexer.q_norm.weight"; checkpoint.has_tensor(name))
+              (void) checkpoint.dense_device(name);
+      }
       // the first long prompt would otherwise grow the staging buffers mid-request (a whole MTP bank in the catch-up, a
       // whole trunk bank in the refill): size them now, the steady state every later request already has
       f.mtp_cache->reserve_staging(mtp_slots); f.cache->reserve_staging();

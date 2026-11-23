@@ -403,7 +403,7 @@ int main() {
         CK(cudaStreamSynchronize(st));
         for (const auto & [vcod, vbuf, name] : {std::tuple{KvCodec::Tq3, static_cast<void *>(vc), "tcq3/tq3"},
                                                 std::tuple{KvCodec::Tcq2, tv, "tcq3/tcq2"}}) {
-            auto run_t = [&](int nq, const KvCompactSeg * cs) {
+            auto run_t = [&, vcod = vcod, vbuf = vbuf](int nq, const KvCompactSeg * cs) {  // copies: C++17 lambdas cannot capture bindings
                 const int hp[2] = {N - nq, N - nq + 1};
                 cudaMemcpy(dpos, hp, 8, cudaMemcpyHostToDevice);
                 const int split = std::clamp(2 * sms / KVH, 1, 256);

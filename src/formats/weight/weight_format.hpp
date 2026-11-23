@@ -78,11 +78,11 @@ struct WeightFormat {
     virtual void dequant_h(const Mat &, __half * out, cudaStream_t) const = 0;
     // Rows [row0, row0 + nrows) of dequant_h into out [nrows][cols], for an engine that has no whole-matrix FP16 scratch
     // (the target's 200K-row lm_head is dumped in 2048-row chunks for the drafter's trainer). false: no row-range kernel.
-    virtual bool dequant_rows_h(const Mat &, __half * out, int row0, int nrows, cudaStream_t) const { return false; }
+    virtual bool dequant_rows_h(const Mat &, __half * /*out*/, int /*row0*/, int /*nrows*/, cudaStream_t) const { return false; }
     // int8 prefill without an FP16 round trip: weights quantised straight to int8 [rows][cols] (row-major) plus the
     // per-row scales row_scale[r] = amax/127 (1 for a zero row), the same rule as int8_quant_rows. false: use the
     // dequant_h + per-chunk quantise path (the default for every format).
-    virtual bool dequant_i8(const Mat &, int8_t * w8, float * row_scale, cudaStream_t) const { return false; }
+    virtual bool dequant_i8(const Mat &, int8_t * /*w8*/, float * /*row_scale*/, cudaStream_t) const { return false; }
     // dequant_i8 above returns true (the engine then needs no FP16 scratch for this format's int8 GEMMs)
     virtual bool has_dequant_i8() const { return false; }
     // dequant_i8 of the weights times col_mul[column] (SmoothQuant column scales, cols floats on the device); false: not
@@ -96,7 +96,7 @@ struct WeightFormat {
     virtual size_t row_bytes(int /*cols*/) const { return 0; }
     virtual size_t aux_row_bytes(int /*cols*/) const { return 0; }
     // Optional kernel for max_matvec_cols() < n < the cuBLAS threshold; false = use dequant + GEMM.
-    virtual bool gemm(const Mat &, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t) const { return false; }
+    virtual bool gemm(const Mat &, const __half * /*x*/, __nv_bfloat16 * /*y*/, int /*n*/, cudaStream_t) const { return false; }
     virtual bool has_gemm() const { return fused_gemm_cols() > 0; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
     // y [n][rows] F32 through the u4h-family GEMM (weights read once per 64 columns); false: no GEMM for this format
     bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;

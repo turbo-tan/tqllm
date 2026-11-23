@@ -34,6 +34,16 @@ public:
     size_t size() const { return calls_.size(); }
 };
 
+// Layer-major prefill without a prepacked pack: the routed experts of a layer go through its bank (prepare loads the
+// missing ones) only while they fit in it. Experts read from the GGUF on demand (host_blocks) stream the rest through the
+// prefill staging like a pack does: a bank cannot take more experts than its slots (a 28K prompt routes to all 512
+// experts of a layer with ~200 slots: "mixed cache: active set exceeds slots"), and a borrowed layer has no bank at all.
+// Without either (GB10, every expert resident) the bank holds them all. With a pack only the resident ones use the bank.
+inline bool prefill_through_bank(bool prepacked, bool host_blocks, bool bank_ready, int routed, int slots) {
+    if (prepacked) return false;
+    if (!host_blocks) return true;
+    return bank_ready && routed <= slots;
+}
 // Expert path of one trunk layer call: true = waves (several prepares, grouped per wave), false = one split prepare.
 // A prompt chunk (spec off, more than one token) always takes waves. A verify block takes the split path whenever its
 // distinct experts fit the layer's slots: the waves path sums the down projection in another order, so choosing it by
@@ -454,12 +464,10 @@ inline std::vector<int> bank_experts(const std::vector<int> & routed_count, int 
 // discrete GPU, so the released GGUF is the only expert source to download. A GPU that shares system memory (GB10)
 // keeps every expert resident and needs no pack.
 // Build the packed experts in pinned memory only on a discrete GPU without a pack file, outside hot/cold (its tiers manage
-// expert memory) and when the pack fits in ram_frac (default 60 %) of the machine's RAM; otherwise the cache reads experts
-// from the GGUF on demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB. TQLLM_PACK_RAM_FRAC sets ram_frac (a 64 GB
-// host holds the 44 GB IQ3_XXS pack at 0.8; fn_engine_load.cpp).
-inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes,
-                                 double ram_frac = 0.6) {
-    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= ram_frac * host_ram_bytes;
+// expert memory) and when the pack fits in 60 % of the machine's RAM; otherwise the cache reads experts from the GGUF on
+// demand. Hot/cold on .231 (23 GiB RAM) died pinning 51 GB.
+inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool hot_cold, double pack_bytes, double host_ram_bytes) {
+    return !has_pack_file && !integrated_gpu && !hot_cold && pack_bytes <= 0.6 * host_ram_bytes;
 }
 // Pages that may be dropped once the experts sit in pinned memory: the trunk expert tensors only. The per-layer token
 // embedding (Flash-Next: 28.8 GB, one 90-byte row per token and layer) is read from the file at every token; with its
@@ -467,6 +475,9 @@ inline bool build_pack_in_memory(bool has_pack_file, bool integrated_gpu, bool h
 inline bool drop_after_pack(const std::string & tensor) {
     const auto exps = tensor.find("_exps.weight");
     return tensor.rfind("blk.", 0) == 0 && exps != std::string::npos && exps + 12 == tensor.size();
+}
+inline bool drop_layer_after_pack(const std::string & tensor, int layer) {
+    return tensor.rfind("blk." + std::to_string(layer) + ".", 0) == 0 && drop_after_pack(tensor);
 }
 // Read at start-up so the first requests do not fault it in from the disk, when it fits half the RAM: on a small host
 // (.231: 23 GiB, 28.8 GB embedding) the read only cycles the page cache and evicts the cold experts.

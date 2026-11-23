@@ -32,7 +32,8 @@ void FlashNextEngine::refill_borrowed() {
     ck(cudaDeviceSynchronize());
     if (all) std::fprintf(stderr, "tqllm: refilled %d of %zu borrowed expert banks in %.0f ms\n", done, all, std::chrono::duration<double, std::milli>(pclk::now() - r0).count());
     if (all) S().refilled_ = true;
-    S().model_->pf_refill.clear(); led.reset();
+    if (S().model_) S().model_->pf_refill.clear();
+    led.reset();
 }
 
 void FlashNextEngine::arena_resize(size_t bytes) {
@@ -101,7 +102,23 @@ void FlashNextEngine::pc_verify(const std::vector<int> & ids, int p) {
     ref.reset(); bind();
 }
 
+void FlashNextEngine::abort_prefill() {
+    const auto lk = ep_lock();
+    try {
+        (void) cudaDeviceSynchronize(); (void) cudaGetLastError();
+        if (auto & m = S().model_) { m->release_prefill(); m->pf_borrowed.clear(); m->prompt_emb.clear(); m->keep_embeddings = false; }
+        arena_resize(f_.arena_decode);
+        refill_borrowed();
+    } catch (const std::exception & e) { std::fprintf(stderr, "tqllm: cleanup after a failed prefill: %s\n", e.what()); }
+    f_.cp->rt.trim_below = SIZE_MAX;
+}
+
 void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int) {
+    try { spec_begin_impl(prompt, count); }
+    catch (...) { abort_prefill(); throw; }
+}
+
+void FlashNextEngine::spec_begin_impl(const std::vector<uint32_t> & prompt, uint32_t count) {
     if (ep_gate_) ep_reclaim(*f_.cp, *ep_gate_);  // before the lock: rank 0's forwards already sent finish first
     const auto lk = ep_lock(); S().serving_ = true; if (ep_gate_) ++ep_gate_->served;
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
@@ -453,6 +470,13 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             // banks an earlier long prompt left below their slot target grow back into the freed memory with the refill
             if (slots_.size() == 1) f_.cache->regrow(size_t(768) << 20);
         }
+    }
+    // a decode that passes the indexer budget (2048 positions) selects through the QSA scratch: made here, outside any
+    // graph capture and before the refill sizes the banks (made at that step, its device sync failed the attention layers'
+    // captures, each step rerun without a graph)
+    if (P + int(count) > 2048 && !f_.cp->rt.qsa_batch && f_.cp->rt.kv_capacity > 2048) {
+        int attn = 0; for (int l = 0; l < c.layers; ++l) attn += checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight");
+        if (attn) { PersistentAlloc keep; f_.cp->rt.qsa_batch = std::make_unique<tqllm_cuda::QsaBatchScratch>(16, f_.cp->rt.kv_capacity, 4, 2048); }
     }
     stamp("before the bank refill"); refill_borrowed(); f_.cp->rt.trim_below = SIZE_MAX; stamp("banks refilled");
     S().model_->set_spec(true);

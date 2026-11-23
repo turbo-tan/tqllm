@@ -188,7 +188,7 @@ struct DFlash {
     static constexpr int injBatch = 32;  // tokens per inject matvec batch (the u4h NCOL cap); the inject scratch is sized to it
     Mat fc, sel_hidden, w_kv_all;  // w_kv_all: [layer][k | v] rows of every layer, one matvec for injection
     const float *enc_norm = nullptr, *out_norm = nullptr;
-    const __nv_bfloat16 *sel_prev = nullptr, *sel_next = nullptr;  // [vocab][rank]
+    tqllm_cuda::SelTable sel_prev, sel_next;  // [vocab][rank]
     std::vector<DFlashLayer> L;
 };
 
