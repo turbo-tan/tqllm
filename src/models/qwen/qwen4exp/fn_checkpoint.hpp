@@ -54,6 +54,10 @@ class Checkpoint {
     std::map<std::string, size_t> owners_;
 public:
     // after the experts are in pinned memory: drop the trunk expert pages, keep every tensor read per token cached
+    // the same, for one layer's trunk experts (build_packed drops each layer once it is copied)
+    void release_layer_expert_pages(int layer) const {
+        for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_layer_after_pack(name, layer)) files_[i]->release_tensor(name);
+    }
     void release_expert_pages() const { for (const auto & [name, i] : owners_) if (tqllm::flashnext::drop_after_pack(name)) files_[i]->release_tensor(name); }
     size_t warm_tensors(int threads, double host_ram_bytes) const {
         size_t n = 0;
