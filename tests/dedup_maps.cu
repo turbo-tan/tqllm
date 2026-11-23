@@ -49,6 +49,28 @@ int main() {
             same &= got[0] == w[0] && got[1] == w[1];
             for (int c = 0; c < w[1]; ++c) same &= got[2 + c] == w[2 + c] && got[2 + DC + c] == w[2 + DC + c];
         }
+        // the same maps from the routed ids alone, each token's last assignment taken as the extra (shared) expert:
+        // the ids as moe_extend_ids widens them are ids[] with that last column set to `extra`
+        if (topk >= 2) {
+            const int extra = experts - 1;
+            std::vector<int> routed(size_t(n) * (topk - 1)), wide(ids);
+            for (int t = 0; t < n; ++t) {
+                for (int q = 0; q < topk - 1; ++q) routed[size_t(t) * (topk - 1) + q] = ids[t * topk + q];
+                wide[t * topk + topk - 1] = extra;
+            }
+            int * d_r, * d_w, * d_gu2, * d_dn2;
+            check(cudaMalloc(&d_r, routed.size() * 4)); check(cudaMalloc(&d_w, A * 4));
+            check(cudaMalloc(&d_gu2, size_t(A) * DS * 4)); check(cudaMalloc(&d_dn2, size_t(A) * DS * 4));
+            check(cudaMemcpy(d_r, routed.data(), routed.size() * 4, cudaMemcpyHostToDevice));
+            check(cudaMemcpy(d_w, wide.data(), A * 4, cudaMemcpyHostToDevice));
+            tqllm_cuda::moe_dedup_maps(d_w, d_so, A, topk, nullptr, d_gu, d_dn, A, nullptr);
+            tqllm_cuda::moe_dedup_maps(d_r, d_so, A, topk, nullptr, d_gu2, d_dn2, A, nullptr, extra);
+            std::vector<int> a1(size_t(A) * DS), a2(a1.size()), b1(a1.size()), b2(a1.size());
+            check(cudaMemcpy(a1.data(), d_gu, a1.size() * 4, cudaMemcpyDeviceToHost)); check(cudaMemcpy(a2.data(), d_gu2, a2.size() * 4, cudaMemcpyDeviceToHost));
+            check(cudaMemcpy(b1.data(), d_dn, b1.size() * 4, cudaMemcpyDeviceToHost)); check(cudaMemcpy(b2.data(), d_dn2, b2.size() * 4, cudaMemcpyDeviceToHost));
+            if (a1 != a2 || b1 != b2) { std::printf("FAIL extra expert: topk %d n %d skew %d\n", topk, n, skew); ok = false; }
+            cudaFree(d_r); cudaFree(d_w); cudaFree(d_gu2); cudaFree(d_dn2);
+        }
         if (!same) { std::printf("FAIL topk %d n %d skew %d (groups %d)\n", topk, n, skew, G); ok = false; }
         ++cases;
         cudaFree(d_ids); cudaFree(d_so); cudaFree(d_slots); cudaFree(d_gu); cudaFree(d_dn);

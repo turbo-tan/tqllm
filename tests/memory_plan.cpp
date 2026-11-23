@@ -13,12 +13,15 @@ int main() {
     MemShape fn; fn.attention_layers = 12; fn.kv_heads = 2; fn.head_dim = 256; fn.index_dim = 128; fn.experts = 512; fn.topk = 10;
     const size_t slot = mb(94.8);
 
-    // context keep: the reserve (1 GB for one sequence, 256 MB for several) steps to 2 GB past 64K; host K/V lowers the state
+    // context keep: one sequence keeps 1 GB at every context (its tiered banks lend a long prompt what it needs); several
+    // sequences keep 256 MB, 2 GB past 64K; host K/V lowers the state
     {
-        MemRun a; a.context = 65536; MemRun b = a; b.context = 65537; MemRun np2 = a; np2.sequences = 2;
-        check(context_keep(fn, a).reserve == 1024 * kMiB && context_keep(fn, b).reserve == 2048 * kMiB,
-              "one sequence: reserve 1 GB to 64K (256 MB ran 3090 GSM8K decodes out of memory), 2 GB past it");
+        MemRun a; a.context = 65536; MemRun b = a; b.context = 65537; MemRun np2 = a; np2.sequences = 2; MemRun np2b = np2; np2b.context = 65537;
+        check(context_keep(fn, a).reserve == 1024 * kMiB && context_keep(fn, b).reserve == 1024 * kMiB,
+              "one sequence: reserve 1 GB (256 MB ran 3090 GSM8K decodes out of memory), also past 64K (3090 128K decode, 11-19)");
+        check(context_keep(fn, MemRun{262144}).reserve == 1024 * kMiB, "one sequence at 256K: 1 GB");
         check(context_keep(fn, np2).reserve == 256 * kMiB, "several sequences to 64K: 256 MB (their keep holds a state per extra sequence)");
+        check(context_keep(fn, np2b).reserve == 2048 * kMiB, "several sequences past 64K: 2 GB");
         MemRun dev; dev.context = 160000; MemRun host = dev; host.kv_host = true;
         check(context_keep(fn, host).state < context_keep(fn, dev).state, "host K/V: old positions leave the device state");
         MemRun shortk = host; shortk.context = 60000;
@@ -27,21 +30,23 @@ int main() {
         check(context_keep(fn, small).state < context_keep(fn, dev).state, "state grows with the context");
     }
 
-    // RTX 3090, 128K server (context 160000), one sequence, 1.4.2 M1 start: 17675 MB free without banks, 2304 MB kept
-    // (2 GB reserve + 256 MB) -> 162 slots; the second round measured 235 MB of rebuild extra -> 2539 MB kept, 159 slots
+    // RTX 3090, 128K server (context 160000), one sequence, 1.4.2 M1 start: 17675 MB free without banks. Until 11-19 it kept
+    // 2304 MB (2 GB reserve + 256 MB) -> 162 slots; with the 1 GB reserve it keeps 1280 MB -> 172 slots (rc170d at context
+    // 131072: 156 -> 169 slots, json 123.8 -> 138.2 tok/s, 128K decode 75.5 tok/s, texts equal). The second round measured
+    // 235 MB of rebuild extra -> 1515 MB kept
     {
         MemRun r; r.context = 160000; r.kv_host = true;
         const SlotPlan p = auto_slot_plan(fn, r, mb(17675), slot, 0);
-        check(p.keep == 2304 * kMiB, "3090 128K keeps 2304 MB (got " + std::to_string(p.keep / kMiB) + ")");
-        check(p.slots == 162, "3090 128K first round 162 slots (got " + std::to_string(p.slots) + ")");
+        check(p.keep == 1280 * kMiB, "3090 128K keeps 1280 MB (got " + std::to_string(p.keep / kMiB) + ")");
+        check(p.slots == 172, "3090 128K first round 172 slots (got " + std::to_string(p.slots) + ")");
         const SlotPlan q = auto_slot_plan(fn, r, mb(17673), slot, 0, 235 * kMiB);
-        check(q.keep == 2539 * kMiB && q.slots == 159, "3090 128K second round 2539 MB kept, 159 slots (got " + std::to_string(q.slots) + ")");
+        check(q.keep == 1515 * kMiB && q.slots == 170, "3090 128K second round 1515 MB kept, 170 slots (got " + std::to_string(q.slots) + ")");
         check(q.tiers && q.tier_keep == 256 * kMiB, "one sequence: tiered banks, the refill leaves 256 MB");
         check(q.tier_a < q.slots && q.tier_a > q.verify_min, "tier A below the target and above the verify floor");
         check(q.drafts == 5 && q.adaptive, "3090 one sequence: adaptive drafts up to 5 (not every expert resident)");
     }
 
-    // GB10, one sequence: 106035 MB free, 2304 MB kept -> every expert resident (512); drafts must be 7 as with a pinned
+    // GB10, one sequence: 106035 MB free, 1280 MB kept -> every expert resident (512); drafts must be 7 as with a pinned
     // slots=512 manifest (1.4.1 drafted 5: 104 vs 122 tok/s, fixed in 1.4.2)
     {
         MemRun r; r.context = 81920;
@@ -76,6 +81,14 @@ int main() {
         // running requests' next step failed for memory (HTTP 500)
         const size_t fixed = 284 * kMiB;
         check(request_shrink_bytes(fn, 3300, kv + 256 * kMiB, 256 * kMiB, fixed) == fixed, "a new sequence's fixed state is given back too");
+        // 3090 np 4 with the prompt cache (11-18): admission counts the rows a new cached sequence allocates, and those
+        // are sized by the request (plus next-turn room), not by the slot context
+        check(multi_sequence_rows(true, 45, 384, 32768) == cached_sequence_rows(45, 384, 32768), "prompt cache: one sequence's sizing");
+        check(multi_sequence_rows(true, 45, 384, 32768) < 8192, "a short chat does not hold the whole slot context");
+        check(multi_sequence_rows(true, 30000, 1500, 32768) == 32768, "never more than the slot context");
+        check(multi_sequence_rows(false, 400, 0, 32768) == 416, "no prompt cache: the request's rows");
+        check(request_shrink_bytes(fn, multi_sequence_rows(true, 400, 0, 32768), sequence_kv_bytes(fn, 416) + 256 * kMiB, 256 * kMiB) > 0,
+              "room for the request's rows is not room for a cached sequence");
         check(sequence_kv_bytes(fn, 8192) == size_t(fn.attention_layers) * (2 * 8192 * 2 * 256 * 2 + 8192 * 128 * 4 + 2048 * 4), "K/V bytes per sequence");
     }
     // small card (12 GB): the keep is 512 MB; with the CPU pool (--exact off) the drafts stay inside its 4-row block

@@ -1,8 +1,11 @@
 #pragma once
+#include <chrono>
 // Flash-Next model: DecodeModel (decode, layer-major prefill, MTP drafting) and the packed expert file.
 #include "fn_layers.hpp"
+#include "expert_parallel.hpp"
 #include "decode_rules.hpp"
 #include "fn_cpu_experts.hpp"
+#include "../../../core/tp_comm.hpp"
 #include "cpu_pool.hpp"
 #include <atomic>
 #include <functional>
@@ -14,12 +17,13 @@
 struct PinnedInts { int * p = nullptr; size_t n = 0; void need(size_t k) { if (k > n) { if (p) cudaFreeHost(p); ck(cudaMallocHost(reinterpret_cast<void **>(&p), k * sizeof(int))); n = k; } } };
 inline double g_host_ms[3];  // decode host time blocked in: routed ids D2H, cache prepare, prefetch issue
 void release_decode_graphs(uint64_t owner);  // fn_layer_forward.cpp: a finished model's decode graphs
+size_t decode_graph_instantiations();         // fn_layer_forward.cpp: graph execs built so far (TQLLM_DEBUG=steptrace)
 struct DecodeModel {
     const Checkpoint & cp; const Fixtures & fx; const Qwen4ExpConfig & c; int h, width;
     MixedExpertCache & experts; MixedExpertCache * mtp_experts = nullptr;
     std::vector<RecurrentState> rec; std::vector<AttentionState> att; std::vector<std::unique_ptr<Device<float>>> ple_past;
     PleTokenHistory history; int position = 0;
-    bool prefetch_on = true; cudaStream_t copy_stream = nullptr, miss_stream = nullptr;
+    bool prefetch_on = !tqllm::debug_on("no_guess"); cudaStream_t copy_stream = nullptr, miss_stream = nullptr;  // TQLLM_DEBUG=no_guess: no next-layer guess copies (A/B)
     // speculative decoding: per-token rollback state, final wide residual rows of the last step, MTP head state
     bool spec = false; int spec_pos0 = 0, spec_n = 0; size_t spec_hist0 = 0;
     std::vector<std::unique_ptr<Device<float>>> ple_saved, ple_old;
@@ -33,10 +37,11 @@ struct DecodeModel {
     size_t kv_to_host() {
         static const int keep = std::getenv("TQFN_KV_HOST_KEEP") ? std::atoi(std::getenv("TQFN_KV_HOST_KEEP")) : 32768;
         size_t freed = 0;
-        for (size_t l = 0; l < att.size(); ++l) {
-            auto & a = att[l];
+        for (size_t l = 0; l <= att.size(); ++l) {  // the trunk's attention layers, then the MTP layer (index L, its own gather)
+            auto & a = l < att.size() ? att[l] : mtp_att;
             if (!a.k || !a.k->vmm || a.len <= 2 * keep) continue;
-            const size_t row = a.k->bytes / size_t(kv_cap(a, cp.rt.kv_capacity)), per = a.k->page_rows(row), cut = size_t(a.len - keep) / per;
+            const size_t row = a.k->bytes / size_t(kv_cap(a, cp.rt.kv_capacity));
+            const size_t cut = std::min(a.k->on_host.size(), tqllm::flashnext::kv_host_front(size_t(a.len), size_t(keep), a.k->page_rows(row)));
             for (size_t i = 0; i < cut; ++i) for (KvBuf * b : {a.k.get(), a.v.get()})
                 if (!b->on_host[i] && b->move(i, true)) freed += b->page;
             if (a.k->any_host()) make_host_gather(cp, int(l));  // decode reads these rows through it: made before the bank refill
@@ -47,7 +52,8 @@ struct DecodeModel {
     // reused prefix); returns the bytes moved. Pages that do not fit stay on the host (read over PCIe).
     size_t kv_to_device() {
         size_t moved = 0;
-        for (auto & a : att) if (a.k && a.k->vmm)
+        for (size_t l = 0; l <= att.size(); ++l)
+            if (auto & a = l < att.size() ? att[l] : mtp_att; a.k && a.k->vmm)
             for (KvBuf * b : {a.k.get(), a.v.get()}) for (size_t i = 0; i < b->on_host.size(); ++i)
                 if (b->on_host[i] && b->move(i, false)) moved += b->page;
         return moved;
@@ -68,8 +74,16 @@ struct DecodeModel {
         kv_capacity = int((capacity + 1023) / 1024 * 1024);
         for (auto & a : att) a.cap = kv_capacity;
         mtp_att.cap = kv_capacity;
+        // the decode norm / RoPE position tables cover this sequence (attention and indexer rotary), built here outside any capture
+        tqllm_cuda::fn_rope_positions(int64_t(kv_capacity) + 64, k.rotary, k.theta, nullptr);
+        tqllm_cuda::fn_rope_positions(int64_t(kv_capacity) + 64, std::min(k.rotary, 128), k.theta, nullptr);
     }
     int kv_capacity = 0;
+    // DFlash2 feature capture (null: off): after each layer in cap_layers, every row's stream mean goes to
+    // cap_out + row * cap_stride + (index in cap_layers) * hidden (BF16), for the drafter's inject
+    const std::vector<int> * cap_layers = nullptr; __nv_bfloat16 * cap_out = nullptr; int64_t cap_stride = 0;
+    void capture(int layer, const float * res, int n);
+    void capture(int layer, const __nv_bfloat16 * res, int n);
     // decode graphs are this model's own (decode_rules.hpp GraphWarmup): a model built at a finished one's address starts afresh
     const uint64_t graph_owner = tqllm::flashnext::next_graph_owner();
     static std::set<const void *> & finished_models() { static std::set<const void *> s; return s; }
@@ -90,6 +104,160 @@ struct DecodeModel {
                          __nv_bfloat16 * wide_b = nullptr; };
     int hc_path(const std::string & prefix, int n) const;
     bool prefill_wide_bf16(int sub) const;
+    // --split layer: every rank must run the same forwards (same rows); a rank whose host decisions differed (draft count,
+// prefill chunk) would wait for a hop that never comes, so a mismatch fails the step with the reason instead
+// TQLLM_DEBUG=split: every collective of the split in order (to find where two ranks' sequences part)
+static void split_trace(const char * op, uint64_t v) {
+    static const bool on = tqllm::debug_on("split"); static uint64_t seq = 0;
+    if (on) { std::fprintf(stderr, "SPLIT %llu %s %llu\n", (unsigned long long) seq++, op, (unsigned long long) v); std::fflush(stderr); }
+}
+// Pipelined prefill (head_only, chunks of kPipeRows+ rows, no DFlash2 capture): a rank sends its chunk's trunk rows from a
+// staging copy on this second stream, so it starts the next chunk while the link and the next rank work on this one (2x 3090
+// on 1 GbE: rank 0 waited 65 % of a 32K prefill). Every other split collective first waits for the pending send, so the
+// ranks' NCCL calls never overlap.
+static constexpr int kPipeRows = 256;
+// `done`: after the last op on the stream; `sent`: after the last send (the staging copy waits for it); `ready`: the compute
+// stream's work the next stream op must follow
+struct SplitComm { cudaStream_t stream = nullptr; cudaEvent_t ready = nullptr, sent = nullptr, done = nullptr; bool pending = false, sending = false;
+                   std::unique_ptr<Device<float>> staging; };
+static SplitComm & split_comm() {
+    static SplitComm c;
+    if (!c.stream) {
+        ck(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking));
+        for (cudaEvent_t * e : {&c.ready, &c.sent, &c.done}) ck(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+    }
+    return c;
+}
+// the compute stream waits for every op on the split stream (before any NCCL call on the compute stream)
+static void split_join() {
+    auto & c = split_comm();
+    if (c.pending) { ck(cudaStreamWaitEvent(nullptr, c.done, 0)); c.pending = false; }
+}
+// after a pipelined prefill: its staging buffer goes back to the banks (2x 3090, 128K: 316 MB held through decode)
+static void split_release_staging() {
+    auto & c = split_comm();
+    if (!c.staging) return;
+    split_join(); ck(cudaStreamSynchronize(c.stream)); c.sending = false;
+    c.staging.reset();
+}
+static void split_check(tqllm::TpComm & tp, uint64_t v) {
+    split_join();
+    split_trace("check", v);
+    static uint64_t * d = nullptr; if (!d) ck(cudaMalloc(&d, sizeof(uint64_t) * (1 + 8)));
+    ck(cudaMemcpy(d, &v, sizeof v, cudaMemcpyHostToDevice));
+    tp.all_gather(d, d + 1, sizeof v, nullptr);
+    uint64_t all[8] = {}; ck(cudaMemcpy(all, d + 1, sizeof(uint64_t) * size_t(tp.world()), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < tp.world(); ++i)
+        if (all[i] != v) throw std::runtime_error("--split layer: the ranks diverged (forward of " + std::to_string(v) + " bytes here, " +
+                                                  std::to_string(all[i]) + " on rank " + std::to_string(i) + ")");
+}
+// the smallest value over the ranks, on every rank
+static void split_min(tqllm::TpComm & tp, int * v) {
+    split_join();
+    split_trace("min", uint64_t(*v));
+    static int * d = nullptr; if (!d) ck(cudaMalloc(&d, sizeof(int) * 9));
+    ck(cudaMemcpy(d, v, sizeof(int), cudaMemcpyHostToDevice));
+    tp.all_gather(d, d + 1, sizeof(int), nullptr);
+    int all[8] = {}; ck(cudaMemcpy(all, d + 1, sizeof(int) * size_t(tp.world()), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < tp.world(); ++i) *v = std::min(*v, all[i]);
+}
+// the last rank's values on every rank (head_only: its draft block, picked tokens); n <= 64
+static void split_from_last(tqllm::TpComm & tp, int * v, int n) {
+    split_join();
+    split_trace("from_last", uint64_t(v[0]));
+    static int * d = nullptr; if (!d) ck(cudaMalloc(&d, sizeof(int) * 64));
+    ck(cudaMemcpy(d, v, sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
+    tp.broadcast(d, sizeof(int) * size_t(n), tp.world() - 1, nullptr);
+    ck(cudaMemcpy(v, d, sizeof(int) * size_t(n), cudaMemcpyDeviceToHost));
+}
+// rank 0's values on every rank (decisions that depend on each card's free memory, e.g. the prefill chunk)
+static void split_agree(tqllm::TpComm & tp, int * v, int n) {
+    split_join();
+    split_trace("agree", uint64_t(v[0]));
+    static int * d = nullptr; if (!d) ck(cudaMalloc(&d, sizeof(int) * 16));
+    ck(cudaMemcpy(d, v, sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
+    tp.broadcast(d, sizeof(int) * size_t(n), 0, nullptr);
+    ck(cudaMemcpy(v, d, sizeof(int) * size_t(n), cudaMemcpyDeviceToHost));
+}
+// The trunk layers of one forward: all of them, or (--split layer) this rank's [lo, hi) between the boundary hops of the
+    // residual rows (`rows()` returns the buffer the next layer reads, `bytes` its size); every rank ends with the trunk output
+    // (head_only: the last rank; the ops are tqllm::trunk_ops, tests/layer_split.cpp)
+    template <class Layer, class Rows> void trunk_layers(Layer && layer, Rows && rows, size_t bytes, int nrows) {
+        const auto & r = cp.run;
+        if (!r.split) { for (int l = 0; l < c.layers; ++l) layer(l); return; }
+        tqllm::TpComm & tp = *r.split;
+        const bool to_all = !r.head_only || cp.rt.rows_to_all;
+        // every rank takes the same branch: the same rows, flags and capture on all of them
+        const bool pipelined = !to_all && nrows >= kPipeRows && !(cap_layers && cap_out);
+        if (!pipelined) split_check(tp, uint64_t(bytes));
+        auto & sc = split_comm();
+        if (pipelined) {  // the split stream's ops follow what the compute stream did so far (the rows buffer's last writes)
+            ck(cudaEventRecord(sc.ready, nullptr)); ck(cudaStreamWaitEvent(sc.stream, sc.ready, 0));
+        }
+        static const std::vector<int> no_features;
+        const auto ops = tqllm::trunk_ops(r.ranges, tp.rank(), to_all, cap_layers && cap_out ? *cap_layers : no_features);
+        // TQLLM_DEBUG=splittime: per forward of 256+ rows (prefill chunks), this rank's wait for the rows from the rank
+        // before it, its own layers, and the wait for the last rank's output (syncs the device: a profile, not a run)
+        static const bool timed = tqllm::debug_on("splittime");
+        const bool tm = timed && nrows >= 256;
+        using clk = std::chrono::steady_clock;
+        clk::time_point t0, t1, t2;
+        if (tm) { ck(cudaDeviceSynchronize()); t0 = t1 = clk::now(); }
+        // DFlash2 feature rows: [nrows][h] of a target layer, strided in cap_out, staged contiguous for the link
+        static std::unique_ptr<Device<__nv_bfloat16>> tmp;
+        const size_t need = size_t(nrows) * size_t(h), fbytes = need * sizeof(__nv_bfloat16);
+        const size_t pitch = size_t(cap_stride) * sizeof(__nv_bfloat16), frow = size_t(h) * sizeof(__nv_bfloat16);
+        auto feat_slot = [&](int i) { return cap_out + size_t(i) * size_t(h); };
+        auto stage_out = [&](int i) { ck(cudaMemcpy2DAsync(tmp->p, frow, feat_slot(i), pitch, frow, size_t(nrows), cudaMemcpyDeviceToDevice, nullptr)); };
+        auto stage_in = [&](int i) { ck(cudaMemcpy2DAsync(feat_slot(i), pitch, tmp->p, frow, frow, size_t(nrows), cudaMemcpyDeviceToDevice, nullptr)); };
+        for (const auto & op : ops) {
+            if ((op.kind == tqllm::TrunkOp::send_feat || op.kind == tqllm::TrunkOp::recv_feat || op.kind == tqllm::TrunkOp::bcast_feat) &&
+                (!tmp || tmp->count < need)) { PersistentAlloc keep; tmp = std::make_unique<Device<__nv_bfloat16>>(need); }
+            switch (op.kind) {
+            case tqllm::TrunkOp::recv_rows:
+                if (!pipelined) { tp.recv(rows(), bytes, op.peer, nullptr); break; }
+                tp.recv(rows(), bytes, op.peer, sc.stream);
+                ck(cudaEventRecord(sc.done, sc.stream)); sc.pending = true;
+                ck(cudaStreamWaitEvent(nullptr, sc.done, 0));
+                break;
+            case tqllm::TrunkOp::layers:
+                if (tm) { ck(cudaDeviceSynchronize()); t1 = clk::now(); }
+                for (uint32_t l = r.lr.lo; l < r.lr.hi; ++l) layer(int(l));
+                if (tm) { ck(cudaDeviceSynchronize()); t2 = clk::now(); }
+                break;
+            case tqllm::TrunkOp::send_rows: {
+                const size_t floats = (bytes + 3) / 4;
+                if (pipelined && (!sc.staging || sc.staging->count < floats)) {
+                    try { PersistentAlloc keep; sc.staging.reset(); sc.staging = std::make_unique<Device<float>>(floats); }
+                    catch (const std::exception &) { cudaGetLastError(); sc.staging.reset(); }
+                }
+                if (!pipelined || !sc.staging) { split_join(); tp.send(rows(), bytes, op.peer, nullptr); break; }
+                if (sc.sending) ck(cudaStreamWaitEvent(nullptr, sc.sent, 0));  // the previous chunk left the staging buffer
+                ck(cudaMemcpyAsync(sc.staging->p, rows(), bytes, cudaMemcpyDeviceToDevice, nullptr));
+                ck(cudaEventRecord(sc.ready, nullptr));
+                ck(cudaStreamWaitEvent(sc.stream, sc.ready, 0));
+                tp.send(sc.staging->p, bytes, op.peer, sc.stream);
+                ck(cudaEventRecord(sc.sent, sc.stream)); ck(cudaEventRecord(sc.done, sc.stream));
+                sc.pending = sc.sending = true;
+                break;
+            }
+            case tqllm::TrunkOp::bcast_rows: tp.broadcast(rows(), bytes, op.peer, nullptr); break;
+            case tqllm::TrunkOp::send_feat: stage_out(op.feat); tp.send(tmp->p, fbytes, op.peer, nullptr); break;
+            case tqllm::TrunkOp::recv_feat: tp.recv(tmp->p, fbytes, op.peer, nullptr); stage_in(op.feat); break;
+            case tqllm::TrunkOp::bcast_feat:
+                if (op.peer == tp.rank()) stage_out(op.feat);
+                tp.broadcast(tmp->p, fbytes, op.peer, nullptr);
+                if (op.peer != tp.rank()) stage_in(op.feat);
+                break;
+            }
+        }
+        if (tm) {
+            ck(cudaDeviceSynchronize());
+            const auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            std::fprintf(stderr, "SPLITTIME rank %d rows %d wait_in %.1f layers %.1f wait_out %.1f ms\n", tp.rank(), nrows, ms(t0, t1), ms(t1, t2),
+                         ms(t2, clk::now()));
+        }
+    }
     void layer_forward(int layer, std::unique_ptr<Device<float>> & residual, int n, const float * ple_rows,
                        AttentionState * attn, MixedExpertCache & cache, const std::vector<Seg> * segs = nullptr,
                        const PrefillSink * sink = nullptr);
@@ -108,6 +276,16 @@ struct DecodeModel {
         int * ids_host = nullptr; size_t ids_cap = 0;
         const MixedExpertCache * cache = nullptr; int layer = -1; std::vector<int> plan; int issued = 0;  // copies queued ahead
         double copy_bytes = 0;
+        // experts read from the GGUF on demand: the routed experts the host tier lacks are read into this pinned ring (one
+        // half per staging half), so a prompt's stream never evicts the tier
+        char * ring[2] = {nullptr, nullptr}; size_t ring_bytes = 0;
+        int half0 = 0;  // layer-outer prefill: one group per layer, the layers alternate halves (layer & 1)
+        // layer-outer prefill: the next layer's experts the tier lacks are read into its ring half on a thread while this
+        // layer computes (pre_read[e]: expert e is in the ring)
+        std::future<void> pre; int pre_layer = -1; std::vector<char> pre_read;
+        // layer-outer (step_outer): ring half layer & 1 holds every streamed expert of ring_layer read so far (ring_have, by
+        // expert id), so later chunks of the layer upload them again from RAM instead of the drive
+        bool outer = false; int ring_layer = -1; std::vector<char> ring_have; cudaEvent_t ring_ev[2] = {};
         char * bounce[2] = {nullptr, nullptr}; size_t bounce_bytes = 0;  // pinned host blocks per half: experts read on demand (rt.expert_blocks)
         const std::function<void(int, const int *, size_t, char *, size_t)> * blocks = nullptr;  // rt.expert_blocks of the running prefill
     };
@@ -131,9 +309,14 @@ struct DecodeModel {
     static void stage_alloc(PrefillStage & st, size_t need, int K);
     // copy group g of the plan into staging bank g & 1 once the compute stream is done with it (runs of consecutive ids:
     // one 2D copy per piece)
-    static void stage_upload(PrefillStage & st, const MixedExpertCache & cache, int layer, int g);
+    static void stage_upload(PrefillStage & st, MixedExpertCache & cache, int layer, int g);
     // start the copies of `layer` (plan + first two groups) unless they are already queued
-    static void stage_begin(PrefillStage & st, const MixedExpertCache & cache, int layer);
+    static void stage_begin(PrefillStage & st, MixedExpertCache & cache, int layer);
+    // layer-outer prefill with a host tier: start reading `layer`'s missing experts into its ring half now
+    static void stage_prefetch(PrefillStage & st, MixedExpertCache & cache, int layer);
+    // layer-outer, a chunk after the layer's first: its groups staged again (from the tier and the ring) when the layer
+    // has more than one group
+    static void stage_restart(PrefillStage & st, MixedExpertCache & cache, int layer);
     // Hands back what only layer-major prefill uses (its buffers, both staging banks, the pool's free blocks): the MTP
     // catch-up and decode that follow then have that memory, e.g. for their expert banks (plain cudaMalloc).
     void release_prefill();
@@ -160,6 +343,14 @@ struct DecodeModel {
     // Runs n new tokens through the trunk; returns the head-input rows [n][hidden]; keeps the wide rows in res_keep.
     // next: the tokens of the chunk that follows (its host prep starts now, on a thread).
     std::unique_ptr<Device<float>> step(const std::vector<int> & tokens, const std::vector<int> * next = nullptr);
+    // Layer-outer prefill of consecutive chunks (each of 256+ tokens, in prompt order; experts read from the GGUF on
+    // demand): every layer runs over all chunks before the next layer starts, so a layer's streamed experts are read once
+    // per prompt instead of once per chunk (a 16K chunk streamed ~24 GB from a SATA drive). The same (layer, chunk) calls
+    // as step() per chunk, with the same rows, positions and carried state: the same output. Each chunk's wide rows stay
+    // on the device (BF16 when the layers take them) between layers. done(c, head_rows): after the last layer, chunk c's
+    // final rows are in res_keep and head_rows its [n][hidden] head input, in chunk order.
+    void step_outer(const std::vector<std::vector<int>> & chunks, const std::function<void(size_t, const Device<float> &)> & done);
+    bool pf_hold_next = false;  // step_outer: a layer's staged experts stay for the next chunk (no next-layer prefetch yet)
 
     // One verify pass over several sequences (this model first): row-independent work (projections, router, experts)
     // runs once for all rows, PLE history and the attention / recurrent cores run per sequence. Returns the head-input
@@ -204,26 +395,8 @@ struct DecodeModel {
     static void ck_copy(Device<float> & dst, const Device<float> & src) { ck(cudaMemcpyAsync(dst.p, src.p, src.count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
     static void ck_copy_n(Device<float> & dst, const float * src, size_t count) { ck(cudaMemcpyAsync(dst.p, src, count * sizeof(float), cudaMemcpyDeviceToDevice, nullptr)); }
 };
-// --split experts, rank 1: the engine's serving calls and the helper share `mu`; the helper computes a forward for rank 0
-// only when it gets mu without waiting and the engine is idle (no request of its own), else it declines
-struct EpHelperGate {
-    std::recursive_mutex mu; bool stop = false; std::function<bool()> idle;
-    std::mutex wmu;                 // the control channel's writes (lease grants and revokes)
-    std::mutex lm; std::condition_variable lcv; bool lease_out = false;  // rank 0 may send forwards (kEpLease .. kEpLeaseEnd)
-    uint64_t served = 0, banks_checked = ~uint64_t(0);  // requests this box began / when its banks were last checked (under mu)
-    std::function<bool()> refresh;  // the helper's bank check: every bank full, slot tables current (under mu)
-};
-// --split experts, rank 1: grant rank 0 the lease when this box is idle (caller holds gate.mu); take it back before a request
-// of this box's own starts (caller does not hold gate.mu: the helper finishes the forwards already sent)
-void ep_grant(const Checkpoint & cp, EpHelperGate & gate);
-void ep_reclaim(const Checkpoint & cp, EpHelperGate & gate);
-// --split experts, rank 0: the control-channel reader (lease grants, revokes)
-void ep_start_reader(const Checkpoint & cp);
-// --split experts, rank 1 (a thread): rank 0's decode forwards it accepts (each: c.layers exchanges of input rows -> this
-// rank's experts e % 2 == 1 -> result rows), until rank 0 sends stop or goes away
-void ep_help(const Checkpoint & cp, MixedExpertCache & cache, std::shared_ptr<EpHelperGate> gate);
-// --split experts, rank 0: tell rank 1 to stop following
-void ep_stop(const Checkpoint & cp);
+// --split experts: Flash-Next's expert shard for the model-independent ExpertParallel (src/experts/expert_parallel.hpp)
+tqllm::ExpertShard flashnext_expert_shard(const Checkpoint & cp, MixedExpertCache & cache);
 
 // The packed expert file (TQFNEXP1 / TQFNEXPT), its reader and the per-expert repack are shared components now
 // (src/experts/packed_experts.hpp): GLM-5.3-Flash writes and reads the same file. These are the Checkpoint-shaped
@@ -238,30 +411,32 @@ inline std::array<std::vector<char>, 6> repack_expert(const Checkpoint & checkpo
     return tqllm::repack_expert(checkpoint.expert_payload(layer, id), checkpoint.config.hidden, checkpoint.config.expert_ff,
                                 tiled);
 }
-// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file
-inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads) {
+// The packed experts built in pinned host memory from the GGUF: the bytes tqfn-pack writes (untiled), without the file.
+// Only layers [lo, hi) are held (--split layer: this rank's trunk layers; each rank held all 48 layers, 2 x 51 GB on a
+// 124 GB 2x RTX 4090 host, and the per-layer token embedding pages were pushed out: decode 15-73 tok/s, a rank OOM-killed).
+inline PackedExperts build_packed(const Checkpoint & checkpoint, int threads, int lo = 0, int hi = 1 << 30) {
     const auto & c = checkpoint.config; PackedExperts pe; pe.layers = c.layers; pe.experts = c.experts; pe.sizes.resize(size_t(c.layers));
+    pe.lo = std::max(0, lo); pe.hi = std::min(c.layers, hi);
     uint64_t off = 0;
     for (int l = 0; l < c.layers; ++l) {
         const auto parts = repack_expert(checkpoint, l, 0, false); uint64_t b = 0;
         for (int k = 0; k < 6; ++k) { pe.sizes[size_t(l)][size_t(k)] = parts[size_t(k)].size(); b += parts[size_t(k)].size(); }
         pe.base.push_back(off); pe.block.push_back(b); off += b * uint64_t(c.experts);
     }
-    pe.bytes = size_t(off); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
-    // Release pinned storage if a loader or layout check fails; workers finish before the storage is freed.
-    std::unique_ptr<char, decltype(&cudaFreeHost)> pinned(host, &cudaFreeHost);
-    CpuPool pool(std::max(1, threads));
-    for (int l = 0; l < c.layers; ++l) {
-        pool.run(c.experts, [&](int e) {
-            const auto parts = repack_expert(checkpoint, l, e, false);
-            char * d = host + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
+    const auto span = packed_span(pe.base, pe.block, c.experts, pe.lo, pe.hi);
+    pe.bytes = size_t(span.second - span.first); char * host = nullptr; ck(cudaMallocHost(reinterpret_cast<void **>(&host), pe.bytes));
+    char * origin = host - span.first;  // map + base[l] for the held layers
+    std::atomic<int64_t> next{0}; const int64_t total = int64_t(pe.hi - pe.lo) * c.experts; std::vector<std::thread> pool;
+    for (int t = 0; t < std::max(1, threads); ++t) pool.emplace_back([&] {
+        for (int64_t i; (i = next++) < total;) {
+            const int l = pe.lo + int(i / c.experts), e = int(i % c.experts);
+            const auto parts = repack_expert(checkpoint, l, e, false); char * d = origin + pe.base[size_t(l)] + uint64_t(e) * pe.block[size_t(l)];
             for (int k = 0; k < 6; ++k) {
                 require(parts[size_t(k)].size() == pe.sizes[size_t(l)][size_t(k)], "expert layout varies within a layer");
                 std::memcpy(d, parts[size_t(k)].data(), parts[size_t(k)].size()); d += parts[size_t(k)].size();
             }
-        });
-        checkpoint.release_layer_expert_pages(l);
-    }
-    pinned.release();
-    pe.map = host; pe.tiled = false; return pe;
+        }
+    });
+    for (auto & t : pool) t.join();
+    pe.map = origin; pe.tiled = false; return pe;
 }

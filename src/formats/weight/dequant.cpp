@@ -407,6 +407,13 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         }
+        case GGML_FP8T:  // per 128: F32 scale, 128 E4M3
+            if (n < 0 || n % 128) break;
+            for (int64_t b = 0; b < n / 128; ++b) {
+                const uint8_t * blk = s + b * 132; float sc; std::memcpy(&sc, blk, 4);
+                for (int i = 0; i < 128; ++i) dst[b * 128 + i] = e4m3_to_float(blk[4 + i]) * sc;
+            }
+            return;
         case GGML_TQV12: {  // docs/reference/formats.md "TQV-12", in TQ4's rotated basis (the values the TQV kernels decode)
             if (n < 0 || n % 128) break;
             static const uint32_t table[4096] = {

@@ -15,4 +15,6 @@ void TpComm::group_begin() {}
 void TpComm::group_end() {}
 void TpComm::ctl_send(const void *, size_t) {}
 void TpComm::ctl_recv(void *, size_t) {}
+void TpComm::ctl_all_gather(const void *, void *, size_t) {}
+int TpComm::local_ranks() const { return 1; }
 }  // namespace tqllm

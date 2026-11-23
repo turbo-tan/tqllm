@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <string>
 #include <cstdlib>
 #include <vector>
@@ -7,6 +8,8 @@
 #include "decode_rules.hpp"
 #include "common.cuh"
 #include <cub/block/block_scan.cuh>
+#include <mma.h>
+#include <cuda_bf16.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <climits>
@@ -47,31 +50,33 @@ __global__ void score_blocks(const float * pooled_keys, const float * query, flo
     if (lane == 0) scores[block] = total;
 }
 
-__device__ __forceinline__ void pool_block(const float * raw, float * pooled, int b, int ratio, int dim, int ring) {
+__device__ __forceinline__ void pool_block(const float * raw, float * pooled, int b, int ratio, int dim, int ring, int pring) {
     auto at = [&](int64_t cell) { return (cell % ring) * dim; };  // raw keys live in a ring of the newest cells
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float sum = raw[at(int64_t(b) * ratio) + d];
         for (int r = 1; r < ratio; ++r)
             sum = __fadd_rn(sum, raw[at(int64_t(b) * ratio + r) + d]);
-        pooled[int64_t(b) * dim + d] = __fmul_rn(sum, 1.f / ratio);
+        pooled[int64_t(pring ? b % pring : b) * dim + d] = __fmul_rn(sum, 1.f / ratio);
     }
 }
 __global__ void pool_raw_keys(const float * raw, float * pooled, int first_block,
-                              int nblocks, int ratio, int dim, int ring) {
+                              int nblocks, int ratio, int dim, int ring, int pring) {
     if (blockIdx.x >= nblocks) return;
-    pool_block(raw, pooled, first_block + blockIdx.x, ratio, dim, ring);
+    pool_block(raw, pooled, first_block + blockIdx.x, ratio, dim, ring, pring);
 }
 // one cache per blockIdx.y
 __global__ void pool_raw_keys_multi(const QsaBlockJobs jobs, int ratio, int dim) {
     const int j = blockIdx.y;
     if (int(blockIdx.x) >= jobs.blocks[j]) return;
-    pool_block(jobs.in[j], jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, jobs.ring[j]);
+    pool_block(jobs.in[j], jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, jobs.ring[j], jobs.pring[j]);
 }
 
+// tab (optional): fn_rope_positions' table (the same floats as the FP64 expressions below)
 __device__ __forceinline__ void norm_rope_block(const float * pooled, const float * weight, float * normalized,
-                                                int block, int ratio, int dim, int rotary, float theta, float epsilon) {
+                                                int block, int ratio, int dim, int rotary, float theta, float epsilon,
+                                                const float2 * tab, int pring) {
     const int lane = threadIdx.x;
-    const float * src = pooled + int64_t(block) * dim;
+    const float * src = pooled + int64_t(pring ? block % pring : block) * dim;
     float ss = 0.f;
     for (int d = lane; d < dim; d += 32) ss += src[d] * src[d];
     for (int delta = 16; delta; delta >>= 1)
@@ -82,8 +87,12 @@ __device__ __forceinline__ void norm_rope_block(const float * pooled, const floa
         float value = __fmul_rn(__fmul_rn(src[d], inv), weight[d]);
         if (d < rotary) {
             const int pair = d % half;
-            const double angle = double(int64_t(block) * ratio) / pow(double(theta), double(2 * pair) / rotary);
-            const float cosine = float(cos(angle)), sine = float(sin(angle));
+            float cosine, sine;
+            if (tab) { const float2 cs = tab[int64_t(block) * ratio * half + pair]; cosine = cs.x; sine = cs.y; }
+            else {
+                const double angle = double(int64_t(block) * ratio) / pow(double(theta), double(2 * pair) / rotary);
+                cosine = float(cos(angle)); sine = float(sin(angle));
+            }
             const int other = d < half ? d + half : d - half;
             const float paired = __fmul_rn(__fmul_rn(src[other], inv), weight[other]);
             value = d < half ? value * cosine - paired * sine : value * cosine + paired * sine;
@@ -93,14 +102,14 @@ __device__ __forceinline__ void norm_rope_block(const float * pooled, const floa
 }
 __global__ void norm_rope_blocks(const float * pooled, const float * weight, float * normalized,
                                  int first_block, int ratio, int dim, int rotary,
-                                 float theta, float epsilon) {
-    norm_rope_block(pooled, weight, normalized, first_block + blockIdx.x, ratio, dim, rotary, theta, epsilon);
+                                 float theta, float epsilon, const float2 * tab, int pring) {
+    norm_rope_block(pooled, weight, normalized, first_block + blockIdx.x, ratio, dim, rotary, theta, epsilon, tab, pring);
 }
 __global__ void norm_rope_blocks_multi(const QsaBlockJobs jobs, const float * weight, int ratio, int dim, int rotary,
-                                       float theta, float epsilon) {
+                                       float theta, float epsilon, const float2 * tab) {
     const int j = blockIdx.y;
     if (int(blockIdx.x) >= jobs.blocks[j]) return;
-    norm_rope_block(jobs.in[j], weight, jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, rotary, theta, epsilon);
+    norm_rope_block(jobs.in[j], weight, jobs.out[j], jobs.first[j] + blockIdx.x, ratio, dim, rotary, theta, epsilon, tab, jobs.pring[j]);
 }
 
 __global__ void expand_selection(const uint64_t * sorted, int32_t * positions, uint8_t * valid,
@@ -420,6 +429,77 @@ __global__ void __launch_bounds__(32 * W) score_bits_k(const float * pooled_keys
         }
     }
 }
+// score_bits_k on tensor cores: q (4 heads x 128) . k (128) with both sides split into bf16 hi + lo (all four
+// products, small terms first, fp32 accumulate: within ~2^-16 of the fp32 dot's magnitude), relu per head, summed in
+// head order. A 64-query x 64-block tile per thread block: the keys are split into shared memory once and serve all four
+// heads, each head's queries are split in turn. Bits differ from score_bits_k in the last places, so a top-k can take
+// another block at a near tie.
+constexpr int kTcQ = 64, kTcB = 64, kTcLd = 136;  // ld: 128 + 8 bf16 (row starts 16 B apart in the banks)
+__device__ __forceinline__ void split_rows(const float * src, int64_t stride, int rows, int valid, __nv_bfloat16 * hi, __nv_bfloat16 * lo) {
+    for (int i = threadIdx.x; i < rows * 32; i += blockDim.x) {
+        const int r = i / 32, c = (i % 32) * 4;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (r < valid) v = *reinterpret_cast<const float4 *>(src + r * stride + c);
+        const float x[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const __nv_bfloat16 h = __float2bfloat16_rn(x[j]);
+            hi[r * kTcLd + c + j] = h; lo[r * kTcLd + c + j] = __float2bfloat16_rn(x[j] - __bfloat162float(h));
+        }
+    }
+}
+__global__ void __launch_bounds__(256) score_bits_tc_k(const float * pooled_keys, const float * query, uint32_t * scores,
+                                                       int blocks, int tokens, int first_position, int ratio) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    constexpr int H = 4, DIM = 128;
+    extern __shared__ __align__(128) unsigned char tc_smem[];
+    __nv_bfloat16 * kh = reinterpret_cast<__nv_bfloat16 *>(tc_smem), * kl = kh + kTcB * kTcLd, * qh = kl + kTcB * kTcLd, * ql = qh + kTcQ * kTcLd;
+    const int t0 = blockIdx.y * kTcQ, n0 = blockIdx.x * kTcB;
+    const int last = min(tokens, t0 + kTcQ) - 1;
+    if (n0 >= min(blocks, (first_position + last + 1) / ratio)) return;  // no complete block in this tile
+    split_rows(pooled_keys + int64_t(n0) * DIM, DIM, kTcB, min(kTcB, blocks - n0), kh, kl);
+    const int warp = threadIdx.x / 32, wq = warp / 2, wb = (warp % 2) * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> total[2];
+    wmma::fill_fragment(total[0], 0.f); wmma::fill_fragment(total[1], 0.f);
+    #pragma unroll 1
+    for (int h = 0; h < H; ++h) {
+        __syncthreads();  // the previous head's queries are read
+        split_rows(query + int64_t(t0) * H * DIM + h * DIM, H * DIM, kTcQ, min(kTcQ, tokens - t0), qh, ql);
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
+        wmma::fill_fragment(acc[0], 0.f); wmma::fill_fragment(acc[1], 0.f);
+        #pragma unroll
+        for (int kk = 0; kk < DIM; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ah, al;
+            wmma::load_matrix_sync(ah, qh + wq * 16 * kTcLd + kk, kTcLd); wmma::load_matrix_sync(al, ql + wq * 16 * kTcLd + kk, kTcLd);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bh, bl;
+                wmma::load_matrix_sync(bh, kh + (wb + 16 * j) * kTcLd + kk, kTcLd); wmma::load_matrix_sync(bl, kl + (wb + 16 * j) * kTcLd + kk, kTcLd);
+                wmma::mma_sync(acc[j], al, bl, acc[j]); wmma::mma_sync(acc[j], al, bh, acc[j]);
+                wmma::mma_sync(acc[j], ah, bl, acc[j]); wmma::mma_sync(acc[j], ah, bh, acc[j]);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int i = 0; i < acc[j].num_elements; ++i) total[j].x[i] += fmaxf(acc[j].x[i], 0.f);  // same element layout
+    }
+    __syncthreads();
+    float * out = reinterpret_cast<float *>(tc_smem);  // [kTcQ][kTcB + 4], over the key / query tiles
+    constexpr int ol = kTcB + 4;
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) wmma::store_matrix_sync(out + wq * 16 * ol + wb + 16 * j, total[j], ol, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = threadIdx.x; i < kTcQ * kTcB; i += blockDim.x) {
+        const int qi = i / kTcB, b = n0 + i % kTcB, t = t0 + qi;
+        if (t >= tokens || b >= blocks || b >= (first_position + t + 1) / ratio) continue;
+        const float v = out[qi * ol + i % kTcB];
+        scores[int64_t(t) * blocks + b] = __float_as_uint(v == 0.f ? 0.f : v);
+    }
+#endif
+}
 // topk_sorted_k on score bits: the need-th largest key is (T << 32 | ~i) for the threshold score T; three radix passes
 // (11, 11, 10 bits) find T and how many keys equal to T it takes (r); ties go by index, smallest first, as the key order does.
 __global__ void __launch_bounds__(1024) topk_bits_k(const uint32_t * scores, uint64_t * out, int blocks, int first_position,
@@ -554,15 +634,16 @@ void qsa_score_blocks(const float * pooled_keys, const float * query, float * sc
 
 void qsa_norm_rope_blocks(const float * pooled, const float * weight, float * normalized,
                           int first_block, int blocks, int ratio, int dim, int rotary,
-                          float theta, float epsilon, cudaStream_t stream) {
+                          float theta, float epsilon, cudaStream_t stream, int pooled_ring) {
     if (!pooled || !weight || !normalized || normalized == pooled || normalized == weight ||
         first_block < 0 || blocks <= 0 || ratio <= 0 || dim <= 0 ||
         rotary < 2 || rotary > dim || rotary % 2 ||
         !std::isfinite(theta) || theta <= 0.f || !std::isfinite(epsilon) || epsilon <= 0.f ||
         (int64_t(first_block) + blocks - 1) * ratio > std::numeric_limits<int>::max())
         throw std::invalid_argument("QSA norm/RoPE: invalid dimensions or pointer");
+    const float2 * tab = fn_rope_positions((int64_t(first_block) + blocks - 1) * ratio, rotary, theta, stream);
     norm_rope_blocks<<<blocks, 32, 0, stream>>>(pooled, weight, normalized, first_block,
-                                                 ratio, dim, rotary, theta, epsilon);
+                                                 ratio, dim, rotary, theta, epsilon, tab, pooled_ring);
     ck(cudaPeekAtLastError());
 }
 
@@ -575,8 +656,10 @@ QsaRawKeyCache::QsaRawKeyCache(int max_cells, int ratio, int dim, int ring)
         ring_ = std::min(max_cells, ring > 0 ? ring : 4096 + 2 * ratio + kRollback);
         ck(cudaMalloc(&raw_, size_t(ring_) * dim * sizeof(float)));
         if (ring_ < max_cells) ck(cudaMallocHost(&host_raw_, size_t(max_cells) * dim * sizeof(float)));
-        if (max_cells >= ratio)
-            ck(cudaMalloc(&pooled_, size_t(max_cells / ratio) * dim * sizeof(float)));
+        if (max_cells >= ratio) {
+            pooled_ring_ = std::max(1, std::min(max_cells / ratio, (ring_ + ratio - 1) / ratio));
+            ck(cudaMalloc(&pooled_, size_t(pooled_ring_) * dim * sizeof(float)));
+        }
         if (max_cells >= ratio)
             ck(cudaMalloc(&normalized_, size_t(max_cells / ratio) * dim * sizeof(float)));
     } catch (...) {
@@ -597,7 +680,7 @@ void QsaRawKeyCache::normalize_new(const float * weight, int rotary, float theta
     const int count = complete_blocks() - normalized_blocks_;
     if (!count) return;
     qsa_norm_rope_blocks(pooled_, weight, normalized_, normalized_blocks_, count,
-                         ratio_, dim_, rotary, theta, epsilon, stream);
+                         ratio_, dim_, rotary, theta, epsilon, stream, pooled_ring_);
     normalized_blocks_ += count;
 }
 
@@ -616,6 +699,18 @@ void QsaRawKeyCache::reserve_ring(int cells, cudaStream_t stream) {
     ck(cudaStreamSynchronize(stream)); cudaFree(raw_); raw_ = next; ring_ = cells;
 }
 
+// the pooled ring holds every block not yet normalized: grown (keeping those blocks) before a pending set would not fit
+void QsaRawKeyCache::reserve_pooled(int blocks, cudaStream_t stream) {
+    blocks = std::min(blocks, max_cells_ / ratio_);
+    if (!pooled_ || blocks <= pooled_ring_) return;
+    const int cap = std::min(max_cells_ / ratio_, std::max(blocks, 2 * pooled_ring_));
+    float * next = nullptr; ck(cudaMalloc(&next, size_t(cap) * dim_ * sizeof(float)));
+    for (int b = normalized_blocks_; b < complete_blocks(); ++b)
+        ck(cudaMemcpyAsync(next + int64_t(b % cap) * dim_, pooled_ + int64_t(b % pooled_ring_) * dim_, size_t(dim_) * sizeof(float),
+                           cudaMemcpyDeviceToDevice, stream));
+    ck(cudaStreamSynchronize(stream)); cudaFree(pooled_); pooled_ = next; pooled_ring_ = cap;
+}
+
 void QsaRawKeyCache::append(const float * keys, int tokens, cudaStream_t stream) {
     if (!keys || tokens <= 0 || tokens > max_cells_ - size_)
         throw std::invalid_argument("QSA raw-key cache: invalid append");
@@ -631,7 +726,8 @@ void QsaRawKeyCache::append(const float * keys, int tokens, cudaStream_t stream)
     const int first = size_ / ratio_;
     const int count = end / ratio_ - first;
     if (count > 0) {
-        pool_raw_keys<<<count, 128, 0, stream>>>(raw_, pooled_, first, count, ratio_, dim_, ring_);
+        reserve_pooled(end / ratio_ - normalized_blocks_, stream);
+        pool_raw_keys<<<count, 128, 0, stream>>>(raw_, pooled_, first, count, ratio_, dim_, ring_, pooled_ring_);
         ck(cudaPeekAtLastError());
     }
     size_ = end;
@@ -651,8 +747,9 @@ void QsaRawKeyCache::append_deferred(const float * keys, int tokens, std::vector
     if (host_raw_) ck(cudaMemcpyAsync(host_raw_ + int64_t(size_) * dim_, keys, size_t(tokens) * dim_ * sizeof(float), cudaMemcpyDeviceToHost, stream));
     const int first = size_ / ratio_, count = end / ratio_ - first;
     if (count > 0) {
+        reserve_pooled(end / ratio_ - normalized_blocks_, stream);
         const int j = pools.count++;
-        pools.in[j] = raw_; pools.out[j] = pooled_; pools.first[j] = first; pools.blocks[j] = count; pools.ring[j] = ring_;
+        pools.in[j] = raw_; pools.out[j] = pooled_; pools.first[j] = first; pools.blocks[j] = count; pools.ring[j] = ring_; pools.pring[j] = pooled_ring_;
     }
     size_ = end;
 }
@@ -661,7 +758,7 @@ void QsaRawKeyCache::normalize_deferred(QsaBlockJobs & norms) {
     const int count = complete_blocks() - normalized_blocks_;
     if (!count) return;
     const int j = norms.count++;
-    norms.in[j] = pooled_; norms.out[j] = normalized_; norms.first[j] = normalized_blocks_; norms.blocks[j] = count;
+    norms.in[j] = pooled_; norms.out[j] = normalized_; norms.first[j] = normalized_blocks_; norms.blocks[j] = count; norms.pring[j] = pooled_ring_;
     normalized_blocks_ += count;
 }
 
@@ -684,7 +781,11 @@ void QsaRawKeyCache::append_multi(const std::vector<QsaRawKeyCache *> & caches, 
     if (pools.count) { pool_raw_keys_multi<<<dim3(most, pools.count), 128, 0, stream>>>(pools, ratio, dim); ck(cudaPeekAtLastError()); }
     for (auto * c : caches) c->normalize_deferred(norms);
     most = 0; for (int j = 0; j < norms.count; ++j) most = std::max(most, norms.blocks[j]);
-    if (norms.count) { norm_rope_blocks_multi<<<dim3(most, norms.count), 32, 0, stream>>>(norms, weight, ratio, dim, rotary, theta, epsilon); ck(cudaPeekAtLastError()); }
+    if (norms.count) {
+        int64_t last = 0; for (int j = 0; j < norms.count; ++j) last = std::max(last, (int64_t(norms.first[j]) + norms.blocks[j] - 1) * ratio);
+        const float2 * tab = fn_rope_positions(last, rotary, theta, stream);
+        norm_rope_blocks_multi<<<dim3(most, norms.count), 32, 0, stream>>>(norms, weight, ratio, dim, rotary, theta, epsilon, tab); ck(cudaPeekAtLastError());
+    }
 }
 
 void QsaIndexer::append_multi(const std::vector<QsaIndexer *> & indexers, const float * raw_keys, const std::vector<int> & off,
@@ -698,6 +799,46 @@ void QsaIndexer::append_multi(const std::vector<QsaIndexer *> & indexers, const 
     QsaRawKeyCache::append_multi(caches, raw_keys, off, tokens, key_norm, a.rotary_, a.theta_, a.epsilon_, stream);
 }
 
+void QsaRawKeyCache::export_cells(int cells, float * raw, float * pooled, float * normalized, cudaStream_t stream) const {
+    if (cells < 0 || cells > size_ || !raw) throw std::invalid_argument("QSA raw-key cache: invalid export");
+    const size_t row = size_t(dim_) * sizeof(float);
+    if (host_raw_) {  // every appended cell is mirrored: copy behind the mirror's own queued copies on this stream
+        ck(cudaMemcpyAsync(raw, host_raw_, size_t(cells) * row, cudaMemcpyHostToHost, stream));
+    } else {  // the ring holds every cell (ring_ == max_cells_, no wrap)
+        ck(cudaMemcpyAsync(raw, raw_, size_t(cells) * row, cudaMemcpyDeviceToHost, stream));
+    }
+    const int blocks = cells / ratio_, nb = std::min(normalized_blocks_, blocks);
+    // pooled: only the blocks not yet normalized are read again (import_cells), at their rows of `pooled`
+    if (pooled) for (int b = nb; b < blocks; ++b)
+        ck(cudaMemcpyAsync(pooled + int64_t(b) * dim_, pooled_ + int64_t(b % pooled_ring_) * dim_, row, cudaMemcpyDeviceToHost, stream));
+    if (nb && normalized) ck(cudaMemcpyAsync(normalized, normalized_, size_t(nb) * row, cudaMemcpyDeviceToHost, stream));
+}
+void QsaRawKeyCache::import_cells(int cells, int normalized_blocks, const float * raw, const float * pooled, const float * normalized, cudaStream_t stream) {
+    const int blocks = cells / ratio_;
+    if (size_ != 0 || cells < 0 || cells > max_cells_ || !raw || normalized_blocks < 0 || normalized_blocks > blocks)
+        throw std::invalid_argument("QSA raw-key cache: invalid import");
+    const size_t row = size_t(dim_) * sizeof(float);
+    if (host_raw_) ck(cudaMemcpyAsync(host_raw_, raw, size_t(cells) * row, cudaMemcpyDefault, stream));
+    for (int c = std::max(0, cells - ring_); c < cells;) {  // the ring keeps the last ring_ cells, as after the appends
+        const int run = std::min(cells - c, ring_ - c % ring_);
+        ck(cudaMemcpyAsync(raw_ + int64_t(c % ring_) * dim_, raw + int64_t(c) * dim_, size_t(run) * row, cudaMemcpyDefault, stream));
+        c += run;
+    }
+    if (normalized_blocks) ck(cudaMemcpyAsync(normalized_, normalized, size_t(normalized_blocks) * row, cudaMemcpyDefault, stream));
+    size_ = cells; normalized_blocks_ = normalized_blocks;
+    reserve_pooled(blocks - normalized_blocks, stream);  // the pending blocks into the ring (the source holds them at their rows)
+    if (pooled) for (int b = normalized_blocks; b < blocks; ++b)
+        ck(cudaMemcpyAsync(pooled_ + int64_t(b % pooled_ring_) * dim_, pooled + int64_t(b) * dim_, row, cudaMemcpyDefault, stream));
+}
+void QsaRawKeyCache::import_from(const QsaRawKeyCache & o, int cells, cudaStream_t stream) {
+    if (o.ratio_ != ratio_ || o.dim_ != dim_ || cells < 0 || cells > o.size_ || (!o.host_raw_ && o.ring_ < o.max_cells_))
+        throw std::invalid_argument("QSA raw-key cache: invalid import from another cache");
+    const int nb = std::min(o.normalized_blocks_, cells / ratio_);
+    import_cells(cells, nb, o.host_raw_ ? o.host_raw_ : o.raw_, nullptr, o.normalized_, stream);
+    for (int b = nb; b < cells / ratio_; ++b)  // the other's pending pooled blocks, from its ring
+        ck(cudaMemcpyAsync(pooled_ + int64_t(b % pooled_ring_) * dim_, o.pooled_ + int64_t(b % o.pooled_ring_) * dim_, size_t(dim_) * sizeof(float),
+                           cudaMemcpyDeviceToDevice, stream));
+}
 void QsaRawKeyCache::truncate(int cells) {
     if (cells < 0 || cells > size_) throw std::invalid_argument("QSA raw-key cache: invalid truncate");
     if (host_raw_ && size_ - cells > kRollback && cells % ratio_) {  // the ring no longer holds that block's first cells
@@ -856,9 +997,32 @@ QsaDeviceSelection QsaIndexer::select_batch(const float * raw_queries, const flo
     if (blocks > 0 && topk) {
         if (heads_ == 4 && dim_ == 128) {  // score bits (4 B) and a 3-pass top-k: the same keys, 2.5x faster top-k at 122K positions
             uint32_t * bits = reinterpret_cast<uint32_t *>(scratch.keys);
-            score_bits_k<4, 16, 8><<<dim3(unsigned((blocks + 31) / 32), unsigned((tokens + 15) / 16)), dim3(32, 8), 0, stream>>>(
-                keys_.normalized(), scratch.query, bits, blocks, tokens, first_position, ratio_);
+            qsa_score_bits(keys_.normalized(), scratch.query, bits, blocks, tokens, first_position, ratio_, stream);
             topk_bits_k<<<tokens, 1024, 0, stream>>>(bits, scratch.sorted, blocks, first_position, ratio_, need_cap);
+            // TQLLM_DEBUG=qsa_tc_check: the same selection with the fp32 scores, sets compared per query (counts on stderr)
+            static const bool tc_check = tqllm::debug_cstr("qsa_tc_check") != nullptr;
+            if (tc_check) {
+                static long long checked = 0, differ = 0;
+                uint32_t * ref = nullptr; uint64_t * refk = nullptr;
+                ck(cudaMallocAsync(reinterpret_cast<void **>(&ref), size_t(tokens) * blocks * 4, stream));
+                ck(cudaMallocAsync(reinterpret_cast<void **>(&refk), size_t(tokens) * kTopkCap * 8, stream));
+                qsa_score_bits(keys_.normalized(), scratch.query, ref, blocks, tokens, first_position, ratio_, stream, 0);
+                topk_bits_k<<<tokens, 1024, 0, stream>>>(ref, refk, blocks, first_position, ratio_, need_cap);
+                std::vector<uint64_t> a(size_t(tokens) * kTopkCap), b(a.size());
+                ck(cudaMemcpyAsync(a.data(), scratch.sorted, a.size() * 8, cudaMemcpyDeviceToHost, stream));
+                ck(cudaMemcpyAsync(b.data(), refk, b.size() * 8, cudaMemcpyDeviceToHost, stream));
+                ck(cudaStreamSynchronize(stream)); ck(cudaFreeAsync(ref, stream)); ck(cudaFreeAsync(refk, stream));
+                int d = 0;
+                for (int t = 0; t < tokens; ++t) {
+                    const int need = std::min((first_position + t + 1) / ratio_, need_cap);
+                    std::vector<uint32_t> x, y;
+                    for (int i = 0; i < need; ++i) { x.push_back(uint32_t(a[size_t(t) * kTopkCap + i])); y.push_back(uint32_t(b[size_t(t) * kTopkCap + i])); }
+                    std::sort(x.begin(), x.end()); std::sort(y.begin(), y.end()); d += x != y;
+                }
+                checked += tokens; differ += d;
+                std::fprintf(stderr, "QSA_TC_CHECK first %d tokens %d blocks %d: %d queries select another set (total %lld of %lld)\n",
+                             first_position, tokens, blocks, d, differ, checked);
+            }
         } else {
             scratch.full();  // 64-bit keys
             qsa_score_pack(keys_.normalized(), scratch.query, scratch.keys, blocks, first_position, ratio_, heads_, dim_, tokens, stream);
@@ -979,16 +1143,21 @@ void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens
     const int cells = first_cells + tokens - 1;
     if (tokens <= 0 || width <= 0 || cells <= 0) throw std::invalid_argument("QSA gather: invalid call");
     if (cells > max_cells_) {  // the attention state is sized per request: a longer one grows the cell maps
+        // sizes are recorded only once every buffer exists: a failed allocation (out of memory) left max_cells_ /
+        // max_rows_ claiming freed buffers, and the next request failed "invalid dimensions" / illegal address
         ck(cudaStreamSynchronize(stream)); cudaFree(flags_); cudaFree(map_); cudaFree(temp_);
-        max_cells_ = cells; temp_bytes_ = 0;
-        ck(cudaMalloc(&flags_, size_t(max_cells_) * sizeof(int))); ck(cudaMalloc(&map_, size_t(max_cells_) * sizeof(int)));
-        ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells_)); ck(cudaMalloc(&temp_, temp_bytes_));
+        flags_ = map_ = nullptr; temp_ = nullptr; max_cells_ = 0; temp_bytes_ = 0;
+        size_t tb = 0;
+        ck(cudaMalloc(&flags_, size_t(cells) * sizeof(int))); ck(cudaMalloc(&map_, size_t(cells) * sizeof(int)));
+        ck(cub::DeviceScan::ExclusiveSum(nullptr, tb, flags_, map_, cells)); ck(cudaMalloc(&temp_, tb));
+        max_cells_ = cells; temp_bytes_ = tb;
     }
     if (tokens * width > max_rows_) {
-        cudaFree(k_); cudaFree(v_); cudaFree(pos_);
-        max_rows_ = tokens * width;
-        ck(cudaMalloc(&k_, size_t(max_rows_) * row_bytes_)); ck(cudaMalloc(&v_, size_t(max_rows_) * row_bytes_));
-        ck(cudaMalloc(&pos_, size_t(max_rows_) * sizeof(int32_t)));
+        cudaFree(k_); cudaFree(v_); cudaFree(pos_); k_ = v_ = nullptr; pos_ = nullptr; max_rows_ = 0;
+        const int rows = tokens * width;
+        ck(cudaMalloc(&k_, size_t(rows) * row_bytes_)); ck(cudaMalloc(&v_, size_t(rows) * row_bytes_));
+        ck(cudaMalloc(&pos_, size_t(rows) * sizeof(int32_t)));
+        max_rows_ = rows;
     }
     const int items = tokens * width;
     ck(cudaMemsetAsync(flags_, 0, size_t(cells) * sizeof(int), stream));
@@ -1011,5 +1180,26 @@ void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens
 QsaGather::Stats QsaGather::stats() const {
     unsigned long long c[2] = {0, 0}; ck(cudaMemcpy(c, counters_, sizeof(c), cudaMemcpyDeviceToHost));
     return {c[0], c[1]};
+}
+// the indexer's block scores (4 heads x 128, uint32 score bits, complete blocks only); tensor cores on sm_80+ for 64+
+// queries (score_bits_tc_k), else / with tc = 0 the fp32 CUDA-core kernel (score_bits_k)
+void qsa_score_bits(const float * pooled_keys, const float * query, uint32_t * scores, int blocks, int tokens, int first_position,
+                    int ratio, cudaStream_t stream, int tc) {
+    static const bool tc_ok = [] { int d = 0, major = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d); return major >= 8; }();
+    if (tc < 0) tc = tc_ok && tokens >= kTcQ;  // prefill sub-chunks; decode / verify rows (a few queries) keep the fp32 kernel
+    if (!tc || !tc_ok) {
+        score_bits_k<4, 16, 8><<<dim3(unsigned((blocks + 31) / 32), unsigned((tokens + 15) / 16)), dim3(32, 8), 0, stream>>>(
+            pooled_keys, query, scores, blocks, tokens, first_position, ratio);
+        return;
+    }
+    constexpr size_t smem = size_t(2 * kTcB + 2 * kTcQ) * kTcLd * 2;  // 69,632 B (the epilogue reuses it: 64 x 68 floats)
+    static const bool attr = [] { ck(cudaFuncSetAttribute(score_bits_tc_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem))); return true; }();
+    (void) attr;
+    score_bits_tc_k<<<dim3(unsigned((blocks + kTcB - 1) / kTcB), unsigned((tokens + kTcQ - 1) / kTcQ)), 256, smem, stream>>>(
+        pooled_keys, query, scores, blocks, tokens, first_position, ratio);
+}
+void qsa_topk_bits(const uint32_t * scores, uint64_t * out, int blocks, int tokens, int first_position, int ratio, int need_cap,
+                   cudaStream_t stream) {
+    topk_bits_k<<<tokens, 1024, 0, stream>>>(scores, out, blocks, first_position, ratio, need_cap);
 }
 } // namespace tqllm_cuda

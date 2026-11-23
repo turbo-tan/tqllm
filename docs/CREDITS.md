@@ -18,6 +18,7 @@ weights; improvement = their idea, extended or re-implemented by us.
 | Trellis weight codec behind X3 / X3.1 and the EXL3 packs (mul1 codebook, Hadamard + suh / svh); X3 kernels ported from it via llama-paw (see NOTICE) | turboderp, [ExLlamaV3](https://github.com/turboderp-org/exllamav3); Tseng et al., QTIP ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235)) |
 | X3 / X3.1 GGUF layout and PAW-27B-X3.1 weights; llama-paw X3 kernels (ported, see NOTICE) | PAW, llama-paw |
 | Window GEMV design for X3 decode (one decode per tile into the mma, no grid barrier) | TRUSS (trellis-kernel) |
+| TQV-12 (4-weight vector codebook) and TQT (trellis-code) weight formats at TQ4's size, their GPTQ / Viterbi quantisers, calibration prompts and guides (PRs #56, #59, #61) | [@Scoobylolo](https://github.com/Scoobylolo) |
 | GPTQ (Hessian-based error-compensating rounding; vector variant in the TQV-12 quantiser) | Frantar, Ashkboos, Hoefler, Alistarh, [GPTQ](https://github.com/IST-DASLab/gptq) ([arXiv 2210.17323](https://arxiv.org/abs/2210.17323)) |
 | Incoherence by Hadamard rotation plus vector codebooks for weights, the idea behind TQV-12 (our codebook, layout and kernels) | Tseng, Chee, Sun, Kuleshov, De Sa, QuIP# ([arXiv 2402.04396](https://arxiv.org/abs/2402.04396)) |
 | Bitshift trellis code with computed (table-free) codes, incoherence processing and BlockLDLQ, demonstrated on Llama 2 / 3: the method behind TQT (our c2 code, 18-bit window, layout, encoder and kernels) | Tseng, Sun, Hou, De Sa, QTIP ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235)) |

@@ -558,6 +558,7 @@ void Qwen35Engine::allocate() {
     v_core = Buf(NBUF * lv * 2);
     v_act = Buf(NBUF * F * 2);
     v_xh = Buf(NBUF * widest * 2);
+    xh_cols = widest;
     if (cfg.moe) {
         const size_t K = cfg.expert_used, FE = cfg.expert_ff;
         moe_logits = Buf(NBUF * (cfg.expert_count + 1) * 4);
@@ -582,6 +583,14 @@ void Qwen35Engine::allocate() {
         moe_act = Buf(NBUF * (K + 1) * FE * 2);
         moe_out = Buf(NBUF * (K + 1) * H * 2);
         moe_shared = Buf(NBUF * H * 2);
+        {  // verify-block dedup maps (ffn_block): routed slot ids are the expert ids, the shared expert one past them
+            std::vector<int> iota(cfg.expert_count + 2);
+            for (size_t i = 0; i < iota.size(); ++i) iota[i] = int(i);
+            moe_iota = Buf(iota.size() * sizeof(int));
+            ck(cudaMemcpy(moe_iota.p, iota.data(), iota.size() * sizeof(int), cudaMemcpyHostToDevice));
+            moe_dgu = Buf(size_t(kMoeDedupMax) * tqllm_cuda::kDedupStride * sizeof(int));
+            moe_ddn = Buf(size_t(kMoeDedupMax) * tqllm_cuda::kDedupStride * sizeof(int));
+        }
     }
     v_xf = Buf(NBUF * H * 4);
     v_px = Buf(NBUF * ((H + 255) / 256) * 4);
@@ -626,6 +635,7 @@ void Qwen35Engine::allocate() {
         mtp_vc = Buf(kvf->value_bytes(context_, int(cfg.kvheads), int(hd)));
     }
     v_tokens = Buf(NBUF * 4);
+    if (tp_) d_ctl = Buf(size_t(qwen35::split_msg_ints(NVER)) * 4);
     d_tpar = Buf(size_t(NB) * 4);
     d_tdep = Buf(size_t(NB) * 4);
     d_tcols = Buf(size_t(NB) * 4);
@@ -962,7 +972,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     for (double v : f.kv.at(A + "target_layers").arr) dfl.target_ids.push_back(int(v));
     const int nl = int(f.num(A + "block_count"));
     if (dfl.dspark ? dfl.hd != 256 || dfl.rank != 256 || dfl.heads / dfl.kvheads > 8
-                   : dfl.hd != 128 || dfl.topk != 16 || (!dfl.dspine && int(f.num(A + "conv_kernel_size")) != 2) || F != int(cfg.ffn))
+                   : !qwen35::dflash2_shape_ok(dfl.hd, dfl.topk, dfl.dspine ? 2 : int(f.num(A + "conv_kernel_size")), F))
         throw std::runtime_error(dfl.dspark ? "unsupported DSpark drafter shape" : "unsupported DFlash2 drafter shape");
     const int nf = int(dfl.target_ids.size()), qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
     dfl.fc = to_tq3(f, {"fc.weight"}, nf * H);
@@ -1033,6 +1043,17 @@ void Qwen35Engine::load_dflash(const std::string & path) {
         ck(cudaMemcpy(d_gate.p, ones.data(), ones.size() * 2, cudaMemcpyHostToDevice));
         dfl_part = Buf(size_t(tqllm_cuda::attention_gen256_partial_floats(dfl.heads, int(context_), dfl.nb)) * 4);
     }
+    // block scratch at the drafter's widths: a MoE target's FFN (512 per expert) and attention buffers are narrower
+    dd_t = Buf(B * qwen35::dflash_mix_cols(qd + 2 * kd, F) * 2);
+    dd_act = Buf(B * size_t(F) * 2);
+    dd_q = Buf(B * size_t(qd) * 2);
+    dd_o = Buf(B * size_t(qd) * 2);
+    dd_part = Buf(size_t(tqllm_cuda::attention_gen_partial_floats(
+                      dfl.heads, qwen35::dflash_attn_rows(dfl.ring, dfl.retr ? 128 * 16 + dfl.recent + dfl.block + 64 : 0,
+                                                          int(context_)),
+                      dfl.block)) * 4);
+    if (size_t(nf) * H > xh_cols || size_t(F) > xh_cols || size_t(qd) > xh_cols)
+        throw std::runtime_error("DFlash2 drafter wider than the input scratch");
     d_vals = Buf(B * 16 * 4);
     d_idx = Buf(B * 16 * 4);
     d_cand = Buf(B * 16 * 4);
@@ -1081,8 +1102,9 @@ void Qwen35Engine::load_dflash(const std::string & path) {
                                  int64_t(nd) * H, stream);
         tqllm_cuda::u4h_tune(dsub_w.as<uint8_t>(), dsub_s.as<__half2>(), int(nd), H, stream);
         sync_ck();
-    } else if (const char * dv2 = opt.draft_vocab.c_str(); *dv2 && lm_head.fmt && lm_head.type == GGML_TQ4) {
-        // TQ4 LM head: the draft vocabulary rows gathered into a smaller TQ4 matrix (codes [rows][H / 2], scales [rows][H / 128])
+    } else if (const char * dv2 = opt.draft_vocab.c_str(); *dv2 && lm_head.fmt && lm_head.fmt->row_bytes(int(H)) && !lm_head.fmt->parts()) {
+        // LM head of a row-sliceable format (TQ4, NVF4, ...): the draft vocabulary rows gathered into a smaller matrix of
+        // the same format (data and aux rows, row_bytes / aux_row_bytes)
         std::ifstream in(dv2);
         std::string magic;
         uint64_t nv = 0, nd = 0;
@@ -1093,10 +1115,11 @@ void Qwen35Engine::load_dflash(const std::string & path) {
             if (!(in >> id) || id >= cfg.vocab) throw std::runtime_error("bad id in draft vocab file");
         dsub_ids = Buf(nd * 4);
         ck(cudaMemcpyAsync(dsub_ids.p, ids.data(), nd * 4, cudaMemcpyHostToDevice, stream));
-        dsub_w = Buf(nd * H / 2);
-        dsub_s = Buf(nd * H / 128 * 2);
-        tqllm_cuda::gather_rows(lm_head.p, dsub_w.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 2, stream);
-        tqllm_cuda::gather_rows(lm_head.aux, dsub_s.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 128 * 2, stream);
+        const size_t rb = lm_head.fmt->row_bytes(int(H)), ab = lm_head.fmt->aux_row_bytes(int(H));
+        dsub_w = Buf(nd * rb);
+        if (ab) dsub_s = Buf(nd * ab);
+        tqllm_cuda::gather_rows(lm_head.p, dsub_w.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(rb), stream);
+        if (ab) tqllm_cuda::gather_rows(lm_head.aux, dsub_s.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(ab), stream);
         sync_ck();
         dsub_mat = lm_head;
         dsub_mat.p = dsub_w.p;

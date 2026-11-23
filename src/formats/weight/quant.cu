@@ -116,6 +116,20 @@ void k_expert_matvec(int fmt, const uint8_t * w, const void * aux, const __half 
 }
 
 
+// row tiles per CTA of the dedup launches, per u4h format: [0] the paired gate / up launch (default 1), [1] the single
+// launch (default 2). Per row the k split, MMA order and 8-warp reduction do not depend on MT: the same bits.
+static int g_dedup_mt[32][2] = {};
+static int dedup_mt(int fmt, bool paired) {
+    const int v = fmt >= 0 && fmt < 32 ? g_dedup_mt[fmt][paired ? 0 : 1] : 0;
+    return v > 0 ? v : paired ? 1 : 2;
+}
+void set_dedup_mt(int fmt, int paired_mt, int single_mt) {
+    if (fmt < 0 || fmt >= 32) return;
+    if ((paired_mt && paired_mt != 1 && paired_mt != 2) || (single_mt && single_mt != 1 && single_mt != 2 && single_mt != 4))
+        throw std::invalid_argument("set_dedup_mt: paired 1 / 2, single 1 / 2 / 4 (0: default)");
+    g_dedup_mt[fmt][0] = paired_mt, g_dedup_mt[fmt][1] = single_mt;
+}
+
 void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const __half * x, __nv_bfloat16 * y,
                            int rows, int cols, const int * dmap, int groups, cudaStream_t stream) {
     if (!w || !aux || !x || !y || !dmap || rows <= 0 || cols <= 0 || cols % (fmt == 14 || fmt == 16 ? 128 : fmt == 15 || fmt == 0 ? 64 : 256) || groups <= 0 || groups > 65535)
@@ -123,9 +137,12 @@ void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const _
     // Two 16-row tiles per block (MT 2: per row the same k split and MMA order, bit-identical; GB10 down IQ4_NL 100
     // groups 371 -> 330 us, the paired gate / up launch below stays at MT 1: IQ3_XXS 572 -> 611 us with MT 2)
     // groups beyond the grid are walked by its blocks (a device-built map is padded with slot -1 after its groups)
-    const dim3 grid(unsigned((rows + 31) / 32), unsigned(std::min(groups, kDedupGridGroups)));
+    // row tiles per block: dedup_mt (per format, default 2)
+    const int mt = dedup_mt(fmt, false);
+    const dim3 grid(unsigned((rows + 16 * mt - 1) / (16 * mt)), unsigned(std::min(groups, kDedupGridGroups)));
     const auto * sc = static_cast<const __half2 *>(aux);
-#define TQ_DEDUP(F) u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 2, F, 0, true><<<grid, 256, 0, stream>>>(w, sc, x, y, rows, cols, 0, nullptr, 0, dmap, 1, false, nullptr, nullptr, nullptr, groups)
+#define TQ_DEDUP_MT(F, M) u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, M, F, 0, true><<<grid, 256, 0, stream>>>(w, sc, x, y, rows, cols, 0, nullptr, 0, dmap, 1, false, nullptr, nullptr, nullptr, groups)
+#define TQ_DEDUP(F) (mt == 4 ? TQ_DEDUP_MT(F, 4) : mt == 1 ? TQ_DEDUP_MT(F, 1) : TQ_DEDUP_MT(F, 2))
     switch (fmt) {
         case 0: TQ_DEDUP(0); break;
         case 1: TQ_DEDUP(1); break;
@@ -141,6 +158,7 @@ void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const _
         default: throw std::invalid_argument("k_expert_matvec_dedup: unsupported format");
     }
 #undef TQ_DEDUP
+#undef TQ_DEDUP_MT
 }
 
 void set_tiled_experts(bool on) { const int v = on ? 1 : 0; cudaMemcpyToSymbol(c_tiled_experts, &v, sizeof v); }
@@ -198,9 +216,10 @@ void k_expert_matvec2(int fmt, const uint8_t * wa, const void * auxa, const uint
 // paired dedup launch with the prefetching variant on or off (both bit-identical, test-expert-dedup)
 static void dedup2_launch(int fmt, const uint8_t * wa, const void * auxa, const uint8_t * wb, const void * auxb, const __half * x,
                           __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows, int cols, const int * dmap, int groups, bool pf, cudaStream_t stream) {
-    const dim3 grid(unsigned((rows + 15) / 16), unsigned(std::min(groups, kDedupGridGroups)), 2u);
+    const int mt = pf ? 1 : dedup_mt(fmt, true);  // the prefetching variant is MT 1 only
+    const dim3 grid(unsigned((rows + 16 * mt - 1) / (16 * mt)), unsigned(std::min(groups, kDedupGridGroups)), 2u);
     const auto * sa = static_cast<const __half2 *>(auxa); const auto * sb = static_cast<const __half2 *>(auxb);
-#define TQ_DEDUP2(F) (pf ? u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 1, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups) \
+#define TQ_DEDUP2(F) (mt == 2 ? u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 2, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups) : pf ? u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 1, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups) \
                          : u4h_matvec_k<tqllm_cuda::kDedupCols, __nv_bfloat16, 1, F, 0, true><<<grid, 256, 0, stream>>>(wa, sa, x, ya, rows, cols, 0, nullptr, 0, dmap, 1, false, wb, sb, yb, groups))
     switch (fmt) {
         case 0: TQ_DEDUP2(0); break;
@@ -921,15 +940,16 @@ void udq_dequant_h(int fmt, const uint8_t * w, const uint8_t * rec, __half * out
     }
 }
 // k6: per 32 weights 16 nibble bytes (k4 order) + 2 words of 2-bit highs; 20-byte record (16 int8 scales, d) per 256
-__global__ void k6_dequant_h_k(const uint8_t * w6, const uint8_t * kr, __half * out, int64_t ngroups, int k) {
+__global__ void k6_dequant_h_k(const uint8_t * w6, const uint8_t * kr, __half * out, int64_t ngroups, int k, bool tiled = false) {
     const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (g >= ngroups) return;
     const int64_t blk = g / 2;
     const int h = int(g % 2);
-    const uint8_t * b = w6 + blk * 24 + h * 8;
-    const uint32_t hi = *reinterpret_cast<const uint32_t *>(w6 + blk * 24 + 16 + 4 * h);
     const int64_t row = blk / (k / 32);
     const int sblk = int(blk % (k / 32));
+    const int64_t at = u4h_block_off(int(row), sblk, k / 32, 24, tiled);
+    const uint8_t * b = w6 + at + h * 8;
+    const uint32_t hi = *reinterpret_cast<const uint32_t *>(w6 + at + 16 + 4 * h);
     const uint8_t * rc = kr + (row * (k / 256) + sblk / 8) * 20;
     const float f = __half2float(*reinterpret_cast<const __half *>(rc + 16)) * float(int8_t(rc[(sblk % 8) * 2 + h]));
     const __half sc = __float2half_rn(f), mn = __float2half_rn(-32.f * f);
@@ -948,15 +968,16 @@ void k6_dequant_h(const uint8_t * w6, const uint8_t * kr, __half * out, int rows
     k6_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w6, kr, out, ng, k);
 }
 // k5: per 32 weights 16 nibble bytes (k4 order) + the 32 high bits; one thread per 16-weight group
-__global__ void k5_dequant_h_k(const uint8_t * w5, const uint8_t * kh, __half * out, int64_t ngroups, int k) {
+__global__ void k5_dequant_h_k(const uint8_t * w5, const uint8_t * kh, __half * out, int64_t ngroups, int k, bool tiled = false) {
     const int64_t g = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (g >= ngroups) return;
     const int64_t blk = g / 2;
     const int h = int(g % 2);
-    const uint8_t * b = w5 + blk * 20 + h * 8;
-    const uint32_t hi = *reinterpret_cast<const uint32_t *>(w5 + blk * 20 + 16) >> (16 * h);
     const int64_t row = blk / (k / 32);
     const int sblk = int(blk % (k / 32));
+    const int64_t at = u4h_block_off(int(row), sblk, k / 32, 20, tiled);
+    const uint8_t * b = w5 + at + h * 8;
+    const uint32_t hi = *reinterpret_cast<const uint32_t *>(w5 + at + 16) >> (16 * h);
     const __half2 s = k4_sm(kh + (row * (k / 256) + sblk / 8) * 16, sblk % 8);
     __align__(16) __half v[16];
 #pragma unroll
@@ -1317,61 +1338,61 @@ static std::map<std::pair<int, int>, int> & tuned() {
     return m;
 }
 
-template <class OUT, int FMT = 0>
+template <class OUT, int FMT = 0, bool DT = false>
 static void u4h_launch(const uint8_t * w4, const __half2 * sm, const __half * xh, OUT * y, int rows, int k, int ncols,
                        cudaStream_t s, int mt = -1, const uint32_t * rid = nullptr, int ldy = 0) {
     if (k % 64) throw std::invalid_argument("u4h_matvec: k must be a multiple of 64");
     // a short matrix with more than 8 columns: one CTA per (16 rows, 8 columns) instead of all column tiles in one CTA, so
     // the grid fills the GPU (320 rows x 24 columns: 20 -> 60 CTAs on a 48-SM GB10). Same bits per column (test u4h_columns).
     if (ncols > 8 && ncols <= 64 && (rows + 15) / 16 < 96) {
-        u4h_matvec_k<8, OUT, 1, FMT><<<dim3((rows + 15) / 16, (ncols + 7) / 8), 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        u4h_matvec_k<8, OUT, 1, FMT, 0, false, 1, DT><<<dim3((rows + 15) / 16, (ncols + 7) / 8), 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
         return;
     }
     if (mt < 0 && ncols <= 8) {
-        auto & tm = tuned<FMT>();
+        auto & tm = tuned<FMT + (DT ? 64 : 0)>();
         const auto it = tm.find({rows, k * 2 + (ncols > 1 ? 1 : 0)});
         mt = it == tm.end() ? 1 : it->second;
     }
     if (ncols <= 8 && mt == 5) {  // MT 1 with prefetch
-        u4h_matvec_k<8, OUT, 1, FMT, 1><<<(rows + 15) / 16, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        u4h_matvec_k<8, OUT, 1, FMT, 1, false, 1, DT><<<(rows + 15) / 16, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
         return;
     }
     if (ncols <= 8 && mt > 1) {
-        if (mt >= 4) u4h_matvec_k<8, OUT, 4, FMT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-        else u4h_matvec_k<8, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        if (mt >= 4) u4h_matvec_k<8, OUT, 4, FMT, 0, false, 1, DT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+        else u4h_matvec_k<8, OUT, 2, FMT, 0, false, 1, DT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
         return;
     }
     const int grid = (rows + 15) / 16;
     switch (ncols) {
-        case 1: u4h_matvec_k<1, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 1, rid, ldy); break;
-        case 2: u4h_matvec_k<2, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 2, rid, ldy); break;
-        case 3: u4h_matvec_k<3, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 3, rid, ldy); break;
-        case 4: u4h_matvec_k<4, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 4, rid, ldy); break;
-        case 5: u4h_matvec_k<5, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 5, rid, ldy); break;
-        case 6: u4h_matvec_k<6, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 6, rid, ldy); break;
-        case 7: u4h_matvec_k<7, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 7, rid, ldy); break;
-        case 8: tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<8, OUT, 1, FMT>), 256);
-                u4h_matvec_k<8, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
+        case 1: u4h_matvec_k<1, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 1, rid, ldy); break;
+        case 2: u4h_matvec_k<2, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 2, rid, ldy); break;
+        case 3: u4h_matvec_k<3, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 3, rid, ldy); break;
+        case 4: u4h_matvec_k<4, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 4, rid, ldy); break;
+        case 5: u4h_matvec_k<5, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 5, rid, ldy); break;
+        case 6: u4h_matvec_k<6, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 6, rid, ldy); break;
+        case 7: u4h_matvec_k<7, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 7, rid, ldy); break;
+        case 8: tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<8, OUT, 1, FMT, 0, false, 1, DT>), 256);
+                u4h_matvec_k<8, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, 8, rid, ldy); break;
         default:
             if (ncols > 8 && ncols <= 16) {
                 // 9..16 columns: shared activation loads pay off (3090: head 248320 x 5120 MT 1 / 2 / 4 = 1478 / 1156 /
                 // 982 us, 5120 x 17408 116 / 81 / 93 us)
                 if (mt < 0) mt = rows >= 65536 ? 4 : 2;
-                if (mt >= 4) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 4, FMT>), 256);
-                else if (mt == 2) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 2, FMT>), 256);
-                if (mt >= 4) u4h_matvec_k<16, OUT, 4, FMT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-                else if (mt == 2) u4h_matvec_k<16, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-                else u4h_matvec_k<16, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+                if (mt >= 4) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 4, FMT, 0, false, 1, DT>), 256);
+                else if (mt == 2) tqllm_dev::prefer_l1(reinterpret_cast<const void *>(u4h_matvec_k<16, OUT, 2, FMT, 0, false, 1, DT>), 256);
+                if (mt >= 4) u4h_matvec_k<16, OUT, 4, FMT, 0, false, 1, DT><<<(rows + 63) / 64, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+                else if (mt == 2) u4h_matvec_k<16, OUT, 2, FMT, 0, false, 1, DT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+                else u4h_matvec_k<16, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
             }
-            else if (ncols > 16 && ncols <= 24) u4h_matvec_k<24, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 16 && ncols <= 24) u4h_matvec_k<24, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
             // 25-32 columns (np 8 x 4-row blocks): two row tiles per block from 2048 rows halve the activation re-reads
             // (GB10 IQ4_XS 2560 -> 10240 133 -> 108 us, 12288 rows 164 -> 125); short matrices keep one (640 rows 12 -> 16)
-            else if (ncols > 24 && ncols <= 32 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-            else if (ncols > 24 && ncols <= 32) u4h_matvec_k<32, OUT, 1, FMT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 24 && ncols <= 32 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT, 0, false, 1, DT><<<(rows + 31) / 32, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 24 && ncols <= 32) u4h_matvec_k<32, OUT, 1, FMT, 0, false, 1, DT><<<grid, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
             // 33-64 columns (np 16 x 3-4 rows): two 32-column blocks per row block, side by side in the grid, so the weight rows
             // come from DRAM once instead of once per 32-column launch
-            else if (ncols > 32 && ncols <= 64 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT, 0, false, 2><<<(rows + 31) / 32 * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
-            else if (ncols > 32 && ncols <= 64) u4h_matvec_k<32, OUT, 1, FMT, 0, false, 2><<<grid * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 32 && ncols <= 64 && rows >= 2048) u4h_matvec_k<32, OUT, 2, FMT, 0, false, 2, DT><<<(rows + 31) / 32 * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
+            else if (ncols > 32 && ncols <= 64) u4h_matvec_k<32, OUT, 1, FMT, 0, false, 2, DT><<<grid * 2, 256, 0, s>>>(w4, sm, xh, y, rows, k, ncols, rid, ldy);
             else throw std::invalid_argument("u4h_matvec: 1..64 columns");
     }
 }
@@ -1477,9 +1498,9 @@ void u4h_matvec_mt(const uint8_t * w4, const __half2 * sm, const __half * xh, __
     u4h_launch(w4, sm, xh, y, rows, k, ncols, s, mt);
 }
 
-template <int FMT>
+template <int FMT, bool DT = false>
 static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, cudaStream_t s) {
-    if (tuned<FMT>().count({rows, k * 2}) || !tune_pointer_ok(w4)) return;
+    if (tuned<FMT + (DT ? 64 : 0)>().count({rows, k * 2}) || !tune_pointer_ok(w4)) return;
     __half * x = nullptr;
     __nv_bfloat16 * y = nullptr;
     tune_scratch(&x, size_t(8) * k * 2, &y, size_t(8) * rows * 2, "u4h_tune");
@@ -1488,13 +1509,13 @@ static void tune_impl(const uint8_t * w4, const __half2 * sm, int rows, int k, c
         int best = 1;
         float best_ms = 1e30f;
         for (int mt : {1, 2, 4, 5}) {  // 5: MT 1 with prefetch
-            for (int i = 0; i < 3; ++i) u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, cols, s, mt);
-            const float ms = timed_cold([&] { u4h_launch<__nv_bfloat16, FMT>(w4, sm, x, y, rows, k, cols, s, mt); }, 12, s);
+            for (int i = 0; i < 3; ++i) u4h_launch<__nv_bfloat16, FMT, DT>(w4, sm, x, y, rows, k, cols, s, mt);
+            const float ms = timed_cold([&] { u4h_launch<__nv_bfloat16, FMT, DT>(w4, sm, x, y, rows, k, cols, s, mt); }, 12, s);
             if (ms < best_ms * 0.98f) best_ms = ms, best = mt;
         }
-        tuned<FMT>()[{rows, k * 2 + (cols > 1 ? 1 : 0)}] = best;
+        tuned<FMT + (DT ? 64 : 0)>()[{rows, k * 2 + (cols > 1 ? 1 : 0)}] = best;
         if (tqllm::debug_on("tune"))
-            std::fprintf(stderr, "u4h_tune fmt %d %d x %d, %d col -> MT %d (%.1f us)\n", FMT, rows, k, cols, best, best_ms * 1000.f);
+            std::fprintf(stderr, "u4h_tune fmt %d%s %d x %d, %d col -> MT %d (%.1f us)\n", FMT, DT ? " tiled" : "", rows, k, cols, best, best_ms * 1000.f);
     }
     tune_done(x, y, "u4h_tune");
 }
@@ -1542,6 +1563,60 @@ void u4h_family_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const 
         case 6: u4h_launch<__nv_bfloat16, 6>(w, a, xh, y, rows, k, ncols, s, mt, nullptr, ldy); break;
         default: throw std::invalid_argument("u4h_family_matvec: fmt not wired");
     }
+}
+
+// ---- dense matrices stored as 16-row x 4-block tiles (dense_tiled_bpb: K6, K5): same kernels and bits, tiled loads ----
+int dense_tiled_block_bytes(int fmt) { return dense_tiled_bpb(fmt); }
+void u4h_dense_tile(void * w, int fmt, int rows, int k, cudaStream_t s) {
+    const int bpb = dense_tiled_bpb(fmt);
+    if (!bpb || rows % 16 || (k / 32) % 4) throw std::invalid_argument("u4h_dense_tile: format or shape without tiles");
+    tile_expert_rows_device(static_cast<char *>(w), 1, rows, k, bpb, s);
+}
+void u4h_dense_tiled_matvec_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k, int ncols,
+                                cudaStream_t s, int ldy) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    switch (fmt) {
+        case 6: u4h_launch<float, 6, true>(w, a, xh, y, rows, k, ncols, s, -1, nullptr, ldy); break;
+        case 7: u4h_launch<float, 7, true>(w, a, xh, y, rows, k, ncols, s, -1, nullptr, ldy); break;
+        default: throw std::invalid_argument("u4h_dense_tiled_matvec: format without tiles");
+    }
+}
+void u4h_dense_tiled_matvec_bf16(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k,
+                                 int ncols, cudaStream_t s, int ldy) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    switch (fmt) {
+        case 6: u4h_launch<__nv_bfloat16, 6, true>(w, a, xh, y, rows, k, ncols, s, -1, nullptr, ldy); break;
+        case 7: u4h_launch<__nv_bfloat16, 7, true>(w, a, xh, y, rows, k, ncols, s, -1, nullptr, ldy); break;
+        default: throw std::invalid_argument("u4h_dense_tiled_matvec: format without tiles");
+    }
+}
+void u4h_dense_tiled_tune(int fmt, const uint8_t * w, const void * aux, int rows, int k, cudaStream_t s) {
+    const auto * a = reinterpret_cast<const __half2 *>(aux);
+    if (fmt == 6) tune_impl<6, true>(w, a, rows, k, s);
+    else if (fmt == 7) tune_impl<7, true>(w, a, rows, k, s);
+}
+bool u4h_dense_tiled_gemm_f32(int fmt, const uint8_t * w, const void * aux, const __half * xh, float * y, int rows, int k, int ncols,
+                              cudaStream_t s, int ldy) {
+    switch (fmt) {
+        case 6: u4h_gemm_launch<6, float, true>(w, aux, xh, y, rows, k, ncols, s, ldy); return true;
+        case 7: u4h_gemm_launch<7, float, true>(w, aux, xh, y, rows, k, ncols, s, ldy); return true;
+        default: return false;
+    }
+}
+void u4h_dense_tiled_gemm(int fmt, const uint8_t * w, const void * aux, const __half * xh, __nv_bfloat16 * y, int rows, int k, int ncols,
+                          cudaStream_t s, int ldy) {
+    switch (fmt) {
+        case 6: u4h_gemm_launch<6, __nv_bfloat16, true>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        case 7: u4h_gemm_launch<7, __nv_bfloat16, true>(w, aux, xh, y, rows, k, ncols, s, ldy); break;
+        default: throw std::invalid_argument("u4h_dense_tiled_gemm: format without tiles");
+    }
+}
+void u4h_dense_tiled_dequant_h(int fmt, const uint8_t * w, const void * aux, __half * out, int rows, int k, cudaStream_t s) {
+    const int64_t ng = int64_t(rows) * k / 16;
+    const auto * r = static_cast<const uint8_t *>(aux);
+    if (fmt == 6) k5_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w, r, out, ng, k, true);
+    else if (fmt == 7) k6_dequant_h_k<<<unsigned((ng + 255) / 256), 256, 0, s>>>(w, r, out, ng, k, true);
+    else throw std::invalid_argument("u4h_dense_tiled_dequant_h: format without tiles");
 }
 
 void udq_tune(int fmt, const uint8_t * w, const uint8_t * rec, int rows, int k, cudaStream_t s) {

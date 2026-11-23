@@ -12,6 +12,13 @@ static bool sample_chain() {
 }
 
 void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
+    // the caller (lockstep, step(), the token-by-token MTP loop) reads the head output on every rank
+    struct All { bool & f; bool v; ~All() { f = v; } } all{rows_all, rows_all};
+    rows_all = true;
+    verify_tokens(tokens, n, pos, next);
+}
+
+void Qwen35Engine::verify_tokens(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
     if (!fmt_target) throw std::runtime_error("verify() needs a quantized GGUF model (a registered weight format)");
     if (n < 1 || n > NVER || pos + n > context_) throw std::runtime_error("verify: bad token count or position");
     for (int i = 0; i < n; ++i) h_tok[i] = tokens[i];
@@ -35,7 +42,7 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         if (mm_chunk) tqllm_cuda::mm_scatter(X, mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image tokens
         tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
     } else {
-        split_enter(X, n);
+        split_trunk(X, n, false);
     }
     st("embed");
     const uint32_t n_attn = uint32_t(key_cache.size());
@@ -131,7 +138,9 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         }
         ffn_block(L, n, X);
     }
-    split_leave(X, n);
+    split_trunk(X, n, true);
+    // --split layer, one sequence: the head (and MTP) on the last rank only
+    if (!split_head(rows_all ? qwen35::SplitStep::to_all : qwen35::SplitStep::plain).head_here) return;
     // final hidden states (pre-norm) feed the MTP drafter
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {  // batched verify: one head pass over every slot's columns (per-column results unchanged)
@@ -223,6 +232,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
     if (pc_on && !P0) pc_conv = ++conv_clock;  // a new conversation in this slot
     if (P0 < pc_snap) pc_snap = 0;
+    if (pc_sys && pc_shared(pc_seq, false, pc_sys, prompt) != pc_sys) pc_sys = 0;  // kept only while the prompt shares it
     pc_live = false;
     if (pc_on) pc_seq.assign(prompt.begin(), prompt.end());
     if (P0) std::fprintf(stderr, "tqllm: prompt cache: %u of %u prompt tokens reused\n", P0, P);
@@ -245,6 +255,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         if (im_start_ != ~0u && !tf_path)
             for (uint32_t i = 1; i < P; ++i) if (prompt[i] == im_start_) starts.push_back(i);
         const uint32_t snap = !pc_on ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
+        const uint32_t sys_at = !pc_on ? 0 : kept_state_sys(starts, P, P0, snap, kSysKeep);
         const size_t chunks = (P - P0 + CH - 1) / CH + 1 + starts.size();  // + the split at snap and at each message start
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
         HostBuf staged_pos(chunks * 2 * sizeof(int));
@@ -261,6 +272,8 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         // the head on its last position only, into column 0; a shorter one (a chat prompt's last message is a chunk of its
         // own, a few tokens) runs it on every column, so the last position is column m - 1.
         const auto final_top16 = [](int m) { return m <= NVER ? size_t(m - 1) * 16 : size_t(0); };
+        // --split layer, one sequence: the first token, the MTP catch-up and the drafter's K/V on the last rank only
+        const auto hp = split_head(qwen35::SplitStep::last_chunk);
         try {
             for (uint32_t t = P0, ci = 0; t < P; t += uint32_t(m_last), ++ci) {
                 const int m = int(std::min<uint32_t>(chunk_end(starts, t, P, uint32_t(CH)) - t, snap > t ? snap - t : P));
@@ -269,6 +282,8 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                 positions[2 * ci + 1] = int(t) + 1;
                 const bool final = t + uint32_t(m) == P;
                 prefill_final = final;
+                // --split layer: no feature rows for an eager chunk the drafter's K/V ring never holds (not injected below)
+                feat_none = m > NVER && t + uint32_t(m) <= inj0;
                 mm_chunk = !images.empty();
                 if (mm_chunk)
                     ck(cudaMemcpyAsync(mm_tab.p, static_cast<int *>(staged_mm.p) + 4 * size_t(t), size_t(m) * 4 * sizeof(int),
@@ -277,7 +292,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                              m, t, final ? h_tok : nullptr, false);
                 if (tf_host) ck(cudaMemcpyAsync(tf_host + t, v_tok.p, size_t(m) * 4, cudaMemcpyDeviceToHost, stream));
                 commit(m);
-                if (use_mtp) {
+                if (use_mtp && hp.head_here) {
                     if (final) {
                         sync_ck();
                         next = h_tok[0];
@@ -295,15 +310,16 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                         mtp_run(prompt.data() + t + uint32_t(off) + 1,
                                 v_hid.as<bf16>() + size_t(off) * H, n, t + uint32_t(off) + 1, false);
                     }
-                    if (final && count > 1 && next != eos_)
+                    if (final && count > 1 && next != stop_)
                         first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
                 }
-                for (int off = 0; off < m && dfl_on; off += DFlash::injBatch) {
+                for (int off = 0; off < m && dfl_on && hp.head_here; off += DFlash::injBatch) {
                     const int count = std::min(DFlash::injBatch, m - off);
                     if (t + uint32_t(off + count) <= inj0) continue;
                     dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                 }
                 if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
+                if (t + uint32_t(m) == sys_at) pc_copy(true, true), pc_sys = sys_at;
                 tqllm::prefill_completed(stream,t+uint32_t(m),P,P0);
                 if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -314,9 +330,11 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
             }
             sync_ck();
             mm_chunk = false;
+            feat_none = false;
         } catch (...) {
             cudaStreamSynchronize(stream);
             mm_chunk = false;
+            feat_none = false;
             throw;
         }
         if (tf_host) {
@@ -326,12 +344,17 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                 std::fclose(f);
             }
         }
-        if (!use_mtp) next = h_tok[0];
-        if (sampling() && !use_mtp) {  // the last prompt position's top-16 (MTP: sampled in the loop)
+        if (!use_mtp && hp.head_here) next = h_tok[0];
+        if (sampling() && !use_mtp && hp.head_here) {  // the last prompt position's top-16 (MTP: sampled in the loop)
             const int tc = int(final_top16(m_last) / 16);
             queue_sample(tc, 1, samp.temperature);
             sync_ck();
             next = sample_cols({HeadSampleCol{tc, P, {}}})[0];
+        }
+        if (hp.picks) {
+            std::vector<uint32_t> v{next};
+            from_last(v);
+            next = v.at(0);
         }
         if (kv_cmp && opt.kv_compact_turn) {  // refit the old blocks on this request's queries before decoding
             const auto tc = std::chrono::steady_clock::now();
@@ -350,7 +373,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     gen.count = count;
     gen.D = D;
     gen.native_mtp = use_mtp;
-    if (use_mtp && count > 1 && next != eos_) gen.mtp_draft.assign(1, first_draft);
+    if (use_mtp && count > 1 && next != stop_) gen.mtp_draft.assign(1, first_draft);
     gen.pos = P;
     gen.rdelta = rdelta;
     gen.pending = next;
@@ -402,7 +425,7 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     int live = 0;
     for (int i = 0; i < ns; ++i) {
         select_slot(slots[i]);
-        if (gen.done || gen.out.size() >= gen.count || gen.pending == eos_) gen.done = true;
+        if (gen.done || gen.out.size() >= gen.count || gen.pending == stop_) gen.done = true;
         live += !gen.done;
     }
     const int per = std::max(2, budget / std::max(1, live));
@@ -437,9 +460,13 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
         select_slot(slots[i]);
         done[i] = gen.done;
         if (gen.done) continue;
+        // --split layer, one sequence: the last rank drafts and sends the block
+        const auto hp = split_head(gen.D > 0 ? qwen35::SplitStep::chain : qwen35::SplitStep::plain);
         auto draft = batched ? std::move(drafts[ri++])
-                     : gen.D > 0 ? dflash_draft(gen.pending, gen.pos, std::min(gen.D, per - 1))
-                                 : std::vector<uint32_t>{};
+                     : gen.D > 0 && hp.head_here ? dflash_draft(gen.pending, gen.pos, std::min(gen.D, per - 1))
+                                                 : std::vector<uint32_t>{};
+        if (hp.block) from_last(draft);
+        feat_none = !hp.feats;
         const int n = 1 + int(draft.size());
         if (gen.pos + uint32_t(n) > context_) throw std::runtime_error("verify: position beyond context");
         if (!on_dev) {
@@ -459,10 +486,11 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * segs.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
     upload_rpos(int(segs.size()), [&](int i) { return rdelta_of(segs[size_t(i)].slot); });
     for (const auto & g : segs) kv_track(g.pos, g.n);
-    uint64_t key = batch_graph_seed(batch_topk, unsigned(sp)) ^ (uint64_t(qsa.mode) << 44);  // stash buffer baked in
+    uint64_t key = batch_graph_seed(batch_topk, unsigned(sp)) ^ (uint64_t(qsa.mode) << 44) ^ (uint64_t(rows_all) << 47) ^ (uint64_t(feat_none) << 45);  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
     if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
     else ck(cudaGraphLaunch(cached_verify_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+    feat_none = false;
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -487,24 +515,34 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
         const auto & draft = plan[pi++].draft;
         select_slot(g.slot);
         uint32_t * r = res.data() + g.col0;
-        const int j = accept(draft, r, g.col0);
+        // --split layer, one sequence: the accepted count and the next token from the last rank
+        const auto hp = split_head(gen.D > 0 ? qwen35::SplitStep::chain : qwen35::SplitStep::plain);
+        int j = hp.head_here ? accept(draft, r, g.col0) : 0;
+        if (hp.picks) {
+            std::vector<uint32_t> v{uint32_t(j), r[j]};
+            from_last(v);
+            j = int(v.at(0));
+            if (j > int(draft.size())) throw std::runtime_error("--split layer: accepted count out of range");
+            r[j] = v.at(1);
+        }
+        if (hp.feats_late) feats_to_last(j + 1);  // one sequence: column 0
         ++gen.steps;
         gen.drafted += draft.size();
         gen.accepted += uint64_t(j);
         bool hit_eos = false;
         for (int k = 0; k < j && gen.out.size() < gen.count && !hit_eos; ++k) {  // the reply ends at an accepted EOS
             gen.out.push_back(draft[size_t(k)]);
-            hit_eos = draft[size_t(k)] == eos_;
+            hit_eos = draft[size_t(k)] == stop_;
         }
         if (!hit_eos && gen.out.size() < gen.count) gen.out.push_back(r[j]);
         last_n = g.n;
         stash_col0 = g.col0;
         commit(j + 1);
         stash_col0 = 0;
-        if (dfl.present) dflash_inject(v_feat.as<bf16>() + size_t(g.col0) * nf * H, j + 1, gen.pos);
+        if (dfl.present && hp.head_here) dflash_inject(v_feat.as<bf16>() + size_t(g.col0) * nf * H, j + 1, gen.pos);
         gen.pending = r[j];
         gen.pos += uint32_t(j + 1);
-        if (hit_eos || gen.out.size() >= gen.count || gen.pending == eos_) gen.done = true;
+        if (hit_eos || gen.out.size() >= gen.count || gen.pending == stop_) gen.done = true;
         done[i] = gen.done;
     }
     if (prof) {
@@ -541,7 +579,7 @@ bool Qwen35Engine::dflash_advance() {
     auto & pos = gen.pos;
     const uint32_t count = gen.count;
     const int D = gen.D;
-    if (out.size() >= count || pending == eos_) {
+    if (out.size() >= count || pending == stop_) {
         gen.done = true;
         return false;
     }
@@ -553,42 +591,50 @@ bool Qwen35Engine::dflash_advance() {
     if (tree_mode && !(sampling() && sample_chain()) && D > 1 && !tree_chain) {  // token-tree step (greedy or sampled)
         // draft -> tree -> verify queued back to back on the device; one host sync after the verify
         const auto t0 = now();
+        // --split layer, one sequence: the last rank drafts, builds the tree and sends its columns, then the path
+        const auto hp = split_head(qwen35::SplitStep::tree);
         uint32_t lk[NVER];
         constexpr int NV = std::min(NVER, tqllm::kGdnReplayCols);
-        int nl = opt.lookup ? lookup(lk, tqllm::lookup_limit(opt.lookup, NV)) : 0;
-        // lookup-first (--lookup-first k): a context match of >= k tokens takes the whole verify block
-        bool lf = false;
-        if (opt.lookup_first > 0 && opt.lookup) {
-            uint32_t lk2[NVER];
-            const int n2 = lookup(lk2, tqllm::lookup_first_limit(NV));
-            if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
+        int nl = 0, n = 0;
+        if (hp.head_here) {
+            nl = opt.lookup ? lookup(lk, tqllm::lookup_limit(opt.lookup, NV)) : 0;
+            // lookup-first (--lookup-first k): a context match of >= k tokens takes the whole verify block
+            bool lf = false;
+            if (opt.lookup_first > 0 && opt.lookup) {
+                uint32_t lk2[NVER];
+                const int n2 = lookup(lk2, tqllm::lookup_first_limit(NV));
+                if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
+            }
+            int nt = tqllm::tree_cols(D, nl, lf, NV);
+            if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
+                for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
+                nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
+                const auto cp = gen.copy.propose(NV - nt);
+                if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
+                nl = int(cp.size());
+                std::copy(cp.begin(), cp.end(), lk);
+            }
+            dflash_draft(pending, pos, 0, nullptr, nullptr, true);
+            tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
+                                    v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+            n = nt + nl;
+            if (nl) {  // lookup chain: columns nt .. n - 1, the first under the root
+                int lp[NVER], ld[NVER];
+                for (int i = 0; i < nl; ++i) lp[i] = i ? nt + i - 1 : 0, ld[i] = i + 1;
+                ck(cudaMemcpyAsync(v_tokens.as<uint32_t>() + nt, lk, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
+                ck(cudaMemcpyAsync(d_tpar.as<int>() + nt, lp, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
+                ck(cudaMemcpyAsync(d_tdep.as<int>() + nt, ld, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
+            }
         }
-        int nt = tqllm::tree_cols(D, nl, lf, NV);
-        if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
-            for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
-            nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
-            const auto cp = gen.copy.propose(NV - nt);
-            if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
-            nl = int(cp.size());
-            std::copy(cp.begin(), cp.end(), lk);
-        }
-        dflash_draft(pending, pos, 0, nullptr, nullptr, true);
-        tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
-                                v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
-        const int n = nt + nl;
-        if (nl) {  // lookup chain: columns nt .. n - 1, the first under the root
-            int lp[NVER], ld[NVER];
-            for (int i = 0; i < nl; ++i) lp[i] = i ? nt + i - 1 : 0, ld[i] = i + 1;
-            ck(cudaMemcpyAsync(v_tokens.as<uint32_t>() + nt, lk, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
-            ck(cudaMemcpyAsync(d_tpar.as<int>() + nt, lp, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
-            ck(cudaMemcpyAsync(d_tdep.as<int>() + nt, ld, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));
-        }
+        if (hp.block) n = tree_from_last(n);
         const auto t1 = now();
         h_pos[0] = int(pos);
         h_pos[1] = int(pos) + 1;
         tree_step = true;
+        feat_none = !hp.feats;
         verify_async(nullptr, h_pos, n, pos, res.data(), true);
         tree_step = false;
+        feat_none = false;
         std::vector<int> tpar(static_cast<size_t>(n) + 0);
         in.resize(size_t(n));
         ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
@@ -601,7 +647,7 @@ bool Qwen35Engine::dflash_advance() {
         // follow the target's argmax down the tree; siblings may repeat a token (tree vs lookup chain): keep the deepest
         std::vector<int> path{0}, best;
         uint32_t drawn = 0;  // sampled walk: the draw that left the tree (the next token)
-        if (sampling()) {
+        if (sampling() && hp.head_here) {
             // Sampled tree walk: at each node on the path the next token is drawn from the target's distribution there
             // (penalties, temperature, top-k, top-p: the same exact draw as chain verification). A child that holds
             // the drawn token continues the path; otherwise the draw itself is the next token. Every output token is
@@ -647,8 +693,8 @@ bool Qwen35Engine::dflash_advance() {
                 }
             if (leaf && path.size() > best.size()) best = path;
         };
-        if (sampling()) {
-            // path built above
+        if (sampling() || !hp.head_here) {
+            // path built above, or sent by the last rank below
         } else if (nl) {
             walk(0);
             path = best;
@@ -662,6 +708,17 @@ bool Qwen35Engine::dflash_advance() {
                 node = next;
             }
         }
+        uint32_t bonus = hp.head_here ? sampling() ? drawn : res[size_t(path.back())] : 0;
+        if (hp.picks) {  // the accepted columns and the next token
+            std::vector<uint32_t> v(path.begin(), path.end());
+            v.push_back(bonus);
+            from_last(v);
+            bonus = v.back();
+            path.assign(v.begin(), v.end() - 1);
+            if (path.empty() || path[0] != 0) throw std::runtime_error("--split layer: bad tree path from the last rank");
+            for (size_t i = 1; i < path.size(); ++i)
+                if (path[i] <= path[i - 1] || path[i] >= n) throw std::runtime_error("--split layer: bad tree path from the last rank");
+        }
         const int j = int(path.size()) - 1;
         ++gen.steps;
         gen.drafted += uint64_t(n - 1);
@@ -669,9 +726,8 @@ bool Qwen35Engine::dflash_advance() {
         bool hit_eos = false;
         for (int i = 1; i <= j && out.size() < count && !hit_eos; ++i) {  // the reply ends at an accepted EOS
             out.push_back(in[size_t(path[size_t(i)])]);
-            hit_eos = in[size_t(path[size_t(i)])] == eos_;
+            hit_eos = in[size_t(path[size_t(i)])] == stop_;
         }
-        const uint32_t bonus = sampling() ? drawn : res[size_t(path.back())];
         if (!hit_eos && out.size() < count) out.push_back(bonus);
         const auto t3 = now();
         bool contiguous = true;
@@ -701,14 +757,15 @@ bool Qwen35Engine::dflash_advance() {
             tqllm_cuda::gather_path(d_gdesc.as<tqllm_cuda::PathGather>(), int(g.size()), d_tcols.as<int>(), j + 1,
                                     int(pos), stream);
         }
+        if (hp.feats_late) feats_to_last(j + 1);  // the accepted path's features (columns 0 .. j) for the drafter
         if (defer) {  // deferred commit: the next verify replays this path in its GDN / conv kernels
             if (pend_k) cur = (cur + 1) % NSLOT;  // this verify wrote the previous path's state into slot cur + 1
             pend_sp = sp;
             sp ^= 1;
             set_pending(j + 1);
             last_n = 0;
-            dflash_inject(v_feat.as<bf16>(), j + 1, pos);
-        } else if (dfl_fixed_grids()) {
+            if (hp.head_here) dflash_inject(v_feat.as<bf16>(), j + 1, pos);
+        } else if (dfl_fixed_grids() && hp.head_here) {
             // commit + inject as one graph: ~110 small launches otherwise leave the GPU waiting on the host
             const int k = j + 1;
             if (k > last_n) throw std::runtime_error("commit: accepted count out of range");
@@ -724,7 +781,7 @@ bool Qwen35Engine::dflash_advance() {
             last_n = 0;
         } else {
             commit(j + 1);
-            dflash_inject(v_feat.as<bf16>(), j + 1, pos);
+            if (hp.head_here) dflash_inject(v_feat.as<bf16>(), j + 1, pos);
         }
         if (prof) {
             sync_ck();
@@ -735,15 +792,28 @@ bool Qwen35Engine::dflash_advance() {
         if (hit_eos) gen.done = true;
     } else {
         const auto t0 = now();
-        const auto draft = dflash_draft(pending, pos, D);
+        // --split layer, one sequence: the last rank drafts, accepts and samples
+        const auto hp = split_head(qwen35::SplitStep::chain);
+        auto draft = hp.head_here ? dflash_draft(pending, pos, D) : std::vector<uint32_t>{};
+        if (hp.block) from_last(draft);
         const auto t1 = now();
         in.assign(1, pending);
         in.insert(in.end(), draft.begin(), draft.end());
-        verify(in.data(), int(in.size()), pos, res.data());
+        feat_none = !hp.feats;
+        verify_tokens(in.data(), int(in.size()), pos, res.data());
+        feat_none = false;
         const auto t2 = now();
         gen.t_draft += ms(t0, t1);
         gen.t_verify += ms(t1, t2);
-        const int j = accept(draft, res.data(), 0);
+        int j = hp.head_here ? accept(draft, res.data(), 0) : 0;
+        if (hp.picks) {
+            std::vector<uint32_t> v{uint32_t(j), res[size_t(j)]};
+            from_last(v);
+            j = int(v.at(0));
+            if (j > int(draft.size())) throw std::runtime_error("--split layer: accepted count out of range");
+            res[size_t(j)] = v.at(1);
+        }
+        if (hp.feats_late) feats_to_last(j + 1);
         if (tqllm::debug_on("draft") && gen.steps < 6) {  // DEBUG
             std::fprintf(stderr, "step %llu pos %u pending %u\n  draft:", (unsigned long long) gen.steps, pos, pending);
             for (auto d : draft) std::fprintf(stderr, " %u", d);
@@ -757,12 +827,12 @@ bool Qwen35Engine::dflash_advance() {
         bool hit_eos = false;
         for (int i = 0; i < j && out.size() < count && !hit_eos; ++i) {  // the reply ends at an accepted EOS
             out.push_back(draft[i]);
-            hit_eos = draft[i] == eos_;
+            hit_eos = draft[i] == stop_;
         }
         if (!hit_eos && out.size() < count) out.push_back(res[j]);
         const auto t3 = now();
         commit(j + 1);
-        dflash_inject(v_feat.as<bf16>(), j + 1, pos);  // real features of the accepted positions
+        if (hp.head_here) dflash_inject(v_feat.as<bf16>(), j + 1, pos);  // real features of the accepted positions
         if (prof) {
             sync_ck();
             gen.t_tail += ms(t3, now());
@@ -771,7 +841,7 @@ bool Qwen35Engine::dflash_advance() {
         pos += uint32_t(j + 1);
         if (hit_eos) gen.done = true;
     }
-    if (out.size() >= count || pending == eos_) gen.done = true;
+    if (out.size() >= count || pending == stop_) gen.done = true;
     dec_progress();
     return !gen.done;
 }
@@ -811,6 +881,12 @@ std::vector<uint32_t> Qwen35Engine::dflash_finish(uint64_t * stats) {
         std::fprintf(stderr, "prefill %u tokens %.1f ms (%.0f tok/s) | per step: draft %.2f ms, verify %.2f ms, "
                      "commit+inject %.2f ms (%llu steps)\n", P, last_prefill_ms, 1000.0 * P / last_prefill_ms,
                      t_draft / steps, t_verify / steps, t_tail / steps, (unsigned long long) steps);
+    if (prof && steps && cfg.moe) {  // verify-block expert dedup since start: launches, groups, distinct experts
+        unsigned long long d[3] = {0, 0, 0};
+        tqllm_cuda::moe_dedup_stats(d);
+        if (d[0]) std::fprintf(stderr, "moe dedup: %llu maps, %.1f groups / %.1f distinct experts per layer\n", d[0],
+                               double(d[1]) / double(d[0]), double(d[2]) / double(d[0]));
+    }
     if (stage_prof && stage_acc.count("_steps")) {
         const double ns = double(stage_acc["_steps"].second);
         double tot = 0;
@@ -944,39 +1020,57 @@ void Qwen35Engine::select_slot(int s) {
 }
 
 bool Qwen35Engine::mtp_advance() {
-    if (gen.done || gen.out.size() >= gen.count || gen.pending == eos_) {
+    if (gen.done || gen.out.size() >= gen.count || gen.pending == stop_) {
         gen.done = true;
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
     auto & draft = gen.mtp_draft;
     int D = gen.D;
-    // --lookup L: a match of the last tokens earlier in prompt + output that runs longer than the MTP chain (or >= K
-    // with --lookup-first K) is the draft instead; the MTP cache is rebuilt from the verified tokens either way
-    if (opt.lookup > 0) {
-        uint32_t lk[NVER];
-        const int n = lookup(lk, std::min(opt.lookup, NVER - 1));
-        if (n >= (opt.lookup_first > 0 ? opt.lookup_first : D + 1)) {
-            draft.assign(lk, lk + n);
-            D = n;
+    // --split layer, one sequence: the MTP layer, lookup, accept and sampling on the last rank; it sends the drafts and
+    // the accepted count with the next token
+    const auto hp = split_head(qwen35::SplitStep::mtp);
+    if (hp.head_here) {
+        // --lookup L: a match of the last tokens earlier in prompt + output that runs longer than the MTP chain (or >= K
+        // with --lookup-first K) is the draft instead; the MTP cache is rebuilt from the verified tokens either way
+        if (opt.lookup > 0) {
+            uint32_t lk[NVER];
+            const int n = lookup(lk, std::min(opt.lookup, NVER - 1));
+            if (n >= (opt.lookup_first > 0 ? opt.lookup_first : D + 1)) {
+                draft.assign(lk, lk + n);
+                D = n;
+            }
         }
+        while (int(draft.size()) < D)
+            draft.push_back(mtp_run(&draft.back(), nullptr, 1, gen.pos + uint32_t(draft.size())));
     }
-    while (int(draft.size()) < D)
-        draft.push_back(mtp_run(&draft.back(), nullptr, 1, gen.pos + uint32_t(draft.size())));
+    if (hp.block) {
+        from_last(draft);
+        D = int(draft.size());
+    }
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<uint32_t> in{gen.pending}, res(size_t(D) + 1);
     in.insert(in.end(), draft.begin(), draft.end());
-    verify(in.data(), int(in.size()), gen.pos, res.data());
+    feat_none = !hp.feats;
+    verify_tokens(in.data(), int(in.size()), gen.pos, res.data());
+    feat_none = false;
     const auto t2 = std::chrono::steady_clock::now();
     // greedy: longest prefix matching the target's argmax; sampling: speculative sampling with the deterministic MTP
     // draft (accept draft j with the target's probability of it, else resample without it), res[j] the next token
-    const int j = accept(draft, res.data(), 0);
+    int j = hp.head_here ? accept(draft, res.data(), 0) : 0;
+    if (hp.picks) {
+        std::vector<uint32_t> v{uint32_t(j), res[size_t(j)]};
+        from_last(v);
+        j = int(v.at(0));
+        if (j > D) throw std::runtime_error("--split layer: accepted count out of range");
+        res[size_t(j)] = v.at(1);
+    }
     ++gen.steps;
     gen.drafted += uint64_t(D);
     gen.accepted += uint64_t(j);
     for (int i = 0; i < j && gen.out.size() < gen.count; ++i) {
         gen.out.push_back(draft[size_t(i)]);
-        if (draft[size_t(i)] == eos_) {
+        if (draft[size_t(i)] == stop_) {
             gen.done = true;
             break;
         }
@@ -986,8 +1080,11 @@ bool Qwen35Engine::mtp_advance() {
     const uint32_t repair_pos = gen.pos + 1;
     gen.pos += uint32_t(j + 1);
     gen.pending = res[size_t(j)];
-    gen.done |= gen.out.size() >= gen.count || gen.pending == eos_;
-    if (!gen.done) {
+    gen.done |= gen.out.size() >= gen.count || gen.pending == stop_;
+    if (!hp.head_here) {
+        draft.clear();
+        if (gen.done) sync_ck();
+    } else if (!gen.done) {
         std::vector<uint32_t> repaired(draft.begin(), draft.begin() + j);
         repaired.push_back(gen.pending);
         // Pair each committed token with the target hidden of its preceding position.
@@ -1016,6 +1113,8 @@ int Qwen35Engine::drafter_features(const std::vector<uint32_t> & tokens, std::ve
     if (!dfl.present) return 0;
     const auto P = uint32_t(tokens.size());
     if (P == 0 || P + 1 > context_) throw std::runtime_error("drafter_features: sequence exceeds the context");
+    struct All { bool & f; bool v; ~All() { f = v; } } all{rows_all, rows_all};
+    rows_all = true;  // rank 0 returns every target layer's rows
     const int H = int(cfg.hidden), nf = int(dfl.target_ids.size()), CH = NPF;
     const size_t chunks = (P + CH - 1) / CH, row = size_t(nf) * H;
     feats.assign(size_t(P) * row, 0);

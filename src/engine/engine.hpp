@@ -8,11 +8,21 @@
 #include <vector>
 
 #include "tqllm/model.hpp"
+#include "../core/state_blob.hpp"
 
 namespace tqllm {
 
+// Host byte channel between the ranks of a layer split (src/engine/lockstep.hpp drives it).
+struct ByteChannel {
+    virtual ~ByteChannel() = default;
+    virtual void send(const void * p, size_t n) = 0;
+    virtual void recv(void * p, size_t n) = 0;
+};
+
 struct Engine {
     virtual ~Engine() = default;
+    // set by an engine that is one rank of --split layer: Model wraps it in a LockstepEngine over this channel
+    std::shared_ptr<ByteChannel> lockstep_channel; int lockstep_rank = 0;
     std::string note;  // what the load chose instead of the defaults or the asked mode (empty: none); Model::fit_note, /health
     // step / verify / commit / logits: the token-by-token path. Speculative-only engines (Metal) decode through
     // spec_begin / spec_advance and keep these defaults.
@@ -65,6 +75,9 @@ struct Engine {
     virtual void stop_followers() {}
     virtual bool has_drafter() const { return false; }
     virtual bool native_mtp() const { return false; }  // --mtp drafts with the model's own nextn head
+    // spec_begin with depth 0 lets the engine choose each step's drafts from its own acceptance and step time; serving
+    // then passes 0 unless --draft-max fixes the depth
+    virtual bool adaptive_depth() const { return false; }
     virtual bool incremental() const { return false; }  // spec_begin / spec_advance work (chunked prefill), drafter or not
     virtual void select_slot(int s) {
         if (s != 0) throw std::runtime_error("this model has a single slot");
@@ -92,6 +105,9 @@ struct Engine {
     // prompt tokens slot s would reuse from its previous request (0: none); the scheduler routes a request to the free
     // slot with the longest reuse
     virtual uint32_t prefix_reuse(int, const std::vector<uint32_t> &) const { return 0; }
+    // The active slot (after select_slot) lends a copy of its kept prompt state that covers most of `prompt` to the park,
+    // where every slot can resume from it and it stays for the next (tqserve share_source). false: nothing kept, or no park.
+    virtual bool share_kept(const std::vector<uint32_t> & prompt) { (void) prompt; return false; }
     // While idle: `prefix` is what the slot's next prompt is expected to begin with (its last prompt plus the reply as the
     // client returns it). An engine that kept the last prompt's state may prefill the rest of the prefix now, so a next
     // prompt that does begin with it starts sooner; any other next prompt is served as if this was never called.
@@ -102,6 +118,18 @@ struct Engine {
     virtual int drafter_features(const std::vector<uint32_t> &, std::vector<uint16_t> &) { return 0; }
     // Chunked prefill of tokens at positions [pos, pos + n) with no LM head (KV and recurrent state only); false: unsupported.
     virtual bool prefill_state(const std::vector<uint32_t> &, uint32_t) { return false; }
+    // A slot's kept conversation state (its prompt-cache snapshot: the positions a next turn reuses) as a blob that only this
+    // engine's serialiser reads (src/kv/conversation_state.hpp); nullptr: nothing kept, or not supported
+    virtual std::unique_ptr<StateBlob> export_state(int slot) { (void) slot; return nullptr; }
+    // that blob into an idle slot, so a request whose prompt starts with its tokens resumes there; "" when imported, else why not
+    virtual std::string import_state(int slot, const StateBlob & blob) { (void) slot, (void) blob; return "this engine does not import conversation states"; }
+    // Another box asks for the kept state that serves `prompt` best (an idle slot's or a parked one): a copy, this box keeps
+    // its own until release_state; nullptr: none, or another entity's
+    virtual std::unique_ptr<StateBlob> export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity) { (void) prompt, (void) entity; return nullptr; }
+    // a state fetched from another box into this one's park (a request whose prompt starts with it resumes from there)
+    virtual std::string adopt_state(StateBlob blob) { (void) blob; return "this engine does not adopt conversation states"; }
+    // the fetching box confirmed the transfer: drop this box's parked copy of the conversation
+    virtual void release_state(uint64_t conv) { (void) conv; }
     virtual const float * logits() const { return nullptr; }  // device, [vocab] FP32, valid after a sampling step
     virtual const float * verify_logits() const { return nullptr; }  // device, [n][vocab] FP32 of the last verify
     virtual void set_full_logits(bool) {}  // verify computes every logit (int8 head) instead of the two-stage top-16
@@ -127,6 +155,8 @@ struct Engine {
 bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);
+// Inkling-2-Mini (HF folder, Inkling2LoopForConditionalGeneration), src/models/inkling2/loop; MTP from mtp.safetensors
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact = true);
 // tensor parallelism over linked boxes: world ranks, rank 0 at peer:port (rank 0 listens there for the others)
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",
@@ -138,6 +168,10 @@ class TpComm;
 // The backend wraps it in a LockstepEngine (src/engine/lockstep.hpp): rank 0 serves, the others run follow().
 std::unique_ptr<Engine> make_qwen35_split_engine(const std::string & path, const std::string & tokenizer, uint32_t context,
                                                  int slots, const EngineOptions & options, std::shared_ptr<TpComm> tp);
+// what --split layer sizes the ranks by: each layer's device bytes at this context (weights, K/V or recurrent state) and
+// the bytes every rank holds besides its layers (embedding, head, drafter, buffers)
+void qwen35_split_costs(const std::string & path, uint32_t context, int slots, const EngineOptions & options,
+                        std::vector<uint64_t> & cost, uint64_t & fixed);
 std::unique_ptr<Engine> make_qwen35_engine(const std::string & dir, const std::string & tokenizer, uint32_t context,
                                            int slots = 1, const EngineOptions & options = {});
 

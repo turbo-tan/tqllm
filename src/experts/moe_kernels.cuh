@@ -18,6 +18,9 @@ constexpr int kParamCopyMax = 8192;  // bytes per launch (kernel parameters, CUD
 void param_copy(const void * host, size_t bytes, void * dst, cudaStream_t stream);
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,
               int experts, int topk, int n, float scale, cudaStream_t);
+// Approximate tail skip: weights[t][i] = 0 where skip[t][i] != 0; renorm scales each token's other weights so the token's
+// sum is unchanged (n tokens x topk, one launch per layer call instead of one memset per skipped assignment)
+void moe_skip_weights(float * weights, const int * skip, int n, int topk, bool renorm, cudaStream_t);
 // TQLLM_DEBUG=keep_map pruning: logits[t][e] += mask[e] (0 kept / -inf pruned) for e < experts, rows of stride ld
 void logits_mask(float * logits, const float * mask, int n, int ld, int experts, cudaStream_t);
 // moe_topk on two routings in one launch (this layer's and the next layer's prediction); e <= 1024, warp path.
@@ -35,8 +38,10 @@ void moe_split_ids(const int * ids, const int * hot_slot, const int * cold_slot,
 // slots[a] = slot_of[ids[a]]; gu / dn (each count groups of kDedupStride ints, may be null) hold the groups the host
 // build makes (opened in assignment order, up to kDedupCols columns each; inputs: the token for gu, the assignment for
 // dn), and the groups after them slot -1 (the dedup kernels skip those). count <= 1024; groups >= count.
+// extra >= 0: ids hold topk - 1 routed ids per token, and each token's last assignment is expert `extra` (a fused
+// shared expert), as if the ids had been widened by moe_extend_ids first.
 void moe_dedup_maps(const int * ids, const int * slot_of, int count, int topk, int * slots, int * gu, int * dn, int groups,
-                    cudaStream_t stream);
+                    cudaStream_t stream, int extra = -1);
 // Expert parallelism over two ranks (rank r owns the experts e with e % 2 == r; every rank keeps every expert resident).
 // Per layer a rank runs one expert launch over its own A assignments followed by the peer's Ap (inputs: its own rows, then
 // the peer's). An own assignment of a peer-owned expert goes to the peer when it is among the first `cap` such assignments

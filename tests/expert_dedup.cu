@@ -49,6 +49,16 @@ static std::vector<int> many() {
     for (int t = 0; t < 300; ++t) for (int q = 0; q < 4; ++q) s.push_back(int(g() % 6));
     return s;
 }
+// tail skip (decode_rules tail_skip_targets): a skipped assignment points at its token's first choice, so one token holds
+// the same slot two or three times; 12 tokens share first choice 0 (one slot's columns span two groups of kDedupCols)
+static std::vector<int> skipped() {
+    std::vector<int> s;
+    for (int t = 0; t < 12; ++t) {
+        const int first = t < 9 ? 0 : 1 + t % 2;
+        s.push_back(first); s.push_back(2 + t % 4); s.push_back(t % 3 ? first : 5); s.push_back(first);
+    }
+    return s;
+}
 static void run(uint32_t type, int rows, int cols, bool per_expert, const std::vector<int> & slots = kLight) {
     const int experts = 6, topk = 4, n = int(slots.size()) / topk;
     uint64_t elems = 0, bytes = 0; require(gguf_block_layout(type, elems, bytes), "block layout");
@@ -134,6 +144,10 @@ int main() {
             run(GGML_IQ2_S, 24, 2560, pe, heavy());
             run(GGML_IQ4_NL, 40, 640, pe, heavy());
             run(GGML_Q4_1, 40, 2560, pe, heavy());
+            run(GGML_IQ3_S, 40, 2560, pe, skipped());  // the Flash-Next experts' format
+            run(GGML_IQ3_S, 40, 768, pe, skipped());
+            run(GGML_IQ3_XXS, 40, 2560, pe, skipped());
+            run(GGML_GSQ_Q2_0, 136, 640, pe, skipped());
         }
         std::puts("expert dedup PASS");
     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }

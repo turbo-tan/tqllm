@@ -99,7 +99,7 @@ struct WeightFormat {
     virtual bool gemm(const Mat &, const __half * /*x*/, __nv_bfloat16 * /*y*/, int /*n*/, cudaStream_t) const { return false; }
     virtual bool has_gemm() const { return fused_gemm_cols() > 0; }  // gemm() above is implemented (prefill dispatch, prefill_path.hpp)
     // y [n][rows] F32 through the u4h-family GEMM (weights read once per 64 columns); false: no GEMM for this format
-    bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;
+    virtual bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const;
     // u4h kernel family id with an F32-output GEMM (u4h_family_gemm_f32), including the UD types that are not u4h_id()
     // formats (gemm_f32 above keeps u4h_id(), so engines that call it are unchanged)
     virtual int gemm_f32_id() const { return u4h_id(); }
@@ -115,6 +115,10 @@ struct WeightFormat {
 // Format that loads GGUF type `gguf_type`, or null. The loaded Mat may point at a different (runtime) format,
 // e.g. Q4_0 loads as W4S when every 128-group shares one scale.
 const WeightFormat * weight_format(uint32_t gguf_type);
+// A resident K6 / K5 matrix (16-row multiple, 128-column multiple) rewritten in place as 16-row x 4-block tiles and switched to
+// its tiled format: the same kernels and output bits, every warp load one contiguous run (GB10 decode matvec ~185 -> ~215
+// GB/s). The tiled Mat is not row-sliceable and has no expert paths. false: format or shape without tiles (Mat unchanged).
+bool tile_dense(Mat & m, cudaStream_t s = nullptr);
 void register_weight_format(uint32_t gguf_type, std::unique_ptr<WeightFormat>);
 // Replaces format `gguf_type` with wrap(old): the wrapper keeps the old format and forwards what it does not replace (plugin
 // patches, plugin_format.hpp). Call before any model loads: matrices loaded earlier keep the old format.

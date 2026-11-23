@@ -3,6 +3,9 @@
 // to the box where it is expected to finish soonest, counting the K/V a box already holds for the prompt (prefix reuse).
 // Pure, header-only: tests/serve_router.cpp runs it with just g++.
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <map>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -19,6 +22,7 @@ struct BoxStatus {
     double decode_tps = 0;     // measured tokens / s of one sequence alone (0: unknown)
     double hold_s = 0;         // mean wall time of a request on this box (0: unknown)
     bool helped = false;       // the front door with --split experts: its lone requests get the other box's experts
+    std::string state;         // tqserve --state-listen address (host:port): this box serves and fetches conversation states
 };
 
 // Decode slows with the sequences a box batches: per-sequence rate r1 / (1 + k (n - 1)). GB10 Flash-Next IQ3_S,
@@ -105,6 +109,88 @@ inline int pick_box(const std::vector<BoxStatus> & raw, double prompt, double ge
         if ((!tie && c < best_cost) || (tie && load < oload)) { best = i; best_cost = c; }
     }
     return best < 0 ? 0 : best;
+}
+
+// Conversation states across boxes (--state-listen): a box that can fetch the prompt's kept state from the box holding it
+// is costed as if it held it, less the transfer (priced in prefill tokens: kStateBytesPerToken over the link), so the
+// request goes to the box expected to answer first by load, not to the holder by default. owner = the box to fetch from
+// (-1: none: the pick holds the most, or no fetch prices below its own prefill).
+constexpr double kStateBytesPerToken = 2e5;  // Flash-Next 142 MB / 849 positions, 27B 203 MB / 906 (GB10 11-15)
+struct RoutePick { int box = 0, owner = -1; double fetch_s = 0; };
+inline double state_fetch_s(double tokens, double link_bps) { return 0.02 + tokens * kStateBytesPerToken / (link_bps > 0 ? link_bps : 1e9); }
+inline RoutePick pick_box_fetch(const std::vector<BoxStatus> & raw, double prompt, double gen, double link_bps) {
+    RoutePick r;
+    int owner = -1;
+    for (int i = 0; i < int(raw.size()); ++i) {
+        const auto & b = raw[size_t(i)];
+        if (b.ok && !b.state.empty() && b.reuse > 0 && (owner < 0 || b.reuse > raw[size_t(owner)].reuse)) owner = i;
+    }
+    if (owner < 0) { r.box = pick_box(raw, prompt, gen); return r; }
+    const auto rated = with_measured_rates(raw);
+    auto boxes = raw;
+    std::vector<char> fetches(raw.size(), 0);
+    const double held = raw[size_t(owner)].reuse, fetch = state_fetch_s(held, link_bps);
+    for (int i = 0; i < int(boxes.size()); ++i) {
+        auto & b = boxes[size_t(i)];
+        if (i == owner || !b.ok || b.state.empty() || b.reuse >= held) continue;
+        const double prefill = rated[size_t(i)].prefill_tps > 0 ? rated[size_t(i)].prefill_tps : 1500.0;
+        const double eff = held - fetch * prefill;  // the fetch, as the prefill tokens it costs
+        if (eff > b.reuse) { b.reuse = eff; fetches[size_t(i)] = 1; }
+    }
+    r.box = pick_box(boxes, prompt, gen);
+    if (!fetches[size_t(r.box)]) return r;
+    // a near tie (the 2 % band of pick_box) goes to the holder: no transfer at all beats an equal-cost one
+    const auto adj = with_measured_rates(boxes);
+    const double pc = route_cost(adj[size_t(r.box)], prompt, gen), oc = route_cost(rated[size_t(owner)], prompt, gen);
+    if (route_has_slot(rated[size_t(owner)]) && oc <= pc * 1.02) { r.box = owner; return r; }
+    r.owner = owner; r.fetch_s = fetch;
+    return r;
+}
+
+// The last box known to hold a conversation, kept kHolderTtl past its last sighting: one late status answer (a busy box
+// answers after the 100 ms timeout, and remembered_status then knows no reuse) must not lose the holder, or the follow-up
+// neither goes to it nor fetches from it and prefills again (GB10 11-15: 9 of 48 follow-ups). Keyed by the rendered
+// prompt's first kHolderKeyChars characters (a conversation's turns share them); an entry goes at its TTL.
+constexpr double kHolderTtl = 30.0;
+constexpr size_t kHolderKeyChars = 2048;
+struct HolderMemory {
+    struct Entry { int box = -1; double reuse = 0, seen = 0; };
+    std::map<size_t, Entry> map;
+    static size_t key(const std::string & prompt) { return prompt.size() < 1024 ? 0 : std::hash<std::string>{}(prompt.substr(0, kHolderKeyChars)); }
+    // what the boxes report now: the box with the most reuse holds it
+    void note(const std::vector<BoxStatus> & boxes, size_t k, double now) {
+        if (!k) return;
+        int best = -1;
+        for (int i = 0; i < int(boxes.size()); ++i) if (boxes[size_t(i)].ok && boxes[size_t(i)].reuse > 0 && (best < 0 || boxes[size_t(i)].reuse > boxes[size_t(best)].reuse)) best = i;
+        if (best < 0) return;
+        // a lower report does not take a live entry over: the box this conversation's last turn went to holds a newer state
+        // than the one an older holder still reports (it lent that state away; GB10 11-15)
+        const auto it = map.find(k);
+        if (it != map.end() && now - it->second.seen <= kHolderTtl && it->second.box != best && boxes[size_t(best)].reuse <= it->second.reuse) return;
+        map[k] = {best, boxes[size_t(best)].reuse, now};
+    }
+    // the box this request went to holds it after the request (prompt tokens at least)
+    void served(size_t k, int box, double tokens, double now) { if (k) map[k] = {box, tokens, now}; }
+    // a box that answered (or was remembered) without reporting the reuse it holds gets the remembered reuse back
+    void apply(std::vector<BoxStatus> & boxes, size_t k, double now) {
+        if (!k) return;
+        for (auto it = map.begin(); it != map.end();) it = now - it->second.seen > kHolderTtl ? map.erase(it) : std::next(it);
+        const auto it = map.find(k);
+        if (it == map.end() || it->second.box < 0 || it->second.box >= int(boxes.size())) return;
+        auto & b = boxes[size_t(it->second.box)];
+        if (b.ok && b.reuse < it->second.reuse) b.reuse = it->second.reuse;
+        // one box holds a conversation's state at a time (a lender drops its copy on the fetcher's ack): another box's lower
+        // report is a stale routing text, not a state to resume from
+        for (int i = 0; i < int(boxes.size()); ++i)
+            if (i != it->second.box && boxes[size_t(i)].reuse <= it->second.reuse) boxes[size_t(i)].reuse = 0;
+    }
+};
+
+// tokens two sequences share from the start
+inline size_t shared_prefix(const std::vector<uint32_t> & a, const std::vector<uint32_t> & b) {
+    size_t n = 0; const size_t m = std::min(a.size(), b.size());
+    while (n < m && a[n] == b[n]) ++n;
+    return n;
 }
 
 // Prompt tokens a slot's last conversation (its rendered prompt + answer, `held`) shares with a new rendered prompt,

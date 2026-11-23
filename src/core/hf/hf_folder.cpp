@@ -455,6 +455,73 @@ GgufTensor HfFolder::q4_experts(const std::string & m) const {
     return t;
 }
 
+namespace {
+struct ExpertRows { uint64_t experts = 0, rows = 0, cols = 0, row0 = 0, stride = 1, nrows = 0; };
+ExpertRows expert_rows(const SafeTensor & w, uint64_t cols, uint64_t row0, uint64_t stride, uint64_t nrows, const std::string & m) {
+    if (w.shape.size() != 3) throw std::runtime_error("hf: " + m + " is not an expert stack [experts][rows][..]");
+    ExpertRows r{w.shape[0], w.shape[1], cols, row0, stride, nrows ? nrows : (w.shape[1] - row0 + stride - 1) / stride};
+    if (!stride || row0 + (r.nrows - 1) * stride >= r.rows) throw std::runtime_error("hf: " + m + " row selection out of range");
+    return r;
+}
+}  // namespace
+
+GgufTensor HfFolder::nvfp4_experts(const std::string & m, uint64_t row0, uint64_t stride, uint64_t nrows) const {
+    const SafeTensor w = at(m), sc = at(m + "_scale"), amax = at(m + "_amax"), den = at(m + "_outer_scale_denominator");
+    if (w.dtype != "U8" || sc.dtype != "F8_E4M3" || amax.dtype != "F32" || den.dtype != "F32" || den.bytes != 4)
+        throw std::runtime_error("hf: " + m + " is not a modelopt NVFP4 expert stack");
+    const ExpertRows r = expert_rows(w, w.shape[2] * 2, row0, stride, nrows, m);
+    if (r.cols % 128 || sc.shape.size() != 3 || sc.shape[2] * 16 != r.cols || sc.shape[1] != r.rows || amax.bytes != r.experts * 4)
+        throw std::runtime_error("hf: " + m + " NVFP4 scale shapes");
+    const uint64_t nb = r.cols / 128, per = r.nrows * nb * 76;
+    GgufTensor t; t.type = GGML_NVFP4G; t.ne = {r.cols, r.nrows, r.experts}; t.bytes = r.experts * per;
+    auto maps = std::make_shared<ShardMaps>();
+    t.make_slice = [r, w, sc, amax, den, per, nb, maps](uint64_t e) {
+        if (e >= r.experts) throw std::runtime_error("hf: expert index");
+        float a, d;
+        std::memcpy(&a, maps->at(amax) + e * 4, 4);
+        std::memcpy(&d, maps->at(den), 4);
+        const float g = a / d;  // the expert's global scale: amax / (6 x 448)
+        const char * wq = maps->at(w) + e * r.rows * (r.cols / 2), * ws = maps->at(sc) + e * r.rows * (r.cols / 16);
+        std::vector<char> out(per);
+        for (uint64_t i = 0; i < r.nrows; ++i) {
+            const uint64_t row = r.row0 + i * r.stride;
+            for (uint64_t b = 0; b < nb; ++b) {
+                char * o = out.data() + (i * nb + b) * 76;
+                std::memcpy(o, &g, 4);
+                std::memcpy(o + 4, ws + row * (r.cols / 16) + b * 8, 8);
+                std::memcpy(o + 12, wq + row * (r.cols / 2) + b * 64, 64);
+            }
+        }
+        return out;
+    };
+    t.make = [t] { std::vector<char> out; for (uint64_t e = 0; e < t.ne[2]; ++e) { const auto s = t.make_slice(e); out.insert(out.end(), s.begin(), s.end()); } return out; };
+    return t;
+}
+
+GgufTensor HfFolder::mxfp8_experts(const std::string & m, uint64_t row0, uint64_t stride, uint64_t nrows) const {
+    const SafeTensor w = at(m), sc = at(m + "_scale");
+    if (w.dtype != "F8_E4M3" || sc.dtype != "U8") throw std::runtime_error("hf: " + m + " is not an MXFP8 expert stack");
+    const ExpertRows r = expert_rows(w, w.shape[2], row0, stride, nrows, m);
+    if (r.cols % 32 || sc.shape.size() != 3 || sc.shape[1] != r.rows || sc.shape[2] * 32 != r.cols)
+        throw std::runtime_error("hf: " + m + " MXFP8 scale shapes (one E8M0 per 32 along a row)");
+    const uint64_t rb = r.cols + r.cols / 32, per = r.nrows * rb;
+    GgufTensor t; t.type = GGML_MXFP8; t.ne = {r.cols, r.nrows, r.experts}; t.bytes = r.experts * per;
+    auto maps = std::make_shared<ShardMaps>();
+    t.make_slice = [r, w, sc, rb, per, maps](uint64_t e) {
+        if (e >= r.experts) throw std::runtime_error("hf: expert index");
+        const char * wq = maps->at(w) + e * r.rows * r.cols, * ws = maps->at(sc) + e * r.rows * (r.cols / 32);
+        std::vector<char> out(per);
+        for (uint64_t i = 0; i < r.nrows; ++i) {
+            const uint64_t row = r.row0 + i * r.stride;
+            std::memcpy(out.data() + i * rb, wq + row * r.cols, r.cols);
+            std::memcpy(out.data() + i * rb + r.cols, ws + row * (r.cols / 32), r.cols / 32);
+        }
+        return out;
+    };
+    t.make = [t] { std::vector<char> out; for (uint64_t e = 0; e < t.ne[2]; ++e) { const auto s = t.make_slice(e); out.insert(out.end(), s.begin(), s.end()); } return out; };
+    return t;
+}
+
 GgufTensor HfFolder::q4_rows(const std::vector<std::string> & ms) const {
     auto as = std::make_shared<std::vector<Affine>>(); auto starts = std::make_shared<std::vector<uint64_t>>();
     uint64_t rows = 0;

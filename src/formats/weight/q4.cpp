@@ -446,7 +446,7 @@ struct Iq4l final : WeightFormat {
 };
 // NVF4 (engine id 1018, u4h FMT 16): NVFP4 E2M1 nibbles in IQ4L's 32-weight blocks (16 B, low nibble = even weight); aux per
 // row: the cols / 16 E4M3 group scales, then the row's F32 global scale (NVIDIA's bytes: 4.5 bits per weight with the codes).
-// Experts only (no dense dequant).
+// Experts and dense matrices (prefill through dequant_h).
 struct Nvf4 final : WeightFormat {
     int max_exact_cols() const override { return 64; }
     int u4h_id() const override { return 16; }
@@ -486,8 +486,13 @@ struct Nvf4 final : WeightFormat {
     void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
         tqllm_cuda::u4h_family_matvec_f32(16, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
     }
-    void dequant_h(const Mat &, __half *, cudaStream_t) const override {
-        throw std::runtime_error("NVF4: no dense dequant (expert weights run on the u4h kernels)");
+    // dense NVF4 matrices (modelopt shared expert, LM head): prefill through dequant + cuBLAS
+    void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
+        tqllm_cuda::nvf4_dequant_h(static_cast<const uint8_t *>(m.p), m.aux, out, 0, m.rows, m.cols, s);
+    }
+    bool dequant_rows_h(const Mat & m, __half * out, int row0, int nrows, cudaStream_t s) const override {
+        tqllm_cuda::nvf4_dequant_h(static_cast<const uint8_t *>(m.p), m.aux, out, row0, nrows, m.cols, s);
+        return true;
     }
 };
 // NVFP4G (GGUF 323) loader -> NVF4: per 128 weights F32 global, 8 E4M3 group scales, 64 bytes of codes. The codes go as they are
@@ -981,6 +986,44 @@ struct K5 final : WeightFormat {
                                  m.cols, s);
     }
 };
+
+// K6 / K5 stored as 16-row x 4-block tiles (tile_dense): the base format's kernels with tiled loads, same bits
+struct DenseTiled final : WeightFormat {
+    int id; const char * nm; const WeightFormat * base;
+    DenseTiled(int i, const char * n, const WeightFormat * b) : id(i), nm(n), base(b) {}
+    const char * name() const override { return nm; }
+    Basis basis() const override { return Basis::Plain; }
+    int max_matvec_cols() const override { return base->max_matvec_cols(); }
+    int max_exact_cols() const override { return base->max_exact_cols(); }
+    int max_batch_cols() const override { return base->max_batch_cols(); }
+    int fused_gemm_cols() const override { return base->fused_gemm_cols(); }
+    Mat load(const std::vector<char> &, int, int, const Upload &, cudaStream_t) const override {
+        throw std::runtime_error(std::string(nm) + " is produced by tile_dense");
+    }
+    void matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_dense_tiled_matvec_bf16(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    bool has_matvec_ld() const override { return true; }
+    bool matvec_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_dense_tiled_matvec_bf16(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    void matvec_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        tqllm_cuda::u4h_dense_tiled_matvec_f32(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s);
+    }
+    void dequant_h(const Mat & m, __half * out, cudaStream_t s) const override {
+        tqllm_cuda::u4h_dense_tiled_dequant_h(id, static_cast<const uint8_t *>(m.p), m.aux, out, m.rows, m.cols, s);
+    }
+    bool gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, cudaStream_t s) const override { return gemm_ld(m, x, y, n, m.rows, s); }
+    bool gemm_ld(const Mat & m, const __half * x, __nv_bfloat16 * y, int n, int ldy, cudaStream_t s) const override {
+        tqllm_cuda::u4h_dense_tiled_gemm(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, ldy);
+        return true;
+    }
+    bool gemm_f32(const Mat & m, const __half * x, float * y, int n, cudaStream_t s) const override {
+        if (m.cols % 64) return false;
+        return tqllm_cuda::u4h_dense_tiled_gemm_f32(id, static_cast<const uint8_t *>(m.p), m.aux, x, y, m.rows, m.cols, n, s, m.rows);
+    }
+};
 // Q5_K (GGUF 13) loader -> K5: block d, dmin, scales[12], qh[32], qs[128]; element e: nibble of qs[(e / 64) * 32 + e % 32]
 // (high nibble for the second 32), high bit qh[e % 32] >> (e / 32).
 struct Q5_K final : WeightFormat {
@@ -1210,6 +1253,21 @@ bool WeightFormat::expert_gemm_i8(const Mat & m, const int8_t * xq, const float 
     if (id != 1 && id != 4 && id != 5 && id != 6 && id != 7 && id != 10 && id != 13 && id != 14) return false;
     tqllm_cuda::k_expert_gemm_i8(id, static_cast<const uint8_t *>(m.p), m.aux, xq, xs, xsum, y, rows, m.cols, counts, groups,
                                  capacity, experts, topk, per_expert_input, stream, mode);
+    return true;
+}
+}  // namespace tqllm
+
+namespace tqllm {
+bool tile_dense(Mat & m, cudaStream_t s) {
+    using formats::DenseTiled;
+    static const DenseTiled k6t(7, "K6T", weight_format(formats::ID_K6)), k5t(6, "K5T", weight_format(formats::ID_K5));
+    const DenseTiled * t = m.fmt == k6t.base ? &k6t : m.fmt == k5t.base ? &k5t : nullptr;
+    if (!t || !m.p || m.rows % 16 || m.cols % 128) return false;
+    tqllm_cuda::u4h_dense_tile(const_cast<void *>(m.p), t->id, m.rows, m.cols, s);
+    tqllm_cuda::u4h_dense_tiled_tune(t->id, static_cast<const uint8_t *>(m.p), m.aux, m.rows, m.cols, s);
+    // the tiles are in place before any other stream (a captured decode graph) reads the matrix
+    if (const cudaError_t e = cudaDeviceSynchronize(); e != cudaSuccess) throw std::runtime_error(std::string("tile_dense: ") + cudaGetErrorString(e));
+    m.fmt = t;
     return true;
 }
 }  // namespace tqllm

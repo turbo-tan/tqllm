@@ -1,3 +1,4 @@
+#include "layer_split.hpp"
 #include "tqllm/options.hpp"
 
 #include "flags_gen.hpp"
@@ -23,7 +24,7 @@ std::string codec(const std::string & t) {  // llama.cpp cache type names accept
 }  // namespace
 
 std::string EngineOptions::kv_format() const {
-    if (!kv.empty()) return kv;
+    if (!kv.empty()) return kv == "q8" ? "q8/q8" : kv;  // q8: the rotated int8 codec on K and V (QSA rows, tree verify)
     if (cache_k.empty() && cache_v.empty()) return "bf16";
     const std::string k = cache_k.empty() ? "tq3" : codec(cache_k);
     const std::string v = cache_v.empty() ? k : codec(cache_v);
@@ -31,7 +32,7 @@ std::string EngineOptions::kv_format() const {
 }
 
 std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext, bool no_exact_path,
-                                         const char * (*env)(const char *), int slots) {
+                                         const char * (*env)(const char *), int) {
     std::vector<std::string> out;
     if (!o.exact) return out;
     if (o.prefill_int8 == 1) out.push_back("--prefill-int8 on: int8 prefill GEMMs (KLD 0.003-0.007 vs FP16 prefill)");
@@ -39,11 +40,9 @@ std::vector<std::string> exact_conflicts(const EngineOptions & o, bool flashnext
     if (o.prefill_fp8 == 1) out.push_back("--prefill-fp8 on: FP8 prefill GEMMs (KLD 0.003-0.005 vs FP16 prefill)");
     if (const std::string kv = o.kv_format(); kv != "bf16") out.push_back("KV " + kv + " (-ctk / -ctv / --kv): a lossy KV cache");
     if (flashnext)
-        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_TAIL_SKIP", "TQFN_CPU_MISS"})
+        for (const char * v : {"TQFN_PREFILL_INT8", "TQFN_DENSE_INT8", "TQFN_CPU_MISS"})
             if (const char * s = env(v); s && std::atoi(s) != 0) out.push_back(std::string(v) + " set: an approximation");
     if (no_exact_path) out.push_back("MiniMax / GLM have no exact path yet: they run their approximate path");
-    if (flashnext && o.prompt_cache && slots > 1)
-        out.push_back("--prompt-cache on: a reused prompt prefix splits the prefill, so the text can differ from an uncached prompt");
     for (const auto & p : o.inexact_patches) out.push_back("--plugin patch " + p + ": not byte-identical to the built-in kernel");
     return out;
 }
@@ -124,7 +123,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--prompt-cache") {
         const std::string v = value();
         if (v != "on" && v != "off") throw std::invalid_argument("--prompt-cache must be on or off");
-        o.prompt_cache = v == "on";
+        o.prompt_cache = v == "on"; o.prompt_cache_set = true;
     }
     else if (a == "--prompt-park") o.prompt_park = std::stoi(value());
     else if (a == "--rope-scaling") o.rope.type = value();
@@ -135,7 +134,8 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "--yarn-beta-fast") o.rope.beta_fast = std::stof(value());
     else if (a == "--yarn-beta-slow") o.rope.beta_slow = std::stof(value());
     else if (a == "-md" || a == "--model-draft") o.draft_model = value();
-    else if (a == "--tp-rank") o.tp_rank = std::stoi(value()), o.tp_world = 2;
+    else if (a == "--tp-rank") { o.tp_rank = count(0); if (o.tp_world < 2) o.tp_world = 2; }  // two ranks unless --tp-world says more
+    else if (a == "--tp-world") o.tp_world = count(2);
     else if (a == "--tp-peer") o.tp_peer = value();
     else if (a == "--split") {
         const std::string v = value();
@@ -143,7 +143,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         else if (v == "experts") o.split_experts = true;
         else throw std::invalid_argument("--split: layer or experts");
     }
-    else if (a == "--split-at") o.split_at = std::stoi(value());
+    else if (a == "--split-at") o.split_at = parse_split_at(value());
     else if (a == "--tp-port") o.tp_port = std::stoi(value());
     else if (a == "--plugin") o.plugins.push_back(value());
     else if (a == "--hot-map") o.hot_map = value();
@@ -186,7 +186,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--gdn-state f32|f16] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+    return "  engine: [--exact on|off (on: reference precision; with the prompt cache a long prompt is read in two parts at its reuse point)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off (Flash-Next: on where memory fits)] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n [--gdn-state f32|f16]"
            "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"

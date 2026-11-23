@@ -60,7 +60,7 @@ std::unique_ptr<MappedGguf> MappedGguf::raw(const std::string & path) {
 }
 MappedGguf::~MappedGguf() = default;
 void MappedGguf::release_tensor(const std::string & name) const {
-    if (folder_) return;  // a folder's shards stay mapped; built tensors stay built
+    if (folder_ || replaced_.count(name)) return;  // a folder's shards stay mapped; built tensors stay built
     const auto v = tensor(name);
     mapping_->file.drop(size_t(v.data - mapping_->data), v.size);
 }
@@ -74,6 +74,7 @@ size_t MappedGguf::warm_tensor(const std::string & name, int threads) const {
         for (size_t i = 0; i < v.size; i += page) sum += size_t(uint8_t(v.data[i]));
         (void) sum; return v.size;
     }
+    if (replaced_.count(name)) return 0;
     const auto v = tensor(name); const uint64_t base = uint64_t(v.data - mapping_->data);
     const os::ReadFile file(mapping_->path);
     if (!file.ok()) return 0;
@@ -88,6 +89,12 @@ size_t MappedGguf::warm_tensor(const std::string & name, int threads) const {
     });
     for (auto & t : pool) t.join();
     return done;
+}
+void MappedGguf::advise_random(const std::string & name) const {
+    if (folder_ || replaced_.count(name)) return;
+    const auto v = tensor(name);
+    mapping_->file.advise_random(size_t(v.data - mapping_->data), v.size);
+    on_demand_.insert(name);
 }
 void MappedGguf::release_pages() const {
     if (folder_) return;
@@ -107,13 +114,27 @@ GgufBytes MappedGguf::checked(const GgufTensor & t) const {
         throw std::runtime_error("GGUF mapped view exceeds file");
     return {mapping_->data + t.offset, size_t(t.bytes)};
 }
+void MappedGguf::replace_tensor(const std::string & name, uint32_t type, std::vector<char> bytes) {
+    if (folder_) throw std::runtime_error("replace_tensor: not for a checkpoint folder: " + name);
+    auto & t = file_.tensors.at(name);
+    if (!t.parts.empty() || t.make) throw std::runtime_error("replace_tensor: virtual tensor " + name);
+    t.type = type; t.bytes = bytes.size();
+    replaced_[name] = std::move(bytes);
+}
 GgufBytes MappedGguf::tensor(const std::string & name) const {
+    if (const auto it = replaced_.find(name); it != replaced_.end()) return {it->second.data(), it->second.size()};
     if (folder_) return folder_->bytes(name, file_.tensors.at(name), file_);
     return checked(file_.tensors.at(name));
 }
 GgufBytes MappedGguf::expert(const std::string & name, uint64_t index) const {
     if (folder_ && file_.tensors.at(name).make_slice) throw std::runtime_error("hf: " + name + " is built per expert (expert_owned)");
     return checked(gguf_expert_slice(file_.tensors.at(name), index, name));
+}
+bool MappedGguf::expert_range(const std::string & name, uint64_t index, std::string & path, uint64_t & offset, size_t & bytes) const {
+    if (folder_ || replaced_.count(name)) return false;
+    const GgufBytes v = expert(name, index);
+    path = mapping_->path; offset = uint64_t(v.data - mapping_->data); bytes = v.size;
+    return true;
 }
 std::pair<GgufBytes, std::shared_ptr<const void>> MappedGguf::expert_owned(const std::string & name, uint64_t index) const {
     const auto & t = file_.tensors.at(name);
@@ -144,6 +165,8 @@ std::vector<float> MappedGguf::gather_rows(const std::string & name, const std::
     const auto data = folder_ ? tensor(name) : checked(t);  // a folder's built tensor (token embedding): built once
     const size_t stride = size_t(t.ne[0] / block * bytes);
     std::vector<float> result(rows.size() * size_t(t.ne[0]));
+    if (!folder_ && on_demand_.count(name))  // rows read on demand: every row's pages asked for before the first fault waits
+        for (auto row : rows) mapping_->file.advise_willneed(size_t(data.data + row * stride - mapping_->data), stride);
     const auto part = [&](size_t i0, size_t i1) {
         for (size_t i = i0; i < i1; ++i)
             dequantize_host(t.type, data.data + rows[i] * stride, result.data() + i * t.ne[0], int64_t(t.ne[0]));

@@ -46,7 +46,7 @@ inline ContextKeep context_keep(const MemShape & s, const MemRun & r) {
     const size_t moved = r.kv_host && r.context > 2 * r.kv_host_keep
         ? size_t(s.attention_layers) * size_t(r.context - 2 * r.kv_host_keep) * kv_row : 0;
     const size_t full = tqllm::prefill_context_bytes(r.context, 16, s.attention_layers, s.kv_heads, s.head_dim, s.index_dim);
-    return {full > moved ? full - moved : 0, (r.context > 65536 ? size_t(2048) : r.sequences > 1 ? size_t(256) : size_t(1024)) * kMiB};
+    return {full > moved ? full - moved : 0, (r.sequences > 1 ? (r.context > 65536 ? size_t(2048) : size_t(256)) : size_t(1024)) * kMiB};
 }
 
 // One sequence's attention K/V at `context` positions: per attention layer the bf16 K and V rows, the indexer's raw keys
@@ -71,6 +71,12 @@ inline size_t keep_state(const MemShape & s, const MemRun & r, size_t state_esti
 inline size_t request_shrink_bytes(const MemShape & s, size_t tokens, size_t free, size_t reserve, size_t state = 0) {
     const size_t need = sequence_kv_bytes(s, int(tokens)) + state + reserve;
     return free >= need ? 0 : need - free;
+}
+// Several sequences: the K/V rows a new sequence allocates. With the prompt cache it is sized like one sequence's
+// (cached_sequence_rows: the request plus room for the next turn) and a next turn that does not fit reads its prompt
+// again; sizing every sequence to the slot context took ~1 GB per request from the banks (3090 np 4: 70 vs 105 tok/s).
+inline size_t multi_sequence_rows(bool caching, size_t prompt, size_t max_tokens, size_t slot_context) {
+    return caching ? cached_sequence_rows(prompt, max_tokens, slot_context) : std::min(prompt + max_tokens + 16, slot_context);
 }
 struct SlotPlan {
     size_t keep = 0;      // bytes kept free beside the banks (incl. the measured rebuild extra)

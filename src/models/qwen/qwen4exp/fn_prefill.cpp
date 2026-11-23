@@ -2,6 +2,7 @@
 #include "debug.hpp"
 #include "fn_model.hpp"
 #include "decode_rules.hpp"
+#include "host_expert_tier.hpp"
 
 std::vector<int> DecodeModel::stage_plan(const MixedExpertCache & cache, int layer) {
     std::vector<int> plan; const bool bank = cache.bank_ready(layer);
@@ -30,29 +31,52 @@ void DecodeModel::stage_alloc(PrefillStage & st, size_t need, int K) {
     for (int b = 0; b < 2; ++b) ck(cudaEventRecord(st.done[b], nullptr));
 }
 
-void DecodeModel::stage_upload(PrefillStage & st, const MixedExpertCache & cache, int layer, int g) {
+// the pinned host ring: both halves of `need` bytes (grown after every copy and read-ahead from it is done)
+static void ring_grow(DecodeModel::PrefillStage & st, size_t need) {
+    if (st.ring_bytes >= need) return;
+    if (st.pre.valid()) st.pre.get();
+    ck(cudaDeviceSynchronize());
+    for (auto & r : st.ring) { if (r) ck(cudaFreeHost(r)); r = nullptr; }
+    for (auto & r : st.ring) ck(cudaMallocHost(reinterpret_cast<void **>(&r), need));
+    st.ring_bytes = need; st.ring_layer = -1;
+}
+
+void DecodeModel::stage_upload(PrefillStage & st, MixedExpertCache & cache, int layer, int g) {
     const auto lay = cache.bank_layout(layer); size_t off[6]; stage_offsets(lay, st.K, off);
-    const int b = g & 1; ck(cudaStreamWaitEvent(st.copy, st.done[b], 0));
+    const int b = (g + st.half0) & 1; ck(cudaStreamWaitEvent(st.copy, st.done[b], 0));
     const size_t g0 = size_t(g) * st.K, g1 = std::min(st.plan.size(), g0 + size_t(st.K));
-    if (!lay.src0) {  // experts read from the GGUF on demand: the group's blocks are assembled in this half's pinned buffer
-        require(st.blocks && *st.blocks, "layer-major prefill: experts to stream but no expert source");
-        if (st.bounce_bytes < size_t(st.K) * lay.block) {
-            ck(cudaStreamSynchronize(st.copy));
-            for (auto & hb : st.bounce) if (hb) { ck(cudaFreeHost(hb)); hb = nullptr; }
-            st.bounce_bytes = size_t(st.K) * lay.block;
-            for (auto & hb : st.bounce) ck(cudaMallocHost(reinterpret_cast<void **>(&hb), st.bounce_bytes));
+    if (lay.host_tier) {  // per-expert blocks: the tier's, or read from the drive into the ring
+        HostExpertTier & tier = *cache.host_tier();
+        // layer-outer: the layer's ring half holds every expert read for it (slot = expert id), so its later chunks
+        // upload them again from RAM; else this staging half's ring holds the group's reads (slot = position)
+        const bool whole = st.outer && st.ring_layer == layer;
+        const int rb = whole ? (layer & 1) : b;
+        if (!whole) {
+            if (st.pre.valid()) st.pre.get();
+            ring_grow(st, size_t(st.K) * lay.block);
+            ck(cudaEventSynchronize(st.ready[b]));  // this half's last upload has read its ring
         }
-        ck(cudaEventSynchronize(st.ready[b]));  // this half's previous upload has read its host blocks
-        const size_t n = g1 - g0;
-        if (n) (*st.blocks)(layer, st.plan.data() + g0, n, st.bounce[b], lay.block);
-        size_t po = 0;
-        for (int i = 0; i < 6; ++i) {
-            if (lay.piece[i] && n) ck(cudaMemcpy2DAsync(st.half[b] + off[i], lay.piece[i], st.bounce[b] + po, lay.block,
-                                                        lay.piece[i], n, cudaMemcpyHostToDevice, st.copy));
-            po += lay.piece[i];
+        cache.tier_before(st.copy);  // an evicted expert's device-to-host copy into the tier lands before it is read here
+        std::vector<const char *> src(g1 - g0); std::vector<int> cold; std::vector<char *> into;
+        for (size_t r = g0; r < g1; ++r) {
+            const int e = st.plan[r];
+            char * slot = st.ring[rb] + (whole ? size_t(e) : r - g0) * lay.block;
+            if (const char * p = tier.find(layer, e)) src[r - g0] = p;
+            else if (whole && st.ring_have[size_t(e)]) src[r - g0] = slot;
+            else { cold.push_back(e); into.push_back(slot); src[r - g0] = slot; if (whole) st.ring_have[size_t(e)] = 1; }
         }
-        st.copy_bytes += double(n) * lay.block;
+        tier.read_into(layer, cold, into);
+        for (size_t r = g0; r < g1; ++r) {
+            size_t po = 0;
+            for (int i = 0; i < 6; ++i) {
+                if (lay.piece[i]) ck(cudaMemcpyAsync(st.half[b] + off[i] + (r - g0) * lay.piece[i], src[r - g0] + po, lay.piece[i], cudaMemcpyHostToDevice, st.copy));
+                po += lay.piece[i];
+            }
+        }
+        st.copy_bytes += double(g1 - g0) * lay.block;
         ck(cudaEventRecord(st.ready[b], st.copy));
+        if (whole) { if (!st.ring_ev[rb]) ck(cudaEventCreateWithFlags(&st.ring_ev[rb], cudaEventDisableTiming)); ck(cudaEventRecord(st.ring_ev[rb], st.copy)); }
+        cache.tier_after(st.ready[b]);  // the tier reuses the blocks read here only after these copies
         return;
     }
     for (size_t r0 = g0; r0 < g1;) {
@@ -68,14 +92,54 @@ void DecodeModel::stage_upload(PrefillStage & st, const MixedExpertCache & cache
     ck(cudaEventRecord(st.ready[b], st.copy));
 }
 
-void DecodeModel::stage_begin(PrefillStage & st, const MixedExpertCache & cache, int layer) {
+// layer-outer with a host tier: `layer`'s ring half takes its streamed experts (slot = expert id). Once every upload of
+// the layer two back (the same half) is done, the half is this layer's: its read-ahead (if it ran) is kept.
+static void ring_take(DecodeModel::PrefillStage & st, MixedExpertCache & cache, int layer, size_t block) {
+    const int rb = layer & 1;
+    if (st.pre_layer == layer) { if (st.pre.valid()) st.pre.get(); st.ring_have = st.pre_read; }
+    else {
+        if (st.pre.valid()) st.pre.get();
+        ring_grow(st, size_t(cache.experts()) * block);
+        if (st.ring_ev[rb]) ck(cudaEventSynchronize(st.ring_ev[rb]));
+        st.ring_have.assign(size_t(cache.experts()), 0);
+    }
+    st.pre_layer = -1; st.ring_layer = layer;
+}
+
+void DecodeModel::stage_prefetch(PrefillStage & st, MixedExpertCache & cache, int layer) {
+    if (!st.outer || layer >= cache.layers() || !st.copy || !cache.has_layout(layer)) return;
+    const auto lay = cache.bank_layout(layer);
+    if (!lay.host_tier || st.layer == layer || st.ring_layer == layer) return;
+    if (st.pre.valid()) st.pre.get();
+    if (st.ring_bytes < size_t(cache.experts()) * lay.block) return;  // grown when the layer is staged
+    const int rb = layer & 1;
+    if (st.ring_ev[rb]) ck(cudaEventSynchronize(st.ring_ev[rb]));  // the uploads of the layer two back read this half
+    HostExpertTier & tier = *cache.host_tier();
+    st.pre_read.assign(size_t(cache.experts()), 0);
+    std::vector<int> ids; std::vector<char *> into;
+    for (int e : stage_plan(cache, layer))
+        if (tier.peek(layer, e) < 0) { ids.push_back(e); into.push_back(st.ring[rb] + size_t(e) * lay.block); st.pre_read[size_t(e)] = 1; }
+    st.pre_layer = layer;
+    st.pre = std::async(std::launch::async, [&tier, layer, ids = std::move(ids), into = std::move(into)] { tier.read_into(layer, ids, into); });
+}
+
+void DecodeModel::stage_restart(PrefillStage & st, MixedExpertCache & cache, int layer) {
+    if (st.layer != layer || st.cache != &cache || st.plan.size() <= size_t(st.K)) return;  // one group stays staged
+    st.plan = stage_plan(cache, layer); st.issued = 0;
+    const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
+    for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
+}
+
+void DecodeModel::stage_begin(PrefillStage & st, MixedExpertCache & cache, int layer) {
     if (st.layer == layer && st.cache == &cache) return;
     st.cache = &cache; st.layer = layer; st.issued = 0;
+    st.half0 = st.K >= cache.experts() ? (layer & 1) : 0;  // a whole layer per group (layer-outer): the layers alternate halves
     // no prepacked file (a GB10 keeps every expert in its bank): nothing to stage, prefill_layer fills the bank instead
     const auto lay = cache.bank_layout(layer);
-    if (!lay.src0) { st.plan.clear(); return; }
+    if (!lay.streamable()) { st.plan.clear(); return; }
     const size_t need = tqllm::stage_need(lay.piece, st.K);
     if (need > st.half_bytes) { stage_alloc(st, need, st.K); st.cache = &cache; st.layer = layer; st.issued = 0; }  // before any upload
+    if (st.outer && lay.host_tier) ring_take(st, cache, layer, lay.block);
     st.plan = stage_plan(cache, layer);
     const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
     for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
@@ -92,9 +156,8 @@ void DecodeModel::release_prefill() {
     }
     auto & st = stage();
     if (!keep) { for (auto & hp : st.half) if (hp) { ck(cudaFree(hp)); hp = nullptr; } st.half_bytes = 0; st.K = 0; }
-    for (auto & hb : st.bounce) if (hb) { ck(cudaFreeHost(hb)); hb = nullptr; }
-    st.bounce_bytes = 0;
-    st.layer = -1; st.cache = nullptr; st.plan.clear(); st.issued = 0;
+    if (st.pre.valid()) st.pre.get();
+    st.layer = -1; st.cache = nullptr; st.plan.clear(); st.issued = 0; st.pre_layer = -1; st.ring_layer = -1;
     if (!keep) { cp.rt.qsa_batch.reset(); tqllm_cuda::fn_gdn_release_workspaces(); }
     ++cp.rt.prefill_epoch;
     if (res_keep && res_keep->count > size_t(64) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(64) * width); }
@@ -182,13 +245,9 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     st.plan.resize(std::min(st.plan.size(), size_t(st.issued) * size_t(st.K)));
     std::vector<char> planned(size_t(E), 0); for (int e : st.plan) planned[size_t(e)] = 1;
     std::vector<int> hot;
-    // without a prepacked file the routed experts go through the bank while they fit in it; experts read from the GGUF
-    // on demand stream otherwise, through staging like a pack's (rt.expert_blocks)
-    int routed = 0; for (int e = 0; e < E; ++e) routed += cnt[size_t(e)] > 0;
-    const bool through_bank = tqllm::flashnext::prefill_through_bank(lay.src0 != nullptr, bool(cp.rt.expert_blocks), cache.bank_ready(layer),
-                                                                     routed, cache.slots(layer));  // decode_rules.hpp
-    for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) || through_bank ? hot : st.plan).push_back(e);
-    require(st.plan.empty() || lay.src0 || cp.rt.expert_blocks, "layer-major prefill: experts to stream but no prepacked expert file (--experts)");
+    // without a prepacked file every routed expert goes through the bank (prepare loads the missing ones)
+    for (int e = 0; e < E; ++e) if (cnt[size_t(e)] && !planned[size_t(e)]) (cache.resident(layer, e) || !lay.streamable() ? hot : st.plan).push_back(e);
+    require(st.plan.empty() || lay.streamable(), "layer-major prefill: experts to stream but no prepacked expert file (--experts)");
     const int groups = int((st.plan.size() + size_t(st.K) - 1) / size_t(st.K));
     for (; st.issued < std::min(groups, 2); ++st.issued) stage_upload(st, cache, layer, st.issued);
     // per-slot assignment lists of every pass, uploaded once: [counts W][groups W x cap]
@@ -199,7 +258,15 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
         for (size_t i = 0; i < experts.size(); ++i) { ps.slot_of[size_t(experts[i])] = slots[i]; ps.cap = std::max(ps.cap, cnt[size_t(experts[i])]); }
         ps.at = total; total += size_t(W) * (1 + ps.cap); passes.push_back(std::move(ps));
     };
-    if (!hot.empty()) { const int cap = cache.plan_slots(layer); const auto slots = cache.prepare(layer, hot); plan_pass(hot, slots, cap); }
+    // experts read from the GGUF on demand: a layer whose bank the plan borrowed computes its routed experts through a small
+    // temporary bank, released after its passes (a bank sized to the free memory took the room the plan counted on: "out
+    // of memory: attention KV page", .77 8.5K prompt); the refill after the prompt rebuilds it
+    constexpr int kTempBankSlots = 64;
+    const bool temp_bank = !lay.streamable() && borrowed && !cache.bank_ready(layer) && !hot.empty();
+    const int bank_cap = hot.empty() ? 0 : temp_bank ? cache.plan_slots_at_most(layer, kTempBankSlots) : cache.plan_slots(layer);
+    const auto hot_passes = tqllm::flashnext::bank_passes(hot, size_t(bank_cap), [&](int e) { return cache.resident(layer, e); });
+    require(hot_passes.size() == 1 || groups == 0, "layer-major prefill: bank passes beside staged experts");
+    if (!hot.empty()) { const auto slots = cache.prepare(layer, hot_passes[0]); plan_pass(hot_passes[0], slots, bank_cap); }
     for (int g = 0; g < groups; ++g) {
         const size_t g0 = size_t(g) * st.K, g1 = std::min(st.plan.size(), g0 + size_t(st.K));
         std::vector<int> ex, sl;
@@ -287,7 +354,7 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     size_t off[6]; stage_offsets(lay, st.K, off);
     const int next = layer + 1 < c.layers ? layer + 1 : -1;
     for (int g = 0; g < groups; ++g) {
-        const int b = g & 1; ck(cudaStreamWaitEvent(nullptr, st.ready[b], 0));
+        const int b = (g + st.half0) & 1; ck(cudaStreamWaitEvent(nullptr, st.ready[b], 0));
         const Pass & ps = passes[pi++];
         if (ps.cap > 0 && std::any_of(st.idx_host + ps.at, st.idx_host + ps.at + ps.W, [](int x) { return x > 0; })) {
             Mat m[3];
@@ -300,9 +367,27 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
         ck(cudaEventRecord(st.done[b], nullptr));
         if (g + 2 < groups) { stage_upload(st, cache, layer, g + 2); st.issued = g + 3; }
     }
+    // the routed experts the bank did not hold (experts read from the GGUF on demand): one more bank pass each, loaded once
+    // the pass before it has run (its slots are reused); each pass's rows are its own assignments of pf_ed
+    for (size_t k = 1; k < hot_passes.size(); ++k) {
+        ck(cudaDeviceSynchronize());
+        const int cap = cache.plan_slots(layer);
+        const auto slots = cache.prepare(layer, hot_passes[k]);
+        passes.clear(); total = 0; plan_pass(hot_passes[k], slots, cap);
+        if (st.idx_cap < total) { if (st.idx_host) ck(cudaFreeHost(st.idx_host)); st.idx_cap = std::max(total, size_t(4) << 20);
+                                  ck(cudaMallocHost(reinterpret_cast<void **>(&st.idx_host), st.idx_cap * 4)); }
+        {   std::vector<tqllm::PassSlots> ps; for (const auto & p : passes) ps.push_back({p.W, p.cap, p.at, p.slot_of.data()});
+            tqllm::fill_pass_lists(ids, A, E, ps, st.idx_host); }
+        grow(pf_idx, total);
+        ck(cudaMemcpyAsync(pf_idx->p, st.idx_host, total * 4, cudaMemcpyHostToDevice, nullptr));
+        const Mat m[3] = {cache.bank_mat(layer, 0), cache.bank_mat(layer, 1), cache.bank_mat(layer, 2)};
+        run_pass(m, passes[0]);
+    }
+    if (temp_bank) { ck(cudaDeviceSynchronize()); cache.release_bank(layer); }
     lmark(2);
     // queue the next layer's first groups now: they land while this layer finishes and the next one's dense part runs
-    if (next >= 0 && stage_early(next)) stage_begin(st, cache, next); else st.layer = -1;
+    if (pf_hold_next) {}  // step_outer: the next chunk of this layer reads the same staged experts
+    else if (next >= 0 && stage_early(next)) stage_begin(st, cache, next); else st.layer = -1;
     // combine and the hyper-connection update per sub-chunk (rows of `wide` replaced)
     for (int d = 0; d < n; d += sub) {
         const int nd = std::min(sub, n - d); ArenaMark scratch;

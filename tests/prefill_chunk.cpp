@@ -89,6 +89,16 @@ int main() {
     if (tqllm::chunk_end({}, 0, 20000, 8192) != 8192 || tqllm::chunk_end({}, 8192, 20000, 8192) != 16384)
         { std::fprintf(stderr, "FAIL no message starts: the plain grid\n"); ++failures; }
     if (tqllm::kept_state_msg({}, 20000, 0) != 0) { std::fprintf(stderr, "FAIL no message starts: nothing kept by this rule\n"); ++failures; }
+    // the system-message state (GB10 8 x 32K shared system prompt): a 31,680-token system message, a 190-token user message,
+    // the generation prompt last; kept at the end of the system message, not for short ones, not when resumed past it
+    {
+        const std::vector<uint32_t> starts{31680, 31872};
+        if (tqllm::kept_state_msg(starts, 31877, 0) != 31872) { std::fprintf(stderr, "FAIL last-message state\n"); ++failures; }
+        if (tqllm::kept_state_sys(starts, 31877, 0, 31872, 4096) != 31680) { std::fprintf(stderr, "FAIL system-message state\n"); ++failures; }
+        if (tqllm::kept_state_sys(starts, 31877, 31680, 31872, 4096) != 0) { std::fprintf(stderr, "FAIL resumed at the system end: kept already\n"); ++failures; }
+        if (tqllm::kept_state_sys({300, 500}, 600, 0, 500, 4096) != 0) { std::fprintf(stderr, "FAIL a short system message keeps nothing\n"); ++failures; }
+        if (tqllm::kept_state_sys({31680}, 31877, 0, 31680, 4096) != 0) { std::fprintf(stderr, "FAIL the same position as the last-message state\n"); ++failures; }
+    }
     if (failures) return 1;
     std::puts("prefill_chunk: ok");
     return 0;

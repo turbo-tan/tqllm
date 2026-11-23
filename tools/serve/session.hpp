@@ -38,14 +38,17 @@ struct ServeOptions {
     // think_off: what a Jinja-rendered prompt still needs when thinking is off (the MiniMax template has no
     // enable_thinking: its answer starts right after the end tag; the Qwen template closes the block itself)
     std::string think_open = "<think>", think_close = "</think>", think_off;
+    bool keep_high = false;  // the template has its own effort levels (Inkling-2: none .. high, numbers): passed verbatim, the template checks them
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
     return o;
 }
-inline int draft_length(bool native_mtp = false) {
+inline int draft_length(bool native_mtp = false, bool adaptive = false) {
     const int d = serve_options().draft_max;
-    return d ? d : native_mtp ? 4 : 0;  // --mtp 4: best of depths 1-5 and 7 at 1.6K-51K (.77 3090, 10-13); 0: the drafter's default
+    if (d) return d;
+    if (adaptive) return 0;  // the engine picks each step's depth (Inkling-2 DSpark)
+    return native_mtp ? 4 : 0;  // --mtp 4: best of depths 1-5 and 7 at 1.6K-51K (.77 3090, 10-13); 0: the drafter's default
 }
 inline uint32_t repeat_limit() { return serve_options().repeat_limit; }
 
@@ -346,10 +349,12 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 if (const auto * et = kw->get("enable_thinking"); et && et->kind == tqllm::Json::Bool) req.thinking = et->num != 0;
                 if (const auto * e = kw->get("reasoning_effort"); e && e->kind == tqllm::Json::String) effort = e->str;
             }
-            if (effort == "minimal") effort = "low";
-            if (effort == "high" || effort == "max") effort = "xhigh";
+            if (!serve_options().keep_high) {  // the native Qwen levels; keep_high: the template's own levels, verbatim
+                if (effort == "minimal") effort = "low";
+                if (effort == "high" || effort == "max") effort = "xhigh";
+            }
             std::string effort_text;
-            if (req.thinking) {
+            if (req.thinking && !serve_options().keep_high) {
                 if (effort == "xhigh")
                     effort_text = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
                                   "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
@@ -688,6 +693,7 @@ inline size_t orphan_tool_tail(std::string_view t, bool partial = false) {
 // first <function= or <tool_call> marker and keeps the prose before it, so that prose is final and can stream; a
 // tail that could still grow into either marker is held back (as emit() holds back stop-sequence prefixes).
 inline size_t tool_stream_limit(const std::string & t) {
+    if (serve_options().keep_high) return 0;  // Inkling-2: a call starts with its bare name, so the answer streams at the end
     static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
     size_t end = t.size();
     for (const auto & m : markers) { const auto p = t.find(m); if (p != std::string::npos) end = std::min(end, p); }
@@ -843,6 +849,17 @@ inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatReques
     for (const auto & stop : req.stop)
         if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
 }
+// A reply that ended before max_tokens with no EOS token in it: the engine stopped at end-of-sequence (or a stop rule),
+// not at the length limit. A trailing run of `limit` identical ids is the repeat guard's cut, which stays "length".
+inline bool stopped_without_eos(const std::vector<uint32_t> & gen, uint32_t max_tokens, bool ignore_eos, uint32_t limit) {
+    if (ignore_eos || gen.size() >= max_tokens) return false;
+    if (limit && gen.size() >= limit) {
+        uint32_t run = 1;
+        for (size_t i = gen.size() - 1; i > 0 && gen[i - 1] == gen.back(); --i) ++run;
+        if (run >= limit) return false;
+    }
+    return true;
+}
 inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & gen,
                    DecodeResult & result) {
     {
@@ -857,6 +874,10 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
             }
             output.push_back(tok);
         }
+        // engines that stop at end-of-sequence do not hand the EOS token back: a reply shorter than max_tokens without
+        // one stopped there too, unless the repeat guard cut it (GB10 27B 11-18: such replies said "length")
+        if (result.finish_reason == "length" && stopped_without_eos(gen, req.max_tokens, req.ignore_eos, repeat_limit()))
+            result.finish_reason = "stop";
         if (req.return_token_ids) result.token_ids = output;
         result.text = tokenizer.decode(output);
         for (const auto & stop : req.stop) {
@@ -893,7 +914,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         model.set_continuation(req.continuation);
         if (!images.spans.empty()) model.set_prompt_images(images.spans);
         { tqllm::PrefillObservation progress(observe_prefill(req.observation));
-        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
+        model.spec_begin(prompt, count, draft_length(model.native_mtp(), model.adaptive_depth())); }
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
         while (model.spec_advance()) {
@@ -956,7 +977,56 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
 
 // [<tool_call>]\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>\n</tool_call>: values that parse as
 // JSON (numbers, booleans, objects, arrays) are kept as JSON, anything else becomes a string.
+// Inkling-2: each call is <|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>; the
+// detokenizer drops the special tokens, so the text holds NAME{"name":"NAME","args":{...}} per call
+inline size_t json_object_end(const std::string & t, size_t open) {  // index after the '}' matching t[open], or npos
+    int depth = 0;
+    bool str = false;
+    for (size_t i = open; i < t.size(); ++i) {
+        const char c = t[i];
+        if (str) { if (c == '\\') ++i; else if (c == '"') str = false; continue; }
+        if (c == '"') str = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) return i + 1;
+    }
+    return std::string::npos;
+}
+inline void extract_inkling_tool_calls(DecodeResult & r) {
+    // a reply that starts with a call (no thinking message, e.g. right after a tool result) ends its first message at
+    // <|end_message|> like a thinking block would: the split then put the call in reasoning; move it back
+    if (r.text.find("{\"name\":") == std::string::npos && r.reasoning.find("{\"name\":") != std::string::npos) {
+        r.text = r.reasoning + r.text;
+        r.reasoning.clear();
+    }
+    static const std::string key = "{\"name\":";
+    size_t first = std::string::npos, at = 0;
+    while ((at = r.text.find(key, at)) != std::string::npos) {
+        const size_t end = json_object_end(r.text, at);
+        if (end == std::string::npos) break;
+        tqllm::Json j;
+        try { j = tqllm::parse_json(r.text.substr(at, end - at)); } catch (const std::exception &) { at = end; continue; }
+        const auto * name = j.get("name");
+        const auto * args = j.get("args");
+        if (!name || name->kind != tqllm::Json::String || !args || args->kind != tqllm::Json::Object) { at = end; continue; }
+        size_t start = at;
+        if (start >= name->str.size() && r.text.compare(start - name->str.size(), name->str.size(), name->str) == 0) start -= name->str.size();
+        if (first == std::string::npos) first = start;
+        ToolCall call;
+        call.name = name->str;
+        call.arguments = r.text.substr(at, end - at);
+        const auto ap = call.arguments.find("\"args\":");
+        call.arguments = call.arguments.substr(ap + 7, call.arguments.size() - ap - 8);
+        r.tool_calls.push_back(std::move(call));
+        at = end;
+    }
+    if (!r.tool_calls.empty()) {
+        r.text = trim(r.text.substr(0, first));
+        r.finish_reason = "tool_calls";
+    }
+}
+
 inline void extract_tool_calls(DecodeResult & r) {
+    if (serve_options().keep_high) { extract_inkling_tool_calls(r); return; }
     // <tool_call> / </tool_call> are special tokens the detokenizer drops, so blocks are found by <function=...>.
     const auto first_fn = r.text.find("<function=");
     if (first_fn == std::string::npos) {
@@ -1226,6 +1296,7 @@ private:
     }
     // tool_stream_limit() on the answer: the first marker found once, the partial-marker hold-back on the tail only
     size_t tool_limit(std::string_view t) {
+        if (serve_options().keep_high) return 0;  // Inkling-2: a call starts with its bare name: hold the answer to the end
         static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
         if (tool_at_ == std::string::npos) {
             const size_t from = tool_scan_ > 10 ? tool_scan_ - 10 : 0;
@@ -1340,7 +1411,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     {   struct HookReset { tqllm::Model & m; ~HookReset() { m.set_first_token_hook(nullptr); } } hook_reset{model};
         model.set_first_token_hook(send_first);
         tqllm::PrefillObservation progress(observe_prefill(req.observation));
-        model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
+        model.spec_begin(prompt, count, draft_length(model.native_mtp(), model.adaptive_depth())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
     send_first();

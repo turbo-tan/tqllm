@@ -3,6 +3,7 @@
 #include "debug.hpp"
 #include "fn_state.hpp"
 #include "experts/moe_kernels.cuh"
+#include <optional>
 #include <vector>
 // conv / defer (several sequences): the conv rows go to conv (the batch buffer, row off), and the recurrence is recorded in
 // defer for one tqllm_cuda::fn_gdn_multi launch over the batch instead of running here
@@ -13,6 +14,26 @@ struct GdnPre { const float * qkv, * z, * a, * b; float * conv = nullptr; int of
 inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p, float * result, int n,
                            int layer, const Fixtures * fixtures, RecurrentState * carry, const GdnPre * pre = nullptr, float * raw_out = nullptr,
                            const __half * input_h = nullptr, const __nv_bfloat16 * input_b = nullptr);
+// the GDN alpha and beta projections of a decode block (BF16 weights) in one segmented launch: the same bits as two project()
+// calls (tests/glue_fuse.cu); other cases: the two calls
+inline void project_alpha_beta(const Checkpoint & checkpoint, const std::string & prefix, const float * x, float * alpha, float * beta,
+                               int cols, int vh, int n) {
+    const std::string an = prefix + "ssm_alpha.weight", bn = prefix + "ssm_beta.weight";
+    const bool block_rows = vh <= 16 || (vh <= 1024 && cols >= 1024);  // fn_gemv_bf16_tokens' block-per-row path
+    if (n <= 8 && block_rows && cols % 8 == 0 && checkpoint.bf16_gemv(an) && checkpoint.bf16_gemv(bn)) {
+        tqllm_cuda::GemvSegs g; g.n = 2;
+        g.w[0] = checkpoint.bf16_device(an); g.y[0] = alpha; g.ld[0] = vh; g.start[0] = 0; g.start[1] = vh;
+        g.w[1] = checkpoint.bf16_device(bn); g.y[1] = beta; g.ld[1] = vh; g.start[2] = 2 * vh;
+        tqllm_cuda::fn_gemv_bf16_segments(g, x, cols, n, nullptr);
+        return;
+    }
+    checkpoint.project(an, x, alpha, cols, vh, n);
+    checkpoint.project(bn, x, beta, cols, vh, n);
+}
+// a decode block's output projection reads the FP16 image its producer wrote (gated RMS, attention gate): no conversion
+inline bool decode_half_input(const Checkpoint & checkpoint, const std::string & name, int n, const Fixtures * fixtures) {
+    return n < 64 && !fixtures && !tqllm::debug_cstr("dump_gdn") && checkpoint.takes_half_input(name);
+}
 inline std::vector<float> recurrent_forward(const Checkpoint & checkpoint, const std::vector<float> & mixed,
                                         int layer, const Fixtures * fixtures = nullptr, RecurrentState * carry = nullptr) {
     const int n = int(mixed.size() / checkpoint.config.hidden);
@@ -48,6 +69,7 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
                          checkpoint.takes_half_input(prefix + "ssm_out.weight");
     std::unique_ptr<Device<__half>> qkvh, zh;
     if (half_io) { qkvh = std::make_unique<Device<__half>>(size_t(n) * channels); zh = std::make_unique<Device<__half>>(size_t(n) * vh * dim); }
+    SideBranch * branch = nullptr;
     if (!pre) {
         const Checkpoint::SharedInput shared_in(checkpoint, input.p, size_t(n) * c.hidden, const_cast<__half *>(input_h));
         // prefill blocks: one BF16 image of the input for the BF16 alpha / beta projections (each converted it before)
@@ -56,15 +78,23 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
         if (!xbp && n > 64 && checkpoint.is_bf16(prefix + "ssm_alpha.weight") && checkpoint.is_bf16(prefix + "ssm_beta.weight")) {
             xb = std::make_unique<Device<__nv_bfloat16>>(size_t(n) * c.hidden); tqllm_cuda::f32_to_bf16(input.p, xb->p, xb->count, nullptr); xbp = xb->p; }
         const Checkpoint::SharedBf16 shared_b(checkpoint, xbp ? input.p : nullptr, size_t(n) * c.hidden, xbp);
+        // a one-sequence decode step on device maps (tl_side): the gate, alpha and beta projections on the side branch beside
+        // the qkv projection and the conv, joined before the recurrence (same projections of the same input)
+        branch = tl_side && direct && !half_io ? &SideBranch::get() : nullptr;
+        if (branch) {
+            const Checkpoint::OnStream on(checkpoint, branch->fork());
+            checkpoint.project(prefix + "attn_gate.weight", input.p, z.p, c.hidden, vh * dim, n);
+            checkpoint.project(prefix + "ssm_alpha.weight", input.p, a.p, c.hidden, vh, n);
+            checkpoint.project(prefix + "ssm_beta.weight", input.p, b.p, c.hidden, vh, n);
+        }
         if (half_io) {
             checkpoint.project(prefix + "attn_qkv.weight", input.p, nullptr, c.hidden, channels, n, qkvh->p);
             checkpoint.project(prefix + "attn_gate.weight", input.p, nullptr, c.hidden, vh * dim, n, zh->p);
         } else {
             checkpoint.project(prefix + "attn_qkv.weight", input.p, qkv.p, c.hidden, channels, n);
-            checkpoint.project(prefix + "attn_gate.weight", input.p, z.p, c.hidden, vh * dim, n);
+            if (!branch) checkpoint.project(prefix + "attn_gate.weight", input.p, z.p, c.hidden, vh * dim, n);
         }
-        checkpoint.project(prefix + "ssm_alpha.weight", input.p, a.p, c.hidden, vh, n);
-        checkpoint.project(prefix + "ssm_beta.weight", input.p, b.p, c.hidden, vh, n);
+        if (!branch) project_alpha_beta(checkpoint, prefix, input.p, a.p, b.p, c.hidden, vh, n);
     }
     if (fixtures && fixtures->has("linear_attn_qkv_mixed" + suffix)) {
         compare("gdn_qkv_projection" + suffix, qkv.get(), fixtures->values("linear_attn_qkv_mixed" + suffix), .02);
@@ -128,6 +158,7 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
         carry->neg_a = neg_a; carry->bias = bias; carry->kh = kh; carry->vh = vh; carry->dim = dim; carry->eps = float(checkpoint.epsilon);
     }
     const float * state_in = carry ? carry->state->p : state.p;
+    if (branch) branch->join();
     if (pre && pre->defer && carry) {
         auto & d = *pre->defer;
         require(d.count < tqllm_cuda::GdnSeqs::kMax, "GDN: too many sequences in one batch");
@@ -151,10 +182,14 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
         return;
     }
     Device<float> gated(out.count);
-    tqllm_cuda::fn_gated_rms(out.p, z.p, checkpoint.dense_device(prefix + "ssm_norm.weight"), gated.p, vh, dim, n, float(checkpoint.epsilon), nullptr);
+    const bool gh = decode_half_input(checkpoint, prefix + "ssm_out.weight", n, fixtures);
+    Device<__half> gated_h(gh ? out.count : 1);
+    tqllm_cuda::fn_gated_rms(out.p, z.p, checkpoint.dense_device(prefix + "ssm_norm.weight"), gated.p, vh, dim, n, float(checkpoint.epsilon), nullptr,
+                             gh ? gated_h.p : nullptr);
     if (fixtures && fixtures->has("final_output" + suffix))
         compare("gdn_sigmoid_norm" + suffix, gated.get(), fixtures->values("final_output" + suffix), .02);
-    checkpoint.project(prefix + "ssm_out.weight", gated.p, projected.p, vh * dim, c.hidden, n);
+    { std::optional<Checkpoint::SharedInput> shared; if (gh) shared.emplace(checkpoint, gated.p, gated.count, gated_h.p);
+      checkpoint.project(prefix + "ssm_out.weight", gated.p, projected.p, vh * dim, c.hidden, n); }
     if (const char * dump = tqllm::debug_cstr("dump_gdn")) {
         std::vector<float> pv(size_t(n) * c.hidden); ck(cudaMemcpy(pv.data(), result, pv.size() * 4, cudaMemcpyDeviceToHost));
         for (const auto & [tag, values] : {std::pair<std::string, std::vector<float>>{"gated", gated.get()}, {"projected", pv}}) {
@@ -169,8 +204,12 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
 // slot context and an 8-token verify block of attention_core's widest selection (top_k 2048 + ratio 4 - 1): no allocation
 // inside graph capture. kv_to_host makes them before the bank refill sizes the banks around them (made at the first
 // decode step, after the refill took the free memory, a 145K prompt on a 3090 at slots=auto ran out of memory).
-inline std::unique_ptr<tqllm_cuda::QsaGather> & host_gather(int layer) {
+inline std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> & host_gathers() {
     static std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> gathers;
+    return gathers;
+}
+inline std::unique_ptr<tqllm_cuda::QsaGather> & host_gather(int layer) {
+    auto & gathers = host_gathers();
     if (size_t(layer) >= gathers.size()) gathers.resize(size_t(layer) + 1);
     return gathers[size_t(layer)];
 }
@@ -207,11 +246,21 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
     auto v_d = mk(pre ? pre->v : nullptr, size_t(n) * kvheads * dim);
     auto & qg = *qg_d; auto & k = *k_d; auto & v = *v_d;
     Device<float> q(size_t(n) * heads * dim), kn(k.count);
+    // a one-sequence decode step on device maps (tl_side): the k and v projections on the side branch beside the q projection
+    // and its norm / rope, joined before the k norm (same projections of the same input)
+    SideBranch * const branch = tl_side && carry && !pre && !fixtures ? &SideBranch::get() : nullptr;
     if (!pre) {
         const Checkpoint::SharedInput shared_in(checkpoint, input.p, size_t(n) * c.hidden, const_cast<__half *>(input_h));
+        if (branch) {
+            const Checkpoint::OnStream on(checkpoint, branch->fork());
+            checkpoint.project(prefix + "attn_k.weight", input.p, k.p, c.hidden, kvheads * dim, n);
+            checkpoint.project(prefix + "attn_v.weight", input.p, v.p, c.hidden, kvheads * dim, n);
+        }
         checkpoint.project(prefix + "attn_q.weight", input.p, qg.p, c.hidden, heads * dim * 2, n);
-        checkpoint.project(prefix + "attn_k.weight", input.p, k.p, c.hidden, kvheads * dim, n);
-        checkpoint.project(prefix + "attn_v.weight", input.p, v.p, c.hidden, kvheads * dim, n);
+        if (!branch) {
+            checkpoint.project(prefix + "attn_k.weight", input.p, k.p, c.hidden, kvheads * dim, n);
+            checkpoint.project(prefix + "attn_v.weight", input.p, v.p, c.hidden, kvheads * dim, n);
+        }
     }
     if (fixtures && fixtures->has("Qcur_full" + suffix)) {
         compare("attention_query_projection" + suffix, qg.get(), fixtures->values("Qcur_full" + suffix), .02);
@@ -219,22 +268,37 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
         compare("attention_value_projection" + suffix, v.get(), fixtures->values("Vcur" + suffix, 0), .02);
     }
     const int pos = carry ? carry->len : 0;
-    tqllm_cuda::fn_norm_rope(qg.p, checkpoint.dense_device(prefix + "attn_q_norm.weight"), q.p, heads, dim, n, pos, checkpoint.rotary, checkpoint.theta,
-                            float(checkpoint.epsilon), true, nullptr);
-    tqllm_cuda::fn_norm_rope(k.p, checkpoint.dense_device(prefix + "attn_k_norm.weight"), kn.p, kvheads, dim, n, pos, checkpoint.rotary, checkpoint.theta,
-                            float(checkpoint.epsilon), false, nullptr);
-    Device<__nv_bfloat16> kb(k.count), vb(v.count);
-    tqllm_cuda::f32_to_bf16(kn.p, kb.p, kn.count, nullptr);
-    tqllm_cuda::f32_to_bf16(v.p, vb.p, v.count, nullptr);
+    const size_t row = size_t(kvheads) * dim;
+    const int cap = carry ? kv_cap(*carry, checkpoint.rt.kv_capacity) : 0;
+    if (carry) {
+        if (!carry->k) { PersistentAlloc keep; const size_t most = size_t(std::max(cap, checkpoint.rt.kv_capacity_full)) * row * sizeof(__nv_bfloat16);
+                         carry->k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most); carry->v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most); }
+        require(pos + n <= cap, "decode context exceeds the attention KV capacity (pos " + std::to_string(pos) + " + " + std::to_string(n) + " > " + std::to_string(cap) + ")");
+    }
+    // decode blocks: q / k norm + RoPE, k and v into the cache rows in one launch (fn_attention_prep, the same bits)
+    const bool prep = carry && !fixtures && n < 64 && !carry->k->any_host() && !carry->v->any_host() &&
+                      (!branch || (branch->join(), true)) &&
+                      tqllm_cuda::fn_attention_prep(qg.p, k.p, v.p, checkpoint.dense_device(prefix + "attn_q_norm.weight"),
+                                                    checkpoint.dense_device(prefix + "attn_k_norm.weight"), q.p, carry->k->p + size_t(pos) * row,
+                                                    carry->v->p + size_t(pos) * row, heads, kvheads, dim, n, pos, checkpoint.rotary, checkpoint.theta,
+                                                    float(checkpoint.epsilon), nullptr);
+    Device<__nv_bfloat16> kb(prep ? 1 : k.count), vb(prep ? 1 : v.count);
+    if (!prep) {
+        tqllm_cuda::fn_norm_rope(qg.p, checkpoint.dense_device(prefix + "attn_q_norm.weight"), q.p, heads, dim, n, pos, checkpoint.rotary, checkpoint.theta,
+                                float(checkpoint.epsilon), true, nullptr);
+        if (branch) branch->join();
+        tqllm_cuda::fn_norm_rope(k.p, checkpoint.dense_device(prefix + "attn_k_norm.weight"), kn.p, kvheads, dim, n, pos, checkpoint.rotary, checkpoint.theta,
+                                float(checkpoint.epsilon), false, nullptr);
+        tqllm_cuda::f32_to_bf16(kn.p, kb.p, kn.count, nullptr);
+        tqllm_cuda::f32_to_bf16(v.p, vb.p, v.count, nullptr);
+    }
     auto out_d = raw_out ? std::make_unique<Device<float>>(Device<float>::View{}, raw_out, q.count) : std::make_unique<Device<float>>(q.count);
     auto & out = *out_d; struct Out { float * p; } projected{result};
     if (carry) {
-        const size_t row = size_t(kvheads) * dim;
-        const int cap = kv_cap(*carry, checkpoint.rt.kv_capacity);
-        if (!carry->k) { PersistentAlloc keep; carry->k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16)); carry->v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16)); }
-        require(pos + n <= cap, "decode context exceeds the attention KV capacity (pos " + std::to_string(pos) + " + " + std::to_string(n) + " > " + std::to_string(cap) + ")");
-        ck(cudaMemcpyAsync(carry->k->p + size_t(pos) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
-        ck(cudaMemcpyAsync(carry->v->p + size_t(pos) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
+        if (!prep) {
+            ck(cudaMemcpyAsync(carry->k->p + size_t(pos) * row, kb.p, kb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
+            ck(cudaMemcpyAsync(carry->v->p + size_t(pos) * row, vb.p, vb.count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, nullptr));
+        }
         // QSA (the model's own long-context attention): every token's indexer key is kept; once the context passes the
         // indexer budget each query attends to its top-k selected positions (dense attention is the same below it)
         constexpr bool qsa_on = true;  // the model's sparse attention (dense is the same below the top-k budget)
@@ -324,10 +388,13 @@ inline void attention_core(const Checkpoint & checkpoint, const float * input_p,
         checkpoint.project(prefix + "attn_output.weight", key, projected.p, heads * dim, c.hidden, n);
         return;
     }
-    tqllm_cuda::fn_attention_gate(out.p, qg.p, heads, dim, n, nullptr);
+    const bool oh = decode_half_input(checkpoint, prefix + "attn_output.weight", n, fixtures);
+    Device<__half> out_h(oh ? out.count : 1);
+    tqllm_cuda::fn_attention_gate(out.p, qg.p, heads, dim, n, nullptr, oh ? out_h.p : nullptr);
     if (fixtures && fixtures->has("attn_gated" + suffix))
         compare("attention_gated_output" + suffix, out.get(), fixtures->values("attn_gated" + suffix), .02);
-    checkpoint.project(prefix + "attn_output.weight", out.p, projected.p, heads * dim, c.hidden, n);
+    { std::optional<Checkpoint::SharedInput> shared; if (oh) shared.emplace(checkpoint, out.p, out.count, out_h.p);
+      checkpoint.project(prefix + "attn_output.weight", out.p, projected.p, heads * dim, c.hidden, n); }
     if (fixtures) compare("attention_projected_output" + suffix, [&] { std::vector<float> v2(size_t(n) * c.hidden); ck(cudaMemcpy(v2.data(), result, v2.size() * 4, cudaMemcpyDeviceToHost)); return v2; }(), fixtures->values("attn_output" + suffix), .02);
 }
 // Decode blocks of several sequences, every context within the indexer budget: norm / RoPE, the K/V appends, the indexer
@@ -355,7 +422,8 @@ inline bool attention_multi(const Checkpoint & checkpoint, const float * input_p
         AttentionState & carry = *segs[i].carry;
         if (!carry.k) {
             const int cap = kv_cap(carry, checkpoint.rt.kv_capacity);
-            PersistentAlloc keep; carry.k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16)); carry.v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16));
+            PersistentAlloc keep; const size_t most = size_t(std::max(cap, checkpoint.rt.kv_capacity_full)) * row * sizeof(__nv_bfloat16);
+            carry.k = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most); carry.v = std::make_unique<KvBuf>(size_t(cap) * row * sizeof(__nv_bfloat16), most);
         }
         seqs.off[i] = segs[i].off; seqs.n[i] = segs[i].n; seqs.pos[i] = carry.len; seqs.k[i] = carry.k->p; seqs.v[i] = carry.v->p;
     }
@@ -406,28 +474,48 @@ struct MixerResult { std::vector<float> mixed, inject; };
 // the low-rank activation is written with its image too, so no projection converts its input
 // rs (prefill sub-chunks > 64 tokens): `normalized` is only a key for the BF16 image; the mix recomputes the normalized rows from
 // (rs_x, rs, rs_gamma), the inputs the norm read
-inline void mix_device(const Checkpoint & checkpoint, const std::string & prefix, const float * normalized, int n,
+// mixed_h (decode blocks): also the FP16 image of the mixed rows, when the fused up + mix launch runs; returns whether it did
+inline bool mix_device(const Checkpoint & checkpoint, const std::string & prefix, const float * normalized, int n,
                        float * mixed, float * inject, const __nv_bfloat16 * normalized_bf16 = nullptr,
-                       const float * rs_x = nullptr, const float * rs = nullptr, const float * rs_gamma = nullptr) {
+                       const float * rs_x = nullptr, const float * rs = nullptr, const float * rs_gamma = nullptr, SideBranch * branch = nullptr,
+                       __half * mixed_h = nullptr) {
     const auto & c = checkpoint.config; const int h = c.hidden, streams = c.hc, width = h * streams;
     Device<float> low(size_t(n) * c.hc_low_rank), logits(size_t(n) * width);
     if (normalized_bf16) {
         Device<__nv_bfloat16> lowb(low.count);
+        // branch (a one-sequence decode step on device maps): the inject projection beside down / up, joined before the mix
+        if (!inject) branch = nullptr;
+        // decode blocks on BF16 mixer weights: down (+ its silu) and inject in one launch, up and the mix in another
+        // (tests/glue_fuse.cu: the same bits as the projections, hc_low_silu_bf16 and hc_mix below)
+        if (!branch && !rs && inject && n <= 8 && checkpoint.bf16_gemv(prefix + "down.weight") && checkpoint.bf16_gemv(prefix + "inject.weight") &&
+            checkpoint.bf16_gemv(prefix + "up.weight") &&
+            tqllm_cuda::hc_down_inject_bf16x(checkpoint.bf16_device(prefix + "down.weight"), checkpoint.bf16_device(prefix + "inject.weight"),
+                                             normalized_bf16, low.p, lowb.p, inject, c.hc_low_rank, streams, width, n, streams, nullptr)) {
+            if (tqllm_cuda::hc_up_mix_bf16(checkpoint.bf16_device(prefix + "up.weight"), low.p, normalized, mixed, mixed_h, nullptr, h, streams,
+                                           c.hc_low_rank, n, nullptr)) return mixed_h != nullptr;
+            { const Checkpoint::SharedBf16 img(checkpoint, low.p, low.count, lowb.p);
+              checkpoint.project(prefix + "up.weight", low.p, logits.p, c.hc_low_rank, width, n); }
+            tqllm_cuda::hc_mix(normalized, logits.p, mixed, h, streams, n, nullptr);
+            return false;
+        }
+        if (branch) { const Checkpoint::OnStream on(checkpoint, branch->fork()); checkpoint.project(prefix + "inject.weight", normalized, inject, width, streams, n); }
         { const Checkpoint::SharedBf16 img(checkpoint, normalized, size_t(n) * width, normalized_bf16);
           checkpoint.project(prefix + "down.weight", normalized, low.p, width, c.hc_low_rank, n);
           tqllm_cuda::hc_low_silu_bf16(low.p, lowb.p, int(low.count), streams, nullptr);
-          if (inject) checkpoint.project(prefix + "inject.weight", normalized, inject, width, streams, n); }
+          if (inject && !branch) checkpoint.project(prefix + "inject.weight", normalized, inject, width, streams, n); }
         { const Checkpoint::SharedBf16 img(checkpoint, low.p, low.count, lowb.p);
           checkpoint.project(prefix + "up.weight", low.p, logits.p, c.hc_low_rank, width, n); }
+        if (branch) branch->join();
         if (rs) tqllm_cuda::hc_mix_rs(rs_x, rs, rs_gamma, logits.p, mixed, h, streams, n, nullptr);
         else tqllm_cuda::hc_mix(normalized, logits.p, mixed, h, streams, n, nullptr);
-        return;
+        return false;
     }
     checkpoint.project(prefix + "down.weight", normalized, low.p, width, c.hc_low_rank, n);
     tqllm_cuda::hc_low_silu(low.p, int(low.count), streams, nullptr);
     checkpoint.project(prefix + "up.weight", low.p, logits.p, c.hc_low_rank, width, n);
     tqllm_cuda::hc_mix(normalized, logits.p, mixed, h, streams, n, nullptr);
     if (inject) checkpoint.project(prefix + "inject.weight", normalized, inject, width, streams, n);
+    return false;
 }
 // quantised mixer weights on row scales: the down / inject projections read the FP16 image as their converted input (no
 // fp32 normalized rows, no conversion of the wide rows); the mix recomputes the normalized values like hc_mix_rs

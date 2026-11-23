@@ -1,4 +1,5 @@
 // qwen35 engine: the forward pass (decode, prefill, layers). The class is declared in qwen35_engine.hpp.
+#include <filesystem>
 #include "qwen35_engine.hpp"
 #include "calib_dump.hpp"
 #include "cuda_compat.hpp"
@@ -220,10 +221,11 @@ void Qwen35Engine::cmp_upload() {
     ck(cudaMemcpyAsync(d_stage_off.p, off, sizeof(off), cudaMemcpyHostToDevice, stream));
 }
 
-void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_host
+void Qwen35Engine::pc_copy(bool save, bool sys) {  // recurrent state of slot cur <-> pc_host (sys: pc_sys_host)
     const size_t cb = conv_bytes(), rb = rec_bytes(), nl = conv_state.size() / NSLOT;
-    if (!pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
-    auto * h = static_cast<char *>(pc_host->p);
+    auto & buf = sys ? pc_sys_host : pc_host;
+    if (!buf) buf = std::make_unique<HostBuf>(nl * (cb + rb));
+    auto * h = static_cast<char *>(buf->p);
     for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
         if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
@@ -237,6 +239,11 @@ uint32_t Qwen35Engine::pc_match(const std::vector<uint32_t> & prompt) {
     // exact: resume only at a kept prefill state; the live state's last tokens came from decode steps, whose numbers
     // differ from a prefill of the same tokens
     const uint32_t n = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt);
+    if (pc_shared(pc_seq, false, pc_sys, prompt) > n) {  // only the system message is shared: resume at its end
+        if (pend_k) set_pending(0);
+        pc_copy(false, true);
+        return pc_sys;
+    }
     if (!n || (pc_live && n == pc_seq.size())) return n;
     if (pend_k) set_pending(0);  // the live state's deferred path is discarded with it
     pc_copy(false);
@@ -476,6 +483,23 @@ void Qwen35Engine::set_rope() {
                              "--rope-scale %.0f)\n", context_, cfg.ctx_train, std::ceil(double(context_) / cfg.ctx_train));
 }
 
+// TQLLM_DEBUG=moe_dump:DIR[@L]: append each MoE layer's expert inputs (x: [n][H] half, ids: [n][K] int, act: [n][K(+1)][FE]
+// half) to DIR/l<layer>.<what>.bin, for calibrating expert quantization. Prefill chunks, uncaptured launches only; a debug tool.
+void Qwen35Engine::moe_dump(long layer, const char * what, const void * dev, size_t bytes, int n) {
+    static const std::string * spec = tqllm::debug_value("moe_dump");
+    if (!spec || spec->empty() || n <= NVER) return;
+    static const tqllm::DirLayer dl = tqllm::debug_dir_layer(*spec);
+    if (dl.layer >= 0 && layer != dl.layer) return;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    ck(cudaStreamIsCapturing(stream, &cs));
+    if (cs != cudaStreamCaptureStatusNone) return;
+    std::vector<char> h(bytes);
+    ck(cudaMemcpyAsync(h.data(), dev, bytes, cudaMemcpyDeviceToHost, stream));
+    sync_ck();
+    const std::string path = dl.dir + "/l" + std::to_string(layer) + "." + what + ".bin";
+    if (FILE * f = std::fopen(path.c_str(), "ab")) { std::fwrite(h.data(), 1, bytes, f); std::fclose(f); }
+}
+
 void Qwen35Engine::moe_profile_write() {
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     ck(cudaStreamIsCapturing(stream, &cs));
@@ -509,6 +533,8 @@ void Qwen35Engine::swap_seq(SeqState & s) {
     std::swap(pc_snap, s.pc_snap);
     std::swap(pc_seq, s.pc_seq);
     std::swap(pc_host, s.pc_host);
+    std::swap(pc_sys, s.pc_sys);
+    std::swap(pc_sys_host, s.pc_sys_host);
     std::swap(pc_conv, s.pc_conv);
 }
 
@@ -1121,15 +1147,19 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
     }
     if (cfg.moe) {
         const int E = int(cfg.expert_count), K = int(cfg.expert_used), FE = int(cfg.expert_ff), FS = int(cfg.shared_ff);
+        st("ffn_norm");
         tqllm_cuda::moe_router(L.router, L.sh_gate, XIN, moe_logits.as<float>(), H, E, n, stream);
         tqllm_cuda::moe_topk(moe_logits.as<float>(), moe_ids.as<int>(), moe_weights.as<float>(),
                              moe_shared_weights.as<float>(), E, K, n, 1.f, stream);
+        st("moe_router");
         const long li = &L - layer.data();
         if (moe_prof.p && li >= 0 && li < long(cfg.layers)) {
             tqllm_cuda::moe_count(moe_ids.as<int>(), moe_prof.as<unsigned long long>() + size_t(li) * E, n * K, stream);
             // decode replays a captured graph (the count kernel runs, host code does not): write on uncaptured calls
             if (li + 1 == long(cfg.layers)) moe_profile_write();
         }
+        moe_dump(li, "x", XH, size_t(n) * H * 2, n);  // TQLLM_DEBUG=moe_dump:DIR (calibration; uncaptured calls only)
+        moe_dump(li, "ids", moe_ids.as<int>(), size_t(n) * K * 4, n);
         const bool split = L.n_cold > 0;
         const bool grouped_gemm = n > NVER && segs.empty() && !wide_mm;
         // decode: the shared expert rides the routed launches as assignment K of every token (appended to the hot
@@ -1137,7 +1167,17 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
         const bool fuse = L.sh_slot >= 0 && !grouped_gemm;
         const int KV = fuse ? K + 1 : K;
         const int * IDS = moe_ids.as<int>();
-        if (fuse) {
+        // verify block (2 .. NVER columns per slot): one read per distinct expert instead of one per assignment; tokens
+        // share experts and every token carries the fused shared expert. Bit-identical to the per-assignment matvec
+        // (tests/expert_dedup.cu). GB10 35B-A3B, 8 columns: MoE ~18 of a 30 ms verify step before.
+        const int A = n * KV;
+        const bool dedup = n > 1 && !grouped_gemm && !split && moe_dgu.p && A <= kMoeDedupMax && L.ex_gate.fmt == L.ex_up.fmt && L.ex_gate.fmt->u4h_id() >= 0 &&
+                           tqllm_cuda::k_expert_dedup_fmt(L.ex_gate.fmt->u4h_id()) && L.ex_down.fmt->u4h_id() >= 0 &&
+                           tqllm_cuda::k_expert_dedup_fmt(L.ex_down.fmt->u4h_id());
+        // the maps take the shared expert as each token's last assignment themselves (no widened id list)
+        if (dedup) tqllm_cuda::moe_dedup_maps(moe_ids.as<int>(), moe_iota.as<int>(), A, KV, nullptr, moe_dgu.as<int>(),
+                                              moe_ddn.as<int>(), A, stream, fuse ? L.sh_slot : -1);
+        if (fuse && !dedup) {
             tqllm_cuda::moe_extend_ids(moe_ids.as<int>(), split ? L.hot_slot : nullptr, split ? L.cold_slot : nullptr,
                                        split ? moe_hot_ids.as<int>() : moe_xids.as<int>(), split ? moe_cold_ids.as<int>() : nullptr,
                                        K, n, L.sh_slot, stream);
@@ -1226,6 +1266,9 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
             L.ex_down.fmt->expert_matvec(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_hot_ids.as<int>(), n, KV,
                                          true, stream);
             join();
+        } else if (dedup) {
+            L.ex_gate.fmt->expert_matvec_dedup2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
+                                                moe_dgu.as<int>(), A, stream);
         } else if (!grouped_gemm && !split && paired(L.ex_gate, L.ex_up)) {
             L.ex_gate.fmt->expert_matvec2(L.ex_gate, L.ex_up, XH, moe_gate.as<bf16>(), moe_up.as<bf16>(), FE,
                                           IDS, n, KV, stream);
@@ -1233,10 +1276,14 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
             project(L.ex_gate, L.cx_gate, XH, moe_gate.as<bf16>(), FE, false);
             project(L.ex_up, L.cx_up, XH, moe_up.as<bf16>(), FE, false);
         }
+        st("moe_gate_up");
         if (!overlap) {
             tqllm_cuda::moe_swiglu(moe_gate.as<bf16>(), moe_up.as<bf16>(), moe_act.as<__half>(), n * KV * FE, stream);
-            project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
+            moe_dump(li, "act", moe_act.as<__half>(), size_t(n) * KV * FE * 2, n);
+            if (dedup) L.ex_down.fmt->expert_matvec_dedup(L.ex_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, moe_ddn.as<int>(), A, stream);
+            else project(L.ex_down, L.cx_down, moe_act.as<__half>(), moe_out.as<bf16>(), H, true);
         }
+        st("moe_down");
         if (fuse) {
             tqllm_cuda::moe_sum_strided(moe_out.as<bf16>(), KV, moe_out.as<bf16>() + size_t(K) * H, KV * H, moe_weights.as<float>(),
                                         moe_shared_weights.as<float>(), X, H, K, n, stream);
@@ -1249,6 +1296,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
                                 moe_shared_weights.as<float>(), X, H, K, n, stream);
         }
         tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
+        st("moe_shared_sum");
         return;
     }
     if (!L.w_gu.p) throw std::runtime_error("multi-token path needs fused gate/up weights");
@@ -1698,27 +1746,91 @@ void Qwen35Engine::flush_pending() {
 }
 
 
-void Qwen35Engine::split_enter(bf16 * X, int n) {
-    const int from = tp_->rank() - 1;
+void Qwen35Engine::split_trunk(bf16 * X, int n, bool after) {
+    if (!tp_) return;
+    const auto hp = split_head(rows_all ? qwen35::SplitStep::to_all : qwen35::SplitStep::plain);
+    static const std::vector<int> none;
+    const auto ops = trunk_ops(ranges_, tp_->rank(), hp.to_all, dfl.present && !feat_none ? dfl.target_ids : none);
     const size_t H = cfg.hidden, nf = dfl.present ? dfl.target_ids.size() : 0;
-    tp_->recv(X, size_t(n) * H * 2, from, stream);
-    tp_->recv(v_px.p, size_t(n) * (H / 256) * 4, from, stream);
-    if (nf) tp_->recv(v_feat.p, size_t(n) * nf * H * 2, from, stream);
+    const size_t xb = size_t(n) * H * 2, pb = size_t(n) * (H / 256) * 4, fb = size_t(n) * H * 2;
+    // a target layer's rows [n][H], strided in v_feat ([n][nf][H]), staged contiguous in v_in (free between forwards)
+    bf16 * F = v_feat.as<bf16>(), * T = v_in.as<bf16>();
+    auto stage_out = [&](int k) { ck(cudaMemcpy2DAsync(T, H * 2, F + size_t(k) * H, nf * H * 2, H * 2, size_t(n), cudaMemcpyDeviceToDevice, stream)); };
+    auto stage_in = [&](int k) { ck(cudaMemcpy2DAsync(F + size_t(k) * H, nf * H * 2, T, H * 2, H * 2, size_t(n), cudaMemcpyDeviceToDevice, stream)); };
+    bool past = false;
+    for (const auto & op : ops) {
+        if (op.kind == TrunkOp::layers) { past = true; continue; }
+        if (past != after) continue;
+        switch (op.kind) {
+        case TrunkOp::recv_rows: tp_->recv(X, xb, op.peer, stream); tp_->recv(v_px.p, pb, op.peer, stream); break;
+        case TrunkOp::send_rows: tp_->send(X, xb, op.peer, stream); tp_->send(v_px.p, pb, op.peer, stream); break;
+        case TrunkOp::bcast_rows: tp_->broadcast(X, xb, op.peer, stream); tp_->broadcast(v_px.p, pb, op.peer, stream); break;
+        case TrunkOp::send_feat: stage_out(op.feat); tp_->send(T, fb, op.peer, stream); break;
+        case TrunkOp::recv_feat: tp_->recv(T, fb, op.peer, stream); stage_in(op.feat); break;
+        case TrunkOp::bcast_feat:
+            if (op.peer == tp_->rank()) stage_out(op.feat);
+            tp_->broadcast(T, fb, op.peer, stream);
+            if (op.peer != tp_->rank()) stage_in(op.feat);
+            break;
+        case TrunkOp::layers: break;
+        }
+    }
 }
 
-void Qwen35Engine::split_leave(bf16 * X, int n) {
-    if (!tp_) return;
-    const int last = tp_->world() - 1;
-    const size_t H = cfg.hidden, nf = dfl.present ? dfl.target_ids.size() : 0;
-    const size_t xb = size_t(n) * H * 2, pb = size_t(n) * (H / 256) * 4, fb = size_t(n) * nf * H * 2;
-    if (tp_->rank() < last) {
-        tp_->send(X, xb, tp_->rank() + 1, stream);
-        tp_->send(v_px.p, pb, tp_->rank() + 1, stream);
-        if (fb) tp_->send(v_feat.p, fb, tp_->rank() + 1, stream);
+void Qwen35Engine::feats_to_last(int rows) {
+    if (!tp_ || !dfl.present || rows < 1) return;
+    const size_t H = cfg.hidden, nf = dfl.target_ids.size(), fb = size_t(rows) * H * 2;
+    bf16 * F = v_feat.as<bf16>(), * T = v_in.as<bf16>();
+    for (const auto & op : qwen35::late_feat_ops(ranges_, tp_->rank(), dfl.target_ids)) {
+        bf16 * slot = F + size_t(op.feat) * H;
+        if (op.kind == TrunkOp::send_feat) {
+            ck(cudaMemcpy2DAsync(T, H * 2, slot, nf * H * 2, H * 2, size_t(rows), cudaMemcpyDeviceToDevice, stream));
+            tp_->send(T, fb, op.peer, stream);
+        } else {
+            tp_->recv(T, fb, op.peer, stream);
+            ck(cudaMemcpy2DAsync(slot, nf * H * 2, T, H * 2, H * 2, size_t(rows), cudaMemcpyDeviceToDevice, stream));
+        }
     }
-    tp_->broadcast(X, xb, last, stream);
-    tp_->broadcast(v_px.p, pb, last, stream);
-    if (fb) tp_->broadcast(v_feat.p, fb, last, stream);
+}
+
+void Qwen35Engine::from_last(std::vector<uint32_t> & v) {
+    const int cap = qwen35::split_msg_ints(NVER);
+    if (last_rank_) {
+        if (int(v.size()) >= cap) throw std::runtime_error("--split layer: a message of more than " + std::to_string(cap - 1) + " ints");
+        std::vector<uint32_t> m(1, uint32_t(v.size()));
+        m.insert(m.end(), v.begin(), v.end());
+        ck(cudaMemcpyAsync(d_ctl.p, m.data(), m.size() * 4, cudaMemcpyHostToDevice, stream));  // pageable: staged now
+    }
+    tp_->broadcast(d_ctl.p, size_t(cap) * 4, tp_->world() - 1, stream);
+    if (last_rank_) return;
+    std::vector<uint32_t> m(static_cast<size_t>(cap));
+    ck(cudaMemcpyAsync(m.data(), d_ctl.p, m.size() * 4, cudaMemcpyDeviceToHost, stream));
+    sync_main();
+    if (m[0] >= uint32_t(cap)) throw std::runtime_error("--split layer: bad message from the last rank");
+    v.assign(m.begin() + 1, m.begin() + 1 + m[0]);
+}
+
+int Qwen35Engine::tree_from_last(int n) {
+    const int cap = qwen35::split_msg_ints(NVER);
+    uint32_t * C = d_ctl.as<uint32_t>();
+    if (last_rank_) {
+        if (n > NVER) throw std::runtime_error("--split layer: a tree of more than the verify columns");
+        const uint32_t h = uint32_t(n);
+        ck(cudaMemcpyAsync(C, &h, 4, cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(C + 1, v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToDevice, stream));
+        ck(cudaMemcpyAsync(C + 1 + NVER, d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToDevice, stream));
+        ck(cudaMemcpyAsync(C + 1 + 2 * NVER, d_tdep.p, size_t(n) * 4, cudaMemcpyDeviceToDevice, stream));
+    }
+    tp_->broadcast(C, size_t(cap) * 4, tp_->world() - 1, stream);
+    if (last_rank_) return n;
+    ck(cudaMemcpyAsync(v_tokens.p, C + 1, size_t(NVER) * 4, cudaMemcpyDeviceToDevice, stream));
+    ck(cudaMemcpyAsync(d_tpar.p, C + 1 + NVER, size_t(NVER) * 4, cudaMemcpyDeviceToDevice, stream));
+    ck(cudaMemcpyAsync(d_tdep.p, C + 1 + 2 * NVER, size_t(NVER) * 4, cudaMemcpyDeviceToDevice, stream));
+    uint32_t h = 0;
+    ck(cudaMemcpyAsync(&h, C, 4, cudaMemcpyDeviceToHost, stream));
+    sync_main();
+    if (h < 1 || h > uint32_t(NVER)) throw std::runtime_error("--split layer: bad tree from the last rank");
+    return int(h);
 }
 
 int Qwen35Engine::split_min(int v) {
@@ -1753,38 +1865,67 @@ void Qwen35Engine::park_init(int slots) {
         n = int(std::min<size_t>(size_t(4) * size_t(slots), per ? budget / per : 0));
     }
     if (n <= 0) return;
-    park_ = std::make_unique<PromptPark>(n);
-    park_sp_.resize(size_t(n));
+    park_ = make_state_store("local", StateStoreOptions{n});
     std::fprintf(stderr, "tqllm: prompt park: %d kept conversations outside the slots (up to %.2f GB host memory)\n", n,
                  double(per) * n / 1e9);
 }
 
-uint32_t Qwen35Engine::park_best(const std::vector<uint32_t> & prompt, int * where) const {
+uint32_t Qwen35Engine::park_best(const std::vector<uint32_t> & prompt, uint64_t * conv) const {
     uint32_t best = 0;
-    if (where) *where = -1;
+    if (conv) *conv = 0;
     if (!park_) return 0;
-    for (size_t i = 0; i < park_sp_.size(); ++i) {
-        const auto & sp = park_sp_[i];
-        if (!sp.snap || park_->where(sp.conv) != int(i)) continue;
-        if (lora_n && sp.lora != lora_slot[size_t(active)]) continue;  // built with other LoRA scales
-        const uint32_t n = pc_shared(sp.seq, false, sp.snap, prompt);
-        if (n > best) { best = n; if (where) *where = int(i); }
-    }
+    const std::string tag = lora_layout();
+    park_->for_each([&](const StateMeta & m) {
+        if (lora_n && (m.layout.size() < tag.size() || m.layout.compare(m.layout.size() - tag.size(), tag.size(), tag) != 0))
+            return;  // built with other LoRA scales
+        const uint32_t n = pc_shared(m.tokens, false, m.positions, prompt);
+        if (n > best) { best = n; if (conv) *conv = m.conv; }
+    });
     return best;
 }
 
-// the active slot's kept state -> a park space (the slot is about to hold another conversation)
-void Qwen35Engine::park_out() {
-    if (!park_ || !pc_conv || !pc_snap || !pc_host || pc_seq.size() < pc_snap) return;
-    const int s = park_->park(pc_conv);
-    if (s < 0) return;
-    auto & sp = park_sp_[size_t(s)];
-    const size_t kr = size_t(kv_row_bytes(true)) * pc_snap, vr = size_t(kv_row_bytes(false)) * pc_snap;
-    const size_t db = dfl_park_bytes(pc_snap);
-    size_t need = 2 * db * dfl_kc.size();
+size_t Qwen35Engine::kept_kv_bytes(uint32_t snap) const {
+    const size_t kr = size_t(kv_row_bytes(true)) * snap, vr = size_t(kv_row_bytes(false)) * snap;
+    size_t need = 2 * dfl_park_bytes(snap) * dfl_kc.size();
     for (const auto & k : key_cache) need += k.p ? kr + vr : 0;
-    if (sp.kv_cap < need) sp.kv = std::make_unique<HostBuf>(need), sp.kv_cap = need;
-    auto * h = static_cast<char *>(sp.kv->p);
+    return need;
+}
+
+std::string Qwen35Engine::state_layout(uint32_t snap) const {
+    std::error_code ec; const auto bytes = std::filesystem::file_size(model_path_, ec);
+    const size_t attn = size_t(std::count_if(key_cache.begin(), key_cache.end(), [](const KvRef & k) { return k.p != nullptr; }));
+    const size_t nl = conv_state.size() / NSLOT;
+    return "fmt=q35state1|engine=qwen35|model=" + std::filesystem::path(model_path_).filename().string() + ":" + (ec ? std::string("?") : std::to_string(bytes)) +
+           "|rank=" + std::to_string(tp_ ? tp_->rank() : 0) + "/" + std::to_string(tp_ ? tp_->world() : 1) +
+           "|layers=" + std::to_string(lr_.lo) + ".." + std::to_string(lr_.hi) + "/" + std::to_string(cfg.layers) +
+           "|kv=" + std::to_string(attn) + "x(k " + std::to_string(kv_row_bytes(true)) + " + v " + std::to_string(kv_row_bytes(false)) + ")[" + std::to_string(snap) + "]" +
+           "|drafter=" + std::to_string(dfl_kc.size()) + "x2x" + std::to_string(dfl_park_bytes(snap)) +
+           "|recurrent=" + std::to_string(nl) + "x(" + std::to_string(conv_bytes()) + " + " + std::to_string(rec_bytes()) + ")" +
+           lora_layout();
+}
+
+// runtime LoRA: a kept state is only valid under the scales it was built with (the active slot's)
+std::string Qwen35Engine::lora_layout() const {
+    if (!lora_n) return {};
+    std::string t = "|lora=";
+    for (float v : lora_slot[size_t(active)]) t += std::to_string(v) + ",";
+    return t;
+}
+
+std::unique_ptr<StateBlob> Qwen35Engine::kept_blob(bool move_state, bool sys) {
+    const uint32_t pc_snap = sys ? this->pc_sys : this->pc_snap;  // the positions this blob keeps
+    auto & pc_host = sys ? pc_sys_host : this->pc_host;
+    if (!pc_conv || !pc_snap || !pc_host || pc_seq.size() < pc_snap) return nullptr;
+    const size_t kr = size_t(kv_row_bytes(true)) * pc_snap, vr = size_t(kv_row_bytes(false)) * pc_snap;
+    const size_t db = dfl_park_bytes(pc_snap), need = kept_kv_bytes(pc_snap);
+    // a pooled buffer of a dropped state (smallest that fits), else a new one (the pool keeps no more buffers than states)
+    auto & pool = *park_pool_;
+    size_t pick = pool.size();
+    for (size_t i = 0; i < pool.size(); ++i) if (pool[i].cap >= need && (pick == pool.size() || pool[i].cap < pool[pick].cap)) pick = i;
+    ParkBuf kb;
+    if (pick < pool.size()) { kb = std::move(pool[pick]); pool.erase(pool.begin() + long(pick)); }
+    else { if (!pool.empty()) pool.erase(pool.begin()); kb = {need, std::make_unique<HostBuf>(need)}; }
+    auto * h = static_cast<char *>(kb.buf->p);
     for (size_t a = 0; a < key_cache.size(); ++a) {
         if (!key_cache[a].p) continue;
         ck(cudaMemcpyAsync(h, key_cache[a].p, kr, cudaMemcpyDeviceToHost, stream)), h += kr;
@@ -1795,11 +1936,62 @@ void Qwen35Engine::park_out() {
         ck(cudaMemcpyAsync(h, dfl_vc[l].p, db, cudaMemcpyDeviceToHost, stream)), h += db;
     }
     sync_ck();
-    sp.conv = pc_conv;
-    sp.seq.assign(pc_seq.begin(), pc_seq.begin() + pc_snap);
-    sp.snap = pc_snap;
-    sp.lora = lora_n ? lora_slot[size_t(active)] : std::vector<float>();
-    sp.state = std::move(pc_host);
+    auto b = std::make_unique<StateBlob>();
+    b->meta.conv = pc_conv; b->meta.positions = pc_snap;
+    b->meta.tokens.assign(pc_seq.begin(), pc_seq.begin() + pc_snap);
+    b->meta.layout = state_layout(pc_snap);
+    StatePart kv; kv.kind = StatePart::Kind::KvRows; kv.bytes = need;
+    void * kp = kb.buf->p;
+    kv.data = std::shared_ptr<void>(kp, ParkOwn{kb.buf.release(), kb.cap, park_pool_});
+    StatePart st; st.kind = StatePart::Kind::Recurrent;  // the recurrent state at snap (pc_copy's layout)
+    st.bytes = (conv_state.size() / NSLOT) * (conv_bytes() + rec_bytes());
+    HostBuf * state = nullptr;
+    if (move_state) state = pc_host.release();
+    else { state = new HostBuf(st.bytes); std::memcpy(state->p, pc_host->p, st.bytes); }
+    void * sp = state->p;
+    st.data = std::shared_ptr<void>(sp, ParkOwn{state, 0, nullptr});
+    b->parts.push_back(std::move(kv)); b->parts.push_back(std::move(st));
+    return b;
+}
+
+void Qwen35Engine::restore_kept(StateBlob & b, bool take_state) {
+    const uint32_t snap = b.meta.positions;
+    const size_t kr = size_t(kv_row_bytes(true)) * snap, vr = size_t(kv_row_bytes(false)) * snap;
+    const auto * h = static_cast<const char *>(b.parts[0].data.get());
+    if (pend_k) set_pending(0);
+    qsa.plan.unkeyed(0);  // token keys are not parked: the resumed rows stay dense
+    for (size_t a = 0; a < key_cache.size(); ++a) {
+        if (!key_cache[a].p) continue;
+        ck(cudaMemcpyAsync(key_cache[a].p, h, kr, cudaMemcpyHostToDevice, stream)), h += kr;
+        ck(cudaMemcpyAsync(value_cache[a].p, h, vr, cudaMemcpyHostToDevice, stream)), h += vr;
+    }
+    const size_t db = dfl_park_bytes(snap);
+    for (size_t l = 0; db && l < dfl_kc.size(); ++l) {
+        ck(cudaMemcpyAsync(dfl_kc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
+        ck(cudaMemcpyAsync(dfl_vc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
+    }
+    sync_ck();
+    pc_seq = b.meta.tokens;
+    pc_snap = snap;
+    pc_sys = 0;  // the rows past the restored ones may belong to the slot's previous conversation
+    pc_live = false;
+    auto * own = take_state ? std::get_deleter<ParkOwn>(b.parts[1].data) : nullptr;
+    if (own && own->buf) { pc_host.reset(own->buf); own->buf = nullptr; }  // the recurrent state comes back without a copy
+    else { pc_host = std::make_unique<HostBuf>(b.parts[1].bytes); std::memcpy(pc_host->p, b.parts[1].data.get(), b.parts[1].bytes); }
+}
+
+// the active slot's kept state -> the park (the slot is about to hold another conversation)
+void Qwen35Engine::park_out() {
+    if (!park_) return;
+    auto b = kept_blob(true);
+    if (!b) return;
+    const std::shared_ptr<void> state = b->parts[1].data;  // kept: a state the park cannot take stays with the slot
+    const auto put = park_->put(std::move(*b));
+    if (put == ConversationStateStore::Put::NoRoom || put == ConversationStateStore::Put::Refused) {
+        auto * own = std::get_deleter<ParkOwn>(state);
+        pc_host.reset(own->buf); own->buf = nullptr;
+        return;
+    }
     pc_drop();
     pc_conv = 0;
 }
@@ -1808,37 +2000,125 @@ void Qwen35Engine::park_out() {
 // state is parked and that one comes back (KV rows; its recurrent state at snap is restored by pc_match as usual)
 void Qwen35Engine::park_swap(const std::vector<uint32_t> & prompt) {
     if (!park_) return;
-    const uint32_t own = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt);
-    int s = -1;
-    const uint32_t best = park_best(prompt, &s);
-    if (s < 0 || best <= own) {
+    const uint32_t own = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, prompt);
+    uint64_t conv = 0;
+    const uint32_t best = park_best(prompt, &conv);
+    if (!conv || best <= own) {
         if (!own) park_out();  // a new conversation takes this slot: keep the one it held
         return;
     }
+    park_->protect(conv);  // the slot's own state, parked next, must not take this one's space
     park_out();
-    auto & sp = park_sp_[size_t(s)];
-    const size_t kr = size_t(kv_row_bytes(true)) * sp.snap, vr = size_t(kv_row_bytes(false)) * sp.snap;
-    const auto * h = static_cast<const char *>(sp.kv->p);
-    if (pend_k) set_pending(0);
-    qsa.plan.unkeyed(0);  // token keys are not parked: the resumed rows stay dense
-    for (size_t a = 0; a < key_cache.size(); ++a) {
-        if (!key_cache[a].p) continue;
-        ck(cudaMemcpyAsync(key_cache[a].p, h, kr, cudaMemcpyHostToDevice, stream)), h += kr;
-        ck(cudaMemcpyAsync(value_cache[a].p, h, vr, cudaMemcpyHostToDevice, stream)), h += vr;
+    auto b = park_->take(conv, "");
+    if (!b) { park_->release(conv); shared_convs_.erase(conv); return; }
+    if (shared_convs_.count(conv)) {  // a lent state (share_kept): this slot gets a copy, the entry goes back for the next
+        restore_kept(*b, false);
+        pc_conv = ++conv_clock;
+        const auto put = park_->put(std::move(*b));
+        if (put == ConversationStateStore::Put::NoRoom || put == ConversationStateStore::Put::Refused) shared_convs_.erase(conv);
+        else park_->retire(conv);
+        return;
     }
-    const size_t db = dfl_park_bytes(sp.snap);
-    for (size_t l = 0; db && l < dfl_kc.size(); ++l) {
-        ck(cudaMemcpyAsync(dfl_kc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
-        ck(cudaMemcpyAsync(dfl_vc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
+    restore_kept(*b, true);
+    pc_conv = b->meta.conv;
+}
+
+// the active slot's kept state, copied into the park under its own key so every slot can resume from it (tqserve lends
+// it when requests with one long shared prefix arrive together); retired, so it is the first state dropped for room
+bool Qwen35Engine::share_kept(const std::vector<uint32_t> & prompt) {
+    // the kept state that covers more of the requesting prompt: the last-message one, or the system-message one
+    const bool sys = pc_shared(pc_seq, false, pc_sys, prompt) > pc_shared(pc_seq, false, pc_snap, prompt);
+    const uint32_t at = sys ? pc_sys : pc_snap;
+    if (!park_ || !pc_on || !at || pc_seq.size() < at) return false;
+    const std::vector<uint32_t> kept(pc_seq.begin(), pc_seq.begin() + at);
+    for (uint64_t c : shared_convs_) {  // already lent (the same tokens, the same LoRA scales)
+        bool same = false;
+        park_->for_each([&](const StateMeta & m) { if (m.conv == c && m.positions == at && m.tokens == kept && m.layout == state_layout(at)) same = true; });
+        if (same) return true;
     }
-    sync_ck();
-    pc_seq = std::move(sp.seq);
-    pc_snap = sp.snap;
-    pc_live = false;
-    pc_host = std::move(sp.state);
-    pc_conv = sp.conv;
-    sp.snap = 0;
-    park_->pickup(sp.conv);
+    auto b = kept_blob(false, sys);
+    if (!b) return false;
+    const uint64_t conv = ++conv_clock;
+    b->meta.conv = conv;
+    const auto put = park_->put(std::move(*b));
+    if (put == ConversationStateStore::Put::NoRoom || put == ConversationStateStore::Put::Refused) return false;
+    shared_convs_.insert(conv); park_->retire(conv);
+    return true;
+}
+
+std::unique_ptr<StateBlob> Qwen35Engine::export_state(int slot) {
+    if (!pc_on || slot < 0 || slot >= nslots) return nullptr;
+    select_slot(slot);
+    return kept_blob(false);
+}
+
+std::string Qwen35Engine::import_state(int slot, const StateBlob & blob) {
+    if (!pc_on) return "conversation state import: needs the prompt cache (--prompt-cache on)";
+    if (slot < 0 || slot >= nslots) return "conversation state import: no slot " + std::to_string(slot);
+    const uint32_t snap = blob.meta.positions;
+    if (!snap || blob.meta.tokens.size() != snap) return "conversation state import: tokens: got " + std::to_string(blob.meta.tokens.size()) + ", want " + std::to_string(snap);
+    if (snap >= context_) return "conversation state import: positions: got " + std::to_string(snap) + ", the slot holds " + std::to_string(context_);
+    if (const auto why = layout_mismatch(blob.meta.layout, state_layout(snap)); !why.empty()) return "conversation state import: " + why;
+    const size_t rec = (conv_state.size() / NSLOT) * (conv_bytes() + rec_bytes());
+    if (blob.parts.size() != 2 || blob.parts[0].bytes != kept_kv_bytes(snap) || blob.parts[1].bytes != rec ||
+        blob.parts[0].memory != StatePart::Memory::Host || blob.parts[1].memory != StatePart::Memory::Host)
+        return "conversation state import: parts: want 2 host parts of " + std::to_string(kept_kv_bytes(snap)) + " and " + std::to_string(rec) + " bytes";
+    select_slot(slot);
+    pc_drop();
+    StateBlob copy = blob;  // shares the parts' bytes; restore_kept copies them (take_state false)
+    restore_kept(copy, false);
+    pc_conv = ++conv_clock;
+    return {};
+}
+
+// another box's request for the kept state that serves `prompt` best: a slot's (its snapshot, not a live state: a fetched
+// state must resume exactly) or a parked one, as a copy; this box keeps it until release_state
+std::unique_ptr<StateBlob> Qwen35Engine::export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity) {
+    if (!pc_on) return nullptr;
+    uint32_t best = 0; int slot = -1;
+    for (int s = 0; s < nslots; ++s) {
+        const uint32_t n = s == active ? pc_shared(pc_seq, false, pc_snap, prompt) : pc_shared(parked[size_t(s)].pc_seq, false, parked[size_t(s)].pc_snap, prompt);
+        if (n > best) { best = n; slot = s; }
+    }
+    uint64_t conv = 0;
+    const uint32_t in_park = park_best(prompt, &conv);
+    if (in_park > best && conv) {  // a copy of the parked state; the park keeps it
+        auto b = park_->take(conv, entity);
+        if (!b) return nullptr;
+        auto copy = std::make_unique<StateBlob>(*b);
+        park_->put(std::move(*b));
+        return copy;
+    }
+    if (slot < 0 || !entity.empty()) return nullptr;  // a slot's state has no entity tag: only an untagged request gets it
+    select_slot(slot);
+    return kept_blob(false);
+}
+
+// a state fetched from another box into this box's park (a request whose prompt starts with it resumes from there)
+std::string Qwen35Engine::adopt_state(StateBlob blob) {
+    if (!pc_on || !park_) return "conversation state adopt: needs the prompt cache and the prompt park (--prompt-cache on, --np > 1)";
+    const uint32_t snap = blob.meta.positions;
+    if (!snap || blob.meta.tokens.size() != snap) return "conversation state adopt: tokens do not match the positions";
+    if (const auto why = layout_mismatch(blob.meta.layout, state_layout(snap)); !why.empty()) return "conversation state adopt: " + why;
+    const size_t rec = (conv_state.size() / NSLOT) * (conv_bytes() + rec_bytes());
+    if (blob.parts.size() != 2 || blob.parts[0].bytes != kept_kv_bytes(snap) || blob.parts[1].bytes != rec)
+        return "conversation state adopt: parts: want 2 host parts of " + std::to_string(kept_kv_bytes(snap)) + " and " + std::to_string(rec) + " bytes";
+    blob.meta.conv = ++conv_clock;  // conversation ids are per box: the owner's id stays with the owner (its ack names it)
+    const auto put = park_->put(std::move(blob));
+    return put == ConversationStateStore::Put::Stored || put == ConversationStateStore::Put::Replaced ? std::string() : "conversation state adopt: the park has no room";
+}
+
+// the fetching box confirmed the transfer: this box's copies go (the park's, and a slot's kept snapshot), so one box holds
+// the conversation and a later turn finds the newest state
+void Qwen35Engine::release_state(uint64_t conv) {
+    if (!conv) return;
+    if (park_) park_->evict(conv);
+    if (pc_conv == conv) { pc_drop(); pc_seq.clear(); pc_conv = 0; }
+    for (int s = 0; s < nslots; ++s) {
+        if (s == active) continue;
+        auto & p = parked[size_t(s)];
+        if (p.pc_conv == conv) { p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); p.pc_conv = 0; }
+    }
 }
 
 }  // namespace qwen35_detail

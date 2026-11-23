@@ -11,6 +11,9 @@
 namespace tqllm_cuda {
 namespace {
 // GSQ Q2_0: F16 scale, 16 bytes of adjacent 2-bit codes per 64 weights; value = scale * (code - 1).
+// float(code - 1) for the 2-bit code in v's low bits without an I2F (quarter-rate on the 3090; the decode kernels issued
+// one per weight): 2^23 + code minus 2^23 + 1 is exact, so the value and every product and sum using it are unchanged
+__device__ __forceinline__ float q2m1(unsigned v) { return __uint_as_float(0x4B000000u | (v & 3u)) - 8388609.f; }
 __device__ float value(const unsigned char * data, int64_t element) {
     const auto * block = data + (element / 64) * 18;
     const int j = int(element % 64);
@@ -18,7 +21,8 @@ __device__ float value(const unsigned char * data, int64_t element) {
     return scale * (int((block[2 + j / 4] >> (2 * (j % 4))) & 3u) - 1);
 }
 // Warp per (row, assignment): each 64-weight block (18 bytes) is read by the whole warp, 2 weights per lane.
-template<class T> __global__ void dot_warp(const unsigned char * weights, const __half * x, T * y,
+// NB > 0: cols == 64 NB, the block loop unrolled so a lane's NB loads are in flight together (same sums in the same order)
+template<class T, int NB = 0> __global__ void dot_warp(const unsigned char * weights, const __half * x, T * y,
                                           int rows, int cols, int experts, const int * ids, int topk, bool per_expert) {
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, assignment = blockIdx.y;
     if (row >= rows) return;
@@ -28,13 +32,14 @@ template<class T> __global__ void dot_warp(const unsigned char * weights, const 
     if (expert >= 0 && expert < experts) {
         const unsigned char * r = weights + (int64_t(expert) * rows + row) * (cols / 64) * 18;
         const __half2 * xv = reinterpret_cast<const __half2 *>(x + int64_t(input) * cols);
-        for (int b = 0; b < cols / 64; ++b) {
+#pragma unroll
+        for (int b = 0; b < (NB ? NB : cols / 64); ++b) {
             const unsigned char * block = r + b * 18;
             const float scale = __half2float(*reinterpret_cast<const __half *>(block));  // 18-byte blocks: 2-byte aligned
             const unsigned q = block[2 + lane / 2] >> (4 * (lane & 1));
             const float2 xx = __half22float2(xv[b * 32 + lane]);
-            sum += scale * (int(q & 3u) - 1) * xx.x;
-            sum += scale * (int((q >> 2) & 3u) - 1) * xx.y;
+            sum += scale * q2m1(q) * xx.x;
+            sum += scale * q2m1(q >> 2) * xx.y;
         }
     }
     for (int d = 16; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
@@ -271,10 +276,10 @@ template<bool WIDE, bool STAGE = false> __global__ void __launch_bounds__(256) d
                         if (c >= nc) break;
                         const __half2 * xr = xs + c * (cols / 2) + b * 32 + t;
                         const float2 x0 = __half22float2(xr[0]), x1 = __half22float2(xr[8]), x2 = __half22float2(xr[16]), x3 = __half22float2(xr[24]);
-                        s0[c] += scale * (int(q0 & 3u) - 1) * x0.x; s0[c] += scale * (int((q0 >> 2) & 3u) - 1) * x0.y;
-                        s1[c] += scale * (int(q1 & 3u) - 1) * x1.x; s1[c] += scale * (int((q1 >> 2) & 3u) - 1) * x1.y;
-                        s2[c] += scale * (int(q2 & 3u) - 1) * x2.x; s2[c] += scale * (int((q2 >> 2) & 3u) - 1) * x2.y;
-                        s3[c] += scale * (int(q3 & 3u) - 1) * x3.x; s3[c] += scale * (int((q3 >> 2) & 3u) - 1) * x3.y;
+                        s0[c] += scale * q2m1(q0) * x0.x; s0[c] += scale * q2m1(q0 >> 2) * x0.y;
+                        s1[c] += scale * q2m1(q1) * x1.x; s1[c] += scale * q2m1(q1 >> 2) * x1.y;
+                        s2[c] += scale * q2m1(q2) * x2.x; s2[c] += scale * q2m1(q2 >> 2) * x2.y;
+                        s3[c] += scale * q2m1(q3) * x3.x; s3[c] += scale * q2m1(q3 >> 2) * x3.y;
                     }
                 }
             }
@@ -304,8 +309,8 @@ template<bool WIDE, bool STAGE = false> __global__ void __launch_bounds__(256) d
             for (int c = 0; c < DC; ++c) {
                 if (c >= nc) break;
                 const float2 xx = __half22float2(xs[c * (cols / 2) + b * 32 + lane]);
-                sum[c] += scale * (int(q & 3u) - 1) * xx.x;
-                sum[c] += scale * (int((q >> 2) & 3u) - 1) * xx.y;
+                sum[c] += scale * q2m1(q) * xx.x;
+                sum[c] += scale * q2m1(q >> 2) * xx.y;
             }
         }
     } else {
@@ -369,6 +374,8 @@ void gsq_q2_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, i
         throw std::invalid_argument("GSQ Q2_0: invalid expert dimensions");
     if (k >= 3072)
         dot_wide<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
+    else if (k == 640)  // Flash-Next down
+        dot_warp<__nv_bfloat16, 10><<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
     else
         dot_warp<<<dim3(unsigned((r + 7) / 8), unsigned(n * topk)), 256, 0, s>>>(static_cast<const unsigned char *>(w), x, y, r, k, experts, ids, topk, per_expert);
 }

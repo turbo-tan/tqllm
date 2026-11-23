@@ -9,6 +9,7 @@
 | Observe prefill, decode and hardware on the API port | [Runtime monitor](MONITOR.md) |
 | Follow a recorded monitor walkthrough | [Monitor demo](demos/monitor/README.md) |
 | Run on a Mac (Apple Silicon, Metal) | [Mac](guides/mac.md) |
+| Run Inkling-2-Mini on a Mac (MLX), with measured speeds and quality gates | [Inkling-2-Mini](models/inkling2.md) |
 | Run natively on Windows (no WSL) | [Windows](guides/windows.md) |
 | Connect coding agents | [Agent setup](guides/coding-agents.md) |
 | Add DFlash2 or native MTP drafting | [Speculative decoding](guides/speculative-decoding.md) |

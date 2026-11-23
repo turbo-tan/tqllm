@@ -142,6 +142,28 @@ static void grows_past_first_shape() {
     expect_gather(g, mixed(1, 128, 500), r, k.p, v.p);  // and back to a short one
 }
 
+// a call whose compact buffers do not fit (out of memory) throws and leaves the gather usable at its old size: the sizes
+// were recorded before the allocations, so the next request ran on freed buffers ("invalid dimensions", illegal address)
+static void failed_growth_keeps_working() {
+    {   // asking for more than the device on unified memory (GB10) takes the host's memory with it: the kernel OOM killer
+        // ran on a GB10 (11-18, ctest -j 4: user session services killed), so the case is skipped there
+        int dev = 0, integrated = 0; ck(cudaGetDevice(&dev));
+        if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && integrated) {
+            std::printf("SKIP failed_growth_keeps_working: unified memory\n"); return; } }
+    const Rows r(5000, 512);
+    Device<__nv_bfloat16> k(r.keys.size()), v(r.values.size()); k.put(r.keys); v.put(r.values);
+    tqllm_cuda::QsaGather g(5000, r.row_bytes());
+    expect_gather(g, mixed(2, 256, 4000), r, k.p, v.p);
+    size_t fr = 0, tot = 0; ck(cudaMemGetInfo(&fr, &tot));
+    const int width = int(std::min<size_t>(size_t(INT32_MAX) / 2, tot / r.row_bytes() + 1));  // K alone is past the device
+    bool threw = false;
+    try { g.run(nullptr, nullptr, 1, width, 4000, k.p, v.p, nullptr); } catch (const std::exception &) { threw = true; }
+    cudaGetLastError();
+    require(threw, "a gather larger than the device must fail");
+    expect_gather(g, mixed(2, 256, 4000), r, k.p, v.p);
+    expect_gather(g, mixed(3, 512, 4990), r, k.p, v.p);
+}
+
 static void reads_host_memory() {
     const Selection s = mixed(6, 2048, 8000); const Rows r(s.cells(), 512);
     void * hk = nullptr, * hv = nullptr;  // mapped pinned host pages, as K/V moved to host by TQFN_KV_HOST
@@ -324,6 +346,7 @@ int main() {
         {"device_cells_not_cached", device_cells_not_cached},
         {"rewrite_invalidates_cache", rewrite_invalidates_cache},
         {"runs_inside_graph_capture", runs_inside_graph_capture},
+        {"failed_growth_keeps_working", failed_growth_keeps_working},
     };
     int failed = 0;
     for (const auto & c : cases) {

@@ -18,5 +18,6 @@ void hf_map_minimax_m3(const HfFolder & h, GgufFile & f);
 void hf_map_minimax_m3_dspark(const HfFolder & h, GgufFile & f);
 void hf_map_qwen4_exp(const HfFolder & h, GgufFile & f);  // arch_qwen4_exp.cpp
 void hf_map_qwen35(const HfFolder & h, GgufFile & f);     // arch_qwen35.cpp
+void hf_map_inkling2_loop(const HfFolder & h, GgufFile & f);  // arch_inkling2_loop.cpp
 
 }  // namespace tqllm

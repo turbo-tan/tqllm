@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 namespace tqllm {
+struct StateBlob;  // src/kv/conversation_state.hpp
 struct WeightInfo { std::string name; uint8_t dtype; std::vector<uint64_t> shape; uint64_t offset; uint64_t bytes; };
 class Model {
 public:
@@ -53,6 +54,7 @@ public:
     bool kv_idle_step();
     bool has_drafter() const;  // a DFlash2 drafter is loaded (-md)
     bool native_mtp() const;   // --mtp: the model's own MTP head drafts
+    bool adaptive_depth() const;   // depth 0 to spec_begin: the engine picks each step's drafts
     std::string fit_note() const;  // what the memory fit chose instead of the defaults (KV, context, buffers), or empty
     bool incremental() const;  // spec_begin / spec_advance / spec_finish available (chunked prefill), with or without a drafter
     void select_slot(int slot);
@@ -73,6 +75,14 @@ public:
     // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
     const std::vector<uint32_t> & spec_tokens(int slot = 0) const;
     uint32_t prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const;  // prompt tokens the slot would reuse
+    bool share_kept(int slot, const std::vector<uint32_t> & prompt);  // slot's kept prompt state lent to the park (Engine::share_kept)
+    // the slot's kept conversation state as a blob (nullptr: none / unsupported); import into an idle slot ("" or why not)
+    std::unique_ptr<StateBlob> export_state(int slot);
+    std::string import_state(int slot, const StateBlob & blob);
+    // across boxes (engine thread only): the best kept state for a prompt as a copy; a fetched one into the park; drop after an ack
+    std::unique_ptr<StateBlob> export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity);
+    std::string adopt_state(StateBlob blob);
+    void release_state(uint64_t conv);
     // while idle: prefill what the slot's next prompt is expected to begin with (Engine::prefill_ahead); true: prefilled
     bool prefill_ahead(int slot, const std::vector<uint32_t> & prefix);
     // Drafter target features [P][nf * hidden] (BF16 bits) of every position of `tokens` (prefilled from 0); returns nf.

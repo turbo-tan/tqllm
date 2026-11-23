@@ -62,6 +62,7 @@ struct ExpertPayload {
 // Prints every expert cache's last link entries (queued / started / done / demand / pickup, with addresses) to stderr,
 // once per process: call it on the first GPU error, which usually surfaces far from the copy that caused it.
 void dump_expert_links(const char * why);
+class HostExpertTier;
 class MixedExpertCache {
     struct State;
     std::unique_ptr<State> state_;
@@ -83,6 +84,13 @@ public:
     using Prepacked = std::function<const char *(int layer, int expert)>;
     // registered: the blocks live in page-locked (cudaHostRegister) memory and are DMA-ed directly, no staging copy.
     void set_prepacked(Prepacked, bool registered = false);
+    // experts read from the GGUF on demand: misses come out of (and evicted experts go back to) a pinned host RAM tier
+    void set_host_tier(HostExpertTier * tier);
+    HostExpertTier * host_tier() const;
+    // copies on another stream read tier blocks up to `done`: the tier reuses a block only after it (prefill staging)
+    void tier_after(cudaEvent_t done);
+    // `other` reads tier blocks next: it waits for the miss stream's copies so far (an evicted expert's device-to-host copy)
+    void tier_before(cudaStream_t other);
     // Speculative upload of a later layer's likely experts on a copy stream (registered prepacked source only).
     // Slots are claimed immediately; the next prepare() of that layer waits for the copies on its own stream.
     void prefetch(int layer, const std::vector<int> & expert_ids, cudaStream_t copy_stream);
@@ -117,6 +125,8 @@ public:
     // banks exist and imported back before the host path is used again.
     struct BankLayout {
         char * dst[6] = {}; size_t piece[6] = {}; const char * src0 = nullptr; size_t block = 0;  // gate/up/down data+aux
+        bool host_tier = false;  // the experts stream from a host tier (per-expert blocks, stage_source) instead of src0
+        bool streamable() const { return src0 || host_tier; }
     };
     struct BankState { std::vector<int> ids; std::vector<uint64_t> ages; std::vector<uint64_t> freq; };
     int slots() const;           // the largest layer's slots
@@ -132,8 +142,13 @@ public:
     int grow_into(size_t keep_free, int max_slots);
     size_t device_staging_bytes() const;  // device staging held (only an unregistered prepacked pack needs it)
     int plan_slots(int layer);  // the slots the layer's next bank gets (sized to the free memory when it has none)
+    // the layer's next bank (it has none) gets `slots` (at most its target) instead of a share of the free memory: a
+    // prefill's temporary bank in memory its plan counted on (experts read from the GGUF on demand). Returns the slots.
+    int plan_slots_at_most(int layer, int slots);
+    // rebuilds banks below their target at the target, same experts (copied on the device), while free memory holds it
+    // (+ keep_free); the targets first go back to set_layer_tiers' plan (shrink_to_free lowers them for one request)
     int regrow(size_t keep_free);
-    int shrink_to_free(size_t need, int floor_slots);  // gives back slots (largest banks first, never below floor_slots) until need bytes are free; banks rebuilt with their most-used experts  // rebuilds banks below their target at the target, same experts, while free memory holds it (+ keep_free)
+    int shrink_to_free(size_t need, int floor_slots);  // gives back slots (largest banks first, never below floor_slots) until need bytes are free; banks rebuilt with their most-used experts
     int experts() const; int layers() const;
     bool bank_ready(int layer) const;
     bool has_layout(int layer) const;  // a bank existed once: bank_layout / bank_mat answer without one (no device pointers)

@@ -30,6 +30,13 @@ static bool known_template_difference(const std::string & name) {
 }
 
 int main(int argc, char ** argv) {
+    {  // tojson(sort_keys=true) (Inkling-2's tool_declare): keys sorted at every level, compact separators
+        tqserve::JinjaTemplate t(R"({{- tools | tojson(sort_keys=true, separators=(",", ":")) -}})");
+        const auto tools = tqllm::parse_json(R"([{"z":1,"a":{"y":2,"b":3}}])");
+        const auto msgs = tqllm::parse_json("[]");
+        const std::string got = t.render(msgs, &tools, false, nullptr);
+        if (got != R"([{"a":{"b":3,"y":2},"z":1}])") { std::fprintf(stderr, "tojson sort_keys: got %s\n", got.c_str()); return 1; }
+    }
     const std::string tpl_path = argc > 1 ? argv[1] : "tests/template/qwen38_chat_template.jinja";
     const std::string cases_path = argc > 2 ? argv[2] : "tests/template/cases.json";
     tqserve::JinjaTemplate tpl(slurp(tpl_path));

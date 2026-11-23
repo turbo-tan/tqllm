@@ -51,6 +51,38 @@ Checked on the release build: the model loads and answers fixed questions correc
 Not verified yet: Qwen3.5 / 3.6 mixture-of-experts GGUFs (`qwen35moe`, such as Qwen3.6-35B-A3B). The MoE models
 (Flash-Next, GLM-5.3-Flash, MiniMax) do not run on native Windows yet; use WSL 2 there.
 
+### How much GPU memory it uses
+
+Measured peak, tqLLM 1.6.0 Docker image, drafter on as shipped (DFlash2-TQ3, or the model's MTP head where marked),
+reasoning on. On NVIDIA cards the memory fit fills the free VRAM up to a small margin, so long contexts show close to
+the card's size; what does not fit (LM head, token embeddings, the oldest K/V) moves to system RAM, shown as host RAM.
+
+| Card | Model file | KV | Context x users | Peak VRAM | Host RAM |
+|---|---|---|---|---|---|
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 4K x 1 | 19.5 GiB | 1.6 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 32K x 1 | 21.3 GiB | 1.7 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 64K x 1 | 23.1 GiB | 8.1 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 32K x 4 (`--context 131072 --np 4`) | 22.4 GiB | 12.1 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ_L-QSA.gguf`, MTP, `--qsa-from 49152` | bf16 | 4K x 1 | 19.0 GiB | 2.0 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ_L-QSA.gguf`, MTP, `--qsa-from 49152` | bf16 | 140K x 1 | 23.1 GiB | 12.6 GiB |
+| RTX 3090 24 GB | `Qwen3.8-27B-TQ_L-QSA.gguf`, `--qsa-from 49152` | t4kv | 256K x 1 | 23.3 GiB | 8.7 GiB |
+| 16 GB (RTX 3090 held to 16,203 MiB free) | `Qwen3.8-27B-TQ_XS.gguf` | tq3 | 4K x 1 | 15.1 GiB | 3.8 GiB |
+| 16 GB (RTX 3090 held to 16,203 MiB free) | `Qwen3.8-27B-TQ3_4S-v2.gguf` | tq3 | 16K x 1 | 15.1 GiB | 4.2 GiB |
+| 16 GB (RTX 3090 held to 16,203 MiB free) | `Qwen3.8-27B-TQ_XS.gguf` | tq3 | 200K x 1 | 14.8 GiB | 6.5 GiB |
+| 16 GB (RTX 3090 held to 16,203 MiB free) | `Qwen3.8-27B-TQ_XS.gguf` | tq3 | 256K x 1 (TqCache) | 15.1 GiB | 7.1 GiB |
+| 16 GB (RTX 3090 held to 16,203 MiB free) | `Qwen3.8-27B-TQ_XS.gguf` | tq3 | 32K x 4 | 15.3 GiB | 5.5 GiB |
+| GB10 / DGX Spark (unified) | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 4K x 1 | 22.2 GiB total | (same memory) |
+| GB10 / DGX Spark (unified) | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 128K x 1 | 30.3 GiB total | (same memory) |
+| GB10 / DGX Spark (unified) | `Qwen3.8-27B-TQ3_4S-v2.gguf` | bf16 | 32K x 4 | 31.7 GiB total | (same memory) |
+| GB10 / DGX Spark (unified) | Flash-Next, `flashnext.tqfn` (public IQ3_S), MTP | default | 32K x 1 | 67.7 GiB total | (same memory) |
+| GB10 / DGX Spark (unified) | Flash-Next, `flashnext.tqfn` (public IQ3_S), MTP | default | 32K x 4 | 71.6 GiB total | (same memory) |
+
+Not measured yet: a real 16 GB card (the 16 GB rows are an RTX 3090 with the rest of its memory held), 12 GB cards
+and Flash-Next on a 24 GB card (both need 64 GB of system RAM; the test PC has 32 GB), and Macs.
+How: `nvidia-smi` every 200 ms through load, one short chat and prompts filling about 85 % of each slot's context,
+minus the idle baseline; host RAM is the drop in available system memory. On GB10 the total is that drop alone.
+RTX 3090 driver 615.71.09, image `ytan2000/tqllm:1.6.0` (engine 933dc6f), 2026-11-15.
+
 ## See what your model is doing
 
 Watch prefill, output rates and hardware use in one view. Both rates stay in the
@@ -131,7 +163,8 @@ requirements, and [the architecture guide](docs/ARCHITECTURE.md) for the source 
 
 Built on work from Qwen, ggml/llama.cpp, Google Research, z-lab, Tom Turney,
 spiritbuun, turboderp ([ExLlamaV3](https://github.com/turboderp-org/exllamav3): the trellis format and kernels behind
-X3 and our EXL3 support) and the contributors listed in [Credits](docs/CREDITS.md).
+X3 and our EXL3 support), [@Scoobylolo](https://github.com/Scoobylolo) (the TQV-12 and TQT weight formats, their
+quantisers and guides: #56, #59, #61) and the contributors listed in [Credits](docs/CREDITS.md).
 Third-party notices remain in [NOTICE](NOTICE). Thank you to our community testers.
 
 tqLLM is created by David Y. Tan and licensed under Apache-2.0: if you copy or redistribute it, keep the

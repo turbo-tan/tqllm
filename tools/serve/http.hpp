@@ -21,6 +21,7 @@ struct Request {
     std::string authorization;
     std::string content_type, origin, host;
     bool routed = false;              // X-Tqllm-Routed: sent here by a front door (tqserve --peer); never routed again
+    std::string state_owner;          // X-Tqllm-State-Owner (front door only: "host:port;positions=N"): fetch the state from there
     uint64_t content_length = 0;      // as advertised
     std::vector<uint8_t> body;        // exactly content_length bytes, empty when 0
     std::string error;                 // set when the request is unusable
@@ -119,6 +120,8 @@ inline Request split_request(const uint8_t * in, size_t len, uint64_t body_limit
             req.origin = val;
         } else if (name == "host") {
             req.host = val;
+        } else if (name == "x-tqllm-state-owner") {
+            req.state_owner = val;
         } else if (name == "x-tqllm-routed") {
             req.routed = true;
         }

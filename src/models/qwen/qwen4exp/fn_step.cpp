@@ -7,9 +7,20 @@ DecodeModel::HostPrep DecodeModel::prepare_host(const std::vector<int> & tokens)
     p.embedding = cp.file("token_embd.weight").gather_rows("token_embd.weight", rows);
     const auto ids = history.append_batch(tokens);
     std::vector<uint64_t> ple_rows(ids.begin(), ids.end());
-    p.ple = cp.file("per_layer_token_embd.weight").gather_rows("per_layer_token_embd.weight", ple_rows);
+    if (cp.run.owns_ple(c)) p.ple = cp.file("per_layer_token_embd.weight").gather_rows("per_layer_token_embd.weight", ple_rows);
     return p;
 }
+
+namespace {
+template <typename T>
+void capture_rows(const std::vector<int> * layers, __nv_bfloat16 * out, int64_t stride, int layer, const T * res, int n, int hc, int h) {
+    if (!layers || !out) return;
+    for (size_t i = 0; i < layers->size(); ++i)
+        if ((*layers)[i] == layer) tqllm_cuda::hc_mean_bf16(res, n, hc, h, out + i * size_t(h), stride, nullptr);
+}
+}  // namespace
+void DecodeModel::capture(int layer, const float * res, int n) { capture_rows(cap_layers, cap_out, cap_stride, layer, res, n, c.hc, h); }
+void DecodeModel::capture(int layer, const __nv_bfloat16 * res, int n) { capture_rows(cap_layers, cap_out, cap_stride, layer, res, n, c.hc, h); }
 
 std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens, const std::vector<int> * next) {
     const int n = int(tokens.size());
@@ -45,10 +56,12 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
         if (prefill_wide_bf16(std::min(sub, n))) {
             if (!res_keep_b || res_keep_b->count < size_t(n) * width) { PersistentAlloc keep; res_keep_b.reset(); res_keep_b = std::make_unique<Device<__nv_bfloat16>>(size_t(n) * width); }
             tqllm_cuda::wide_pack(res_keep->p, res_keep_b->p, int64_t(n) * width, nullptr);
-            for (int layer = 0; layer < c.layers; ++layer) { prefill_layer(layer, nullptr, n, dp.p, experts, nullptr, res_keep_b->p); g_arena->used = base; }
+            trunk_layers([&](int layer) { prefill_layer(layer, nullptr, n, dp.p, experts, nullptr, res_keep_b->p); capture(layer, res_keep_b->p, n); g_arena->used = base; },
+                         [&] { return static_cast<void *>(res_keep_b->p); }, size_t(n) * width * sizeof(__nv_bfloat16), n);
             tqllm_cuda::wide_unpack(res_keep_b->p, res_keep->p, int64_t(n) * width, nullptr);
         } else
-        for (int layer = 0; layer < c.layers; ++layer) { prefill_layer(layer, res_keep->p, n, dp.p, experts); g_arena->used = base; }
+        trunk_layers([&](int layer) { prefill_layer(layer, res_keep->p, n, dp.p, experts); capture(layer, res_keep->p, n); g_arena->used = base; },
+                     [&] { return static_cast<void *>(res_keep->p); }, size_t(n) * width * sizeof(float), n);
         position += n;
         Device<float> norm(size_t(width) * n);
         tqllm_cuda::hc_norm(res_keep->p, cp.dense_device("output_hc_norm.weight"), norm.p, h, c.hc, n, float(cp.epsilon), nullptr);
@@ -58,15 +71,16 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     }
     const bool layer_reset = g_arena && !spec;
     const size_t base = g_arena ? g_arena->used : 0;
-    for (int layer = 0; layer < c.layers; ++layer) {
+    trunk_layers([&](int layer) {
         layer_forward(layer, residual, n, dp.p, nullptr, experts);
-        if (!layer_reset) continue;
+        capture(layer, residual->p, n);
+        if (!layer_reset) return;
         auto & pp = pingpong[layer & 1];
         if (!pp || pp->count < size_t(n) * width) { PersistentAlloc keep; pp = std::make_unique<Device<float>>(size_t(n) * width); }
         ck(cudaMemcpyAsync(pp->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
         residual = std::make_unique<Device<float>>(Device<float>::View{}, pp->p, size_t(n) * width);
         g_arena->used = base;
-    }
+    }, [&] { return static_cast<void *>(residual->p); }, size_t(n) * width * sizeof(float), n);
     position += n;
     if (res_keep->count < size_t(n) * width) { PersistentAlloc keep; res_keep = std::make_unique<Device<float>>(size_t(n) * width); }
     ck(cudaMemcpyAsync(res_keep->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
@@ -75,6 +89,68 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     auto out = std::make_unique<Device<float>>(size_t(h) * n);
     mix_device(cp, "output_hc_", norm.p, n, out->p, nullptr);
     return out;
+}
+
+void DecodeModel::step_outer(const std::vector<std::vector<int>> & chunks, const std::function<void(size_t, const Device<float> &)> & done) {
+    require(!chunks.empty() && g_arena && !spec && !cp.rt.hot_map && !cp.run.split && !(cap_layers && cap_out), "layer-outer prefill: unsupported setup");
+    const int sub = std::max(16, cp.rt.sub_req > 0 ? std::min(cp.run.tune.sub, cp.rt.sub_req) : cp.run.tune.sub);
+    struct Chunk { int n = 0, pos = 0; bool bf16 = false; std::unique_ptr<Device<float>> wide, ple; std::unique_ptr<Device<__nv_bfloat16>> wide_b; };
+    std::vector<Chunk> ck_(chunks.size());
+    // host prep in prompt order (the PLE history), each chunk's wide rows built as step() builds them
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto & tokens = chunks[i]; auto & k = ck_[i]; k.n = int(tokens.size()); k.pos = position;
+        require(k.n >= 256, "layer-outer prefill: a chunk below 256 tokens");
+        if (g_arena) g_arena->used = 0;
+        HostPrep prep;
+        if (i == 0 && prep_next_.valid()) { prep = prep_next_.get(); require(prep.tokens == tokens, "prefill host prep was made for other tokens"); }
+        else prep = prepare_host(tokens);
+        spec_pos0 = position; spec_n = k.n; spec_hist0 = prep.hist0;
+        if (keep_embeddings) std::memcpy(prompt_emb.p.get() + size_t(position) * h, prep.embedding.data(), prep.embedding.size() * sizeof(float));
+        PersistentAlloc keep;
+        Device<float> de(prep.embedding.size()); de.put(prep.embedding);
+        k.wide = std::make_unique<Device<float>>(size_t(width) * k.n);
+        tqllm_cuda::hc_init(de.p, k.wide->p, h, c.hc, k.n, nullptr);
+        k.ple = std::make_unique<Device<float>>(prep.ple.size()); k.ple->put(prep.ple);
+        k.bf16 = prefill_wide_bf16(std::min(sub, k.n));
+        if (k.bf16) {
+            k.wide_b = std::make_unique<Device<__nv_bfloat16>>(size_t(k.n) * width);
+            tqllm_cuda::wide_pack(k.wide->p, k.wide_b->p, int64_t(k.n) * width, nullptr);
+            ck(cudaDeviceSynchronize()); k.wide.reset();
+        }
+        position += k.n;
+    }
+    const int end = position;
+    struct Outer { PrefillStage & st; Outer(PrefillStage & s) : st(s) { st.outer = true; }
+                   ~Outer() { try { if (st.pre.valid()) st.pre.get(); } catch (...) {} st.pre_layer = -1; st.outer = false; st.ring_layer = -1; } } outer_mode{stage()};
+    if (g_arena) g_arena->used = 0;
+    const size_t base = g_arena->used;
+    for (int layer = 0; layer < c.layers; ++layer)
+        for (size_t i = 0; i < ck_.size(); ++i) {
+            auto & k = ck_[i]; position = k.pos;
+            pf_hold_next = i + 1 < ck_.size();
+            // the next layer's missing experts are read from the drive while this layer's chunks compute (after its first
+            // chunk on layer 0: the staging and ring exist from then on)
+            if (layer + 1 < c.layers && i == (layer == 0 ? 1 : 0) && experts.host_tier()) stage_prefetch(stage(), experts, layer + 1);
+            if (i > 0) stage_restart(stage(), experts, layer);
+            if (k.bf16) prefill_layer(layer, nullptr, k.n, k.ple->p, experts, nullptr, k.wide_b->p);
+            else prefill_layer(layer, k.wide->p, k.n, k.ple->p, experts);
+            g_arena->used = base;
+        }
+    pf_hold_next = false; position = end;
+    { auto & st = stage(); if (st.pre.valid()) st.pre.get(); }
+    for (size_t i = 0; i < ck_.size(); ++i) {
+        auto & k = ck_[i];
+        if (res_keep->count < size_t(k.n) * width) { PersistentAlloc keep; res_keep.reset(); res_keep = std::make_unique<Device<float>>(size_t(k.n) * width); }
+        if (k.bf16) tqllm_cuda::wide_unpack(k.wide_b->p, res_keep->p, int64_t(k.n) * width, nullptr);
+        else ck(cudaMemcpyAsync(res_keep->p, k.wide->p, size_t(k.n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));
+        k.wide.reset(); k.wide_b.reset(); k.ple.reset();
+        if (g_arena) g_arena->used = 0;
+        Device<float> norm(size_t(width) * k.n);
+        tqllm_cuda::hc_norm(res_keep->p, cp.dense_device("output_hc_norm.weight"), norm.p, h, c.hc, k.n, float(cp.epsilon), nullptr);
+        Device<float> out(size_t(h) * k.n);
+        mix_device(cp, "output_hc_", norm.p, k.n, out.p, nullptr);
+        done(i, out);
+    }
 }
 
 std::unique_ptr<Device<float>> DecodeModel::step_multi(const std::vector<DecodeModel *> & ms, const std::vector<std::vector<int>> & toks) {
@@ -91,9 +167,11 @@ std::unique_ptr<Device<float>> DecodeModel::step_multi(const std::vector<DecodeM
     Device<float> de(embedding.size()); de.put(embedding);
     auto residual = std::make_unique<Device<float>>(size_t(width) * n);
     tqllm_cuda::hc_init(de.p, residual->p, h, c.hc, n, nullptr);
-    const auto ple = cp.file("per_layer_token_embd.weight").gather_rows("per_layer_token_embd.weight", ple_rows);
+    std::vector<float> ple;
+    if (cp.run.owns_ple(c)) ple = cp.file("per_layer_token_embd.weight").gather_rows("per_layer_token_embd.weight", ple_rows);
     Device<float> dp(ple.size()); dp.put(ple);
-    for (int layer = 0; layer < c.layers; ++layer) layer_forward(layer, residual, n, dp.p, nullptr, experts, &segs);
+    trunk_layers([&](int layer) { layer_forward(layer, residual, n, dp.p, nullptr, experts, &segs); },
+                 [&] { return static_cast<void *>(residual->p); }, size_t(n) * width * sizeof(float), n);
     for (const auto & sg : segs) {
         DecodeModel & m = *sg.m; m.position += sg.n;
         if (m.res_keep->count < size_t(sg.n) * width) { PersistentAlloc keep; m.res_keep = std::make_unique<Device<float>>(size_t(sg.n) * width); }

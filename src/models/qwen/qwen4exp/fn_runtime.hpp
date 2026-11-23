@@ -2,7 +2,7 @@
 // Flash-Next engine runtime: CUDA error checks, scratch arena, prefill tuning and the shared per-process state.
 #include <unordered_map>
 #include <memory>
-#include <functional>
+namespace tqllm { class ExpertParallel; }
 namespace tqllm { class TpComm; }
 // Private stage replay and native short-context chain diagnostics, not a generation or speed benchmark.
 #include "debug.hpp"
@@ -14,6 +14,7 @@ namespace tqllm { class TpComm; }
 #include "kv_store.hpp"
 #include "kv_format.hpp"
 #include "decode_rules.hpp"
+#include "layer_split.hpp"
 #include "qwen4exp.hpp"
 #include "dequant.hpp"
 #include "moe_kernels.cuh"
@@ -68,7 +69,12 @@ inline void apply_layer_slots(tqllm::MixedExpertCache & cache, const std::string
     if (text.empty()) return;
     std::vector<int> caps; size_t at = 0;
     while (at <= text.size()) { const size_t e = std::min(text.find(',', at), text.size()); caps.push_back(std::stoi(text.substr(at, e - at))); at = e + 1; }
-    caps = tqllm::flashnext::lift_layer_floor(tqllm::flashnext::scale_layer_slots(caps, slots, cache.experts()), min_slots, cache.experts());
+    std::vector<bool> owned(caps.size(), true);  // --split layer: only this rank's layers hold banks
+    if (int(caps.size()) == cache.layers()) {
+        int n = 0; for (int l = 0; l < cache.layers(); ++l) n += cache.has_layout(l);
+        if (n > 0) for (int l = 0; l < cache.layers(); ++l) owned[size_t(l)] = cache.has_layout(l);  // none yet: before the first banks
+    }
+    caps = tqllm::flashnext::scale_owned_layer_slots(caps, owned, slots, cache.experts(), min_slots);
     cache.set_layer_slots(caps);
     std::printf("DECODE per-layer expert slots %d..%d from %s\n", *std::min_element(caps.begin(), caps.end()), cache.slots(), from.c_str());
 }
@@ -125,6 +131,23 @@ struct ScratchArena { char * base = nullptr; size_t size = 0, used = 0, high = 0
 inline const bool kPrefillLog = tqllm::debug_cstr("fn_prefill_log") != nullptr;  // prefill profile (syncs)
 inline ScratchArena * g_arena = nullptr; inline int g_persistent = 0;
 struct PersistentAlloc { PersistentAlloc() { ++g_persistent; } ~PersistentAlloc() { --g_persistent; } };
+// A second stream for decode work that reads only inputs already made on the calling thread's stream (shared expert, GDN
+// gate / alpha / beta projections): fork() makes it wait for everything queued so far, join() makes the calling stream
+// wait for what it queued. Inside a captured layer this becomes a parallel graph branch. The kernels and their inputs
+// are the ones the serial order runs, so the results are the same; only scratch from the bump arena may be written there
+// (nothing is freed or reused before the join). tl_side: the current layer takes these branches (decode_rules side_branches).
+struct SideBranch {
+    cudaStream_t s = nullptr; cudaEvent_t fork_e = nullptr, join_e = nullptr; bool open = false;
+    static SideBranch & get() {
+        thread_local SideBranch b;
+        if (!b.s) { ck(cudaStreamCreateWithFlags(&b.s, cudaStreamNonBlocking));
+                    ck(cudaEventCreateWithFlags(&b.fork_e, cudaEventDisableTiming)); ck(cudaEventCreateWithFlags(&b.join_e, cudaEventDisableTiming)); }
+        return b;
+    }
+    cudaStream_t fork() { ck(cudaEventRecord(fork_e, cudaStreamPerThread)); ck(cudaStreamWaitEvent(s, fork_e, 0)); open = true; return s; }
+    void join() { if (!open) return; ck(cudaEventRecord(join_e, s)); ck(cudaStreamWaitEvent(cudaStreamPerThread, join_e, 0)); open = false; }
+};
+inline thread_local bool tl_side = false;
 // --dense-cache-mb: one layer's fp16 dense weight images, dequantised once and reused by every
 // 256-token sub-chunk of that layer (the pool is a prefill borrow: counted in the bank eviction, freed with the prefill buffers)
 struct DenseHalfCache {
@@ -151,10 +174,26 @@ struct FnConfig {
     bool tile_experts = false;
     float draft_tau = 0.f;  // one sequence: stop MTP drafting below this draft probability (0: fixed drafts)
     int predict_n = 4;      // next-layer prediction (prefetch) for verify blocks of up to this many tokens
-    bool prompt_cache = false;  // --prompt-cache on (several slots): a slot keeps its sequence and reuses a shared prompt prefix
+    bool prompt_cache = false;  // --prompt-cache on: a slot keeps its sequence and reuses a shared prompt prefix
+    bool prompt_cache_set = false;  // --prompt-cache given (else prompt_cache_by_fit may turn it on at start-up)
+    int prompt_park = -1;       // --prompt-park N: kept states parked outside the slots (0: off; -1: 4 x slots), at most 4 GB
     bool unified_memory = false;  // the GPU shares system memory (GB10): set at load
     // --split experts: the link to the other rank (rank 0 serves, rank 1 computes its experts of rank 0's decode forwards)
     std::shared_ptr<tqllm::TpComm> ep;
+    std::shared_ptr<tqllm::ExpertParallel> experts;  // the shared expert work over `ep` (src/experts/expert_parallel.hpp)
+    // --split layer: one rank per GPU runs the trunk layers [lr.lo, lr.hi); the residual rows cross the boundary and the
+    // last rank broadcasts the trunk output, so every rank runs the head, MTP and sampling (identical host decisions)
+    std::shared_ptr<tqllm::TpComm> split;
+    std::vector<uint32_t> split_at;          // --split-at (empty: by each rank's free memory)
+    std::vector<tqllm::LayerRange> ranges;   // every rank's trunk layers
+    tqllm::LayerRange lr;                    // this rank's
+    // the per-layer token embedding rows are read only on the rank that runs the PLE layer
+    template <class Config> bool owns_ple(const Config & c) const { return !split || c.ple_layers.empty() || lr.owns(uint32_t(c.ple_layers[0])); }
+    // --split layer with one sequence (--np 1): the head, the MTP layer and the DFlash2 drafter run on the last rank only; it
+    // hands the others the draft block and the picked tokens, so the trunk output never travels back (decode_rules.hpp
+    // head_rank_ops); --np > 1 keeps every rank running them on the broadcast rows
+    bool head_only = false, last_rank = true;  // last_rank: this rank is the split's last (or there is no split)
+    bool head_here() const { return !head_only || last_rank; }
 };
 // one engine's mutable state shared by its sequences (one stream): Checkpoint::rt
 struct FnRuntime {
@@ -166,8 +205,10 @@ struct FnRuntime {
     bool profile_decode_req = false;  // TQLLM_DEBUG=profile_decode: the profiled request is in its decode
     double qsa_ms = 0;         // prefill profile (kPrefillLog)
     int qsa_block = 2048;      // queries per QSA selection block (prefill): the plan lowers it (1024, 512) before halving the chunk
+    bool rows_to_all = false;  // head_only: this forward's trunk output goes to every rank anyway (Engine::verify)
     int block_seqs = 1;        // sequences in the decode block being run (batched np > 1 verify): predicts() scales its row limit
     int trace_waves = 0, trace_min_slots = 1 << 30;  // TQLLM_DEBUG=steptrace: decode layers on the waves path / fewest bank slots this step
+    int trace_plain = 0;       // TQLLM_DEBUG=steptrace: graph-path layer calls this step that ran plain (graph warm-up)
     int sub_req = 0;           // the request's dense sub-chunk cap: follows the block (the arena's users scale with it), 0 = --prefill-sub
     int prefill_stage = 0;     // the request's staging slices (experts per half), 0 = the engine's --prefill-stage / small-card clamp
     int prefill_epoch = 0;     // bumped when a prefill releases decode scratch: graph capture warms up again
@@ -224,6 +265,9 @@ template<class T> struct Device {
                                      (g_persistent ? "persistent" : "temporary") + "), " + std::to_string(fr >> 20) + " MiB free");
         }
     }
+    // owning: no copies (a copy freed its buffer twice / left the other dangling); moves hand the buffer over
+    Device(const Device &) = delete; Device & operator=(const Device &) = delete;
+    Device(Device && o) noexcept : p(o.p), count(o.count), owned(o.owned), plain(o.plain) { o.p = nullptr; o.owned = false; }
     ~Device() {
         if (!owned) return;
         // a free inside a CUDA graph capture (a buffer replaced by a larger one in a captured step) is invalid for pool

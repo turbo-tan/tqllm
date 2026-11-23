@@ -115,6 +115,59 @@ int main() {
         tqserve::PeerMemory fresh;
         check(!tqserve::remembered_status(late, fresh).ok, "never answered -> skipped");
     }
+    {   // conversation states across boxes (--state-listen): fetch-aware picks
+        auto st = [](BoxStatus b, const char * a) { b.state = a; return b; };
+        // the holder is fuller than the other box: the other box takes the follow-up and fetches the state from the holder
+        BoxStatus holder = st(box(1, 7, 0, 900), "10.0.0.2:9000"), other = st(box(6, 2), "10.0.0.1:9000");
+        auto r = tqserve::pick_box_fetch({other, holder}, 1000, 384, 3e9);
+        check(r.box == 0 && r.owner == 1 && r.fetch_s > 0, "holder busier -> the other box, fetching from the holder");
+        // same load: the holder keeps it (a fetch costs more than holding)
+        holder = st(box(4, 4, 0, 900), "10.0.0.2:9000"); other = st(box(4, 4), "10.0.0.1:9000");
+        r = tqserve::pick_box_fetch({other, holder}, 1000, 384, 3e9);
+        check(r.box == 1 && r.owner == -1, "same load -> the holder, no fetch");
+        // a box without a state listener cannot fetch: the old prefix rule decides (the holder)
+        BoxStatus plain = box(6, 2); holder = st(box(1, 7, 0, 900), "10.0.0.2:9000");
+        r = tqserve::pick_box_fetch({plain, holder}, 1000, 384, 3e9);
+        check(r.owner == -1, "no listener on the other box -> no fetch");
+        // nobody holds the prompt: the plain pick
+        r = tqserve::pick_box_fetch({st(box(6, 2), "a:1"), st(box(1, 7), "b:1")}, 1000, 384, 3e9);
+        check(r.box == 0 && r.owner == -1, "nothing held -> the usual pick, no fetch");
+        // a slow link prices the fetch above the prefill it saves: no fetch
+        holder = st(box(1, 7, 0, 900), "10.0.0.2:9000"); other = st(box(6, 2), "10.0.0.1:9000");
+        r = tqserve::pick_box_fetch({other, holder}, 1000, 384, 2e7);
+        check(r.owner == -1, "20 MB/s link -> prefill instead of a fetch");
+    }
+    {   // the holder survives a late status answer (remembered_status knows no reuse)
+        tqserve::HolderMemory hm;
+        const std::string prompt(3000, 'x');
+        const size_t k = tqserve::HolderMemory::key(prompt);
+        auto st = [](BoxStatus b, const char * a) { b.state = a; return b; };
+        std::vector<BoxStatus> now = {st(box(4, 4), "a:1"), st(box(1, 7, 0, 700), "b:1")};
+        hm.note(now, k, 0.0);
+        std::vector<BoxStatus> late = {st(box(6, 2), "a:1"), st(box(1, 7, 0, 0), "b:1")};  // box 1 late: its reuse is unknown
+        hm.apply(late, k, 5.0);
+        auto r = tqserve::pick_box_fetch(late, 900, 384, 3e9);
+        check(late[1].reuse == 700 && r.box == 0 && r.owner == 1, "late status -> still fetches from the remembered holder");
+        std::vector<BoxStatus> later = {st(box(6, 2), "a:1"), st(box(1, 7, 0, 0), "b:1")};
+        hm.apply(later, k, 40.0);
+        check(later[1].reuse == 0, "past the TTL -> forgotten");
+        hm.served(k, 0, 900, 41.0);
+        std::vector<BoxStatus> next = {st(box(6, 2), "a:1"), st(box(1, 7), "b:1")};
+        hm.apply(next, k, 42.0);
+        check(next[0].reuse == 900, "the box a request went to holds it afterwards");
+        check(tqserve::HolderMemory::key("short") == 0, "a short prompt (no held conversation) has no key");
+        // a stale report from the box that lent the state away must not take the holder back (GB10 11-15: three third
+        // turns went to the lender, which held nothing any more, and prefilled in full)
+        tqserve::HolderMemory h2;
+        h2.served(k, 1, 928, 100.0);  // turn 2 went to box 1 (it fetched the state)
+        std::vector<BoxStatus> t3 = {st(box(4, 4, 0, 862), "a:1"), st(box(0, 8, 0, 0), "b:1")};  // box 0 still reports its old text
+        h2.note(t3, k, 110.0);
+        h2.apply(t3, k, 110.0);
+        auto r3 = tqserve::pick_box_fetch(t3, 1000, 64, 3e9);
+        check(t3[1].reuse >= 928 && (r3.box == 1 || r3.owner == 1), "a stale lower report from the lender -> the turn follows the newer holder");
+        // shared-prefix tokens (the lender forgets by tokens, not by decoded text)
+        check(tqserve::shared_prefix({1, 2, 3, 4}, {1, 2, 3, 9}) == 3 && tqserve::shared_prefix({}, {1}) == 0, "shared token prefix");
+    }
     if (failures) return 1;
     std::puts("serve_router: ok");
     return 0;

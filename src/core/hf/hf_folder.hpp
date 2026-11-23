@@ -57,6 +57,12 @@ public:
     GgufTensor q4(const std::string & module, const BlockOrder & rows = {}, const BlockOrder & cols = {}) const;
     GgufTensor q4_cols(const std::vector<std::string> & modules) const;  // the modules side by side (same rows)
     GgufTensor q4_experts(const std::string & module) const;  // [experts][rows][cols / 8]: built one expert at a time
+    // Expert stacks stored quantised as one tensor [experts][rows][..] (Inkling 2), rows row0, row0 + stride, .. (nrows,
+    // 0 = to the end), one expert built per slice. ModelOpt NVFP4: `tensor` U8 E2M1 pairs (low nibble = even column),
+    // `tensor`_scale E4M3 per 16, per-expert `tensor`_amax / `tensor`_outer_scale_denominator -> GGML_NVFP4G. MXFP8:
+    // `tensor` E4M3, `tensor`_scale E8M0 per 32 along a row -> GGML_MXFP8 rows. The same values, no requantisation.
+    GgufTensor nvfp4_experts(const std::string & tensor, uint64_t row0 = 0, uint64_t stride = 1, uint64_t nrows = 0) const;
+    GgufTensor mxfp8_experts(const std::string & tensor, uint64_t row0 = 0, uint64_t stride = 1, uint64_t nrows = 0) const;
     // The modules stacked along the rows (a sharded per-layer token embedding): built on read, gathered by row, warmed.
     GgufTensor q4_rows(const std::vector<std::string> & modules) const;
     // An affine 4-bit or stored matrix dequantised to `type` (BF16 / F32 / F16), rows [row0, row0 + nrows) (0: all).

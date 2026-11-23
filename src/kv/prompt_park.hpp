@@ -50,6 +50,22 @@ public:
     void release(uint64_t conv) { protected_.erase(conv); }
     // the conversation ended (or was abandoned): its state goes first when room is needed, still collectable until then
     void retire(uint64_t conv) { if (const int s = find(conv); s >= 0) spaces_[size_t(s)].dead = true; }
+    // the space a new state would take if none were free (oldest dead, else oldest live neither protected nor `keep`), or -1
+    int victim(uint64_t keep) const {
+        const int d = oldest([keep](const Space & s) { return s.dead && s.conv != keep; });
+        return d >= 0 ? d : oldest([this, keep](const Space & s) { return s.conv != keep && !protected_.count(s.conv); });
+    }
+    // frees the conversation's space without a pickup (an eviction by the caller); false if not parked
+    bool drop(uint64_t conv) {
+        const int s = find(conv);
+        if (s < 0) return false;
+        spaces_[size_t(s)] = {};
+        protected_.erase(conv);
+        return true;
+    }
+    bool dead(uint64_t conv) const { const int s = find(conv); return s >= 0 && spaces_[size_t(s)].dead; }
+    // the conversation in a used space (0 if free)
+    uint64_t conv_at(int s) const { return s >= 0 && size_t(s) < spaces_.size() && spaces_[size_t(s)].used ? spaces_[size_t(s)].conv : 0; }
     int size() const { return int(spaces_.size()); }
     const Stats & stats() const { return stats_; }
 

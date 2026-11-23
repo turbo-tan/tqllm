@@ -1,5 +1,6 @@
 // Host-only contract test for the KV-cache format registry: every format is registered, reports sane sizes and
 // provenance, and declares its verify-scratch need. No GPU needed.
+#include <algorithm>
 #include "kv_format.hpp"
 
 #include <cstdio>
@@ -14,7 +15,7 @@ static int fails = 0;
 int main() {
     const auto names = kv_format_names();
     CHECK(names.size() >= 7, "expected the 7 built-in formats, got %zu", names.size());
-    for (const char * must : {"bf16", "q8", "q8k-turbo3v", "t4k-turbo3v", "t4kv", "tq3", "tq3k-tq2v"}) {
+    for (const char * must : {"bf16", "q8/q8", "q8k-turbo3v", "t4k-turbo3v", "t4kv", "tq3", "tq3k-tq2v"}) {
         bool found = false;
         for (const auto & n : names) found = found || n == must;
         CHECK(found, "format %s not registered", must);
@@ -42,8 +43,12 @@ int main() {
         CHECK(k1 % 16 == 0 && v1 % 16 == 0, "%s: rows must stay 16-byte aligned", n.c_str());
     }
     // the conservative default must stay on for formats not validated without the context-sized scratch
-    for (const char * keep : {"bf16", "q8", "q8k-turbo3v", "t4k-turbo3v", "t4kv"})
+    for (const char * keep : {"bf16", "q8k-turbo3v", "t4k-turbo3v", "t4kv"})
         CHECK(kv_format(keep)->needs_context_scratch(), "%s must keep the conservative scratch", keep);
+    // int8 KV (--kv q8 / -ctk q8_0) is the rotated split codec: it has QSA rows and tree verify (issue #60: the plain
+    // int8 format had neither, so a QSA file attended densely and DFlash2 verified chains)
+    CHECK(kv_format("q8/q8")->qsa_ok() && kv_format("q8/q8")->tree_ok(), "q8/q8: QSA rows and tree verify");
+    CHECK(std::find(names.begin(), names.end(), "q8") == names.end(), "no plain q8 format left beside q8/q8");
     CHECK(!kv_format("tq3")->needs_context_scratch(), "tq3 uses only the multi-query partials (measured 2026-10-05)");
     CHECK(!kv_format("tq3k-tq2v")->needs_context_scratch(), "tq3k-tq2v uses only the multi-query partials");
     // tq3 record: 112 B per head per token for K and for V

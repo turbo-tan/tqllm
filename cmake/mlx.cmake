@@ -16,10 +16,21 @@ add_library(tqmlx STATIC src/backends/metal/tq4.cpp src/backends/metal/tq3.cpp s
 target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/metal)
 target_link_libraries(tqmlx PUBLIC mlx tqllm)
 target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp
+               src/models/inkling2/loop/inkling2_mlx.cpp src/models/inkling2/loop/inkling2_mlx_draft.cpp src/backends/metal/floatx_nax.cpp
+               src/backends/metal/engine_inkling2_mlx.cpp
                src/formats/weight/dequant.cpp src/backends/metal/draft_head.cpp src/backends/metal/prefill.cpp
                src/backends/metal/nax_affine.cpp src/backends/metal/matrix_unit_check.cpp src/backends/metal/prefill_fused.cpp src/backends/metal/ane_program.mm)
 set_source_files_properties(src/backends/metal/ane_program.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(tqmlx PUBLIC "-framework Foundation" "-framework Metal" "-framework IOSurface")
+target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
+add_executable(inkling2-mlx-check tools/inkling2_mlx_check.cpp)
+target_link_libraries(inkling2-mlx-check PRIVATE tqmlx)
+if(BUILD_TESTING)
+  add_executable(test-mlx-inkling2 tests/mlx_inkling2.cpp)
+  target_link_libraries(test-mlx-inkling2 PRIVATE tqmlx)
+  add_test(NAME mlx_inkling2 COMMAND test-mlx-inkling2)
+  set_tests_properties(mlx_inkling2 PROPERTIES ENVIRONMENT "MLX_ENABLE_TF32=0")
+endif()
 foreach(tool tqmlx-probe:tqmlx_probe tqmlx-dflash:tqmlx_dflash tqmlx-spec:tqmlx_spec tqmlx-ar:tqmlx_ar tqmlx-tree-bench:tqmlx_tree_bench tqmlx-qsa-bench:tqmlx_qsa_bench bench-mlx-sdpa:bench_mlx_sdpa
              bench-mlx-verify:bench_mlx_verify bench-mlx-prefill-gemm:bench_mlx_prefill_gemm bench-mlx-gdn-step:bench_mlx_gdn_step)
   string(REPLACE ":" ";" parts ${tool})

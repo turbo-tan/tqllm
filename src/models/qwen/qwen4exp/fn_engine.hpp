@@ -5,10 +5,12 @@
 //   chunk (--prefill-chunk wins), gsq_rco=1, layer_slots=<per-layer routing plan, scaled to the slots>
 // Pilot only: hot_map=<int32 map>, cold_slots=16, cold_host_mb=3072, cold_readers=0; no packed bank or pruning.
 // One slot, greedy MTP speculative decoding (exact: tokens identical to plain greedy). A fresh DecodeModel per request
-// resets the recurrent, PLE, attention and MTP state (--prompt-cache on with --np > 1: kept, see SlotState::snap_); the
+// resets the recurrent, PLE, attention and MTP state (--prompt-cache on: kept, see SlotState::snap_); the
 // expert caches persist across requests.
 #include "fn_model.hpp"
+#include "conversation_state.hpp"
 #include <array>
+#include "dflash2_drafter.hpp"
 #include "engine.hpp"
 #include "decode_rules.hpp"
 #include "memory_plan.hpp"
@@ -16,11 +18,14 @@
 #include "cold_expert_memo.hpp"
 #include "expert_read_pool.hpp"
 #include "expert_fetch_queue.hpp"
+#include "fn_host_tier.hpp"
 
 namespace tqllm::flashnext {
 using ColdFetchQueue=ExpertFetchQueue<std::array<ExpertPayload,3>>;
 struct FnServe {
     std::vector<std::string> ggufs; std::string mtp, experts, draft_vocab, hot_map_path, cold_store_path;
+    std::string dflash;  // manifest dflash=: the DFlash2 drafter GGUF (one sequence drafts with it; several use MTP)
+    std::unique_ptr<tqllm::Dflash2Drafter> drafter; std::unique_ptr<Device<__nv_bfloat16>> dfl_feat; size_t dfl_feat_rows = 0;
     std::string layer_slots;  // manifest layer_slots=: per-layer expert slots when no experts file carries a .slots plan
     std::unique_ptr<ColdExpertStore> cold_store;
     bool cold_fast = false, cold_reclaim_hot = false, cold_mmap = false, cold_streaming = false;
@@ -42,6 +47,10 @@ struct FnServe {
     size_t plan_budget = 0;  // free + bank bytes after the warm-up (pool trimmed, 256 MB steps): a prompt length always plans the same chunk / block
     size_t mtp_bank_bytes = 0;  // the MTP expert bank's device bytes at start (the plan's catch-up term and a multi-chunk prompt's room)
     float * res_host = nullptr; size_t res_host_cap = 0;  // pinned prompt residuals of a multi-chunk prefill (one prefill at a time)
+    // experts read from the GGUF on demand: the pinned host tier under the banks (decode_rules.hpp host_tier_blocks)
+    std::unique_ptr<tqllm::flashnext::TierLoader> tier_loader; std::unique_ptr<tqllm::HostExpertTier> tier; char * tier_mem = nullptr;
+    uint64_t tier_rows_per_token = 0, tier_kv_per_token = 0, tier_ring_half = 0;  // ring: one half of the prefill stream ring at full size  // a prompt's host bytes per token (decode_rules.hpp prompt_host_bytes)
+    void fit_tier(uint64_t need);  // the tier's elastic chunks to the RAM available (host_expert_tier.hpp fit_tier_chunks)
 };
 class FlashNextEngine final : public tqllm::Engine {
     FnServe f_; uint32_t context_;
@@ -56,6 +65,7 @@ class FlashNextEngine final : public tqllm::Engine {
         ColdFetchQueue::Stats cold_fetch_at_decode_{};
         size_t plan_catchup_bytes_ = 0;             // the plan's catch-up peak: what an overlapped refill must leave free
         bool refilled_ = false;                     // this request's prefill borrowed banks and the refill brought them back
+        tqllm::flashnext::DrafterPick pick_{};                      // one sequence with a DFlash2 drafter: which drafter drafts (decode_rules)
         // per request: offered_ drafts, taken_[m] the steps that kept m tokens (LEDGER decode steps)
         std::vector<int> ctx_; size_t plen_ = 0; uint64_t copied_ = 0;  // prompt + output so far (copy drafts), steps that verified a copy
         std::vector<int> out_; mutable std::vector<uint32_t> out_view_; int generate_ = 0, d1_ = 0; bool done_ = true; uint64_t steps_ = 0, toks_ = 0, offered_ = 0; std::array<uint64_t, 17> taken_{}; uint64_t prefill_us_ = 0, decode_us_ = 0;
@@ -64,31 +74,60 @@ class FlashNextEngine final : public tqllm::Engine {
         // --prompt-cache on: the model stays after its request; snap_ = a prompt position (kTail before the end of the
         // prompt in seq_) whose recurrent conv / state and PLE history rows were copied during the prefill, so a prompt
         // that starts with seq_[0, snap_] prefills only from snap_ (an agent's next turn: earlier turns + new message)
-        std::vector<int> seq_; int snap_ = 0;
+        // live_ (one slot): the position the finished request's own state ended at (seq_ = prompt ++ output); a next turn
+        // that repeats seq_[0, live_] reads only its new part, without a restore (reusable_from)
+        // snap_rows_: the step size that read [snap_, end) when the snapshot was taken (0: the chunk); a restore reads alike
+        std::vector<int> seq_; int snap_ = 0, live_ = 0, snap_rows_ = 0;
         bool serving_ = false;  // a request is in this slot (spec_begin .. spec_finish / spec_abort): --split experts rank 1 is not idle
         std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
+        uint64_t conv_ = 0;  // the conversation this slot's kept state belongs to (0: none)
     };
     // the next turn re-renders the end of the last prompt (assistant header) differently. A reused prompt is not
     // byte-identical to an uncached one at any tail (10de944a: 256, both chunks layer-major, still differed): the prefill
     // kernels are not chunk-size invariant, so --exact on warns (exact_conflicts)
     static constexpr int kTail = 64;
-    bool caching() const { return f_.cp->run.prompt_cache && slots_.size() > 1; }
-    static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, snap_) are reusable
-        return s.model_ ? reusable_prefix(s.seq_, s.snap_, prompt) : 0;
+    bool caching() const { return tqllm::flashnext::prompt_cache_keeps(f_.cp->run.prompt_cache, slots_.size()); }
+    // conversations moving between slots, the park and other boxes: several slots only
+    bool sharing() const { return caching() && slots_.size() > 1; }
+    static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, live_ or snap_) are reusable
+        return s.model_ ? reusable_from(s.seq_, s.live_, s.snap_, prompt) : 0;
     }
     void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
+    // --prompt-cache: the kept sequence's K/V capacity grown to `rows` with its state (kept_sequence_rows); false when the
+    // memory does not hold it (the state may be partly grown then: the caller drops it)
+    bool grow_kept(DecodeModel & m, size_t rows);
     void restore_snapshot(SlotState & s, int p);  // back to position p (= snap_): recurrent / PLE state copied back, K/V and history cut
     // TQLLM_DEBUG=pc_verify: after a restore, prefill [0, p) into a fresh sequence (64-token steps) and print how far each
     // restored state buffer is from it (relative rms; a wrong buffer is ~1, rounding ~1e-3)
     void pc_verify(const std::vector<int> & ids, int p);
+    // the slot's kept state (snap_) as a conversation state blob, and back into an idle slot (fn_state_io.cpp)
+    std::string state_layout(int p) const;
+    std::unique_ptr<StateBlob> export_from(SlotState & s);
+    std::string import_into(SlotState & s, const StateBlob & b);
+    // kept states parked outside the slots (ConversationStateStore "local", the prompt park's rules + a byte budget): a slot
+    // a new conversation takes parks its kept state; a follow-up resumes from the park in whichever slot it gets
+    std::unique_ptr<tqllm::ConversationStateStore> park_; uint64_t conv_clock_ = 0;
+    void park_init();
+    size_t park_budget() const;
+    int park_best(const std::vector<uint32_t> & prompt, uint64_t * conv) const;
+    void park_swap(const std::vector<uint32_t> & prompt);  // spec_begin, before the slot's own reuse is decided
+    void park_note(const char * what, tqllm::ConversationStateStore::Put put) const;
+public:
+    std::unique_ptr<StateBlob> export_state(int slot) override;
+    std::string import_state(int slot, const StateBlob & blob) override;
+    std::unique_ptr<StateBlob> export_state_for(const std::vector<uint32_t> & prompt, const std::string & entity) override;
+    std::string adopt_state(StateBlob blob) override;
+    void release_state(uint64_t conv) override;
+private:
     std::vector<SlotState> slots_; int cur_ = 0;
-    // --split experts, rank 1: every serving call holds the gate, so the helper thread computes rank 0's forwards only
-    // between them and only while no request of this box's own is in a slot
-    std::shared_ptr<EpHelperGate> ep_gate_;
-    std::unique_lock<std::recursive_mutex> ep_lock() { return ep_gate_ ? std::unique_lock<std::recursive_mutex>(ep_gate_->mu) : std::unique_lock<std::recursive_mutex>(); }
-    void start_ep_helper();
-    void ep_note_state() { if (ep_gate_) ep_grant(*f_.cp, *ep_gate_); }  // under ep_lock: idle again -> lease to rank 0
+    // --split experts, rank 1: every serving call holds the box lock, so the helper computes rank 0's forwards only between
+    // them and only while no request of this box's own is in a slot (src/experts/expert_parallel.hpp)
+    tqllm::ExpertParallel * ep_helper() const { return f_.cp && f_.cp->run.experts && f_.cp->run.experts->rank() == 1 ? f_.cp->run.experts.get() : nullptr; }
+    std::unique_lock<std::recursive_mutex> ep_lock() { auto * e = ep_helper(); return e ? e->lock() : std::unique_lock<std::recursive_mutex>(); }
+    void ep_note_state() { if (auto * e = ep_helper()) e->note_idle(); }  // under ep_lock: idle again -> lease to rank 0
     std::function<void()> first_token_hook_;  // set_first_token_hook
+    tqllm::Dflash2Drafter::EmbedFn dfl_embed();
+    tqllm::Dflash2Drafter::HeadFn dfl_head();
     void trace_step(int slots, int drafts, const std::vector<std::pair<size_t, std::vector<int>>> & per_slot, const std::vector<int> & slot_ids);
     uint64_t batched_steps_ = 0, serial_steps_ = 0;  // spec_step: one verify pass for all slots / one slot at a time (TQLLM_DEBUG=mem)
     SlotState & S() { return slots_[size_t(cur_)]; }
@@ -104,8 +143,8 @@ public:
     FlashNextEngine(const std::string & manifest, uint32_t context, int nslots, const FnConfig & options);
     // TQLLM_DEBUG=mem: where the device memory is (MiB); "other" = KV, QSA keys, recurrent state, CUDA context
     void ledger(const char * at) const;
-    void stop_followers() override { if (f_.cp && f_.cp->run.ep) ep_stop(*f_.cp); }
-    ~FlashNextEngine() override { if (ep_gate_) { std::lock_guard<std::recursive_mutex> g(ep_gate_->mu); ep_gate_->stop = true; } }
+    void stop_followers() override { if (f_.cp && f_.cp->run.experts) f_.cp->run.experts->stop_peer(); }
+    ~FlashNextEngine() override { if (auto * e = ep_helper()) e->close(); }
     // borrowed banks back, filled with the prompt's most-routed experts (Strata does the same)
     // after release_prefill (buffers freed, pool trimmed): the ledger rebuilds the borrowed banks; a bank that no longer
     // fits refills on its first use in decode
@@ -124,7 +163,7 @@ public:
         auto & sl = slots_[size_t(s)];
         sl.done_ = true; sl.serving_ = false; ep_note_state();
         try { if (sl.model_) { cudaDeviceSynchronize(); cudaGetLastError(); sl.model_.reset(); } } catch (...) {}
-        sl.snap_ = 0;
+        sl.snap_ = sl.live_ = 0;
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
         const auto lk = ep_lock();
@@ -160,11 +199,20 @@ public:
                          S().decode_us_ / 1e3 / std::max<double>(1, double(S().steps_)), (unsigned long long) S().offered_, (unsigned long long) S().copied_, kept.c_str());
             std::fprintf(stderr, "LEDGER slot steps since start: batched %llu, one slot at a time %llu | decode arena high %.0f of %.0f MB | host blocked since start: ids D2H %.0f ms, cache prepare %.0f ms, prefetch issue %.0f ms\n", (unsigned long long) batched_steps_, (unsigned long long) serial_steps_,
                          f_.arena.high / 1048576.0, f_.arena.size / 1048576.0, g_host_ms[0], g_host_ms[1], g_host_ms[2]);
+            if (f_.tier) { const auto & ts = f_.tier->stats(); const auto ti = f_.tier->index_stats();
+                std::fprintf(stderr, "LEDGER host tier since start: %d of %d blocks held, hits %llu, drive reads %llu (%.0f ms), prompt stream reads %llu, demoted %llu, released %llu, evicted %llu, fences %llu, refused %llu\n",
+                             f_.tier->resident(), f_.tier->blocks(), (unsigned long long) ti.hits, (unsigned long long) ts.loads, ts.load_ms,
+                             (unsigned long long) ts.stream_reads, (unsigned long long) ts.demotes, (unsigned long long) ti.released,
+                             (unsigned long long) ti.evictions, (unsigned long long) ti.fences, (unsigned long long) ti.refused); }
             std::fprintf(stderr, "LEDGER decode rounds %llu | since start: prefetched %llu used %llu, pf pending %llu running %llu waited-unread %llu skipped %llu\n",
                          (unsigned long long) S().steps_, (unsigned long long) f_.cache->prefetched(), (unsigned long long) f_.cache->prefetch_used(),
                          (unsigned long long) s.pf_pending, (unsigned long long) s.pf_running, (unsigned long long) s.pf_waited_unread, (unsigned long long) s.pf_skipped);
         }
         if (!caching()) S().model_.reset();
+        else if (slots_.size() == 1 && S().model_ && !S().out_.empty()) {  // the reply's state stays for the next turn
+            S().seq_.insert(S().seq_.end(), S().out_.begin(), S().out_.end());
+            S().live_ = S().model_->position + 1 == int(S().seq_.size()) ? S().model_->position : 0;
+        }
         S().prompt_res_.reset();
         return r;
     }
@@ -178,7 +226,8 @@ public:
     int slots() const override { return int(slots_.size()); }
     void set_first_token_hook(std::function<void()> hook) override { first_token_hook_ = std::move(hook); }
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
-        return caching() && s >= 0 && s < int(slots_.size()) ? uint32_t(reuse(slots_[size_t(s)], prompt)) : 0;
+        if (!caching() || s < 0 || s >= int(slots_.size())) return 0;
+        return uint32_t(std::max(reuse(slots_[size_t(s)], prompt), park_best(prompt, nullptr)));  // a parked state resumes in any slot
     }
     void select_slot(int s) override { require(s >= 0 && s < int(slots_.size()), "Flash-Next slot out of range"); cur_ = s; }
     // one step for every listed slot: each drafts with its own MTP state, one verify pass covers all of them
