@@ -187,6 +187,79 @@ def calib_ids(tok, wiki, srcdir, ntok, seqlen, seed=0):
     return out
 
 
+def official_experts(model_dir, l, dev="cpu"):
+    """layer l's experts as the reference loads them (the checkpoint's NVFP4 / MXFP8 dequantised to BF16 by the transformers
+    loader ops, w13 de-interleaved): (gate_up [E, 2I, D], down [E, D, I]); needs no model, only the pylib transformers"""
+    sys.path.insert(0, str(Path(model_dir) / "pylib"))
+    from safetensors import safe_open
+    from transformers.core_model_loading import Inkling2LoopDequantizeExperts, Interleave
+    f = safe_open(str(Path(model_dir) / "model-00001-of-00001.safetensors"), "pt", device=dev)
+    keys = set(f.keys())
+    out = {}
+    for w in ("w13", "w2"):
+        base = f"model.llm.layers.{l}.mlp.experts.{w}_weight"
+        names = [base, base + "_scale", base + "_amax", base + "_outer_scale_denominator"]
+        src = {n: f.get_tensor(n) for n in names if n in keys}
+        x = Inkling2LoopDequantizeExperts().convert(src, names, ["x"], model=None, full_layer_name=None)["x"]
+        if w == "w13":
+            x = Interleave(dim=1).convert({"x": x}, ["x"], ["x"])["x"]
+        out[w] = x
+    return out["w13"], out["w2"]
+
+
+def calibrate(model, mods, group, seqs):
+    import torch
+    stats = {l: ExpertStats("cuda") for l in group}
+    hooks = []
+    for l in group:
+        def pre(module, a, kw, l=l):
+            hs, ti, tw = (list(a) + [kw.get(k) for k in ("hidden_states", "top_k_index", "top_k_weights")][len(a):])[:3]
+            with torch.no_grad():
+                stats[l].add(hs, ti, tw, module.gate_up_proj, module.down_proj, module._apply_gate)
+
+        hooks.append(mods[l].register_forward_pre_hook(pre, with_kwargs=True))
+    t0 = time.time()
+    with torch.no_grad():
+        for i, ids in enumerate(seqs):
+            model(input_ids=torch.tensor([ids], device="cuda"), use_cache=False, logits_to_keep=1)
+            if i % 32 == 31:
+                log(f"  calibration {i + 1}/{len(seqs)} {time.time() - t0:.0f} s")
+    for h in hooks:
+        h.remove()
+    for l in group:
+        s = stats[l]
+        log(f"layer {l}: tokens {s.N}, expert tokens min {int(s.n.min())} median {int(s.n.median())} max {int(s.n.max())}, "
+            f"experts below 256: {int((s.n < 256).sum())}")
+    return stats
+
+
+def cmd_hessian(args):
+    """calibrate and save the per-expert Hessians of some layers (hess/L<l>.pt, 3.4 GB each) so another machine can encode them"""
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = False
+    hd = Path(args.out) / "hess"
+    hd.mkdir(parents=True, exist_ok=True)
+    todo = [l for l in parse_layers(args.layers) if not (hd / f"L{l:02d}.pt").exists()]
+    if not todo:
+        return
+    model, mods = load_model(args.model)
+    gu, dn = official_experts(args.model, todo[0], "cuda")  # the model-free loader must equal the reference's own weights
+    assert torch.equal(gu, mods[todo[0]].gate_up_proj.data) and torch.equal(dn, mods[todo[0]].down_proj.data), "official_experts != the loaded model"
+    del gu, dn
+    from transformers import AutoTokenizer
+    seqs = calib_ids(AutoTokenizer.from_pretrained(args.model), args.wiki, args.srcdir, args.tokens, args.seqlen)
+    for g in range(0, len(todo), args.group):
+        group = todo[g:g + args.group]
+        stats = calibrate(model, mods, group, seqs)
+        for l in group:
+            s = stats[l]
+            torch.save({"Hgu": s.Hgu.cpu(), "Hdn": s.Hdn.cpu(), "S": s.S.cpu(), "n": s.n.cpu(), "Hg": s.Hg.cpu(), "N": s.N}, str(hd / f"L{l:02d}.pt.tmp"))
+            os.replace(str(hd / f"L{l:02d}.pt.tmp"), hd / f"L{l:02d}.pt")
+            log(f"saved Hessians of layer {l}")
+        del stats
+        torch.cuda.empty_cache()
+
+
 def cmd_encode(args):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -202,49 +275,42 @@ def cmd_encode(args):
     log("layers to encode:", {l: need[l] for l in todo})
     if not todo:
         return
+
+    def encode_one(l, s, w_gu, w_dn):
+        for ci, n in enumerate(names):
+            if n not in need[l]:
+                continue
+            t0 = time.time()
+            with torch.no_grad():
+                gu, dn, errs = encode_layer(s, w_gu, w_dn, args, CODECS[n], dgu[ci], ddn[ci])
+            for name, arr in (("gu", gu), ("dn", dn)):
+                p = encdirs[n] / f"L{l:02d}_{name}.bin"
+                arr.tofile(str(p) + ".tmp")
+                if name == "gu":
+                    json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(encdirs[n] / f"L{l:02d}.json", "w"))
+                os.replace(str(p) + ".tmp", p)
+            log(f"layer {l} {n} done in {time.time() - t0:.0f} s, mean rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
+
+    if args.from_h:  # Hessians dumped by `hessian` (another machine), weights straight from the checkpoint: no reference model
+        for l in todo:
+            d = torch.load(Path(args.from_h) / f"L{l:02d}.pt")
+            s = ExpertStats("cuda")
+            s.Hgu, s.Hdn, s.Hg = d["Hgu"].cuda(), d["Hdn"].cuda(), d["Hg"].cuda()
+            s.S, s.n, s.N = d["S"].cuda(), d["n"].cuda(), d["N"]
+            gu, dn = official_experts(args.model, l, "cpu")
+            encode_one(l, s, gu.cuda(), dn.cuda())
+            del s, d, gu, dn
+            torch.cuda.empty_cache()
+        return
     model, mods = load_model(args.model)
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.model)
-    seqs = calib_ids(tok, args.wiki, args.srcdir, args.tokens, args.seqlen)
+    seqs = calib_ids(AutoTokenizer.from_pretrained(args.model), args.wiki, args.srcdir, args.tokens, args.seqlen)
     for g in range(0, len(todo), args.group):
         group = todo[g:g + args.group]
         log("group", group)
-        stats = {l: ExpertStats("cuda") for l in group}
-        hooks = []
+        stats = calibrate(model, mods, group, seqs)
         for l in group:
-            m = mods[l]
-
-            def pre(module, a, kw, l=l):
-                hs, ti, tw = (list(a) + [kw.get(k) for k in ("hidden_states", "top_k_index", "top_k_weights")][len(a):])[:3]
-                with torch.no_grad():
-                    stats[l].add(hs, ti, tw, module.gate_up_proj, module.down_proj, module._apply_gate)
-
-            hooks.append(m.register_forward_pre_hook(pre, with_kwargs=True))
-        t0 = time.time()
-        with torch.no_grad():
-            for i, ids in enumerate(seqs):
-                model(input_ids=torch.tensor([ids], device="cuda"), use_cache=False, logits_to_keep=1)
-                if i % 32 == 31:
-                    log(f"  calibration {i + 1}/{len(seqs)} {time.time() - t0:.0f} s")
-        for h in hooks:
-            h.remove()
-        for l in group:
-            s = stats[l]
-            log(f"layer {l}: tokens {s.N}, expert tokens min {int(s.n.min())} median {int(s.n.median())} max {int(s.n.max())}, "
-                f"experts below 256: {int((s.n < 256).sum())}")
-            for ci, n in enumerate(names):
-                if n not in need[l]:
-                    continue
-                t0 = time.time()
-                with torch.no_grad():
-                    gu, dn, errs = encode_layer(s, mods[l].gate_up_proj, mods[l].down_proj, args, CODECS[n], dgu[ci], ddn[ci])
-                for name, arr in (("gu", gu), ("dn", dn)):
-                    p = encdirs[n] / f"L{l:02d}_{name}.bin"
-                    arr.tofile(str(p) + ".tmp")
-                    if name == "gu":
-                        json.dump({"n": s.n.tolist(), "S": s.S.tolist(), "err": errs, "seconds": time.time() - t0}, open(encdirs[n] / f"L{l:02d}.json", "w"))
-                    os.replace(str(p) + ".tmp", p)
-                log(f"layer {l} {n} done in {time.time() - t0:.0f} s, mean rel err gu {np.mean([x[0] for x in errs]):.5f} down {np.mean([x[1] for x in errs]):.5f}")
+            encode_one(l, stats[l], mods[l].gate_up_proj, mods[l].down_proj)
         del stats
         torch.cuda.empty_cache()
 
@@ -428,7 +494,7 @@ def cmd_pack(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("encode", "eval", "pack", "sweep"):
+    for name in ("encode", "hessian", "eval", "pack", "sweep"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="the official checkpoint folder")
         p.add_argument("--out", required=True)
@@ -441,8 +507,10 @@ def main():
             p.add_argument("--gguf", required=True)
             p.add_argument("--dense-q8", action="store_true", help="also the embedding, head and attention q / k / v / o as Q8_0")
         if name == "encode":
-            p.add_argument("--wiki", required=True)
-            p.add_argument("--srcdir", required=True)
+            p.add_argument("--from-h", default="", help="folder of Hessians from `hessian` (no reference model is loaded)")
+        if name in ("encode", "hessian"):
+            p.add_argument("--wiki", default="")
+            p.add_argument("--srcdir", default="")
             p.add_argument("--tokens", type=int, default=200000)
             p.add_argument("--seqlen", type=int, default=1000)
             p.add_argument("--group", type=int, default=6)
