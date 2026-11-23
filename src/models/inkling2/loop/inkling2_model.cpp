@@ -388,17 +388,25 @@ struct Inkling2Model::Impl {
         ck(cudaMemset(ucount.p, 0, size_t(L) * E_ * 4), "counts");
     }
     // partial residency: per layer the resident_share experts routed most so far (since load) move to the device
+    std::vector<float> route_hist;  // decayed routed counts per (layer, expert), host side
+    int decode_steps = 0;           // decode forwards since the last plan (partial residency replans every kReplanEvery)
     int replan_experts() {
         if (resident_share >= Ls[0].eg.E) return 0;
         const int E_ = Ls[0].eg.E;
-        std::vector<int> cnt(size_t(L) * E_);
-        ck(cudaMemcpyAsync(cnt.data(), ucount.p, cnt.size() * 4, cudaMemcpyDeviceToHost, s), "counts");
+        std::vector<int> fresh(size_t(L) * E_);
+        ck(cudaMemcpyAsync(fresh.data(), ucount.p, fresh.size() * 4, cudaMemcpyDeviceToHost, s), "counts");
         ck(cudaStreamSynchronize(s), "counts");
+        ck(cudaMemsetAsync(ucount.p, 0, size_t(L) * E_ * 4, s), "counts");
+        // decayed history: routes since the last plan count fully, older ones half per plan, so the resident set follows
+        // what decode routes to now (a prompt's routing, or an earlier request's, fades)
+        if (route_hist.size() != fresh.size()) route_hist.assign(fresh.size(), 0.0f);
+        std::vector<float> cnt(fresh.size());
+        for (size_t i = 0; i < fresh.size(); ++i) cnt[i] = route_hist[i] = 0.5f * route_hist[i] + float(fresh[i]);
         int moved = 0;
         for (int l = 0; l < L; ++l) {
             std::vector<int> order(static_cast<size_t>(E_));
             for (int e = 0; e < E_; ++e) order[size_t(e)] = e;
-            const int * c = cnt.data() + size_t(l) * E_;
+            const float * c = cnt.data() + size_t(l) * E_;
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
             std::vector<char> want(static_cast<size_t>(E_), 0);
             for (int i = 0; i < resident_share; ++i) want[size_t(order[size_t(i)])] = 1;
@@ -951,6 +959,9 @@ struct Inkling2Model::Impl {
         std::fwrite(h.data(), 4, h.size(), dump);
     }
     void forward(const int * tokens, int n, int want, std::vector<float> & logits_out) {
+        // partial residency: re-plan the resident experts from the recent routing every kReplanEvery decode steps
+        constexpr int kReplanEvery = 32;
+        if (n == 1 && resident_share < Ls[0].eg.E && ++decode_steps >= kReplanEvery) { decode_steps = 0; replan_experts(); }
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (n <= 0 || n > chunk || want > n) throw std::runtime_error("inkling2: chunk size");
         grow_logits(want);

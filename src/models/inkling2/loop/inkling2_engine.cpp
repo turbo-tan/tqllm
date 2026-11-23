@@ -68,6 +68,7 @@ public:
             const int n = int(std::min<size_t>(chunk, p.size() - i));
             m_.forward(p.data() + i, n, 1, lg_);
         }
+        m_.replan_experts();  // partial residency (16 GB cards): the prompt's most-routed experts onto the device
         t1_ = std::chrono::steady_clock::now();
         prefill_us_ = uint64_t(std::chrono::duration<double, std::micro>(t1_ - t0).count());
         tok_ = pick(0);
