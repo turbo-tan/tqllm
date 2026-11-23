@@ -5,6 +5,19 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## 1.7.0 (2026-11-23)
 
+### Added
+- Inkling-2-Mini (Thinking Machines, 26.4B looped MoE, 3.4B active) on NVIDIA (RTX 30 to Blackwell, DGX Spark / GB10) and
+  on Apple Silicon (MLX), from the official checkpoint folder (NVFP4 / MXFP8 experts, BF16 dense): exact by default (KLD
+  0.0023 against BF16 on an RTX 3090, 0.0024 on an M5 Pro), MTP drafting (`--mtp`), tool calls and the thinking split
+  through its own Jinja template. `--exact off`: INT8 dense weights, and on sm_12x (Blackwell, GB10) the prompt experts on
+  the native FP4 block-scaled tensor cores (KLD 0.0096). Guide and measurements: [docs/models/inkling2.md](docs/models/inkling2.md).
+  DGX Spark against Strata 0.2.20 on the same weights, exact: prompts 2.1x faster at 8K, 3.2x at 128K, 3.7x at 256K.
+  RTX 3090: answers 65.3 against 34.9 tok/s at 64K. Mac M5 Pro against MTPLX 2.13.1: exact answers 40.4 against 35.3.
+
+### Fixed
+- `tqllm serve` on a Mac with `--model` set to a model folder (Inkling-2-Mini) no longer adds the default Qwen3.8-27B
+  drafter, which tqserve refused (the server exited at start).
+
 ### Changed
 - Flash-Next `--exact off` (CUDA) now includes route-tail skip at rank 8: a non-resident expert that every token of a decode
   call ranks 8th or lower is not copied or computed (weight 0). KLD vs `--exact on` 0.022, GSM8K-200 0.965 -> 0.975. `--exact on`
