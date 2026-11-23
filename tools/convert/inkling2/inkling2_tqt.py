@@ -416,6 +416,19 @@ def cmd_eval(args):
     log(f"ALL {n} positions: KLD vs lp_bf16 {kld:.5f}, top-1 {top1:.2f} %, layers {args.layers} (tqt) {args.layers2 or '-'} (tqt2)")
 
 
+def cmd_compare(args):
+    """one layer encoded in several variants (--out dirs, comma separated; each holds enc/): KLD / top-1 of that layer alone"""
+    model, mods = load_model(args.model)
+    gate = Gate(args.model)
+    l = int(args.layers)
+    for d in args.out.split(","):
+        saved = substitute(mods, l, tqt, Path(d) / "enc")
+        kld, top1, _ = gate.score(model, verbose=False)
+        mods[l].gate_up_proj.data.copy_(saved[0])
+        mods[l].down_proj.data.copy_(saved[1])
+        log(f"layer {l} alone, {d}: KLD {kld:.5f}, top-1 {top1:.2f} %")
+
+
 def cmd_sweep(args):
     """KLD / top-1 of each layer alone in the given code (the rest as the checkpoint): the sensitivity of the tiers' allocation"""
     model, mods = load_model(args.model)
@@ -519,7 +532,7 @@ def cmd_pack(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("encode", "hessian", "eval", "pack", "sweep"):
+    for name in ("encode", "hessian", "eval", "pack", "sweep", "compare"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="the official checkpoint folder")
         p.add_argument("--out", required=True)
@@ -546,7 +559,7 @@ def main():
             p.add_argument("--n0", type=float, required=True)
             p.add_argument("--nmin", type=float, default=64)
     args = ap.parse_args()
-    {"encode": cmd_encode, "hessian": cmd_hessian, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep}[args.cmd](args)
+    {"encode": cmd_encode, "hessian": cmd_hessian, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep, "compare": cmd_compare}[args.cmd](args)
 
 
 if __name__ == "__main__":
