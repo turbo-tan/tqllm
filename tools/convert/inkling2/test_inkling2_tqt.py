@@ -252,3 +252,44 @@ def test_overlay_dense_q8_tensor_is_two_dimensional(tmp_path, monkeypatch):
     i = b.index(b"token_embd.weight") + len(b"token_embd.weight")
     assert int.from_bytes(b[i:i + 4], "little") == 2  # n_dims
     assert [int.from_bytes(b[i + 4 + 8 * k:i + 12 + 8 * k], "little") for k in range(2)] == [64, 3]
+
+
+@pytest.mark.skipif(not _cuda_ok(), reason="needs CUDA and nvcc")
+def test_tqt3_viterbi_gaussian_mse_and_idempotent():
+    """3-bit blocks: normalised MSE close to the 3-bit rate-distortion bound 1/64, and re-encoding the decoded values is lossless"""
+    import tqt3
+    torch.manual_seed(0)
+    n = 512
+    X = torch.randn(n, 128, device="cuda")
+    crms = tqt3.code_rms()
+    best = 1e9
+    for g in tqt3.GAMMAS:
+        sc = float(g / crms)
+        st = tqt3.viterbi(X / sc)
+        v = tqt3.table()[tqt3.windows(st.cpu().numpy())].reshape(n, 128)
+        best = min(best, float(((X.cpu().numpy() / sc - v) ** 2).mean() * sc * sc))
+    assert best < 0.021, best
+    sc = 0.5
+    st = tqt3.viterbi(X / sc)
+    v = tqt3.table()[tqt3.windows(st.cpu().numpy())].reshape(n, 128)
+    st2 = tqt3.viterbi(torch.from_numpy(v).to("cuda"))
+    v2 = tqt3.table()[tqt3.windows(st2.cpu().numpy())].reshape(n, 128)
+    assert np.abs(v2 - v).max() < 1e-6
+
+
+def test_tqt3_pack_decode_windows():
+    import tqt3
+    rng = np.random.RandomState(7)
+    N, K = 3, 256
+    st = rng.randint(0, 256, (N, K // 128, 48), dtype=np.uint8)
+    sc = (rng.rand(N, K // 128) * 0.1 + 0.01).astype(np.float16)
+    raw = tqt3.pack(sc, st)
+    assert raw.shape == (N, K // 128 * 50)
+    ref = tqt3.table()[tqt3.windows(st)].reshape(N, K // 128, 128) * sc.astype(np.float32)[:, :, None]
+    assert np.allclose(tqt3.decode(raw.tobytes(), N, K), ref.reshape(N, K))
+    bits = int.from_bytes(bytes(st[0, 0]), "little")
+    for p in (0, 1, 10, 62, 63):  # window p = the 18 bits at offset 6 p of the cyclic 384-bit stream
+        assert tqt3.windows(st[0, 0])[p] == (((bits | bits << 384) >> (6 * p)) & 0x3FFFF)
+    if torch.cuda.is_available():
+        got = tqt3.windows_t(torch.from_numpy(st).cuda()).cpu().numpy()
+        assert (got == tqt3.windows(st)).all()

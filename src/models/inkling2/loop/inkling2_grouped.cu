@@ -637,10 +637,44 @@ __global__ void __launch_bounds__(64) decode_tqt2_bf16_k(ExpertMat m, int rows, 
     }
 }
 
+// TQT3 (fmt 5): stream = 64 six-bit symbols, window p = the 18 bits at bit 6 p of the block's cyclic 384-bit stream
+__global__ void __launch_bounds__(64) decode_tqt3_bf16_k(ExpertMat m, int rows, int cols, int ldrows, __nv_bfloat16 * out) {
+    const int b = blockIdx.x, row = blockIdx.y, e = blockIdx.z, t = threadIdx.x;
+    const uint8_t * codes = (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (size_t(cols) * 3 / 8) + size_t(b) * 48;
+    const __half * sc = reinterpret_cast<const __half *>(m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) + b;
+    __shared__ float v[128];
+    uint32_t win = 0;
+    for (int j = 0; j < 18; ++j) {
+        const int i = (6 * t + j) % 384;
+        win |= uint32_t((codes[i >> 3] >> (i & 7)) & 1u) << j;
+    }
+    const uint32_t pr = tqllm_cuda::tqtk::pair_win(win);
+    const float s = __half2float(*sc);
+    const float2 w = __half22float2(*reinterpret_cast<const __half2 *>(&pr));
+    v[2 * t] = w.x * s;
+    v[2 * t + 1] = w.y * s;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int i = (t / h) * 2 * h + t % h;
+        const float a = v[i], c = v[i + h];
+        v[i] = a + c;
+        v[i + h] = a - c;
+        __syncthreads();
+    }
+    __nv_bfloat16 * o = out + (size_t(e) * ldrows + row) * cols + size_t(b) * 128;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int c = t + 64 * j;
+        const float x = v[c] * 0.08838834764831845f;
+        o[c] = __float2bfloat16((kTqtS1[c / 32] >> (c % 32)) & 1u ? -x : x);
+    }
+}
+
 void experts_decode_bf16(const ExpertMat & m, int E, int rows, int cols, int ldrows, __nv_bfloat16 * out, cudaStream_t s) {
     if (rows % BM || cols % BK) throw std::runtime_error("inkling2 experts_decode_bf16: rows % 64 or cols % 64");
-    if (m.fmt == 3 || m.fmt == 4) {
+    if (m.fmt >= 3) {
         if (m.fmt == 3) decode_tqt_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+        else if (m.fmt == 5) decode_tqt3_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
         else decode_tqt2_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
         return;
     }

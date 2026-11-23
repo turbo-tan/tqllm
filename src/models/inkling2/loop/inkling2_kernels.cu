@@ -457,7 +457,7 @@ __device__ __forceinline__ void rows_dot_nvf4(const uint8_t * const * row, const
 // a row's data / aux pointers inside expert e
 template <int FMT>
 __device__ __forceinline__ const uint8_t * row_ptr(const ExpertMat & m, int e, int row, int cols) {
-    return (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (FMT == 4 ? size_t(cols / 4) : FMT >= 2 ? size_t(cols / 2) : size_t(cols + cols / 32));
+    return (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (FMT == 5 ? size_t(cols) * 3 / 8 : FMT == 4 ? size_t(cols / 4) : FMT >= 2 ? size_t(cols / 2) : size_t(cols + cols / 32));
 }
 template <int FMT>
 __device__ __forceinline__ const uint8_t * aux_ptr(const ExpertMat & m, int e, int row, int cols) {
@@ -623,8 +623,39 @@ __device__ __forceinline__ float row_dot_tqt2(const uint8_t * row, const uint8_t
     }
     return acc;
 }
+// TQT3 row (fmt 5): a lane takes a 32-weight segment = 12 stream bytes (+ the first word of the next segment of its block), pair p
+// reads the 18 bits at bit 6 p
+__device__ __forceinline__ float row_dot_tqt3(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
+    const uint32_t * w3 = reinterpret_cast<const uint32_t *>(row);
+    const __half * sc = reinterpret_cast<const __half *>(aux);
+    float acc = 0.0f;
+    for (int sg = lane; sg < cols / 32; sg += 32) {
+        const uint32_t E[4] = {__ldcs(w3 + 3 * sg), __ldcs(w3 + 3 * sg + 1), __ldcs(w3 + 3 * sg + 2), __ldg(w3 + 3 * ((sg & ~3) | ((sg + 1) & 3)))};
+        const float scl = __half2float(__ldg(sc + sg / 4));
+        const uint4 * xp = reinterpret_cast<const uint4 *>(xh + size_t(sg) * 32);
+        float part = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint4 xv = __ldg(xp + q);
+            const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q * 4 + j, i = (6 * p) / 32, o = (6 * p) % 32;
+                const uint32_t wp = tqllm_cuda::tqtk::pair_win(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o));
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wp));
+                const float2 xf = __half22float2(*reinterpret_cast<const __half2 *>(&xw[j]));
+                part = fmaf(wf.x, xf.x, part);
+                part = fmaf(wf.y, xf.y, part);
+            }
+        }
+        acc = fmaf(scl, part, acc);
+    }
+    return acc;
+}
 template <int FMT> __device__ __forceinline__ float row_dot_trellis(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
-    return FMT == 4 ? row_dot_tqt2(row, aux, cols, xh, lane) : row_dot_tqt(row, aux, cols, xh, lane);
+    if constexpr (FMT == 5) return row_dot_tqt3(row, aux, cols, xh, lane);
+    else if constexpr (FMT == 4) return row_dot_tqt2(row, aux, cols, xh, lane);
+    else return row_dot_tqt(row, aux, cols, xh, lane);
 }
 // grid (rows / 8, n * topk): as expert_gate_up_k, xh = x rotated per 128 (FP16)
 template <int FMT>
@@ -1215,7 +1246,8 @@ void expert_gate_up(const ExpertMat & g, const ExpertMat & u, int rows, int cols
     if (cols % 128 || g.fmt != u.fmt) throw std::runtime_error("inkling2 experts: cols % 128 or mixed formats");
     if (g.fmt >= 3) {
         if (!xh) throw std::runtime_error("inkling2 experts: TQT needs the rotated activation");
-        if (g.fmt == 4) expert_gate_up_tqt_k<4><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
+        if (g.fmt == 5) expert_gate_up_tqt_k<5><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
+        else if (g.fmt == 4) expert_gate_up_tqt_k<4><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
         else expert_gate_up_tqt_k<3><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
     } else if (g.fmt == 2) {
         if (cols == 2304) gate_up_launch<2, 72>(g, u, rows, cols, x, ids, act, n, topk, gc, uc, s);
@@ -1233,7 +1265,8 @@ void expert_down(const ExpertMat & d, int rows, int cols, const __nv_bfloat16 * 
     if (topk > 16 || cols % 128) throw std::runtime_error("inkling2 expert_down: topk > 16 or cols % 128");
     if (d.fmt >= 3) {
         if (!acth) throw std::runtime_error("inkling2 experts: TQT needs the rotated activation");
-        if (d.fmt == 4) expert_down_tqt_k<4><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
+        if (d.fmt == 5) expert_down_tqt_k<5><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
+        else if (d.fmt == 4) expert_down_tqt_k<4><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
         else expert_down_tqt_k<3><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
     } else if (d.fmt == 2) {
         if (cols == 1152) down_launch<2, 36>(d, rows, cols, act, ids, wts, out, n, topk, s);

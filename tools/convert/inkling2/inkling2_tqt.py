@@ -27,11 +27,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "qwen35"))
 import tqt  # noqa: E402
 import tqt2  # noqa: E402
+import tqt3  # noqa: E402
 import tqv12  # noqa: E402
 
 D, I, E = 2304, 1152, 128
 BLOCK = 128
-CODECS = {"tqt": tqt, "tqt2": tqt2}
+CODECS = {"tqt": tqt, "tqt2": tqt2, "tqt3": tqt3}
+ENCDIR = {"tqt": "enc", "tqt2": "enc2", "tqt3": "enc3"}
 
 
 def log(*a):
@@ -40,6 +42,8 @@ def log(*a):
 
 def parse_layers(spec):
     out = []
+    if spec in ("", "none"):
+        return out
     for part in spec.split("+"):
         a, _, b = part.partition("-")
         out += list(range(int(a), int(b or a) + 1))
@@ -292,7 +296,7 @@ def cmd_encode(args):
     names = args.codec.split(",")
     dgu, ddn = [float(x) for x in args.damp_gu.split(",")], [float(x) for x in args.damp_dn.split(",")]
     assert len(names) == len(dgu) == len(ddn), "one --damp-gu / --damp-dn value per codec"
-    encdirs = {n: outdir / ("enc" if n == "tqt" else "enc2") for n in names}
+    encdirs = {n: outdir / ENCDIR[n] for n in names}
     for d in encdirs.values():
         d.mkdir(parents=True, exist_ok=True)
     need = {l: [n for n in names if not (encdirs[n] / f"L{l:02d}_dn.bin").exists()] for l in parse_layers(args.layers)}
@@ -408,12 +412,12 @@ def substitute(mods, l, codec, encdir):
 def cmd_eval(args):
     model, mods = load_model(args.model)
     gate = Gate(args.model)
-    layers = [(l, tqt, "enc") for l in parse_layers(args.layers)] + [(l, tqt2, "enc2") for l in (parse_layers(args.layers2) if args.layers2 else [])]
+    layers = [(l, CODECS[n], ENCDIR[n]) for n, spec in (("tqt", args.layers), ("tqt2", args.layers2), ("tqt3", args.layers3)) for l in parse_layers(spec)]
     for l, codec, sub in layers:
         substitute(mods, l, codec, Path(args.out) / sub)
         log("substituted layer", l, codec.__name__)
     kld, top1, n = gate.score(model)
-    log(f"ALL {n} positions: KLD vs lp_bf16 {kld:.5f}, top-1 {top1:.2f} %, layers {args.layers} (tqt) {args.layers2 or '-'} (tqt2)")
+    log(f"ALL {n} positions: KLD vs lp_bf16 {kld:.5f}, top-1 {top1:.2f} %, layers {args.layers or '-'} (tqt) {args.layers2 or '-'} (tqt2) {args.layers3 or '-'} (tqt3)")
 
 
 def cmd_compare(args):
@@ -433,7 +437,7 @@ def cmd_sweep(args):
     """KLD / top-1 of each layer alone in the given code (the rest as the checkpoint): the sensitivity of the tiers' allocation"""
     model, mods = load_model(args.model)
     gate = Gate(args.model)
-    codec, sub = (tqt2, "enc2") if args.code == "tqt2" else (tqt, "enc")
+    codec, sub = CODECS[args.code], ENCDIR[args.code]
     res = {}
     for l in parse_layers(args.layers):
         saved = substitute(mods, l, codec, Path(args.out) / sub)
@@ -500,7 +504,7 @@ def write_overlay(path, layers, dense=()):
         blobs.append(b + bytes(pad))
         off += len(b) + pad
     kvs = [("general.architecture", b"inkling2-tqt-experts")]
-    for codec in (tqt, tqt2):
+    for codec in (tqt, tqt2, tqt3):
         if any(c is codec for _, _, c in layers):
             kvs.append((codec.CODE_KEY, codec.CODE_TAG.encode()))
     head = b"GGUF" + np.uint32(3).tobytes() + np.uint64(len(infos)).tobytes() + np.uint64(len(kvs)).tobytes()
@@ -522,11 +526,12 @@ def cmd_pack(args):
     out = Path(args.out)
     layers = [(l, out / "enc", tqt) for l in parse_layers(args.layers) if (out / "enc" / f"L{l:02d}_dn.bin").exists()]
     layers += [(l, out / "enc2", tqt2) for l in (parse_layers(args.layers2) if args.layers2 else []) if (out / "enc2" / f"L{l:02d}_dn.bin").exists()]
+    layers += [(l, out / "enc3", tqt3) for l in (parse_layers(args.layers3) if args.layers3 else []) if (out / "enc3" / f"L{l:02d}_dn.bin").exists()]
     if len({l for l, _, _ in layers}) != len(layers):
-        raise SystemExit("a layer is in both --layers (tqt) and --layers2 (tqt2)")
+        raise SystemExit("a layer is in more than one of --layers / --layers2 / --layers3")
     dense = dense_q8_tensors(args.model) if args.dense_q8 else ()
     n = write_overlay(args.gguf, sorted(layers, key=lambda x: x[0]), dense)
-    log(f"{args.gguf}: {len(layers)} layers ({[l for l, _, c in layers if c is tqt]} tqt, {[l for l, _, c in layers if c is tqt2]} tqt2), {n / 1e9:.3f} GB")
+    log(f"{args.gguf}: {len(layers)} layers ({[l for l, _, c in layers if c is tqt]} tqt, {[l for l, _, c in layers if c is tqt2]} tqt2, {[l for l, _, c in layers if c is tqt3]} tqt3), {n / 1e9:.3f} GB")
 
 
 def main():
@@ -538,9 +543,10 @@ def main():
         p.add_argument("--out", required=True)
         p.add_argument("--layers", default="0-23", help="layers of the 4-bit code (pack / eval) or of this encode run")
         if name == "sweep":
-            p.add_argument("--code", choices=("tqt", "tqt2"), required=True)
+            p.add_argument("--code", choices=sorted(CODECS), required=True)
         if name in ("pack", "eval"):
             p.add_argument("--layers2", default="", help="layers of the 2-bit code TQT2 (their enc2 files)")
+            p.add_argument("--layers3", default="", help="layers of the 3-bit code TQT3 (their enc3 files)")
         if name == "pack":
             p.add_argument("--gguf", required=True)
             p.add_argument("--dense-q8", action="store_true", help="also the embedding, head and attention q / k / v / o as Q8_0")

@@ -297,7 +297,7 @@ void rot128(const float * x, float * y) {  // R x
 }
 void make_bank_tqt(ExpertBank & b, int E, int rows, int cols, int fmt = 3) {
     b.m.fmt = fmt;
-    const size_t rb = size_t(cols) / (fmt == 4 ? 4 : 2), nb = size_t(cols) / 128;
+    const size_t rb = fmt == 5 ? size_t(cols) * 3 / 8 : size_t(cols) / (fmt == 4 ? 4 : 2), nb = size_t(cols) / 128;
     b.m.stride = rb * rows; b.m.aux_stride = nb * 2 * rows;
     b.bytes.resize(b.m.stride * E); b.aux.resize(b.m.aux_stride * E);
     b.w.resize(size_t(E) * rows * cols);
@@ -311,7 +311,12 @@ void make_bank_tqt(ExpertBank & b, int E, int rows, int cols, int fmt = 3) {
                 double q[128];
                 for (int p = 0; p < 64; ++p) {
                     float lo, hi;
-                    if (fmt == 4) {
+                    if (fmt == 5) {
+                        const uint8_t * s = row + k * 48;
+                        uint32_t w = 0;
+                        for (int j = 0; j < 18; ++j) { const int i = (6 * p + j) % 384; w |= uint32_t((s[i >> 3] >> (i & 7)) & 1) << j; }
+                        tqt_pair(w, lo, hi, 18);
+                    } else if (fmt == 4) {
                         const uint8_t * s = row + k * 32;
                         uint32_t w = 0;
                         for (int j = 0; j < 4; ++j) { const int i = (p + j) & 63; w |= uint32_t((s[i >> 1] >> (4 * (i & 1))) & 15) << (4 * j); }
@@ -353,7 +358,7 @@ void test_experts_tqt(int fmt) {
         const auto h = from_bf(down(dd, size_t(E) * I * D));
         double worst = 0;
         for (size_t i = 0; i < h.size(); ++i) worst = std::max(worst, std::fabs(h[i] - bf(G.w[i])) / (std::fabs(G.w[i]) + 1e-3));
-        report(fmt == 4 ? "experts TQT2 decode to BF16 (un-rotated)" : "experts TQT decode to BF16 (un-rotated)", worst, 1e-2, true);
+        report(fmt == 5 ? "experts TQT3 decode to BF16 (un-rotated)" : fmt == 4 ? "experts TQT2 decode to BF16 (un-rotated)" : "experts TQT decode to BF16 (un-rotated)", worst, 1e-2, true);
         cudaFree(dd);
     }
     const auto X = randv(size_t(NMAX) * D, 1.0f);
@@ -424,8 +429,8 @@ void test_experts_tqt(int fmt) {
         bit = bit && std::memcmp(a1.data(), act.data() + size_t(t) * topk * I, a1.size() * 4) == 0;
         bit = bit && std::memcmp(o1.data(), out.data() + size_t(t) * D, o1.size() * 4) == 0;
     }
-    report(fmt == 4 ? "experts TQT2 gate/up + SwiGLU" : "experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
-    report(fmt == 4 ? "experts TQT2 down + combine" : "experts TQT down + combine", eo, 3e-2, bit);
+    report(fmt == 5 ? "experts TQT3 gate/up + SwiGLU" : fmt == 4 ? "experts TQT2 gate/up + SwiGLU" : "experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
+    report(fmt == 5 ? "experts TQT3 down + combine" : fmt == 4 ? "experts TQT2 down + combine" : "experts TQT down + combine", eo, 3e-2, bit);
     cudaFree(dxh); cudaFree(dah); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
 }
 
@@ -873,6 +878,7 @@ int main() {
     test_experts(1);
     test_experts_tqt(3);
     test_experts_tqt(4);
+    test_experts_tqt(5);
     test_route();
     test_attn_res_capture(1);
     test_attn_res_capture(5);

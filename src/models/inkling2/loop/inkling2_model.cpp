@@ -269,6 +269,20 @@ struct Inkling2Model::Impl {
             });
             x.m.fmt = 4; x.m.stride = size_t(x.rows) * C / 4; x.m.aux_stride = size_t(x.rows) * nb * 2;
             tqt_experts = true;
+        } else if (t.type == GGML_TQT3) {  // 50 B records (FP16 scale + 48 stream bytes per 128) -> planes [rows][cols * 3 / 8] + scales [rows][cols / 128]
+            const size_t nb = C / 128;
+            if (C % 128 || b.size() != R * nb * 50) throw std::runtime_error("inkling2: " + n + " bytes");
+            x.hw = Pinned(R * C * 3 / 8); x.ha = Pinned(R * nb * 2);
+            uint8_t * codes = x.hw.as<uint8_t>(), * sc = x.ha.as<uint8_t>();
+            parallel_blocks(int64_t(R), [&](int64_t r) {
+                const auto * row = reinterpret_cast<const uint8_t *>(b.data()) + size_t(r) * nb * 50;
+                for (size_t k = 0; k < nb; ++k) {
+                    std::memcpy(sc + (size_t(r) * nb + k) * 2, row + k * 50, 2);
+                    std::memcpy(codes + size_t(r) * C * 3 / 8 + k * 48, row + k * 50 + 2, 48);
+                }
+            });
+            x.m.fmt = 5; x.m.stride = size_t(x.rows) * C * 3 / 8; x.m.aux_stride = size_t(x.rows) * nb * 2;
+            tqt_experts = true;
         } else {
             throw std::runtime_error("inkling2: " + n + " expert type " + std::to_string(t.type));
         }
