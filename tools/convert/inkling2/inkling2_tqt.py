@@ -202,7 +202,7 @@ def _dequant_experts(weight, scale, amax=None, denominator=None):
         e2m1 = torch.tensor(E2M1, device=dev)
         byte = torch.arange(256, device=dev)
         b2v = torch.stack((e2m1[byte & 0xF], e2m1[byte >> 4]), dim=-1)
-        factor = amax.float() / denominator.float()
+        factor = amax.to(torch.bfloat16).float() / denominator.to(torch.bfloat16).float()  # the loader casts every source to the param dtype
     for st in range(0, E_, 8):
         ex = slice(st, st + 8)
         bs = scale[ex].float()
@@ -546,7 +546,7 @@ def main():
             p.add_argument("--n0", type=float, required=True)
             p.add_argument("--nmin", type=float, default=64)
     args = ap.parse_args()
-    {"encode": cmd_encode, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep}[args.cmd](args)
+    {"encode": cmd_encode, "hessian": cmd_hessian, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep}[args.cmd](args)
 
 
 if __name__ == "__main__":
