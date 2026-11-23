@@ -88,190 +88,149 @@ __device__ __forceinline__ void unrot128(float (&v)[4], int lane) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] = v[j] * 0.08838834764831845f * sign_of(4 * lane + j);
 }
-// stage nc input rows (FP16, cols each) rotated into shared xs [nc][cols] (FP16); all warps of the block
-__device__ __forceinline__ void stage_rot(__half * xs, const __half * x, const int * rows_of, int nc, int cols, int fixed_row) {
-    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, nwarps = blockDim.x / 32, nb = cols / 128;
-    for (int t = warp; t < nc * nb; t += nwarps) {
-        const int c = t / nb, b = t % nb;
-        const int64_t r = rows_of ? rows_of[c] : fixed_row;
-        const __half2 * src = reinterpret_cast<const __half2 *>(x + r * cols + b * 128 + 4 * lane);
-        const float2 p0 = __half22float2(src[0]), p1 = __half22float2(src[1]);
-        float v[4] = {p0.x, p0.y, p1.x, p1.y};
-        rot128(v, lane);
-        __half2 * dst = reinterpret_cast<__half2 *>(xs + int64_t(c) * cols + b * 128 + 4 * lane);
-        dst[0] = __floats2half2_rn(v[0], v[1]);
-        dst[1] = __floats2half2_rn(v[2], v[3]);
-    }
-}
-// A warp's rows staged through shared memory: the next row's stream is loaded (8-byte coalesced loads into registers; a
-// row is a multiple of 8 bytes, not always of 16) while the current one is decoded from shared memory. Rows of up to
-// 1280 bytes (cols 2560 at KB 7 = 1120 B).
-constexpr int kRowVec = 5, kRowWords = kRowVec * 32 * 2;
-struct RowStage {
-    uint2 r[kRowVec];
-    __device__ __forceinline__ void load(const uint32_t * row, int nvec, int lane) {
-        const uint2 * p = reinterpret_cast<const uint2 *>(row);
-#pragma unroll
-        for (int i = 0; i < kRowVec; ++i) { const int j = lane + 32 * i; r[i] = j < nvec ? __ldg(p + j) : make_uint2(0, 0); }
-    }
-    __device__ __forceinline__ void store(uint32_t * buf, int nvec, int lane) const {
-#pragma unroll
-        for (int i = 0; i < kRowVec; ++i) { const int j = lane + 32 * i; if (j < nvec) reinterpret_cast<uint2 *>(buf)[j] = r[i]; }
-    }
-};
 template <class T> __device__ __forceinline__ T out_cast(float v) {
     if constexpr (std::is_same_v<T, float>) return v;
     else return __float2bfloat16_rn(v);
 }
-// one row's dot products with NC staged columns (nc <= NC present): the per-lane order of the header
-template <int KB, int NC>
-__device__ __forceinline__ void row_dot(const uint32_t * rw, const __half * __restrict__ sc, const __half * xs,
-                                        int cols, int nc, int lane, float (&sum)[NC]) {
+// ---- tensor-core kernel (all expert paths) ----
+// CTA = 8 warps = RT 16-row tiles x KG k-parts (KG = 640-groups per part: cols 2560 -> KG 4, RT 2; cols 640 -> KG 1,
+// RT 8). Lane (g, t) of a warp decodes rows g and g + 8 of its tile, segment t (pairs 16t .. 16t + 15, weights
+// 32t .. 32t + 31) of each 128-block; MMA u takes pairs 2u, 2u + 1 (TQT's k order, the inputs loaded to match).
+// Per row and column: the 5 blocks of a group in one FP32 MMA accumulator, c = s * tmp + c per group, the k-parts summed
+// in part order through shared memory: the same numbers for every kernel, column set and grid (tests/fnt_format.cu).
+constexpr int kCols = 8, kXPad = 8;  // columns per pass (one MMA n tile); FP16 row padding of the staged inputs
+__device__ __forceinline__ int kparts(int cols) { return cols >= 4 * kGroup ? 4 : cols >= 2 * kGroup ? 2 : 1; }
+// 5 stream words of row-block blk starting at segment t's first bit (pre-shifted when it is mid-word)
+template <int KB> __device__ __forceinline__ void seg_words(const uint32_t * __restrict__ blk, int t, uint32_t (&E)[5]) {
     constexpr int NW = 2 * KB;
-    const int nb = cols / 128;
+    const int bw = (t * KB) >> 1;
+    uint32_t r[6];
 #pragma unroll
-    for (int c = 0; c < NC; ++c) sum[c] = 0.f;
-    for (int g = 0; g < nb / 5; ++g) {
-        float part[NC];
+    for (int i = 0; i < 6; ++i) { int j = bw + i; j -= j >= NW ? NW : 0; r[i] = __ldg(blk + j); }
+    if ((t * KB) & 1) {
 #pragma unroll
-        for (int c = 0; c < NC; ++c) part[c] = 0.f;
-        for (int bb = 0; bb < 5; ++bb) {
-            const int b = g * 5 + bb;
-            float w[4];
-            lane_w<KB>(rw + b * NW, lane, w);
+        for (int i = 0; i < 5; ++i) E[i] = __funnelshift_r(r[i], r[i + 1], 16);
+    } else {
 #pragma unroll
-            for (int c = 0; c < NC; ++c) {
-                if (c >= nc) break;
-                const __half2 * xp = reinterpret_cast<const __half2 *>(xs + c * cols + b * 128 + 4 * lane);
-                const float2 x0 = __half22float2(xp[0]), x1 = __half22float2(xp[1]);
-                part[c] = __fmaf_rn(w[0], x0.x, part[c]);
-                part[c] = __fmaf_rn(w[1], x0.y, part[c]);
-                part[c] = __fmaf_rn(w[2], x1.x, part[c]);
-                part[c] = __fmaf_rn(w[3], x1.y, part[c]);
-            }
-        }
-        const float s = __half2float(sc[g]);
-#pragma unroll
-        for (int c = 0; c < NC; ++c) sum[c] = __fmaf_rn(s, part[c], sum[c]);
-    }
-#pragma unroll
-    for (int c = 0; c < NC; ++c)
-        for (int d = 16; d; d >>= 1) sum[c] += __shfl_xor_sync(0xffffffffu, sum[c], d);
-}
-
-// expert matvec: block = 64 rows (8 warps x 8) of one assignment; ids null -> expert 0 (plain matvec, column a)
-template <int KB, class T>
-__global__ void __launch_bounds__(256) k_matvec(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
-                                                const __half * __restrict__ x, T * __restrict__ y, int rows, int cols,
-                                                int experts, const int * __restrict__ ids, int topk, bool per_expert) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    uint32_t * wbuf = reinterpret_cast<uint32_t *>(smem) + (threadIdx.x / 32) * kRowWords;
-    __half * xs = reinterpret_cast<__half *>(smem + 8 * kRowWords * 4);
-    const int a = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    const int expert = ids ? ids[a] : 0;
-    const int input = per_expert ? a : a / topk;
-    const bool valid = expert >= 0 && expert < experts;
-    const int64_t rw_words = int64_t(cols / 128) * 2 * KB, ng = cols / kGroup;
-    const int nvec = int(rw_words / 2), row0 = blockIdx.x * 64 + warp * 8, nr = valid ? min(8, rows - row0) : 0;
-    RowStage st;
-    if (nr > 0) st.load(w + (int64_t(expert) * rows + row0) * rw_words, nvec, lane);
-    stage_rot(xs, x, nullptr, 1, cols, input);
-    __syncthreads();
-    for (int rr = 0; rr < 8; ++rr) {
-        const int row = row0 + rr;
-        if (row >= rows) break;
-        float sum[1];
-        if (valid) {
-            __syncwarp();
-            st.store(wbuf, nvec, lane);
-            __syncwarp();
-            if (rr + 1 < nr) st.load(w + (int64_t(expert) * rows + row + 1) * rw_words, nvec, lane);
-            row_dot<KB, 1>(wbuf, sc + (int64_t(expert) * rows + row) * ng, xs, cols, 1, lane, sum);
-        } else sum[0] = nanf("");
-        if (!lane) y[int64_t(a) * rows + row] = out_cast<T>(sum[0]);
+        for (int i = 0; i < 5; ++i) E[i] = r[i];
     }
 }
-// dedup: per group (quant_kernels.cuh kDedupStride layout) the expert's rows are decoded once for its columns
-constexpr int kDedupPass = 4;  // columns staged per pass (a group of up to kDedupCols columns takes 1 or 2 passes)
+template <int KB> __device__ __forceinline__ uint32_t seg_pair(const uint32_t (&E)[5], int j) {
+    const int o = j * KB;  // compile-time with j unrolled
+    return code16(__funnelshift_r(E[o >> 5], E[(o >> 5) + 1], o & 31));  // y uses the window's low 16 bits only
+}
+// One pass: rows [row0, row0 + RT * 16) of expert e against nc <= 8 staged columns xs [8][cols + kXPad]; returns the
+// lane's 4 outputs (rows g, g + 8 x columns 2t, 2t + 1) on the k-part-0 warps (valid = true)
 template <int KB>
-__global__ void __launch_bounds__(256) k_dedup(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
-                                               const __half * __restrict__ x, __nv_bfloat16 * __restrict__ y, int rows,
-                                               int cols, const int * __restrict__ dmap, int groups) {
-    constexpr int DC = kDedupCols, NP = kDedupPass;
-    extern __shared__ __align__(16) unsigned char smem[];
-    uint32_t * wbuf = reinterpret_cast<uint32_t *>(smem) + (threadIdx.x / 32) * kRowWords;
-    __half * xs = reinterpret_cast<__half *>(smem + 8 * kRowWords * 4);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    const int64_t rw_words = int64_t(cols / 128) * 2 * KB, ng = cols / kGroup;
-    const int nvec = int(rw_words / 2), row0 = blockIdx.x * 64 + warp * 8, nr = min(8, rows - row0);
-    bool first = true;
-    for (int gi = int(blockIdx.y); gi < groups; gi += int(gridDim.y)) {
-        const int * e = dmap + int64_t(gi) * kDedupStride;
-        if (e[0] < 0) return;
-        const uint32_t * we = w + int64_t(e[0]) * rows * rw_words;
-        for (int c0 = 0; c0 < e[1]; c0 += NP) {
-            const int nc = min(NP, e[1] - c0);
-            RowStage st;
-            if (nr > 0) st.load(we + row0 * rw_words, nvec, lane);
-            if (!first) __syncthreads();
-            first = false;
-            stage_rot(xs, x, e + 2 + c0, nc, cols, 0);
-            __syncthreads();
-            for (int rr = 0; rr < nr; ++rr) {
-                const int row = row0 + rr;
-                __syncwarp();
-                st.store(wbuf, nvec, lane);
-                __syncwarp();
-                if (rr + 1 < nr) st.load(we + (row + 1) * rw_words, nvec, lane);
-                float sum[NP];
-                row_dot<KB, NP>(wbuf, sc + (int64_t(e[0]) * rows + row) * ng, xs, cols, nc, lane, sum);
+__device__ __forceinline__ void mma_pass(const uint32_t * __restrict__ w, const __half * __restrict__ sc, const __half * xs,
+                                         int64_t erow0, int rows_left, int cols, float * red, float (&out)[4], bool & valid) {
+    constexpr int NW = 2 * KB;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+    const int KG = kparts(cols), kp = warp % KG, rt = warp / KG;
+    const int ng = cols / kGroup, gpp = ng / KG;  // 640-groups per k-part
+    const int nb = cols / 128, xstride = cols + kXPad;
+    const int ra = min(rt * 16 + g, rows_left - 1), rb = min(rt * 16 + g + 8, rows_left - 1);
+    const uint32_t * wa = w + (erow0 + ra) * int64_t(nb) * NW;
+    const uint32_t * wb = w + (erow0 + rb) * int64_t(nb) * NW;
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int gi = kp * gpp; gi < (kp + 1) * gpp; ++gi) {
+        float tmp[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-                for (int c = 0; c < NP; ++c) {
-                    if (c >= nc) break;
-                    if (!lane) y[int64_t(e[2 + DC + c0 + c]) * rows + row] = __float2bfloat16_rn(sum[c]);
-                }
-            }
+        for (int bb = 0; bb < 5; ++bb) {
+            const int b = gi * 5 + bb;
+            uint32_t Ea[5], Eb[5];
+            seg_words<KB>(wa + b * NW, t, Ea);
+            seg_words<KB>(wb + b * NW, t, Eb);
+            const uint4 * xp = reinterpret_cast<const uint4 *>(xs + g * xstride + b * 128 + t * 32);
+            uint4 x4[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x4[i] = xp[i];
+            const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
+#pragma unroll
+            for (int u = 0; u < 8; ++u)
+                mma_f16(tmp, seg_pair<KB>(Ea, 2 * u), seg_pair<KB>(Eb, 2 * u), seg_pair<KB>(Ea, 2 * u + 1),
+                        seg_pair<KB>(Eb, 2 * u + 1), xw[2 * u], xw[2 * u + 1]);
         }
+        const float sa = __half2float(sc[(erow0 + ra) * ng + gi]), sb = __half2float(sc[(erow0 + rb) * ng + gi]);
+        c[0] = fmaf(sa, tmp[0], c[0]); c[1] = fmaf(sa, tmp[1], c[1]);
+        c[2] = fmaf(sb, tmp[2], c[2]); c[3] = fmaf(sb, tmp[3], c[3]);
+    }
+    if (KG > 1) {
+        __syncthreads();  // red is free (the previous pass read it)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) red[(warp * 32 + lane) * 4 + i] = c[i];
+        __syncthreads();
+        if (kp == 0)
+            for (int q = 1; q < KG; ++q)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) c[i] += red[((warp + q) * 32 + lane) * 4 + i];
+    }
+    valid = kp == 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) out[i] = c[i];
+}
+// shared layout: xs [kCols][cols + kXPad] FP16, then red [8 warps][32][4] F32
+__host__ __device__ constexpr size_t mma_smem(int cols) { return size_t(kCols) * (cols + kXPad) * 2 + 8 * 32 * 4 * 4; }
+// stage nc columns (input rows in_rows[c]) rotated; columns nc..7 zero
+__device__ __forceinline__ void stage_cols(__half * xs, const __half * x, const int * in_rows, int nc, int cols) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, nb = cols / 128, xstride = cols + kXPad;
+    for (int q = warp; q < kCols * nb; q += 8) {
+        const int c = q / nb, b = q % nb;
+        __half2 * dst = reinterpret_cast<__half2 *>(xs + c * xstride + b * 128 + 4 * lane);
+        if (c >= nc) { dst[0] = dst[1] = __floats2half2_rn(0.f, 0.f); continue; }
+        const __half2 * src = reinterpret_cast<const __half2 *>(x + int64_t(in_rows[c]) * cols + b * 128 + 4 * lane);
+        const float2 p0 = __half22float2(src[0]), p1 = __half22float2(src[1]);
+        float v[4] = {p0.x, p0.y, p1.x, p1.y};
+        rot128(v, lane);
+        dst[0] = __floats2half2_rn(v[0], v[1]);
+        dst[1] = __floats2half2_rn(v[2], v[3]);
     }
 }
-// grouped (prefill): block = 64 rows of one expert, its tokens C at a time (moe_group lists)
-template <int KB, int C>
-__global__ void __launch_bounds__(256) k_grouped(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
-                                                 const __half * __restrict__ x, __nv_bfloat16 * __restrict__ y, int rows,
-                                                 int cols, const int * __restrict__ counts, const int * __restrict__ groups,
-                                                 int capacity, int topk, bool per_expert) {
+// work item -> (expert, up to 8 (input row, output row) pairs); MODE 0: assignment a = blockIdx.y (ids, topk);
+// 1: dedup map entry; 2: moe_group lists (the expert's tokens 8 at a time)
+template <int KB, int MODE, class T>
+__global__ void __launch_bounds__(256, 2) k_mma(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
+                                                const __half * __restrict__ x, T * __restrict__ y, int rows, int cols,
+                                                int experts, const int * __restrict__ ids, int topk, bool per_expert,
+                                                const int * __restrict__ dmap, int ngroups, const int * __restrict__ counts,
+                                                const int * __restrict__ groups, int capacity) {
     extern __shared__ __align__(16) unsigned char smem[];
-    uint32_t * wbuf = reinterpret_cast<uint32_t *>(smem) + (threadIdx.x / 32) * kRowWords;
-    __half * xs = reinterpret_cast<__half *>(smem + 8 * kRowWords * 4);
-    __shared__ int in_rows[C];
-    const int expert = blockIdx.y, count = counts[expert];
-    if (count == 0) return;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    const int64_t rw_words = int64_t(cols / 128) * 2 * KB, ng = cols / kGroup;
-    const int nvec = int(rw_words / 2), row0 = blockIdx.x * 64 + warp * 8, nr = min(8, rows - row0);
-    const uint32_t * we = w + int64_t(expert) * rows * rw_words;
-    const int * g = groups + int64_t(expert) * capacity;
-    for (int c0 = 0; c0 < count; c0 += C) {
-        const int nc = min(C, count - c0);
-        RowStage st;
-        if (nr > 0) st.load(we + row0 * rw_words, nvec, lane);
-        __syncthreads();
-        if (threadIdx.x < nc) { const int a = g[c0 + threadIdx.x]; in_rows[threadIdx.x] = per_expert ? a : a / topk; }
-        __syncthreads();
-        stage_rot(xs, x, in_rows, nc, cols, 0);
-        __syncthreads();
-        for (int rr = 0; rr < nr; ++rr) {
-            const int row = row0 + rr;
-            __syncwarp();
-            st.store(wbuf, nvec, lane);
-            __syncwarp();
-            if (rr + 1 < nr) st.load(we + (row + 1) * rw_words, nvec, lane);
-            float sum[C];
-            row_dot<KB, C>(wbuf, sc + (int64_t(expert) * rows + row) * ng, xs, cols, nc, lane, sum);
-#pragma unroll
-            for (int c = 0; c < C; ++c) {
-                if (c >= nc) break;
-                if (!lane) y[int64_t(g[c0 + c]) * rows + row] = __float2bfloat16_rn(sum[c]);
+    __half * xs = reinterpret_cast<__half *>(smem);
+    float * red = reinterpret_cast<float *>(smem + size_t(kCols) * (cols + kXPad) * 2);
+    __shared__ int in_rows[kCols], out_rows[kCols];
+    const int lane = threadIdx.x & 31, g = lane / 4, t = lane % 4;
+    const int KG = kparts(cols), RT = 8 / KG, rt = (threadIdx.x / 32) / KG;
+    const int row0 = blockIdx.x * RT * 16;
+    if (row0 >= rows) return;
+    const int rows_left = rows - row0;
+    for (int it = 0; ; ++it) {
+        const int item = int(blockIdx.y) + it * int(gridDim.y);
+        int expert = 0, total = 0;
+        if (MODE == 0) { if (it > 0) break; expert = ids ? ids[blockIdx.y] : 0; total = 1; }
+        else if (MODE == 1) { if (item >= ngroups) break; const int * e = dmap + int64_t(item) * kDedupStride; expert = e[0]; total = e[0] < 0 ? 0 : e[1]; if (e[0] < 0) break; }
+        else { if (item >= experts) break; expert = item; total = counts[item]; }
+        const bool bad = MODE == 0 && (expert < 0 || expert >= experts);
+        for (int c0 = 0; c0 < total; c0 += kCols) {
+            const int nc = min(kCols, total - c0);
+            __syncthreads();  // the previous pass finished reading xs / in_rows
+            if (threadIdx.x < nc) {
+                int in = 0, o = 0;
+                if (MODE == 0) { o = blockIdx.y; in = per_expert ? o : o / topk; }
+                else if (MODE == 1) { const int * e = dmap + int64_t(item) * kDedupStride; in = e[2 + c0 + threadIdx.x]; o = e[2 + kDedupCols + c0 + threadIdx.x]; }
+                else { o = groups[int64_t(item) * capacity + c0 + threadIdx.x]; in = per_expert ? o : o / topk; }
+                in_rows[threadIdx.x] = in; out_rows[threadIdx.x] = o;
+            }
+            __syncthreads();
+            stage_cols(xs, x, in_rows, nc, cols);
+            __syncthreads();
+            float v[4]; bool valid;
+            mma_pass<KB>(w, sc, xs, int64_t(bad ? 0 : expert) * rows + row0, rows_left, cols, red, v, valid);
+            if (valid) {
+                const int r = rt * 16 + g;
+                const auto put = [&](int col, int rr, float val) {
+                    if (col < nc && rr < rows_left) y[int64_t(out_rows[col]) * rows + row0 + rr] = out_cast<T>(bad ? nanf("") : val);
+                };
+                put(2 * t, r, v[0]); put(2 * t + 1, r, v[1]); put(2 * t, r + 8, v[2]); put(2 * t + 1, r + 8, v[3]);
             }
         }
     }
@@ -303,56 +262,51 @@ void check(int kb, const void * w, const void * sc, const void * x, const void *
 
 #define FNT_KB(kb, F) switch (kb) { case 4: F(4); break; case 5: F(5); break; case 6: F(6); break; default: F(7); break; }
 
-template <class T>
-static void matvec_any(int kb, const void * w, const __half * sc, const __half * x, T * y, int rows, int cols, int experts,
-                       const int * ids, int n, int topk, bool per_expert, cudaStream_t s) {
-    fntk::check(kb, w, sc, x, y, rows, cols);
-    if (cols > 2560) throw std::invalid_argument("FNT: row too long (2560 max)");
-    if (n <= 0 || topk <= 0 || int64_t(n) * topk > 65535 || experts <= 0 || int64_t(experts) * rows > INT_MAX)
-        throw std::invalid_argument("FNT: invalid expert grid");
-    const dim3 grid(unsigned((rows + 63) / 64), unsigned(n * topk));
-    const size_t smem = 8 * fntk::kRowWords * 4 + size_t(cols) * sizeof(__half);
-#define L(K) fntk::k_matvec<K, T><<<grid, 256, smem, s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, experts, ids, topk, per_expert)
+template <int MODE, class T>
+static void launch_mma(int kb, const void * w, const __half * sc, const __half * x, T * y, int rows, int cols, int experts,
+                       const int * ids, int topk, bool per_expert, const int * dmap, int ngroups, const int * counts,
+                       const int * groups, int capacity, unsigned gy, cudaStream_t s) {
+    const int KG = cols >= 2560 ? 4 : cols >= 1280 ? 2 : 1, RT = 8 / KG;
+    const dim3 grid(unsigned((rows + RT * 16 - 1) / (RT * 16)), gy);
+    const size_t smem = fntk::mma_smem(cols);
+    static bool attr[4] = {};
+#define L(K) do { \
+        auto kern = fntk::k_mma<K, MODE, T>; \
+        if (smem > 48 * 1024 && !attr[K - 4]) { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr[K - 4] = true; } \
+        kern<<<grid, 256, smem, s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, experts, ids, topk, per_expert, dmap, ngroups, counts, groups, capacity); \
+    } while (0)
     FNT_KB(kb, L)
 #undef L
+}
+static void check_cols(int cols) {
+    if (cols != 640 && cols != 1280 && cols != 2560) throw std::invalid_argument("FNT: kernels take rows of 640, 1280 or 2560");
 }
 void fnt_expert_matvec(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                        int experts, const int * ids, int n, int topk, bool per_expert, cudaStream_t s) {
-    matvec_any(kb, w, sc, x, y, rows, cols, experts, ids, n, topk, per_expert, s);
+    fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
+    if (n <= 0 || topk <= 0 || int64_t(n) * topk > 65535 || experts <= 0 || int64_t(experts) * rows > INT_MAX)
+        throw std::invalid_argument("FNT: invalid expert grid");
+    launch_mma<0>(kb, w, sc, x, y, rows, cols, experts, ids, topk, per_expert, nullptr, 0, nullptr, nullptr, 0, unsigned(n * topk), s);
 }
 void fnt_matvec_f32(int kb, const void * w, const __half * sc, const __half * x, float * y, int rows, int cols, int n, cudaStream_t s) {
-    matvec_any(kb, w, sc, x, y, rows, cols, 1, nullptr, n, 1, true, s);
+    fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
+    if (n <= 0 || n > 65535) throw std::invalid_argument("FNT: invalid column count");
+    launch_mma<0>(kb, w, sc, x, y, rows, cols, 1, nullptr, 1, true, nullptr, 0, nullptr, nullptr, 0, unsigned(n), s);
 }
 void fnt_expert_dedup(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                       const int * dmap, int groups, cudaStream_t s) {
-    fntk::check(kb, w, sc, x, y, rows, cols);
+    fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (!dmap || groups <= 0 || groups > 65535) throw std::invalid_argument("FNT: invalid dedup map");
-    const size_t smem = 8 * fntk::kRowWords * 4 + size_t(fntk::kDedupPass) * cols * sizeof(__half);
-    if (smem > 48 * 1024 || cols > 2560) throw std::invalid_argument("FNT: dedup row too long");
-    const dim3 grid(unsigned((rows + 63) / 64), unsigned(std::min(groups, kDedupGridGroups)));
-#define L(K) fntk::k_dedup<K><<<grid, 256, smem, s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, dmap, groups)
-    FNT_KB(kb, L)
-#undef L
+    launch_mma<1>(kb, w, sc, x, y, rows, cols, 0, nullptr, 1, true, dmap, groups, nullptr, nullptr, 0,
+                  unsigned(std::min(groups, kDedupGridGroups)), s);
 }
 void fnt_expert_grouped(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                         const int * counts, const int * groups, int capacity, int experts, int topk, bool per_expert, cudaStream_t s) {
-    fntk::check(kb, w, sc, x, y, rows, cols);
+    fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * rows > INT_MAX)
         throw std::invalid_argument("FNT: invalid grouped expert dimensions");
-    constexpr int C = 8;
-    const size_t smem = 8 * fntk::kRowWords * 4 + size_t(C) * cols * sizeof(__half);
-    if (smem > 96 * 1024 || cols > 2560) throw std::invalid_argument("FNT: grouped row too long");
-    static bool attr[4] = {};
-    if (smem > 48 * 1024 && !attr[kb - 4]) {
-#define A(K) cudaFuncSetAttribute(fntk::k_grouped<K, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024)
-        FNT_KB(kb, A)
-#undef A
-        attr[kb - 4] = true;
-    }
-    const dim3 grid(unsigned((rows + 63) / 64), unsigned(experts));
-#define L(K) fntk::k_grouped<K, C><<<grid, 256, smem, s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, counts, groups, capacity, topk, per_expert)
-    FNT_KB(kb, L)
-#undef L
+    launch_mma<2>(kb, w, sc, x, y, rows, cols, experts, nullptr, topk, per_expert, nullptr, 0, counts, groups, capacity,
+                  unsigned(std::min(experts, 65535)), s);
 }
 void fnt_dequant_h(int kb, const void * w, const __half * sc, __half * out, int rows, int cols, cudaStream_t s) {
     fntk::check(kb, w, sc, out, out, rows, cols);
