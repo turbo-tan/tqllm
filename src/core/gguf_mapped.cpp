@@ -2,6 +2,7 @@
 #include "dequant.hpp"
 #include "hf_folder.hpp"
 #include <map>
+#include <set>
 #include <mutex>
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,8 @@
 namespace tqllm {
 struct MappedGguf::Mapping {
     os::MappedFile file;
+    std::mutex advice_mutex;
+    std::set<size_t> random_tables;
     const char * data;
     size_t size;
     const std::string & path;
@@ -150,6 +153,16 @@ std::vector<float> MappedGguf::gather_rows(const std::string & name, const std::
     // the same way in any part, so the result does not change)
     const size_t cores = std::max(1u, std::thread::hardware_concurrency());
     const size_t threads = rows.size() >= 4096 ? std::min<size_t>(16, cores) : std::min<size_t>({8, cores, rows.size() / 64});
+    // Hints belong to this mapping, so reopening another model at a reused address gets its own advice.
+    if (!folder_ && t.bytes >= (uint64_t(1) << 30)) {
+        const size_t base = size_t(data.data - mapping_->data);
+        {
+            std::lock_guard<std::mutex> hold(mapping_->advice_mutex);
+            if (mapping_->random_tables.insert(base).second) mapping_->file.advise_random(base, data.size);
+        }
+        if (threads <= 1 && rows.size() > 1)
+            for (auto row : rows) mapping_->file.prefetch(base + size_t(row) * stride, stride);
+    }
     if (threads <= 1) { part(0, rows.size()); return result; }
     std::vector<std::thread> pool;
     const size_t step = (rows.size() + threads - 1) / threads;

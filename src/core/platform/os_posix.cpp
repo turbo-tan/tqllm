@@ -1,5 +1,6 @@
 #include "os_file.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <dlfcn.h>
@@ -58,6 +59,14 @@ bool MappedFile::drop(size_t offset, size_t bytes) const noexcept {
 #endif
 }
 void MappedFile::advise_random() const noexcept { madvise(const_cast<char *>(data_), size_, MADV_RANDOM); }
+static void advise_range(const char * data, size_t size, size_t offset, size_t bytes, int advice) noexcept {
+    if (offset >= size || !bytes) return;
+    bytes = std::min(bytes, size - offset);
+    const size_t page = page_size(), start = offset / page * page, stop = (offset + bytes + page - 1) / page * page;
+    madvise(const_cast<char *>(data) + start, std::min(stop, (size + page - 1) / page * page) - start, advice);
+}
+void MappedFile::advise_random(size_t offset, size_t bytes) const noexcept { advise_range(data_, size_, offset, bytes, MADV_RANDOM); }
+void MappedFile::prefetch(size_t offset, size_t bytes) const noexcept { advise_range(data_, size_, offset, bytes, MADV_WILLNEED); }
 
 struct ReadFile::Impl { int fd = -1; };
 ReadFile::ReadFile(const std::string & path) : impl_(std::make_unique<Impl>()) {

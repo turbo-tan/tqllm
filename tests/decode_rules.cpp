@@ -220,6 +220,9 @@ int main() {
     check(small_card_chunk(25319, 32768) == 25600, "25.3K prompt: 25.6K, the largest the plan can take");
     check(small_card_chunk(25319, 16384) == 16384 && small_card_chunk(40000, 32768) == 32768, "capped at the max chunk");
     check(small_card_chunk(1, 32768) == 1024 && small_card_chunk(0, 32768) == 0, "tiny and empty prompts");
+    check(short_prompt_chunk(300, 16384) == 2048 && short_prompt_chunk(2049, 16384) == 3072, "short prompt: its own length, at least 2K");
+    check(short_prompt_chunk(16384, 16384) == 16384 && short_prompt_chunk(16385, 16384) == 16384 && short_prompt_chunk(0, 16384) == 16384,
+          "a prompt of a chunk or more keeps the engine chunk");
 
     // parking the LM heads for a multi-chunk prompt: only when their room can make the whole prompt one chunk (the pin +
     // unpark is ~1.1 s of TTFT, and a 25.3K prompt at 16 GB cannot reach one chunk with 11.1 GB free)
