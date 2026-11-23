@@ -63,7 +63,10 @@ else()
   set(TQLLM_OS_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/core/platform/os_posix.cpp)
 endif()
 add_library(tqllm src/core/runtime.cpp ${TQLLM_OS_SOURCE})
-target_sources(tqllm PRIVATE src/core/ctl_star.cpp src/core/tokenizer.cpp src/core/embed_inputs.cpp src/core/options.cpp src/kv/kv_store.cpp src/kv/conversation_state.cpp src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/hf/arch_qwen4_exp.cpp src/core/hf/arch_qwen35.cpp src/core/hf/arch_inkling2_loop.cpp src/core/safetensors.cpp src/experts/moe.cpp src/models/qwen/qwen4exp/qwen4exp.cpp)
+target_sources(tqllm PRIVATE src/core/tokenizer.cpp src/core/embed_inputs.cpp src/core/options.cpp src/kv/kv_store.cpp src/kv/conversation_state.cpp src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/hf/arch_qwen4_exp.cpp src/core/hf/arch_qwen35.cpp src/core/hf/arch_inkling2_loop.cpp src/core/safetensors.cpp src/experts/moe.cpp src/models/qwen/qwen4exp/qwen4exp.cpp)
+if(NOT WIN32)  # the multi-GPU control star uses POSIX sockets; Windows builds use the TpComm stub
+  target_sources(tqllm PRIVATE src/core/ctl_star.cpp)
+endif()
 target_include_directories(tqllm PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(tqllm PRIVATE ${CMAKE_DL_LIBS})
 if(MSVC)
@@ -92,9 +95,11 @@ add_test(NAME device-free COMMAND test-device-free)
 add_executable(test-layer-split tests/layer_split.cpp)  # multi-GPU layer split: each rank's layer range
 add_test(NAME layer-split COMMAND test-layer-split)
 set_tests_properties(layer-split PROPERTIES LABELS cpu)
-add_executable(test-ctl-star tests/ctl_star.cpp src/core/ctl_star.cpp)  # multi-GPU control star: N ranks over loopback
-target_link_libraries(test-ctl-star PRIVATE Threads::Threads)
-add_test(NAME ctl-star COMMAND test-ctl-star)
+if(NOT WIN32)
+  add_executable(test-ctl-star tests/ctl_star.cpp src/core/ctl_star.cpp)  # multi-GPU control star: N ranks over loopback
+  target_link_libraries(test-ctl-star PRIVATE Threads::Threads)
+  add_test(NAME ctl-star COMMAND test-ctl-star)
+endif()
 set_tests_properties(ctl-star PROPERTIES LABELS cpu)
 add_executable(test-lockstep tests/lockstep.cpp)  # multi-GPU layer split: rank 1 makes rank 0's engine calls
 target_include_directories(test-lockstep PRIVATE include)

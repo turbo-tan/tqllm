@@ -7,7 +7,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#ifdef _WIN32
+#include <cstdlib>
+#else
 #include <unistd.h>
+#endif
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,7 +27,11 @@ inline std::vector<LayerRange> agree_split(TpComm & tp, const std::vector<uint64
     const uint32_t layers = uint32_t(cost.size());
     struct Report { uint64_t free_b, layers, cap_b, avail_b, need_b, limited; char host[48]; };
     Report mine{free_b, layers, room.limited ? room.cap : 0, room.available, room.need_one, room.limited ? 1u : 0u, {}};
+#ifdef _WIN32
+    if (const char * c = std::getenv("COMPUTERNAME")) std::snprintf(mine.host, sizeof mine.host, "%s", c);
+#else
     gethostname(mine.host, sizeof mine.host - 1);
+#endif
     std::vector<Report> all(static_cast<size_t>(world));
     tp.ctl_all_gather(&mine, all.data(), sizeof mine);
     std::vector<uint32_t> bounds(size_t(world - 1), 0);
