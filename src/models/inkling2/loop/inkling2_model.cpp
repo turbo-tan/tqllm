@@ -322,13 +322,19 @@ struct Inkling2Model::Impl {
     size_t expert_budget = SIZE_MAX;
     size_t dev_mem = 0;
     int resident_share = 0;  // experts per 128 kept on the device (128: all)
+    // TQT prompt path without whole-model BF16 copies: one layer's BF16 experts (gate+up, down) plus the grouped GEMM buffers
+    size_t tqt_scratch_bytes() const {
+        const size_t A = size_t(chunk) * topk;
+        return size_t(E) * 2 * I * D * 2 + size_t(E) * D * I * 2 + A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
+    }
     void place_experts() {
         size_t total = 0;
         for (const auto & Y : Ls) total += Y.eg.bytes() + Y.eu.bytes() + Y.ed.bytes();
         auto budget = [&] {
             size_t fr = 0, tot = 0;
             ck(cudaMemGetInfo(&fr, &tot), "mem info");
-            const size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
+            size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
+            if (tqt_experts && dev_mem < (size_t(96) << 30)) keep += tqt_scratch_bytes();  // the per-visit BF16 decode of a TQT layer
             return std::min(expert_budget, fr > keep ? fr - keep : 0);
         };
         size_t b = budget();
