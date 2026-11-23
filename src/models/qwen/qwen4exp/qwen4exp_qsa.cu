@@ -1192,7 +1192,7 @@ void qsa_score_bits(const float * pooled_keys, const float * query, uint32_t * s
             pooled_keys, query, scores, blocks, tokens, first_position, ratio);
         return;
     }
-    constexpr size_t smem = size_t(2 * kTcB + 2 * kTcQ) * kTcLd * 2;  // 69,632 B (the epilogue reuses it: 64 x 68 floats)
+    static constexpr size_t smem = size_t(2 * kTcB + 2 * kTcQ) * kTcLd * 2;  // 69,632 B (the epilogue reuses it: 64 x 68 floats)
     static const bool attr = [] { ck(cudaFuncSetAttribute(score_bits_tc_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem))); return true; }();
     (void) attr;
     score_bits_tc_k<<<dim3(unsigned((blocks + kTcB - 1) / kTcB), unsigned((tokens + kTcQ - 1) / kTcQ)), 256, smem, stream>>>(
