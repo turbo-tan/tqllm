@@ -475,12 +475,11 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
                 for (int b = 0; b < 5; ++b) {
                     const uint8_t * B = blk + 2 + b * sb;
                     float v[128];
+                    uint8_t E[64];  // the stream + its first 4 bytes again (the windows wrap inside the block)
+                    std::memcpy(E, B, sb); std::memcpy(E + sb, B, 4);
                     for (int p = 0; p < 64; ++p) {
-                        uint32_t w = 0;
-                        for (int i = 0; i < 16; ++i) {  // bit p * kb + i of the block's stream (mod kb * 64)
-                            const int bit = (p * kb + i) % (kb * 64);
-                            w |= uint32_t((B[bit >> 3] >> (bit & 7)) & 1u) << i;
-                        }
+                        const int o = p * kb;  // window = bits o .. o + 15 (little-endian bit order)
+                        const uint32_t w = ((uint32_t(E[o >> 3]) | uint32_t(E[(o >> 3) + 1]) << 8 | uint32_t(E[(o >> 3) + 2]) << 16) >> (o & 7)) & 0xFFFFu;
                         const uint32_t y = (w * 0x9E3779B1u + 0x7F4A7C15u) & 0xFFFFu;
                         const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
                         const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
