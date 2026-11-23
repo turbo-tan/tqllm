@@ -187,22 +187,46 @@ def calib_ids(tok, wiki, srcdir, ntok, seqlen, seed=0):
     return out
 
 
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _dequant_experts(weight, scale, amax=None, denominator=None):
+    """transformers PR #51050 Inkling2LoopDequantizeExperts without transformers: NVFP4 (amax given: two E2M1 per byte, low nibble
+    first, E4M3 scale per 16, per-expert factor amax / denominator) or MXFP8 (E4M3 values, 2 ** (scale - 127) per 32) -> BF16"""
+    import torch
+    dev = weight.device
+    E_, rows = weight.shape[:2]
+    cols = weight.shape[2] * 2 if amax is not None else weight.shape[2]
+    out = torch.empty(E_, rows, cols, dtype=torch.bfloat16, device=dev)
+    if amax is not None:
+        e2m1 = torch.tensor(E2M1, device=dev)
+        byte = torch.arange(256, device=dev)
+        b2v = torch.stack((e2m1[byte & 0xF], e2m1[byte >> 4]), dim=-1)
+        factor = amax.float() / denominator.float()
+    for st in range(0, E_, 8):
+        ex = slice(st, st + 8)
+        bs = scale[ex].float()
+        if amax is None:
+            v = weight[ex].float().view(*bs.shape, 32) * torch.exp2(bs - 127)[..., None]
+        else:
+            v = b2v[weight[ex].to(torch.uint8).long()].view(*bs.shape, 16) * bs[..., None] * factor[ex, None, None, None]
+        out[ex] = v.reshape(-1, rows, cols).to(torch.bfloat16)
+    return out
+
+
 def official_experts(model_dir, l, dev="cpu"):
-    """layer l's experts as the reference loads them (the checkpoint's NVFP4 / MXFP8 dequantised to BF16 by the transformers
-    loader ops, w13 de-interleaved): (gate_up [E, 2I, D], down [E, D, I]); needs no model, only the pylib transformers"""
-    sys.path.insert(0, str(Path(model_dir) / "pylib"))
+    """layer l's experts as the reference loads them (the checkpoint's NVFP4 / MXFP8 dequantised to BF16, w13 de-interleaved to
+    gate rows then up rows): (gate_up [E, 2I, D], down [E, D, I]); needs no model and no transformers"""
     from safetensors import safe_open
-    from transformers.core_model_loading import Inkling2LoopDequantizeExperts, Interleave
     f = safe_open(str(Path(model_dir) / "model-00001-of-00001.safetensors"), "pt", device=dev)
     keys = set(f.keys())
     out = {}
     for w in ("w13", "w2"):
         base = f"model.llm.layers.{l}.mlp.experts.{w}_weight"
-        names = [base, base + "_scale", base + "_amax", base + "_outer_scale_denominator"]
-        src = {n: f.get_tensor(n) for n in names if n in keys}
-        x = Inkling2LoopDequantizeExperts().convert(src, names, ["x"], model=None, full_layer_name=None)["x"]
-        if w == "w13":
-            x = Interleave(dim=1).convert({"x": x}, ["x"], ["x"])["x"]
+        t = {k: f.get_tensor(base + k) if base + k in keys else None for k in ("", "_scale", "_amax", "_outer_scale_denominator")}
+        x = _dequant_experts(t[""], t["_scale"], t["_amax"], t["_outer_scale_denominator"])
+        if w == "w13":  # rows alternate gate / up: de-interleave (Interleave(dim=1))
+            x = x.reshape(x.shape[0], x.shape[1] // 2, 2, x.shape[2]).transpose(1, 2).reshape(x.shape).contiguous()
         out[w] = x
     return out["w13"], out["w2"]
 
@@ -243,9 +267,10 @@ def cmd_hessian(args):
     if not todo:
         return
     model, mods = load_model(args.model)
-    gu, dn = official_experts(args.model, todo[0], "cuda")  # the model-free loader must equal the reference's own weights
-    assert torch.equal(gu, mods[todo[0]].gate_up_proj.data) and torch.equal(dn, mods[todo[0]].down_proj.data), "official_experts != the loaded model"
-    del gu, dn
+    for l in todo:  # the model-free loader must equal the reference's own weights (NVFP4 and MXFP8 layers)
+        gu, dn = official_experts(args.model, l, "cuda")
+        assert torch.equal(gu, mods[l].gate_up_proj.data) and torch.equal(dn, mods[l].down_proj.data), f"official_experts != the loaded model, layer {l}"
+        del gu, dn
     from transformers import AutoTokenizer
     seqs = calib_ids(AutoTokenizer.from_pretrained(args.model), args.wiki, args.srcdir, args.tokens, args.seqlen)
     for g in range(0, len(todo), args.group):

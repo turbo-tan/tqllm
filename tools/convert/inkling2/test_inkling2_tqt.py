@@ -218,3 +218,23 @@ def test_gpu_decode_matches_numpy(codec_name):
     for e in range(2):
         ref = (codec.decode(raw[e].tobytes(), N, K).reshape(N, K // 128, 128) @ R).reshape(N, K)
         assert np.abs(got[e] - ref).max() <= np.abs(ref).max() * 2 ** -7
+
+
+def test_dequant_experts_nvfp4_and_mxfp8():
+    E_, rows, cols = 2, 4, 32
+    rng = np.random.RandomState(4)
+    codes = torch.from_numpy(rng.randint(0, 256, (E_, rows, cols // 2), dtype=np.uint8))
+    scale = torch.from_numpy(rng.randint(0x30, 0x48, (E_, rows, cols // 16), dtype=np.uint8)).view(torch.float8_e4m3fn)
+    amax, den = torch.tensor([2.0, 3.0]), torch.tensor([6.0])
+    got = Q._dequant_experts(codes, scale, amax, den).float()
+    c = codes.numpy()
+    for e in range(E_):
+        for r in range(rows):
+            for j in range(cols):
+                nib = (c[e, r, j // 2] >> (4 * (j % 2))) & 15
+                want = Q.E2M1[nib] * float(scale[e, r, j // 16].float()) * float(amax[e] / den[0])
+                assert abs(got[e, r, j] - want) <= abs(want) * 2 ** -8 + 1e-9
+    w8 = torch.from_numpy(rng.randint(0, 0x70, (1, 2, 64), dtype=np.uint8)).view(torch.float8_e4m3fn)
+    s8 = torch.from_numpy(rng.randint(120, 125, (1, 2, 2), dtype=np.uint8))
+    g8 = Q._dequant_experts(w8, s8).float()
+    assert abs(g8[0, 1, 40] - float(w8[0, 1, 40].float()) * 2.0 ** (int(s8[0, 1, 1]) - 127)) < 1e-6
