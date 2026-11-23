@@ -14,23 +14,29 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New in [1.6.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.6.0)** ([all changes](CHANGELOG.md)):
+**New in [1.7.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.7.0)** ([all changes](CHANGELOG.md)):
 
-![tqLLM 1.6.0](https://tqllm.com/assets/tqllm-1.6.0.png)
+![tqLLM 1.7.0](https://tqllm.com/assets/tqllm-1.7.0.png)
 
-- **Long context, 3.2x faster on a 16 GB card:** QSA sparse attention for Qwen3.8-27B (`--qsa-from N`, opt-in,
-  approximate). Past N keys each answer token reads only the key blocks the in-file indexer picks. RTX 5060 Ti 16 GB,
-  TQ_XS-QSA, 200K prompt: 93.4 tok/s against 29.3. RTX 3090, TQ_L-QSA: 182.2 against 143.6 at 128K, 170.5 against
-  119.5 at 256K.
-- **Flash-Next over two linked boxes:** `--split experts` lets an idle second box compute half of each layer's experts;
-  the output is the same as one box. Two DGX Sparks, one user: 68.4 tok/s against 64.4. With `--peer`, 16 users over
-  both boxes: 238 tok/s.
-- **Two GPUs in one PC:** `--split layer` for the dense 27B ([multi-GPU guide](docs/guides/multi-gpu.md)).
-- **Mac, instant next turn:** `--prompt-cache on` resumes a chat from the state its last prompt kept; follow-up first
-  token at 34K in 0.36-0.47 s.
-- **int8 prefill for llama.cpp IQ4_XS GGUFs** (`--prefill-int8 on`), no extra VRAM.
-- **Fixed:** garbage tokens on M1-M4 Macs (#38). **Known issue:** the 12 GB / 4-user copy-engine fault from 1.5.0 is
-  not fixed; use `--np 2` on 12 GB cards.
+- **Inkling-2-Mini (Thinking Machines) on NVIDIA and Mac:** loads the official NVFP4 / MXFP8 checkpoint, exact by
+  default (KLD 0.0023 against BF16 on an RTX 3090), with MTP drafting, tool calls and the thinking split.
+  [Inkling guide](docs/models/inkling2.md).
+  - DGX Spark against Strata 0.2.20 on the same weights, exact against exact: prompts 2.1x faster at 8K, 3.2x at 128K,
+    3.7x at 256K (1,451 against 385 tok/s).
+  - RTX 3090: answers 1.8x faster at 64K (65.3 against 34.9 tok/s); at 128K 55.0 tok/s, where Strata runs out of
+    VRAM unless its K/V goes to host RAM (6.4 tok/s). Strata leads short context (8K: 93.4 against 77.9 exact).
+  - Mac M5 Pro against MTPLX 2.13.1: exact answers +14 % (40.4 against 35.3 tok/s), prompts faster from 1K to 64K.
+  - `--exact off`: INT8 dense weights, and FP4 tensor-core prompt experts on Blackwell / DGX Spark (approximate:
+    KLD 0.0096, top-1 96.0 %).
+- **TQV-12 and TQT weight formats** by @Scoobylolo: TQ4's size with lower error (Qwen3.8-27B at 14.72 GB: KLD -38 %).
+- **Two GPUs or two PCs:** `--split layer` for Flash-Next and the 27B, with the memory fit across both cards
+  ([multi-GPU guide](docs/guides/multi-gpu.md)).
+- Runtime LoRA adapters, an embeddings server, `--embed-host` / `--head-host`, a prompt cache that follows a
+  conversation across slots, and Flash-Next on 64 GB hosts.
+- 18 pull requests by @Scoobylolo: faster verify attention and long-context prefill, a warning-free build, exact
+  sampling from the int8 head, and more ([changelog](CHANGELOG.md)).
+- **Known issue:** on 16 GB cards Inkling-2-Mini's 20 GB checkpoint streams part of its experts from RAM; a 14.5 GB
+  file is planned for 1.7.1.
 
 Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
@@ -38,15 +44,16 @@ Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 
 ## Supported models
 
-Checked on the release build: the model loads and answers fixed questions correctly (1.6.0: RTX 3090, DGX Spark / GB10, M5 Pro Mac).
+Checked on the release build: the model loads and answers fixed questions correctly (1.7.0: Flash-Next and Inkling-2-Mini on RTX 3090 and DGX Spark / GB10, Inkling-2-Mini on an M5 Pro Mac).
 
-| Model | Files tqLLM loads | Hardware | 1.6.0 check |
+| Model | Files tqLLM loads | Hardware | 1.7.0 check |
 |---|---|---|---|
-| Qwen3.8-27B and fine-tunes (e.g. Qwopus3.8) | TQ3_4S, TQ_L / TQ4, K-quant and IQ GGUFs; EXL3 folders; DFlash2 and MTP drafters | NVIDIA, 16 GB and up; DGX Spark / GB10 | passed |
-| Qwen3.8-27B on a Mac | mlx-community 4-bit, TQ_L, QSA files ([Mac guide](docs/guides/mac.md)) | Apple Silicon (48 GB tested) | passed |
+| Qwen3.8-27B and fine-tunes (e.g. Qwopus3.8) | TQ3_4S, TQ_L / TQ4, K-quant and IQ GGUFs; EXL3 folders; DFlash2 and MTP drafters | NVIDIA, 16 GB and up; DGX Spark / GB10 | unit tests; model check from 1.6.0 |
+| Qwen3.8-27B on a Mac | mlx-community 4-bit, TQ_L, QSA files ([Mac guide](docs/guides/mac.md)) | Apple Silicon (48 GB tested) | unit tests; model check from 1.6.0 |
+| Inkling-2-Mini (26B looped MoE, 3.4B active) | the official checkpoint folder (NVFP4 / MXFP8 experts, BF16 dense) | NVIDIA 24 GB and up; DGX Spark / GB10; Apple Silicon (48 GB tested) | passed (exact KLD gate on 3090, GB10, M5 Pro) |
 | Qwen3.8-Flash-Next (125B MoE, 6B active) | `.tqfn` manifest over the public IQ3_S GGUF, tqLLM's own file, Unsloth Dynamic v3.1 GGUFs, NVIDIA NVFP4 experts | 24 GB GPU + 64 GB RAM; DGX Spark / GB10 | passed |
-| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.6.0 |
-| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.6.0 |
+| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.7.0 |
+| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.7.0 |
 
 Not verified yet: Qwen3.5 / 3.6 mixture-of-experts GGUFs (`qwen35moe`, such as Qwen3.6-35B-A3B). The MoE models
 (Flash-Next, GLM-5.3-Flash, MiniMax) do not run on native Windows yet; use WSL 2 there.
