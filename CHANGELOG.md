@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Performance
+- Flash-Next decode: the segmented BF16 GEMV (routers + shared-expert gates of two layers in one launch, the GDN alpha /
+  beta projections) picks its segment's pointers with constant indices; indexing the parameter struct by a register
+  copied it to local memory in every thread. RTX 3090, router launch (1026 x 2560): 8.2 / 11.7 / 12.6 -> 5.9 / 8.6 /
+  11.1 us at 1 / 4 / 8 tokens; ISTA IQ3_XXS GSM8K-50 170.8 -> 170.0 s, decode 136.6 -> 137.7 tok/s; same bits.
+
 ## 1.7.0 (2026-11-23)
 
 ### Added
