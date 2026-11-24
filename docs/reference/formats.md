@@ -111,3 +111,31 @@ prefill dequantisation. Every kernel variant and column count gives the same bit
 (109.3 / 130.0 / 205.7), 5120 x 17408 62.0 / 72.0 / 92.2 (60.1 / 63.7 / 96.2), 16384 x 5120 59.0 / 65.4 / 92.4
 (56.6 / 59.9 / 103.9), 5120 x 6144 24.2 / 26.9 / 36.0 (24.1 / 26.5 / 39.1): within 4 % of TQ4 at one column, up to
 13 % slower at 8 (`ffn_down`), faster at 16.
+
+## FNT: trellis-coded MoE experts at 2 to 3.5 bits per weight
+
+FNT-k applies TQT's idea to routed-expert tensors at lower rates: a tail-biting bitshift-trellis code with a 16-bit
+window, k stream bits per pair of weights (k = 4..7, i.e. 2, 2.5, 3 or 3.5 bits per weight) and one FP16 scale per 640
+weights (+0.025 bits per weight). On Gaussian data the MSE is 0.0715 / 0.0364 / 0.0186 / 0.0098 at k = 4 / 5 / 6 / 7
+(rate-distortion bound 0.0625 / 0.0313 / 0.0156 / 0.0078). tqLLM only.
+
+| | |
+|---|---|
+| GGUF tensor type | 330 / 331 / 332 / 333 for k = 4 / 5 / 6 / 7, valid only together with the key `tqllm.fnt.code = "fnt-c2w16-v1"` |
+| Block | 640 weights along the row (rows must be a multiple of 640): FP16 scale (2 B) + 5 streams of k * 8 bytes, one per 128 weights |
+| Stream | k * 64 bits, bit i = bit i % 8 of byte i / 8; bit indices mod k * 64 (the stream wraps inside its 128 weights) |
+| Window of pair p (weights 2p, 2p+1 of the 128) | w = bits p*k .. p*k + 15 of the stream (bit p*k is bit 0 of w) |
+| Code (32-bit unsigned arithmetic) | y = (w * 0x9E3779B1 + 0x7F4A7C15) & 0xFFFF; z = y * 0x2C1B3C6D + 0x9E3779B9; z2 = z * 0x297A2D39 + 0x7F4A7C15; h(v) = (v & 0x8FFF8FFF) ^ 0x3B603B60 read as two FP16 (low half first): TQT's c2 with a 16-bit window |
+| Weights 2p, 2p+1 | the FP16 sums h(z) + h(z2) (round to nearest even; low halves = weight 2p), times the block's scale, in the rotated basis |
+| Basis | TQ4's per 128 weights (H D / sqrt(128)); the engine sees a plain-basis matrix: every FNT kernel rotates its input itself |
+
+The encoder (BlockLDLQ with a tail-biting Viterbi search per 128 weights, per-expert Hessians from captured routed
+inputs, `tools/convert/qwen4exp/fnt_quant.py`) and the measurements are in the [FNT guide](../guides/fnt.md). On
+Qwen3.8-Flash-Next the routed experts at 2.48 bits per weight (shard 1 41.52 GB instead of 47.04 GB) have a KLD of
+0.145 against a Q8_0-expert reference, against 0.198 for the ISTA-DASLab GSQ-RCO IQ3_XXS experts they replace.
+
+**Kernels.** Expert matvec, dedup (one read per distinct expert of a verify block) and the prefill grouped GEMM run on
+tensor cores with TQT's k order and give the same bits per row and column (tests/fnt_format.cu, which also checks the
+FP16 dequantisation and `dequantize_host` bit for bit against an independent decoder). `expert-dedup-bench`, RTX 3090,
+16 experts x 2 columns, us per call (the ISTA format each replaces in brackets): gate / up FNT4 22.3 (IQ2_XS 23.5), FNT6
+30.0 (IQ3_S 25.3); down FNT4 17.8 (GSQ Q2_0 32.4), FNT7 24.6 (IQ4_NL 24.7).

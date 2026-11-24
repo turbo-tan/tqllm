@@ -7,6 +7,8 @@
 #include "decode_rules.hpp"
 #include <atomic>
 #include "fn_graphs.hpp"
+#include "fn_moe_dump.hpp"
+#include "gguf.hpp"
 #include <map>
 #include <mutex>
 #include <thread>
@@ -352,6 +354,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             tqllm_cuda::moe_topk(nl->p, next_ids->p, nw.p, nsw.p, c.experts, c.topk, n, 1.f, nullptr);
         }
     } else tqllm_cuda::moe_topk(logits.p, routed.p, weights.p, shared_weights.p, c.experts, c.topk, n, 1.f, nullptr);
+    if (trunk && !capturing && tqllm::flashnext::moe_dump_wants(layer))  // TQLLM_DEBUG=moe_dump (fn_moe_dump.hpp)
+        tqllm::flashnext::moe_dump_write(layer, n, h, c.topk, mixed.get(), routed.get(), weights.get(), shared_weights.get());
     auto end_capture = [&] {
         if (!capturing) return;
         capturing = false;
@@ -547,7 +551,9 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         static float * x_host = nullptr; static __nv_bfloat16 * cpu_out = nullptr;
         if (miss_driven && trunk && cpu_budget <= 0) { ++calls_at_zero; if ((cpu_budget = tqllm::flashnext::next_cpu_budget(0, false, calls_at_zero)) > 0) calls_at_zero = 0; }
         const int pool_rows = cp.run.small_card ? tqllm::flashnext::kCpuPoolRows : tqllm::flashnext::kCpuPoolMaxRows;
-        const bool use_cpu = cpu_pool && trunk && n <= pool_rows && (!miss_driven || cpu_budget > 0);
+        // FNT trellis layers have no fast CPU decoder (dequantize_host is the bit-serial reference): their misses stay on the GPU
+        const bool cpu_fmt = !gguf_is_fnt(cache.bank_mat(layer, 0).type) && !gguf_is_fnt(cache.bank_mat(layer, 2).type);
+        const bool use_cpu = cpu_pool && trunk && cpu_fmt && n <= pool_rows && (!miss_driven || cpu_budget > 0);
         if (use_cpu) {
             if (!x_host) { ck(cudaMallocHost(reinterpret_cast<void **>(&x_host), size_t(pool_rows) * h * 4));
                            ck(cudaMallocHost(reinterpret_cast<void **>(&cpu_out), size_t(pool_rows) * c.topk * h * 2)); }

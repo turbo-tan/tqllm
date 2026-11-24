@@ -11,6 +11,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   resident experts are re-planned from recent routing (16 GB cards kept the first N for good); the prompt path
   multiplies experts in groups sized from free memory. RTX 5060 Ti, 14.5 GB TQT file, decode 1K / 8K / 32K
   55.9 / 25.5 / 22.2 -> 65.4 / 47.2 / 37.3 tok/s (`--exact off`); KLD 0.00644, top-1 96.93 % against BF16.
+- FNT, a trellis-coded routed-expert format (GGUF types 330-333: 2, 2.5, 3 and 3.5 bits per weight, 16-bit window, TQT's
+  code c2, one FP16 scale per 640 weights, docs/reference/formats.md), its tensor-core expert kernels (matvec, dedup,
+  prefill GEMM: the same bits), `TQLLM_DEBUG=moe_dump` (routed-expert calibration capture) and the quantiser
+  `tools/convert/qwen4exp/fnt_quant.py` (docs/guides/fnt.md). Qwen3.8-Flash-Next with FNT experts (2.48 bpw) instead of
+  the ISTA-DASLab GSQ-RCO IQ3_XXS ones (2.84 bpw): shard 1 47.04 -> 41.52 GB, KLD vs a Q8_0-expert reference 0.198 ->
+  0.145 (WikiText-2, 8 x 2048), same top token 88.98 -> 90.60 %.
 
 ### Performance
 

@@ -22,9 +22,12 @@ int main(int argc, char ** argv) {
     for (const Case cs : {Case{22, 82, 640, 2560, "gate/up IQ2_S"}, Case{16, 66, 640, 2560, "gate/up IQ2_XXS"}, Case{17, 74, 640, 2560, "gate/up IQ2_XS"}, Case{18, 98, 640, 2560, "gate/up IQ3_XXS"}, Case{21, 110, 640, 2560, "gate/up IQ3_S"},
                           Case{20, 144, 2560, 640, "down IQ4_NL"},
                           Case{323, 152, 640, 2560, "gate/up NVF4"}, Case{323, 152, 2560, 640, "down NVF4"}, Case{302, 72, 2560, 640, "down GSQ_Q2_0"},
-                          Case{12, 144, 512, 2048, "gate/up Q4_K 35B"}, Case{13, 176, 2048, 512, "down Q5_K 35B"}}) {
+                          Case{12, 144, 512, 2048, "gate/up Q4_K 35B"}, Case{13, 176, 2048, 512, "down Q5_K 35B"},
+                          Case{330, 162, 640, 2560, "gate/up FNT4"}, Case{331, 202, 640, 2560, "gate/up FNT5"}, Case{332, 242, 640, 2560, "gate/up FNT6"},
+                          Case{330, 162, 2560, 640, "down FNT4"}, Case{333, 282, 2560, 640, "down FNT7"}}) {
         if (argc > 5 && !std::strstr(cs.what, argv[5])) continue;
-        std::vector<char> raw(size_t(cs.rows) * slots * cs.cols / 256 * cs.bb);
+        const bool fnt = cs.ty >= 330 && cs.ty <= 333;  // FNT-k: bb bytes per 640 weights (FP16 scale first)
+        std::vector<char> raw(size_t(cs.rows) * slots * cs.cols / (fnt ? 640 : 256) * cs.bb);
         for (auto & c : raw) c = char(g() & 255);
         const __half d = __float2half(0.001f);
         for (size_t b = 0; b < raw.size() / cs.bb; ++b) {
@@ -32,6 +35,7 @@ int main(int argc, char ** argv) {
                 for (int h = 0; h < 2; ++h) { const float gs = 0.02f; std::memcpy(raw.data() + b * cs.bb + h * 76, &gs, 4); std::memset(raw.data() + b * cs.bb + h * 76 + 4, 0x38, 8); }
                 continue;
             }
+            if (fnt) { std::memcpy(raw.data() + b * cs.bb, &d, 2); continue; }
             if (cs.ty == 302) { for (int q = 0; q < 4; ++q) std::memcpy(raw.data() + b * cs.bb + q * 18, &d, 2); continue; }
             if (cs.ty == 20) for (int q = 0; q < 8; ++q) std::memcpy(raw.data() + b * cs.bb + q * 18, &d, 2);
             else std::memcpy(raw.data() + b * cs.bb, &d, 2);
@@ -57,7 +61,7 @@ int main(int argc, char ** argv) {
         const double bytes = double(raw.size()) / slots * G;
         std::printf("dedup %-16s G=%d cols=%d: %7.2f us  %6.0f GB/s\n", cs.what, G, C, 1000.f * ms / iters, bytes * iters / (ms / 1000) / 1e9);
         {  // TQFN_TILED layout: same output bits, timing of the lane-contiguous code tiles
-            const int bpb = tqllm_cuda::tiled_block_bytes(m.fmt->u4h_id());
+            const int bpb = tqllm_cuda::tiled_block_bytes(m.fmt->expert_kernel_id());
             if (bpb) {
                 const size_t tb = size_t(cs.rows) * slots * (cs.cols / 32) * bpb;
                 std::vector<char> h(tb), t(tb);

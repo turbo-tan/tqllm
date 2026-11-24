@@ -43,6 +43,7 @@ void register_q4();
 void register_tq4();
 void register_tqv12();
 void register_tqt();
+void register_fnt();
 void register_tq3();
 void register_i8h();
 void register_gsq_q2();
@@ -65,6 +66,7 @@ void builtins() {
         formats::register_tq4();
         formats::register_tqv12();
         formats::register_tqt();
+        formats::register_fnt();
         formats::register_tq3();
         formats::register_i8h();
         formats::register_gsq_q2();

@@ -157,6 +157,8 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
         case GGML_TQT:    elems = 128; bytes = 66;  return true;  // TQLLM: FP16 scale + 64 B trellis stream
         case GGML_TQT2:   elems = 128; bytes = 34;  return true;  // TQLLM: FP16 scale + 32 B 2-bit trellis stream
         case GGML_TQT3:   elems = 128; bytes = 50;  return true;  // TQLLM: FP16 scale + 48 B 3-bit trellis stream
+        case GGML_FNT4: case GGML_FNT5: case GGML_FNT6: case GGML_FNT7:  // TQLLM: FP16 scale + 5 x k * 8 B trellis streams
+            elems = 640; bytes = 2 + 40 * uint64_t(gguf_fnt_kb(type)); return true;
         default: return false;
     }
 }
@@ -315,6 +317,11 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
     const bool tqt3_c1 = tqt3 != f.kv.end();
     if (tqt3_c1 && tqt3->second.str != "tqt3-c1-v1")
         throw std::runtime_error("GGUF " + path + ": TQT3 code \"" + tqt3->second.str + "\" is not supported (this build has tqt3-c1-v1)");
+    // FNT files: tensor types 330-333 + the code tag
+    const auto fnt = f.kv.find("tqllm.fnt.code");
+    const bool fnt_c2 = fnt != f.kv.end();
+    if (fnt_c2 && fnt->second.str != "fnt-c2w16-v1")
+        throw std::runtime_error("GGUF " + path + ": FNT code \"" + fnt->second.str + "\" is not supported (this build has fnt-c2w16-v1)");
     std::vector<std::pair<std::string, GgufTensor>> infos;
     for (uint64_t i = 0; i < n_tensors; ++i) {
         auto name = r.str();
@@ -335,6 +342,7 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
         if (t.type == GGML_TQT && !tqt_c2) throw std::runtime_error("GGUF TQT tensor " + name + " without tqllm.tqt.code");
         if (t.type == GGML_TQT2 && !tqt2_c1) throw std::runtime_error("GGUF TQT2 tensor " + name + " without tqllm.tqt2.code");
         if (t.type == GGML_TQT3 && !tqt3_c1) throw std::runtime_error("GGUF TQT3 tensor " + name + " without tqllm.tqt3.code");
+        if (gguf_is_fnt(t.type) && !fnt_c2) throw std::runtime_error("GGUF FNT tensor " + name + " without tqllm.fnt.code");
         t.offset = r.get<uint64_t>();
         if (t.type == GGML_X3) {  // self-describing X3Record groups (the K can differ per expert): size from x3.bytes.<name>
             t.bytes = uint64_t(f.num("x3.bytes." + name, 0));

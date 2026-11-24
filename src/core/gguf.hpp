@@ -49,7 +49,13 @@ enum GgmlType : uint32_t {
     // TQT3 (the 3-bit trellis code tqt3-c1-v1, 50 B per 128: FP16 scale + 48 stream bytes, tools/convert/inkling2/tqt3.py): file type 308,
     // only together with the key tqllm.tqt3.code = "tqt3-c1-v1"; read by the Inkling expert loader.
     GGML_TQT3 = 308,
+    // FNT-k (k = 4..7 stream bits per weight pair; tail-biting bitshift trellis, 16-bit window, code c2, 128-block
+    // Hadamard basis, one FP16 scale per 640 weights; docs/reference/formats.md "FNT"): 640 weights = FP16 scale + 5 x k * 8
+    // stream bytes. Only together with the key tqllm.fnt.code = "fnt-c2w16-v1".
+    GGML_FNT4 = 330, GGML_FNT5 = 331, GGML_FNT6 = 332, GGML_FNT7 = 333,
 };
+inline bool gguf_is_fnt(uint32_t t) { return t >= GGML_FNT4 && t <= GGML_FNT7; }
+inline int gguf_fnt_kb(uint32_t t) { return int(t - GGML_FNT4) + 4; }
 
 
 struct GgufTensor {
