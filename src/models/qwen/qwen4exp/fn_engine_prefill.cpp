@@ -472,7 +472,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         std::fprintf(stderr, "tqllm: attention KV: %.0f MB back on the device for this prompt\n", back / 1048576.0);
     if (host_res) {
         f_.mtp_cache->clear();
-        if (!(f_.cp->run.head_here() && chunk >= 256) && f_.res_host_cap < size_t(P) * W) {  // kv_inline below needs none
+        if (tqllm::flashnext::prefill_residuals_on_host(f_.cp->run.head_here(), chunk) && f_.res_host_cap < size_t(P) * W) {  // kv_inline below needs none
             if (f_.res_host) ck(cudaFreeHost(f_.res_host));
             ck(cudaMallocHost(reinterpret_cast<void **>(&f_.res_host), size_t(P) * W * sizeof(float))); f_.res_host_cap = size_t(P) * W;
         }

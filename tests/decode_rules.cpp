@@ -429,6 +429,11 @@ int main() {
     check(!pin_residual_at_start(6 * GB, 109 * GB, 18 * GB, false), "pod, 18 GB available: pinned per request");
     check(!pin_residual_at_start(6 * GB, 48 * GB, 30 * GB, false), "48 GB machine: never more than a tenth of RAM pinned for it");
     check(!pin_residual_at_start(0, 125 * GB, 40 * GB, false), "single-chunk contexts need no buffer");
+    // the buffer is filled only by a head whose chunks are below the layer-major minimum (kv_inline writes the MTP K/V per
+    // chunk otherwise; ranks without the head run no MTP layer), so it is neither pinned at start nor allocated per request
+    check(!prefill_residuals_on_host(true, kLayerMajorChunkMin) && !prefill_residuals_on_host(true, 8192), "layer-major chunks: MTP K/V inline, no host rows");
+    check(!prefill_residuals_on_host(false, 8192) && !prefill_residuals_on_host(false, 128), "a rank without the head keeps no residual rows");
+    check(prefill_residuals_on_host(true, 128), "a head with chunks below 256 would catch up from host rows");
     // GB10 (unified memory), Flash-Next 131K context: 4.3 GB beside 60 GB available is pinned at start (11-18: pinned in the
     // first 128K request it took 2.2 s of TTFT); with less than 20 GB left after it, per request
     check(pin_residual_at_start(size_t(4.3 * GB), 121 * GB, 60 * GB, true), "GB10, 60 GB available: the 131K buffer pinned at start");
