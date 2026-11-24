@@ -1,4 +1,5 @@
 #include "tq3_expert_cache.hpp"
+#include "device_cap.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +20,9 @@ template<class T> struct Device {
     std::vector<T> get(size_t n) { std::vector<T> x(n); check(cudaMemcpy(x.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return x; }
 };
 static void run() {
+    // the full-device cases fill a 1 GB device (device_cap.h): on the real one the desktop sharing the card frees memory
+    // while it is full, and a bank that should have evicted another fit in it
+    device_cap::limit(size_t(1) << 30);
     const int layers = 4, experts = 5, hidden = 2560, ff = 640, slots = 3;
     const std::array<std::array<uint32_t, 3>, 4> types{{{18, 18, 20}, {21, 21, GGML_GSQ_Q2_0}, {22, 22, 20}, {23, 23, GGML_GSQ_Q2_0}}};
     std::vector<std::array<std::vector<char>, 3>> raw(layers * experts);

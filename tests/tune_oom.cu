@@ -1,6 +1,7 @@
 // Shape autotuning under a full device: the tuning scratch must fail closed (throw, context still usable),
 // not launch its timing kernels on null buffers (a sticky illegal address seen by the next unrelated CUDA call).
 #include "quant_kernels.cuh"
+#include "device_cap.h"
 
 #include <cuda_runtime.h>
 
@@ -51,6 +52,9 @@ int main() {
         std::printf("SKIP: tune_oom fills device memory, which is host memory on an integrated GPU\n");
         return 0;
     }
+    // a 512 MB device past the weights below: the desktop sharing the card frees memory while it is full (device_cap.h),
+    // and a 72 KB scratch that found some tuned instead of failing
+    device_cap::limit(size_t(512) << 20);
     const int rows = 512, k = 4096;
     void * w = nullptr, * aux = nullptr;
     if (cudaMalloc(&w, size_t(rows) * k) != cudaSuccess || cudaMalloc(&aux, size_t(rows) * k / 8) != cudaSuccess) {
