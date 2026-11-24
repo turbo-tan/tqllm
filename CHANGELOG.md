@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Performance
+- Flash-Next decode: IQ2_XXS / IQ2_XS expert banks get the dedup kernels (one read of an expert for every verify row
+  that routes to it; before, one block row per assignment). The ISTA-DASLab GSQ-RCO IQ3_XXS file has these types in
+  the gate / up of 19 of 48 layers. RTX 3090, pinned pack, 32K context: mixed prompts cold / GSM8K / warm 125.8 / 145.6 /
+  126.5 -> 128.7 / 149.1 / 130.1 tok/s, GSM8K-50 170.8 -> 167.1 s (49/50 both); greedy replies identical (md5 of 70).
+
 ## 1.7.0 (2026-11-23)
 
 ### Added
