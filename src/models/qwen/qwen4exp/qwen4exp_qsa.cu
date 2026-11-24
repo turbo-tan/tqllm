@@ -1116,65 +1116,129 @@ __global__ void gather_remap_k(const int32_t * positions, const uint8_t * valid,
     const int t = i / width, pos = positions[i];
     out[i] = valid[i] && pos >= 0 && pos < first_cells + t ? map[pos] : -1;
 }
+// O(selected) marking (no pass over every cell): a cell's stamp is the call's epoch once one of its picks claimed it; that
+// pick appends the cell to the list (its compact index is its list index, in claim order: the attention reads each pick's
+// row through the remapped position, so the order of the compact rows does not change what it reads)
+__global__ void gather_begin_k(unsigned * ctl) { if (++ctl[0] == 0u) ctl[0] = 1u; ctl[1] = 0u; }
+__global__ void gather_mark_list_k(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
+                                   unsigned * stamp, int * map, int * list, unsigned * ctl) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * width) return;
+    const int t = i / width, pos = positions[i];
+    if (!valid[i] || pos < 0 || pos >= first_cells + t) return;
+    const unsigned e = ctl[0];
+    if (atomicExch(stamp + pos, e) != e) { const int j = int(atomicAdd(ctl + 1, 1u)); map[pos] = j; list[j] = pos; }
+}
+// gather_rows_k over the listed cells (one warp per entry)
+__global__ void gather_rows_list_k(const int * list, const unsigned * ctl, const uint4 * keys, const uint4 * values,
+                                   uint4 * k_out, uint4 * v_out, int row_vec, int host_cells, int cache_rows, const int * tag,
+                                   int * claim, const uint4 * ck, const uint4 * cv, unsigned long long * counters) {
+    const int j = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    if (j >= int(ctl[1])) return;
+    const int c = list[j];
+    const uint4 * ks = keys + int64_t(c) * row_vec, * vs = values + int64_t(c) * row_vec;
+    bool hit = false;
+    if (cache_rows > 0 && c < host_cells) {
+        const int slot = c % cache_rows;
+        hit = tag[slot] == c;
+        if (hit) { ks = ck + int64_t(slot) * row_vec; vs = cv + int64_t(slot) * row_vec; }
+        else if (lane == 0) atomicMin(claim + slot, c);
+    }
+    const int64_t dst = int64_t(j) * row_vec;
+    for (int x = lane; x < row_vec; x += 32) { k_out[dst + x] = ks[x]; v_out[dst + x] = vs[x]; }
+    if (lane == 0 && c < host_cells) { atomicAdd(counters, 1ull); if (hit) atomicAdd(counters + 1, 1ull); }
+}
 }  // namespace
 
-QsaGather::QsaGather(int max_cells, size_t row_bytes, int cache_rows, int max_rows) : max_cells_(max_cells), row_bytes_(row_bytes), cache_rows_(std::max(0, cache_rows)) {
-    if (max_cells <= 0 || row_bytes == 0 || row_bytes % 16) throw std::invalid_argument("QSA gather: invalid shape");
-    ck(cudaMalloc(&counters_, 2 * sizeof(unsigned long long))); ck(cudaMemset(counters_, 0, 2 * sizeof(unsigned long long)));
-    if (max_rows > 0) {
-        max_rows_ = max_rows;
-        ck(cudaMalloc(&k_, size_t(max_rows_) * row_bytes_)); ck(cudaMalloc(&v_, size_t(max_rows_) * row_bytes_));
-        ck(cudaMalloc(&pos_, size_t(max_rows_) * sizeof(int32_t)));
+// the per-call buffers of a QsaGather; one set for every shared gather of the process (one GPU; grown, never shrunk; a grown
+// set keeps the old buffers until exit: a captured decode graph may still name them)
+static bool g_gather_scan = false;
+void qsa_gather_set_scan(bool on) { g_gather_scan = on; }
+struct QsaGather::Scratch {
+    int cells = 0, rows = 0; size_t row_bytes = 0, temp_bytes = 0; bool scan = false;
+    int * flags = nullptr; int * map = nullptr; void * temp = nullptr; void * k = nullptr; void * v = nullptr; int32_t * pos = nullptr;
+    int * list = nullptr; unsigned * ctl = nullptr;  // O(selected) marking: flags hold epochs (never cleared), list / ctl the claims
+    std::vector<void *> retired; bool owned = false;
+    ~Scratch() { if (owned) { for (void * p : retired) cudaFree(p); for (void * p : {static_cast<void *>(flags), static_cast<void *>(map), temp, k, v,
+                                                    static_cast<void *>(pos), static_cast<void *>(list), static_cast<void *>(ctl)}) cudaFree(p); } }
+    void drop(void * p) { if (!p) return; if (owned) cudaFree(p); else retired.push_back(p); }
+    // sizes are recorded only once every buffer exists: a failed allocation (out of memory) must not leave cells / rows
+    // claiming freed buffers (the next request failed "invalid dimensions" / illegal address)
+    void need(int max_cells, int max_rows, size_t rb, cudaStream_t stream) {
+        if (row_bytes && rb != row_bytes) throw std::invalid_argument("QSA gather: shared buffers need one row size");
+        row_bytes = rb;
+        if (max_cells > cells) {
+            if (stream) ck(cudaStreamSynchronize(stream));
+            drop(flags); drop(map); drop(temp); flags = map = nullptr; temp = nullptr; cells = 0; temp_bytes = 0;
+            size_t tb = 0;
+            ck(cudaMalloc(&flags, size_t(max_cells) * sizeof(int))); ck(cudaMalloc(&map, size_t(max_cells) * sizeof(int)));
+            if (scan) { ck(cub::DeviceScan::ExclusiveSum(nullptr, tb, flags, map, max_cells)); ck(cudaMalloc(&temp, tb)); }
+            else {
+                ck(cudaMemset(flags, 0, size_t(max_cells) * sizeof(int)));  // epoch 0: never a call's (gather_begin_k skips it)
+                if (!ctl) { ck(cudaMalloc(&ctl, 2 * sizeof(unsigned))); ck(cudaMemset(ctl, 0, 2 * sizeof(unsigned))); }
+            }
+            cells = max_cells; temp_bytes = tb;
+        }
+        if (max_rows > rows) {
+            if (stream) ck(cudaStreamSynchronize(stream));
+            drop(k); drop(v); drop(pos); drop(list); k = v = nullptr; pos = nullptr; list = nullptr; rows = 0;
+            ck(cudaMalloc(&k, size_t(max_rows) * row_bytes)); ck(cudaMalloc(&v, size_t(max_rows) * row_bytes));
+            ck(cudaMalloc(&pos, size_t(max_rows) * sizeof(int32_t)));
+            if (!scan) ck(cudaMalloc(&list, size_t(max_rows) * sizeof(int)));
+            rows = max_rows;
+        }
     }
+};
+static QsaGather::Scratch & shared_gather_scratch() { static QsaGather::Scratch g; return g; }
+
+QsaGather::QsaGather(int max_cells, size_t row_bytes, int cache_rows, int max_rows, bool shared)
+    : row_bytes_(row_bytes), cache_rows_(std::max(0, cache_rows)) {
+    if (max_cells <= 0 || row_bytes == 0 || row_bytes % 16) throw std::invalid_argument("QSA gather: invalid shape");
+    if (shared) sc_ = &shared_gather_scratch();
+    else { own_ = std::make_unique<Scratch>(); own_->owned = true; own_->scan = g_gather_scan; sc_ = own_.get(); }
+    ck(cudaMalloc(&counters_, 2 * sizeof(unsigned long long))); ck(cudaMemset(counters_, 0, 2 * sizeof(unsigned long long)));
     if (cache_rows_) {
         ck(cudaMalloc(&tag_, size_t(cache_rows_) * sizeof(int))); ck(cudaMemset(tag_, 0xff, size_t(cache_rows_) * sizeof(int)));  // -1: empty
         ck(cudaMalloc(&claim_, size_t(cache_rows_) * sizeof(int))); ck(cudaMemset(claim_, 0x7f, size_t(cache_rows_) * sizeof(int)));  // ~INT_MAX
         ck(cudaMalloc(&ck_, size_t(cache_rows_) * row_bytes)); ck(cudaMalloc(&cv_, size_t(cache_rows_) * row_bytes));
     }
-    ck(cudaMalloc(&flags_, size_t(max_cells) * sizeof(int)));
-    ck(cudaMalloc(&map_, size_t(max_cells) * sizeof(int)));
-    ck(cub::DeviceScan::ExclusiveSum(nullptr, temp_bytes_, flags_, map_, max_cells));
-    ck(cudaMalloc(&temp_, temp_bytes_));
+    sc_->need(max_cells, max_rows, row_bytes, nullptr);
 }
-QsaGather::~QsaGather() { cudaFree(flags_); cudaFree(map_); cudaFree(temp_); cudaFree(k_); cudaFree(v_); cudaFree(pos_);
-                          cudaFree(tag_); cudaFree(claim_); cudaFree(ck_); cudaFree(cv_); cudaFree(counters_); }
+QsaGather::~QsaGather() { cudaFree(tag_); cudaFree(claim_); cudaFree(ck_); cudaFree(cv_); cudaFree(counters_); }
+const void * QsaGather::keys() const { return sc_->k; }
+const void * QsaGather::values() const { return sc_->v; }
+const int32_t * QsaGather::positions() const { return sc_->pos; }
 void QsaGather::run(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
                     const void * keys, const void * values, cudaStream_t stream, int host_cells, int written_from) {
     const int cells = first_cells + tokens - 1;
     if (tokens <= 0 || width <= 0 || cells <= 0) throw std::invalid_argument("QSA gather: invalid call");
-    if (cells > max_cells_) {  // the attention state is sized per request: a longer one grows the cell maps
-        // sizes are recorded only once every buffer exists: a failed allocation (out of memory) left max_cells_ /
-        // max_rows_ claiming freed buffers, and the next request failed "invalid dimensions" / illegal address
-        ck(cudaStreamSynchronize(stream)); cudaFree(flags_); cudaFree(map_); cudaFree(temp_);
-        flags_ = map_ = nullptr; temp_ = nullptr; max_cells_ = 0; temp_bytes_ = 0;
-        size_t tb = 0;
-        ck(cudaMalloc(&flags_, size_t(cells) * sizeof(int))); ck(cudaMalloc(&map_, size_t(cells) * sizeof(int)));
-        ck(cub::DeviceScan::ExclusiveSum(nullptr, tb, flags_, map_, cells)); ck(cudaMalloc(&temp_, tb));
-        max_cells_ = cells; temp_bytes_ = tb;
-    }
-    if (tokens * width > max_rows_) {
-        cudaFree(k_); cudaFree(v_); cudaFree(pos_); k_ = v_ = nullptr; pos_ = nullptr; max_rows_ = 0;
-        const int rows = tokens * width;
-        ck(cudaMalloc(&k_, size_t(rows) * row_bytes_)); ck(cudaMalloc(&v_, size_t(rows) * row_bytes_));
-        ck(cudaMalloc(&pos_, size_t(rows) * sizeof(int32_t)));
-        max_rows_ = rows;
-    }
+    Scratch & g = *sc_;
+    g.need(cells, tokens * width, row_bytes_, stream);  // the attention state is sized per request: a longer one grows the maps
     const int items = tokens * width;
-    ck(cudaMemsetAsync(flags_, 0, size_t(cells) * sizeof(int), stream));
-    gather_mark_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, flags_);
-    size_t tb = temp_bytes_; ck(cub::DeviceScan::ExclusiveSum(temp_, tb, flags_, map_, cells, stream));
     const int rv = int(row_bytes_ / 16), cached = cache_rows_ ? std::min(host_cells, cells) : 0;
     // other K/V, or rows rewritten at or below a cell the cache may hold: start empty, never serve a stale row
     if (cache_rows_ && (keys != cached_keys_ || written_from < cached_below_)) {
         ck(cudaMemsetAsync(tag_, 0xff, size_t(cache_rows_) * sizeof(int), stream)); cached_keys_ = keys; cached_below_ = 0;
     }
     cached_below_ = std::max(cached_below_, cached);
-    gather_rows_k<<<(int64_t(cells) * 32 + 255) / 256, 256, 0, stream>>>(flags_, map_, cells, static_cast<const uint4 *>(keys),
-        static_cast<const uint4 *>(values), static_cast<uint4 *>(k_), static_cast<uint4 *>(v_), rv, std::max(0, host_cells), cached ? cache_rows_ : 0,
-        tag_, claim_, static_cast<const uint4 *>(ck_), static_cast<const uint4 *>(cv_), counters_);
-    if (cached) gather_fill_k<<<(int64_t(cache_rows_) * 32 + 255) / 256, 256, 0, stream>>>(map_, cells, cache_rows_, tag_, claim_,
-        static_cast<const uint4 *>(k_), static_cast<const uint4 *>(v_), static_cast<uint4 *>(ck_), static_cast<uint4 *>(cv_), rv);
-    gather_remap_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, map_, pos_);
+    if (g.scan) {
+        ck(cudaMemsetAsync(g.flags, 0, size_t(cells) * sizeof(int), stream));
+        gather_mark_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, g.flags);
+        size_t tb = g.temp_bytes; ck(cub::DeviceScan::ExclusiveSum(g.temp, tb, g.flags, g.map, cells, stream));
+        gather_rows_k<<<(int64_t(cells) * 32 + 255) / 256, 256, 0, stream>>>(g.flags, g.map, cells, static_cast<const uint4 *>(keys),
+            static_cast<const uint4 *>(values), static_cast<uint4 *>(g.k), static_cast<uint4 *>(g.v), rv, std::max(0, host_cells), cached ? cache_rows_ : 0,
+            tag_, claim_, static_cast<const uint4 *>(ck_), static_cast<const uint4 *>(cv_), counters_);
+    } else {
+        gather_begin_k<<<1, 1, 0, stream>>>(g.ctl);
+        gather_mark_list_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells,
+            reinterpret_cast<unsigned *>(g.flags), g.map, g.list, g.ctl);
+        gather_rows_list_k<<<(int64_t(items) * 32 + 255) / 256, 256, 0, stream>>>(g.list, g.ctl, static_cast<const uint4 *>(keys),
+            static_cast<const uint4 *>(values), static_cast<uint4 *>(g.k), static_cast<uint4 *>(g.v), rv, std::max(0, host_cells), cached ? cache_rows_ : 0,
+            tag_, claim_, static_cast<const uint4 *>(ck_), static_cast<const uint4 *>(cv_), counters_);
+    }
+    if (cached) gather_fill_k<<<(int64_t(cache_rows_) * 32 + 255) / 256, 256, 0, stream>>>(g.map, cells, cache_rows_, tag_, claim_,
+        static_cast<const uint4 *>(g.k), static_cast<const uint4 *>(g.v), static_cast<uint4 *>(ck_), static_cast<uint4 *>(cv_), rv);
+    gather_remap_k<<<(items + 255) / 256, 256, 0, stream>>>(positions, valid, tokens, width, first_cells, g.map, g.pos);
     ck(cudaPeekAtLastError());
 }
 QsaGather::Stats QsaGather::stats() const {

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <climits>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -377,28 +378,36 @@ private:
 // memory (TQFN_KV_HOST): every selected row is read once, in wide loads, instead of once per query head by the attention
 // kernel over PCIe. Positions are renumbered in the same order with the same causal cut, so the attention result is
 // identical to reading the rows in place.
+// qsa_gather_set_scan(true): gathers made afterwards mark the selected cells with a pass over every cell (flags, scan,
+// one warp per cell: the first version; A/B and benches). Default: O(selected) marking, the same rows for every pick.
+void qsa_gather_set_scan(bool on);
 class QsaGather {
 public:
     // cache_rows > 0: rows of cells below run()'s host_cells stay in a direct-mapped device cache between calls
     // max_rows > 0: the compact buffers are allocated now for calls up to that many selections (tokens x width), so a call
     // inside CUDA graph capture never allocates; max_cells likewise sizes the cell maps for the longest context
-    QsaGather(int max_cells, size_t row_bytes, int cache_rows = 0, int max_rows = 0);
+    // shared: the per-call buffers (cell marks / map, compact K / V rows, positions) are one set for every shared gather
+    // of the process (decode runs the layers one after another on one stream; 12 x 34 MB at 8 x 2051 rows); the row cache
+    // stays per gather
+    QsaGather(int max_cells, size_t row_bytes, int cache_rows = 0, int max_rows = 0, bool shared = false);
     ~QsaGather();
     QsaGather(const QsaGather &) = delete;
     QsaGather & operator=(const QsaGather &) = delete;
-    // positions / valid [tokens][width]; query t sees cells below first_cells + t; keys / values: row_bytes per cell
+    // positions / valid [tokens][width]; query t sees cells below first_cells + t; keys / values: row_bytes per cell.
+    // Every valid pick below its cut gets a compact row index in positions() (-1 otherwise); distinct cells get distinct rows
+    // holding the cell's K / V row (their order is not the cell order)
     void run(const int32_t * positions, const uint8_t * valid, int tokens, int width, int first_cells,
              const void * keys, const void * values, cudaStream_t stream, int host_cells = 0, int written_from = INT_MAX);
     struct Stats { uint64_t host_rows = 0, cache_hits = 0; };  // rows of host cells copied, of those served by the cache
     Stats stats() const;
-    const void * keys() const { return k_; }
-    const void * values() const { return v_; }
-    const int32_t * positions() const { return pos_; }  // [tokens][width], -1 for rows the attention skips
+    const void * keys() const;
+    const void * values() const;
+    const int32_t * positions() const;  // [tokens][width], -1 for rows the attention skips
+    struct Scratch;
 
 private:
-    int max_cells_ = 0, max_rows_ = 0; size_t row_bytes_ = 0, temp_bytes_ = 0;
-    int * flags_ = nullptr; int * map_ = nullptr; void * temp_ = nullptr;
-    void * k_ = nullptr; void * v_ = nullptr; int32_t * pos_ = nullptr;
+    size_t row_bytes_ = 0;
+    Scratch * sc_ = nullptr; std::unique_ptr<Scratch> own_;
     int cache_rows_ = 0; int * tag_ = nullptr; int * claim_ = nullptr; void * ck_ = nullptr; void * cv_ = nullptr;
     unsigned long long * counters_ = nullptr;  // host rows, cache hits
     const void * cached_keys_ = nullptr; int cached_below_ = 0;  // the K/V the cache holds rows of, cells it may hold
