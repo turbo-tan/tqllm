@@ -96,6 +96,42 @@ void expert_dedup(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d,
 // counts[ids[a]] += 1 for a < A (routed-expert use per layer)
 void count_routes(const int * ids, int A, int * counts, cudaStream_t s);
 // router selection from F32 logits [n][E]: s = sigmoid; top-k of s + bias (lowest id on ties); w = s / sum * scale
-void route_topk(const float * logits, const float * bias, int * ids, float * wts, int n, int E, int topk, float scale, cudaStream_t s);
+// counts (may be null): counts[ids[a]] += 1 for every chosen expert (count_routes in the same launch)
+void route_topk(const float * logits, const float * bias, int * ids, float * wts, int n, int E, int topk, float scale, cudaStream_t s,
+                int * counts = nullptr);
+
+// a thread block of a kernel or a virtual block of a fused kernel: block index, thread index, threads, named barrier
+// (0 = the whole block); the decode kernels' bodies take one so fused kernels can run them for sub-blocks
+struct Blk {
+    int x, y, z, t, nt, bar;
+#ifdef __CUDACC__
+    __device__ __forceinline__ void sync() const { asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(nt) : "memory"); }
+#endif
+};
+#ifdef __CUDACC__
+__device__ __forceinline__ Blk blk_of_launch() {
+    return Blk{int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), int(threadIdx.x), int(blockDim.x), 0};
+}
+#endif
+// few-token path (n <= kSmallN): conv k + conv v (static or dynamic) and kv_finish of n tokens in one launch (a block of
+// 128 per KV head; the bodies of conv_static / conv_dynamic / inkling2_kv_finish); s[0].C / d[0].C = kvheads * 128
+struct ConvStaticA { const __nv_bfloat16 * x; const float * w; float * state; float * y32; __nv_bfloat16 * y16; int n, C; const float * add; int round_sum; __nv_bfloat16 * hist; };
+struct ConvDynamicA { const __nv_bfloat16 * x; const float * stat; const __nv_bfloat16 * dyn; float * state; __nv_bfloat16 * y16; int n, C; __nv_bfloat16 * hist; };
+struct KvFinishA { const __nv_bfloat16 * k; const __nv_bfloat16 * v; __nv_bfloat16 * kc; __nv_bfloat16 * vc; int kvheads; float clip, eps; const int * dpos; int ring; };
+struct ConvKvA { int dyn[2]; ConvStaticA s[2]; ConvDynamicA d[2]; KvFinishA kv; };
+void conv_kv_finish(const ConvKvA & a, int n, cudaStream_t s);
+
+// exact greedy LM head for one decode token: w BF16 [rows][K] (rows >= V), q / scale its INT8 per-row copy
+// (quantize_rows_i8), bound [V] from head_bound_build: |x . w_r - approx_r| <= |x| bound_r. Every row gets the INT8 score;
+// only rows whose score + |x| bound can still reach the best row's floor (two BF16 ulps of separation below its lower
+// bound) are rescored with the gemv's BF16 sum, bf16, softcap; token = their argmax (lowest index on ties) = the argmax of
+// the full softcapped logits. n <= kSmallN rows x [n][K] -> token[n]; approx: n * V floats; cells: 2 zeroed words (cleared
+// again after each call); token2 may be null.
+struct HeadBound { const __nv_bfloat16 * w; const int8_t * q; const float * scale; const float * bound; int rows, K, V; };
+void head_bound_build(const __nv_bfloat16 * w, const int8_t * q, const float * scale, float * bound, int rows, int K, cudaStream_t s);
+void head_greedy(const HeadBound & h, const __nv_bfloat16 * x, int n, float cap, float * approx, unsigned long long * cells, int * token, int * token2,
+                 cudaStream_t s);
+// argmax of n F32 values (lowest index on ties) into *token (and *token2); cells as above
+void argmax_greedy(const float * x, size_t n, unsigned long long * cells, int * token, int * token2, cudaStream_t s);
 
 }  // namespace tqllm_cuda::inkling2

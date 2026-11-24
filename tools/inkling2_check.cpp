@@ -6,13 +6,15 @@
 // Greedy: the first 64 generated tokens (or the reference's length if shorter) must match. Pass: KLD <= 0.01, top-1 >= 98 %,
 // greedy on >= 4 of 5 prompts.
 // --mt REF (GOLDEN_BIN = golden/mt): multi-text full-vocabulary gate; --onestep: per-visit check;
-// --bench 1024,8192 [--decode N] [--profile decode|prefill] (GOLDEN_BIN = golden/mt): prefill / decode tok/s, graph == eager;
+// --bench 1024,8192 [--decode N] [--profile decode|prefill|greedy] (GOLDEN_BIN = golden/mt): prefill / decode tok/s, graph == eager;
 // --spec GOLDEN_BIN CTXLIST [--decode N] (GOLDEN_BIN arg 2 = golden/mt): MTP spec decode vs plain on the greedy prompts
-// and bench-text contexts, spec == plain and tokens per step;
+// and bench-text contexts, spec == plain and tokens per step (--spec-trace: every adaptive step on stderr);
+// --reuse CTXLIST (GOLDEN_BIN = golden/mt): exact conversation reuse vs a fresh prefill (first logits, tokens, TTFT);
 // --exact off: the device fast dense format (INT8 W8A16 on Ampere), gated by KLD / PPL
 // --expert-budget-mb N: device memory for the routed experts (the rest stream from mapped host memory);
 // --handover (golden/mt): prompt -> decode hand-over KLD; --greedy-debug NAME (golden/bin): one prompt's paths per step.
 #include "inkling2_model.hpp"
+#include "inkling2_spec_policy.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_profiler_api.h>
@@ -34,6 +36,7 @@ using namespace tqllm;
 namespace {
 size_t g_budget = SIZE_MAX;  // --expert-budget-mb: device bytes for the routed experts (default: what fits)
 bool g_exact = true;           // --exact off: the device fast dense format (INT8 W8A16 on Ampere)
+bool g_spec_trace = false;    // --spec-trace: every adaptive spec / plain step (drafts, accepted, ms) on stderr
 template <class T> std::vector<T> load(const std::string & p) {
     std::ifstream in(p, std::ios::binary);
     if (!in) throw std::runtime_error("cannot read " + p);
@@ -179,6 +182,67 @@ int run_onestep(const std::string & model, const std::string & dir, bool hf) {
 // Speed: for each context length, prefill that many tokens of the multi-text golden (repeated) in chunks, then greedy
 // decode `ndec` tokens; prefill and decode tok/s. The first length runs twice, the second time without the decode graph:
 // the decoded tokens and every step's logits must be bitwise equal (graph == eager, and plain decode is deterministic).
+// --reuse CTXLIST (GOLDEN_BIN = golden/mt): exact conversation reuse, as the engine does it. Turn 1: prompt A (ctx tokens
+// of the bench text) prefilled in chunks aligned from 0, the state at the start of its final chunk kept (snapshot), a
+// greedy reply (32 tokens, and once 2 chunks + 100 tokens). Turn 2: B = A + reply + 64 new tokens, (1) restored to the
+// snapshot and prefilled from there, (2) fresh from 0 (1.7.0): first-token logits bitwise, 32 greedy tokens, TTFT.
+int run_reuse(const std::string & model, const std::string & dir, const std::string & list, int chunk) {
+    std::vector<int> ctxs;
+    for (std::stringstream ss(list); ss.good();) { std::string x; std::getline(ss, x, ','); if (!x.empty()) ctxs.push_back(std::atoi(x.c_str())); }
+    const Texts tx = read_texts(dir);
+    std::vector<int> text;
+    for (const auto & v : tx.ids) text.insert(text.end(), v.begin(), v.end());
+    const int maxc = *std::max_element(ctxs.begin(), ctxs.end()), longr = 2 * chunk + 100;
+    std::vector<int> fill;
+    while (int(fill.size()) < maxc + longr + 400) fill.insert(fill.end(), text.begin(), text.end());
+    Inkling2Model m(model, maxc + longr + 512, chunk, false, g_budget, g_exact);
+    std::vector<float> lg;
+    const int U = 64, G = 32;
+    int keep = 0;
+    auto prefill = [&](const std::vector<int> & p, size_t from) {  // aligned chunks; snapshot at the final chunk's start
+        for (size_t i = from; i < p.size(); i += size_t(chunk)) {
+            const int n = int(std::min<size_t>(size_t(chunk), p.size() - i));
+            if (i + size_t(chunk) >= p.size() && i > 0) { m.snapshot(); keep = int(i); }
+            m.forward(p.data() + i, n, 1, lg);
+        }
+        return int(std::max_element(lg.begin(), lg.end()) - lg.begin());
+    };
+    auto gen = [&](int first, int n) {
+        std::vector<int> out{first};
+        for (int i = 1; i < n; ++i) out.push_back(m.forward_greedy(out.back()));
+        return out;
+    };
+    bool all = true;
+    for (const int ctx : ctxs)
+        for (const int R : {32, longr}) {
+            if (R == longr && ctx != ctxs.front()) continue;
+            std::vector<int> A(fill.begin(), fill.begin() + ctx);
+            m.reset(); keep = 0;
+            const auto reply = gen(prefill(A, 0), R);
+            std::vector<int> B = A;
+            B.insert(B.end(), reply.begin(), reply.end());
+            B.insert(B.end(), fill.begin() + ctx + R, fill.begin() + ctx + R + U);
+            const int k1 = keep;
+            auto t0 = std::chrono::steady_clock::now();
+            const bool restored = keep > 0 && m.restore();
+            const int c1 = prefill(B, restored ? size_t(k1) : 0);
+            const double ttft1 = secs(t0);
+            const auto lg1 = lg;
+            const auto o1 = gen(c1, G);
+            m.reset();
+            t0 = std::chrono::steady_clock::now();
+            const int c2 = prefill(B, 0);
+            const double ttft2 = secs(t0);
+            const bool lg_eq = lg1.size() == lg.size() && std::memcmp(lg1.data(), lg.data(), lg.size() * 4) == 0;
+            const auto o2 = gen(c2, G);
+            const bool ok = restored && lg_eq && o1 == o2;
+            all = all && ok;
+            std::printf("reuse ctx %6d (+%d reply, +%d new): turn-2 TTFT reuse %.3f s (from %d), fresh (1.7.0) %.3f s; first logits %s, tokens %s\n", ctx, R,
+                        U, ttft1, k1, ttft2, lg_eq ? "bitwise equal" : "DIFFER", o1 == o2 ? "== fresh" : "DIFFER");
+        }
+    return all ? 0 : 1;
+}
+
 int run_bench(const std::string & model, const std::string & dir, const std::string & list, int chunk, int ndec, const std::string & profile) {
     std::vector<int> ctxs;
     for (std::stringstream ss(list); ss.good();) { std::string x; std::getline(ss, x, ','); if (!x.empty()) ctxs.push_back(std::atoi(x.c_str())); }
@@ -205,13 +269,17 @@ int run_bench(const std::string & model, const std::string & dir, const std::str
         got.clear(); hash = 1469598103934665603ull;
         if (prof) cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: the decode steps only
         const auto t1 = std::chrono::steady_clock::now();
+        double tf = 0;  // inside forward() (graph launch, GPU, logits copy); the rest is the host argmax and hash
         for (int i = 0; i < ndec; ++i) {
             const int am = int(std::max_element(lg.begin(), lg.end()) - lg.begin());
             got.push_back(am);
+            const auto t2 = std::chrono::steady_clock::now();
             m.forward(&am, 1, 1, lg);
+            tf += secs(t2);
             for (size_t j = 0; j < lg.size(); j += 97) { uint32_t u; std::memcpy(&u, &lg[j], 4); hash = (hash ^ u) * 1099511628211ull; }
         }
         td = secs(t1);
+        std::printf("bench ctx %6d decode split: %.3f ms / token in forward(), %.3f ms host argmax + hash\n", ctx, tf / ndec * 1e3, (td - tf) / ndec * 1e3);
         std::fprintf(stderr, "bench ids:");  // diagnostic: the generated ids, so a serving run can be compared exactly
         for (const int x : got) std::fprintf(stderr, " %d", x);
         std::fprintf(stderr, "\n");
@@ -232,6 +300,19 @@ int run_bench(const std::string & model, const std::string & dir, const std::str
             std::printf("bench ctx %6d run 2 (eager, route log): decode %.2f tok/s; graph == eager: tokens %s, logits %s\n", ctx, ndec / td2,
                         a == b ? "equal" : "DIFFER", ha == hb ? "equal" : "DIFFER");
             if (a != b || ha != hb) return 1;
+            {   // run 3: greedy decode without logits (forward_greedy): the same tokens
+                m.reset();
+                for (int p = 0; p < ctx; p += chunk) { const int n = std::min(chunk, ctx - p); m.forward(fill.data() + p, n, 1, lg); }
+                std::vector<int> g;
+                int tok = int(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                if (profile == "greedy") cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: run 3's greedy steps
+                const auto t3 = std::chrono::steady_clock::now();
+                for (int i = 0; i < ndec; ++i) { g.push_back(tok); tok = m.forward_greedy(tok); }
+                const double td3 = secs(t3);
+                if (profile == "greedy") cudaProfilerStop();
+                std::printf("bench ctx %6d run 3 (greedy, no logits): decode %.2f tok/s; tokens %s\n", ctx, ndec / td3, g == a ? "equal" : "DIFFER");
+                if (g != a) return 1;
+            }
         }
     }
     return 0;
@@ -349,7 +430,7 @@ GenStats gen_plain(Inkling2Model & m, const std::vector<int> & prompt, int chunk
     GenStats g;
     g.tok.push_back(argmax_row(lg, 0, m.vocab()));
     const auto t0 = std::chrono::steady_clock::now();
-    while (int(g.tok.size()) < N) { int a = g.tok.back(); m.forward(&a, 1, 1, lg); g.tok.push_back(argmax_row(lg, 0, m.vocab())); ++g.steps; }
+    while (int(g.tok.size()) < N) { g.tok.push_back(m.forward_greedy(g.tok.back())); ++g.steps; }  // greedy without logits (bounded head)
     g.secs = secs(t0);
     return g;
 }
@@ -367,20 +448,28 @@ GenStats gen_spec(Inkling2Model & m, const std::vector<int> & prompt, int chunk,
     std::vector<int> d, blk(8);
     if (prof) cudaProfilerStart();
     const auto t0 = std::chrono::steady_clock::now();
-    double ema = 3.0;
+    tqllm::Inkling2SpecPolicy pol(adaptive ? 0 : 7);  // the engine's choice of spec / plain steps (adaptive), or always 7 drafts
     while (int(g.tok.size()) < N) {
         const int anchor = g.tok.back();
-        const int L = adaptive ? std::max(2, std::min(7, int(ema + 0.5) + 1)) : 7;
+        const int L = pol.next(1 << 20);
+        const auto ts = std::chrono::steady_clock::now();
+        if (L == 0) {
+            g.tok.push_back(m.forward_greedy(anchor)); pol.plain_done(secs(ts)); ++g.steps;
+            if (g_spec_trace && adaptive) std::fprintf(stderr, "  step %3d plain %.2f ms\n", g.steps, secs(ts) * 1e3);
+            continue;
+        }
         m.draft(anchor, d, L);
         blk[0] = anchor;
         for (int i = 0; i < L; ++i) blk[size_t(i + 1)] = d[size_t(i)];
-        m.verify(blk.data(), L + 1, lg);
+        int nx[8];
+        m.verify_greedy(blk.data(), L + 1, nx);  // the verify rows' greedy tokens (bounded LM head), no logits
         int a = 0;
-        while (a < L && argmax_row(lg, a, V) == d[size_t(a)]) ++a;
-        ema = 0.7 * ema + 0.3 * (a == L ? a + 1.0 : double(a));
+        while (a < L && nx[a] == d[size_t(a)]) ++a;
         m.commit(a + 1);
+        pol.spec_done(a, L, secs(ts));
+        if (g_spec_trace && adaptive) std::fprintf(stderr, "  step %3d spec L %d accepted %d %.2f ms\n", g.steps + 1, L, a, secs(ts) * 1e3);
         for (int i = 0; i < a; ++i) g.tok.push_back(d[size_t(i)]);
-        g.tok.push_back(argmax_row(lg, a, V));
+        g.tok.push_back(nx[a]);
         ++g.steps;
     }
     g.secs = secs(t0);
@@ -398,15 +487,17 @@ int run_spec(const std::string & model, const std::string & mt, const std::strin
     std::vector<int> fill;
     while (int(fill.size()) < maxc) fill.insert(fill.end(), text.begin(), text.end());
     std::vector<std::pair<std::string, std::vector<int>>> prompts;
+    std::map<std::string, std::vector<int>> refs;  // the reference's greedy tokens
     {
         std::ifstream g(gb + "/greedy.txt");
         std::string line;
         while (std::getline(g, line)) {
             std::istringstream in(line);
-            std::string name; int nin;
+            std::string name; int nin, ngen = 0;
             in >> name >> nin;
             std::vector<int> pin(nin);
             for (auto & x : pin) in >> x;
+            if (in >> ngen) { std::vector<int> r(ngen); for (auto & x : r) in >> x; refs[name] = r; }
             prompts.emplace_back(name, pin);
         }
     }
@@ -426,6 +517,12 @@ int run_spec(const std::string & model, const std::string & mt, const std::strin
                     "spec == plain: %s", name.c_str(), pin.size(), (N - 1) / p.secs, (N - 1) / q.secs, double(N - 1) / q.steps, (N - 1) / r.secs,
                     double(N - 1) / r.steps, same ? "yes\n" : "NO, first difference at ");
         if (!same) std::printf("%d\n", first);
+        uint64_t h = 1469598103934665603ull;
+        for (const int t : p.tok) h = (h ^ uint64_t(uint32_t(t))) * 1099511628211ull;
+        int agree = 0;
+        if (refs.count(name)) { const auto & r = refs[name]; while (agree < int(r.size()) && agree < int(p.tok.size()) && r[size_t(agree)] == p.tok[size_t(agree)]) ++agree; }
+        std::printf("  plain %-12s tokens hash %016llx, first %d of %d equal to the reference's greedy\n", name.c_str(), (unsigned long long)h, agree,
+                    refs.count(name) ? int(std::min(refs[name].size(), p.tok.size())) : 0);
     }
     std::printf("spec: %s\n", all ? "PASS (every spec stream equals plain)" : "FAIL");
     return all ? 0 : 1;
@@ -437,7 +534,7 @@ int main(int argc, char ** argv) {
     const std::string model = argv[1], gold = argv[2];
     int chunk = 64;
     bool do_tf = true, do_greedy = true, first64 = false, hf = false;
-    std::string visits, mt_ref, bench, gdebug, profile, spec_bin, spec_ctx;
+    std::string visits, mt_ref, bench, gdebug, profile, spec_bin, spec_ctx, reuse;
     bool onestep = false, handover = false;
     int ndec = 64;
     for (int i = 3; i < argc; ++i) {
@@ -452,10 +549,12 @@ int main(int argc, char ** argv) {
         else if (a == "--spec" && i + 2 < argc) { spec_bin = argv[++i]; spec_ctx = argv[++i]; }
         else if (a == "--greedy-debug" && i + 1 < argc) gdebug = argv[++i];
         else if (a == "--bench" && i + 1 < argc) bench = argv[++i];
+        else if (a == "--reuse" && i + 1 < argc) reuse = argv[++i];
         else if (a == "--decode" && i + 1 < argc) ndec = std::atoi(argv[++i]);
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
         else if (a == "--expert-budget-mb" && i + 1 < argc) g_budget = size_t(std::atoll(argv[++i])) << 20;
         else if (a == "--exact" && i + 1 < argc) g_exact = std::string(argv[++i]) != "off";
+        else if (a == "--spec-trace") g_spec_trace = true;
         else if (a == "--visits" && i + 1 < argc) visits = argv[++i];
         else if (a == "--first64") { do_greedy = false; first64 = true; }
     }
@@ -467,6 +566,7 @@ int main(int argc, char ** argv) {
         if (!spec_bin.empty()) return run_spec(model, gold, spec_bin, spec_ctx, chunk, ndec, profile == "spec");
         if (!gdebug.empty()) return run_greedy_debug(model, gold, gdebug, chunk, 12);
         if (!bench.empty()) return run_bench(model, gold, bench, chunk, ndec, profile);
+        if (!reuse.empty()) return run_reuse(model, gold, reuse, chunk);
         const auto t0 = std::chrono::steady_clock::now();
         const auto ids = load<int32_t>(gold + "/tf_ids.i32");
         Inkling2Model m(model, int(ids.size()) + 64, chunk, hf, g_budget, g_exact);

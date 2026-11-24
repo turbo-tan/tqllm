@@ -34,6 +34,16 @@ public:
     // row-major [want][vocab()]
     void forward(const int * tokens, int n, int want, std::vector<float> & logits);
     void reset();  // empty caches and states
+    // one decode token at position length(): returns the greedy next token (argmax of the softcapped logits, lowest index
+    // on ties, == forward()'s logits' argmax) without producing the logits; exact mode reads an INT8 copy of the LM head
+    // and rescores in BF16 only the rows that can still win
+    int forward_greedy(int token);
+    // conversation reuse: snapshot() keeps the conv states, the position and the sliding-window rings' last window of
+    // K / V rows (later tokens may overwrite them; the full-attention rows stay in place); restore() goes back to exactly
+    // that state (false only without a snapshot or inside a verify block). Prefilling the same tokens from there in the
+    // same chunks gives the same results bitwise as prefilling from 0.
+    void snapshot();
+    bool restore();
     // per-visit error against the reference's own hidden states (x0, visit outputs, final), one step each; n <= chunk
     void debug_visits(const std::vector<float> & hs, int n);
     // record the routed expert ids (topk per token) of every visit call, in call order; nullptr stops
@@ -51,6 +61,8 @@ public:
     void draft(int anchor, std::vector<int> & tokens, int steps = 7);
     void verify(const int * tokens, int n, std::vector<float> & logits);
     void commit(int keep);
+    // verify() without logits: next[i] = the greedy token after tokens[0 .. i] (exact, as argmax of verify()'s rows)
+    void verify_greedy(const int * tokens, int n, int * next);
     int vocab() const;
 
 private:

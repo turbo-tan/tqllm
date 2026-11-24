@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -137,7 +138,12 @@ struct Inkling2Model::Impl {
     Dev dlen;
     int * h_len = nullptr, * h_tok = nullptr;
     float * h_logits = nullptr;
-    cudaGraphExec_t graphs[K::kSmallN + 1] = {};  // [0]: the decode step; [n]: a verify block of n tokens
+    cudaGraphExec_t graphs[K::kSmallN + 2] = {};  // [0]: the decode step; [n]: a verify block of n tokens; [kSmallN + 1]: greedy decode
+    // greedy decode without logits: exact mode reads an INT8 copy of the LM head + per-row bounds and rescores only the rows
+    // that can still win (K::head_greedy); --exact off argmaxes its own (INT8) head's logits on the device
+    Dev hq8, hsc, hbound, happrox, hcells, dtok;
+    int * h_next = nullptr;
+    bool greedy_step = false;
     // workspace
     Dev ids, x0, hA, hB, P, B1[2], O17[2], a3, msgs, gt[3], r, m, oconv, mconv, tmp;
     Dev arn;  // attn_res_norm split-k scratch (n <= kSmallN), allocated and zeroed before any capture
@@ -548,6 +554,14 @@ struct Inkling2Model::Impl {
     }
 
     void alloc() {
+        if (out.d.p) {  // exact BF16 head: its INT8 copy and the per-row bounds (0.46 GB)
+            hq8 = Dev(size_t(V) * D); hsc = Dev(size_t(V) * 4); hbound = Dev(size_t(V) * 4);
+            K::quantize_rows_i8(out.w(), hq8.as<int8_t>(), hsc.as<float>(), V, D, s);
+            K::head_bound_build(out.w(), hq8.as<int8_t>(), hsc.as<float>(), hbound.as<float>(), V, D, s);
+        }
+        happrox = Dev(size_t(K::kSmallN) * V * 4); hcells = Dev(16); dtok = Dev(size_t(K::kSmallN) * 4);
+        ck(cudaMemsetAsync(hcells.p, 0, 16, s), "cells");
+        ck(cudaHostAlloc(&h_next, size_t(K::kSmallN) * 4, cudaHostAllocDefault), "pinned");
         const int n = chunk, nslots = L + (passes - 1) * (core1 - core0);
         slots.resize(nslots);
         for (int i = 0; i < nslots; ++i) {
@@ -598,6 +612,7 @@ struct Inkling2Model::Impl {
         logits16 = Dev(size_t(want) * V * 2); logits = Dev(size_t(want) * V * 4);
         want_rows = want;
         for (auto & g : graphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }  // they hold the old buffers
+        for (auto & g : vgraphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }
     }
     // Y[n][rows] = X[n][cols] W^T, BF16 in / out, F32 accumulate
     void gemm(const bf16 * W, int rows, int cols, const bf16 * X, void * Y, int n, bool f32 = false) {
@@ -698,14 +713,26 @@ struct Inkling2Model::Impl {
         if (Y.full) { sg[ns++] = seg(Y.kproj, pxk, kdyn.p); sg[ns++] = seg(Y.vproj, pxv, vdyn.p); }
         project(sg, ns, n);
         const int C = G * HD;
-        if (Y.full) {
+        if (small) {  // both convolutions and kv_finish in one launch
+            K::ConvKvA cv{};
+            cv.kv = K::KvFinishA{kt.as<bf16>(), vt.as<bf16>(), S.kc.as<bf16>(), S.vc.as<bf16>(), G, qk_clip, eps, dlen.as<int>(), S.ring};
+            const bf16 * raw[2] = {kraw.as<bf16>(), vraw.as<bf16>()}, * dyn[2] = {kdyn.as<bf16>(), vdyn.as<bf16>()};
+            const float * w[2] = {Y.kconv.as<float>(), Y.vconv.as<float>()};
+            bf16 * y[2] = {kt.as<bf16>(), vt.as<bf16>()};
+            for (int i = 0; i < 2; ++i) {
+                cv.dyn[i] = Y.full;
+                cv.s[i] = K::ConvStaticA{raw[i], w[i], S.conv[i].as<float>(), nullptr, y[i], n, C, nullptr, 0, hist(S, i)};
+                cv.d[i] = K::ConvDynamicA{raw[i], w[i], dyn[i], S.conv[i].as<float>(), y[i], n, C, hist(S, i)};
+            }
+            K::conv_kv_finish(cv, n, s);
+        } else if (Y.full) {
             K::conv_dynamic(kraw.as<bf16>(), Y.kconv.as<float>(), kdyn.as<bf16>(), S.conv[0].as<float>(), kt.as<bf16>(), n, C, s, hist(S, 0));
             K::conv_dynamic(vraw.as<bf16>(), Y.vconv.as<float>(), vdyn.as<bf16>(), S.conv[1].as<float>(), vt.as<bf16>(), n, C, s, hist(S, 1));
         } else {
             K::conv_static(kraw.as<bf16>(), Y.kconv.as<float>(), S.conv[0].as<float>(), nullptr, kt.as<bf16>(), n, C, s, nullptr, false, hist(S, 0));
             K::conv_static(vraw.as<bf16>(), Y.vconv.as<float>(), S.conv[1].as<float>(), nullptr, vt.as<bf16>(), n, C, s, nullptr, false, hist(S, 1));
         }
-        tqllm_cuda::inkling2_kv_finish(kt.as<bf16>(), vt.as<bf16>(), S.kc.as<bf16>(), S.vc.as<bf16>(), n, G, qk_clip, eps, dlen.as<int>(), S.ring, s);
+        if (!small) tqllm_cuda::inkling2_kv_finish(kt.as<bf16>(), vt.as<bf16>(), S.kc.as<bf16>(), S.vc.as<bf16>(), n, G, qk_clip, eps, dlen.as<int>(), S.ring, s);
         tqllm_cuda::Inkling2AttnArgs at;
         at.q = q.as<bf16>(); at.rs = rs.as<bf16>(); at.sink = sink.as<bf16>(); at.gate = gate.as<bf16>();
         at.q_scale = Y.q_scale.as<bf16>(); at.rel_scale = Y.rel_scale.as<bf16>(); at.rel_proj = Y.rel_proj.as<bf16>();
@@ -750,8 +777,7 @@ struct Inkling2Model::Impl {
         }
         sg[0] = seg(Y.router, xb.as<bf16>(), rlog.p, true);
         project(sg, 1, n);
-        K::route_topk(rlog.as<float>(), Y.rbias.as<float>(), eids.as<int>(), ewts.as<float>(), n, E, topk, rscale, s);
-        K::count_routes(eids.as<int>(), n * topk, ucount.as<int>() + size_t(l) * E, s);
+        K::route_topk(rlog.as<float>(), Y.rbias.as<float>(), eids.as<int>(), ewts.as<float>(), n, E, topk, rscale, s, ucount.as<int>() + size_t(l) * E);
         if (route_log) {
             route_log->emplace_back(size_t(n) * topk);
             ck(cudaMemcpyAsync(route_log->back().data(), eids.p, size_t(n) * topk * 4, cudaMemcpyDeviceToHost, s), "route log");
@@ -922,8 +948,26 @@ struct Inkling2Model::Impl {
             for (int c = 0; c < 4; ++c) { S.hist[c] = Dev(size_t(K::kSmallN) * C[c] * 2); S.snap[c] = Dev(size_t(C[c]) * 12); }
         }
         for (auto & g : graphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }  // the steps now capture the taps
+        for (auto & g : vgraphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }
         mtp_on = true;
         if (len) throw std::runtime_error("inkling2 mtp: enable before the first forward");
+        prepare_greedy_graphs();
+    }
+    // capture (not run) the greedy decode graph and the greedy verify graphs of every block size now: their first use
+    // would otherwise pay the capture inside a timed step (the spec policy compares step times)
+    void prepare_greedy_graphs() {
+        if (route_log || dump || hf_attention) return;
+        grow_logits(K::kSmallN);
+        *h_len = len;
+        greedy_step = true;
+        try {
+            for (int n = 1; n <= K::kSmallN; ++n) {
+                verifying = n > 1; verify_n = 0;
+                cudaGraphExec_t & g = n == 1 ? graphs[K::kSmallN + 1] : vgraphs[n];
+                if (!g) g = instantiate_graph(capture_graph(s, [&] { step(h_tok, n, n, nullptr); }));
+            }
+        } catch (...) { verifying = false; greedy_step = false; throw; }
+        verifying = false; greedy_step = false;
     }
     static constexpr int kMtpSplits = 16;
     // draft context K / V of the m committed tokens at positions pos0.. (their taps are in `taps`), and f_rnn of the last
@@ -973,8 +1017,10 @@ struct Inkling2Model::Impl {
             K::mtp_add(d_h.as<float>(), d_mo.as<bf16>(), size_t(nb) * D, s);
         }
         K::rms_norm(d_h.as<float>(), m_norm.as<float>(), nullptr, d_hid.as<bf16>(), nb, D, mtp_eps, s);
-        {   // base logits of the 7 masked positions through the target LM head
+        {   // base logits of the 7 masked positions through the target LM head (its INT8 copy when there is one: the drafts
+            // only propose tokens, every one is verified with the BF16 head)
             K::GemvSeg sg = seg(out, d_hid.as<bf16>() + D, d_base.p, true);
+            if (hq8.p) sg = K::GemvSeg{reinterpret_cast<const bf16 *>(hq8.p), d_hid.as<bf16>() + D, d_base.p, V, D, D, V, 1, hsc.as<float>()};
             K::gemv(&sg, 1, steps, s);
         }
         ck(cudaMemsetAsync(d_state.p, 0, size_t(mrank) * 4, s), "state");
@@ -1030,6 +1076,56 @@ struct Inkling2Model::Impl {
         ck(cudaStreamSynchronize(s), "forward");
         if (mtp_on && !verifying) mtp_context(len, n);  // every committed token becomes draft context
         len += n;
+    }
+    // verify block of n tokens (as verify()), greedy tokens of its n rows into next[n], no logits
+    cudaGraphExec_t vgraphs[K::kSmallN + 1] = {};
+    void verify_greedy(const int * tokens, int n, int * next) {
+        if (!mtp_on) throw std::runtime_error("inkling2: verify needs enable_mtp()");
+        if (n < 1 || n > K::kSmallN) throw std::runtime_error("inkling2: a verify block is n <= 8 tokens");
+        if (len + n > context) throw std::runtime_error("inkling2: context full");
+        grow_logits(n);
+        verifying = true; verify_n = n; greedy_step = true;
+        *h_len = len;
+        std::memcpy(h_tok, tokens, size_t(n) * 4);
+        try {
+            if (!route_log && !dump && !hf_attention) {
+                cudaGraphExec_t & g = vgraphs[n];
+                if (!g) g = instantiate_graph(capture_graph(s, [&] { step(h_tok, n, n, nullptr); }));
+                ck(cudaGraphLaunch(g, s), "graph launch");
+            } else {
+                step(h_tok, n, n, nullptr);
+            }
+        } catch (...) { verifying = false; greedy_step = false; throw; }
+        verifying = false; greedy_step = false;
+        ck(cudaStreamSynchronize(s), "verify_greedy");
+        std::memcpy(next, h_next, size_t(n) * 4);
+        len += n;
+    }
+    // one decode token at length(): the greedy next token (argmax of the softcapped logits, lowest index on ties), no logits
+    int forward_greedy(int token) {
+        constexpr int kReplanEvery = 32;
+        if (resident_share < Ls[0].eg.E && ++decode_steps >= kReplanEvery) { decode_steps = 0; replan_experts(); }
+        if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
+        if (len + 1 > context) throw std::runtime_error("inkling2: context full");
+        if (verifying) throw std::runtime_error("inkling2: forward_greedy inside a verify block");
+        grow_logits(1);
+        *h_len = len; *h_tok = token;
+        greedy_step = true;
+        try {
+            if (!route_log && !dump && !hf_attention) {
+                cudaGraphExec_t & g = graphs[K::kSmallN + 1];
+                if (!g) g = instantiate_graph(capture_graph(s, [&] { step(h_tok, 1, 1, nullptr); }));
+                ck(cudaGraphLaunch(g, s), "graph launch");
+            } else {
+                step(h_tok, 1, 1, nullptr);
+            }
+        } catch (...) { greedy_step = false; throw; }
+        greedy_step = false;
+        ck(cudaStreamSynchronize(s), "forward_greedy");
+        const int next = *h_next;
+        if (mtp_on) mtp_context(len, 1);
+        len += 1;
+        return next;
     }
     // spec decode: forward() of a verify block (states before it kept), then commit(keep) keeps its first keep tokens
     bool verifying = false;
@@ -1117,6 +1213,21 @@ struct Inkling2Model::Impl {
         dump_rows(tmp.as<float>(), n);
         if (dump) { std::fclose(dump); dump = nullptr; }
         const bf16 * last = fin.as<bf16>() + size_t(n - want) * D;
+        if (greedy_step) {  // the greedy token of each of the `want` rows, no logits
+            if (hq8.p) {
+                const K::HeadBound hb{out.w(), hq8.as<int8_t>(), hsc.as<float>(), hbound.as<float>(), V, D, V};
+                K::head_greedy(hb, last, want, fcap, happrox.as<float>(), hcells.as<unsigned long long>(), dtok.as<int>(), nullptr, s);
+            } else {
+                K::GemvSeg sg = seg(out, last, logits16.p);
+                project(&sg, 1, want);
+                K::to_f32(logits16.as<bf16>(), logits.as<float>(), size_t(want) * V, s);
+                K::softcap(logits.as<float>(), size_t(want) * V, fcap, s);
+                for (int i = 0; i < want; ++i)
+                    K::argmax_greedy(logits.as<float>() + size_t(i) * V, size_t(V), hcells.as<unsigned long long>(), dtok.as<int>() + i, nullptr, s);
+            }
+            ck(cudaMemcpyAsync(h_next, dtok.p, size_t(want) * 4, cudaMemcpyDeviceToHost, s), "token");
+            return;
+        }
         K::GemvSeg sg = seg(out, last, logits16.p);
         project(&sg, 1, want);
         K::to_f32(logits16.as<bf16>(), logits.as<float>(), size_t(want) * V, s);
@@ -1176,6 +1287,66 @@ struct Inkling2Model::Impl {
         reset();
     }
 
+    // conversation reuse: the conv states, the position and the window of K / V rows before it in every sliding-window
+    // ring (the rows later tokens may overwrite; full-attention rows sit at their position and are only appended to).
+    // restore() puts all of it back, however many tokens came since. The buffers are allocated on the first snapshot.
+    std::vector<Dev> keep_conv, keep_kv;
+    int keep_len = -1;
+    // the window's rows [p0, len) of a ring cache as at most two contiguous slot ranges: (first slot, rows) pairs
+    void ring_ranges(int ring, int p0, int n, int (&r)[2][2]) const {
+        const int s0 = p0 % ring, a = std::min(n, ring - s0);
+        r[0][0] = s0; r[0][1] = a; r[1][0] = 0; r[1][1] = n - a;
+    }
+    void copy_window(bool save) {
+        const size_t rb = size_t(G) * HD * 2;  // bytes per cache row
+        const int p0 = std::max(0, keep_len - window), n = keep_len - p0;
+        size_t k = 0;
+        auto one = [&](Dev & kc, Dev & vc, int ring) {
+            if (!ring) return;
+            if (save && keep_kv.size() < k + 2) { keep_kv.emplace_back(size_t(window) * rb); keep_kv.emplace_back(size_t(window) * rb); }
+            int r[2][2];
+            ring_ranges(ring, p0, n, r);
+            size_t off = 0;
+            for (int j = 0; j < 2; ++j) {
+                if (!r[j][1]) continue;
+                const size_t bytes = size_t(r[j][1]) * rb, at = size_t(r[j][0]) * rb;
+                char * kk = keep_kv[k].as<char>() + off, * kv = keep_kv[k + 1].as<char>() + off;
+                if (save) {
+                    ck(cudaMemcpyAsync(kk, kc.as<char>() + at, bytes, cudaMemcpyDeviceToDevice, s), "keep kv");
+                    ck(cudaMemcpyAsync(kv, vc.as<char>() + at, bytes, cudaMemcpyDeviceToDevice, s), "keep kv");
+                } else {
+                    ck(cudaMemcpyAsync(kc.as<char>() + at, kk, bytes, cudaMemcpyDeviceToDevice, s), "restore kv");
+                    ck(cudaMemcpyAsync(vc.as<char>() + at, kv, bytes, cudaMemcpyDeviceToDevice, s), "restore kv");
+                }
+                off += bytes;
+            }
+            k += 2;
+        };
+        for (auto & S : slots) one(S.kc, S.vc, S.ring);
+        for (auto & Y : ml) one(Y.kc, Y.vc, Y.ring);
+    }
+    void snapshot() {
+        if (verify_n) throw std::runtime_error("inkling2: snapshot inside a verify block");
+        const int C[4] = {G * HD, G * HD, D, D};
+        if (keep_conv.empty())
+            for (size_t i = 0; i < slots.size(); ++i) for (int c = 0; c < 4; ++c) keep_conv.emplace_back(size_t(C[c]) * 12);
+        size_t k = 0;
+        for (auto & S : slots) for (int c = 0; c < 4; ++c, ++k) ck(cudaMemcpyAsync(keep_conv[k].p, S.conv[c].p, size_t(C[c]) * 12, cudaMemcpyDeviceToDevice, s), "keep");
+        keep_len = len;
+        copy_window(true);
+        ck(cudaStreamSynchronize(s), "keep");
+    }
+    bool restore() {
+        if (keep_len < 0 || len < keep_len || verify_n) return false;
+        const int C[4] = {G * HD, G * HD, D, D};
+        size_t k = 0;
+        for (auto & S : slots) for (int c = 0; c < 4; ++c, ++k) ck(cudaMemcpyAsync(S.conv[c].p, keep_conv[k].p, size_t(C[c]) * 12, cudaMemcpyDeviceToDevice, s), "restore");
+        copy_window(false);
+        ck(cudaStreamSynchronize(s), "restore");
+        len = keep_len;
+        return true;
+    }
+
     void reset() {
         const int C[4] = {G * HD, G * HD, D, D};
         for (auto & sl : slots)
@@ -1216,11 +1387,13 @@ Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, b
 }
 Inkling2Model::~Inkling2Model() {
     for (auto & g : p_->graphs) if (g) cudaGraphExecDestroy(g);
+    for (auto & g : p_->vgraphs) if (g) cudaGraphExecDestroy(g);
     if (p_->h_len) cudaFreeHost(p_->h_len);
     if (p_->h_tok) cudaFreeHost(p_->h_tok);
     if (p_->h_logits) cudaFreeHost(p_->h_logits);
     if (p_->h_gc) cudaFreeHost(p_->h_gc);
     if (p_->h_gf) cudaFreeHost(p_->h_gf);
+    if (p_->h_next) cudaFreeHost(p_->h_next);
     if (p_->blas) cublasDestroy(p_->blas);
     if (p_->s) cudaStreamDestroy(p_->s);
 }
@@ -1236,5 +1409,9 @@ void Inkling2Model::verify(const int * tokens, int n, std::vector<float> & logit
 void Inkling2Model::commit(int keep) { p_->commit(keep); }
 int Inkling2Model::resident_experts() const { return p_->resident_share; }
 int Inkling2Model::vocab() const { return p_->V; }
+int Inkling2Model::forward_greedy(int token) { return p_->forward_greedy(token); }
+void Inkling2Model::snapshot() { p_->snapshot(); }
+void Inkling2Model::verify_greedy(const int * tokens, int n, int * next) { p_->verify_greedy(tokens, n, next); }
+bool Inkling2Model::restore() { return p_->restore(); }
 
 }  // namespace tqllm
