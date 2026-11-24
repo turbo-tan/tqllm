@@ -3,6 +3,16 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Performance
+- Flash-Next long context: the host-row gather (decode reads of K/V moved to host memory) keeps one set of compact
+  rows, positions and cell maps for all trunk attention layers instead of one per layer, and marks the selected cells
+  in O(selected) instead of a memset, scan and one-warp-per-cell pass over the whole context per layer per step.
+  RTX 3090, gather bench (6-row verify block, 16K-row cache): 34.3 / 41.3 / 47.7 -> 29.7 / 34.3 / 35.8 us at 32K /
+  64K / 120K cells; ISTA IQ3_XXS after a 120K-token prompt: peak VRAM 23980 -> 23209 MB, decode 92.0 -> 92.3 tok/s;
+  same output bits.
+
 ## 1.7.0 (2026-11-23)
 
 ### Added
