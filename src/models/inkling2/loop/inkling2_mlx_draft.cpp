@@ -2,6 +2,8 @@
 #include "mlx_kv.hpp"
 #include "safetensors.hpp"
 #include "gguf.hpp"
+#include "hf_folder.hpp"
+#include "dflash_mlx.hpp"
 #include <cstring>
 #include <functional>
 #include <array>
@@ -297,8 +299,223 @@ std::vector<mx::array> Inkling2MlxDraft::state() const {
     if (p_->f_rnn) out.push_back(*p_->f_rnn);
     return out;
 }
+namespace {
+struct DSparkKept { std::vector<MlxKvCache> caches; std::optional<mx::array> f_rnn; };
+struct DFlash2Kept { std::vector<MlxKvCache> caches; };
+}  // namespace
+std::any Inkling2MlxDraft::keep() const {
+    DSparkKept k;
+    for (const auto& Y : p_->layers) k.caches.push_back(Y.cache);
+    k.f_rnn = p_->f_rnn;
+    return k;
+}
+void Inkling2MlxDraft::restore(const std::any& kept) {
+    const auto& k = std::any_cast<const DSparkKept&>(kept);
+    for (size_t i = 0; i < p_->layers.size(); ++i) p_->layers[i].cache = k.caches.at(i);
+    p_->f_rnn = k.f_rnn;
+}
 void Inkling2MlxDraft::reset() {
     for (auto& Y : p_->layers) Y.cache.reset();
     p_->f_rnn.reset();
+}
+
+// ---- DFlash2 (incoai/Inkling-2-Mini-DFlash2) ----
+// Reference: sglang 0.5.21 srt/models/dflash.py (DFlash2DraftModel, DFlashGroupedConv, CandidateSelector) with the
+// drafter's Inkling patch (sglang_inkling_dflash2.py: capture ids 5 / 23 / 41 / 48, selector softcap after the edge
+// correction, candidates over the real vocabulary).
+namespace {
+// A projection: 8-bit affine (served) or BF16 as stored (tests)
+struct Proj {
+    std::optional<Q8> q;
+    std::optional<mx::array> w;
+    mx::array apply(const mx::array& x) const { return q ? linear(x, *q) : bf16(linear(x, *w)); }
+    // rows [a, b) of the output (a sub-projection of a stacked one)
+    Proj rows(int a, int b) const {
+        if (!q) { auto r = mx::contiguous(mx::slice(*w, {a, 0}, {b, w->shape(1)})); mx::eval(r); return Proj{std::nullopt, r}; }
+        auto cut = [&](const mx::array& t) { return mx::contiguous(mx::slice(t, {a, 0}, {b, t.shape(1)})); };  // Q8 evaluates
+        return Proj{Q8(cut(q->w), cut(q->scales), cut(q->biases), q->group), std::nullopt};
+    }
+};
+}  // namespace
+
+struct Inkling2MlxDFlash2::Impl {
+    struct Layer {
+        mx::array in_norm, post_norm, q_norm, k_norm, attn_base, mlp_base;
+        Proj qkv, kv, o, attn_kernel, mlp_kernel, gate_up, down;
+        MlxKvCache cache;
+    };
+    std::vector<Layer> layers;
+    std::optional<mx::array> fc_norm, norm, predecessor, successor, mask_row;
+    std::optional<Proj> fc, selector;
+    Inkling2MlxDraft::Head head;
+    int D = 0, V = 0, H = 0, G = 0, HD = 0, I = 0, group = 0, rank = 0;
+    float eps = 1e-6f, theta = 1e4f;
+    std::optional<Trace> trace;
+
+    Impl(const std::string& folder, int context, int vocab, Inkling2MlxDraft::Head run_head, const Embed& embed, bool bf16_proj)
+        : head(std::move(run_head)), V(vocab) {
+        HfFolder f(folder);
+        if (f.architecture() != "DFlash2DraftModel") throw std::runtime_error("inkling2 MLX DFlash2: not a DFlash2DraftModel folder: " + folder);
+        const auto* dc = f.section("dflash_config");
+        if (!dc) throw std::runtime_error("inkling2 MLX DFlash2: no dflash_config");
+        auto dn = [&](const char* key) { const auto* v = dc->get(key); if (!v) throw std::runtime_error(std::string("dflash_config.") + key); return v->num; };
+        std::vector<int> taps;
+        if (const auto* t = dc->get("target_layer_ids")) for (const auto& v : t->arr) taps.push_back(int(v.num));
+        const auto* softcap_mode = dc->get("selector_softcap_mode");
+        D = int(f.num("hidden_size")); H = int(f.num("num_attention_heads")); G = int(f.num("num_key_value_heads"));
+        HD = int(f.num("head_dim")); I = int(f.num("intermediate_size")); eps = float(f.num("rms_norm_eps"));
+        group = int(dn("conv_group_size")); rank = int(dn("selector_rank"));
+        if (const auto* rp = f.section("rope_parameters")) if (const auto* th = rp->get("rope_theta")) theta = float(th->num);
+        const int L = int(f.num("num_hidden_layers")), window = int(f.num("sliding_window"));
+        // the taps are the DSpark ones (Inkling2Mlx::build): entering applications 5, 23, 41 and the final norm (48); the
+        // selector's softcap after its edge correction is monotone, so the greedy walk ignores it (dflash_select)
+        if (taps != std::vector<int>{5, 23, 41, 48} || dn("block_size") != kBlock || dn("conv_kernel_size") != 2 ||
+            dn("selector_top_k") != 16 || rank != 256 || group != 16 || HD != 128 || D % group ||
+            !softcap_mode || softcap_mode->str != "after_correction" || window <= 0 || L <= 0)
+            throw std::runtime_error("inkling2 MLX DFlash2: unsupported drafter configuration");
+        auto get = [&](const std::string& name) {
+            const auto& t = f.at(name);
+            if (t.dtype != "BF16") throw std::runtime_error("inkling2 MLX DFlash2: " + name + " is not BF16");
+            mx::Shape shape;
+            for (auto d : t.shape) shape.push_back(int(d));
+            const auto bytes = safetensors_read(t);
+            mx::array raw(reinterpret_cast<const uint8_t*>(bytes.data()), {int(bytes.size())}, mx::uint8);
+            auto value = mx::reshape(mx::view(raw, mx::bfloat16), shape);
+            mx::eval(value);
+            return value;
+        };
+        // every array kept is evaluated here: a lazy one would carry this thread's stream into the server's decode
+        // thread ("There is no Stream(gpu, 0) in current thread")
+        auto vec = [&](const std::string& name, mx::Shape shape = {}) {
+            auto v = f32(get(name));
+            if (!shape.empty()) v = mx::reshape(v, shape);
+            v = mx::contiguous(v);
+            mx::eval(v);
+            return v;
+        };
+        auto proj = [&](const std::vector<std::string>& names) {
+            std::vector<mx::array> parts;
+            for (const auto& n : names) parts.push_back(get(n));
+            auto w = parts.size() == 1 ? parts[0] : mx::concatenate(parts, 0);
+            if (bf16_proj) { w = mx::contiguous(w); mx::eval(w); return Proj{std::nullopt, w}; }
+            return Proj{Q8::quantize(w), std::nullopt};
+        };
+        const int qn = H * HD, kn = G * HD;
+        for (int l = 0; l < L; ++l) {
+            const std::string p = "layers." + std::to_string(l) + ".";
+            auto qkv = proj({p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"});
+            layers.push_back(Layer{vec(p + "input_layernorm.weight"), vec(p + "post_attention_layernorm.weight"),
+                vec(p + "self_attn.q_norm.weight"), vec(p + "self_attn.k_norm.weight"),
+                vec(p + "attention_conv.base_kernel", {4 * D}), vec(p + "mlp_conv.base_kernel", {4 * D}),
+                qkv, qkv.rows(qn, qn + 2 * kn), proj({p + "self_attn.o_proj.weight"}),
+                proj({p + "attention_conv.kernel_projection.weight"}), proj({p + "mlp_conv.kernel_projection.weight"}),
+                proj({p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"}), proj({p + "mlp.down_proj.weight"}),
+                MlxKvCache(context, window)});
+        }
+        fc = proj({"fc.weight"});
+        if (fc->apply(mx::zeros({1, 4 * D}, mx::bfloat16)).shape(1) != D) throw std::runtime_error("inkling2 MLX DFlash2: fc shape");
+        fc_norm = vec("hidden_norm.weight"); norm = vec("norm.weight");
+        selector = Proj{std::nullopt, get("candidate_selector.hidden_projection.weight")};
+        predecessor = get("candidate_selector.predecessor_codebook"); successor = get("candidate_selector.successor_codebook");
+        if (predecessor->shape(1) != rank || predecessor->shape(0) < V || successor->shape() != predecessor->shape())
+            throw std::runtime_error("inkling2 MLX DFlash2: selector codebook shape");
+        const uint32_t mask = uint32_t(dn("mask_token_id"));
+        mask_row = f32(embed(mx::array(&mask, {1}, mx::uint32)));
+        mx::eval(*mask_row);
+        if (mask_row->shape() != mx::Shape{1, D}) throw std::runtime_error("inkling2 MLX DFlash2: target width");
+    }
+    mx::array rms(const mx::array& x, const mx::array& w) const { return mx::fast::rms_norm(f32(x), w, eps); }
+    // [n, count * HD] -> [1, count, n, HD]: per-head RMSNorm, then NeoX RoPE at positions pos ..
+    mx::array heads(const mx::array& x, int count, const mx::array& w, int pos) const {
+        const int n = x.shape(0);
+        auto y = bf16(mx::fast::rms_norm(f32(mx::reshape(x, {n, count, HD})), w, eps));
+        y = mx::expand_dims(mx::transpose(y, {1, 0, 2}), 0);
+        return mx::fast::rope(y, HD, false, theta, 1.f, pos);
+    }
+    mx::array values(const mx::array& x, int count) const {
+        return mx::expand_dims(mx::transpose(mx::reshape(x, {x.shape(0), count, HD}), {1, 0, 2}), 0);
+    }
+    void commit(const mx::array& taps, int pos0) {
+        const int m = taps.shape(0);
+        if (taps.ndim() != 3 || taps.shape(1) != 4 || taps.shape(2) != D) throw std::invalid_argument("inkling2 MLX DFlash2 taps");
+        // concat(taps 5, 23, 41, 48) -> fc -> hidden_norm: the context rows every layer projects to keys / values
+        auto ctx = bf16(rms(fc->apply(bf16(mx::reshape(taps, {m, 4 * D}))), *fc_norm));
+        const int kn = G * HD;
+        for (auto& Y : layers) {
+            auto kv = Y.kv.apply(ctx);
+            Y.cache.append(heads(cols(kv, 0, kn), G, Y.k_norm, pos0), bf16(values(cols(kv, kn, 2 * kn), G)));
+            Y.cache.retain_window();
+        }
+    }
+    mx::array propose(const mx::array& x0, const mx::array& anchor, int P, int steps) {
+        if (steps < 1 || steps >= kBlock) throw std::invalid_argument("inkling2 MLX DFlash2 steps");
+        const int n = kBlock, qn = H * HD, kn = G * HD;
+        auto x = mx::concatenate({f32(x0), mx::broadcast_to(*mask_row, {n - 1, D})}, 0);
+        for (auto& Y : layers) {
+            // attention sublayer: conv(side 0) of the normed rows in, conv(side 1) of its output + the residual out, both
+            // from one kernel projection of the normed rows
+            auto normed = bf16(rms(x, Y.in_norm));
+            auto kernel = Y.attn_kernel.apply(normed);
+            auto input = dflash_conv(f32(normed), f32(kernel), Y.attn_base, group, 0);
+            auto qkv = Y.qkv.apply(bf16(input));
+            auto q = heads(cols(qkv, 0, qn), H, Y.q_norm, P);
+            auto k = heads(cols(qkv, qn, qn + kn), G, Y.k_norm, P);
+            auto v = bf16(values(cols(qkv, qn + kn, qn + 2 * kn), G));
+            auto [keys, vals] = Y.cache.peek(k, v);  // the context window, then the block's own rows (not causal)
+            auto att = mx::fast::scaled_dot_product_attention(q, keys, vals, 1.f / std::sqrt(float(HD)), "");
+            att = mx::reshape(mx::transpose(mx::squeeze(att, 0), {1, 0, 2}), {n, qn});
+            x = dflash_conv(f32(Y.o.apply(bf16(att))), f32(kernel), Y.attn_base, group, 1, x);
+            // MLP sublayer, the same wrapping
+            normed = bf16(rms(x, Y.post_norm));
+            kernel = Y.mlp_kernel.apply(normed);
+            input = dflash_conv(f32(normed), f32(kernel), Y.mlp_base, group, 0);
+            auto gu = f32(Y.gate_up.apply(bf16(input)));
+            auto g = cols(gu, 0, I), u = cols(gu, I, 2 * I);
+            auto act = bf16(mx::multiply(bf16(mx::multiply(g, mx::sigmoid(g))), u));
+            x = dflash_conv(f32(Y.down.apply(act)), f32(kernel), Y.mlp_base, group, 1, x);
+        }
+        auto hid = bf16(rms(x, *norm));
+        // candidates: the target head over the real tokens (row 0, the anchor's, is not read by the walk)
+        auto logits = mx::contiguous(f32(cols(head(hid), 0, V)));
+        auto [ids, unary] = dflash_top16(logits);
+        auto gate = f32(selector->apply(hid));
+        auto succ = f32(mx::take(*successor, ids, 0));
+        auto anchor_id = mx::reshape(mx::astype(anchor, mx::uint32), {});
+        trace = Trace{f32(hid), ids, unary};
+        return dflash_select(ids, unary, gate, succ, *predecessor, anchor_id, steps);
+    }
+};
+
+Inkling2MlxDFlash2::Inkling2MlxDFlash2(const std::string& folder, int context, int vocab, Head head, Embed embed, bool bf16_projections)
+    : p_(std::make_unique<Impl>(folder, context, vocab, std::move(head), embed, bf16_projections)) {}
+Inkling2MlxDFlash2::~Inkling2MlxDFlash2() = default;
+bool Inkling2MlxDFlash2::is_drafter_folder(const std::string& path) {
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(path) || !fs::exists(fs::path(path) / "config.json") || !fs::exists(fs::path(path) / "model.safetensors"))
+        return false;
+    try { return HfFolder(path).architecture() == "DFlash2DraftModel"; } catch (const std::exception&) { return false; }
+}
+void Inkling2MlxDFlash2::commit(const mx::array& taps, int pos0) { p_->commit(taps, pos0); }
+mx::array Inkling2MlxDFlash2::propose(const mx::array& x0, const mx::array& anchor, int position, int steps) {
+    return p_->propose(x0, anchor, position, steps);
+}
+std::vector<mx::array> Inkling2MlxDFlash2::state() const {
+    std::vector<mx::array> out;
+    for (const auto& Y : p_->layers) Y.cache.collect(out);
+    return out;
+}
+void Inkling2MlxDFlash2::reset() { for (auto& Y : p_->layers) Y.cache.reset(); p_->trace.reset(); }
+std::any Inkling2MlxDFlash2::keep() const {
+    DFlash2Kept k;
+    for (const auto& Y : p_->layers) k.caches.push_back(Y.cache);
+    return k;
+}
+void Inkling2MlxDFlash2::restore(const std::any& kept) {
+    const auto& k = std::any_cast<const DFlash2Kept&>(kept);
+    for (size_t i = 0; i < p_->layers.size(); ++i) p_->layers[i].cache = k.caches.at(i);
+}
+Inkling2MlxDFlash2::Trace Inkling2MlxDFlash2::last_trace() const {
+    if (!p_->trace) throw std::logic_error("inkling2 MLX DFlash2: no propose yet");
+    return *p_->trace;
 }
 }  // namespace tqllm::mlx_backend

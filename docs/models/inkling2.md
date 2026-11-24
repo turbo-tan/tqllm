@@ -83,19 +83,31 @@ tqserve --model <Inkling-2-Mini folder> --jinja --np 1 --context 32768          
 tqserve --model <folder> --jinja --np 1 --context 32768 --mtp                    # + DSpark drafter (mtp.safetensors)
 tqserve --model <folder> --jinja --np 1 --context 32768 --mtp --exact off        # 8-bit attention + LM head
 tqserve --model <folder> --jinja --np 1 --mtp -md dspark-Inkling-2-Mini-Q8_0.gguf  # drafter from Unsloth's GGUF
+tqserve --model <folder> --jinja --np 1 --context 32768 -md <Inkling-2-Mini-DFlash2 folder>  # DFlash2 drafter (incoai, Apache-2.0)
 ```
 
 - `--exact on` (the default) keeps the checkpoint's numerics. `--exact off` stores the attention projections (q, k, v,
   output, output gate) and the LM head in 8 bits (affine, group 64); greedy tokens still come from the BF16 head.
-- `--mtp` drafts with the model's own DSpark head and verifies each draft block in one forward. It is exact against the
-  verify path: the speculative output is the greedy decode of the verify forward (MLX's multi-row products are not
-  bit-identical to its matrix-vector ones, so speculative and plain output can differ at near-ties). The engine
-  chooses the drafts per round from measured acceptance and round time; `--draft-max N` fixes it.
+- `--mtp` drafts with the model's own DSpark head; `-md FOLDER` with incoai's DFlash2 drafter (config.json +
+  model.safetensors of `incoai/Inkling-2-Mini-DFlash2`: a five-layer block drafter fed by the same taps, ~0.9 more
+  tokens a round). Each draft block is verified in one forward, and the speculative output is the plain greedy output
+  bit for bit: a decode step and a verify block (1..8 rows) run the same row-invariant products
+  (`src/models/inkling2/loop/inkling2_rows.hpp`: dense on the 8 x 8 matrix unit, routed experts read once per run of
+  rows, attention over keys in absolute-position blocks), so row j of a block equals the j-th decode step
+  (`inkling2-mlx-check --rowcheck 8`, `--spec 0`: spec == plain 5/5, exit 1 otherwise). The engine chooses the drafts
+  per round from measured acceptance and round time; `--draft-max N` fixes it.
+- Turn reuse: the state after a prompt's prefill is kept; a next request whose prompt starts with that prompt and
+  continues at a message start (a chat follow-up) resumes there and prefills only the new messages, with the tokens a
+  fresh server gives (prefill chunks restart at message starts past 1024; `inkling2-mlx-check --turns N`).
 - Run with `MLX_ENABLE_TF32=0` (the gates below were measured with it).
 - Memory: ~19 GB of weights, +0.35 GB for the bounded greedy head, +0.4 GB with `--mtp`. On 48 GB, 256K of context
-  peaks at 30.7 GB. The verify experts' matrix-unit copy (+~11 GB) is only made when it fits within 70 % of memory.
+  peaks at 30.7 GB. The DFlash2 drafter adds ~0.6 GB (8-bit projections + its selector tables).
 
 ### Speed (Apple M5 Pro, 48 GB, 2026-11-23, commit 5bb112d)
+
+These rows predate the row-invariant products and DFlash2 (1.7.0's MLX products, speculative output not equal to
+plain). Same-session card A/B of the row-invariant build (2026-11-24, commit d73914f6): exact + DFlash2 57.1 tok/s
+(DSpark on 1.7.0's products 52.1), `--exact off` + DFlash2 66.8 (56.3), exact plain 36.4 (40.2).
 
 Same machine and session as MTPLX 2.13.1 (`youssofal/MTPLX` cf39588), chat API, greedy, reasoning effort none.
 

@@ -15,7 +15,7 @@ add_library(tqmlx STATIC src/backends/metal/tq4.cpp src/backends/metal/tq3.cpp s
             src/backends/metal/q4_embedding.cpp src/backends/metal/weights.cpp src/backends/metal/kquant.cpp src/spec/draft_tree.cpp src/spec/suffix_copy.cpp)
 target_include_directories(tqmlx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/metal)
 target_link_libraries(tqmlx PUBLIC mlx tqllm)
-target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp
+target_sources(tqmlx PRIVATE src/backends/metal/qwen35.cpp src/backends/metal/gdn.cpp src/backends/metal/dflash.cpp src/spec/dflash_mlx.cpp
                src/models/inkling2/loop/inkling2_mlx.cpp src/models/inkling2/loop/inkling2_mlx_draft.cpp src/backends/metal/floatx_nax.cpp
                src/backends/metal/engine_inkling2_mlx.cpp
                src/formats/weight/dequant.cpp src/backends/metal/draft_head.cpp src/backends/metal/prefill.cpp
@@ -32,7 +32,8 @@ if(BUILD_TESTING)
   set_tests_properties(mlx_inkling2 PROPERTIES ENVIRONMENT "MLX_ENABLE_TF32=0")
 endif()
 foreach(tool tqmlx-probe:tqmlx_probe tqmlx-dflash:tqmlx_dflash tqmlx-spec:tqmlx_spec tqmlx-ar:tqmlx_ar tqmlx-tree-bench:tqmlx_tree_bench tqmlx-qsa-bench:tqmlx_qsa_bench bench-mlx-sdpa:bench_mlx_sdpa
-             bench-mlx-verify:bench_mlx_verify bench-mlx-prefill-gemm:bench_mlx_prefill_gemm bench-mlx-gdn-step:bench_mlx_gdn_step)
+             bench-mlx-verify:bench_mlx_verify bench-mlx-prefill-gemm:bench_mlx_prefill_gemm bench-mlx-gdn-step:bench_mlx_gdn_step
+             bench-mlx-expert-rows:bench_mlx_expert_rows)
   string(REPLACE ":" ";" parts ${tool})
   list(GET parts 0 target)
   list(GET parts 1 source)
@@ -42,7 +43,7 @@ endforeach()
 target_include_directories(tqmlx-dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 if(BUILD_TESTING)
   # GPU tests run with TF32 off (exact FP32 references)
-  foreach(test dense_rows tq4 tq4_affine8 gdn gdn_fuse prefill_fused gdn_scan8 gdn_fast decode_rows kv_int8_append kv_tcq kv_formats_model tree_verify tree_kernels tree_device attention_exact attention_qsa nax_affine dflash dflash_block dflash_retrieve dflash_selector dspine_bridge dflash_top16 sampling_topk sample_rows draft_ahead_math draft_head_rows kquant tq4_basis attention_rows matrix_unit threadgroup_fit)
+  foreach(test dense_rows tq4 tq4_affine8 gdn gdn_fuse prefill_fused gdn_scan8 gdn_fast decode_rows kv_int8_append kv_tcq kv_formats_model tree_verify tree_kernels tree_device attention_exact attention_qsa nax_affine dflash dflash_block dflash_retrieve dflash_selector dspine_bridge dflash_top16 sampling_topk sample_rows draft_ahead_math draft_head_rows kquant tq4_basis attention_rows matrix_unit threadgroup_fit inkling2_rows)
     string(REPLACE "_" "-" name ${test})
     add_executable(test-mlx-${name} tests/mlx_${test}.cpp)
     target_link_libraries(test-mlx-${name} PRIVATE tqmlx)
@@ -52,7 +53,7 @@ if(BUILD_TESTING)
   set_tests_properties(mlx_tree_device PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})  # the 8K lattice fixture
   target_compile_definitions(test-mlx-kquant PRIVATE KQ_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/kquant_golden.bin")
   # model-file tests (run by hand with a GGUF path)
-  foreach(test prefix mtp draft_head)
+  foreach(test prefix mtp draft_head inkling2_dflash2)
     string(REPLACE "_" "-" name ${test})
     add_executable(test-mlx-${name} tests/mlx_${test}.cpp)
     target_link_libraries(test-mlx-${name} PRIVATE tqmlx)

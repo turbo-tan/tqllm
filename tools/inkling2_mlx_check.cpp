@@ -1,4 +1,5 @@
 #include "inkling2_mlx.hpp"
+#include "inkling2_turns.hpp"
 #include "dequant.hpp"
 #include <mlx/mlx.h>
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 namespace mx=mlx::core;
 using tqllm::mlx_backend::Inkling2Mlx;
+using tqllm::mlx_backend::inkling2_prefill_chunks;
 namespace {
 template<class T> std::vector<T> load(const std::string& path) {
     std::ifstream f(path,std::ios::binary|std::ios::ate);
@@ -52,7 +54,7 @@ std::vector<uint32_t> spec_tokens(Inkling2Mlx& m,uint32_t first,int count,int de
     }
     return out;
 }
-int full_gate(const std::string& model,const std::string& dir,int chunk,bool exact) {
+int full_gate(const std::string& model,const std::string& dir,int chunk,bool exact,int bits) {
     auto packed=load<uint32_t>(dir+"/texts.bin");
     if(packed.empty()) throw std::runtime_error("empty multi-text input");
     std::vector<std::vector<uint32_t>> texts;size_t offset=1,total=0,maxn=0;
@@ -63,7 +65,7 @@ int full_gate(const std::string& model,const std::string& dir,int chunk,bool exa
     }
     if(offset!=packed.size()) throw std::runtime_error("trailing multi-text data");
     auto top=load<uint32_t>(dir+"/top1_bf16.i32");if(top.size()!=total) throw std::runtime_error("multi-text top1 count");
-    Inkling2Mlx m(model,int(maxn)+64,exact);const int V=m.vocabulary();
+    Inkling2Mlx m(model,int(maxn)+64,exact,bits);const int V=m.vocabulary();
     std::ifstream file(dir+"/lp_bf16.f16",std::ios::binary|std::ios::ate);
     if(!file || size_t(file.tellg())!=total*size_t(V)*2) throw std::runtime_error("full-vocabulary reference dimensions");file.seekg(0);
     std::vector<uint16_t> half(V);std::vector<float> ref(V);size_t seen=0,agree=0,nll_n=0;double kl_all=0,nll=0;
@@ -93,14 +95,23 @@ int full_gate(const std::string& model,const std::string& dir,int chunk,bool exa
 int main(int argc,char** argv) {
     try {
         if (argc<3) {std::fprintf(stderr,"usage: inkling2-mlx-check MODEL GOLDEN_BIN [--chunk N] [--decode N] [--bench DEPTH] [--greedy-only]\n");return 2;}
-        std::string drafter;  // --draft FILE: a DSpark drafter GGUF instead of the checkpoint's mtp.safetensors
-        int chunk=64,decode=64,bench=0,spec=-1,runs=3;bool greedy=false,flips=false,onestep=false,mt=false,profile=false,exact=true;
+        std::string drafter;  // --draft PATH: a DSpark drafter GGUF or a DFlash2 drafter folder instead of the checkpoint's mtp.safetensors
+        int chunk=64,decode=64,bench=0,spec=-1,runs=3;bool greedy=false,flips=false,onestep=false,mt=false,profile=false,exact=true,blocks=false;int bits=8,rowcheck=0,turns=0;Inkling2Mlx::DraftPrecision draft_precision;
         for (int i=3;i<argc;++i) {
             std::string a=argv[i];
             if (a=="--greedy-only") greedy=true;
             else if(a=="--flips") flips=true;
             else if(a=="--profile") profile=true;
+            else if(a=="--blocks") blocks=true;  // with --bench: wall time of one forward of 1..8 tokens (the verify block's cost)
             else if(a=="--onestep") onestep=true;
+            // with --bench: a block of N tokens run as a verify block against N single-token forwards from the same
+            // prefill, visit by visit (spec == plain needs row j of the block bitwise equal to the j-th single step)
+            else if(i+1<argc && a=="--rowcheck") rowcheck=std::stoi(argv[++i]);
+            // turn reuse: a conversation of N tokens, then a follow-up (an answer message + a user message): the follow-up
+            // resumed from the kept state must give a cold prefill's bits (first logits, 64 greedy tokens); prints both TTFTs
+            else if(i+1<argc && a=="--turns") turns=std::stoi(argv[++i]);
+            else if(a=="--draft-bf16-proj") draft_precision.bf16_projections=true;   // drafter A/B (see DraftPrecision)
+            else if(a=="--draft-bf16-head") draft_precision.bf16_head=true;
             else if(i+1<argc && a=="--mt") {if(std::string(argv[++i])!="bf16") throw std::runtime_error("only pinned BF16 reference staged");mt=true;}
             else if (i+1<argc && a=="--chunk") chunk=std::stoi(argv[++i]);
             else if (i+1<argc && a=="--decode") decode=std::stoi(argv[++i]);
@@ -109,16 +120,17 @@ int main(int argc,char** argv) {
             else if (i+1<argc && a=="--draft") drafter=argv[++i];
             else if (i+1<argc && a=="--runs") runs=std::stoi(argv[++i]);  // --bench repetitions (default 3)
             else if (i+1<argc && a=="--exact") {const std::string v=argv[++i];if(v!="on" && v!="off") throw std::runtime_error("--exact on|off");exact=v=="on";}
+            else if (i+1<argc && a=="--dense-bits") {bits=std::stoi(argv[++i]);if(bits!=8 && bits!=4) throw std::runtime_error("--dense-bits 8|4");}
             else throw std::runtime_error("unknown option "+a);
         }
         if (chunk<=0 || decode<=0 || bench<0 || runs<=0) throw std::runtime_error("invalid timing configuration");
         mx::set_default_device(mx::Device::gpu);
         mx::set_cache_limit(size_t(512)*1024*1024);
         const std::string model=argv[1],dir=argv[2];
-        if(mt) return full_gate(model,dir,chunk,exact);
+        if(mt) return full_gate(model,dir,chunk,exact,bits);
         auto ids=load<uint32_t>(dir+"/tf_ids.i32");
-        Inkling2Mlx m(model,std::max(bench+decode+16,int(ids.size())+1024),exact);
-        if(spec>=0) m.enable_draft(drafter.empty()?model:drafter);
+        Inkling2Mlx m(model,std::max(bench+decode+16,int(ids.size())+1024),exact,bits);
+        if(spec>=0) m.enable_draft(drafter.empty()?model:drafter,draft_precision);
         std::printf("MODEL_READY positions %zu vocab %d\n",ids.size(),m.vocabulary());std::fflush(stdout);
         if(onestep) {
             if(ids.size()<64) throw std::runtime_error("visit trace needs first64 prompt ids");
@@ -135,6 +147,99 @@ int main(int argc,char** argv) {
         }
         if (bench) {
             std::vector<uint32_t> prompt;while(int(prompt.size())<bench) prompt.insert(prompt.end(),ids.begin(),ids.end());prompt.resize(bench);
+            if(turns>0) {
+                // A: N tokens of golden text after a user role token; B: A + a model message + a user message
+                std::vector<uint32_t> A{200000u};
+                while(int(A.size())<turns) A.insert(A.end(),ids.begin(),ids.end());
+                A.resize(size_t(turns));
+                std::vector<uint32_t> B(A);
+                B.push_back(200001u);B.insert(B.end(),ids.begin(),ids.begin()+std::min<size_t>(200,ids.size()));
+                B.push_back(200000u);B.insert(B.end(),ids.begin()+std::min<size_t>(300,ids.size()/2),ids.begin()+std::min<size_t>(420,ids.size()));
+                auto prefill_chunks=[&](std::span<const uint32_t> prompt,size_t from) {
+                    mx::array lg=mx::array(0.0f);
+                    for(auto [p,end]:inkling2_prefill_chunks(prompt,from,4096)) lg=m.forward(prompt.subspan(p,end-p));
+                    mx::eval(lg);return lg;
+                };
+                auto decode=[&](const mx::array& lg) {
+                    std::vector<uint32_t> out{best(lg)};
+                    while(out.size()<64) {auto l=m.forward(std::span<const uint32_t>(&out.back(),1));out.push_back(best(l));}
+                    return out;
+                };
+                m.reset();auto t0=std::chrono::steady_clock::now();
+                auto cold=prefill_chunks(B,0);const double cold_ms=seconds(t0)*1000;
+                auto cold_tokens=decode(cold);
+                m.reset();prefill_chunks(A,0);auto kept=m.keep();
+                decode(m.forward(std::span<const uint32_t>(&A.back(),1)));   // the answer that turn generated (moves the state on)
+                t0=std::chrono::steady_clock::now();m.restore(kept);
+                auto warm=prefill_chunks(B,A.size());const double warm_ms=seconds(t0)*1000;
+                auto warm_tokens=decode(warm);
+                auto a=mx::contiguous(cold),b=mx::contiguous(warm);mx::eval(a,b);
+                const bool same_logits=a.nbytes()==b.nbytes() && std::memcmp(a.data<void>(),b.data<void>(),a.nbytes())==0;
+                const bool same=same_logits && cold_tokens==warm_tokens;
+                std::printf("TURNS conversation %d follow-up %zu: cold prefill %.1f ms, resumed %.1f ms (%zu new tokens); first logits %s, 64 tokens %s: %s\n",
+                            turns,B.size(),cold_ms,warm_ms,B.size()-A.size(),same_logits?"same":"DIFFER",cold_tokens==warm_tokens?"same":"DIFFER",same?"PASS":"FAIL");
+                return same?0:1;
+            }
+            if(rowcheck>0) {
+                auto run=[&](bool block,bool verify,std::vector<uint32_t>& tokens) {
+                    m.reset();auto lg=prefill(m,prompt,chunk);uint32_t token=best(lg);
+                    std::vector<std::vector<mx::array>> traces;
+                    if(!block) {
+                        tokens.clear();
+                        for(int j=0;j<rowcheck;++j) {
+                            tokens.push_back(token);std::vector<mx::array> t;
+                            lg=m.forward(std::span<const uint32_t>(&token,1),false,&t);token=best(lg);
+                            for(auto& a:t) {a=mx::contiguous(a);mx::eval(a);}
+                            traces.push_back(std::move(t));
+                        }
+                    } else {
+                        std::vector<mx::array> t;
+                        lg=m.forward(std::span<const uint32_t>(tokens),true,&t,nullptr,verify);
+                        for(auto& a:t) {a=mx::contiguous(a);mx::eval(a);}
+                        traces.push_back(std::move(t));
+                    }
+                    return traces;
+                };
+                std::vector<uint32_t> tokens;
+                const auto single=run(false,false,tokens);
+                for(bool verify:{true,false}) {
+                    const auto block=run(true,verify,tokens)[0];
+                    if(block.size()!=single[0].size()) throw std::runtime_error("rowcheck trace length");
+                    for(int j=0;j<rowcheck;++j) {
+                        int first=-1;double worst=0;
+                        for(size_t v=0;v<block.size();++v) {
+                            auto row=mx::contiguous(mx::slice(block[v],{j,0},{j+1,block[v].shape(1)}));mx::eval(row);
+                            const float* a=row.data<float>();const float* b=single[size_t(j)][v].data<float>();
+                            const int D=row.shape(1);double err=0,mag=0;bool same=true;
+                            for(int c=0;c<D;++c) {same=same && a[c]==b[c];err+=double(a[c]-b[c])*(a[c]-b[c]);mag+=double(b[c])*b[c];}
+                            if(!same && first<0) first=int(v);
+                            worst=std::max(worst,std::sqrt(err/(mag+1e-30)));
+                        }
+                        std::printf("ROWCHECK %s row %d first_diff_visit %d of %zu max_rel %.3g\n",verify?"verify":"chunk",j,first,block.size(),worst);
+                    }
+                    std::fflush(stdout);
+                }
+                return 0;
+            }
+            if(blocks) {
+                m.warm_up();   // as the server does at load: no first-use compiles in the timed rows
+                auto lg=prefill(m,prompt,chunk);uint32_t token=best(lg);
+                for(int i=0;i<4;++i) {lg=m.forward(std::span<const uint32_t>(&token,1));token=best(lg);}
+                double one=0;
+                for(int n:{1,2,3,4,6,8}) {
+                    std::vector<uint32_t> block(size_t(n),token);double ms=0;const int reps=8;
+                    for(int r=0;r<reps;++r) {const auto t0=std::chrono::steady_clock::now();lg=m.forward(std::span<const uint32_t>(block),false);mx::eval(lg);ms+=seconds(t0)*1000;}
+                    ms/=reps;if(n==1) one=ms;
+                    std::printf("BLOCK tokens %d forward_ms %.3f vs_one %.2f\n",n,ms,ms/one);std::fflush(stdout);
+                }
+                for(int n:{1,8}) {  // where an n-token forward's time goes (synchronised per phase: instrumented, not throughput)
+                    std::vector<uint32_t> block(size_t(n),token);std::array<double,5> ph{};const int reps=4;
+                    for(int r=0;r<reps;++r) {lg=m.forward(std::span<const uint32_t>(block),false,nullptr,&ph);mx::eval(lg);}
+                    std::printf("BLOCK_PHASES tokens %d input %.3f attention_conv %.3f mlp_input %.3f experts_conv %.3f residual_state %.3f\n",
+                                n,ph[0]/reps,ph[1]/reps,ph[2]/reps,ph[3]/reps,ph[4]/reps);std::fflush(stdout);
+                }
+                return 0;
+            }
             if(profile) {
                 auto lg=prefill(m,prompt,chunk);uint32_t token=best(lg);
                 for(int i=0;i<8;++i) {lg=m.forward(std::span<const uint32_t>(&token,1));token=best(lg);}
@@ -183,7 +288,9 @@ int main(int argc,char** argv) {
             }
             std::printf("SPEC_ALL identical %d/%d tokens/step %.3f decode plain %.2f tok/s spec %.2f tok/s\n",identical,prompts,
                         double(total_tokens)/total_steps,total_tokens/plain_seconds,total_tokens/spec_seconds);
-            return 0;
+            // the release gate: greedy speculative output is the plain greedy output on every prompt
+            std::printf("SPEC_GATE %s\n",identical==prompts?"PASS":"FAIL");
+            return identical==prompts?0:1;
         }
         if (greedy || flips) {
             std::ifstream f(dir+"/greedy.txt");if(!f) throw std::runtime_error("greedy inputs missing");

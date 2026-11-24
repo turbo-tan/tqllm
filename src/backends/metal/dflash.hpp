@@ -1,5 +1,6 @@
 #pragma once
 #include "qwen35.hpp"
+#include "dflash_mlx.hpp"
 #include <memory>
 #include <optional>
 #include <utility>
@@ -9,19 +10,6 @@ struct DSpineBridgeResult { mlx::core::array output,raw,rms,packed; };
 DSpineBridgeResult dspine_bridge(const mlx::core::array& raw,const mlx::core::array& anchor,
     const mlx::core::array& read,const mlx::core::array& write,const mlx::core::array& codebook,
     const mlx::core::array& packed_weights,const mlx::core::array& bias,float epsilon);
-// side 0: input taps of the block, side 1: output taps; with a residual, returns bf(residual + conv)
-mlx::core::array dflash_conv(const mlx::core::array& input,const mlx::core::array& dynamic,
-                            const mlx::core::array& base,int group,int side,
-                            const std::optional<mlx::core::array>& residual=std::nullopt);
-mlx::core::array dflash_select(const mlx::core::array& mapped,const mlx::core::array& unary,
-    const mlx::core::array& gate,const mlx::core::array& successors,
-    const mlx::core::array& predecessors,uint32_t anchor,int count);
-// the same selection from an anchor id already on the GPU (uint32 scalar)
-mlx::core::array dflash_select(const mlx::core::array& mapped,const mlx::core::array& unary,
-    const mlx::core::array& gate,const mlx::core::array& successors,
-    const mlx::core::array& predecessors,const mlx::core::array& anchor,int count);
-// the 16 largest logits per row, largest first (ties: lower column first): {column ids (uint32), values (float32)} [rows, 16]
-std::pair<mlx::core::array,mlx::core::array> dflash_top16(const mlx::core::array& logits);
 class DFlash2 {
 public:
     // block_rows: the largest draft block (16 served; 8 for block-8 pricing tests)
