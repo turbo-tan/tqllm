@@ -178,6 +178,27 @@ static void run(int kb, int rows, int cols, int n, bool per_expert) {
                     require(std::memcmp(&b, &y[size_t(a) * rows + r], 2) == 0, "FNT matvec_f32 differs from expert_matvec");
                 }
     }
+    // the decode split path (fn_layer_forward.cpp, host maps): the hits run first with the misses' ids set to -1, then the
+    // misses with the hits' ids set to -1, into the same output. An id of -1 writes nothing (the u4h kernels' rule), so the
+    // two launches give expert_matvec's rows bit for bit (a -1 that wrote NaN put NaN into every hit row of a one-row
+    // step with both hits and misses).
+    for (int mask = 1; mask < (1 << std::min(A, 4)); ++mask) {
+        std::vector<int> hit(ids), miss(ids);
+        for (int a = 0; a < A; ++a) ((mask >> (a % 4)) & 1 ? miss : hit)[a] = -1;
+        Dev<int> dh(A), dm(A); dh.put(hit); dm.put(miss);
+        Dev<__nv_bfloat16> ys(size_t(A) * rows);
+        const std::vector<__nv_bfloat16> fill(size_t(A) * rows, __float2bfloat16(-123.f));
+        ys.put(fill);
+        fmt->expert_matvec(m, dx.p, ys.p, rows, dh.p, n, topk, per_expert, nullptr);
+        const auto part = ys.get(size_t(A) * rows);
+        for (int a = 0; a < A; ++a)
+            if (hit[a] < 0)
+                for (int r = 0; r < rows; ++r)
+                    require(std::memcmp(&part[size_t(a) * rows + r], &fill[0], 2) == 0, "FNT expert_matvec wrote an assignment with id -1");
+        fmt->expert_matvec(m, dx.p, ys.p, rows, dm.p, n, topk, per_expert, nullptr);
+        require(std::memcmp(ys.get(size_t(A) * rows).data(), y.data(), y.size() * 2) == 0,
+                "FNT hit + miss launches (ids -1 for the other part) differ from one expert_matvec");
+    }
     // invalid id -> NaN
     ids[0] = experts; di.put(ids);
     fmt->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, nullptr);
@@ -194,6 +215,8 @@ int main() {
             run(kb, 70, 2560, 3, false);
             run(kb, 130, 640, 2, true);
         }
+        run(5, 640, 2560, 1, false);  // one row (decode without drafts): the split path's hit / miss launches
+        run(6, 2560, 640, 1, true);
         run(5, 640, 2560, 9, false);
         run(6, 640, 2560, 60, false);  // > 32 tokens per expert: two prefill GEMM chunks
         run(7, 2560, 640, 40, true);

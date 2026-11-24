@@ -186,7 +186,7 @@ __device__ __forceinline__ void stage_cols(__half * xs, const __half * x, const 
         dst[1] = __floats2half2_rn(v[2], v[3]);
     }
 }
-// work item -> (expert, up to 8 (input row, output row) pairs); MODE 0: assignment a = blockIdx.y (ids, topk);
+// work item -> (expert, up to 8 (input row, output row) pairs); MODE 0: assignment a = blockIdx.y (ids, topk; id -1 skipped);
 // 1: dedup map entry; 2: moe_group lists (the expert's tokens 8 at a time)
 template <int KB, int MODE, class T>
 __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
@@ -202,6 +202,9 @@ __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __
     const int KG = kparts(cols), RT = 8 / KG, rt = (threadIdx.x / 32) / KG;
     const int row0 = blockIdx.x * RT * 16;
     if (row0 >= rows) return;
+    // MODE 0, id -1: the assignment belongs to another launch (the decode split path's hit / miss lists, hot / cold banks):
+    // nothing is written, as in the u4h kernels (whole block, before any barrier). An id >= experts still writes NaN.
+    if (MODE == 0 && ids && ids[blockIdx.y] < 0) return;
     const int rows_left = rows - row0;
     for (int it = 0; ; ++it) {
         const int item = int(blockIdx.y) + it * int(gridDim.y);
@@ -209,7 +212,7 @@ __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __
         if (MODE == 0) { if (it > 0) break; expert = ids ? ids[blockIdx.y] : 0; total = 1; }
         else if (MODE == 1) { if (item >= ngroups) break; const int * e = dmap + int64_t(item) * kDedupStride; expert = e[0]; total = e[0] < 0 ? 0 : e[1]; if (e[0] < 0) break; }
         else { if (item >= experts) break; expert = item; total = counts[item]; }
-        const bool bad = MODE == 0 && (expert < 0 || expert >= experts);
+        const bool bad = MODE == 0 && expert >= experts;  // id -1 returned above
         for (int c0 = 0; c0 < total; c0 += kCols) {
             const int nc = min(kCols, total - c0);
             __syncthreads();  // the previous pass finished reading xs / in_rows
