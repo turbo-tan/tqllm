@@ -3,6 +3,15 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Flash-Next no longer pins the prompt residual buffer (context x hc x hidden fp32: 1.3 GB at a 32K context, 2.7 GB
+  at 64K, 5.4 GB at 131K) at start-up, nor allocates it per request on a layer-split rank without the head: nothing
+  reads it since the MTP layer's keys / values are written with each prefill chunk. RTX 3090, 59 GiB host, ISTA
+  IQ3_XXS, 32K context: 1.3 GB more host memory free (lowest MemAvailable during the run 5.1 -> 6.6 GB); replies
+  identical (md5 of 70 short replies and of a 120K-token prompt's decode).
+
 ## 1.7.0 (2026-11-23)
 
 ### Added
