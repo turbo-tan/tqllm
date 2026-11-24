@@ -119,6 +119,22 @@ static void run(int cols, int n, bool per_expert, int rows=19) {
             }
         }
     }
+    { // decode split path (Flash-Next host maps, hot / cold banks): two expert_matvec launches into one output, each with
+      // the other's assignments at id -1. A -1 writes nothing, so together they give the full launch's bits.
+        const auto sentinel = __float2bfloat16(-123.f);
+        for (int parity = 0; parity < 2; ++parity) {
+            std::vector<int> part0(ids), part1(ids);
+            for (size_t a = 0; a < ids.size(); ++a) ((a + parity) % 2 ? part0 : part1)[a] = -1;
+            Device<int> d0(ids.size()), d1(ids.size()); d0.put(part0); d1.put(part1);
+            Device<__nv_bfloat16> merged(y.size()); merged.put(std::vector<__nv_bfloat16>(y.size(), sentinel));
+            format->expert_matvec(m, dx.p, merged.p, rows, d0.p, n, topk, per_expert, nullptr);
+            const auto half = merged.get(y.size());
+            for (size_t a = 0; a < ids.size(); ++a) if (part0[a] < 0) for (int r = 0; r < rows; ++r)
+                require(std::memcmp(&half[a * rows + r], &sentinel, sizeof(sentinel)) == 0, "Q2 expert_matvec wrote an assignment with id -1");
+            format->expert_matvec(m, dx.p, merged.p, rows, d1.p, n, topk, per_expert, nullptr);
+            require(std::memcmp(merged.get(y.size()).data(), y.data(), y.size() * sizeof(y[0])) == 0, "Q2 split launches (ids -1) differ from one launch");
+        }
+    }
     Device<float> logits(size_t(m.rows) * n);
     format->matvec_f32(m, dx.p, logits.p, n, nullptr);
     auto f = logits.get(size_t(m.rows) * n);

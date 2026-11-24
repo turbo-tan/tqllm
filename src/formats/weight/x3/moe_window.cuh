@@ -18,6 +18,7 @@ static __global__ void xw_moe_build(const int* __restrict__ ids, int count, int 
     }
     const int items = (rows / XwGeom::COLS) * kparts;
     for (int i = 0; i < count; ++i) {
+        if (ids[i] < 0) continue;   // id -1: another launch's assignment (hot / cold, hit / miss lists): nothing written
         const XwExpert& e = bank[ids[i]];
         XwMoeList& L = lists[e.codec];
         XwPart& p = L.p[L.count++];
@@ -69,7 +70,7 @@ __device__ __forceinline__ void xw_dedup_plan(const int* __restrict__ ids, int n
     __syncthreads();
     if (t < slots) {
         const int e = pl.ids[t];
-        int f = 1;
+        int f = e >= 0;   // id -1 (another launch's assignment): no part, no aindex entry, nothing written
         for (int s = 0; s < t; ++s) f &= (pl.ids[s] != e);
         pl.first[t] = f;
     }
@@ -80,8 +81,8 @@ __device__ __forceinline__ void xw_dedup_plan(const int* __restrict__ ids, int n
         for (int s = 0; s < t; ++s)
             if (pl.first[s]) { if (pl.ids[s] == e) seen = rank; ++rank; }
         pl.u[t] = pl.first[t] ? rank : seen;
-        pl.codec0[t] = bank0[e].codec;
-        pl.codec1[t] = pair ? bank1[e].codec : pl.codec0[t];
+        pl.codec0[t] = e < 0 ? -1 : bank0[e].codec;
+        pl.codec1[t] = e < 0 ? -1 : pair ? bank1[e].codec : pl.codec0[t];
     }
     __syncthreads();
     if (t < slots) {
@@ -101,7 +102,7 @@ __device__ __forceinline__ void xw_dedup_plan(const int* __restrict__ ids, int n
         int g = 0;
         for (int s = 0; s < slots; ++s) g += pl.first[s];
         pl.groups = g;
-        for (int a = 0; a < slots; ++a) pl.aindex[pl.u[a] * n + a / topk] = a;
+        for (int a = 0; a < slots; ++a) if (pl.ids[a] >= 0) pl.aindex[pl.u[a] * n + a / topk] = a;
     }
     __syncthreads();
 }
@@ -147,6 +148,7 @@ static __global__ void xw_moe_build2(const int* __restrict__ ids, int count, int
     }
     const int items = (rows / XwGeom::COLS) * kparts;
     for (int i = 0; i < count; ++i) {
+        if (ids[i] < 0) continue;   // id -1: nothing written
         for (int m = 0; m < 2; ++m) {
             const XwExpert& e = (m ? bankB : bankA)[ids[i]];
             XwMoeList& L = lists[e.codec];

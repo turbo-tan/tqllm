@@ -100,6 +100,25 @@ int main() {
             const auto y = out.get(size_t(n) * kv * rows), yr = ref.get(size_t(n) * kv * rows);
             require(std::memcmp(y.data(), yr.data(), y.size() * 2) == 0,
                     "expert_matvec at the 35B-A3B shape == the dense matvec of each row-sliced expert");
+            // split launches (hot / cold banks, the Flash-Next decode split path): each one's ids carry -1 for the
+            // other's assignments; a -1 writes nothing and reads no weights, so the two together give the full launch
+            std::vector<int> hot(ids), cold(ids);
+            for (int a = 0; a < n * kv; ++a) (a % 3 ? cold : hot)[size_t(a)] = -1;
+            Device<int> dh(ids.size()), dc(ids.size()); dh.put(hot); dc.put(cold);
+            Device<__nv_bfloat16> merged(y.size());
+            const auto sentinel = __float2bfloat16(-123.f);
+            merged.put(std::vector<__nv_bfloat16>(y.size(), sentinel));
+            fmt->expert_matvec(m, dx.p, merged.p, rows, dh.p, n, kv, false, stream);
+            ck(cudaStreamSynchronize(stream));
+            const auto part = merged.get(y.size());
+            bool untouched = true;
+            for (int a = 0; a < n * kv; ++a) if (hot[size_t(a)] < 0)
+                for (int r = 0; r < rows; ++r) untouched &= std::memcmp(&part[size_t(a) * rows + r], &sentinel, 2) == 0;
+            require(untouched, "expert_matvec leaves assignments with id -1 untouched");
+            fmt->expert_matvec(m, dx.p, merged.p, rows, dc.p, n, kv, false, stream);
+            ck(cudaStreamSynchronize(stream));
+            require(std::memcmp(merged.get(y.size()).data(), y.data(), y.size() * 2) == 0,
+                    "two expert_matvec launches with ids -1 for the other's assignments == one launch (bit for bit)");
         }
 
         // ---- verify / prefill: grouped GEMM over the stack that holds one slot more than the map addresses ----

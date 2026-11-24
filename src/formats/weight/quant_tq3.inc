@@ -450,6 +450,7 @@ __global__ void __launch_bounds__(256) tq3_matvec_h_k(const uint4 * w, const __h
                                                       const int * ids = nullptr, int topk = 1, bool per_expert = false) {
     if constexpr (EXPERT) {
         const int assignment = blockIdx.y;
+        if (ids[assignment] < 0) return;  // id -1: another launch's assignment (split path hit / miss lists), nothing written
         w += int64_t(ids[assignment]) * rows * (k / 32);
         xh += int64_t(per_expert ? assignment : assignment / topk) * k;
         y += int64_t(assignment) * rows;

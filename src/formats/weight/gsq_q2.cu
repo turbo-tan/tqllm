@@ -27,6 +27,7 @@ template<class T, int NB = 0> __global__ void dot_warp(const unsigned char * wei
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, assignment = blockIdx.y;
     if (row >= rows) return;
     const int expert = ids ? ids[assignment] : 0;
+    if (expert < 0) return;  // id -1: another launch's assignment (split path hit / miss lists), nothing written; >= experts: NaN
     const int input = per_expert ? assignment : assignment / topk;
     float sum = 0.f;
     if (expert >= 0 && expert < experts) {
@@ -57,6 +58,7 @@ template<class T> __global__ void dot_wide(const unsigned char * weights, const 
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, assignment = blockIdx.y;
     if (row >= rows) return;
     const int expert = ids ? ids[assignment] : 0;
+    if (expert < 0) return;  // id -1: another launch's assignment (split path hit / miss lists), nothing written; >= experts: NaN
     const int input = per_expert ? assignment : assignment / topk;
     float sum = 0.f;
     if (expert >= 0 && expert < experts) {
