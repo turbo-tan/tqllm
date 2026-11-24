@@ -961,7 +961,8 @@ if(TQLLM_CUDA)
   target_link_libraries(test-inkling2-attention PRIVATE CUDA::cudart)
   add_test(NAME inkling2-attention COMMAND test-inkling2-attention)
   set_tests_properties(inkling2-attention PROPERTIES SKIP_RETURN_CODE 77)
-  add_executable(test-inkling2-kernels tests/inkling2_kernels.cu src/models/inkling2/loop/inkling2_kernels.cu src/models/inkling2/loop/inkling2_grouped.cu)  # Inkling-2-Mini few-token kernels vs CPU references
+  add_executable(test-inkling2-kernels tests/inkling2_kernels.cu src/models/inkling2/loop/inkling2_kernels.cu src/models/inkling2/loop/inkling2_grouped.cu
+    src/models/inkling2/loop/inkling2_attention.cu)  # Inkling-2-Mini few-token kernels vs CPU references
   target_include_directories(test-inkling2-kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
   target_link_libraries(test-inkling2-kernels PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME inkling2-kernels COMMAND test-inkling2-kernels)
@@ -1086,6 +1087,9 @@ if(BUILD_TESTING)
                              ${CUDAToolkit_INCLUDE_DIRS})  # CUDA builds: session.hpp -> vision.hpp -> cuda_runtime.h
   target_link_libraries(test-jinja PRIVATE tqjinja)
   add_test(NAME jinja COMMAND test-jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/qwen38_chat_template.jinja ${CMAKE_CURRENT_SOURCE_DIR}/tests/template/cases.json)
+  add_executable(test-inkling2-spec-policy tests/inkling2_spec_policy.cpp)  # Inkling-2-Mini: spec / plain step choice
+  target_include_directories(test-inkling2-spec-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
+  add_test(NAME inkling2-spec-policy COMMAND test-inkling2-spec-policy)
   add_executable(test-inkling2-prompt tests/inkling2_prompt.cpp)  # Inkling-2-Mini: chat template + tokenizer == the reference's input_ids
   target_include_directories(test-inkling2-prompt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
   target_link_libraries(test-inkling2-prompt PRIVATE tqjinja tqllm)

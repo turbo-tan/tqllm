@@ -3,7 +3,7 @@
 // down + combine) on NVF4 planes and MXFP8 rows, router top-k from logits, multi-block depth attention. Every few-token kernel
 // must give token t of an n-token call bitwise the same result as a 1-token call on that token (verify == plain decode).
 // Prompt-chunk kernels: grouped expert GEMM (tensor cores) vs the CPU reference, parallel convolutions vs the per-step ones;
-// the spec-decode conv rollback vs running only the kept tokens.
+// the spec-decode conv rollback vs running only the kept tokens; the exact greedy LM head; one depth-attention scratch for every n.
 #include "inkling2_grouped.cuh"
 #include "inkling2_kernels.cuh"
 
@@ -944,6 +944,127 @@ void test_tqt_group_choice() {
     std::printf("  groups: 16 GB -> %d, 24 GB -> %d, too small -> %d\n", g16, g24, gmin);
 }
 
+// Exact greedy LM head (K::head_greedy: INT8 row copy + bounds, BF16 rescoring of the rows that can still win) and the
+// device argmax against the full head (BF16 gemv, bf16, softcap, host std::max_element): equal tokens over random
+// inputs, rows that duplicate the best row up to one BF16 ulp, exact duplicates (ties: lowest index) and large logits.
+void test_head_greedy() {
+    const int V = 6000, D = 2304, trials = 64;
+    const float cap = 30.0f;
+    auto W = randv(size_t(V) * D, 0.05f);
+    std::vector<bf16> wb = to_bf(W);
+    bf16 * dw = up(wb);
+    int8_t * dq = nullptr; float * dsc = nullptr, * dbound = nullptr, * dapprox = nullptr, * dlog = nullptr;
+    ck(cudaMalloc(&dq, size_t(V) * D), "q"); ck(cudaMalloc(&dsc, V * 4), "sc"); ck(cudaMalloc(&dbound, V * 4), "b");
+    ck(cudaMalloc(&dapprox, V * 4), "ap"); ck(cudaMalloc(&dlog, V * 4), "lg");
+    bf16 * dl16 = nullptr, * dx = nullptr;
+    ck(cudaMalloc(&dl16, V * 2), "l16"); ck(cudaMalloc(&dx, D * 2), "x");
+    unsigned long long * cells = nullptr;
+    int * dtok = nullptr;
+    ck(cudaMalloc(&cells, 16), "cells"); ck(cudaMemset(cells, 0, 16), "cells"); ck(cudaMalloc(&dtok, 8), "tok");
+    bool same = true;
+    int n_eq = 0;
+    for (int tr = 0; tr < trials; ++tr) {
+        auto x = randv(D, tr % 8 == 7 ? 40.0f : 1.0f);  // some inputs with logits far past the cap
+        const auto xb = to_bf(x);
+        ck(cudaMemcpy(dx, xb.data(), D * 2, cudaMemcpyHostToDevice), "x");
+        // full head on the device: the reference logits
+        K::GemvSeg sg{dw, dx, dl16, V, D, D, V, 0};
+        K::gemv(&sg, 1, 1, 0);
+        K::to_f32(dl16, dlog, V, 0);
+        K::softcap(dlog, V, cap, 0);
+        auto lg = down(dlog, V);
+        int best = int(std::max_element(lg.begin(), lg.end()) - lg.begin());
+        if (tr % 2 == 1) {  // near ties: rows near the best one (one BF16 ulp apart, and an exact copy at a lower index)
+            const int c1 = (best + 17) % V, c2 = best > 0 ? best / 2 : 1;
+            for (int k = 0; k < D; ++k) {
+                wb[size_t(c1) * D + k] = __float2bfloat16(__bfloat162float(wb[size_t(best) * D + k]) * (k == 0 ? 1.0078125f : 1.0f));
+                wb[size_t(c2) * D + k] = wb[size_t(best) * D + k];
+            }
+            ck(cudaMemcpy(dw, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice), "w");
+            K::gemv(&sg, 1, 1, 0);
+            K::to_f32(dl16, dlog, V, 0);
+            K::softcap(dlog, V, cap, 0);
+            lg = down(dlog, V);
+            best = int(std::max_element(lg.begin(), lg.end()) - lg.begin());
+        }
+        K::quantize_rows_i8(dw, dq, dsc, V, D, 0);
+        K::head_bound_build(dw, dq, dsc, dbound, V, D, 0);
+        const K::HeadBound hb{dw, dq, dsc, dbound, V, D, V};
+        K::head_greedy(hb, dx, 1, cap, dapprox, cells, dtok, dtok + 1, 0);
+        K::argmax_greedy(dlog, size_t(V), cells, dtok + 1, nullptr, 0);
+        const auto t = down(dtok, 2);
+        if (t[0] != best || t[1] != best)
+            std::printf("  head greedy trial %d (x sd %s): full head %d (%.6f), bounded %d, device argmax %d\n", tr, tr % 8 == 7 ? "40" : "1", best, lg[best], t[0], t[1]);
+        same = same && t[0] == best && t[1] == best;
+        n_eq += t[0] == best;
+    }
+    {   // three rows in one call (a verify block): each row's token == its full-head argmax
+        const auto x = randv(size_t(3) * D, 1.0f);
+        bf16 * dx3 = up(to_bf(x));
+        float * dap3 = nullptr; ck(cudaMalloc(&dap3, size_t(3) * V * 4), "ap3");
+        K::quantize_rows_i8(dw, dq, dsc, V, D, 0);
+        K::head_bound_build(dw, dq, dsc, dbound, V, D, 0);
+        const K::HeadBound hb{dw, dq, dsc, dbound, V, D, V};
+        int * dt3 = nullptr; ck(cudaMalloc(&dt3, 12), "t3");
+        K::head_greedy(hb, dx3, 3, cap, dap3, cells, dt3, nullptr, 0);
+        const auto t3 = down(dt3, 3);
+        for (int r = 0; r < 3; ++r) {
+            K::GemvSeg sg{dw, dx3 + size_t(r) * D, dl16, V, D, D, V, 0};
+            K::gemv(&sg, 1, 1, 0);
+            K::to_f32(dl16, dlog, V, 0);
+            K::softcap(dlog, V, cap, 0);
+            const auto lg = down(dlog, V);
+            const int best = int(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            if (t3[r] != best) std::printf("  head greedy 3-row call: row %d full head %d, bounded %d\n", r, best, t3[r]);
+            same = same && t3[r] == best;
+        }
+        cudaFree(dx3); cudaFree(dap3); cudaFree(dt3);
+    }
+    char what[96];
+    std::snprintf(what, sizeof what, "exact greedy head (%d / %d tokens equal, + a 3-row call)", n_eq, trials);
+    report(what, 0.0, 0.0, same);
+    cudaFree(dw); cudaFree(dq); cudaFree(dsc); cudaFree(dbound); cudaFree(dapprox); cudaFree(dlog); cudaFree(dl16); cudaFree(dx); cudaFree(cells); cudaFree(dtok);
+}
+
+// one scratch shared by calls of different n (a decode step, then a verify block, as the model makes them): each call ==
+// the same call on fresh scratch, bitwise, and the counters at the head of the scratch are zero after it. The fused depth-attention kernel's counters once sat behind the n-sized
+// partials, inside an n = 1 call's result area, so an n = 5 call after an n = 1 call started on stale counters.
+void test_attn_res_shared_scratch() {
+    const int D = 2304, nq = 3, cnt = 5, N = 5;
+    K::States st{};
+    st.count = cnt;
+    std::vector<float *> dS(cnt);
+    for (int j = 0; j < cnt; ++j) { dS[j] = up(randv(size_t(N) * D, 1.0f + j)); st.s[j] = dS[j]; }
+    float * dq = up(randv(size_t(nq) * D, 0.1f)), * dw = up(randv(size_t(nq) * D, 0.3f));
+    const size_t sw = size_t(K::attn_res_norm_scratch_words(K::kSmallN, D));
+    float * shared = nullptr, * fresh = nullptr;
+    ck(cudaMalloc(&shared, sw * 4), "s"); ck(cudaMemset(shared, 0, sw * 4), "s");
+    ck(cudaMalloc(&fresh, sw * 4), "f");
+    bf16 * y = nullptr;
+    ck(cudaMalloc(&y, size_t(nq) * N * D * 2), "y");
+    const float * w[3] = {dw, dw + D, dw + 2 * D};
+    bool same = true;
+    auto call = [&](int n, float * scr) {
+        bf16 * yy[3] = {y, y + size_t(n) * D, y + size_t(2) * n * D};
+        K::attn_res_norm(st, dq, nq, nullptr, w, yy, n, D, 1e-6f, scr, 0);
+        ck(cudaDeviceSynchronize(), "attn_res");
+        return down(y, size_t(nq) * n * D);
+    };
+    for (int rep = 0; rep < 4; ++rep)
+        for (int n : {1, N, 1, 3}) {
+            const auto a = call(n, shared);
+            // the fused kernel's counters (the first 3 kSmallN words) are zero again after every call, whatever n
+            const auto c = down(reinterpret_cast<unsigned *>(shared), size_t(3) * K::kSmallN);
+            for (const unsigned v : c) same = same && v == 0u;
+            ck(cudaMemset(fresh, 0, sw * 4), "f");
+            const auto b = call(n, fresh);
+            same = same && std::memcmp(a.data(), b.data(), a.size() * 2) == 0;
+        }
+    report("depth attention: n = 1 / 5 / 3 calls on one scratch", 0.0, 0.0, same);
+    for (auto p : dS) cudaFree(p);
+    cudaFree(dq); cudaFree(dw); cudaFree(shared); cudaFree(fresh); cudaFree(y);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
@@ -957,6 +1078,7 @@ int main() {
     test_route();
     test_attn_res_capture(1);
     test_attn_res_capture(5);
+    test_attn_res_shared_scratch();
     test_attn_res();
     test_msg_gates();
     test_grouped(2);
@@ -968,6 +1090,7 @@ int main() {
     test_tqt_groups(5);
     test_tqt_group_choice();
     test_conv();
+    test_head_greedy();
     std::printf(ok ? "inkling2-kernels: PASS\n" : "inkling2-kernels: FAIL\n");
     return ok ? 0 : 1;
 }
