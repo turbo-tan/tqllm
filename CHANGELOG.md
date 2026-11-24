@@ -5,6 +5,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Performance
+- Flash-Next decode: IQ2_XXS / IQ2_XS expert banks get the dedup kernels (one read of an expert for every verify row
+  that routes to it; before, one block row per assignment). The ISTA-DASLab GSQ-RCO IQ3_XXS file has these types in
+  the gate / up of 19 of 48 layers. RTX 3090, pinned pack, 32K context: mixed prompts cold / GSM8K / warm 125.8 / 145.6 /
+  126.5 -> 128.7 / 149.1 / 130.1 tok/s, GSM8K-50 170.8 -> 167.1 s (49/50 both); greedy replies identical (md5 of 70).
+
 ### Fixed
 - Flash-Next no longer pins the prompt residual buffer (context x hc x hidden fp32: 1.3 GB at a 32K context, 2.7 GB
   at 64K, 5.4 GB at 131K) at start-up, nor allocates it per request on a layer-split rank without the head: nothing
