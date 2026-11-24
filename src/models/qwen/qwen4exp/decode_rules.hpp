@@ -353,6 +353,14 @@ inline bool prompt_cache_by_fit(bool asked, bool asked_value, bool unified_memor
     if (asked) return asked_value;
     return !unified_memory || available >= kept_bytes * std::max<size_t>(1, slots) + kUnifiedFloor;
 }
+// Whether a multi-chunk prefill copies its wide residual rows (hc x hidden fp32, 40 KB per token) to the pinned host
+// buffer for an MTP catch-up after the trunk. The rank that runs the head writes the MTP layer's keys / values with each
+// chunk from the rows still on the device (kv_inline in fn_engine_prefill.cpp) whenever the chunk is layer-major (256
+// tokens or more, which prefill_plan.hpp requires), and the other ranks run no MTP layer: so the buffer is only filled
+// for a head with chunks below 256. Neither the start-up pin nor a request allocates it otherwise (pinned at start, by
+// pin_residual_at_start, it held 1.3 GB at a 32K context, 2.7 GB at 64K, 5.4 GB at 131K that nothing read).
+constexpr int kLayerMajorChunkMin = 256;  // the smallest chunk of a multi-chunk prefill (prefill_chunk_bytes refuses less)
+inline bool prefill_residuals_on_host(bool head_here, int chunk) { return head_here && chunk < kLayerMajorChunkMin; }
 inline bool pin_residual_at_start(size_t bytes, size_t host_ram, size_t available, bool unified_memory) {
     if (!bytes || bytes > available / 4 || bytes > host_ram / 10) return false;
     return !unified_memory || available >= bytes + kUnifiedFloor;
