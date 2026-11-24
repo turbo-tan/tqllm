@@ -62,4 +62,22 @@ void grouped_gate_up_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bf
 void grouped_down_bf16(const __nv_bfloat16 * Wd, int D, int I, const __nv_bfloat16 * act, int A, int E, const int * hc, const int * ho,
                        __nv_bfloat16 * yg, cublasHandle_t blas, cudaStream_t s);
 
+// Small cards: the same path over experts [e0, e0 + G) at a time, so the BF16 scratch holds one group, not the whole
+// layer. expert_slice: m seen from expert e0 (base + stride, or the per-expert pointer arrays of partial residency).
+// grouped_gather once per visit, then per group: experts_decode_bf16 of the slice, grouped_gate_up_part_bf16 (GEMM +
+// SwiGLU of the group's rows, contiguous in grouped order) and grouped_down_bf16 with the group's hc / ho slices (ho are
+// absolute row offsets). The GEMM descriptors live until the GEMM ran: synchronise the stream before the next group.
+inline ExpertMat expert_slice(const ExpertMat & m, int e0) {
+    ExpertMat r = m;
+    if (m.wp) r.wp = m.wp + e0; else r.w = m.w + size_t(e0) * m.stride;
+    if (m.ap) r.ap = m.ap + e0; else if (m.aux) r.aux = m.aux + size_t(e0) * m.aux_stride;
+    return r;
+}
+void grouped_gather(const __nv_bfloat16 * x, int A, const int * order, int topk, __nv_bfloat16 * xg, int D, cudaStream_t s);
+void grouped_gate_up_part_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bfloat16 * xg, int G, const int * hc, const int * ho,
+                               __nv_bfloat16 * gu, __nv_bfloat16 * act, float gc, float uc, cublasHandle_t blas, cudaStream_t s);
+// the largest group of E, E / 2, ... 8 experts whose BF16 scratch (G * per_expert_b) still leaves every expert resident:
+// experts_b + keep_b + G * per_expert_b <= free_b; none fits: 8 (the experts then share the rest, partial residency)
+int choose_tqt_group(int E, size_t free_b, size_t experts_b, size_t keep_b, size_t per_expert_b);
+
 }  // namespace tqllm_cuda::inkling2

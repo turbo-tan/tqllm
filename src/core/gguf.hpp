@@ -43,6 +43,12 @@ enum GgmlType : uint32_t {
     // TQT (tail-biting bitshift-trellis code c2, 66 B per 128, docs/reference/formats.md): file type 306, only together with
     // the key tqllm.tqt.code = "tqt-c2-v1" (gguf_open_shard refuses 306 without it and any other code tag).
     GGML_TQT = 306,
+    // TQT2 (the 2-bit trellis code tqt2-c1-v1, 34 B per 128: FP16 scale + 32 stream bytes, tools/convert/inkling2/tqt2.py): file type 307,
+    // only together with the key tqllm.tqt2.code = "tqt2-c1-v1"; read by the Inkling expert loader.
+    GGML_TQT2 = 307,
+    // TQT3 (the 3-bit trellis code tqt3-c1-v1, 50 B per 128: FP16 scale + 48 stream bytes, tools/convert/inkling2/tqt3.py): file type 308,
+    // only together with the key tqllm.tqt3.code = "tqt3-c1-v1"; read by the Inkling expert loader.
+    GGML_TQT3 = 308,
 };
 
 

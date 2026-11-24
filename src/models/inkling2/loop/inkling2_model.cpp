@@ -41,6 +41,17 @@ void cb(cublasStatus_t e, const char * what) {
     if (e != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("inkling2: cuBLAS ") + what + " " + std::to_string(int(e)));
 }
 float bf16_f(uint16_t v) { uint32_t u = uint32_t(v) << 16; float f; std::memcpy(&f, &u, 4); return f; }
+float half_f(uint16_t h) {  // IEEE binary16 -> float (Q8_0 block scales)
+    const uint32_t s = uint32_t(h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u;
+    float v;
+    if (e == 0) v = std::ldexp(float(m), -24);
+    else if (e == 31) v = m ? NAN : INFINITY;
+    else v = std::ldexp(float(m | 1024u), int(e) - 25);
+    uint32_t u; std::memcpy(&u, &v, 4);
+    u |= s;
+    std::memcpy(&v, &u, 4);
+    return v;
+}
 
 struct Dev {
     void * p = nullptr;
@@ -135,6 +146,9 @@ struct Inkling2Model::Impl {
     // BF16 expert prompt path (big cards): gathered inputs, gate+up GEMM out, down GEMM out, host counts / offsets
     Dev xg, guo, ygo, ginv;
     bool bf16_experts = false, fp4_experts = false;
+    int tqt_group = 0;  // small cards: TQT prompt experts decoded G at a time (chosen at load from free memory; 0: the whole layer)
+    bool tqt_experts = false;  // some layer's experts are TQT (fmt 3): few-token kernels read the rotated FP16 activations xh16 / acth16
+    Dev xh16, acth16, tqt_bgu, tqt_bdn;  // rotated activations; per-visit BF16 decode of a TQT layer (cards without the whole-model BF16 copies)
     Dev q4codes, q4scales, q4row, q4acodes, q4ascales;
     int * h_gc = nullptr, * h_gf = nullptr;
     int want_rows = 0;  // logits rows allocated (grown on demand by a forward() that wants more)
@@ -160,6 +174,21 @@ struct Inkling2Model::Impl {
     Dev f32(const std::string & n) { const auto v = host_f32(n); return upload(v.data(), v.size() * 4); }
     Dev raw(const std::string & n, uint32_t type) {
         const auto & t = T(n);
+        if (t.type == GGML_Q8_0 && type == GGML_BF16) {  // 8-bit dense tensors of a TQT overlay (blocks of 32: FP16 scale + 32 int8) -> BF16
+            const auto b = f.read(t);
+            const size_t nel = size_t(t.bytes) / 34 * 32;
+            std::vector<uint16_t> h(nel);
+            for (size_t blk = 0; blk < nel / 32; ++blk) {
+                uint16_t d16; std::memcpy(&d16, b.data() + blk * 34, 2);
+                const float d = half_f(d16);
+                for (size_t j = 0; j < 32; ++j) {
+                    const float v = d * float(static_cast<int8_t>(b[blk * 34 + 2 + j]));
+                    uint32_t u; std::memcpy(&u, &v, 4);
+                    h[blk * 32 + j] = uint16_t((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+                }
+            }
+            return upload(h.data(), h.size() * 2);
+        }
         if (t.type != type) throw std::runtime_error("inkling2: " + n + " type " + std::to_string(t.type));
         const auto b = f.read(t);
         return upload(b.data(), b.size());
@@ -213,6 +242,48 @@ struct Inkling2Model::Impl {
             });
             if (mixed) throw std::runtime_error("inkling2: " + n + " has more than one NVFP4 global per row");
             x.m.fmt = 2; x.m.stride = size_t(x.rows) * C / 2; x.m.aux_stride = size_t(x.rows) * ab;
+        } else if (t.type == GGML_TQT) {  // 66 B records (FP16 scale + 64 stream bytes per 128) -> stream planes [rows][cols / 2] + scales [rows][cols / 128]
+            const size_t nb = C / 128;
+            if (C % 128 || b.size() != R * nb * 66) throw std::runtime_error("inkling2: " + n + " bytes");
+            x.hw = Pinned(R * C / 2); x.ha = Pinned(R * nb * 2);
+            uint8_t * codes = x.hw.as<uint8_t>(), * sc = x.ha.as<uint8_t>();
+            parallel_blocks(int64_t(R), [&](int64_t r) {
+                const auto * row = reinterpret_cast<const uint8_t *>(b.data()) + size_t(r) * nb * 66;
+                for (size_t k = 0; k < nb; ++k) {
+                    std::memcpy(sc + (size_t(r) * nb + k) * 2, row + k * 66, 2);
+                    std::memcpy(codes + size_t(r) * C / 2 + k * 64, row + k * 66 + 2, 64);
+                }
+            });
+            x.m.fmt = 3; x.m.stride = size_t(x.rows) * C / 2; x.m.aux_stride = size_t(x.rows) * nb * 2;
+            tqt_experts = true;
+        } else if (t.type == GGML_TQT2) {  // 34 B records (FP16 scale + 32 stream bytes per 128) -> planes [rows][cols / 4] + scales [rows][cols / 128]
+            const size_t nb = C / 128;
+            if (C % 128 || b.size() != R * nb * 34) throw std::runtime_error("inkling2: " + n + " bytes");
+            x.hw = Pinned(R * C / 4); x.ha = Pinned(R * nb * 2);
+            uint8_t * codes = x.hw.as<uint8_t>(), * sc = x.ha.as<uint8_t>();
+            parallel_blocks(int64_t(R), [&](int64_t r) {
+                const auto * row = reinterpret_cast<const uint8_t *>(b.data()) + size_t(r) * nb * 34;
+                for (size_t k = 0; k < nb; ++k) {
+                    std::memcpy(sc + (size_t(r) * nb + k) * 2, row + k * 34, 2);
+                    std::memcpy(codes + size_t(r) * C / 4 + k * 32, row + k * 34 + 2, 32);
+                }
+            });
+            x.m.fmt = 4; x.m.stride = size_t(x.rows) * C / 4; x.m.aux_stride = size_t(x.rows) * nb * 2;
+            tqt_experts = true;
+        } else if (t.type == GGML_TQT3) {  // 50 B records (FP16 scale + 48 stream bytes per 128) -> planes [rows][cols * 3 / 8] + scales [rows][cols / 128]
+            const size_t nb = C / 128;
+            if (C % 128 || b.size() != R * nb * 50) throw std::runtime_error("inkling2: " + n + " bytes");
+            x.hw = Pinned(R * C * 3 / 8); x.ha = Pinned(R * nb * 2);
+            uint8_t * codes = x.hw.as<uint8_t>(), * sc = x.ha.as<uint8_t>();
+            parallel_blocks(int64_t(R), [&](int64_t r) {
+                const auto * row = reinterpret_cast<const uint8_t *>(b.data()) + size_t(r) * nb * 50;
+                for (size_t k = 0; k < nb; ++k) {
+                    std::memcpy(sc + (size_t(r) * nb + k) * 2, row + k * 50, 2);
+                    std::memcpy(codes + size_t(r) * C * 3 / 8 + k * 48, row + k * 50 + 2, 48);
+                }
+            });
+            x.m.fmt = 5; x.m.stride = size_t(x.rows) * C * 3 / 8; x.m.aux_stride = size_t(x.rows) * nb * 2;
+            tqt_experts = true;
         } else {
             throw std::runtime_error("inkling2: " + n + " expert type " + std::to_string(t.type));
         }
@@ -266,13 +337,23 @@ struct Inkling2Model::Impl {
     size_t expert_budget = SIZE_MAX;
     size_t dev_mem = 0;
     int resident_share = 0;  // experts per 128 kept on the device (128: all)
+    // TQT prompt path without whole-model BF16 copies: one layer's BF16 experts (gate+up, down) plus the grouped GEMM buffers
+    size_t tqt_per_expert_bytes() const { return (size_t(2) * I * D + size_t(D) * I) * 2; }  // one expert's gate + up + down in BF16
+    size_t tqt_fixed_bytes() const {  // the grouped GEMM buffers of one prompt chunk
+        const size_t A = size_t(chunk) * topk;
+        return A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
+    }
     void place_experts() {
         size_t total = 0;
         for (const auto & Y : Ls) total += Y.eg.bytes() + Y.eu.bytes() + Y.ed.bytes();
         auto budget = [&] {
             size_t fr = 0, tot = 0;
             ck(cudaMemGetInfo(&fr, &tot), "mem info");
-            const size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
+            size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
+            if (tqt_experts && dev_mem < (size_t(96) << 30)) {  // the per-visit BF16 decode of a TQT layer, one group at a time
+                tqt_group = K::choose_tqt_group(E, fr, total, keep + tqt_fixed_bytes(), tqt_per_expert_bytes());
+                keep += tqt_fixed_bytes() + size_t(tqt_group) * tqt_per_expert_bytes();
+            }
             return std::min(expert_budget, fr > keep ? fr - keep : 0);
         };
         size_t b = budget();
@@ -288,6 +369,9 @@ struct Inkling2Model::Impl {
         resident_share = total <= b ? E_ : std::max(topk, int(double(b) / double(total) * E_));
         for (auto & Y : Ls) { place(Y.eg, resident_share); place(Y.eu, resident_share); place(Y.ed, resident_share); }
         ck(cudaStreamSynchronize(s), "place");
+        if (tqt_group)
+            std::fprintf(stderr, "inkling2: TQT prompt experts in groups of %d (%.2f GB BF16 scratch), %d of %d experts per layer resident\n", tqt_group,
+                         double(size_t(tqt_group) * tqt_per_expert_bytes()) / 1e9, resident_share, E_);
         // big cards (>= 96 GB): BF16 prompt copies for the cuBLAS path, allocated after the quantized stacks are placed
         // (the pinned host copies are free again then); a failed allocation keeps the WMMA path
         if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX) {
@@ -313,6 +397,13 @@ struct Inkling2Model::Impl {
                 cudaGetLastError();
             }
         }
+        if (tqt_experts && !bf16_experts) {  // TQT prompt path: one layer's BF16 decode per visit, then the cuBLAS per-expert GEMMs
+            const size_t A = size_t(chunk) * topk;
+            const int G = tqt_group ? tqt_group : E;
+            tqt_bgu = Dev(size_t(G) * 2 * I * D * 2); tqt_bdn = Dev(size_t(G) * D * I * 2);
+            xg = Dev(A * D * 2); guo = Dev(A * 2 * I * 2); ygo = Dev(A * D * 2); ginv = Dev(A * 4);
+            if (!h_gc) { ck(cudaMallocHost(&h_gc, size_t(E) * 4), "pinned"); ck(cudaMallocHost(&h_gf, size_t(E) * 4), "pinned"); }
+        }
         if (fp4_experts) {
             const size_t max_rows = std::max<size_t>(size_t(chunk), size_t(chunk) * topk);
             const size_t max_cols = std::max<size_t>(D, I);
@@ -326,17 +417,25 @@ struct Inkling2Model::Impl {
         ck(cudaMemset(ucount.p, 0, size_t(L) * E_ * 4), "counts");
     }
     // partial residency: per layer the resident_share experts routed most so far (since load) move to the device
+    std::vector<float> route_hist;  // decayed routed counts per (layer, expert), host side
+    int decode_steps = 0;           // decode forwards since the last plan (partial residency replans every kReplanEvery)
     int replan_experts() {
         if (resident_share >= Ls[0].eg.E) return 0;
         const int E_ = Ls[0].eg.E;
-        std::vector<int> cnt(size_t(L) * E_);
-        ck(cudaMemcpyAsync(cnt.data(), ucount.p, cnt.size() * 4, cudaMemcpyDeviceToHost, s), "counts");
+        std::vector<int> fresh(size_t(L) * E_);
+        ck(cudaMemcpyAsync(fresh.data(), ucount.p, fresh.size() * 4, cudaMemcpyDeviceToHost, s), "counts");
         ck(cudaStreamSynchronize(s), "counts");
+        ck(cudaMemsetAsync(ucount.p, 0, size_t(L) * E_ * 4, s), "counts");
+        // decayed history: routes since the last plan count fully, older ones half per plan, so the resident set follows
+        // what decode routes to now (a prompt's routing, or an earlier request's, fades)
+        if (route_hist.size() != fresh.size()) route_hist.assign(fresh.size(), 0.0f);
+        std::vector<float> cnt(fresh.size());
+        for (size_t i = 0; i < fresh.size(); ++i) cnt[i] = route_hist[i] = 0.5f * route_hist[i] + float(fresh[i]);
         int moved = 0;
         for (int l = 0; l < L; ++l) {
             std::vector<int> order(static_cast<size_t>(E_));
             for (int e = 0; e < E_; ++e) order[size_t(e)] = e;
-            const int * c = cnt.data() + size_t(l) * E_;
+            const float * c = cnt.data() + size_t(l) * E_;
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
             std::vector<char> want(static_cast<size_t>(E_), 0);
             for (int i = 0; i < resident_share; ++i) want[size_t(order[size_t(i)])] = 1;
@@ -484,6 +583,7 @@ struct Inkling2Model::Impl {
         int pf = tqllm_cuda::inkling2_attention_decode_floats(H, K::kSmallN, kSplitsFull);
         pq = Dev(size_t(n) * H * HD * 2); pr = Dev(size_t(n) * H * DR * 4);  // prompt attention scratch
         gdedup = Dev(size_t(1 + K::kSmallN * topk * (1 + K::kSmallN)) * 4);
+        xh16 = Dev(size_t(K::kSmallN) * D * 2); acth16 = Dev(size_t(K::kSmallN) * topk * I * 2);
         if (hf_attention) pf = std::max(pf, tqllm_cuda::inkling2_attention_partial_floats(H, n, context));
         part = Dev(size_t(pf) * 4);
         dlen = Dev(4);
@@ -657,7 +757,12 @@ struct Inkling2Model::Impl {
             ck(cudaMemcpyAsync(route_log->back().data(), eids.p, size_t(n) * topk * 4, cudaMemcpyDeviceToHost, s), "route log");
             ck(cudaStreamSynchronize(s), "route log");
         }
-        if (small && n > 1) {
+        if (small && Y.eg.m.fmt >= 3) {  // TQT: the weights live in TQ4's rotated basis, so the activations rotate per 128 (FP16)
+            K::rotate_h(xb.as<bf16>(), xh16.as<__half>(), D, n, s);
+            K::expert_gate_up(Y.eg.m, Y.eu.m, I, D, xb.as<bf16>(), eids.as<int>(), act.as<bf16>(), n, topk, gcap, ucap, s, xh16.as<__half>());
+            K::rotate_h(act.as<bf16>(), acth16.as<__half>(), I, n * topk, s);
+            K::expert_down(Y.ed.m, D, I, act.as<bf16>(), eids.as<int>(), ewts.as<float>(), moe.as<bf16>(), n, topk, s, acth16.as<__half>());
+        } else if (small && n > 1) {
             K::expert_dedup(Y.eg.m, Y.eu.m, Y.ed.m, I, D, xb.as<bf16>(), eids.as<int>(), ewts.as<float>(), gdedup.as<int>(), act.as<bf16>(), yd.as<bf16>(),
                             moe.as<bf16>(), n, topk, gcap, ucap, s);
         } else if (small) {
@@ -667,7 +772,33 @@ struct Inkling2Model::Impl {
             const int A = n * topk;
             int * go = gorder.as<int>(), * gc = gcounts.as<int>(), * gf = goffsets.as<int>(), * gt_ = gtile.as<int>();
             K::group_assignments(eids.as<int>(), A, E, go, gc, gf, gt_, s);
-            if (fp4_experts && Y.eg.m.fmt == 2 && Y.eu.m.fmt == 2 && Y.ed.m.fmt == 2 && I % 64 == 0 && D % 64 == 0) {
+            if (Y.eg.m.fmt >= 3) {  // TQT / TQT2: BF16 copies of the original-basis weights (resident, or decoded G experts at a time), cuBLAS per expert
+                ck(cudaMemcpyAsync(h_gc, gcounts.p, size_t(E) * 4, cudaMemcpyDeviceToHost, s), "counts");
+                ck(cudaMemcpyAsync(h_gf, goffsets.p, size_t(E) * 4, cudaMemcpyDeviceToHost, s), "offsets");
+                ck(cudaStreamSynchronize(s), "group");
+                if (bf16_experts) {
+                    K::grouped_gate_up_bf16(Y.eg.bgu.as<bf16>(), I, D, xb.as<bf16>(), A, E, topk, go, h_gc, h_gf, xg.as<bf16>(), guo.as<bf16>(),
+                                            act.as<bf16>(), gcap, ucap, blas, s);
+                    K::grouped_down_bf16(Y.ed.bdn.as<bf16>(), D, I, act.as<bf16>(), A, E, h_gc, h_gf, ygo.as<bf16>(), blas, s);
+                } else {
+                    const int G = tqt_group ? tqt_group : E;
+                    K::grouped_gather(xb.as<bf16>(), A, go, topk, xg.as<bf16>(), D, s);
+                    for (int e0 = 0; e0 < E; e0 += G) {
+                        const int g = std::min(G, E - e0);
+                        int rows = 0;
+                        for (int e = e0; e < e0 + g; ++e) rows += h_gc[e];
+                        if (rows == 0) continue;
+                        K::experts_decode_bf16(K::expert_slice(Y.eg.m, e0), g, I, D, 2 * I, tqt_bgu.as<bf16>(), s);
+                        K::experts_decode_bf16(K::expert_slice(Y.eu.m, e0), g, I, D, 2 * I, tqt_bgu.as<bf16>() + size_t(I) * D, s);
+                        K::experts_decode_bf16(K::expert_slice(Y.ed.m, e0), g, D, I, D, tqt_bdn.as<bf16>(), s);
+                        K::grouped_gate_up_part_bf16(tqt_bgu.as<bf16>(), I, D, xg.as<bf16>(), g, h_gc + e0, h_gf + e0, guo.as<bf16>(), act.as<bf16>(),
+                                                     gcap, ucap, blas, s);
+                        K::grouped_down_bf16(tqt_bdn.as<bf16>(), D, I, act.as<bf16>(), A, g, h_gc + e0, h_gf + e0, ygo.as<bf16>(), blas, s);
+                        if (e0 + g < E) ck(cudaStreamSynchronize(s), "tqt group");  // the scratch and the GEMM descriptors are reused by the next group
+                    }
+                }
+                K::moe_combine_grouped(ygo.as<bf16>(), go, A, ewts.as<float>(), moe.as<bf16>(), n, D, topk, ginv.as<int>(), s);
+            } else if (fp4_experts && Y.eg.m.fmt == 2 && Y.eu.m.fmt == 2 && Y.ed.m.fmt == 2 && I % 64 == 0 && D % 64 == 0) {
                 K::quantize_act_nvfp4(xb.as<bf16>(), n, D, q4codes.as<uint8_t>(), q4scales.as<uint8_t>(), q4row.as<float>(), s);
                 K::grouped_gate_up_fp4_q(Y.eg.m, Y.eu.m, I, D, q4codes.as<uint8_t>(), q4scales.as<uint8_t>(), q4row.as<float>(), A, E, topk, go, gc,
                                          gf, gt_, q4acodes.as<uint8_t>(), q4ascales.as<uint8_t>(), gcap, ucap, s);
@@ -870,6 +1001,9 @@ struct Inkling2Model::Impl {
         std::fwrite(h.data(), 4, h.size(), dump);
     }
     void forward(const int * tokens, int n, int want, std::vector<float> & logits_out) {
+        // partial residency: re-plan the resident experts from the recent routing every kReplanEvery decode steps
+        constexpr int kReplanEvery = 32;
+        if (n == 1 && resident_share < Ls[0].eg.E && ++decode_steps >= kReplanEvery) { decode_steps = 0; replan_experts(); }
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (n <= 0 || n > chunk || want > n) throw std::runtime_error("inkling2: chunk size");
         grow_logits(want);

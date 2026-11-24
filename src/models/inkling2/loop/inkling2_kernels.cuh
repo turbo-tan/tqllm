@@ -2,6 +2,7 @@
 // Inkling-2-Mini elementwise / small kernels (inkling2_kernels.cu). Activations: F32 buffers holding the values the
 // transformers reference holds (BF16-rounded where it stores BF16), BF16 buffers as GEMM inputs. n = tokens of a chunk.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -59,7 +60,9 @@ void quantize_rows_i8(const __nv_bfloat16 * w, int8_t * q, float * scale, int ro
 void dequant_rows_i8(const int8_t * q, const float * scale, __nv_bfloat16 * w, int rows, int K, cudaStream_t s);
 void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
 // a stack of routed experts on the device: fmt 1 MXFP8 rows (w: per expert rows x (cols + cols / 32) bytes), fmt 2 NVF4
-// planes (w: codes [rows][cols / 2]; aux: [rows][cols / 16 E4M3 scales, F32 global]); stride / aux_stride: bytes per expert
+// planes (w: codes [rows][cols / 2]; aux: [rows][cols / 16 E4M3 scales, F32 global]), fmt 3 TQT planes (w: stream bytes
+// [rows][cols / 2]; aux: FP16 scales [rows][cols / 128]; weights in TQ4's rotated basis, so the few-token kernels read the
+// activation rotated per 128 as FP16: xh); stride / aux_stride: bytes per expert
 // With wp / ap (device arrays [experts]) each expert's data / aux sits at its own address (a device slot or mapped host
 // memory: the experts that do not fit stream over the bus), else at w + e * stride.
 struct ExpertMat {
@@ -67,11 +70,16 @@ struct ExpertMat {
     const uint8_t * const * wp = nullptr; const uint8_t * const * ap = nullptr;
 };
 // routed experts, gate + up + softcapped SwiGLU: act[a][i] for assignment a = t * topk + k (expert ids[a]), x [n][cols]
+// xh[c][:] = R x[c][:] per 128-column block (R = D H / sqrt(128), TQ4's rotation: signs S1, Sylvester Hadamard), x BF16 [ncols][k],
+// k % 128 == 0, xh FP16 (the activation of TQT weights)
+void rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t s);
+// fmt 3 reads xh (x rotated per 128, FP16 [n][cols]) instead of x
 void expert_gate_up(const ExpertMat & g, const ExpertMat & u, int rows, int cols, const __nv_bfloat16 * x, const int * ids, __nv_bfloat16 * act, int n,
-                    int topk, float gc, float uc, cudaStream_t s);
+                    int topk, float gc, float uc, cudaStream_t s, const __half * xh = nullptr);
 // down + combine: out[t][r] = bf16(sum_k w[t][k] * bf16(W_down[ids[t][k]][r] . act[t * topk + k]))
+// fmt 3 reads acth (act rotated per 128, FP16 [n * topk][cols]) instead of act
 void expert_down(const ExpertMat & d, int rows, int cols, const __nv_bfloat16 * act, const int * ids, const float * wts, __nv_bfloat16 * out, int n,
-                 int topk, cudaStream_t s);
+                 int topk, cudaStream_t s, const __half * acth = nullptr);
 // attn_res() for nq <= 4 streams, fused with rms_norm() of each stream i that has a weight w[i]:
 // y16[i] = bf16(w[i] * rms(stream i)); out (F32 [nq][n][D]) may be null. n <= kSmallN splits D over blocks (two kernels,
 // internal scratch); larger n runs one block per token. The per-token arithmetic does not depend on n either way.
