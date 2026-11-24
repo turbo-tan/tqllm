@@ -3,6 +3,17 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Routed-expert kernels of GSQ Q2_0, TQ3_4S and X3 skip an assignment whose id is -1 (the u4h kernels' rule) instead
+  of writing NaN (GSQ), reading the weights before the bank (TQ3) or reading a bank entry at -1 (X3: illegal
+  address). The Flash-Next decode split path and the qwen35 hot / cold banks run two launches into one output, each
+  with the other part's ids at -1, so a -1 must write nothing. Tests: gsq_q2, qwen35_expert_tq3, x3_moe (two launches
+  with ids -1 == one launch); they fail on the old kernels. `TQLLM_DEBUG=moe_nan` checks the Flash-Next split path's
+  expert outputs at run time. Output bits unchanged where the bug was not reached (ISTA IQ3_XXS: md5 of 70 replies,
+  and of 6 replies without drafts).
+
 ## 1.7.0 (2026-11-23)
 
 ### Added
