@@ -142,6 +142,10 @@ int main() {
             run(GGML_IQ3_XXS, 40, 256, pe, many());
             run(GGML_GSQ_Q2_0, 72, 640, pe, many());
             run(GGML_IQ2_S, 24, 2560, pe, heavy());
+            run(GGML_IQ2_XXS, 24, 256, pe);  // IQ2_XXS / IQ2_XS: dedup kernels for the ISTA files' 2-bit gate / up
+            run(GGML_IQ2_XXS, 24, 2560, pe, heavy());
+            run(GGML_IQ2_XS, 24, 256, pe);
+            run(GGML_IQ2_XS, 24, 2560, pe, heavy());
             run(GGML_IQ4_NL, 40, 640, pe, heavy());
             run(GGML_Q4_1, 40, 2560, pe, heavy());
             run(GGML_IQ3_S, 40, 2560, pe, skipped());  // the Flash-Next experts' format

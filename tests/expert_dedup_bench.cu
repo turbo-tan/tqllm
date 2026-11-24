@@ -19,7 +19,7 @@ int main(int argc, char ** argv) {
     const int slots = 512, ntok = 8, DS = tqllm_cuda::kDedupStride;
     std::mt19937 g(7);
     struct Case { unsigned ty; int bb, rows, cols; const char * what; };
-    for (const Case cs : {Case{22, 82, 640, 2560, "gate/up IQ2_S"}, Case{18, 98, 640, 2560, "gate/up IQ3_XXS"}, Case{21, 110, 640, 2560, "gate/up IQ3_S"},
+    for (const Case cs : {Case{22, 82, 640, 2560, "gate/up IQ2_S"}, Case{16, 66, 640, 2560, "gate/up IQ2_XXS"}, Case{17, 74, 640, 2560, "gate/up IQ2_XS"}, Case{18, 98, 640, 2560, "gate/up IQ3_XXS"}, Case{21, 110, 640, 2560, "gate/up IQ3_S"},
                           Case{20, 144, 2560, 640, "down IQ4_NL"},
                           Case{323, 152, 640, 2560, "gate/up NVF4"}, Case{323, 152, 2560, 640, "down NVF4"}, Case{302, 72, 2560, 640, "down GSQ_Q2_0"},
                           Case{12, 144, 512, 2048, "gate/up Q4_K 35B"}, Case{13, 176, 2048, 512, "down Q5_K 35B"}}) {
