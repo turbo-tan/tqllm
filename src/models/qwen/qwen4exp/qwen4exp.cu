@@ -1768,10 +1768,26 @@ void fn_gemv_bf16(const __nv_bfloat16 * w, const float * x, float * y, int rows,
 // Several row-blocks of bf16 weights against the same few-token input in one launch (router + shared gate of this and
 // the next layer). Each row is computed exactly as fn_gemv_bf16_few_k (same threads, same order); outputs go to
 // y[s] + t * ld[s] + row.
+// The segment of a block and its pointers without indexing the parameter struct by a register: g.w[seg] with a computed
+// seg made every thread copy the whole GemvSegs to local memory (the segmented launches ran ~2x slower than
+// fn_gemv_bf16_tiles_k on the same rows). R rows per block: a segment owns ceil(rows / R) consecutive blocks.
+struct SegPick { const __nv_bfloat16 * w; float * y; int64_t ld; int rows, base_block; };
+template<int R> __device__ __forceinline__ SegPick seg_pick(const GemvSegs & g) {
+    SegPick p{g.w[0], g.y[0], g.ld[0], g.start[1] - g.start[0], 0};
+    int base = (g.start[1] - g.start[0] + R - 1) / R;
+#pragma unroll
+    for (int s = 1; s < kGemvSegs; ++s) {
+        if (s < g.n && int(blockIdx.x) >= base) {
+            p = SegPick{g.w[s], g.y[s], g.ld[s], g.start[s + 1] - g.start[s], base};
+            base += (g.start[s + 1] - g.start[s] + R - 1) / R;
+        }
+    }
+    return p;
+}
 template<int T> __global__ void fn_gemv_bf16_seg_k(GemvSegs g, const float * x, int cols) {
-    int seg = 0; while (seg + 1 < g.n && int(blockIdx.x) >= g.start[seg + 1]) ++seg;
-    const int row = blockIdx.x - g.start[seg], lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-    const uint4 * wr = reinterpret_cast<const uint4 *>(g.w[seg] + int64_t(row) * cols);
+    const SegPick sp = seg_pick<1>(g);
+    const int row = int(blockIdx.x) - sp.base_block, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const uint4 * wr = reinterpret_cast<const uint4 *>(sp.w + int64_t(row) * cols);
     float sum[T];
     #pragma unroll
     for (int t = 0; t < T; ++t) sum[t] = 0.f;
@@ -1796,7 +1812,7 @@ template<int T> __global__ void fn_gemv_bf16_seg_k(GemvSegs g, const float * x, 
     if (threadIdx.x < T) {
         float r = 0.f;
         for (int k = 0; k < int(blockDim.x / 32); ++k) r += part[threadIdx.x][k];
-        g.y[seg][int64_t(threadIdx.x) * g.ld[seg] + row] = r;
+        sp.y[int64_t(threadIdx.x) * sp.ld + row] = r;
     }
 }
 // R rows of one segment per block (fn_gemv_bf16_seg_k with the tiles kernel's idea): x is read once per R rows instead of
@@ -1804,13 +1820,8 @@ template<int T> __global__ void fn_gemv_bf16_seg_k(GemvSegs g, const float * x, 
 // earlier segments; rows past the segment's end are clamped and never written. Each (row, token) sum keeps seg_k's order
 // (same threads, same columns per thread, same reductions), so the output is bit-identical.
 template<int R, int T> __global__ void fn_gemv_bf16_seg_rows_k(GemvSegs g, const float * x, int cols) {
-    int seg = 0, base = 0;
-    for (int s = 0; s < g.n; ++s) {  // g.start has n + 1 entries, so the last segment maps like the others
-        const int nb = (g.start[s + 1] - g.start[s] + R - 1) / R;
-        if (int(blockIdx.x) < base + nb) { seg = s; break; }
-        base += nb;
-    }
-    const int rows = g.start[seg + 1] - g.start[seg], row0 = (int(blockIdx.x) - base) * R;
+    const SegPick sp = seg_pick<R>(g);
+    const int rows = sp.rows, row0 = (int(blockIdx.x) - sp.base_block) * R;
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     float sum[R][T];
     #pragma unroll
@@ -1827,7 +1838,7 @@ template<int R, int T> __global__ void fn_gemv_bf16_seg_rows_k(GemvSegs g, const
         }
         #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const uint4 packed = reinterpret_cast<const uint4 *>(g.w[seg] + int64_t(min(row0 + r, rows - 1)) * cols)[v];
+            const uint4 packed = reinterpret_cast<const uint4 *>(sp.w + int64_t(min(row0 + r, rows - 1)) * cols)[v];
             const __nv_bfloat16 * wv = reinterpret_cast<const __nv_bfloat16 *>(&packed);
             #pragma unroll
             for (int t = 0; t < T; ++t)
@@ -1850,7 +1861,7 @@ template<int R, int T> __global__ void fn_gemv_bf16_seg_rows_k(GemvSegs g, const
         if (row0 + r >= rows) continue;
         float s = 0.f;
         for (int k = 0; k < int(blockDim.x / 32); ++k) s += part[i][k];
-        g.y[seg][int64_t(t) * g.ld[seg] + row0 + r] = s;
+        sp.y[int64_t(t) * sp.ld + row0 + r] = s;
     }
 }
 // up to 8 tokens per launch: a verify block (5 drafts + 1) reads each weight row once (with chunks of 4 it read it twice);

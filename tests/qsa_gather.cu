@@ -1,3 +1,4 @@
+#include <memory>
 // QsaGather: the selected K/V rows of a decode step copied into one compact buffer (TQFN_KV_HOST decode).
 // Contract checked here against a CPU model:
 //   - a cell is copied when some token t selects it with valid != 0 and 0 <= pos < first_cells + t
@@ -61,25 +62,38 @@ struct Rows {
     size_t row_bytes() const { return row * sizeof(__nv_bfloat16); }
 };
 
+static void verify_gather(const tqllm_cuda::QsaGather & g, const Selection & s, const Rows & r);
 // gather on the device and compare positions and every copied row with the CPU model
 static void expect_gather(tqllm_cuda::QsaGather & g, const Selection & s, const Rows & r, const void * keys, const void * values,
                           cudaStream_t stream = nullptr, int host_cells = 0) {
     Device<int32_t> dp(s.positions.size()); Device<uint8_t> dm(s.valid.size()); dp.put(s.positions); dm.put(s.valid);
     g.run(dp.p, dm.p, s.tokens, s.width, s.first, keys, values, stream, host_cells);
     ck(cudaStreamSynchronize(stream)); ck(cudaDeviceSynchronize());
+    verify_gather(g, s, r);
+}
+static void verify_gather(const tqllm_cuda::QsaGather & g, const Selection & s, const Rows & r) {
     const Model m = reference(s);
     std::vector<int32_t> got(s.positions.size());
     ck(cudaMemcpy(got.data(), g.positions(), got.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < got.size(); ++i)
-        require(got[i] == m.positions[i], "position " + std::to_string(i) + ": got " + std::to_string(got[i]) + " want " + std::to_string(m.positions[i]));
     std::vector<__nv_bfloat16> k(size_t(m.rows) * r.row), v(k.size());
     if (m.rows) {
         ck(cudaMemcpy(k.data(), g.keys(), k.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
         ck(cudaMemcpy(v.data(), g.values(), v.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
     }
-    for (int c = 0; c < s.cells(); ++c) if (const int j = m.map[size_t(c)]; j >= 0) {
-        require(!std::memcmp(&k[size_t(j) * r.row], &r.keys[size_t(c) * r.row], r.row_bytes()), "key row of cell " + std::to_string(c));
-        require(!std::memcmp(&v[size_t(j) * r.row], &r.values[size_t(c) * r.row], r.row_bytes()), "value row of cell " + std::to_string(c));
+    // what the attention reads: every pick the reference keeps has a compact row holding its cell's K / V row, the others
+    // -1; one row per distinct cell (the rows' order is free)
+    std::vector<int> row_of(size_t(s.cells()), -1), cell_of(size_t(m.rows), -1);
+    for (size_t i = 0; i < got.size(); ++i) {
+        const std::string at = "position " + std::to_string(i) + ": got " + std::to_string(got[i]) + " want " + std::to_string(m.positions[i]);
+        require((got[i] >= 0) == (m.positions[i] >= 0) && got[i] < m.rows, at);
+        if (got[i] < 0) continue;
+        const int c = s.positions[i];
+        require(row_of[size_t(c)] < 0 || row_of[size_t(c)] == got[i], at + " (cell in two rows)");
+        require(cell_of[size_t(got[i])] < 0 || cell_of[size_t(got[i])] == c, at + " (row of two cells)");
+        if (row_of[size_t(c)] >= 0) continue;
+        row_of[size_t(c)] = got[i]; cell_of[size_t(got[i])] = c;
+        require(!std::memcmp(&k[size_t(got[i]) * r.row], &r.keys[size_t(c) * r.row], r.row_bytes()), "key row of cell " + std::to_string(c));
+        require(!std::memcmp(&v[size_t(got[i]) * r.row], &r.values[size_t(c) * r.row], r.row_bytes()), "value row of cell " + std::to_string(c));
     }
 }
 
@@ -217,6 +231,19 @@ static void cache_matches_uncached_over_steps() {
     for (int step = 0; step < 6; ++step) expect_gather(g, shifted(4, 2048, 20000 + step * 3, step), r, h.dk, h.dv, nullptr, 15000);
 }
 
+// shared per-call buffers: two gathers (other K/V, own caches) called in turn, the second over a longer context (the set
+// grows), each still matching the uncached copy
+static void shared_buffers_match() {
+    const Rows a(20100, 512); Rows b(26100, 512);
+    for (auto & x : b.keys) x = __float2bfloat16(-__bfloat162float(x) * 0.5f);  // other values than a's at the same cells
+    HostRows ha(a), hb(b);
+    tqllm_cuda::QsaGather ga(20100, a.row_bytes(), 4096, 4 * 2048, true), gb(20100, b.row_bytes(), 4096, 4 * 2048, true);
+    for (int step = 0; step < 4; ++step) {
+        expect_gather(ga, shifted(4, 2048, 20000 + step * 3, step), a, ha.dk, ha.dv, nullptr, 15000);
+        expect_gather(gb, shifted(4, 2048, 26000 + step * 3, step + 1), b, hb.dk, hb.dv, nullptr, 21000);
+    }
+}
+
 static void repeat_selection_hits_cache() {
     const Rows r(20100, 512); HostRows h(r);
     tqllm_cuda::QsaGather g(20100, r.row_bytes(), 32768);  // more slots than cells: no conflicts
@@ -294,9 +321,7 @@ static void runs_inside_graph_capture() {
     const cudaError_t end = cudaStreamEndCapture(st, &graph); cudaGetLastError();
     require(failed.empty() && end == cudaSuccess && graph, "capture of a larger call failed: " + (failed.empty() ? std::string(cudaGetErrorString(end)) : failed));
     ck(cudaGraphInstantiate(&exec, graph, 0)); ck(cudaGraphLaunch(exec, st)); ck(cudaStreamSynchronize(st));
-    const Model m = reference(s);
-    std::vector<int32_t> got(s.positions.size()); ck(cudaMemcpy(got.data(), g.positions(), got.size() * 4, cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < got.size(); ++i) require(got[i] == m.positions[i], "captured gather position " + std::to_string(i));
+    verify_gather(g, s, r);
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(st);
 }
 
@@ -329,8 +354,49 @@ static void attention_bits_unchanged() {
     for (size_t i = 0; i < a.size(); ++i) require(!std::memcmp(&a[i], &b[i], sizeof(float)), "attention output differs at " + std::to_string(i));
 }
 
-int main() {
+// bench: one decode layer's gather at a long context (6-row verify block, top-2048 blocks of 4 cells, the host rows below
+// cells - 32K through a 16K-row cache, the picks moving a little each step): the scan marking vs the O(selected) one
+static void bench(int cells) {
+    const int tokens = 6, width = 2048 + 3; const size_t row = 512;  // 2 kv heads x 256 bf16
+    Device<__nv_bfloat16> k(size_t(cells) * row), v(size_t(cells) * row);
+    std::vector<Selection> steps;
+    for (int st = 0; st < 8; ++st) {
+        Selection s(tokens, width, cells - tokens);
+        for (int t = 0; t < tokens; ++t) for (int w = 0; w < width; ++w) {
+            const size_t i = size_t(t) * width + w; s.valid[i] = 1;
+            const int block = w < 2048 ? int((uint64_t(w) * 2654435761u + uint64_t(t % 2) * 97 + uint64_t(w % 16 == 0 ? st : 0) * 7919) % uint64_t((cells - 8) / 4)) : -1;
+            s.positions[i] = block >= 0 ? block * 4 + (w % 4) : cells - tokens - 3 + (w - 2048) + t;
+        }
+        steps.push_back(s);
+    }
+    std::vector<std::unique_ptr<Device<int32_t>>> dps; std::vector<std::unique_ptr<Device<uint8_t>>> dms;
+    for (auto & s : steps) { dps.push_back(std::make_unique<Device<int32_t>>(s.positions.size())); dps.back()->put(s.positions);
+                             dms.push_back(std::make_unique<Device<uint8_t>>(s.valid.size())); dms.back()->put(s.valid); }
+    auto dp = [&](int i) { return dps[size_t(i)]->p; }; auto dm = [&](int i) { return dms[size_t(i)]->p; };
+    for (bool scan : {true, false, true, false}) {
+        tqllm_cuda::qsa_gather_set_scan(scan);
+        tqllm_cuda::QsaGather g(cells, row * 2, 16384, tokens * width);
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+        for (int w = 0; w < 4; ++w) g.run(dp(w % 8), dm(w % 8), tokens, width, cells - tokens, k.p, v.p, nullptr, cells - 32768);
+        const int reps = 200; cudaEventRecord(a);
+        for (int r = 0; r < reps; ++r) g.run(dp(r % 8), dm(r % 8), tokens, width, cells - tokens, k.p, v.p, nullptr, cells - 32768);
+        cudaEventRecord(b); cudaEventSynchronize(b); float ms = 0; cudaEventElapsedTime(&ms, a, b);
+        std::printf("bench cells %d %s: %.1f us per gather\n", cells, scan ? "scan" : "list", 1000.f * ms / reps);
+        cudaEventDestroy(a); cudaEventDestroy(b);
+    }
+    tqllm_cuda::qsa_gather_set_scan(false);
+}
+
+static void scan_mode_matches() {  // the first version (pass over every cell) still meets the same contract
+    tqllm_cuda::qsa_gather_set_scan(true);
+    try { matches_reference(); duplicates_copied_once(); cache_matches_uncached_over_steps(); } catch (...) { tqllm_cuda::qsa_gather_set_scan(false); throw; }
+    tqllm_cuda::qsa_gather_set_scan(false);
+}
+
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "bench") { for (int c : {32768, 65536, 122880}) bench(c); return 0; }
     const struct { const char * name; void (*run)(); } cases[] = {
+        {"scan_mode_matches", scan_mode_matches},
         {"matches_reference", matches_reference},
         {"duplicates_copied_once", duplicates_copied_once},
         {"skips_invalid_negative_and_future", skips_invalid_negative_and_future},
@@ -341,6 +407,7 @@ int main() {
         {"rejects_bad_shapes", rejects_bad_shapes},
         {"attention_bits_unchanged", attention_bits_unchanged},
         {"cache_matches_uncached_over_steps", cache_matches_uncached_over_steps},
+        {"shared_buffers_match", shared_buffers_match},
         {"repeat_selection_hits_cache", repeat_selection_hits_cache},
         {"same_slot_conflict_is_safe", same_slot_conflict_is_safe},
         {"device_cells_not_cached", device_cells_not_cached},
