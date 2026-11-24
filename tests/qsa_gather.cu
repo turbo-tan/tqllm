@@ -297,7 +297,11 @@ static void rewrite_invalidates_cache() {
     Device<int32_t> dp(s.positions.size()); Device<uint8_t> dm(s.valid.size()); dp.put(s.positions); dm.put(s.valid);
     g.run(dp.p, dm.p, s.tokens, s.width, s.first, h.dk, h.dv, nullptr, 4000, 120);  // this call wrote from position 120 on
     ck(cudaDeviceSynchronize());
-    const Model m = reference(s); const int j = m.map[120];
+    // the compact row of cell 120 is the one its pick (token 0, w 20) was remapped to: in the O(selected) marking the rows
+    // are in claim order (atomics across warps), not the reference's cell order, so reference(s).map[120] can name another
+    // cell's row
+    int32_t j = -1; ck(cudaMemcpy(&j, g.positions() + 20, sizeof(j), cudaMemcpyDeviceToHost));
+    require(j >= 0, "cell 120's pick has no compact row");
     std::vector<__nv_bfloat16> k(r.row);
     ck(cudaMemcpy(k.data(), static_cast<const char *>(g.keys()) + size_t(j) * r.row_bytes(), r.row_bytes(), cudaMemcpyDeviceToHost));
     require(!std::memcmp(k.data(), &r.keys[size_t(120) * r.row], r.row_bytes()), "a rewritten row came from the cache (stale)");
