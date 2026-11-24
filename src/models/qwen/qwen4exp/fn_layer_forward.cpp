@@ -590,6 +590,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             const int32_t hdr[3] = {layer, n, predict ? A : 0}; std::fwrite(hdr, 4, 3, dump);
             std::fwrite(routed_ids.data(), 4, routed_ids.size(), dump);
             if (predict) std::fwrite(ids_host.p + A, 4, size_t(A), dump);
+            std::fflush(dump);  // a server stopped by its scope keeps the whole trace
         }
         // TQFN_CPU_MISS: a non-resident expert goes to the CPU pool; its GPU assignment points at a resident expert of the
         // same token (output row overwritten before the combine), so the cache neither copies nor inserts it.

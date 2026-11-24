@@ -150,6 +150,8 @@ void k_expert_matvec_dedup(int fmt, const uint8_t * w, const void * aux, const _
         case 5: TQ_DEDUP(5); break;
         case 6: TQ_DEDUP(6); break;
         case 7: TQ_DEDUP(7); break;
+        case 8: TQ_DEDUP(8); break;
+        case 9: TQ_DEDUP(9); break;
         case 10: TQ_DEDUP(10); break;
         case 13: TQ_DEDUP(13); break;
         case 14: TQ_DEDUP(14); break;
@@ -228,6 +230,8 @@ static void dedup2_launch(int fmt, const uint8_t * wa, const void * auxa, const 
         case 5: TQ_DEDUP2(5); break;
         case 6: TQ_DEDUP2(6); break;
         case 7: TQ_DEDUP2(7); break;
+        case 8: TQ_DEDUP2(8); break;
+        case 9: TQ_DEDUP2(9); break;
         case 10: TQ_DEDUP2(10); break;
         case 13: TQ_DEDUP2(13); break;
         case 14: TQ_DEDUP2(14); break;

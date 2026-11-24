@@ -8,6 +8,7 @@
 #include "inkling2_kernels.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -269,6 +270,168 @@ void test_experts(int fmt) {
     report(fmt == 2 ? "experts NVF4 gate/up + SwiGLU" : "experts MXFP8 gate/up + SwiGLU", ea, 2e-2, bit);
     report(fmt == 2 ? "experts NVF4 down + combine" : "experts MXFP8 down + combine", eo, 2e-2, bit);
     cudaFree(dx); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
+}
+
+// TQT (fmt 3): random stream bytes and FP16 scales; the reference weights are the code's values x scale in TQ4's rotated basis
+// (written from the format description: tools/convert/qwen35/tqt.py code_values) un-rotated per 128 (R^-1 = D H / sqrt(128))
+const uint32_t kS1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+float tqt_sign(int c) { return (kS1[c / 32] >> (c % 32)) & 1u ? -1.0f : 1.0f; }
+void tqt_pair(uint32_t w, float & lo, float & hi, int L = 18) {
+    const uint32_t x = (w * 0x9E3779B1u + 0x7F4A7C15u) << (32 - L), y = (x << 16) | (x >> 16);
+    const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
+    const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    auto f16 = [](uint32_t b) { __half h; std::memcpy(&h, &b, 2); return __half2float(h); };
+    lo = __half2float(__float2half_rn(f16(h1 & 0xFFFF) + f16(h2 & 0xFFFF)));
+    hi = __half2float(__float2half_rn(f16(h1 >> 16) + f16(h2 >> 16)));
+}
+void fwht128(double * v) {
+    for (int h = 1; h < 128; h <<= 1)
+        for (int i = 0; i < 128; i += 2 * h)
+            for (int j = i; j < i + h; ++j) { const double a = v[j], b = v[j + h]; v[j] = a + b; v[j + h] = a - b; }
+}
+void rot128(const float * x, float * y) {  // R x
+    double v[128];
+    for (int c = 0; c < 128; ++c) v[c] = double(x[c]) * tqt_sign(c);
+    fwht128(v);
+    for (int c = 0; c < 128; ++c) y[c] = float(v[c] / std::sqrt(128.0));
+}
+void make_bank_tqt(ExpertBank & b, int E, int rows, int cols, int fmt = 3) {
+    b.m.fmt = fmt;
+    const size_t rb = fmt == 5 ? size_t(cols) * 3 / 8 : size_t(cols) / (fmt == 4 ? 4 : 2), nb = size_t(cols) / 128;
+    b.m.stride = rb * rows; b.m.aux_stride = nb * 2 * rows;
+    b.bytes.resize(b.m.stride * E); b.aux.resize(b.m.aux_stride * E);
+    b.w.resize(size_t(E) * rows * cols);
+    for (int e = 0; e < E; ++e)
+        for (int r = 0; r < rows; ++r) {
+            uint8_t * row = b.bytes.data() + e * b.m.stride + size_t(r) * rb;
+            for (size_t j = 0; j < rb; ++j) row[j] = uint8_t(rng());
+            for (size_t k = 0; k < nb; ++k) {
+                const __half sc = __float2half_rn(0.004f + 0.0001f * float(rng() % 100));
+                std::memcpy(b.aux.data() + e * b.m.aux_stride + (size_t(r) * nb + k) * 2, &sc, 2);
+                double q[128];
+                for (int p = 0; p < 64; ++p) {
+                    float lo, hi;
+                    if (fmt == 5) {
+                        const uint8_t * s = row + k * 48;
+                        uint32_t w = 0;
+                        for (int j = 0; j < 18; ++j) { const int i = (6 * p + j) % 384; w |= uint32_t((s[i >> 3] >> (i & 7)) & 1) << j; }
+                        tqt_pair(w, lo, hi, 18);
+                    } else if (fmt == 4) {
+                        const uint8_t * s = row + k * 32;
+                        uint32_t w = 0;
+                        for (int j = 0; j < 4; ++j) { const int i = (p + j) & 63; w |= uint32_t((s[i >> 1] >> (4 * (i & 1))) & 15) << (4 * j); }
+                        tqt_pair(w, lo, hi, 16);
+                    } else {
+                        const uint8_t * s = row + k * 64;
+                        tqt_pair((uint32_t(s[p]) | uint32_t(s[(p + 1) & 63]) << 8 | uint32_t(s[(p + 2) & 63]) << 16) & 0x3FFFF, lo, hi);
+                    }
+                    q[2 * p] = double(lo) * __half2float(sc); q[2 * p + 1] = double(hi) * __half2float(sc);
+                }
+                fwht128(q);
+                float * wr = b.w.data() + (size_t(e) * rows + r) * cols + k * 128;
+                for (int c = 0; c < 128; ++c) wr[c] = float(q[c] / std::sqrt(128.0)) * tqt_sign(c);
+            }
+        }
+    b.upload();
+}
+std::vector<__half> rot_half(const std::vector<float> & x, size_t rows, size_t cols) {
+    std::vector<__half> o(x.size());
+    std::vector<float> y(128);
+    for (size_t r = 0; r < rows; ++r)
+        for (size_t b = 0; b < cols / 128; ++b) {
+            rot128(x.data() + r * cols + b * 128, y.data());
+            for (int c = 0; c < 128; ++c) o[r * cols + b * 128 + c] = __float2half_rn(y[c]);
+        }
+    return o;
+}
+
+void test_experts_tqt(int fmt) {
+    const int E = 16, topk = 8, D = 2304, I = 1152, NMAX = 4;
+    const float gc = 4.0f, uc = 25.0f;
+    ExpertBank G, U, Dn;
+    make_bank_tqt(G, E, I, D, fmt); make_bank_tqt(U, E, I, D, fmt); make_bank_tqt(Dn, E, D, I, fmt);
+    {   // the BF16 decode (original basis) against the reference weights, one expert of each stack
+        bf16 * dd = nullptr;
+        ck(cudaMalloc(&dd, size_t(E) * I * D * 2), "dec");
+        K::experts_decode_bf16(G.m, E, I, D, I, dd, 0);
+        ck(cudaDeviceSynchronize(), "decode");
+        const auto h = from_bf(down(dd, size_t(E) * I * D));
+        double worst = 0;
+        for (size_t i = 0; i < h.size(); ++i) worst = std::max(worst, std::fabs(h[i] - bf(G.w[i])) / (std::fabs(G.w[i]) + 1e-3));
+        report(fmt == 5 ? "experts TQT3 decode to BF16 (un-rotated)" : fmt == 4 ? "experts TQT2 decode to BF16 (un-rotated)" : "experts TQT decode to BF16 (un-rotated)", worst, 1e-2, true);
+        cudaFree(dd);
+    }
+    const auto X = randv(size_t(NMAX) * D, 1.0f);
+    std::vector<int> ids(size_t(NMAX) * topk);
+    std::vector<float> wts(ids.size());
+    for (int t = 0; t < NMAX; ++t) {
+        std::vector<int> p(E);
+        for (int e = 0; e < E; ++e) p[e] = e;
+        std::shuffle(p.begin(), p.end(), rng);
+        for (int k = 0; k < topk; ++k) { ids[t * topk + k] = p[k]; wts[t * topk + k] = 0.5f + float(rng() % 100) / 100.0f; }
+    }
+    const auto xr = rot_half(X, NMAX, D);
+    __half * dxh = up(xr), * dah = nullptr;
+    {   // the device rotation against the host one (FP16 outputs, FP32 butterflies in another order: <= 1 FP16 step)
+        bf16 * dxb = up(to_bf(X));
+        __half * drot = nullptr;
+        ck(cudaMalloc(&drot, xr.size() * 2), "rot");
+        K::rotate_h(dxb, drot, D, NMAX, 0);
+        ck(cudaDeviceSynchronize(), "rotate");
+        const auto r = down(drot, xr.size());
+        double worst = 0;
+        for (size_t i = 0; i < r.size(); ++i) worst = std::max(worst, std::fabs(__half2float(r[i]) - __half2float(xr[i])) / (std::fabs(__half2float(xr[i])) + 0.05));
+        report("rotate_h (TQ4 rotation, FP16)", worst, 2e-3, true);
+        cudaFree(dxb); cudaFree(drot);
+    }
+    bf16 * dact = nullptr, * dout = nullptr;
+    int * dids = up(ids);
+    float * dw = up(wts);
+    ck(cudaMalloc(&dact, size_t(NMAX) * topk * I * 2), "act"); ck(cudaMalloc(&dout, size_t(NMAX) * D * 2), "out");
+    ck(cudaMalloc(&dah, size_t(NMAX) * topk * I * 2), "acth");
+    K::expert_gate_up(G.m, U.m, I, D, nullptr, dids, dact, NMAX, topk, gc, uc, 0, dxh);
+    ck(cudaDeviceSynchronize(), "gate up");
+    const auto act = from_bf(down(dact, size_t(NMAX) * topk * I));
+    const auto ar = rot_half(act, size_t(NMAX) * topk, I);
+    ck(cudaMemcpy(dah, ar.data(), ar.size() * 2, cudaMemcpyHostToDevice), "acth");
+    K::expert_down(Dn.m, D, I, nullptr, dids, dw, dout, NMAX, topk, 0, dah);
+    ck(cudaDeviceSynchronize(), "down");
+    const auto out = from_bf(down(dout, size_t(NMAX) * D));
+    double ea = 0, eo = 0;
+    for (int t = 0; t < NMAX; ++t) {
+        std::vector<double> y(D, 0.0);
+        for (int k = 0; k < topk; ++k) {
+            const int a = t * topk + k, e = ids[a];
+            for (int i = 0; i < I; ++i) {
+                double g = 0, u = 0;
+                for (int c = 0; c < D; ++c) {
+                    g += double(G.w[(size_t(e) * I + i) * D + c]) * X[size_t(t) * D + c];
+                    u += double(U.w[(size_t(e) * I + i) * D + c]) * X[size_t(t) * D + c];
+                }
+                g = bf(float(g)); u = bf(float(u));
+                const double ref = gc * std::tanh(g / gc) / (1.0 + std::exp(-g)) * uc * std::tanh(u / uc);
+                ea = std::max(ea, std::fabs(act[size_t(a) * I + i] - ref) / (std::fabs(ref) + 0.05));
+            }
+            for (int r = 0; r < D; ++r) {
+                double d = 0;
+                for (int i = 0; i < I; ++i) d += double(Dn.w[(size_t(e) * D + r) * I + i]) * act[size_t(a) * I + i];
+                y[r] += bf(float(d)) * wts[a];
+            }
+        }
+        for (int r = 0; r < D; ++r) eo = std::max(eo, std::fabs(out[size_t(t) * D + r] - y[r]) / (std::fabs(y[r]) + 0.05));
+    }
+    bool bit = true;
+    for (int t = 0; t < NMAX; ++t) {
+        K::expert_gate_up(G.m, U.m, I, D, nullptr, dids + t * topk, dact, 1, topk, gc, uc, 0, dxh + size_t(t) * D);
+        K::expert_down(Dn.m, D, I, nullptr, dids + t * topk, dw + t * topk, dout, 1, topk, 0, dah + size_t(t) * topk * I);
+        ck(cudaDeviceSynchronize(), "experts one");
+        const auto a1 = from_bf(down(dact, size_t(topk) * I)), o1 = from_bf(down(dout, size_t(D)));
+        bit = bit && std::memcmp(a1.data(), act.data() + size_t(t) * topk * I, a1.size() * 4) == 0;
+        bit = bit && std::memcmp(o1.data(), out.data() + size_t(t) * D, o1.size() * 4) == 0;
+    }
+    report(fmt == 5 ? "experts TQT3 gate/up + SwiGLU" : fmt == 4 ? "experts TQT2 gate/up + SwiGLU" : "experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
+    report(fmt == 5 ? "experts TQT3 down + combine" : fmt == 4 ? "experts TQT2 down + combine" : "experts TQT down + combine", eo, 3e-2, bit);
+    cudaFree(dxh); cudaFree(dah); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
 }
 
 void test_route() {
@@ -706,6 +869,81 @@ void test_attn_res_capture(int n) {
 }
 }  // namespace
 
+// small cards: the TQT prompt path decodes and multiplies G experts at a time (expert_slice + grouped_gather +
+// grouped_gate_up_part_bf16 + grouped_down_bf16 on the group's hc / ho slices) == the whole layer at once, bitwise;
+// a group with no routed rows is skipped. choose_tqt_group keeps every expert resident when a smaller group allows it.
+void test_tqt_groups(int fmt) {
+    const int E = 16, G = 4, topk = 4, D = 256, I = 128, n = 96, A = n * topk;
+    const float gc = 4.0f, uc = 25.0f;
+    ExpertBank Gt, Ut, Dt;
+    make_bank_tqt(Gt, E, I, D, fmt); make_bank_tqt(Ut, E, I, D, fmt); make_bank_tqt(Dt, E, D, I, fmt);
+    const auto X = randv(size_t(n) * D, 1.0f);
+    std::vector<int> ids(A);
+    for (int t = 0; t < n; ++t) {  // experts 8-11 (one whole group) never routed, expert 2 never routed
+        std::vector<int> p;
+        for (int e = 0; e < E; ++e) if (e != 2 && (e < 8 || e > 11)) p.push_back(e);
+        std::shuffle(p.begin(), p.end(), rng);
+        for (int k = 0; k < topk; ++k) ids[t * topk + k] = p[k];
+    }
+    bf16 * dx = up(to_bf(X)), * dbgu = nullptr, * dbdn = nullptr, * sgu = nullptr, * sdn = nullptr;
+    bf16 * dxg = nullptr, * dgu = nullptr, * dact = nullptr, * dyg = nullptr, * dact2 = nullptr, * dyg2 = nullptr;
+    int * dids = up(ids), * order = nullptr, * counts = nullptr, * offsets = nullptr, * tiles = nullptr;
+    ck(cudaMalloc(&dbgu, size_t(E) * 2 * I * D * 2), "bgu"); ck(cudaMalloc(&dbdn, size_t(E) * D * I * 2), "bdn");
+    ck(cudaMalloc(&sgu, size_t(G) * 2 * I * D * 2), "sgu"); ck(cudaMalloc(&sdn, size_t(G) * D * I * 2), "sdn");
+    ck(cudaMalloc(&dxg, size_t(A) * D * 2), "xg"); ck(cudaMalloc(&dgu, size_t(A) * 2 * I * 2), "gu");
+    ck(cudaMalloc(&dact, size_t(A) * I * 2), "act"); ck(cudaMalloc(&dyg, size_t(A) * D * 2), "yg");
+    ck(cudaMalloc(&dact2, size_t(A) * I * 2), "act2"); ck(cudaMalloc(&dyg2, size_t(A) * D * 2), "yg2");
+    ck(cudaMalloc(&order, A * 4), "order"); ck(cudaMalloc(&counts, E * 4), "counts"); ck(cudaMalloc(&offsets, E * 4), "offsets");
+    ck(cudaMalloc(&tiles, (E + 1) * 4), "tiles");
+    cublasHandle_t blas = nullptr;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) { std::printf("cublasCreate failed\n"); ok = false; return; }
+    K::group_assignments(dids, A, E, order, counts, offsets, tiles, 0);
+    const auto hc = down(counts, size_t(E)), ho = down(offsets, size_t(E));
+    // whole layer
+    K::experts_decode_bf16(Gt.m, E, I, D, 2 * I, dbgu, 0);
+    K::experts_decode_bf16(Ut.m, E, I, D, 2 * I, dbgu + size_t(I) * D, 0);
+    K::experts_decode_bf16(Dt.m, E, D, I, D, dbdn, 0);
+    K::grouped_gate_up_bf16(dbgu, I, D, dx, A, E, topk, order, hc.data(), ho.data(), dxg, dgu, dact, gc, uc, blas, 0);
+    K::grouped_down_bf16(dbdn, D, I, dact, A, E, hc.data(), ho.data(), dyg, blas, 0);
+    ck(cudaDeviceSynchronize(), "whole");
+    // G experts at a time (the model's loop)
+    ck(cudaMemset(dact2, 0, size_t(A) * I * 2), "act2"); ck(cudaMemset(dyg2, 0, size_t(A) * D * 2), "yg2");
+    K::grouped_gather(dx, A, order, topk, dxg, D, 0);
+    int groups_run = 0;
+    for (int e0 = 0; e0 < E; e0 += G) {
+        int rows = 0;
+        for (int e = e0; e < e0 + G; ++e) rows += hc[e];
+        if (rows == 0) continue;
+        ++groups_run;
+        K::experts_decode_bf16(K::expert_slice(Gt.m, e0), G, I, D, 2 * I, sgu, 0);
+        K::experts_decode_bf16(K::expert_slice(Ut.m, e0), G, I, D, 2 * I, sgu + size_t(I) * D, 0);
+        K::experts_decode_bf16(K::expert_slice(Dt.m, e0), G, D, I, D, sdn, 0);
+        K::grouped_gate_up_part_bf16(sgu, I, D, dxg, G, hc.data() + e0, ho.data() + e0, dgu, dact2, gc, uc, blas, 0);
+        K::grouped_down_bf16(sdn, D, I, dact2, A, G, hc.data() + e0, ho.data() + e0, dyg2, blas, 0);
+        ck(cudaDeviceSynchronize(), "group");
+    }
+    const auto a1 = down(dact, size_t(A) * I), a2 = down(dact2, size_t(A) * I), y1 = down(dyg, size_t(A) * D), y2 = down(dyg2, size_t(A) * D);
+    const bool same = std::memcmp(a1.data(), a2.data(), a1.size() * 2) == 0 && std::memcmp(y1.data(), y2.data(), y1.size() * 2) == 0;
+    report(fmt == 3 ? "TQT prompt experts in groups == whole layer (bitwise)" : "TQT3 prompt experts in groups == whole layer (bitwise)", 0.0, 1.0,
+           same && groups_run == E / G - 1);
+    cublasDestroy(blas);
+    cudaFree(dx); cudaFree(dbgu); cudaFree(dbdn); cudaFree(sgu); cudaFree(sdn); cudaFree(dxg); cudaFree(dgu); cudaFree(dact); cudaFree(dyg);
+    cudaFree(dact2); cudaFree(dyg2); cudaFree(dids); cudaFree(order); cudaFree(counts); cudaFree(offsets); cudaFree(tiles);
+}
+
+void test_tqt_group_choice() {
+    const size_t GB = size_t(1) << 30, per = size_t(3) * 1152 * 2304 * 2;  // Inkling: gate + up + down of one expert in BF16 (15.9 MB)
+    // 16 GB card (5060 Ti): 15.2 GB free, 12.61 GB of TQT experts, 1.5 GB reserve + 0.23 GB chunk buffers:
+    // the whole layer (128 x 15.9 MB = 2.04 GB) would push experts out; 64 does not
+    const int g16 = K::choose_tqt_group(128, size_t(15.2 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);
+    const int g24 = K::choose_tqt_group(128, size_t(22.5 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);  // 24 GB card: whole layer
+    const int gmin = K::choose_tqt_group(128, size_t(13.0 * GB), size_t(12.61 * GB), size_t(1.73 * GB), per);  // nothing fits: 8
+    const bool fits16 = 12.61 * GB + 1.73 * GB + double(g16) * per <= 15.2 * GB;
+    report("TQT group choice (16 GB: smaller group, 24 GB: whole layer, too small: 8)", 0.0, 1.0,
+           g16 < 128 && g16 >= 8 && fits16 && g24 == 128 && gmin == 8);
+    std::printf("  groups: 16 GB -> %d, 24 GB -> %d, too small -> %d\n", g16, g24, gmin);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
@@ -713,6 +951,9 @@ int main() {
     test_gemv_i8();
     test_experts(2);
     test_experts(1);
+    test_experts_tqt(3);
+    test_experts_tqt(4);
+    test_experts_tqt(5);
     test_route();
     test_attn_res_capture(1);
     test_attn_res_capture(5);
@@ -723,6 +964,9 @@ int main() {
     test_grouped_bf16_threshold();
     test_grouped_bf16(2);
     test_grouped_bf16(1);
+    test_tqt_groups(3);
+    test_tqt_groups(5);
+    test_tqt_group_choice();
     test_conv();
     std::printf(ok ? "inkling2-kernels: PASS\n" : "inkling2-kernels: FAIL\n");
     return ok ? 0 : 1;

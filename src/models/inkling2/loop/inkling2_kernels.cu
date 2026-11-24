@@ -1,5 +1,6 @@
 // Inkling-2-Mini small kernels (see inkling2_kernels.cuh). Correctness first: simple one-block-per-token shapes.
 #include "inkling2_kernels.cuh"
+#include "tqt_decode.cuh"
 
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -456,10 +457,11 @@ __device__ __forceinline__ void rows_dot_nvf4(const uint8_t * const * row, const
 // a row's data / aux pointers inside expert e
 template <int FMT>
 __device__ __forceinline__ const uint8_t * row_ptr(const ExpertMat & m, int e, int row, int cols) {
-    return (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (FMT == 2 ? size_t(cols / 2) : size_t(cols + cols / 32));
+    return (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (FMT == 5 ? size_t(cols) * 3 / 8 : FMT == 4 ? size_t(cols / 4) : FMT >= 2 ? size_t(cols / 2) : size_t(cols + cols / 32));
 }
 template <int FMT>
 __device__ __forceinline__ const uint8_t * aux_ptr(const ExpertMat & m, int e, int row, int cols) {
+    if constexpr (FMT >= 3) return (m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) * 2;
     return FMT == 2 ? (m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 16 + 4) : nullptr;
 }
 
@@ -528,6 +530,166 @@ __global__ void __launch_bounds__(256) expert_down_nvf4_k(ExpertMat md, int rows
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) if (lane == 0 && row0 + r < rows) out[size_t(t) * rows + row0 + r] = __float2bfloat16(y[r]);
+}
+
+// warp per 128 columns: signs S1, a 128-point Walsh-Hadamard transform (4 values per lane + shuffles), / sqrt(128), FP16
+__constant__ uint32_t kRotS1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+__global__ void rotate_h_k(const __nv_bfloat16 * x, __half * xh, int k) {
+    const int col = blockIdx.y, lane = threadIdx.x % 32, grp = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (grp * 128 >= k) return;
+    const size_t base = size_t(col) * k + size_t(grp) * 128 + lane * 4;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float xv = __bfloat162float(x[base + j]);
+        v[j] = ((kRotS1[lane / 8] >> ((lane * 4 + j) % 32)) & 1u) ? -xv : xv;
+    }
+    float a = v[0], b = v[1];
+    v[0] = a + b, v[1] = a - b;
+    a = v[2], b = v[3];
+    v[2] = a + b, v[3] = a - b;
+    a = v[0], b = v[2];
+    v[0] = a + b, v[2] = a - b;
+    a = v[1], b = v[3];
+    v[1] = a + b, v[3] = a - b;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float other = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? other - v[j] : v[j] + other;
+        }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xh[base + j] = __float2half_rn(v[j] * 0.08838834764831845f);
+}
+// TQT row (fmt 3) dotted with the rotated FP16 activation: a lane takes whole 32-weight segments (16 stream bytes + the
+// first word of the next segment of its block), the code's FP16 pair values and F32 products, one FP16 scale per block
+__device__ __forceinline__ float row_dot_tqt(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
+    const uint4 * w4 = reinterpret_cast<const uint4 *>(row);
+    const __half * sc = reinterpret_cast<const __half *>(aux);
+    float acc = 0.0f;
+    for (int sg = lane; sg < cols / 32; sg += 32) {
+        const uint4 v = __ldcs(w4 + sg);
+        const uint32_t nx = __ldg(reinterpret_cast<const uint32_t *>(w4 + ((sg & ~3) | ((sg + 1) & 3))));
+        const uint32_t E[5] = {v.x, v.y, v.z, v.w, nx};
+        const float scl = __half2float(__ldg(sc + sg / 4));
+        const uint4 * xp = reinterpret_cast<const uint4 *>(xh + size_t(sg) * 32);
+        float part = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint4 xv = __ldg(xp + q);
+            const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t wp = tqllm_cuda::tqtk::pair(E, q * 4 + j);
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wp));
+                const float2 xf = __half22float2(*reinterpret_cast<const __half2 *>(&xw[j]));
+                part = fmaf(wf.x, xf.x, part);
+                part = fmaf(wf.y, xf.y, part);
+            }
+        }
+        acc = fmaf(scl, part, acc);
+    }
+    return acc;
+}
+// TQT2 row (fmt 4): a lane takes a 32-weight segment = 8 stream bytes (+ the first word of the next segment of its block for the
+// windows of the last pairs), pair p reads the 16 bits at bit 4p
+__device__ __forceinline__ float row_dot_tqt2(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
+    const uint2 * w2 = reinterpret_cast<const uint2 *>(row);
+    const __half * sc = reinterpret_cast<const __half *>(aux);
+    float acc = 0.0f;
+    for (int sg = lane; sg < cols / 32; sg += 32) {
+        const uint2 v = __ldcs(w2 + sg);
+        const uint32_t nx = __ldg(reinterpret_cast<const uint32_t *>(w2 + ((sg & ~3) | ((sg + 1) & 3))));
+        const uint32_t E[3] = {v.x, v.y, nx};
+        const float scl = __half2float(__ldg(sc + sg / 4));
+        const uint4 * xp = reinterpret_cast<const uint4 *>(xh + size_t(sg) * 32);
+        float part = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint4 xv = __ldg(xp + q);
+            const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q * 4 + j, i = p / 8, o = 4 * (p % 8);
+                const uint32_t wp = tqllm_cuda::tqtk::pair_win16(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o));
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wp));
+                const float2 xf = __half22float2(*reinterpret_cast<const __half2 *>(&xw[j]));
+                part = fmaf(wf.x, xf.x, part);
+                part = fmaf(wf.y, xf.y, part);
+            }
+        }
+        acc = fmaf(scl, part, acc);
+    }
+    return acc;
+}
+// TQT3 row (fmt 5): a lane takes a 32-weight segment = 12 stream bytes (+ the first word of the next segment of its block), pair p
+// reads the 18 bits at bit 6 p
+__device__ __forceinline__ float row_dot_tqt3(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
+    const uint32_t * w3 = reinterpret_cast<const uint32_t *>(row);
+    const __half * sc = reinterpret_cast<const __half *>(aux);
+    float acc = 0.0f;
+    for (int sg = lane; sg < cols / 32; sg += 32) {
+        const uint32_t E[4] = {__ldcs(w3 + 3 * sg), __ldcs(w3 + 3 * sg + 1), __ldcs(w3 + 3 * sg + 2), __ldg(w3 + 3 * ((sg & ~3) | ((sg + 1) & 3)))};
+        const float scl = __half2float(__ldg(sc + sg / 4));
+        const uint4 * xp = reinterpret_cast<const uint4 *>(xh + size_t(sg) * 32);
+        float part = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint4 xv = __ldg(xp + q);
+            const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q * 4 + j, i = (6 * p) / 32, o = (6 * p) % 32;
+                const uint32_t wp = tqllm_cuda::tqtk::pair_win(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o));
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wp));
+                const float2 xf = __half22float2(*reinterpret_cast<const __half2 *>(&xw[j]));
+                part = fmaf(wf.x, xf.x, part);
+                part = fmaf(wf.y, xf.y, part);
+            }
+        }
+        acc = fmaf(scl, part, acc);
+    }
+    return acc;
+}
+template <int FMT> __device__ __forceinline__ float row_dot_trellis(const uint8_t * row, const uint8_t * aux, int cols, const __half * xh, int lane) {
+    if constexpr (FMT == 5) return row_dot_tqt3(row, aux, cols, xh, lane);
+    else if constexpr (FMT == 4) return row_dot_tqt2(row, aux, cols, xh, lane);
+    else return row_dot_tqt(row, aux, cols, xh, lane);
+}
+// grid (rows / 8, n * topk): as expert_gate_up_k, xh = x rotated per 128 (FP16)
+template <int FMT>
+__global__ void __launch_bounds__(256) expert_gate_up_tqt_k(ExpertMat mg, ExpertMat mu, int rows, int cols, const __half * xh, const int * ids,
+                                                            __nv_bfloat16 * act, int topk, float gc, float uc) {
+    const int a = blockIdx.y, row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    const int e = ids[a];
+    const __half * xr = xh + size_t(a / topk) * cols;
+    const float g0 = row_dot_trellis<FMT>(row_ptr<FMT>(mg, e, row, cols), aux_ptr<FMT>(mg, e, row, cols), cols, xr, lane);
+    const float u0 = row_dot_trellis<FMT>(row_ptr<FMT>(mu, e, row, cols), aux_ptr<FMT>(mu, e, row, cols), cols, xr, lane);
+    const float g = bfr(warp_sum(g0)), u = bfr(warp_sum(u0));
+    if (lane == 0) act[size_t(a) * rows + row] = __float2bfloat16(gc * tanhf(g / gc) * (1.0f / (1.0f + expf(-g))) * (uc * tanhf(u / uc)));
+}
+// grid (rows / 8, n): as expert_down_k, acth = act rotated per 128 (FP16 [n * topk][cols])
+template <int FMT>
+__global__ void __launch_bounds__(256) expert_down_tqt_k(ExpertMat md, int rows, int cols, const __half * acth, const int * ids, const float * wts,
+                                                         __nv_bfloat16 * out, int topk) {
+    const int t = blockIdx.y, row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    float p[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        if (k >= topk) break;
+        const int a = t * topk + k, e = ids[a];
+        p[k] = row_dot_trellis<FMT>(row_ptr<FMT>(md, e, row, cols), aux_ptr<FMT>(md, e, row, cols), cols, acth + size_t(a) * cols, lane);
+    }
+    float y = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        if (k >= topk) break;
+        y = fmaf(bfr(warp_sum(p[k])), wts[t * topk + k], y);
+    }
+    if (lane == 0) out[size_t(t) * rows + row] = __float2bfloat16(y);
 }
 
 // grid (rows / 8, n): warp = output row of token blockIdx.y over its topk experts
@@ -1079,10 +1241,15 @@ void down_launch(const ExpertMat & d, int rows, int cols, const __nv_bfloat16 * 
     }
 }
 void expert_gate_up(const ExpertMat & g, const ExpertMat & u, int rows, int cols, const __nv_bfloat16 * x, const int * ids, __nv_bfloat16 * act, int n,
-                    int topk, float gc, float uc, cudaStream_t s) {
+                    int topk, float gc, float uc, cudaStream_t s, const __half * xh) {
     if (n <= 0) return;
     if (cols % 128 || g.fmt != u.fmt) throw std::runtime_error("inkling2 experts: cols % 128 or mixed formats");
-    if (g.fmt == 2) {
+    if (g.fmt >= 3) {
+        if (!xh) throw std::runtime_error("inkling2 experts: TQT needs the rotated activation");
+        if (g.fmt == 5) expert_gate_up_tqt_k<5><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
+        else if (g.fmt == 4) expert_gate_up_tqt_k<4><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
+        else expert_gate_up_tqt_k<3><<<dim3((rows + 7) / 8, n * topk), 256, 0, s>>>(g, u, rows, cols, xh, ids, act, topk, gc, uc);
+    } else if (g.fmt == 2) {
         if (cols == 2304) gate_up_launch<2, 72>(g, u, rows, cols, x, ids, act, n, topk, gc, uc, s);
         else gate_up_launch<2, 0>(g, u, rows, cols, x, ids, act, n, topk, gc, uc, s);
     } else if (g.fmt == 1) {
@@ -1093,10 +1260,15 @@ void expert_gate_up(const ExpertMat & g, const ExpertMat & u, int rows, int cols
     }
 }
 void expert_down(const ExpertMat & d, int rows, int cols, const __nv_bfloat16 * act, const int * ids, const float * wts, __nv_bfloat16 * out, int n,
-                 int topk, cudaStream_t s) {
+                 int topk, cudaStream_t s, const __half * acth) {
     if (n <= 0) return;
     if (topk > 16 || cols % 128) throw std::runtime_error("inkling2 expert_down: topk > 16 or cols % 128");
-    if (d.fmt == 2) {
+    if (d.fmt >= 3) {
+        if (!acth) throw std::runtime_error("inkling2 experts: TQT needs the rotated activation");
+        if (d.fmt == 5) expert_down_tqt_k<5><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
+        else if (d.fmt == 4) expert_down_tqt_k<4><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
+        else expert_down_tqt_k<3><<<dim3((rows + 7) / 8, n), 256, 0, s>>>(d, rows, cols, acth, ids, wts, out, topk);
+    } else if (d.fmt == 2) {
         if (cols == 1152) down_launch<2, 36>(d, rows, cols, act, ids, wts, out, n, topk, s);
         else down_launch<2, 0>(d, rows, cols, act, ids, wts, out, n, topk, s);
     } else if (d.fmt == 1) {
@@ -1130,6 +1302,7 @@ void count_routes(const int * ids, int A, int * counts, cudaStream_t s) {
 void expert_dedup(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __nv_bfloat16 * x, const int * ids, const float * wts,
                   int * groups, __nv_bfloat16 * act, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc, cudaStream_t s) {
     const int A = n * topk;
+    if (g.fmt >= 3) throw std::runtime_error("inkling2 expert_dedup: TQT experts take the per-assignment kernels");
     if (A > kMaxAssign || n > kMaxMembers || g.fmt != d.fmt) throw std::runtime_error("inkling2 expert_dedup: block too wide");
     dedup_groups_k<<<1, kMaxAssign, 0, s>>>(ids, A, groups);
     if (g.fmt == 2) {
@@ -1148,6 +1321,9 @@ void quantize_rows_i8(const __nv_bfloat16 * w, int8_t * q, float * scale, int ro
 void dequant_rows_i8(const int8_t * q, const float * scale, __nv_bfloat16 * w, int rows, int K, cudaStream_t s) {
     const size_t n = size_t(rows) * K;
     if (n) dequant_rows_i8_k<<<grid_of(n), 256, 0, s>>>(q, scale, w, n, K);
+}
+void rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t s) {
+    if (ncols > 0 && k > 0) rotate_h_k<<<dim3((k / 128 + 7) / 8, ncols), 256, 0, s>>>(x, xh, k);
 }
 void route_topk(const float * logits, const float * bias, int * ids, float * wts, int n, int E, int topk, float scale, cudaStream_t s) {
     if (n > 0) route_topk_k<<<n, 32, 0, s>>>(logits, bias, ids, wts, E, topk, scale);

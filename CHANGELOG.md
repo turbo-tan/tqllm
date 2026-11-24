@@ -5,7 +5,21 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 
 ## Unreleased
 
+### Added
+- Inkling-2-Mini on 16 GB cards: TQT 4 / 3 / 2-bit routed experts (overlay GGUF next to the checkpoint folder, types
+  306 / 308 / 307) with their decode and prompt kernels and the encoder (`tools/convert/inkling2/inkling2_tqt.py`); the
+  resident experts are re-planned from recent routing (16 GB cards kept the first N for good); the prompt path
+  multiplies experts in groups sized from free memory. RTX 5060 Ti, 14.5 GB TQT file, decode 1K / 8K / 32K
+  55.9 / 25.5 / 22.2 -> 65.4 / 47.2 / 37.3 tok/s (`--exact off`); KLD 0.00644, top-1 96.93 % against BF16.
+
+### Performance
+
 ### Fixed
+- Flash-Next no longer pins the prompt residual buffer (context x hc x hidden fp32: 1.3 GB at a 32K context, 2.7 GB
+  at 64K, 5.4 GB at 131K) at start-up, nor allocates it per request on a layer-split rank without the head: nothing
+  reads it since the MTP layer's keys / values are written with each prefill chunk. RTX 3090, 59 GiB host, ISTA
+  IQ3_XXS, 32K context: 1.3 GB more host memory free (lowest MemAvailable during the run 5.1 -> 6.6 GB); replies
+  identical (md5 of 70 short replies and of a 120K-token prompt's decode).
 - Routed-expert kernels of GSQ Q2_0, TQ3_4S and X3 skip an assignment whose id is -1 (the u4h kernels' rule) instead
   of writing NaN (GSQ), reading the weights before the bank (TQ3) or reading a bank entry at -1 (X3: illegal
   address). The Flash-Next decode split path and the qwen35 hot / cold banks run two launches into one output, each

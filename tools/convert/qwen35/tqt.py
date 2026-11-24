@@ -26,6 +26,7 @@ CODE_KEY = "tqllm.tqt.code"
 CODE_TAG = "tqt-c2-v1"
 BLOCK = 128
 BLOCK_BYTES = 66
+STREAM_BYTES = 64
 L = 18  # window bits of tqt-c2-v1
 HA, HB = 0x9E3779B1, 0x7F4A7C15
 C1, D1, C2, D2 = 0x2C1B3C6D, 0x9E3779B9, 0x297A2D39, 0x7F4A7C15
@@ -156,7 +157,7 @@ def _table_t(dev):
 DAMP_FORMS = tqv12.DAMP_FORMS
 
 
-def gptq(W, H, damp=0.01, gammas=GAMMAS, damp_form="mean", order=False, refit=False):
+def gptq(W, H, damp=0.01, gammas=GAMMAS, damp_form="mean", order=False, refit=False, codec=None):
     """BlockLDLQ in the rotated basis with one trellis per 128-weight block of a row.
     W [N, K] float32 (rotated weights), H [K, K] float32 (rotated, undamped) on one CUDA device.
     Options (the format is the same for all):
@@ -166,14 +167,18 @@ def gptq(W, H, damp=0.01, gammas=GAMMAS, damp_form="mean", order=False, refit=Fa
                  generalised best to held-out inputs on Qwen3.8-27B)
       order      process the 128-blocks in descending tr(H_bb) (block act-order)
       refit      closed-form FP16 scale refit per (row, block) under GPTQ's block metric (U_bb^T U_bb)^-1
+      codec      the code (default: this module's c2); another module with viterbi, windows_t, _table_t, code_rms, STREAM_BYTES
+                 (tools/convert/inkling2/tqt2.py)
     Returns scales fp16 [N, K/128], stream uint8 [N, K/128, 64], Q float32 [N, K] (decoded weights, FP32 products)."""
+    import sys  # noqa: PLC0415
     import torch  # noqa: PLC0415
+    codec = codec or sys.modules[__name__]
     N, K = W.shape
     assert K % BLOCK == 0
     nb = K // BLOCK
     dev = W.device
-    tab = _table_t(dev)
-    crms = code_rms()
+    tab = codec._table_t(dev)  # noqa: SLF001
+    crms = codec.code_rms()
     W = W.clone()
     H, dead = tqv12._damped(H, damp, damp_form)  # noqa: SLF001 (same dampening as the TQV-12 encoder)
     W[:, dead] = 0
@@ -185,7 +190,7 @@ def gptq(W, H, damp=0.01, gammas=GAMMAS, damp_form="mean", order=False, refit=Fa
     U = tqv12._chol_u(H)  # noqa: SLF001
     del H
     scales = torch.empty(N, nb, dtype=torch.float16, device=dev)
-    stream = torch.empty(N, nb, 64, dtype=torch.uint8, device=dev)
+    stream = torch.empty(N, nb, codec.STREAM_BYTES, dtype=torch.uint8, device=dev)
     Q = torch.empty_like(W)
     for i1 in range(0, K, BLOCK):
         i2 = i1 + BLOCK
@@ -197,8 +202,8 @@ def gptq(W, H, damp=0.01, gammas=GAMMAS, damp_form="mean", order=False, refit=Fa
         for g in gammas:
             sc = (rms * (g / crms)).half().float()
             sc = torch.where(sc > 0, sc, torch.full_like(sc, 2.0 ** -24))
-            st = viterbi(W0 / sc[:, None])
-            v = tab[windows_t(st)].reshape(N, BLOCK)
+            st = codec.viterbi(W0 / sc[:, None])
+            v = tab[codec.windows_t(st)].reshape(N, BLOCK)
             if refit:
                 vM = v @ Mb
                 num, den = (vM * W0).sum(1), (vM * v).sum(1)

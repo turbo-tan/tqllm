@@ -2,6 +2,7 @@
 // 64 assignments of one expert: per 64-column step the weight tile is decoded to BF16 in shared memory (exact), the
 // activations of the tile's assignments are gathered, and 8 warps run 16x16x16 BF16 WMMA with F32 accumulators.
 #include "inkling2_grouped.cuh"
+#include "tqt_decode.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -10,6 +11,7 @@
 
 #include "inkling2_fp4_mma.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -570,24 +572,147 @@ void grouped_down(const ExpertMat & d, int rows, int cols, const __nv_bfloat16 *
     else throw std::runtime_error("inkling2 grouped experts: format");
 }
 
+// TQT (fmt 3) to the weights of the original basis: block (b, row, e) = the 128 weights of block b of one row; thread t decodes
+// pair t (code c2, F32 product with the block scale), the block is un-rotated in shared memory (R^-1 = D H / sqrt(128),
+// signs S1 as TQ4) and rounded to BF16. out[(e * ldrows + row) * cols + c]
+__constant__ uint32_t kTqtS1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+__global__ void __launch_bounds__(64) decode_tqt_bf16_k(ExpertMat m, int rows, int cols, int ldrows, __nv_bfloat16 * out) {
+    const int b = blockIdx.x, row = blockIdx.y, e = blockIdx.z, t = threadIdx.x;
+    const uint8_t * codes = (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (cols / 2) + size_t(b) * 64;
+    const __half * sc = reinterpret_cast<const __half *>(m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) + b;
+    __shared__ float v[128];
+    const uint32_t win = uint32_t(codes[t]) | uint32_t(codes[(t + 1) & 63]) << 8 | uint32_t(codes[(t + 2) & 63]) << 16;
+    const uint32_t pr = tqllm_cuda::tqtk::pair_win(win);
+    const float s = __half2float(*sc);
+    const float2 w = __half22float2(*reinterpret_cast<const __half2 *>(&pr));
+    v[2 * t] = w.x * s;
+    v[2 * t + 1] = w.y * s;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int i = (t / h) * 2 * h + t % h;
+        const float a = v[i], c = v[i + h];
+        v[i] = a + c;
+        v[i + h] = a - c;
+        __syncthreads();
+    }
+    __nv_bfloat16 * o = out + (size_t(e) * ldrows + row) * cols + size_t(b) * 128;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int c = t + 64 * j;
+        const float x = v[c] * 0.08838834764831845f;
+        o[c] = __float2bfloat16((kTqtS1[c / 32] >> (c % 32)) & 1u ? -x : x);
+    }
+}
+
+// TQT2 (fmt 4): the same block layout as decode_tqt_bf16_k, the stream is 64 nibbles and window p = nibbles p .. p + 3 (mod 64)
+__global__ void __launch_bounds__(64) decode_tqt2_bf16_k(ExpertMat m, int rows, int cols, int ldrows, __nv_bfloat16 * out) {
+    const int b = blockIdx.x, row = blockIdx.y, e = blockIdx.z, t = threadIdx.x;
+    const uint8_t * codes = (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (cols / 4) + size_t(b) * 32;
+    const __half * sc = reinterpret_cast<const __half *>(m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) + b;
+    __shared__ float v[128];
+    uint32_t win = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = (t + j) & 63;
+        win |= uint32_t((codes[i >> 1] >> (4 * (i & 1))) & 0xFu) << (4 * j);
+    }
+    const uint32_t pr = tqllm_cuda::tqtk::pair_win16(win);
+    const float s = __half2float(*sc);
+    const float2 w = __half22float2(*reinterpret_cast<const __half2 *>(&pr));
+    v[2 * t] = w.x * s;
+    v[2 * t + 1] = w.y * s;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int i = (t / h) * 2 * h + t % h;
+        const float a = v[i], c = v[i + h];
+        v[i] = a + c;
+        v[i + h] = a - c;
+        __syncthreads();
+    }
+    __nv_bfloat16 * o = out + (size_t(e) * ldrows + row) * cols + size_t(b) * 128;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int c = t + 64 * j;
+        const float x = v[c] * 0.08838834764831845f;
+        o[c] = __float2bfloat16((kTqtS1[c / 32] >> (c % 32)) & 1u ? -x : x);
+    }
+}
+
+// TQT3 (fmt 5): stream = 64 six-bit symbols, window p = the 18 bits at bit 6 p of the block's cyclic 384-bit stream
+__global__ void __launch_bounds__(64) decode_tqt3_bf16_k(ExpertMat m, int rows, int cols, int ldrows, __nv_bfloat16 * out) {
+    const int b = blockIdx.x, row = blockIdx.y, e = blockIdx.z, t = threadIdx.x;
+    const uint8_t * codes = (m.wp ? m.wp[e] : m.w + size_t(e) * m.stride) + size_t(row) * (size_t(cols) * 3 / 8) + size_t(b) * 48;
+    const __half * sc = reinterpret_cast<const __half *>(m.ap ? m.ap[e] : m.aux + size_t(e) * m.aux_stride) + size_t(row) * (cols / 128) + b;
+    __shared__ float v[128];
+    uint32_t win = 0;
+    for (int j = 0; j < 18; ++j) {
+        const int i = (6 * t + j) % 384;
+        win |= uint32_t((codes[i >> 3] >> (i & 7)) & 1u) << j;
+    }
+    const uint32_t pr = tqllm_cuda::tqtk::pair_win(win);
+    const float s = __half2float(*sc);
+    const float2 w = __half22float2(*reinterpret_cast<const __half2 *>(&pr));
+    v[2 * t] = w.x * s;
+    v[2 * t + 1] = w.y * s;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int i = (t / h) * 2 * h + t % h;
+        const float a = v[i], c = v[i + h];
+        v[i] = a + c;
+        v[i + h] = a - c;
+        __syncthreads();
+    }
+    __nv_bfloat16 * o = out + (size_t(e) * ldrows + row) * cols + size_t(b) * 128;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int c = t + 64 * j;
+        const float x = v[c] * 0.08838834764831845f;
+        o[c] = __float2bfloat16((kTqtS1[c / 32] >> (c % 32)) & 1u ? -x : x);
+    }
+}
+
 void experts_decode_bf16(const ExpertMat & m, int E, int rows, int cols, int ldrows, __nv_bfloat16 * out, cudaStream_t s) {
     if (rows % BM || cols % BK) throw std::runtime_error("inkling2 experts_decode_bf16: rows % 64 or cols % 64");
+    if (m.fmt >= 3) {
+        if (m.fmt == 3) decode_tqt_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+        else if (m.fmt == 5) decode_tqt3_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+        else decode_tqt2_bf16_k<<<dim3(cols / 128, rows, E), 64, 0, s>>>(m, rows, cols, ldrows, out);
+        return;
+    }
     const dim3 grid(cols / BK, rows / BM, E);
     if (m.fmt == 2) decode_bf16_k<2><<<grid, 256, 0, s>>>(m, rows, cols, ldrows, out);
     else if (m.fmt == 1) decode_bf16_k<1><<<grid, 256, 0, s>>>(m, rows, cols, ldrows, out);
     else throw std::runtime_error("inkling2 experts_decode_bf16: format");
 }
 
+void grouped_gather(const __nv_bfloat16 * x, int A, const int * order, int topk, __nv_bfloat16 * xg, int D, cudaStream_t s) {
+    if (A > 0) gather_rows_k<<<dim3(A, unsigned((D + 2047) / 2048)), 256, 0, s>>>(x, order, topk, xg, D);
+}
+
+void grouped_gate_up_part_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bfloat16 * xg, int G, const int * hc, const int * ho,
+                               __nv_bfloat16 * gu, __nv_bfloat16 * act, float gc, float uc, cublasHandle_t blas, cudaStream_t s) {
+    size_t rows = 0;
+    for (int e = 0; e < G; ++e) rows += size_t(std::max(hc[e], 0));
+    if (rows == 0) return;
+    if (!gemm_grouped_bf16(blas, Wgu, 2 * I, D, xg, gu, G, hc, ho, 0))
+        for (int e = 0; e < G; ++e)
+            if (hc[e] > 0) gemm_bf16(blas, Wgu + size_t(e) * 2 * I * D, 2 * I, D, xg + size_t(ho[e]) * D, gu + size_t(ho[e]) * 2 * I, hc[e]);
+    const size_t r0 = size_t(ho[0]), total = rows * I;
+    swiglu_k<<<unsigned((total / 2 + 255) / 256), 256, 0, s>>>(gu + r0 * 2 * I, act + r0 * I, I, gc, uc, total);
+}
+
 void grouped_gate_up_bf16(const __nv_bfloat16 * Wgu, int I, int D, const __nv_bfloat16 * x, int A, int E, int topk, const int * order, const int * hc,
                           const int * ho, __nv_bfloat16 * xg, __nv_bfloat16 * gu, __nv_bfloat16 * act, float gc, float uc, cublasHandle_t blas,
                           cudaStream_t s) {
     if (A <= 0) return;
-    gather_rows_k<<<dim3(A, unsigned((D + 2047) / 2048)), 256, 0, s>>>(x, order, topk, xg, D);
-    if (!gemm_grouped_bf16(blas, Wgu, 2 * I, D, xg, gu, E, hc, ho, 0))
-        for (int e = 0; e < E; ++e)
-            if (hc[e] > 0) gemm_bf16(blas, Wgu + size_t(e) * 2 * I * D, 2 * I, D, xg + size_t(ho[e]) * D, gu + size_t(ho[e]) * 2 * I, hc[e]);
-    const size_t total = size_t(A) * I;
-    swiglu_k<<<unsigned((total / 2 + 255) / 256), 256, 0, s>>>(gu, act, I, gc, uc, total);
+    grouped_gather(x, A, order, topk, xg, D, s);
+    grouped_gate_up_part_bf16(Wgu, I, D, xg, E, hc, ho, gu, act, gc, uc, blas, s);
+}
+
+int choose_tqt_group(int E, size_t free_b, size_t experts_b, size_t keep_b, size_t per_expert_b) {
+    for (int g = E; g >= 8; g /= 2)
+        if (experts_b + keep_b + size_t(g) * per_expert_b <= free_b) return g;
+    return std::min(E, 8);
 }
 
 void grouped_down_bf16(const __nv_bfloat16 * Wd, int D, int I, const __nv_bfloat16 * act, int A, int E, const int * hc, const int * ho,

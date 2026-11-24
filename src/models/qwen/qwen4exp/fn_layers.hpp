@@ -202,7 +202,8 @@ inline void recurrent_core(const Checkpoint & checkpoint, const float * input_p,
 // Decode reads of host K/V (TQFN_KV_HOST): one gather per layer, each with a 16K-row device cache of host rows (consecutive
 // steps select mostly the same positions: at 128K 81.6 % of the host rows a step reads were read recently). Sized for the
 // slot context and an 8-token verify block of attention_core's widest selection (top_k 2048 + ratio 4 - 1): no allocation
-// inside graph capture. kv_to_host makes them before the bank refill sizes the banks around them (made at the first
+// inside graph capture. The compact rows and cell maps are one set for the trunk's layers (QsaGather shared: 12 x 34 MB -> 34 MB).
+// kv_to_host makes them before the bank refill sizes the banks around them (made at the first
 // decode step, after the refill took the free memory, a 145K prompt on a 3090 at slots=auto ran out of memory).
 inline std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> & host_gathers() {
     static std::vector<std::unique_ptr<tqllm_cuda::QsaGather>> gathers;
@@ -217,7 +218,8 @@ inline void make_host_gather(const Checkpoint & checkpoint, int layer) {
     auto & gather = host_gather(layer); if (gather) return;
     const size_t row = size_t(checkpoint.attention_kvheads) * checkpoint.attention_dim * sizeof(__nv_bfloat16);
     PersistentAlloc keep;
-    gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(checkpoint.rt.kv_capacity, checkpoint.rt.kv_capacity_full), row, 16384, 8 * (2048 + 4 - 1));
+    gather = std::make_unique<tqllm_cuda::QsaGather>(std::max(checkpoint.rt.kv_capacity, checkpoint.rt.kv_capacity_full), row, 16384, 8 * (2048 + 4 - 1),
+                                                     layer < checkpoint.config.layers);  // the MTP layer's (index layers) keeps its own
 }
 // pre: q (with gate), k, v of this sequence's rows projected for a whole batch; raw_out: write the attention output
 // there and stop before the gate and the output projection (both row-wise, done for the batch)
