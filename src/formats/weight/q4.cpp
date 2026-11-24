@@ -1073,6 +1073,18 @@ struct Udq final : WeightFormat {
         tqllm_cuda::k_expert_matvec(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y,
                                   rows, m.cols, ids, n, topk, per_expert_input, stream);
     }
+    // IQ2_XXS / IQ2_XS / IQ2_S: the dedup kernels (one read of an expert's weights for all verify rows that route to it);
+    // per row the same k split, MMA order and warp reduction as the per-assignment kernel, so the same output bits
+    bool has_expert_dedup() const override { return fmt >= 8 && fmt <= 10; }
+    void expert_matvec_dedup(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows, const int * dmap, int groups, cudaStream_t s) const override {
+        tqllm_cuda::k_expert_matvec_dedup(fmt, static_cast<const uint8_t *>(m.p), m.aux, x, y, rows, m.cols, dmap, groups, s);
+    }
+    void expert_matvec_dedup2(const Mat & a, const Mat & b, const __half * x, __nv_bfloat16 * ya, __nv_bfloat16 * yb, int rows,
+                              const int * dmap, int groups, cudaStream_t s) const override {
+        if (a.cols != b.cols) throw std::runtime_error(std::string(nm) + ": paired dedup experts need equal columns");
+        tqllm_cuda::k_expert_matvec_dedup2(fmt, static_cast<const uint8_t *>(a.p), a.aux, static_cast<const uint8_t *>(b.p), b.aux, x, ya, yb,
+                                           rows, a.cols, dmap, groups, s);
+    }
     bool expert_gemm(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows,
                      const int * counts, const int * groups, int capacity, int experts,
                      int topk, bool per_expert_input, cudaStream_t stream) const override {

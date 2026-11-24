@@ -6,12 +6,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Performance
-- Flash-Next long context: the host-row gather (decode reads of K/V moved to host memory) keeps one set of compact
-  rows, positions and cell maps for all trunk attention layers instead of one per layer, and marks the selected cells
-  in O(selected) instead of a memset, scan and one-warp-per-cell pass over the whole context per layer per step.
-  RTX 3090, gather bench (6-row verify block, 16K-row cache): 34.3 / 41.3 / 47.7 -> 29.7 / 34.3 / 35.8 us at 32K /
-  64K / 120K cells; ISTA IQ3_XXS after a 120K-token prompt: peak VRAM 23980 -> 23209 MB, decode 92.0 -> 92.3 tok/s;
-  same output bits.
+### Fixed
+- Flash-Next no longer pins the prompt residual buffer (context x hc x hidden fp32: 1.3 GB at a 32K context, 2.7 GB
+  at 64K, 5.4 GB at 131K) at start-up, nor allocates it per request on a layer-split rank without the head: nothing
+  reads it since the MTP layer's keys / values are written with each prefill chunk. RTX 3090, 59 GiB host, ISTA
+  IQ3_XXS, 32K context: 1.3 GB more host memory free (lowest MemAvailable during the run 5.1 -> 6.6 GB); replies
+  identical (md5 of 70 short replies and of a 120K-token prompt's decode).
 
 ## 1.7.0 (2026-11-23)
 

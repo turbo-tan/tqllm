@@ -759,8 +759,10 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       // spec_begin grows pinned residuals to the actual prompt, not the configured slot capacity.
       f.cache->set_miss_stream(nullptr);
       if (tqllm::debug_on("mem")) checkpoint.resident_report();
-      {   // a multi-chunk prefill's pinned residual rows, pinned here once instead of inside a request (decode_rules.hpp)
-          const size_t rows = int(context) > 4096 ? size_t(context) * size_t(warm.width) : 0;
+      {   // a multi-chunk prefill's pinned residual rows, pinned here once instead of inside a request (decode_rules.hpp), if
+          // its chunks could ever need them: they are kLayerMajorChunkMin tokens or more, which write the MTP K/V inline
+          const bool host_rows = tqllm::flashnext::prefill_residuals_on_host(run.head_here(), tqllm::flashnext::kLayerMajorChunkMin);
+          const size_t rows = int(context) > 4096 && host_rows ? size_t(context) * size_t(warm.width) : 0;
           std::ifstream mi("/proc/meminfo"); const std::string text((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
           int dev = 0, unified = 0; cudaGetDevice(&dev);
           if (cudaDeviceGetAttribute(&unified, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) unified = 0;
