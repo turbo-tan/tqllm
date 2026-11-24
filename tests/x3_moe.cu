@@ -157,6 +157,31 @@ int main(int argc, char ** argv) try {
                 const auto y1 = down(dy1, size_t(topk) * rows);
                 check(std::memcmp(y1.data(), y.data() + size_t(t) * topk * rows, y1.size() * 2) == 0, "n = 1 bit-identical to the batch");
             }
+            // split launches (hot / cold banks, the Flash-Next decode split path): two calls into one output, each with id -1
+            // for the other's assignments. A -1 has no part (no bank read) and writes nothing: together they give y's bits,
+            // alone (n = 1) and as a verify block (n = N)
+            for (int nn : {1, N}) {
+                for (int t0 = 0; t0 < N; t0 += nn) {
+                    const size_t A = size_t(nn) * topk;
+                    std::vector<int> p0(ids.begin() + long(t0 * topk), ids.begin() + long(t0 * topk + A)), p1(p0);
+                    for (size_t a = 0; a < A; ++a) ((a + size_t(t0)) % 2 ? p0 : p1)[a] = -1;
+                    int * d0 = up(p0), * d1 = up(p1);
+                    const __half * xt = dx + size_t(per_slot ? t0 * topk : t0) * cols;
+                    __nv_bfloat16 * ds; ck(cudaMalloc(&ds, A * rows * 2)); ck(cudaMemsetAsync(ds, 0xA5, A * rows * 2, s));
+                    wf->expert_matvec(m, xt, ds, rows, d0, nn, topk, per_slot != 0, s); ck(cudaStreamSynchronize(s));
+                    const auto half = down(ds, A * rows);
+                    bool untouched = true;
+                    for (size_t a = 0; a < A; ++a) if (p0[a] < 0)
+                        for (int r = 0; r < rows; ++r) { uint16_t v; std::memcpy(&v, &half[a * rows + r], 2); untouched &= v == 0xA5A5; }
+                    check(untouched, "expert_matvec leaves assignments with id -1 untouched");
+                    wf->expert_matvec(m, xt, ds, rows, d1, nn, topk, per_slot != 0, s); ck(cudaStreamSynchronize(s));
+                    const auto both = down(ds, A * rows);
+                    check(std::memcmp(both.data(), y.data() + size_t(t0) * topk * rows, both.size() * 2) == 0,
+                          "two launches with ids -1 for the other's assignments == one launch, bit for bit");
+                    cudaFree(d0); cudaFree(d1); cudaFree(ds);
+                }
+            }
+            std::printf("x3_moe per_slot=%d split launches (ids -1): n = 1 and n = %d bit-identical\n", per_slot, N);
             // prompt path: grouped by expert (moe_group's layout: groups [experts][N] of assignments) -> same outputs
             std::vector<int> counts(E, 0), groups(size_t(E) * N, -1);
             for (int a = 0; a < N * topk; ++a) groups[size_t(ids[a]) * N + counts[size_t(ids[a])]++] = a;

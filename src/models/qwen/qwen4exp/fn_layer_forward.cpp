@@ -754,6 +754,17 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
             for (auto [a, r] : cpu_rows) items.push_back({reinterpret_cast<const char *>(cpu_out + size_t(r) * h), reinterpret_cast<char *>(ed.p + size_t(a) * h), size_t(h) * 2});
             tqllm_cuda::scatter_copy(items.data(), int(items.size()), nullptr, 1);
         }
+        // TQLLM_DEBUG=moe_nan: every routed-expert output row of the split path checked for non-finite values (synchronises
+        // each layer call; one line per bad call with its rows and hit / miss counts, and a total at exit)
+        if (static const bool nan_check = tqllm::debug_on("moe_nan"); nan_check) {
+            static uint64_t calls = 0, bad_calls = 0, mixed_one = 0;
+            static struct Report { ~Report() { std::fprintf(stderr, "MOE_NAN split calls %llu, one-row hit+miss %llu, with non-finite expert rows %llu\n",
+                                                            (unsigned long long) calls, (unsigned long long) mixed_one, (unsigned long long) bad_calls); } } report;
+            ++calls; mixed_one += n == 1 && hit_n && miss_n;
+            const auto v = ed.get(); size_t bad = 0;
+            for (const auto & x : v) bad += !std::isfinite(float(x));
+            if (bad) { ++bad_calls; std::fprintf(stderr, "MOE_NAN layer %d n %d hits %d misses %d: %zu of %zu expert outputs non-finite\n", layer, n, hit_n, miss_n, bad, v.size()); }
+        }
         moe_out(ed.p);
         constexpr bool cpu_refill = false;
         if (cpu_refill && !cpu_experts.empty()) {  // the cache still learns the experts the CPU served (copies after this layer)
