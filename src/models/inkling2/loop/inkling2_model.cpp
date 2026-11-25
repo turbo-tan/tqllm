@@ -1351,7 +1351,7 @@ struct Inkling2Model::Impl {
             K::mtp_store_kv(df_kv.as<bf16>(), df_kv.as<bf16>() + kn, 2 * kn, Y.kc.as<bf16>(), Y.vc.as<bf16>(), m, G, pos0, Y.ring, s);
         }
     }
-    void dflash_draft(int anchor, std::vector<int> & out_tokens, int steps) {
+    void dflash_draft(int anchor, std::vector<int> & out_tokens, int steps, std::vector<float> * conf = nullptr) {
         const int nb = mtp_block, P = df_pos >= 0 ? df_pos : len, qn = df_H * HD, kn = G * HD;
         ck(cudaMemcpyAsync(d_tok.p, &anchor, 4, cudaMemcpyHostToDevice, s), "anchor");
         K::embed(embed_ptr, d_tok.as<int>(), embed_norm.as<float>(), d_x0.as<float>(), 1, D, eps, s);
@@ -1403,8 +1403,23 @@ struct Inkling2Model::Impl {
         // not leave stale candidates that verify rejects forever
         ck(cudaPeekAtLastError(), "DFlash2 draft launch");
         ck(cudaMemcpyAsync(out_tokens.data(), df_tok.p, size_t(steps) * 4, cudaMemcpyDeviceToHost, s), "draft");
+        std::vector<int> cid; std::vector<float> cv;
+        if (conf) {  // rows 1 .. steps of the top-16 candidates (step i walks row i)
+            cid.resize(size_t(nb) * 16); cv.resize(size_t(nb) * 16);
+            ck(cudaMemcpyAsync(cid.data(), df_ids.p, cid.size() * 4, cudaMemcpyDeviceToHost, s), "draft ids");
+            ck(cudaMemcpyAsync(cv.data(), df_vals.p, cv.size() * 4, cudaMemcpyDeviceToHost, s), "draft vals");
+        }
         ck(cudaStreamSynchronize(s), "draft");
         ck(cudaGetLastError(), "DFlash2 draft");
+        if (conf) {
+            conf->assign(size_t(steps), 0.0f);
+            for (int i = 0; i < steps; ++i) {
+                const int * ids = cid.data() + size_t(i + 1) * 16; const float * v = cv.data() + size_t(i + 1) * 16;
+                double z = 0, w = 0;
+                for (int c = 0; c < 16; ++c) { const double e = std::exp(double(v[c]) - double(v[0])); z += e; if (ids[c] == out_tokens[size_t(i)]) w = e; }
+                (*conf)[size_t(i)] = float(w / z);  // 0 when the walk left the candidates (its token is then the vocab stop)
+            }
+        }
     }
     // draft context K / V of the m committed tokens at positions pos0.. (their taps are in `taps`), and f_rnn of the last
     void mtp_context(int pos0, int m) {
@@ -1846,6 +1861,12 @@ int Inkling2Model::length() const { return p_->len; }
 int Inkling2Model::replan_experts() { return p_->replan_experts(); }
 void Inkling2Model::enable_mtp(const std::string & dir) { p_->enable_mtp(dir); }
 void Inkling2Model::draft(int anchor, std::vector<int> & tokens, int steps) { p_->draft(anchor, tokens, steps); }
+bool Inkling2Model::dflash_drafter() const { return p_->dflash; }
+void Inkling2Model::draft(int anchor, std::vector<int> & tokens, int steps, std::vector<float> & conf) {
+    conf.clear();
+    if (p_->dflash) p_->dflash_draft(anchor, tokens, std::max(1, std::min(steps, p_->mtp_block - 1)), &conf);
+    else p_->draft(anchor, tokens, steps);
+}
 size_t Inkling2Model::drafter_bytes(const std::string & dir) {
     namespace fs = std::filesystem;
     if (dir.empty()) return 0;
