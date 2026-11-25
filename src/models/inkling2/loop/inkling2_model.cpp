@@ -14,6 +14,7 @@
 #include "inkling2_dflash2.cuh"
 #include "nlohmann/json.hpp"  // tqllm::Json
 #include "graph_capture.hpp"
+#include "inkling2_residency.hpp"
 #include "device_free_cuda.hpp"
 
 #include <cublas_v2.h>
@@ -452,9 +453,11 @@ struct Inkling2Model::Impl {
             if (W) {
                 auto gemv = [&](int n, bool on) { K::set_gemv_mma(on); K::GemvSeg sg = seg(*W, bx.as<bf16>(), bout.p); K::gemv(&sg, 1, n, s); };
                 const double w1 = time([&] { gemv(1, false); }), w8 = time([&] { gemv(n8, false); }), m1 = time([&] { gemv(1, true); }), m8 = time([&] { gemv(n8, true); });
-                mma_dense = K::prefer_mma(w1, w8, m1, m8, drafter);
-                std::fprintf(stderr, "inkling2: dense %dx%d: gemv %.1f / %.1f us, tensor cores %.1f / %.1f us -> %s\n", W->rows, W->cols, w1, w8, m1, m8,
-                             mma_dense ? "tensor cores" : "gemv");
+                // fixed, not timed: the two families round differently and time within noise of each other (3090 19.0 vs
+                // 18.8 us, GB10 12.4 vs 14.3), so a timed pick changed the greedy text between restarts (#105)
+                mma_dense = true;
+                std::fprintf(stderr, "inkling2: dense %dx%d: gemv %.1f / %.1f us, tensor cores %.1f / %.1f us -> tensor cores (fixed)\n", W->rows, W->cols,
+                             w1, w8, m1, m8);
             }
             K::set_gemv_mma(mma_dense);
         }
@@ -551,7 +554,7 @@ struct Inkling2Model::Impl {
     }
     // partial residency: per layer the resident_share experts routed most so far (since load) move to the device
     std::vector<float> route_hist;  // decayed routed counts per (layer, expert), host side
-    int decode_steps = 0;           // decode forwards since the last plan (partial residency replans every kReplanEvery)
+    Inkling2ReplanClock replan_clock;  // re-plan every kEvery decode steps (plain tokens and verify blocks)
     int replan_experts() {
         if (resident_share >= Ls[0].eg.E) return 0;
         const int E_ = Ls[0].eg.E;
@@ -559,11 +562,12 @@ struct Inkling2Model::Impl {
         ck(cudaMemcpyAsync(fresh.data(), ucount.p, fresh.size() * 4, cudaMemcpyDeviceToHost, s), "counts");
         ck(cudaStreamSynchronize(s), "counts");
         ck(cudaMemsetAsync(ucount.p, 0, size_t(L) * E_ * 4, s), "counts");
-        // decayed history: routes since the last plan count fully, older ones half per plan, so the resident set follows
-        // what decode routes to now (a prompt's routing, or an earlier request's, fades)
+        // decayed history: routes since the last plan count fully, older ones x0.9 per plan, so the resident set follows
+        // what decode routes to now (a prompt's routing, or an earlier request's, fades). Halving per plan chased the last
+        // few steps: 80-300 expert matrices moved per plan, the plan never settled, warm drafted replies -10 % (#106)
         if (route_hist.size() != fresh.size()) route_hist.assign(fresh.size(), 0.0f);
         std::vector<float> cnt(fresh.size());
-        for (size_t i = 0; i < fresh.size(); ++i) cnt[i] = route_hist[i] = 0.5f * route_hist[i] + float(fresh[i]);
+        for (size_t i = 0; i < fresh.size(); ++i) cnt[i] = route_hist[i] = 0.9f * route_hist[i] + float(fresh[i]);
         int moved = 0;
         for (int l = 0; l < L; ++l) {
             std::vector<int> order(static_cast<size_t>(E_));
@@ -1500,9 +1504,8 @@ struct Inkling2Model::Impl {
         std::fwrite(h.data(), 4, h.size(), dump);
     }
     void forward(const int * tokens, int n, int want, std::vector<float> & logits_out) {
-        // partial residency: re-plan the resident experts from the recent routing every kReplanEvery decode steps
-        constexpr int kReplanEvery = 32;
-        if (n == 1 && resident_share < Ls[0].eg.E && ++decode_steps >= kReplanEvery) { decode_steps = 0; replan_experts(); }
+        // partial residency: re-plan the resident experts from the recent routing every Inkling2ReplanClock::kEvery decode steps
+        if (replan_clock.step(n, verifying, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (n <= 0 || n > chunk || want > n) throw std::runtime_error("inkling2: chunk size");
         grow_logits(want);
@@ -1536,6 +1539,7 @@ struct Inkling2Model::Impl {
         if (!mtp_on) throw std::runtime_error("inkling2: verify needs enable_mtp()");
         if (n < 1 || n > K::kSmallN) throw std::runtime_error("inkling2: a verify block is n <= 8 tokens");
         if (len + n > context) throw std::runtime_error("inkling2: context full");
+        if (replan_clock.step(n, true, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
         grow_logits(n);
         verifying = true; verify_n = n; greedy_step = true;
         *h_len = len;
@@ -1556,8 +1560,7 @@ struct Inkling2Model::Impl {
     }
     // one decode token at length(): the greedy next token (argmax of the softcapped logits, lowest index on ties), no logits
     int forward_greedy(int token) {
-        constexpr int kReplanEvery = 32;
-        if (resident_share < Ls[0].eg.E && ++decode_steps >= kReplanEvery) { decode_steps = 0; replan_experts(); }
+        if (replan_clock.step(1, false, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (len + 1 > context) throw std::runtime_error("inkling2: context full");
         if (verifying) throw std::runtime_error("inkling2: forward_greedy inside a verify block");

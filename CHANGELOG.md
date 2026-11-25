@@ -3,6 +3,23 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.8.3 (2026-11-25)
+
+### Fixed
+- Inkling-2-Mini (CUDA) with a drafter, when the routed experts do not all fit on the card (e.g. 24 GB at 128K
+  context): the first reply after a start ran up to 3.5x slower than the next ones (#106). The experts kept on the
+  card were re-planned from recent routing only on plain decode steps, so a drafted reply kept the plan made from its
+  prompt to the end. Drafted steps now re-plan too, backing off while the plan is settled. RTX 3090, 131K context,
+  `--exact off`, 4,096 tokens: first reply 65-78 -> 179-181 tok/s, later replies 200-202 as before.
+- Inkling-2-Mini (CUDA): the dense kernel family is fixed to tensor cores instead of timed at load (#105). The two
+  families time within noise of each other (RTX 3090 19.0 vs 18.8 us), round differently, and a restart could change
+  the greedy text.
+
+### Performance
+- Inkling-2-Mini on Mac: the NVFP4 routed experts read 32 weights a lane step (no idle lanes at the end of a row).
+  Five Tech2Wild prompts (thinking at effort none), M5 Pro, DFlash2: exact 76.0 -> 79.3 tok/s, `--exact off
+  --dense-bits 4` 80.1 -> 85.5. Exact as before: spec == plain 5/5, flips 3/320, KLD 0.00244.
+
 ## 1.8.2 (2026-11-25)
 
 ### Fixed

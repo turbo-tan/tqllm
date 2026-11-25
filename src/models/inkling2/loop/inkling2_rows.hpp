@@ -272,6 +272,77 @@ inline mlx::core::array inkling2_rows_experts(const mlx::core::array& x, const m
                   std::nullopt, false, mx::Device(mx::Device::gpu))[0];
 }
 
+// NVFP4 routed experts, wide lanes: the same products as inkling2_rows_experts (bits 4), four lanes per output row and
+// eight rows per simdgroup, a lane step of 32 weights (16 code bytes + 2 scales). K = 2304 / 1152 split into whole steps
+// (the 16-weight form left a quarter of the lanes idle on its last step of each down row). Row-invariant: a row's sums
+// (32-weight lane steps in a fixed K order, then the four lanes by xor shuffles) never depend on the other rows.
+inline mlx::core::array inkling2_rows_experts4(const mlx::core::array& x, const mlx::core::array& xrow, const mlx::core::array& ids,
+                                               const mlx::core::array& codes, const mlx::core::array& scales, const mlx::core::array& outer,
+                                               bool swiglu = false, float gate_cap = 0.f, float up_cap = 0.f, int sg = 4) {
+    namespace mx = mlx::core;
+    const int P = ids.ndim() == 1 ? ids.shape(0) : 0, E = codes.shape(0), O = codes.shape(1), K = codes.shape(2) * 8;
+    if (P < 1 || P > 64 || x.ndim() != 2 || x.shape(1) != K || x.dtype() != mx::bfloat16 || xrow.shape() != ids.shape() ||
+        codes.dtype() != mx::uint32 || scales.dtype() != mx::uint8 || scales.shape() != mx::Shape{E, O, K / 16} || K % 128 || O % (8 * sg))
+        throw std::invalid_argument("Inkling2 rows experts4 shape");
+    static const char* body = R"METAL(
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const uint slot = lane >> 2, q = lane & 3u;
+    const uint p0 = threadgroup_position_in_grid.y;
+    const uint e = ids[p0];
+    if (p0 > 0 && ids[p0 - 1] == e) return;  // the run's first pair computes the run
+    uint count = 1;
+    while (count < 8u && p0 + count < uint(P) && ids[p0 + count] == e) ++count;
+    const uint o = (threadgroup_position_in_grid.x * SG + sg) * 8u + slot;
+    float acc[8];
+    for (int r = 0; r < 8; ++r) acc[r] = 0.0f;
+    const device uchar* crow = codes + (size_t(e) * O + o) * (K / 2);
+    const device uchar* srow = scales + (size_t(e) * O + o) * (K / 16);
+    for (uint k = q * 32u; k < uint(K); k += 128u) {
+        const uint4 c = *(const device uint4*)(crow + k / 2);
+        const float s0 = float(E4M3[srow[k / 16]]), s1 = float(E4M3[srow[k / 16 + 1]]);
+        const uint w4[4] = {c.x, c.y, c.z, c.w};
+        float wv[32];
+        for (int j = 0; j < 4; ++j) for (int i = 0; i < 8; ++i) wv[8 * j + i] = float(E2M1[(w4[j] >> (4 * i)) & 15u]);
+        for (int r = 0; r < 8; ++r) {  // constant bounds: acc stays in registers
+            if (uint(r) >= count) break;
+            const device bfloat16_t* xr = x + size_t(xrow[p0 + r]) * K + k;
+            float xv[8], a0 = 0.0f, a1 = 0.0f;
+            load8(xr, xv);      for (int i = 0; i < 8; ++i) a0 = fma(xv[i], wv[i], a0);
+            load8(xr + 8, xv);  for (int i = 0; i < 8; ++i) a0 = fma(xv[i], wv[8 + i], a0);
+            load8(xr + 16, xv); for (int i = 0; i < 8; ++i) a1 = fma(xv[i], wv[16 + i], a1);
+            load8(xr + 24, xv); for (int i = 0; i < 8; ++i) a1 = fma(xv[i], wv[24 + i], a1);
+            acc[r] = fma(a0, s0, acc[r]);
+            acc[r] = fma(a1, s1, acc[r]);
+        }
+    }
+    const float g = outer[e] * (1.0f / 2688.0f);
+    for (int r = 0; r < 8; ++r) {
+        if (uint(r) >= count) break;  // count is the same for every lane
+        float v = acc[r];
+        v += simd_shuffle_xor(v, 1u);
+        v += simd_shuffle_xor(v, 2u);
+        v = float(bfloat16_t(v * g));
+        if (SWIGLU) {
+            const float uv = simd_shuffle_down(v, 4u);  // the next slot: the up row of this gate row
+            if (q != 0 || (slot & 1u)) continue;
+            const float sig = 1.0f / (1.0f + metal::precise::exp(-v));
+            const float gc = caps[0], uc = caps[1];
+            const float a = metal::precise::tanh(v / gc) * gc * sig * (metal::precise::tanh(uv / uc) * uc);
+            y[size_t(p0 + r) * (O / 2) + o / 2] = bfloat16_t(a);
+        } else if (q == 0) {
+            y[size_t(p0 + r) * O + o] = bfloat16_t(v);
+        }
+    }
+)METAL";
+    static auto kernel = mx::fast::metal_kernel("tqllm_inkling2_rows_experts4", {"x", "xrow", "ids", "codes", "scales", "outer", "caps"}, {"y"},
+                                                body, rows_detail::fp8_header());
+    const float cap[2] = {swiglu ? gate_cap : 1.f, swiglu ? up_cap : 1.f};
+    return kernel({x, mx::astype(xrow, mx::uint32), mx::astype(ids, mx::uint32), mx::view(codes, mx::uint8), scales,
+                   mx::astype(outer, mx::float32), mx::array(cap, {2}, mx::float32)},
+                  {{P, swiglu ? O / 2 : O}}, {mx::bfloat16}, {(O / (8 * sg)) * 32 * sg, P, 1}, {32 * sg, 1, 1},
+                  {{"P", P}, {"K", K}, {"O", O}, {"SG", sg}, {"SWIGLU", swiglu}}, std::nullopt, false, mx::Device(mx::Device::gpu))[0];
+}
+
 // Sink attention of 1..8 query rows (a decode step or a verify block) with the relative bias computed in place:
 // q [1, H, n, HD], keys / values [1, G, >= s, HD] (cache rows 0 .. s - 1 at positions start ..), rel [n, H, DR] and
 // proj [DR, E] (bias of distance d < E: BF16(rel . proj[:, d])), sinks [n, H] (a zero-value key per row), row r at

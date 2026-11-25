@@ -424,8 +424,11 @@ struct Inkling2Mlx::Impl {
             auto restore = mx::reshape(mx::slice(sorting, {2, 0}, {3, P}), {P});
             const auto& gu = experts[l][0];
             const auto& dn = experts[l][1];
-            auto act = inkling2_rows_experts(bf16(x), token, sorted, gu.codes, gu.scales, gu.global, gu.bits, true, gate_cap, up_cap);
-            auto y = inkling2_rows_experts(act, mx::arange(P, mx::uint32), sorted, dn.codes, dn.scales, dn.global, dn.bits);
+            // NVFP4: the wide-lane kernel (32 weights a lane step); MXFP8 layers keep the 16-weight one
+            auto act = gu.bits == 4 ? inkling2_rows_experts4(bf16(x), token, sorted, gu.codes, gu.scales, *gu.global, true, gate_cap, up_cap)
+                                    : inkling2_rows_experts(bf16(x), token, sorted, gu.codes, gu.scales, gu.global, gu.bits, true, gate_cap, up_cap);
+            auto y = dn.bits == 4 ? inkling2_rows_experts4(act, mx::arange(P, mx::uint32), sorted, dn.codes, dn.scales, *dn.global)
+                                  : inkling2_rows_experts(act, mx::arange(P, mx::uint32), sorted, dn.codes, dn.scales, dn.global, dn.bits);
             return {mx::reshape(y, {P, 1, D}), routes, restore};
         }
         std::optional<ExpertGroups> groups;
