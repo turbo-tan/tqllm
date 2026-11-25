@@ -142,6 +142,22 @@ int main() {
         check(req.ok && req.error.empty(), "reasoning_effort none parses");
         check(!req.thinking, "enable_thinking false is kept");
     }
+    {   // thinking off, rendered with a Jinja template: the prompt opens the answer's text message (no thinking message);
+        // with tools, or with thinking on, the turn is left to the model
+        so.think_off = "<|message_model|><|content_text|>"; so.think_off_without_tools = true;
+        const tqserve::PromptRenderer render = [](const tqllm::Json &, const tqllm::Json *, const tqllm::Json &) { return std::string("P"); };
+        const auto off = tqserve::parse_request(
+            R"({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"none"}})", 64, "", true, true,
+            "high", &render);
+        check(off.ok && off.prompt_text == "P<|message_model|><|content_text|>", "thinking off: the answer's text message is opened");
+        const auto on = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}]})", 64, "", true, true, "high", &render);
+        check(on.ok && on.prompt_text == "P", "thinking on: the model opens its turn");
+        const auto tools = tqserve::parse_request(
+            R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}],"chat_template_kwargs":{"enable_thinking":false}})",
+            64, "", true, true, "high", &render);
+        check(tools.ok && tools.prompt_text == "P", "thinking off with tools: the model opens its turn (a call may come first)");
+        so.think_off.clear(); so.think_off_without_tools = false;
+    }
     std::filesystem::remove_all(dir);
     std::printf(fail ? "inkling2-reasoning-split: FAIL\n" : "inkling2-reasoning-split: PASS\n");
     return fail ? 1 : 0;

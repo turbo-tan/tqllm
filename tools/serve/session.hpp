@@ -38,6 +38,7 @@ struct ServeOptions {
     // think_off: what a Jinja-rendered prompt still needs when thinking is off (the MiniMax template has no
     // enable_thinking: its answer starts right after the end tag; the Qwen template closes the block itself)
     std::string think_open = "<think>", think_close = "</think>", think_off;
+    bool think_off_without_tools = false;  // think_off only for requests without tools (Inkling-2: a call may open the turn)
     bool keep_high = false;  // the template has its own effort levels (Inkling-2: none .. high, numbers): passed verbatim, the template checks them
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
@@ -425,7 +426,7 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 }
                 req.tools = tools && tools->kind == tqllm::Json::Array && !tools->arr.empty();
                 req.prompt_text = (*renderer)(msgs, req.tools ? tools : nullptr, kw);
-                if (!req.thinking) req.prompt_text += serve_options().think_off;
+                if (!req.thinking && !(req.tools && serve_options().think_off_without_tools)) req.prompt_text += serve_options().think_off;
                 req.ok = true;
                 return req;
             }

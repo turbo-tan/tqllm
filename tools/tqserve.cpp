@@ -485,7 +485,11 @@ int main(int argc, char ** argv) {
         }
         if (tokenizer.encode("<|content_thinking|>").size() == 1) {  // Inkling-2: thinking message, then the answer message
             auto & so = tqserve::serve_options();
-            so.think_open = "<|content_thinking|>"; so.think_close = "<|end_message|>"; so.think_off.clear();
+            // thinking off: the prompt opens the answer's text message (Inkling-2 has only effort levels, and at "none"
+            // it still writes a thinking message), as its template writes an earlier turn without reasoning; with tools
+            // the turn is the model's (it may open with a call)
+            so.think_open = "<|content_thinking|>"; so.think_close = "<|end_message|>";
+            so.think_off = "<|message_model|><|content_text|>"; so.think_off_without_tools = true;
             if (!effort_set) effort = "high";  // the checkpoint's default level (0.9), not xhigh (0.99)
             if (!reasoning_set) reasoning = true;  // the template always opens a thinking message
             so.keep_high = true;
