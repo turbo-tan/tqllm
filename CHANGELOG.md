@@ -3,6 +3,13 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.8.2 (2026-11-25)
+
+### Fixed
+- Inkling-2-Mini, thinking off: the reply ends where the answer's text message ends. After it the model could open a
+  thinking message and a second answer, and all three reached `content` ("391The user asks ... 391" for "What is 17
+  times 23? Answer with the number only.", RTX 3090 and Mac). Non-streamed, streamed and drafted replies stop there.
+
 ## 1.8.1 (2026-11-25)
 
 ### Fixed

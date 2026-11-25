@@ -489,7 +489,7 @@ int main(int argc, char ** argv) {
             // it still writes a thinking message), as its template writes an earlier turn without reasoning; with tools
             // the turn is the model's (it may open with a call)
             so.think_open = "<|content_thinking|>"; so.think_close = "<|end_message|>";
-            so.think_off = "<|message_model|><|content_text|>"; so.think_off_without_tools = true;
+            so.think_off = "<|message_model|><|content_text|>"; so.think_off_without_tools = true; so.think_off_ends_at_close = true;
             if (!effort_set) effort = "high";  // the checkpoint's default level (0.9), not xhigh (0.99)
             if (!reasoning_set) reasoning = true;  // the template always opens a thinking message
             so.keep_high = true;

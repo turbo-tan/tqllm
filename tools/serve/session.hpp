@@ -39,6 +39,9 @@ struct ServeOptions {
     // enable_thinking: its answer starts right after the end tag; the Qwen template closes the block itself)
     std::string think_open = "<think>", think_close = "</think>", think_off;
     bool think_off_without_tools = false;  // think_off only for requests without tools (Inkling-2: a call may open the turn)
+    // think_off opens the answer message, so think_close (one token) ends the reply (Inkling-2: after the answer's
+    // <|end_message|> the model can open a thinking message and a second answer; the detokenizer joined all three)
+    bool think_off_ends_at_close = false;
     bool keep_high = false;  // the template has its own effort levels (Inkling-2: none .. high, numbers): passed verbatim, the template checks them
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
@@ -151,6 +154,7 @@ struct ChatRequest {
     bool chat = true;
     bool tools = false;  // tool schemas were rendered: parse <tool_call> blocks in the output
     bool thinking = false;  // prompt opens a <think> block: split the output into reasoning_content / content
+    bool answer_open = false;  // the prompt opened the answer message (think_off_ends_at_close): think_close ends the reply
     // reasoning budget, llama.cpp semantics: -1 unlimited, 0 end thinking immediately, N > 0 at most N thinking tokens, then the
     // message + end-of-thinking tag are forced and the answer continues. budget_set / message_set: the request named them
     // (otherwise the server defaults apply).
@@ -426,7 +430,10 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 }
                 req.tools = tools && tools->kind == tqllm::Json::Array && !tools->arr.empty();
                 req.prompt_text = (*renderer)(msgs, req.tools ? tools : nullptr, kw);
-                if (!req.thinking && !(req.tools && serve_options().think_off_without_tools)) req.prompt_text += serve_options().think_off;
+                if (!req.thinking && !(req.tools && serve_options().think_off_without_tools)) {
+                    req.prompt_text += serve_options().think_off;
+                    req.answer_open = !serve_options().think_off.empty() && serve_options().think_off_ends_at_close;
+                }
                 req.ok = true;
                 return req;
             }
@@ -854,6 +861,23 @@ inline bool opens_thinking(const tqllm::Tokenizer & tokenizer, const std::vector
     }
     return false;
 }
+// answer_open: the id that ends the reply after the answer message (think_close as one token), -1 otherwise; not when the
+// reply opened a thinking message after all (then think_close ends the thinking, the answer follows)
+inline int64_t answer_end_id(const tqllm::Tokenizer & tokenizer, const ChatRequest & req) {
+    if (!req.answer_open || req.ignore_eos) return -1;
+    const auto close = tokenizer.encode(serve_options().think_close);
+    return close.size() == 1 ? int64_t(close[0]) : -1;
+}
+struct AnswerEnd {  // spec loops: the answer message ended (answer_open), so decoding stops
+    int64_t id;
+    size_t scanned = 0;
+    bool reached(const tqllm::Tokenizer & tokenizer, const std::vector<uint32_t> & ids) {
+        if (id < 0 || opens_thinking(tokenizer, ids)) return false;
+        const auto from = ids.begin() + std::min(scanned, ids.size());
+        scanned = ids.size();
+        return std::find(from, ids.end(), uint32_t(id)) != ids.end();
+    }
+};
 inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & output,
                             DecodeResult & result) {
     if (!req.thinking && !opens_thinking(tokenizer, output)) return;
@@ -880,8 +904,13 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
     {
         std::vector<uint32_t> output;
         result.finish_reason = "length";
+        const int64_t end = opens_thinking(tokenizer, gen) ? -1 : answer_end_id(tokenizer, req);
         for (const uint32_t tok : gen) {
             ++result.completion_tokens;
+            if (int64_t(tok) == end) {
+                result.finish_reason = "stop";
+                break;
+            }
             if (tokenizer.is_eog(tok)) {
                 if (req.ignore_eos) continue;  // counted, not printed; decoding goes on to max_tokens
                 result.finish_reason = "stop";
@@ -932,10 +961,11 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         model.spec_begin(prompt, count, draft_length(model.native_mtp(), model.adaptive_depth())); }
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
+        AnswerEnd end{answer_end_id(tokenizer, req)};
         while (model.spec_advance()) {
             const auto & ids = model.spec_tokens(0);  // used before the next advance only
             if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
-            if (guard.check(ids)) break;
+            if (guard.check(ids) || end.reached(tokenizer, ids)) break;
         }
         uint64_t st[5] = {};
         finish(tokenizer, req, model.spec_finish(st), result);
@@ -958,9 +988,10 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     std::vector<uint32_t> output;
     output.reserve(count);
     RepeatGuard guard;
+    const int64_t end = answer_end_id(tokenizer, req);
     for (uint32_t i = 0; i < count; ++i) {
         ++result.completion_tokens;
-        if (tokenizer.is_eog(next) && !req.ignore_eos) {
+        if ((tokenizer.is_eog(next) && !req.ignore_eos) || (int64_t(next) == end && !opens_thinking(tokenizer, output))) {
             result.finish_reason = "stop";
             break;
         }
@@ -1177,6 +1208,7 @@ public:
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
         const auto te = tok_.encode(serve_options().think_close);  // finish() splits on this id only when it is one token
         think_id_ = te.size() == 1 ? int64_t(te[0]) : -1;
+        end_id_ = answer_end_id(tok_, req);
         thinking_ = req.thinking;
         if (!serve_options().think_open.empty()) {
             const auto to = tok_.encode(serve_options().think_open);
@@ -1294,6 +1326,7 @@ private:
         if (tok_.is_eog(t)) {if (!req_.ignore_eos) done_ = true; return;}  // ignore_eos: counted, not printed
         // the reply opens a thinking message (opens_thinking(): within its first 3 tokens, nothing printed before it)
         if (!thinking_ && taken_ < 3 && open_id_ >= 0 && int64_t(t) == open_id_ && araw_.empty()) thinking_ = true;
+        if (!thinking_ && int64_t(t) == end_id_) {done_ = true; return;}  // answer_open: the answer message ended
         ++taken_;
         if (thinking_ && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
         std::string & raw = thinking_ && !in_answer_ ? rraw_ : araw_;
@@ -1397,7 +1430,7 @@ private:
     size_t hold_ = 0, seen_ = 0;
     bool role_sent_ = false;
     // incremental update() state
-    int64_t think_id_ = -1;
+    int64_t think_id_ = -1, end_id_ = -1;
     bool done_ = false, in_answer_ = false, thinking_ = false;  // thinking_: the request thinks, or the reply opened a thinking message
     int64_t open_id_ = -1;
     size_t taken_ = 0;
@@ -1439,12 +1472,15 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
         model.spec_begin(prompt, count, draft_length(model.native_mtp(), model.adaptive_depth())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
+    AnswerEnd end{answer_end_id(tokenizer, req)};
     send_first();
     while (live && model.spec_advance()) {
         const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;
+        const bool ended = end.reached(tokenizer, ids);
         if (!on_tokens(ids)) { if (req.observation) req.observation->finish("cancelled"); break; }
+        if (ended) break;
     }
     uint64_t st[5] = {};
     finish(tokenizer, req, model.spec_finish(st), result);

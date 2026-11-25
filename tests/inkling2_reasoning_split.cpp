@@ -158,6 +158,41 @@ int main() {
         check(tools.ok && tools.prompt_text == "P", "thinking off with tools: the model opens its turn (a call may come first)");
         so.think_off.clear(); so.think_off_without_tools = false;
     }
+    {   // thinking off with the answer message opened (Mac + 3090, 1.8.1: "What is 17 times 23? Answer with the number
+        // only."): the answer's <|end_message|> ends the reply; the model went on with a thinking message and a second
+        // answer, and content read "391The user asks ... 391"
+        so.think_off = "<|message_model|><|content_text|>"; so.think_off_without_tools = true; so.think_off_ends_at_close = true;
+        const tqserve::PromptRenderer render = [](const tqllm::Json &, const tqllm::Json *, const tqllm::Json &) { return std::string("P"); };
+        const auto req = tqserve::parse_request(
+            R"({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false}})", 64, "", true, true,
+            "high", &render);
+        check(req.answer_open, "thinking off: the request has the answer message open");
+        std::vector<uint32_t> g = bytes("391");
+        g.push_back(259); g.push_back(257); g.push_back(258);
+        for (auto b : bytes("The user asks for 17 times 23.")) g.push_back(b);
+        g.push_back(259); g.push_back(257); g.push_back(260);
+        for (auto b : bytes("391")) g.push_back(b);
+        g.push_back(259); g.push_back(256);
+        tqserve::DecodeResult r;
+        tqserve::finish(tok, req, g, r);
+        std::printf("answer open: reasoning \"%s\" | content \"%s\" | %s\n", r.reasoning.c_str(), r.text.c_str(), r.finish_reason.c_str());
+        check(r.text == "391" && r.reasoning.empty() && r.finish_reason == "stop", "non-stream: the reply ends with the answer message");
+        std::string sr, sc;
+        stream(req, g, sr, sc);
+        check(sc == "391" && sr.empty(), "stream: the reply ends with the answer message");
+        tqserve::AnswerEnd end{tqserve::answer_end_id(tok, req)};
+        check(!end.reached(tok, bytes("39")), "spec loop: no end before the answer's end_message");
+        check(end.reached(tok, std::vector<uint32_t>(g.begin(), g.begin() + 5)), "spec loop: stops at the answer's end_message");
+        auto thinks = req;  // the reply opened a thinking message after all: its end_message is the thinking's end
+        tqserve::DecodeResult t;
+        tqserve::finish(tok, thinks, gen, t);
+        check(t.reasoning == think && t.text == answer, "answer open, reply opens a thinking message: split as before");
+        tqserve::AnswerEnd end2{tqserve::answer_end_id(tok, thinks)};
+        check(!end2.reached(tok, gen), "spec loop: a thinking message's end_message does not stop the reply");
+        const auto on = tqserve::parse_request(R"({"messages":[{"role":"user","content":"hi"}]})", 64, "", true, true, "high", &render);
+        check(!on.answer_open, "thinking on: no answer end rule");
+        so.think_off.clear(); so.think_off_without_tools = false; so.think_off_ends_at_close = false;
+    }
     std::filesystem::remove_all(dir);
     std::printf(fail ? "inkling2-reasoning-split: FAIL\n" : "inkling2-reasoning-split: PASS\n");
     return fail ? 1 : 0;
