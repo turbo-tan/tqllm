@@ -8,6 +8,7 @@
 #include "hf_arch.hpp"
 
 #include <filesystem>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -126,8 +127,10 @@ void hf_map_inkling2_loop(const HfFolder & h, GgufFile & f) {
         for (const auto & [name, t] : o.tensors) {
             auto it = T.find(name);
             const bool experts = name.find("_exps.weight") != std::string::npos;
+            const bool tqt = t.type == GGML_TQT || t.type == GGML_TQT2 || t.type == GGML_TQT3;
+            const bool dense_tqt_ok = !experts && tqt && std::regex_match(name, std::regex(R"(blk\.\d+\.attn_(q|k|v|output)\.weight)"));
             if (it == T.end()) throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " is not a tensor of the model");
-            if (experts ? (t.type != GGML_TQT && t.type != GGML_TQT2 && t.type != GGML_TQT3) : t.type != GGML_Q8_0)
+            if (experts ? !tqt : (t.type != GGML_Q8_0 && !dense_tqt_ok))  // dense TQT: attention q / k / v / o only
                 throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " has an unexpected type " + std::to_string(t.type));
             if (t.ne != it->second.ne) throw std::runtime_error("inkling2-loop: tqt_experts.gguf tensor " + name + " has another shape");
             GgufTensor g = t;

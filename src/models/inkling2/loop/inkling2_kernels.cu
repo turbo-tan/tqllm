@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace tqllm_cuda::inkling2 {
@@ -810,6 +811,120 @@ template <int FMT> __device__ __forceinline__ float row_dot_trellis(const uint8_
     else if constexpr (FMT == 4) return row_dot_tqt2(row, aux, cols, xh, lane);
     else return row_dot_tqt(row, aux, cols, xh, lane);
 }
+// a TQT / TQT2 / TQT3 row against the M members of a dedup group: row_dot_trellis's arithmetic per member (the same
+// segments per lane, the same FP16 pair values, F32 products and per-block scale step), so each member's sum equals the
+// one-token kernel's bitwise; the stream words are read and decoded once for all members
+template <int FMT, int M>
+__device__ __forceinline__ void row_dot_trellis_members(const uint8_t * row, const uint8_t * aux, int cols, const __half * const * xs, int lane,
+                                                        float (&acc)[M]) {
+    const __half * sc = reinterpret_cast<const __half *>(aux);
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.0f;
+    for (int sg = lane; sg < cols / 32; sg += 32) {
+        uint32_t E[5];
+        if constexpr (FMT == 5) {
+            const uint32_t * w3 = reinterpret_cast<const uint32_t *>(row);
+            E[0] = __ldcs(w3 + 3 * sg); E[1] = __ldcs(w3 + 3 * sg + 1); E[2] = __ldcs(w3 + 3 * sg + 2); E[3] = __ldg(w3 + 3 * ((sg & ~3) | ((sg + 1) & 3)));
+            E[4] = 0;
+        } else if constexpr (FMT == 4) {
+            const uint2 * w2 = reinterpret_cast<const uint2 *>(row);
+            const uint2 v = __ldcs(w2 + sg);
+            E[0] = v.x; E[1] = v.y; E[2] = __ldg(reinterpret_cast<const uint32_t *>(w2 + ((sg & ~3) | ((sg + 1) & 3)))); E[3] = E[4] = 0;
+        } else {
+            const uint4 * w4 = reinterpret_cast<const uint4 *>(row);
+            const uint4 v = __ldcs(w4 + sg);
+            E[0] = v.x; E[1] = v.y; E[2] = v.z; E[3] = v.w; E[4] = __ldg(reinterpret_cast<const uint32_t *>(w4 + ((sg & ~3) | ((sg + 1) & 3))));
+        }
+        const float scl = __half2float(__ldg(sc + sg / 4));
+        float part[M];
+#pragma unroll
+        for (int m = 0; m < M; ++m) part[m] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            uint32_t xw[M][4];
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4 *>(xs[m] + size_t(sg) * 32) + q);
+                xw[m][0] = xv.x; xw[m][1] = xv.y; xw[m][2] = xv.z; xw[m][3] = xv.w;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q * 4 + j;
+                uint32_t wp;
+                if constexpr (FMT == 5) { const int i = (6 * p) / 32, o = (6 * p) % 32; wp = tqllm_cuda::tqtk::pair_win(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o)); }
+                else if constexpr (FMT == 4) { const int i = p / 8, o = 4 * (p % 8); wp = tqllm_cuda::tqtk::pair_win16(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o)); }
+                else wp = tqllm_cuda::tqtk::pair(E, p);
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&wp));
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const float2 xf = __half22float2(*reinterpret_cast<const __half2 *>(&xw[m][j]));
+                    part[m] = fmaf(wf.x, xf.x, part[m]);
+                    part[m] = fmaf(wf.y, xf.y, part[m]);
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[m] = fmaf(scl, part[m], acc[m]);
+    }
+}
+template <int FMT, int M>
+__device__ __forceinline__ void dedup_gate_up_tqt_body(const ExpertMat & mg, const ExpertMat & mu, int rows, int cols, const __half * xh, int e,
+                                                       const int * members, __nv_bfloat16 * act, int topk, float gc, float uc, int row, int lane) {
+    const __half * xs[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) xs[m] = xh + size_t(members[m] / topk) * cols;
+    float ga[M], ua[M];
+    row_dot_trellis_members<FMT, M>(row_ptr<FMT>(mg, e, row, cols), aux_ptr<FMT>(mg, e, row, cols), cols, xs, lane, ga);
+    row_dot_trellis_members<FMT, M>(row_ptr<FMT>(mu, e, row, cols), aux_ptr<FMT>(mu, e, row, cols), cols, xs, lane, ua);
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        const float g = bfr(warp_sum(ga[m])), u = bfr(warp_sum(ua[m]));
+        if (lane == 0) act[size_t(members[m]) * rows + row] = __float2bfloat16(gc * tanhf(g / gc) * (1.0f / (1.0f + expf(-g))) * (uc * tanhf(u / uc)));
+    }
+}
+template <int FMT, int M>
+__device__ __forceinline__ void dedup_down_tqt_body(const ExpertMat & md, int rows, int cols, const __half * acth, int e, const int * members,
+                                                    __nv_bfloat16 * y, int row, int lane) {
+    const __half * xs[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) xs[m] = acth + size_t(members[m]) * cols;
+    float acc[M];
+    row_dot_trellis_members<FMT, M>(row_ptr<FMT>(md, e, row, cols), aux_ptr<FMT>(md, e, row, cols), cols, xs, lane, acc);
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        const float v = warp_sum(acc[m]);
+        if (lane == 0) y[size_t(members[m]) * rows + row] = __float2bfloat16(v);
+    }
+}
+#define TQT_DEDUP_SWITCH(CALL)                                                                                                      \
+    switch (nm) {                                                                                                                   \
+        case 1: CALL(1); break; case 2: CALL(2); break; case 3: CALL(3); break; case 4: CALL(4); break;                             \
+        case 5: CALL(5); break; case 6: CALL(6); break; case 7: CALL(7); break; default: CALL(8); break;                            \
+    }
+// grid (rows / 8, n * topk): block y = dedup group (groups from dedup_groups_k), a warp per row for every member
+template <int FMT>
+__global__ void __launch_bounds__(256) dedup_gate_up_tqt_k(ExpertMat mg, ExpertMat mu, int rows, int cols, const __half * xh, const int * ids,
+                                                           const int * groups, __nv_bfloat16 * act, int topk, float gc, float uc) {
+    const int gi = blockIdx.y, row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (gi >= groups[0] || row >= rows) return;
+    const int * gr = groups + 1 + gi * (1 + 8);
+    const int nm = gr[0], e = ids[gr[1]];
+#define TQT_CALL(M) dedup_gate_up_tqt_body<FMT, M>(mg, mu, rows, cols, xh, e, gr + 1, act, topk, gc, uc, row, lane)
+    TQT_DEDUP_SWITCH(TQT_CALL)
+#undef TQT_CALL
+}
+template <int FMT>
+__global__ void __launch_bounds__(256) dedup_down_tqt_k(ExpertMat md, int rows, int cols, const __half * acth, const int * ids, const int * groups,
+                                                        __nv_bfloat16 * y) {
+    const int gi = blockIdx.y, row = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (gi >= groups[0] || row >= rows) return;
+    const int * gr = groups + 1 + gi * (1 + 8);
+    const int nm = gr[0], e = ids[gr[1]];
+#define TQT_CALL(M) dedup_down_tqt_body<FMT, M>(md, rows, cols, acth, e, gr + 1, y, row, lane)
+    TQT_DEDUP_SWITCH(TQT_CALL)
+#undef TQT_CALL
+}
+#undef TQT_DEDUP_SWITCH
 // grid (rows / 8, n * topk): as expert_gate_up_k, xh = x rotated per 128 (FP16)
 template <int FMT>
 __global__ void __launch_bounds__(256) expert_gate_up_tqt_k(ExpertMat mg, ExpertMat mu, int rows, int cols, const __half * xh, const int * ids,
@@ -1261,6 +1376,435 @@ __global__ void __launch_bounds__(256) dedup_down_k(ExpertMat md, int rows, int 
     }
 }
 
+// NVF4 rows against the M members of a dedup group: rows_dot_nvf4_x's arithmetic per (row, member), so a member's results
+// equal the one-token kernels bitwise; each weight chunk is read once for all members, each activation chunk once per R rows
+template <int NC, int R, int M>
+__device__ __forceinline__ void rows_dot_nvf4_members(const uint8_t * const * row, const uint8_t * const * aux, int cols, const __nv_bfloat16 * const * xs,
+                                                      int lane, float (&acc)[R][M]) {
+    float g[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        g[r] = __ldg(reinterpret_cast<const float *>(aux[r] + cols / 16)) * 16384.0f;
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    }
+#pragma unroll
+    for (int i0 = 0; i0 < (NC + 31) / 32; ++i0) {
+        const int c = i0 * 32 + lane;
+        if (c >= NC) break;
+        uint4 q[R]; uint32_t s2[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            q[r] = __ldcs(reinterpret_cast<const uint4 *>(row[r]) + c);
+            s2[r] = __ldg(reinterpret_cast<const uint16_t *>(aux[r]) + c);
+        }
+        float part[R][M];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 0; m < M; ++m) part[r][m] = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                float xv[8];
+                unpack8(__ldg(reinterpret_cast<const uint4 *>(xs[m] + c * 32) + w), xv);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (w == 2) { acc[r][m] = fmaf(part[r][m], e4m3(uint8_t(s2[r] & 0xff)) * g[r], acc[r][m]); part[r][m] = 0.0f; }
+                    const uint32_t qw = w == 0 ? q[r].x : w == 1 ? q[r].y : w == 2 ? q[r].z : q[r].w;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 e = e2m1x2_scaled(qw >> (8 * j));
+                        part[r][m] = fmaf(e.x, xv[2 * j], part[r][m]);
+                        part[r][m] = fmaf(e.y, xv[2 * j + 1], part[r][m]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 0; m < M; ++m) acc[r][m] = fmaf(part[r][m], e4m3(uint8_t(s2[r] >> 8)) * g[r], acc[r][m]);
+    }
+}
+template <int NC, int R, int M>
+__device__ __forceinline__ void dedup_gate_up_nvf4_body(const ExpertMat & mg, const ExpertMat & mu, int rows, int cols, const __nv_bfloat16 * x, int e,
+                                                        const int * members, __nv_bfloat16 * act, int topk, float gc, float uc, int row0, int lane) {
+    const uint8_t * rp[2 * R]; const uint8_t * ap[2 * R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, rows - 1);
+        rp[r] = row_ptr<2>(mg, e, row, cols); ap[r] = aux_ptr<2>(mg, e, row, cols);
+        rp[R + r] = row_ptr<2>(mu, e, row, cols); ap[R + r] = aux_ptr<2>(mu, e, row, cols);
+    }
+    const __nv_bfloat16 * xs[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) xs[m] = x + size_t(members[m] / topk) * cols;
+    float acc[2 * R][M];
+    rows_dot_nvf4_members<NC, 2 * R, M>(rp, ap, cols, xs, lane, acc);
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float g = bfr(warp_sum(acc[r][m])), u = bfr(warp_sum(acc[R + r][m]));
+            if (lane == 0 && row0 + r < rows)
+                act[size_t(members[m]) * rows + row0 + r] = __float2bfloat16(gc * tanhf(g / gc) * (1.0f / (1.0f + expf(-g))) * (uc * tanhf(u / uc)));
+        }
+}
+template <int NC, int R, int M>
+__device__ __forceinline__ void dedup_down_nvf4_body(const ExpertMat & md, int rows, int cols, const __nv_bfloat16 * act, int e, const int * members,
+                                                     __nv_bfloat16 * y, int row0, int lane) {
+    const uint8_t * rp[R]; const uint8_t * ap[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { const int row = min(row0 + r, rows - 1); rp[r] = row_ptr<2>(md, e, row, cols); ap[r] = aux_ptr<2>(md, e, row, cols); }
+    const __nv_bfloat16 * xs[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) xs[m] = act + size_t(members[m]) * cols;
+    float acc[R][M];
+    rows_dot_nvf4_members<NC, R, M>(rp, ap, cols, xs, lane, acc);
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float v = warp_sum(acc[r][m]);
+            if (lane == 0 && row0 + r < rows) y[size_t(members[m]) * rows + row0 + r] = __float2bfloat16(v);
+        }
+}
+#define TQ_DEDUP_SWITCH(CALL)                                                                                                       \
+    switch (nm) {                                                                                                                   \
+        case 1: CALL(1); break; case 2: CALL(2); break; case 3: CALL(3); break; case 4: CALL(4); break;                             \
+        case 5: CALL(5); break; case 6: CALL(6); break; case 7: CALL(7); break; default: CALL(8); break;                            \
+    }
+static_assert(kMaxMembers == 8, "dedup member switch");
+// grid (rows / (8 R), n * topk): block y = group, a warp's R gate and R up rows for every member
+template <int NC, int R>
+__global__ void __launch_bounds__(256) dedup_gate_up_nvf4_k(ExpertMat mg, ExpertMat mu, int rows, int cols, const __nv_bfloat16 * x, const int * ids,
+                                                            const int * groups, __nv_bfloat16 * act, int topk, float gc, float uc) {
+    const int gi = blockIdx.y, row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
+    if (gi >= groups[0] || row0 >= rows) return;
+    const int * gr = groups + 1 + gi * (1 + kMaxMembers);
+    const int nm = gr[0], e = ids[gr[1]];
+#define TQ_CALL(M) dedup_gate_up_nvf4_body<NC, R, M>(mg, mu, rows, cols, x, e, gr + 1, act, topk, gc, uc, row0, lane)
+    TQ_DEDUP_SWITCH(TQ_CALL)
+#undef TQ_CALL
+}
+template <int NC, int R>
+__global__ void __launch_bounds__(256) dedup_down_nvf4_k(ExpertMat md, int rows, int cols, const __nv_bfloat16 * act, const int * ids, const int * groups,
+                                                         __nv_bfloat16 * y) {
+    const int gi = blockIdx.y, row0 = (blockIdx.x * 8 + threadIdx.x / 32) * R, lane = threadIdx.x % 32;
+    if (gi >= groups[0] || row0 >= rows) return;
+    const int * gr = groups + 1 + gi * (1 + kMaxMembers);
+    const int nm = gr[0], e = ids[gr[1]];
+#define TQ_CALL(M) dedup_down_nvf4_body<NC, R, M>(md, rows, cols, act, e, gr + 1, y, row0, lane)
+    TQ_DEDUP_SWITCH(TQ_CALL)
+#undef TQ_CALL
+}
+#undef TQ_DEDUP_SWITCH
+
+// ---- routed experts on tensor cores (decode and verify, 1 .. 8 tokens): one m16n8k16 BF16 MMA tile = 16 rows of one expert x
+// the (up to 8) assignments routed to it (dedup group members as MMA columns). Weights decode exactly into BF16 (NVF4:
+// e2m1 x e4m3 block scale; MXFP8: e4m3 x 2^e8m0), the F32 global scale after the sum. A thread holds 16 consecutive columns
+// of a 64-column chunk; the MMA's k order is a fixed permutation of them (the same for weights and activations). Every
+// output element depends only on its own row and column data and a k order fixed by the shapes, so a token's results do
+// not depend on the other tokens, the group sizes or n: verify rows == single steps bitwise.
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t *>(&v);
+}
+// one row's CPT consecutive columns of a chunk (4 CPT columns: the row's 4 threads side by side), decoded on demand into BF16
+// pairs: pair p = columns 2p, 2p + 1 of the thread's slice
+template <int FMT, int CPT> struct MmaRow;
+template <int CPT> struct MmaRow<2, CPT> {  // NVF4: CPT / 2 bytes of codes (low nibble first), one E4M3 scale per 16 columns
+    uint32_t w[CPT / 8]; float sc[CPT / 16];
+    __device__ __forceinline__ void load(const uint8_t * row, const uint8_t * aux, int cols, int c, int t) {
+        const uint4 * q = reinterpret_cast<const uint4 *>(row + (4 * c + t) * (CPT / 2));
+#pragma unroll
+        for (int i = 0; i < CPT / 32; ++i) { const uint4 v = __ldcs(q + i); w[4 * i] = v.x; w[4 * i + 1] = v.y; w[4 * i + 2] = v.z; w[4 * i + 3] = v.w; }
+        const uint8_t * sp = aux + (4 * c + t) * (CPT / 16);
+#pragma unroll
+        for (int i = 0; i < CPT / 16; ++i) sc[i] = e4m3(__ldg(sp + i)) * 16384.0f;  // e2m1x2_scaled is the value / 2^14
+    }
+    __device__ __forceinline__ uint32_t pair(int p) const {
+        const float2 e = e2m1x2_scaled(w[p / 4] >> (8 * (p & 3)));
+        return pack_bf16x2(e.x * sc[p / 8], e.y * sc[p / 8]);
+    }
+};
+template <int CPT> struct MmaRow<1, CPT> {  // MXFP8: CPT E4M3 bytes (rows are 4-byte aligned), one E8M0 scale per 32 columns
+    uint32_t w[CPT / 4]; float sc[CPT / 32];
+    __device__ __forceinline__ void load(const uint8_t * row, const uint8_t *, int cols, int c, int t) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(row + (4 * c + t) * CPT);
+#pragma unroll
+        for (int i = 0; i < CPT / 4; ++i) w[i] = __ldcs(q + i);
+#pragma unroll
+        for (int i = 0; i < CPT / 32; ++i) sc[i] = e8m0(__ldg(row + cols + (4 * c + t) * (CPT / 32) + i));
+    }
+    __device__ __forceinline__ uint32_t pair(int p) const {
+        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t((w[p / 2] >> (16 * (p & 1))) & 0xffff), __NV_E4M3)));
+        return pack_bf16x2(v.x * sc[p / 16], v.y * sc[p / 16]);
+    }
+};
+// TQT rows (fmt 3 / 4 / 5, 32 columns = one segment per thread, a 4-thread chunk = one 128-column block with one FP16 scale):
+// the decoded FP16 pairs as stored, FP16 MMA against the rotated FP16 activations, the block scale on the chunk's F32 sum
+template <int FMT> struct MmaRowTqt {
+    uint32_t E[FMT == 3 ? 5 : FMT == 4 ? 3 : 4]; float sc;
+    __device__ __forceinline__ void load(const uint8_t * row, const uint8_t * aux, int, int c, int t) {
+        const int sg = 4 * c + t, nx = 4 * c + ((t + 1) & 3);
+        if constexpr (FMT == 3) {
+            const uint4 v = __ldcs(reinterpret_cast<const uint4 *>(row) + sg);
+            E[0] = v.x; E[1] = v.y; E[2] = v.z; E[3] = v.w; E[4] = __ldg(reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint4 *>(row) + nx));
+        } else if constexpr (FMT == 4) {
+            const uint2 v = __ldcs(reinterpret_cast<const uint2 *>(row) + sg);
+            E[0] = v.x; E[1] = v.y; E[2] = __ldg(reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint2 *>(row) + nx));
+        } else {
+            const uint32_t * w3 = reinterpret_cast<const uint32_t *>(row);
+            E[0] = __ldcs(w3 + 3 * sg); E[1] = __ldcs(w3 + 3 * sg + 1); E[2] = __ldcs(w3 + 3 * sg + 2); E[3] = __ldg(w3 + 3 * nx);
+        }
+        sc = __half2float(__ldg(reinterpret_cast<const __half *>(aux) + c));
+    }
+    __device__ __forceinline__ uint32_t pair(int p) const {
+        if constexpr (FMT == 3) return tqllm_cuda::tqtk::pair(E, p);
+        else if constexpr (FMT == 4) {
+            const int i = p / 8, o = 4 * (p % 8);
+            return tqllm_cuda::tqtk::pair_win16(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o));
+        } else {
+            const int i = (6 * p) / 32, o = (6 * p) % 32;
+            return tqllm_cuda::tqtk::pair_win(o == 0 ? E[i] : __funnelshift_r(E[i], E[i + 1], o));
+        }
+    }
+};
+template <int CPT> struct MmaRow<3, CPT> : MmaRowTqt<3> { static_assert(CPT == 32, "TQT: one segment per thread"); };
+template <int CPT> struct MmaRow<4, CPT> : MmaRowTqt<4> { static_assert(CPT == 32, "TQT: one segment per thread"); };
+template <int CPT> struct MmaRow<5, CPT> : MmaRowTqt<5> { static_assert(CPT == 32, "TQT: one segment per thread"); };
+__device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// the CPT / 4 MMAs of one chunk: rows (lo = tile row g, hi = g + 8) against xb (this thread's CPT columns of token g as BF16
+// pairs); MMA j takes the thread's columns 4j .. 4j + 3 as its k 2t, 2t + 1, 2t + 8, 2t + 9
+template <int FMT, int CPT>
+__device__ __forceinline__ void mma_chunk(float (&c)[4], const MmaRow<FMT, CPT> & lo, const MmaRow<FMT, CPT> & hi, const uint32_t (&xb)[CPT / 2]) {
+    if constexpr (FMT >= 3) {  // TQT: the chunk is one scale block; its F32 sum times the row's scale
+        float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int j = 0; j < CPT / 4; ++j) {
+            const uint32_t a[4] = {lo.pair(2 * j), hi.pair(2 * j), lo.pair(2 * j + 1), hi.pair(2 * j + 1)};
+            mma_f16(p, a, xb[2 * j], xb[2 * j + 1]);
+        }
+        c[0] = fmaf(p[0], lo.sc, c[0]); c[1] = fmaf(p[1], lo.sc, c[1]);
+        c[2] = fmaf(p[2], hi.sc, c[2]); c[3] = fmaf(p[3], hi.sc, c[3]);
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < CPT / 4; ++j) {
+        const uint32_t a[4] = {lo.pair(2 * j), hi.pair(2 * j), lo.pair(2 * j + 1), hi.pair(2 * j + 1)};
+        mma_bf16(c, a, xb[2 * j], xb[2 * j + 1]);
+    }
+}
+template <int CPT>
+__device__ __forceinline__ void load_x(const __nv_bfloat16 * x, int c, int t, uint32_t (&xb)[CPT / 2]) {
+    if (!x) {
+#pragma unroll
+        for (int i = 0; i < CPT / 2; ++i) xb[i] = 0u;
+        return;
+    }
+    const uint4 * p = reinterpret_cast<const uint4 *>(x + (4 * c + t) * CPT);
+#pragma unroll
+    for (int i = 0; i < CPT / 8; ++i) { const uint4 v = __ldg(p + i); xb[4 * i] = v.x; xb[4 * i + 1] = v.y; xb[4 * i + 2] = v.z; xb[4 * i + 3] = v.w; }
+}
+__device__ __forceinline__ void load_x16(const __nv_bfloat16 * x, int c, int t, uint32_t (&xb)[8]) { load_x<16>(x, c, t, xb); }
+template <int FMT>
+__device__ __forceinline__ float mma_global_scale(const uint8_t * aux, int cols) {
+    if constexpr (FMT == 2) return __ldg(reinterpret_cast<const float *>(aux + cols / 16));
+    return 1.0f;
+}
+// split-K warps per 16-row tile and columns per thread (a chunk = 4 CPT columns), fixed by the shapes: the k order of every sum
+constexpr int kMmaGuWarps = 6, kMmaGuCpt = 32, kMmaDnWarps = 3, kMmaDnCpt = 32;
+// grid (rows / 16, n * topk), block kMmaGuWarps warps: gate and up tiles of group blockIdx.y, k split over the warps
+template <int FMT>
+__global__ void __launch_bounds__(32 * kMmaGuWarps) mma_gate_up_k(ExpertMat mg, ExpertMat mu, int rows, int cols, const __nv_bfloat16 * x,
+                                                                  const int * ids, const int * groups, __nv_bfloat16 * act, int topk, float gc,
+                                                                  float uc) {
+    const int gi = blockIdx.y;
+    if (groups && gi >= groups[0]) return;
+    // groups == nullptr: one token, assignment blockIdx.y alone (the same arithmetic as a group of one)
+    const int one[2] = {1, gi};
+    const int * gr = groups ? groups + 1 + gi * (1 + kMaxMembers) : one;
+    const int nm = gr[0], e = ids[gr[1]], warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
+    const int r0 = blockIdx.x * 16 + g, r1 = r0 + 8;
+    const uint8_t * gw0 = row_ptr<FMT>(mg, e, r0, cols), * gw1 = row_ptr<FMT>(mg, e, r1, cols);
+    const uint8_t * uw0 = row_ptr<FMT>(mu, e, r0, cols), * uw1 = row_ptr<FMT>(mu, e, r1, cols);
+    const uint8_t * ga0 = aux_ptr<FMT>(mg, e, r0, cols), * ga1 = aux_ptr<FMT>(mg, e, r1, cols);
+    const uint8_t * ua0 = aux_ptr<FMT>(mu, e, r0, cols), * ua1 = aux_ptr<FMT>(mu, e, r1, cols);
+    const __nv_bfloat16 * xr = g < nm ? x + size_t(gr[1 + g] / topk) * cols : nullptr;
+    constexpr int CPT = kMmaGuCpt;
+    const int nch = cols / (4 * CPT), c0 = warp * nch / kMmaGuWarps, c1 = (warp + 1) * nch / kMmaGuWarps;
+    float cg[4] = {0.0f, 0.0f, 0.0f, 0.0f}, cu[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = c0; c < c1; ++c) {
+        MmaRow<FMT, CPT> g0, g1, u0, u1;
+        g0.load(gw0, ga0, cols, c, t); g1.load(gw1, ga1, cols, c, t); u0.load(uw0, ua0, cols, c, t); u1.load(uw1, ua1, cols, c, t);
+        uint32_t xb[CPT / 2];
+        load_x<CPT>(xr, c, t, xb);
+        mma_chunk<FMT, CPT>(cg, g0, g1, xb);
+        mma_chunk<FMT, CPT>(cu, u0, u1, xb);
+    }
+    __shared__ float red[kMmaGuWarps][32][8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { red[warp][lane][i] = cg[i]; red[warp][lane][4 + i] = cu[i]; }
+    __syncthreads();
+    if (warp) return;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float v = red[0][lane][i];
+#pragma unroll
+        for (int w = 1; w < kMmaGuWarps; ++w) v += red[w][lane][i];
+        (i < 4 ? cg[i] : cu[i - 4]) = v;
+    }
+    const float sg[2] = {mma_global_scale<FMT>(ga0, cols), mma_global_scale<FMT>(ga1, cols)};
+    const float su[2] = {mma_global_scale<FMT>(ua0, cols), mma_global_scale<FMT>(ua1, cols)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // c[i]: row r0 (i < 2) or r1, column (member) 2t + (i & 1)
+        const int m = 2 * t + (i & 1), h = i / 2, row = h ? r1 : r0;
+        if (m >= nm || row >= rows) continue;
+        const float gv = bfr(cg[i] * sg[h]), uv = bfr(cu[i] * su[h]);
+        act[size_t(gr[1 + m]) * rows + row] = __float2bfloat16(gc * tanhf(gv / gc) * (1.0f / (1.0f + expf(-gv))) * (uc * tanhf(uv / uc)));
+    }
+}
+// grid (rows / 16, n * topk), block kMmaDnWarps warps: y[a][row] = bf16(W_down[e][row] . act[a]) for the group's members
+template <int FMT>
+__global__ void __launch_bounds__(32 * kMmaDnWarps) mma_down_k(ExpertMat md, int rows, int cols, const __nv_bfloat16 * act, const int * ids,
+                                                               const int * groups, __nv_bfloat16 * y) {
+    const int gi = blockIdx.y;
+    if (gi >= groups[0]) return;
+    const int * gr = groups + 1 + gi * (1 + kMaxMembers);
+    const int nm = gr[0], e = ids[gr[1]], warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
+    const int r0 = blockIdx.x * 16 + g, r1 = r0 + 8;
+    const uint8_t * w0 = row_ptr<FMT>(md, e, r0, cols), * w1 = row_ptr<FMT>(md, e, r1, cols);
+    const uint8_t * a0 = aux_ptr<FMT>(md, e, r0, cols), * a1 = aux_ptr<FMT>(md, e, r1, cols);
+    const __nv_bfloat16 * xr = g < nm ? act + size_t(gr[1 + g]) * cols : nullptr;
+    constexpr int CPT = kMmaDnCpt;
+    const int nch = cols / (4 * CPT), c0 = warp * nch / kMmaDnWarps, c1 = (warp + 1) * nch / kMmaDnWarps;
+    float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 3
+    for (int c = c0; c < c1; ++c) {
+        MmaRow<FMT, CPT> lo, hi;
+        lo.load(w0, a0, cols, c, t); hi.load(w1, a1, cols, c, t);
+        uint32_t xb[CPT / 2];
+        load_x<CPT>(xr, c, t, xb);
+        mma_chunk<FMT, CPT>(cc, lo, hi, xb);
+    }
+    __shared__ float red[kMmaDnWarps][32][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[warp][lane][i] = cc[i];
+    __syncthreads();
+    if (warp) return;
+    const float sc[2] = {mma_global_scale<FMT>(a0, cols), mma_global_scale<FMT>(a1, cols)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float v = red[0][lane][i];
+#pragma unroll
+        for (int w = 1; w < kMmaDnWarps; ++w) v += red[w][lane][i];
+        const int m = 2 * t + (i & 1), h = i / 2, row = h ? r1 : r0;
+        if (m < nm && row < rows) y[size_t(gr[1 + m]) * rows + row] = __float2bfloat16(v * sc[h]);
+    }
+}
+
+// ---- dense BF16 projections on tensor cores (1 .. 8 tokens): the expert kernels' tiles with BF16 rows as stored; the k
+// split and order are fixed by K, so a token's sums do not depend on n (verify rows == single steps bitwise)
+struct MmaGemvArgs { GemvSeg seg[kMaxSegs]; int nseg, n, tile0[kMaxSegs + 1]; };
+constexpr int kMmaGemvWarps = 8;
+__global__ void __launch_bounds__(32 * kMmaGemvWarps) mma_gemv_k(MmaGemvArgs a) {
+    int si = 0;
+#pragma unroll
+    for (int k = 1; k < kMaxSegs; ++k) if (k < a.nseg && int(blockIdx.x) >= a.tile0[k]) si = k;
+    const GemvSeg & sg = a.seg[si];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
+    const int r0 = (int(blockIdx.x) - a.tile0[si]) * 16 + g, r1 = r0 + 8;
+    const __nv_bfloat16 * w0 = sg.W + size_t(min(r0, sg.rows - 1)) * sg.K, * w1 = sg.W + size_t(min(r1, sg.rows - 1)) * sg.K;
+    const __nv_bfloat16 * xr = g < a.n ? sg.x + size_t(g) * sg.ldx : nullptr;
+    const int nch = sg.K / 64, c0 = warp * nch / kMmaGemvWarps, c1 = (warp + 1) * nch / kMmaGemvWarps;
+    float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 2
+    for (int c = c0; c < c1; ++c) {
+        const uint4 * p0 = reinterpret_cast<const uint4 *>(w0 + 64 * c + 16 * t), * p1 = reinterpret_cast<const uint4 *>(w1 + 64 * c + 16 * t);
+        const uint4 l0 = ld_stream(p0), l1 = ld_stream(p0 + 1), h0 = ld_stream(p1), h1 = ld_stream(p1 + 1);
+        const uint32_t lo[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w}, hi[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        uint32_t xb[8];
+        load_x16(xr, c, t, xb);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t af[4] = {lo[2 * j], hi[2 * j], lo[2 * j + 1], hi[2 * j + 1]};
+            mma_bf16(cc, af, xb[2 * j], xb[2 * j + 1]);
+        }
+    }
+    __shared__ float red[kMmaGemvWarps][32][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[warp][lane][i] = cc[i];
+    __syncthreads();
+    if (warp) return;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float v = red[0][lane][i];
+#pragma unroll
+        for (int w = 1; w < kMmaGemvWarps; ++w) v += red[w][lane][i];
+        const int tok = 2 * t + (i & 1), row = i < 2 ? r0 : r1;
+        if (tok >= a.n || row >= sg.rows) continue;
+        const size_t o = size_t(tok) * sg.ldy + row;
+        if (sg.f32) static_cast<float *>(sg.y)[o] = v;
+        else static_cast<__nv_bfloat16 *>(sg.y)[o] = __float2bfloat16(v);
+    }
+}
+
+// one token: down tiles of all topk experts in one block (warp = (k, k-split part)), then the combine over k in order:
+// the arithmetic of mma_down_k + moe_combine_k, without the groups kernel, the yd round trip and the combine launch
+template <int FMT>
+__global__ void __launch_bounds__(32 * kMmaDnWarps * 8) mma_down_combine1_k(ExpertMat md, int rows, int cols, const __nv_bfloat16 * act, const int * ids,
+                                                                             const float * wts, __nv_bfloat16 * out, int topk) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4, k = warp / kMmaDnWarps, part = warp % kMmaDnWarps;
+    const int r0 = blockIdx.x * 16 + g, r1 = r0 + 8;
+    __shared__ float red[8][kMmaDnWarps][32][4];
+    __shared__ float scl[8][2][8];
+    if (k < topk) {
+        const int e = ids[k];
+        const uint8_t * w0 = row_ptr<FMT>(md, e, r0, cols), * w1 = row_ptr<FMT>(md, e, r1, cols);
+        const uint8_t * a0 = aux_ptr<FMT>(md, e, r0, cols), * a1 = aux_ptr<FMT>(md, e, r1, cols);
+        const __nv_bfloat16 * xr = g == 0 ? act + size_t(k) * cols : nullptr;
+        constexpr int CPT = kMmaDnCpt;
+        const int nch = cols / (4 * CPT), c0 = part * nch / kMmaDnWarps, c1 = (part + 1) * nch / kMmaDnWarps;
+        float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 3
+        for (int c = c0; c < c1; ++c) {
+            MmaRow<FMT, CPT> lo, hi;
+            lo.load(w0, a0, cols, c, t); hi.load(w1, a1, cols, c, t);
+            uint32_t xb[CPT / 2];
+            load_x<CPT>(xr, c, t, xb);
+            mma_chunk<FMT, CPT>(cc, lo, hi, xb);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) red[k][part][lane][i] = cc[i];
+        if (part == 0 && t == 0) { scl[k][0][g] = mma_global_scale<FMT>(a0, cols); scl[k][1][g] = mma_global_scale<FMT>(a1, cols); }
+    }
+    __syncthreads();
+    // column 0 (the token) of c[0] (row r0) and c[2] (row r1) lives in lanes with t == 0: 16 rows, one thread each
+    if (threadIdx.x >= 16) return;
+    const int gg = threadIdx.x % 8, h = threadIdx.x / 8, row = blockIdx.x * 16 + gg + 8 * h, ln = gg * 4;
+    if (row >= rows) return;
+    float y = 0.0f;
+    for (int kk = 0; kk < topk; ++kk) {
+        float v = red[kk][0][ln][2 * h];
+#pragma unroll
+        for (int w = 1; w < kMmaDnWarps; ++w) v += red[kk][w][ln][2 * h];
+        y = fmaf(__bfloat162float(__float2bfloat16(v * scl[kk][h][gg])), wts[kk], y);
+    }
+    out[row] = __float2bfloat16(y);
+}
+
 // one warp per row: max |w| -> scale = max / 127; q = round(w / scale)
 __global__ void quantize_rows_i8_k(const __nv_bfloat16 * w, int8_t * q, float * scale, int rows, int K) {
     const int r = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -1369,6 +1913,15 @@ void msg_gate_out(const __nv_bfloat16 * g, const __nv_bfloat16 * FT, const __nv_
     else
         msg_gate_out_k<<<dim3((D + 255) / 256, n), 256, rank * sizeof(float), s>>>(g, FT, GT, h, m, y, D, rank);
 }
+__global__ void msg_gate_combine_k(const float * fa, const float * h, const float * m, float * y, int n, int D) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(n) * D) return;
+    const size_t t = i / D, c = i % D;
+    y[i] = (1.0f - tanhf(fa[t * 2 * D + c])) * h[i] + tanhf(fa[t * 2 * D + D + c]) * m[i];
+}
+void msg_gate_combine(const float * fa, const float * h, const float * m, float * y, int n, int D, cudaStream_t s) {
+    if (n > 0) msg_gate_combine_k<<<grid_of(size_t(n) * D), 256, 0, s>>>(fa, h, m, y, n, D);
+}
 void add(const float * a, const float * b, float * y, size_t n, bool round_bf16, cudaStream_t s) {
     if (n) add_k<<<grid_of(n), 256, 0, s>>>(a, b, y, n, round_bf16); }
 void moe_combine(const __nv_bfloat16 * y, const float * wts, __nv_bfloat16 * out, int n, int D, int topk, cudaStream_t s) {
@@ -1417,9 +1970,26 @@ int attn_res_norm_scratch_words(int n, int D) {
     return n > 0 && n <= kSmallN ? 3 * kSmallN + n * kArnSplit * kMaxStates * 5 + 4 * n * D : 0;
 }
 
-void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s) {
+void gemv_impl(const GemvSeg * segs, int nseg, int n, cudaStream_t s, bool allow_mma);
+namespace { bool g_gemv_mma = true; }
+void set_gemv_mma(bool on) { g_gemv_mma = on; }
+void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s) { gemv_impl(segs, nseg, n, s, g_gemv_mma); }
+void gemv_rows(const GemvSeg * segs, int nseg, int n, cudaStream_t s) { gemv_impl(segs, nseg, n, s, false); }
+void gemv_impl(const GemvSeg * segs, int nseg, int n, cudaStream_t s, bool allow_mma) {
     if (n <= 0 || nseg <= 0) return;
     if (n > kSmallN || nseg > kMaxSegs) throw std::runtime_error("inkling2 gemv: too many tokens / segments");
+    // BF16 rows: tensor cores (gemv_rows: the LM head, whose bounded greedy rescoring sums like gemv_k<1>)
+    bool mma = allow_mma;
+    for (int i = 0; i < nseg; ++i)
+        mma = mma && !segs[i].scale && segs[i].K % 64 == 0 && segs[i].ldx % 8 == 0 &&
+              reinterpret_cast<uintptr_t>(segs[i].W) % 16 == 0 && reinterpret_cast<uintptr_t>(segs[i].x) % 16 == 0;
+    if (mma) {
+        MmaGemvArgs m{};
+        m.nseg = nseg; m.n = n;
+        for (int i = 0; i < nseg; ++i) { m.seg[i] = segs[i]; m.tile0[i + 1] = m.tile0[i] + (segs[i].rows + 15) / 16; }
+        mma_gemv_k<<<m.tile0[nseg], 32 * kMmaGemvWarps, 0, s>>>(m);
+        return;
+    }
     GemvArgs a{};
     a.nseg = nseg;
     for (int i = 0; i < nseg; ++i) {
@@ -1524,7 +2094,11 @@ void expert_dedup(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d,
     if (g.fmt >= 3) throw std::runtime_error("inkling2 expert_dedup: TQT experts take the per-assignment kernels");
     if (A > kMaxAssign || n > kMaxMembers || g.fmt != d.fmt) throw std::runtime_error("inkling2 expert_dedup: block too wide");
     dedup_groups_k<<<1, kMaxAssign, 0, s>>>(ids, A, groups);
-    if (g.fmt == 2) {
+    if (g.fmt == 2 && D == 72 * 32 && I == 36 * 32) {  // Inkling-2-Mini's shapes: the one-token kernels' arithmetic, weights read once per group
+        constexpr int RG = 1, RD = 1;  // rows per warp: the member accumulators stay within ~100 registers (2 blocks / SM)
+        dedup_gate_up_nvf4_k<72, RG><<<dim3((I + 8 * RG - 1) / (8 * RG), A), 256, 0, s>>>(g, u, I, D, x, ids, groups, act, topk, gc, uc);
+        dedup_down_nvf4_k<36, RD><<<dim3((D + 8 * RD - 1) / (8 * RD), A), 256, 0, s>>>(d, D, I, act, ids, groups, yd);
+    } else if (g.fmt == 2) {
         dedup_gate_up_k<2><<<dim3((I + 7) / 8, A), 256, 0, s>>>(g, u, I, D, x, ids, groups, act, topk, gc, uc);
         dedup_down_k<2><<<dim3((D + 7) / 8, A), 256, 0, s>>>(d, D, I, act, ids, groups, yd);
     } else {
@@ -1534,6 +2108,83 @@ void expert_dedup(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d,
     moe_combine(yd, wts, out, n, D, topk, s);
 }
 
+bool expert_mma_ok(const ExpertMat & g, const ExpertMat & d, int I, int D) {
+    const bool tqt = g.fmt >= 3 && g.fmt <= 5;  // one 32-column segment per thread, a chunk = one 128-column scale block
+    return (g.fmt == 1 || g.fmt == 2 || (tqt && kMmaGuCpt == 32 && kMmaDnCpt == 32)) && d.fmt == g.fmt && D % (4 * kMmaGuCpt) == 0 &&
+           I % (4 * kMmaDnCpt) == 0 && I % 16 == 0 && D % 16 == 0;
+}
+void expert_mma_groups(const int * ids, int A, int * groups, cudaStream_t s) {
+    if (A > kMaxAssign) throw std::runtime_error("inkling2 expert_mma: block too wide");
+    dedup_groups_k<<<1, kMaxAssign, 0, s>>>(ids, A, groups);
+}
+template <class F> void by_fmt(int fmt, F && f) {
+    switch (fmt) {
+        case 1: f(std::integral_constant<int, 1>{}); break;
+        case 2: f(std::integral_constant<int, 2>{}); break;
+        case 3: f(std::integral_constant<int, 3>{}); break;
+        case 4: f(std::integral_constant<int, 4>{}); break;
+        case 5: f(std::integral_constant<int, 5>{}); break;
+        default: throw std::runtime_error("inkling2 expert_mma: format");
+    }
+}
+// x / act: BF16, or for TQT (fmt >= 3) the rotated FP16 copies (same element size)
+void expert_mma_gate_up(const ExpertMat & g, const ExpertMat & u, int I, int D, const __nv_bfloat16 * x, const int * ids, const int * groups,
+                        __nv_bfloat16 * act, int A, int topk, float gc, float uc, cudaStream_t s) {
+    const dim3 grid(I / 16, A);
+    by_fmt(g.fmt, [&](auto F) { mma_gate_up_k<decltype(F)::value><<<grid, 32 * kMmaGuWarps, 0, s>>>(g, u, I, D, x, ids, groups, act, topk, gc, uc); });
+}
+void expert_mma_down(const ExpertMat & d, int D, int I, const __nv_bfloat16 * act, const int * ids, const int * groups, __nv_bfloat16 * yd, int A,
+                     cudaStream_t s) {
+    const dim3 grid(D / 16, A);
+    by_fmt(d.fmt, [&](auto F) { mma_down_k<decltype(F)::value><<<grid, 32 * kMmaDnWarps, 0, s>>>(d, D, I, act, ids, groups, yd); });
+}
+void expert_mma(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __nv_bfloat16 * x, const int * ids, const float * wts,
+                int * groups, __nv_bfloat16 * act, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc, cudaStream_t s,
+                __half * xh, __half * acth) {
+    if (!expert_mma_ok(g, d, I, D) || n > kMaxMembers) throw std::runtime_error("inkling2 expert_mma: format / shape / block");
+    const bool tqt = g.fmt >= 3;
+    if (tqt && (!xh || !acth)) throw std::runtime_error("inkling2 expert_mma: TQT needs the rotated activation scratch");
+    const int A = n * topk;
+    const __nv_bfloat16 * xin = x, * ain = act;
+    if (tqt) {  // TQT weights live in TQ4's rotated basis: the activations rotate per 128 (FP16)
+        rotate_h(x, xh, D, n, s);
+        xin = reinterpret_cast<const __nv_bfloat16 *>(xh);
+        ain = reinterpret_cast<const __nv_bfloat16 *>(acth);
+    }
+    if (n == 1) {  // the same bits without the groups kernel, the yd round trip and the combine launch
+        if (topk > 8) throw std::runtime_error("inkling2 expert_mma: topk > 8");
+        expert_mma_gate_up(g, u, I, D, xin, ids, nullptr, act, A, topk, gc, uc, s);
+        if (tqt) rotate_h(act, acth, I, A, s);
+        by_fmt(d.fmt, [&](auto F) { mma_down_combine1_k<decltype(F)::value><<<D / 16, 32 * kMmaDnWarps * 8, 0, s>>>(d, D, I, ain, ids, wts, out, topk); });
+        return;
+    }
+    expert_mma_groups(ids, A, groups, s);
+    expert_mma_gate_up(g, u, I, D, xin, ids, groups, act, A, topk, gc, uc, s);
+    if (tqt) rotate_h(act, acth, I, A, s);
+    expert_mma_down(d, D, I, ain, ids, groups, yd, A, s);
+    moe_combine(yd, wts, out, n, D, topk, s);
+}
+
+void expert_dedup_tqt(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __half * xh, const int * ids, const float * wts,
+                      int * groups, __nv_bfloat16 * act, __half * acth, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc,
+                      cudaStream_t s) {
+    const int A = n * topk;
+    if (g.fmt < 3 || g.fmt != u.fmt) throw std::runtime_error("inkling2 expert_dedup_tqt: format");
+    if (A > kMaxAssign || n > kMaxMembers) throw std::runtime_error("inkling2 expert_dedup_tqt: block too wide");
+    if (D % 128 || I % 128) throw std::runtime_error("inkling2 expert_dedup_tqt: cols % 128");
+    dedup_groups_k<<<1, kMaxAssign, 0, s>>>(ids, A, groups);
+    const dim3 gg((I + 7) / 8, A);
+    if (g.fmt == 5) dedup_gate_up_tqt_k<5><<<gg, 256, 0, s>>>(g, u, I, D, xh, ids, groups, act, topk, gc, uc);
+    else if (g.fmt == 4) dedup_gate_up_tqt_k<4><<<gg, 256, 0, s>>>(g, u, I, D, xh, ids, groups, act, topk, gc, uc);
+    else dedup_gate_up_tqt_k<3><<<gg, 256, 0, s>>>(g, u, I, D, xh, ids, groups, act, topk, gc, uc);
+    rotate_h(act, acth, I, A, s);
+    const dim3 gd((D + 7) / 8, A);
+    if (d.fmt == 5) dedup_down_tqt_k<5><<<gd, 256, 0, s>>>(d, D, I, acth, ids, groups, yd);
+    else if (d.fmt == 4) dedup_down_tqt_k<4><<<gd, 256, 0, s>>>(d, D, I, acth, ids, groups, yd);
+    else if (d.fmt == 3) dedup_down_tqt_k<3><<<gd, 256, 0, s>>>(d, D, I, acth, ids, groups, yd);
+    else throw std::runtime_error("inkling2 expert_dedup_tqt: down format");
+    moe_combine(yd, wts, out, n, D, topk, s);
+}
 void quantize_rows_i8(const __nv_bfloat16 * w, int8_t * q, float * scale, int rows, int K, cudaStream_t s) {
     if (rows > 0) quantize_rows_i8_k<<<(rows + 7) / 8, 256, 0, s>>>(w, q, scale, rows, K);
 }

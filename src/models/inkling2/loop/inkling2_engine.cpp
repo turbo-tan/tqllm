@@ -26,8 +26,15 @@ constexpr uint32_t kEos = 200006;  // generation_config eos_token_id
 
 class Inkling2Engine final : public Engine {
 public:
-    Inkling2Engine(const std::string & dir, uint32_t context, bool mtp, bool exact) : m_(dir, int(context), prompt_chunk(), false, SIZE_MAX, exact), context_(context) {
-        if (mtp) {
+    // drafter: -md FOLDER (a DFlash2 drafter folder), else --mtp (the DSpark head in the checkpoint's mtp.safetensors)
+    Inkling2Engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model)
+        : m_(dir, int(context), prompt_chunk(), false, SIZE_MAX, exact,
+             Inkling2Model::drafter_bytes(!draft_model.empty() ? draft_model : mtp ? dir : std::string())),
+          context_(context) {
+        if (!draft_model.empty()) {
+            m_.enable_mtp(draft_model);
+            mtp_ = true;
+        } else if (mtp) {
             if (!std::filesystem::exists(std::filesystem::path(dir) / "mtp.safetensors")) throw std::runtime_error("inkling2: --mtp needs mtp.safetensors in " + dir);
             m_.enable_mtp(dir);
             mtp_ = true;
@@ -196,8 +203,8 @@ private:
 };
 }  // namespace
 
-std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact) {
-    return std::make_unique<Inkling2Engine>(dir, context, mtp, exact);
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model) {
+    return std::make_unique<Inkling2Engine>(dir, context, mtp, exact, draft_model);
 }
 
 }  // namespace tqllm
