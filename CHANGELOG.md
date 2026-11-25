@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Flash-Next replies report the drafts the decode steps verified as `timings.draft_n` (and in the request log's draft
+  acceptance) instead of steps x the most MTP drafts, which overstated it whenever the adaptive stop, a copy draft or a
+  DFlash2 block verified another count. ISTA IQ3_XXS, two greedy replies: draft_n 260 / 440 -> 233 / 171 (the `LEDGER`
+  drafts offered), acceptance 76 % / 27 % -> 85 % / 70 %; replies identical (md5).
+
 ## 1.8.0 (2026-11-25)
 
 ### Added
@@ -75,10 +83,6 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   with ids -1 == one launch); they fail on the old kernels. `TQLLM_DEBUG=moe_nan` checks the Flash-Next split path's
   expert outputs at run time. Output bits unchanged where the bug was not reached (ISTA IQ3_XXS: md5 of 70 replies,
   and of 6 replies without drafts).
-- Flash-Next replies report the drafts the decode steps verified as `timings.draft_n` (and in the request log's draft
-  acceptance) instead of steps x the most MTP drafts, which overstated it whenever the adaptive stop, a copy draft or a
-  DFlash2 block verified another count. ISTA IQ3_XXS, two greedy replies: draft_n 260 / 440 -> 233 / 171 (the `LEDGER`
-  drafts offered), acceptance 76 % / 27 % -> 85 % / 70 %; replies identical (md5).
 
 ## 1.7.0 (2026-11-23)
 
