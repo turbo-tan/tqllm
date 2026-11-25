@@ -26,7 +26,8 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   drafts' own confidences (the softmax weight of each drafted token among its 16 candidates), calibrated online against
   what this request's drafts were actually accepted at, and the step time per verified row measured on the device. A
   card where verify rows are costly (16 GB: experts stream from RAM) verifies fewer; a 3090 or GB10 more. Output is
-  unchanged (40 / 40 replies equal to `--draft-max 7` on all three cards). Tech2Wild's `bench_inkling.py` (types, one
+  unchanged (40 / 40 replies equal to `--draft-max 7` on all three cards). `timings.draft_n` now counts the drafts
+  each step verified (the window), so acceptance rates are not comparable with 1.8.0's. Tech2Wild's `bench_inkling.py` (types, one
   user), tok/s, 1.8.0 -> 1.8.1:
   - RTX 3090, official checkpoint, exact: coding 200.3 -> 230.5, math 195.4 -> 215.8, json 211.1 -> 228.3,
     html 193.8 -> 216.9, prose 158.5 -> 178.0, narrative 163.7 -> 182.3, summary 174.4 -> 188.9, counting 232.8 -> 287.5
