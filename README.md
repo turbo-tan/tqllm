@@ -16,6 +16,8 @@ with an OpenAI-compatible HTTP server.
 
 **New in [1.8.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.8.0)** ([all changes](CHANGELOG.md)):
 
+![tqLLM 1.8.0](https://github.com/turbo-tan/tqllm/releases/download/v1.8.0/tqllm-1.8.0.png)
+
 - **Inkling-2-Mini drafting with DFlash2** (`-md FOLDER`, incoai's Apache-2.0 drafter), verified on tensor cores so
   drafted output equals plain output. RTX 3090, official checkpoint, exact: code 240.7, math 252.5, chat 142.7 tok/s
   (plain 91; 1.7.0 plain 78.9). DGX Spark / GB10: code 85.3, math 85.5 tok/s. [Inkling guide](docs/models/inkling2.md).
