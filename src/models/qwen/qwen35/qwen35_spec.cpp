@@ -260,7 +260,10 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         uint32_t anchor_at = 0;  // the turn anchor this prefill saves on its way (0: kept already, or none)
         if (pc_on && user_tok_ != ~0u && !starts.empty()) {
             bool move = false;
-            const uint32_t a = kept_state_turn(starts, prompt.data(), P, user_tok_, result_tok_);
+            // `starts` leaves out position 0 (no chunk restarts there); a first message that is the user's still counts
+            std::vector<uint32_t> msgs = starts;
+            if (prompt[0] == im_start_) msgs.insert(msgs.begin(), 0u);
+            const uint32_t a = kept_state_turn(msgs, prompt.data(), P, user_tok_, result_tok_);
             const uint32_t next = kept_anchor_next(KeptStates{pc_snap, pc_sys, pc_anchor}, P0, a, snap, &move);
             if (move) std::swap(pc_host, pc_anchor_host), pc_snap = 0;  // an earlier turn's last-message state is the anchor now
             if (next > P0) anchor_at = next, pc_anchor = 0;

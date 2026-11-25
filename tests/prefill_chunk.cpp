@@ -160,6 +160,9 @@ int main() {
         if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 3, 8) != 7) { std::fprintf(stderr, "FAIL turn anchor (a tool result is not a turn)\n"); ++failures; }
         if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 3, 99) != 15) { std::fprintf(stderr, "FAIL without the result token the tool result counts\n"); ++failures; }
         if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 5, 8) != 0) { std::fprintf(stderr, "FAIL no user message: no anchor\n"); ++failures; }
+        // no system message: the user message starts at 0 (the engine adds 0 to the message starts for this scan)
+        const std::vector<uint32_t> nosys{1, 3, 9, 1, 4, 9, 1, 3, 7, 8, 9, 1, 4};
+        if (tqllm::kept_state_turn({0, 3, 6, 11}, nosys.data(), 13, 3, 8) != 3) { std::fprintf(stderr, "FAIL user message at 0: anchor\n"); ++failures; }
     }
     if (failures) return 1;
     std::puts("prefill_chunk: ok");
