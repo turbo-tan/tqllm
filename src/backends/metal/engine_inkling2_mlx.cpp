@@ -1,5 +1,7 @@
 #include "engine_inkling2_mlx.hpp"
 #include "inkling2_mlx.hpp"
+#include "inkling2_mlx_draft.hpp"
+#include "inkling2_turns.hpp"
 #include "sampling_topk.hpp"
 #include <algorithm>
 #include <chrono>
@@ -14,11 +16,14 @@ namespace {
 class MlxInkling2Engine final : public Engine {
     using Clock=std::chrono::steady_clock;
 public:
-    // drafter: "" (none), the checkpoint folder (--mtp: its mtp.safetensors) or a DSpark drafter GGUF (-md FILE.gguf)
-    MlxInkling2Engine(const std::string& folder,uint32_t context,const std::string& drafter,bool exact) : model_(folder,int(context),exact) {
+    // drafter: "" (none), the checkpoint folder (--mtp: its mtp.safetensors), a DSpark drafter GGUF (-md FILE.gguf) or a
+    // DFlash2 drafter folder (-md FOLDER)
+    MlxInkling2Engine(const std::string& folder,uint32_t context,const std::string& drafter,bool exact,int dense_bits)
+        : model_(folder,int(context),exact,dense_bits) {
         if(drafter==folder && !std::filesystem::exists(std::filesystem::path(folder)/"mtp.safetensors"))
             throw std::runtime_error("inkling2 Metal: --mtp needs mtp.safetensors in "+folder);
         if(!drafter.empty()) model_.enable_draft(drafter);
+        model_.warm_up();
     }
     bool has_drafter() const override {return model_.drafting();}
     bool native_mtp() const override {return model_.drafting();}
@@ -39,16 +44,25 @@ public:
     }
     void spec_begin(const std::vector<uint32_t>& prompt,uint32_t count,int depth) override {
         if(prompt.empty() || prompt.size()>=size_t(model_.context())) throw std::invalid_argument("Inkling2 Metal prompt/context");
-        model_.reset();inflight_.reset();output_.clear();steps_=drafted_=accepted_=0;done_=false;
+        inflight_.reset();output_.clear();steps_=drafted_=accepted_=0;done_=false;
         fixed_depth_=depth>0?std::min(depth,7):0;
         count_=std::min(count,uint32_t(model_.context())-uint32_t(prompt.size()));
         std::optional<mx::array> logits;
         auto start=Clock::now();
-        for(size_t p=0;p<prompt.size();) {
-            const size_t n=std::min(prefill_chunk(p),prompt.size()-p);
-            logits=model_.forward(std::span<const uint32_t>(prompt).subspan(p,n));
-            p+=n;
-        }
+        // turn reuse: a prompt that begins with the previous prompt (the conversation so far; the next one appends the
+        // answer and a new message, starting with a role token) resumes from the state that prefill left. The chunks
+        // restart at message starts, so the resumed prefill runs the chunks a cold one would (same bits)
+        size_t from=0;
+        if(kept_.state && prompt.size()>kept_tokens_.size() && std::equal(kept_tokens_.begin(),kept_tokens_.end(),prompt.begin()) &&
+           mlx_backend::inkling2_message_start(prompt[kept_tokens_.size()])) {
+            model_.restore(kept_);from=kept_tokens_.size();
+            std::fprintf(stderr,"tqserve: turn reuse: %zu of %zu prompt tokens held from the previous turn, prefill %zu\n",from,prompt.size(),prompt.size()-from);
+        } else model_.reset();
+        kept_={};kept_tokens_.clear();
+        for(auto [p,end]:mlx_backend::inkling2_prefill_chunks(prompt,from,prefill_chunk(0)))
+            logits=model_.forward(std::span<const uint32_t>(prompt).subspan(p,end-p));
+        // keep this prompt's end for the next turn (shorter prompts prefill in one chunk anyway)
+        if(prompt.size()>=mlx_backend::kTurnMin) {kept_=model_.keep();kept_tokens_=prompt;}
         decode_start_=Clock::now();prefill_us_=uint64_t(std::chrono::duration<double,std::micro>(decode_start_-start).count());
         done_=count_==0;
         if(!done_) {emit(pick(*logits));if(first_token_) first_token_();}
@@ -116,6 +130,8 @@ private:
     mlx_backend::Inkling2Mlx model_;
     std::vector<uint32_t> output_;
     std::optional<mx::array> inflight_;  // greedy step queued on the GPU, token not read yet
+    mlx_backend::Inkling2Mlx::Kept kept_;   // the state after the last prompt's prefill (turn reuse)
+    std::vector<uint32_t> kept_tokens_;
     std::function<void()> first_token_;
     std::mt19937_64 rng_{0};
     Clock::time_point decode_start_;
@@ -130,8 +146,8 @@ private:
 std::unique_ptr<Engine> make_mlx_inkling2_engine(const std::string& model,const std::string&,uint32_t context,int slots,const EngineOptions& options) {
     if(slots!=1) throw std::invalid_argument("Inkling2 Metal requires --np 1");
     const auto& md=options.draft_model;
-    if(!md.empty() && (md.size()<5 || md.compare(md.size()-5,5,".gguf")!=0))
-        throw std::invalid_argument("Inkling2 Metal drafts with its DSpark head: --mtp, or -md a DSpark drafter GGUF");
-    return std::make_unique<MlxInkling2Engine>(model,context,!md.empty()?md:options.native_mtp?model:std::string(),options.exact);
+    if(!md.empty() && (md.size()<5 || md.compare(md.size()-5,5,".gguf")!=0) && !mlx_backend::Inkling2MlxDFlash2::is_drafter_folder(md))
+        throw std::invalid_argument("Inkling2 Metal drafts with its DSpark head (--mtp, or -md a DSpark drafter GGUF) or -md a DFlash2 drafter folder");
+    return std::make_unique<MlxInkling2Engine>(model,context,!md.empty()?md:options.native_mtp?model:std::string(),options.exact,options.dense_bits);
 }
 }  // namespace tqllm

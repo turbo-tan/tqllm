@@ -69,6 +69,11 @@ later turn can reuse (64 tokens before its end), on the first read too, so long-
 prompt with `--prompt-cache off` (one read in whole chunks); with the cache on, a reused turn gives the same text as its
 first read. `--prompt-cache off` reads every prompt afresh.
 
+`--dense-bits 8|4` (with `--exact off`, default 8) picks the precision of the dense projections and the LM head where an
+engine quantizes them (Inkling-2-Mini on Metal: attention q / k / v / output / gate and the head, group 64). 8 keeps
+greedy tokens on the BF16 head; 4 also takes them from the 4-bit head (the precision of MTPLX's Bare-Speed pack):
+faster decode, larger KLD. Each published number names the setting.
+
 If memory forces a smaller KV cache with `--exact on`, the server says so on stderr and in `/health`
 ("exact on: ..."). An approximation asked for explicitly with `--exact on` (the last column) is a conflict: the server
 prints one `WARN --exact on with ...` line per option, runs the asked option, and `/health` shows

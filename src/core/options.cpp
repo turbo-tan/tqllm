@@ -70,6 +70,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "on" && v != "off") throw std::invalid_argument("--exact must be on or off");
         o.exact = v == "on";
     }
+    else if (a == "--dense-bits") {
+        const std::string v = value();
+        if (v != "8" && v != "4") throw std::invalid_argument("--dense-bits must be 8 or 4");
+        o.dense_bits = std::stoi(v);
+    }
     else if (a == "--qsa-from") {
         const std::string v = value();
         o.qsa_from = v == "off" ? 0 : std::stoi(v);
@@ -186,7 +191,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--exact on|off (on: reference precision; with the prompt cache a long prompt is read in two parts at its reuse point)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off (Flash-Next: on where memory fits)] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n [--gdn-state f32|f16]"
+    return "  engine: [--exact on|off (on: reference precision; with the prompt cache a long prompt is read in two parts at its reuse point)] [--dense-bits 8|4 (--exact off: dense weights; 4 = faster, larger KLD)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off (Flash-Next: on where memory fits)] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n [--gdn-state f32|f16]"
            "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"

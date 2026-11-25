@@ -5,6 +5,7 @@
 #include "mlx_floatx.hpp"
 #include "mlx_kv.hpp"
 #include "inkling2_mlx_draft.hpp"
+#include "inkling2_rows.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -82,7 +83,10 @@ struct Inkling2Mlx::Impl {
     // 64; greedy tokens still come from the BF16 head, see head_approx); the sinks, relative bias, conv projections,
     // controllers and router stay BF16. Not exact against the
     // reference: gated by KLD / PPL against BF16 (0.00267 / 5.671 vs 0.00241 / 5.667; 4-bit fails at 0.018).
+    // --dense-bits 4: the same projections and the LM head in 4 bits (group 64), greedy tokens from the 4-bit head (no
+    // BF16 bound): the precision of MTPLX's Bare-Speed pack, faster decode for a larger KLD.
     static constexpr int kQ8Group = 64;
+    int qbits = 8;
     std::map<std::string, std::vector<mx::array>> q8;
     // Exact greedy decode: a 6-bit copy of the BF16 LM head (group 64, F32 scales, so the scores are F32) with each
     // row's error bound; greedy steps and verify blocks score all rows with it and recompute in BF16 only the rows that
@@ -91,7 +95,8 @@ struct Inkling2Mlx::Impl {
     static constexpr int kHeadBits = 6, kHeadGroup = 64;
     std::vector<mx::array> head_approx;
     std::optional<mx::array> head_bound, head_input;
-    Impl(const std::string& path, int ctx, bool exact) : context(ctx) {
+    Impl(const std::string& path, int ctx, bool exact, int dense_bits) : context(ctx), qbits(dense_bits) {
+        if (qbits != 8 && qbits != 4) throw std::invalid_argument("inkling2 MLX dense bits must be 8 or 4");
         mx::set_default_device(mx::Device::gpu);
         mx::set_cache_limit(size_t(512)*1024*1024);
         HfFolder folder(path);
@@ -153,14 +158,14 @@ struct Inkling2Mlx::Impl {
                 for (const char* m : {"attn.wq_du.weight", "attn.wk_dv.weight", "attn.wv_dv.weight", "attn.wo_ud.weight", "attn.gate_attn.weight"})
                     names.push_back(prefix(l) + m);
             for (const auto& name : names) {
-                auto q = mx::quantize(w(name), kQ8Group, 8);
+                auto q = mx::quantize(w(name), kQ8Group, qbits);
                 mx::eval(q);
                 q8.emplace(name, std::move(q));
                 // The BF16 LM head stays for the drafter's fold (built from it at enable_draft); the rest is replaced.
                 if (name != "unembed.weight") weights.erase(name);
             }
         }
-        build_head_bound();  // both modes: --exact off's greedy tokens also come from the BF16 head
+        if (exact || qbits == 8) build_head_bound();  // --exact on and 8-bit: greedy tokens come from the BF16 head
         for (int l : schedule()) visits.emplace_back(context, full[l] ? 0 : window);
         for(const auto& [name,value]:weights) mx::eval(value);
         for(const auto& q:message_queries) mx::eval(q);
@@ -214,11 +219,16 @@ struct Inkling2Mlx::Impl {
         if (nv) global = mx::divide(mx::multiply(w(name + "_amax"), mx::array(2688.f)), w(name + "_outer_scale_denominator"));
         return FloatxExperts(w(name), w(name + "_scale"), global, nv ? 4 : 8);
     }
+    // A decode step or a verify block (1..8 rows) runs the row-invariant products (inkling2_rows.hpp), so a verify
+    // row equals its decode step bit for bit; prompt chunks keep MLX's matmul.
     mx::array project(const mx::array& x, const std::string& name) const {
         const auto it = q8.find(name);
-        if (it == q8.end()) return linear(x, w(name));
+        const bool few = x.ndim() == 2 && x.shape(0) <= 8;
+        // SIMD row kernel (A/B 11-24 against the matrix-unit one: plain 38.3 vs 36.4 tok/s, 8-row verify 64.5 vs 68.4 ms)
+        if (it == q8.end()) return few ? inkling2_rows_linear(x, w(name)) : linear(x, w(name));
         const auto& q = it->second;
-        return mx::quantized_matmul(bf16(x), q[0], q[1], q[2], true, kQ8Group, 8);
+        if (few) return inkling2_rows_affine(bf16(x), q[0], q[1], q[2], kQ8Group, qbits);
+        return mx::quantized_matmul(bf16(x), q[0], q[1], q[2], true, kQ8Group, qbits);
     }
     mx::array gate(const mx::array& h, const mx::array& message, const std::string& p) const {
         auto both = mx::concatenate({norm(h), norm(message)}, -1);
@@ -305,8 +315,8 @@ struct Inkling2Mlx::Impl {
         const auto a_ = p + "attn.";
         const int n = h.shape(0);
         std::vector<mx::array> qs;  // q, rel, sink, gate
-        for (const char* name : {"wq_du.weight", "wr_du.weight", "attn_sink_proj.weight", "gate_attn.weight"})
-            qs.push_back(project(inputs[0], a_ + name));
+        const char* qnames[4] = {"wq_du.weight", "wr_du.weight", "attn_sink_proj.weight", "gate_attn.weight"};
+        for (const char* name : qnames) qs.push_back(project(inputs[0], a_ + name));
         auto kr = project(inputs[1], a_ + "wk_dv.weight"), vr = project(inputs[2], a_ + "wv_dv.weight");
         std::optional<mx::array> kdyn, vdyn;
         if (full[l]) { kdyn = project(inputs[1], a_ + "k_sconv.weight_proj"); vdyn = project(inputs[2], a_ + "v_sconv.weight_proj"); }
@@ -334,7 +344,8 @@ struct Inkling2Mlx::Impl {
             k = clip(mx::reshape(k, {n, G, HD}), qclip);
             v = norm_bf16(mx::reshape(v, {n, G, HD}));
         }
-        auto bias = linear(rel, mx::transpose(w(a_ + "rel_logits_proj.proj")));
+        // a decode step / verify block: attend() computes the bias in its row-invariant kernel from rel itself
+        auto bias = n > 8 ? linear(rel, mx::transpose(w(a_ + "rel_logits_proj.proj"))) : rel;
         auto keys = mx::expand_dims(mx::transpose(k, {1, 0, 2}), 0);
         auto vals = mx::expand_dims(mx::transpose(v, {1, 0, 2}), 0);
         auto query = mx::expand_dims(mx::transpose(q,{1,0,2}),0);
@@ -356,15 +367,10 @@ struct Inkling2Mlx::Impl {
             if (!verifying) visit.kv.retain_window();
             return out;
         }
-        auto mask = inkling2_mask(bias, sinks, base, start, s, full[l] ? 0 : window);  // [1, H, n, s + 1]
-        // A verify block's few rows as heads of one single-query call: row r of head h becomes head h * n + r, which
-        // keeps the GQA grouping (query heads h of a key head stay together), so MLX runs its split-key vector kernel
-        // instead of the multi-row tiles (64K verify of 6 rows: ~17 ms per full-attention visit).
-        const bool fold = n > 1 && n <= 8;
-        auto out = fold ? mx::reshape(inkling2_sink_attention(mx::reshape(query, {1, H * n, 1, HD}), kc, vc,
-                                                              mx::reshape(mask, {1, H * n, 1, s + 1}), scale),
-                                      {1, H, n, HD})
-                        : inkling2_sink_attention(query,kc,vc,mask,scale);
+        // a decode step or a verify block (bias holds rel here, see pre): keys by absolute position, so a block row
+        // equals its decode step bit for bit (inkling2_rows_attention)
+        auto out = inkling2_rows_attention(query, kc, vc, bias, w(prefix(l) + "attn.rel_logits_proj.proj"), sinks, base, start, s,
+                                           full[l] ? 0 : window, scale);
         if (!verifying) visit.kv.retain_window();  // a verify block trims in commit(), after a rollback
         return out;
     }
@@ -407,37 +413,20 @@ struct Inkling2Mlx::Impl {
         auto [ids, routes] = inkling2_route(project(f32(x), p + "mlp.gate.weight"), w(p + "mlp.gate.bias"), topk, route_scale);
         const int n = x.shape(0);
         // A chunk of tokens runs grouped by expert; one token keeps the per-row matvec path.
-        if (verifying && n > 1 && n <= 8 && experts[l][0].nax_codes) {
-            // Verify block on the matrix unit: rows grouped by expert, each expert's weights read once for its rows.
-            // pairs sorted by expert in one kernel (inkling2_pair_sort): sorted ids, token rows, restore order
-            auto sorting = inkling2_pair_sort(ids);
-            auto sorted = mx::reshape(mx::slice(sorting, {0, 0}, {1, n * topk}), {n * topk});
-            auto token = mx::reshape(mx::slice(sorting, {1, 0}, {2, n * topk}), {n * topk});
-            auto restore = mx::reshape(mx::slice(sorting, {2, 0}, {3, n * topk}), {n * topk});
-            auto gu = experts[l][0].rows(x, token, sorted);  // [n*topk, 2I]
-            auto g = f32(mx::slice(gu, {0, 0}, {n * topk, 2 * I}, {1, 2}));
-            auto u = f32(mx::slice(gu, {0, 1}, {n * topk, 2 * I}, {1, 2}));
-            auto act = mx::multiply(mx::multiply(mx::tanh(mx::divide(g, mx::array(gate_cap))), mx::array(gate_cap)), mx::sigmoid(g));
-            act = bf16(mx::multiply(act, mx::multiply(mx::tanh(mx::divide(u, mx::array(up_cap))), mx::array(up_cap))));
-            // the down product in sorted order; the combine reads pair (t, k) at restore[t K + k]
-            auto y = experts[l][1].rows(act, mx::arange(n * topk, mx::uint32), sorted);  // [n*topk, D]
-            return {mx::reshape(y, {n * topk, 1, D}), routes, restore};
-        }
-        if (verifying && n > 1 && n <= 8) {
-            // Verify block on gather_qmm (no matrix-unit copy): the same one-kernel pair sort, the products grouped by
-            // expert, the combine reading the sorted rows through the restore order.
-            auto sorting = inkling2_pair_sort(ids);
+        if (n <= 8) {
+            // A decode step or a verify block: pairs sorted by expert in one kernel (inkling2_pair_sort), each expert read
+            // once for its run of rows, gate_up with the capped SwiGLU fused, then down; the combine reads pair (t, k) at
+            // restore[t K + k]. The same kernels at every row count, so a verify row equals its decode step bit for bit.
             const int P = n * topk;
+            auto sorting = inkling2_pair_sort(ids);
             auto sorted = mx::reshape(mx::slice(sorting, {0, 0}, {1, P}), {P});
             auto token = mx::reshape(mx::slice(sorting, {1, 0}, {2, P}), {P});
             auto restore = mx::reshape(mx::slice(sorting, {2, 0}, {3, P}), {P});
-            auto gu = experts[l][0](mx::expand_dims(mx::take(x, token, 0), 1), sorted, true);  // [P, 1, 2I]
-            const mx::Shape stop{P, 1, 2 * I};
-            auto g = f32(mx::slice(gu, {0, 0, 0}, stop, {1, 1, 2}));
-            auto u = f32(mx::slice(gu, {0, 0, 1}, stop, {1, 1, 2}));
-            auto act = mx::multiply(mx::multiply(mx::tanh(mx::divide(g, mx::array(gate_cap))), mx::array(gate_cap)), mx::sigmoid(g));
-            act = mx::multiply(act, mx::multiply(mx::tanh(mx::divide(u, mx::array(up_cap))), mx::array(up_cap)));
-            return {experts[l][1](bf16(act), sorted, true), routes, restore};
+            const auto& gu = experts[l][0];
+            const auto& dn = experts[l][1];
+            auto act = inkling2_rows_experts(bf16(x), token, sorted, gu.codes, gu.scales, gu.global, gu.bits, true, gate_cap, up_cap);
+            auto y = inkling2_rows_experts(act, mx::arange(P, mx::uint32), sorted, dn.codes, dn.scales, dn.global, dn.bits);
+            return {mx::reshape(y, {P, 1, D}), routes, restore};
         }
         std::optional<ExpertGroups> groups;
         if (n * topk >= 64) groups.emplace(ids);  // a prompt chunk reads each expert once for its rows
@@ -597,6 +586,7 @@ struct Inkling2Mlx::Impl {
         length+=int(tokens.size());
         return logits;
     }
+    void retain_windows() { for (auto& visit : visits) { visit.kv.retain_window(); visit.before = {}; visit.input = {}; } }
     mx::array greedy_step(const mx::array& token) {
         if (token.size() != 1 || length >= context) throw std::invalid_argument("inkling2 MLX greedy step token/context");
         lazy = true;
@@ -613,43 +603,25 @@ struct Inkling2Mlx::Impl {
     }
     // DSpark speculation (enable_draft): draft `depth` tokens after `anchor`, verify [anchor, drafts] in one target
     // forward, keep the longest prefix the target agrees with and roll the rest back. One host sync per step.
-    std::unique_ptr<Inkling2MlxDraft> draft;
+    std::unique_ptr<Inkling2MlxDrafter> draft;
     std::optional<mx::array> taps;  // [n, 4, D] of the last build() when drafting
-    void enable_draft(const std::string& folder) {
+    void enable_draft(const std::string& folder, Inkling2Mlx::DraftPrecision precision = {}) {
         if (length) throw std::runtime_error("inkling2 MLX: enable the drafter before the first forward");
-        draft = std::make_unique<Inkling2MlxDraft>(folder, context, w("unembed.weight"), V, window,
-            [this](const mx::array& x) {  // drafts only propose (the verify decides): the 6-bit head copy when built
-                if (head_approx.empty()) return project(x, "unembed.weight");
-                return mx::quantized_matmul(f32(x), head_approx[0], head_approx[1], head_approx[2], true, kHeadGroup, kHeadBits);
-            });
-        // Verify blocks run the NVFP4 experts on the matrix unit from a second, fragment-ordered copy (about 0.57 GB
-        // per layer); MXFP8 layers keep gather_qmm. Only when it fits: resident weights + the copy + this context's
-        // full-attention and drafter K / V within 70 % of unified memory (else verify keeps gather_qmm; a long context
-        // that swaps loses far more than the copy gains: 256K 1.3 tok/s with it).
-        size_t copy = 0;
-        for (const auto& layer : experts)
-            if (layer[0].bits == 4 && layer[1].bits == 4)
-                for (const auto& e : layer) copy += e.codes.nbytes() + e.scales.nbytes();
-        int full_visits = 0;
-        for (int l : schedule()) full_visits += full[l];
-        const size_t kv = size_t(context) * size_t(G) * HD * 2 * 2 * size_t(full_visits + 1);  // + the drafter's global layer
-        uint64_t memory = 0;
-        size_t size = sizeof(memory);
-        sysctlbyname("hw.memsize", &memory, &size, nullptr, 0);
-        const double need = double(mx::get_active_memory()) + double(copy) + double(kv);
-        if (memory && need > 0.7 * double(memory)) {
-            std::fprintf(stderr, "inkling2 MLX: verify experts stay on gather_qmm (matrix-unit copy %.1f GB + K/V %.1f GB would pass "
-                         "70 %% of %.0f GB)\n", copy / 1e9, kv / 1e9, memory / 1e9);
-            return;
-        }
-        for (auto& layer : experts)
-            if (layer[0].bits == 4 && layer[1].bits == 4) for (auto& e : layer) e.pack_nax();
+        auto head = [this, precision](const mx::array& x) {  // drafts only propose (the verify decides): the 6-bit head copy when built
+            if (head_approx.empty() || precision.bf16_head) return project(x, "unembed.weight");
+            return mx::quantized_matmul(f32(x), head_approx[0], head_approx[1], head_approx[2], true, kHeadGroup, kHeadBits);
+        };
+        if (Inkling2MlxDFlash2::is_drafter_folder(folder))
+            draft = std::make_unique<Inkling2MlxDFlash2>(folder, context, V, head, [this](const mx::array& ids) {
+                return norm_bf16(mx::take(w("embed.weight"), ids, 0), w("embed_norm.weight"));
+            }, precision.bf16_projections);
+        else draft = std::make_unique<Inkling2MlxDraft>(folder, context, w("unembed.weight"), V, window, head);
     }
     // Depth 0: the drafts per step that maximise expected tokens per millisecond, from this sequence's own record:
     // the acceptance of each draft position (given the ones before it were accepted) and the step time per depth.
     // Both decay (half-life ~35 steps) so the choice follows the text; neighbours are tried every 16th step.
     struct DepthPolicy {
-        static constexpr int kMax = Inkling2MlxDraft::kBlock - 1;
+        static constexpr int kMax = Inkling2MlxDrafter::kBlock - 1;
         std::array<double, kMax> reached{}, kept{};    // position i: steps that drafted and reached it, and kept it
         std::array<double, kMax + 1> ms{}, steps{};     // per depth: decayed step time sum and step count
         int last = 3, count = 0;
@@ -692,7 +664,7 @@ struct Inkling2Mlx::Impl {
         const bool adaptive = depth == 0;
         const auto started = std::chrono::steady_clock::now();
         if (adaptive) depth = policy.choose(context - length - 1);
-        depth = std::min({depth, Inkling2MlxDraft::kBlock - 1, context - length - 1});
+        depth = std::min({depth, Inkling2MlxDrafter::kBlock - 1, context - length - 1});
         if (depth < 1 || anchor >= uint32_t(V)) throw std::invalid_argument("inkling2 MLX speculate depth/anchor/context");
         const int base = length, n = depth + 1;
         auto first = mx::array(&anchor, {1}, mx::uint32);
@@ -735,12 +707,13 @@ struct Inkling2Mlx::Impl {
     }
 };
 
-Inkling2Mlx::Inkling2Mlx(const std::string& folder,int context,bool exact) : p_(std::make_unique<Impl>(folder,context,exact)) {}
+Inkling2Mlx::Inkling2Mlx(const std::string& folder,int context,bool exact,int dense_bits)
+    : p_(std::make_unique<Impl>(folder,context,exact,dense_bits)) {}
 Inkling2Mlx::~Inkling2Mlx()=default;
-mx::array Inkling2Mlx::forward(std::span<const uint32_t> tokens,bool all,std::vector<mx::array>* trace,std::array<double,5>* phase_ms) {
-    p_->phase_ms=phase_ms;
-    try {auto result=p_->forward(tokens,all,trace);p_->phase_ms=nullptr;return result;}
-    catch(...) {p_->phase_ms=nullptr;throw;}
+mx::array Inkling2Mlx::forward(std::span<const uint32_t> tokens,bool all,std::vector<mx::array>* trace,std::array<double,5>* phase_ms,bool verify) {
+    p_->phase_ms=phase_ms;p_->verifying=verify;
+    try {auto result=p_->forward(tokens,all,trace);p_->phase_ms=nullptr;p_->verifying=false;p_->retain_windows();return result;}
+    catch(...) {p_->phase_ms=nullptr;p_->verifying=false;throw;}
 }
 void Inkling2Mlx::reset() {
     for (auto& v:p_->visits) { v.kv.reset(); v.conv={}; v.before={}; v.input={}; }
@@ -749,9 +722,46 @@ void Inkling2Mlx::reset() {
     p_->length=0;
 }
 mx::array Inkling2Mlx::greedy_step(const mx::array& token) { return p_->greedy_step(token); }
-void Inkling2Mlx::enable_draft(const std::string& folder) { p_->enable_draft(folder); }
+void Inkling2Mlx::warm_up() {
+    reset();
+    std::vector<uint32_t> prompt(16);
+    for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = uint32_t(1000 + i);
+    auto logits = forward(prompt);
+    uint32_t token = mx::argmax(logits, -1).item<uint32_t>();
+    auto next = greedy_step(mx::array(&token, {1}, mx::uint32));
+    token = next.item<uint32_t>();
+    // 2..8 rows: a verify block or a prompt's last chunk
+    for (bool verify : {true, false})  // a verify block, or a prompt's last chunk
+        for (int n = 2; n <= 8; ++n) {
+            std::vector<uint32_t> block(size_t(n), token);
+            mx::eval(forward(block, false, nullptr, nullptr, verify));
+        }
+    if (drafting()) for (int depth = 1; depth < Inkling2MlxDrafter::kBlock; ++depth) token = speculate(token, depth).tokens.back();
+    mx::synchronize();
+    reset();
+}
+void Inkling2Mlx::enable_draft(const std::string& folder, DraftPrecision precision) { p_->enable_draft(folder, precision); }
 bool Inkling2Mlx::drafting() const { return p_->draft != nullptr; }
 Inkling2Mlx::Speculation Inkling2Mlx::speculate(uint32_t anchor, int depth) { return p_->speculate(anchor, depth); }
+namespace {
+struct ModelKept { std::vector<Visit> visits; std::any drafter; };
+}  // namespace
+Inkling2Mlx::Kept Inkling2Mlx::keep() const {
+    ModelKept k;
+    k.visits = p_->visits;
+    for (auto& v : k.visits) { v.before = {}; v.input = {}; }
+    if (p_->draft) k.drafter = p_->draft->keep();
+    return Kept{std::make_shared<const std::any>(std::move(k)), p_->length};
+}
+void Inkling2Mlx::restore(const Kept& kept) {
+    const auto& k = std::any_cast<const ModelKept&>(*kept.state);
+    if (k.visits.size() != p_->visits.size() || bool(p_->draft) != k.drafter.has_value())
+        throw std::invalid_argument("inkling2 MLX: a kept state of another configuration");
+    p_->visits = k.visits;
+    if (p_->draft) p_->draft->restore(k.drafter);
+    p_->policy = {};
+    p_->length = kept.position;
+}
 int Inkling2Mlx::position() const { return p_->length; }
 int Inkling2Mlx::vocabulary() const { return p_->V; }
 int Inkling2Mlx::hidden_size() const { return p_->D; }

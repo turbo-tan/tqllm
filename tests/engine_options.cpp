@@ -55,6 +55,9 @@ int main() {
     expect(d.exact, "--exact defaults to on");
     expect(parse({"--exact", "on"}).exact && !parse({"--exact", "off"}).exact, "--exact on|off");
     expect(throws({"--exact", "fast"}) && throws({"--mode", "exact"}) && throws({"--allow-inexact"}), "unknown values / old options rejected");
+    expect(d.dense_bits == 8 && parse({"--exact", "off", "--dense-bits", "4"}).dense_bits == 4 &&
+           parse({"--dense-bits", "8"}).dense_bits == 8, "--dense-bits 8|4 (default 8)");
+    expect(throws({"--dense-bits", "6"}) && throws({"--dense-bits", "16"}), "--dense-bits only 8 or 4");
     // --exact on conflicts: listed and warned; the asked options win (no question, no stop)
     static const char * (*no_env)(const char *) = [](const char *) -> const char * { return nullptr; };
     static const char * (*cpu_miss)(const char *) = [](const char * n) -> const char * { return std::strcmp(n, "TQFN_CPU_MISS") ? nullptr : "4"; };
