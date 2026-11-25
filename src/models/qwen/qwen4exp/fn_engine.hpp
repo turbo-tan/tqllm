@@ -171,7 +171,7 @@ public:
         bind();
         while (spec_advance()) {}
         // steps, drafted, accepted drafts, decode us, prefill us (tqserve timings)
-        if (stats) { stats[0] = S().steps_; stats[1] = S().steps_ * uint64_t(f_.drafts); stats[2] = S().toks_ - S().steps_; stats[3] = S().decode_us_; stats[4] = S().prefill_us_; }
+        if (stats) reply_timings(stats, S());
         std::vector<uint32_t> r(S().out_.begin(), S().out_.end());
         if (tqllm::debug_on("mem")) {  // the decode phase's expert cache traffic (the warm-prompt decode question of 10-17)
             const auto s = f_.cache->stats(), & b = S().stats_at_decode_, m = f_.mtp_cache->stats(), & mb = S().mtp_stats_at_decode_;

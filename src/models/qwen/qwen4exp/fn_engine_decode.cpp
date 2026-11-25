@@ -134,7 +134,7 @@ bool FlashNextEngine::spec_advance() {
     if (dfl_on && head) drafter_done(S().pick_, which, m, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     for (int i = 0; i < m && int(S().out_.size()) < S().generate_; ++i) { S().out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
     m = committed_rows(m, int(S().out_.size()) - int(out0));  // a max_tokens cut keeps the state at the output's end
-    S().model_->accept(m); ++S().steps_; S().toks_ += m; S().offered_ += dr.size(); ++S().taken_[size_t(std::min(m, 16))];
+    S().model_->accept(m); count_step(S(), dr.size(), m);
     if (dfl_on && head) f_.drafter->inject(f_.dfl_feat->p, m, pos0);  // the target features of the committed rows (captured by the step)
     trace_step(1, int(dr.size()), {{S().out_.size(), std::vector<int>(v.begin(), v.begin() + m)}}, {-1});
     // no decode-time bank growth: growing every bank at the first decode step rebuilt all 48 banks and cut the hit rate
@@ -223,7 +223,7 @@ void FlashNextEngine::spec_step(const int * ids, int n, bool * done) {
         const size_t out0 = sl.out_.size();
         for (int i = 0; i < m && int(sl.out_.size()) < sl.generate_; ++i) { sl.out_.push_back(v[i]); if (is_eos(v[i])) { m = i + 1; break; } }
         m = committed_rows(m, int(sl.out_.size()) - int(out0));
-        accepts.push_back({sl.model_.get(), m}); ++sl.steps_; sl.toks_ += m; sl.offered_ += drs[a].size(); ++sl.taken_[size_t(std::min(m, 16))]; vs[a] = v; ms_acc[a] = m;
+        accepts.push_back({sl.model_.get(), m}); count_step(sl, drs[a].size(), m); vs[a] = v; ms_acc[a] = m;
     }
     DecodeModel::accept_multi(accepts);
     { std::vector<std::pair<size_t, std::vector<int>>> tr;
