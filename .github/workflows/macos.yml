@@ -1,0 +1,62 @@
+name: macos
+
+# Prebuilt tqLLM for Apple Silicon Macs on macOS 26: the tqllm wheel (tqserve inside, built against PyPI's MLX) plus the
+# PyPI wheels it needs, as one tar for tqllm.com/install.sh. Runs on GitHub's Apple Silicon runner; no model is served
+# here (the release test with real models runs on our Mac).
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/macos.yml', 'pyproject.toml', 'python/**', 'src/backends/metal/**']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tag or commit to build (e.g. v1.8.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prebuilt:
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Version
+        id: v
+        run: echo "version=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")" >> "$GITHUB_OUTPUT"
+      - name: Build the tqllm wheel
+        run: |
+          python -m venv bv && bv/bin/pip install -q "mlx==0.32.4" "scikit-build-core>=0.10" cmake ninja wheel
+          bv/bin/pip wheel --no-build-isolation --no-deps . -w out
+          W=$(ls out/tqllm-*.whl)
+          case "$W" in *py3-none-macosx_26_0_arm64.whl) ;; *) bv/bin/python -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag macosx_26_0_arm64 "$W" ;; esac
+          ls -la out
+      - name: Dependency wheels (Python 3.10-3.13)
+        run: |
+          for py in 3.10 3.11 3.12 3.13; do
+            bv/bin/pip download -q --only-binary=:all: --platform macosx_26_0_arm64 --python-version $py \
+              "mlx==0.32.4" "huggingface_hub>=0.24" -d wheels
+          done
+          cp out/tqllm-*.whl wheels/ && ls wheels
+      - name: Install test (fresh venv, local wheels only)
+        run: |
+          python -m venv iv && iv/bin/pip install -q --no-index --find-links wheels "tqllm[mlx]==${{ steps.v.outputs.version }}"
+          iv/bin/tqllm --help | head -3
+          T=$(ls iv/lib/python3.12/site-packages/tqllm/bin/tqserve) && otool -L "$T" | grep -i mlx
+          "$T" --help | head -3
+      - name: Tar
+        run: |
+          T=tqllm-${{ steps.v.outputs.version }}-macos26-arm64.tar
+          tar cf "$T" wheels && shasum -a 256 "$T" | tee "$T.sha256" && ls -la "$T"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tqllm-${{ steps.v.outputs.version }}-macos26-arm64
+          path: tqllm-*-macos26-arm64.tar*
