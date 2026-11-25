@@ -221,9 +221,9 @@ void Qwen35Engine::cmp_upload() {
     ck(cudaMemcpyAsync(d_stage_off.p, off, sizeof(off), cudaMemcpyHostToDevice, stream));
 }
 
-void Qwen35Engine::pc_copy(bool save, bool sys) {  // recurrent state of slot cur <-> pc_host (sys: pc_sys_host)
+void Qwen35Engine::pc_copy(bool save, int which) {  // recurrent state of slot cur <-> pc_host / pc_sys_host / pc_anchor_host
     const size_t cb = conv_bytes(), rb = rec_bytes(), nl = conv_state.size() / NSLOT;
-    auto & buf = sys ? pc_sys_host : pc_host;
+    auto & buf = which == pc_system ? pc_sys_host : which == pc_turn ? pc_anchor_host : pc_host;
     if (!buf) buf = std::make_unique<HostBuf>(nl * (cb + rb));
     auto * h = static_cast<char *>(buf->p);
     for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
@@ -239,10 +239,11 @@ uint32_t Qwen35Engine::pc_match(const std::vector<uint32_t> & prompt) {
     // exact: resume only at a kept prefill state; the live state's last tokens came from decode steps, whose numbers
     // differ from a prefill of the same tokens
     const uint32_t n = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt);
-    if (pc_shared(pc_seq, false, pc_sys, prompt) > n) {  // only the system message is shared: resume at its end
+    const uint32_t na = pc_shared(pc_seq, false, pc_anchor, prompt), ns = pc_shared(pc_seq, false, pc_sys, prompt);
+    if (std::max(na, ns) > n) {  // the prompt parts before the last-message state: resume at the turn anchor or the system end
         if (pend_k) set_pending(0);
-        pc_copy(false, true);
-        return pc_sys;
+        pc_copy(false, na >= ns ? pc_turn : pc_system);
+        return na >= ns ? pc_anchor : pc_sys;
     }
     if (!n || (pc_live && n == pc_seq.size())) return n;
     if (pend_k) set_pending(0);  // the live state's deferred path is discarded with it
@@ -535,6 +536,8 @@ void Qwen35Engine::swap_seq(SeqState & s) {
     std::swap(pc_host, s.pc_host);
     std::swap(pc_sys, s.pc_sys);
     std::swap(pc_sys_host, s.pc_sys_host);
+    std::swap(pc_anchor, s.pc_anchor);
+    std::swap(pc_anchor_host, s.pc_anchor_host);
     std::swap(pc_conv, s.pc_conv);
 }
 
@@ -1973,7 +1976,7 @@ void Qwen35Engine::restore_kept(StateBlob & b, bool take_state) {
     sync_ck();
     pc_seq = b.meta.tokens;
     pc_snap = snap;
-    pc_sys = 0;  // the rows past the restored ones may belong to the slot's previous conversation
+    pc_sys = pc_anchor = 0;  // the rows past the restored ones may belong to the slot's previous conversation
     pc_live = false;
     auto * own = take_state ? std::get_deleter<ParkOwn>(b.parts[1].data) : nullptr;
     if (own && own->buf) { pc_host.reset(own->buf); own->buf = nullptr; }  // the recurrent state comes back without a copy
@@ -2000,7 +2003,7 @@ void Qwen35Engine::park_out() {
 // state is parked and that one comes back (KV rows; its recurrent state at snap is restored by pc_match as usual)
 void Qwen35Engine::park_swap(const std::vector<uint32_t> & prompt) {
     if (!park_) return;
-    const uint32_t own = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, prompt);
+    const uint32_t own = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, pc_anchor, prompt);
     uint64_t conv = 0;
     const uint32_t best = park_best(prompt, &conv);
     if (!conv || best <= own) {
@@ -2117,7 +2120,7 @@ void Qwen35Engine::release_state(uint64_t conv) {
     for (int s = 0; s < nslots; ++s) {
         if (s == active) continue;
         auto & p = parked[size_t(s)];
-        if (p.pc_conv == conv) { p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); p.pc_conv = 0; }
+        if (p.pc_conv == conv) { p.pc_live = false; p.pc_snap = 0; p.pc_sys = 0; p.pc_anchor = 0; p.pc_seq.clear(); p.pc_conv = 0; }
     }
 }
 

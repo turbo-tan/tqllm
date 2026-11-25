@@ -122,6 +122,8 @@ public:
             tokenizer.load(tokpath);
             eos_ = stop_ = tokenizer.eos_id();
             im_start_ = tokenizer.special_id("<|im_start|>");
+            if (const auto u = tokenizer.encode("user"); u.size() == 1) user_tok_ = u[0];
+            result_tok_ = tokenizer.special_id("<tool_response>");
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
@@ -206,8 +208,9 @@ public:
         cmp_pos = 0, ring_used = 0;
         cmp_upload();
     }
-    void pc_drop() { pc_live = false, pc_snap = 0, pc_sys = 0; }
-    void pc_copy(bool save, bool sys = false);
+    void pc_drop() { pc_live = false, pc_snap = 0, pc_sys = 0, pc_anchor = 0; }
+    enum PcBuf { pc_last = 0, pc_system = 1, pc_turn = 2 };  // pc_host, pc_sys_host, pc_anchor_host
+    void pc_copy(bool save, int which = pc_last);
     // cache positions of prompt that can be kept (the recurrent state is set to match); the rest is prefilled
     uint32_t pc_match(const std::vector<uint32_t> & prompt);
     // prompt tokens slot s would keep (no state change): the scheduler sends an agent's next turn to its slot
@@ -219,25 +222,26 @@ public:
         if (live && shared(uint32_t(seq.size()))) return uint32_t(seq.size());
         return shared(snap) ? snap : 0;
     }
-    // with the system-message state too: the longer of the two that the prompt shares
-    static uint32_t pc_shared(const std::vector<uint32_t> & seq, bool live, uint32_t snap, uint32_t sys, const std::vector<uint32_t> & prompt) {
-        return std::max(pc_shared(seq, live, snap, prompt), pc_shared(seq, false, sys, prompt));
+    // with the system-message state and the turn anchor too: the longest that the prompt shares
+    static uint32_t pc_shared(const std::vector<uint32_t> & seq, bool live, uint32_t snap, uint32_t sys, uint32_t anchor,
+                              const std::vector<uint32_t> & prompt) {
+        return std::max({pc_shared(seq, live, snap, prompt), pc_shared(seq, false, sys, prompt), pc_shared(seq, false, anchor, prompt)});
     }
     // A failed request (tqserve): its slot's prompt cache may name tokens whose K/V or recurrent state a skipped kernel
     // never wrote, so nothing of it is reused; the slot's next request prefills from position 0
     void spec_abort(int s) override {
         if (s < 0 || s >= nslots) return;
         if (s == active) { pc_drop(); pc_seq.clear(); }
-        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_sys = 0; p.pc_seq.clear(); }
+        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_sys = 0; p.pc_anchor = 0; p.pc_seq.clear(); }
     }
     bool share_kept(const std::vector<uint32_t> & prompt) override;
     int lora_count() const override { return lora_n; }
     void set_lora(const std::vector<float> & scales) override;
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
         if (!pc_on || s < 0 || s >= nslots) return 0;
-        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, prompt)
-                                         : pc_shared(parked[size_t(s)].pc_seq, parked[size_t(s)].pc_live && !opt.exact,
-                                                     parked[size_t(s)].pc_snap, parked[size_t(s)].pc_sys, prompt);
+        const auto & q = parked[size_t(s)];
+        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, pc_sys, pc_anchor, prompt)
+                                         : pc_shared(q.pc_seq, q.pc_live && !opt.exact, q.pc_snap, q.pc_sys, q.pc_anchor, prompt);
         return std::max(own, park_best(prompt, nullptr));  // a parked state resumes in any slot
     }
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
@@ -329,6 +333,11 @@ private:
     // system prompt but not the user message resume there (GB10 27B, 8 x 32K system prompt: each read it again)
     uint32_t pc_sys = 0;
     std::unique_ptr<HostBuf> pc_sys_host;
+    // the turn anchor (prefill_chunk.hpp kept_state_turn): the first message after the last user message, where the next
+    // user turn's prompt parts from this one when the template drops earlier reasoning (issue 82)
+    uint32_t pc_anchor = 0;
+    std::unique_ptr<HostBuf> pc_anchor_host;
+    uint32_t user_tok_ = ~0u, result_tok_ = ~0u;  // "<|im_start|>user", and a tool result's "<tool_response>" after it
     uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
     std::set<uint64_t> shared_convs_;  // park entries lent by share_kept: a resume copies them and leaves them parked
     uint32_t im_start_ = ~0u;  // the chat template's message-start token (prefill chunks restart there)
@@ -675,6 +684,8 @@ private:
         std::unique_ptr<HostBuf> pc_host;
         uint32_t pc_sys = 0;
         std::unique_ptr<HostBuf> pc_sys_host;
+        uint32_t pc_anchor = 0;
+        std::unique_ptr<HostBuf> pc_anchor_host;
         uint64_t pc_conv = 0;
     };
     std::vector<SeqState> parked;  // parked[s] holds slot s while it is not active

@@ -56,6 +56,41 @@ inline uint32_t kept_state_sys(const std::vector<uint32_t> & starts, uint32_t pr
     const uint32_t end = starts[0];
     return end >= min_tokens && end > from && end != snap ? end : 0;
 }
+// A third kept state at the start of the first message after the prompt's last user message (the turn anchor). Chat
+// templates that drop the reasoning of earlier assistant messages once a new user message arrives (Qwen3) re-render
+// every message from there on, so the next user turn shares the prompt only up to that point and the last-message state
+// is past it (issue 82: an agent's every user turn read 120K tokens again). 0: no user message, or nothing follows it.
+// tokens[s + 1] is the role name of the message that starts at s; a user message whose fourth token is `result_tok`
+// ("<|im_start|>user\n<tool_response>": Qwen templates send tool results as user messages) is a tool result, not a turn.
+inline uint32_t kept_state_turn(const std::vector<uint32_t> & starts, const uint32_t * tokens, uint32_t prompt, uint32_t user_tok,
+                                uint32_t result_tok) {
+    for (size_t i = starts.size(); i-- > 0;) {
+        if (starts[i] + 1 >= prompt || tokens[starts[i] + 1] != user_tok) continue;
+        if (starts[i] + 3 < prompt && tokens[starts[i] + 3] == result_tok) continue;
+        return i + 1 < starts.size() && starts[i + 1] < prompt ? starts[i + 1] : 0;
+    }
+    return 0;
+}
+// The positions of a slot's kept states: the last message start, the system-message end and the turn anchor.
+struct KeptStates { uint32_t snap = 0, sys = 0, anchor = 0; };
+// The kept state a prompt resumes at: the longest one it shares (shares(n): the prompt starts with the n tokens the
+// state was built from and is longer than n); 0 when none.
+template <class Shares> uint32_t kept_resume(const KeptStates & k, Shares shares) {
+    uint32_t best = 0;
+    for (uint32_t n : {k.snap, k.anchor, k.sys}) if (n > best && shares(n)) best = n;
+    return best;
+}
+// The turn anchor after a prefill that resumed at `from` (kept states past `from` already dropped), for a prompt whose
+// anchor is at `a` and whose last-message state goes to `snap_new`: a state held at `a` stays (the anchor itself, or an
+// earlier turn's last-message state, moved over: *move_snap); past `from` this prefill saves it, unless it is the
+// last-message state itself (the next turn moves that one over); otherwise the old anchor while it is still shared.
+inline uint32_t kept_anchor_next(const KeptStates & k, uint32_t from, uint32_t a, uint32_t snap_new, bool * move_snap) {
+    *move_snap = false;
+    if (a && a <= from && a == k.anchor) return a;
+    if (a && a <= from && a == k.snap) { *move_snap = true; return a; }
+    if (a > from && a != snap_new) return a;
+    return k.anchor <= from ? k.anchor : 0;
+}
 inline uint32_t kept_state_at(uint32_t prompt, uint32_t from, uint32_t chunk, uint32_t tail) {
     if (chunk == 0 || prompt < tail) return 0;
     const uint32_t grid = (prompt - tail) / chunk * chunk;
