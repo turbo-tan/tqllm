@@ -3,9 +3,34 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.8.0 (2026-11-25)
 
 ### Added
+- Inkling-2-Mini (CUDA): the DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, Apache-2.0; `tqserve -md FOLDER`, drafter
+  weights as INT8 rows) and verify on tensor cores: routed experts (NVFP4, MXFP8, TQT / TQT2 / TQT3) and dense
+  projections run as MMA tiles, each expert's tile read once for all tokens of the block routed to it. A token's bits do
+  not depend on how many tokens are in the block, so speculative output equals plain output. The kernel family (tensor
+  cores or warp kernels, experts and dense separately) and the drafting depth (from the request's own acceptance and a
+  step-time line measured on the device) are chosen per device. Official checkpoint, exact, 300 tokens, plain /
+  DFlash2 tok/s: RTX 3090 math 90.9 / 252.5, code 90.9 / 240.7, chat 91.2 / 142.7 (1.7.0: 78.9 plain at 1K); DGX Spark
+  (GB10) math 36.6 / 85.5, code 36.5 / 85.3, chat 36.6 / 67.0. RTX 5060 Ti 16 GB, TQT overlay (12.81 GB, attention
+  also TQT), `--exact off`, DFlash2: chat 121.9, code 117.2, translate 100.6. KLD vs BF16 (16 texts, 8,768 positions,
+  `--chunk 1`) 0.00237 / top-1 98.21 %: the new kernels round differently, so greedy text can differ from 1.7.0 after
+  a few tokens. (#92)
+- Inkling-2-Mini dense TQT: attention q / k / v / o may come as TQT tensors from the overlay (`tqt_experts.gguf`);
+  `inkling2_tqt.py dense-hessian` / `dense` / `pack --dense-tqt` make them. `inkling2-check --graph-debug` compares
+  graph and eager runs. (#92)
+- Inkling-2-Mini exact conversation reuse: a prompt is prefilled in chunks aligned from position 0 and a follow-up turn
+  resumes from the last chunk's snapshot; first logits bitwise equal to a fresh run. RTX 3090 tqserve, turn-2 first
+  token after a 21K-token turn 8.07 -> 0.45 s, after a 2K-token turn 1.25 -> 0.32 s. (#90)
+- Inkling-2-Mini exact greedy LM head on the device (INT8 copy with a per-row error bound, BF16 rescoring of the rows
+  that can still win, device argmax; sampled requests still get full logits), MTP drafting through it, and an adaptive
+  policy that falls back to plain decoding per request when drafting measures slower. (#90)
+- Inkling-2-Mini on Metal: exact speculative decoding (a decode step and a 1-8 row verify block run the same
+  row-invariant products), the DFlash2 drafter and turn reuse. M5 Pro, 5 prompts x 256 tokens, mean tok/s, 1.7.0 ->
+  1.8.0: exact plain 39.8 -> 40.9, exact + drafter 52.6 (DSpark) -> 63.5 (DFlash2), `--exact off` + drafter 56.3 ->
+  67.4; follow-up first token 1.53 -> 0.51 s at 2K, 11.35 -> 0.57 s at 20K. KLD vs BF16 exact 0.00244 / top-1 98.31 %.
+  The ~11 GB matrix-unit expert copy used when drafting is gone. (#91)
 - Inkling-2-Mini on 16 GB cards: TQT 4 / 3 / 2-bit routed experts (overlay GGUF next to the checkpoint folder, types
   306 / 308 / 307) with their decode and prompt kernels and the encoder (`tools/convert/inkling2/inkling2_tqt.py`); the
   resident experts are re-planned from recent routing (16 GB cards kept the first N for good); the prompt path
@@ -19,8 +44,25 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   0.145 (WikiText-2, 8 x 2048), same top token 88.98 -> 90.60 %.
 
 ### Performance
+- Inkling-2-Mini (CUDA) decode fusions, same output bits: one warp per routed expert in the down projection (combined in
+  k order), depth-attention stats + mix + norms in one launch, route counting inside top-k, conv k + v + kv_finish in
+  one launch. RTX 3090, 1K, exact: 78.9 -> 82.0 tok/s (graph path), 86.4 with the bounded greedy head. (#90)
 
 ### Fixed
+- Qwen3.5 / 3.8 hybrid models (27B) prompt cache: a new user turn no longer re-prefills from 0 when the template or the
+  client drops earlier reasoning (`preserve_thinking: false`). A third kept state, the turn anchor (start of the first
+  message after the last user message; tool results do not count), is resumed instead. RTX 3090, 27B TQ3_4S-v2 +
+  DFlash2, 13-request agent conversation: user turns at 20K / 35K / 50K reused 0 / 0 / 0 -> 4,934 / 20,191 / 35,448
+  tokens; reply equal to `--prompt-cache off`. (#93, fixes #82)
+- Inkling-2-Mini on GB10 (and other cards >= 96 GB): the ~48 GB BF16 prompt expert copies are made only when free
+  memory (page cache and the cgroup limit counted; on unified memory also host MemAvailable) covers them plus 16 GB;
+  otherwise the quantized prompt path is used. On a GB10 an over-allocation can end in the out-of-memory killer, not a
+  failed allocation. (#95)
+- Inkling-2-Mini drafting on 16 GB cards: the expert plan keeps the drafter's memory free, a warm-up draft loads every
+  drafter kernel at enable, and draft launch errors throw (drafting could silently accept nothing). (#92)
+- Tests: `qsa_gather` reads compact rows through the remapped position; `tune_oom`, `mixed_expert_cache` and
+  `expert_slot_tiers` run on a fixed-size device (`tests/device_cap.cpp`) instead of filling a card a desktop also
+  uses (16-19 of 20 -> 20 of 20 passes). No engine change. (#94)
 - Flash-Next no longer pins the prompt residual buffer (context x hc x hidden fp32: 1.3 GB at a 32K context, 2.7 GB
   at 64K, 5.4 GB at 131K) at start-up, nor allocates it per request on a layer-split rank without the head: nothing
   reads it since the MTP layer's keys / values are written with each prefill chunk. RTX 3090, 59 GiB host, ISTA

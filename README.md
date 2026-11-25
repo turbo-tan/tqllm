@@ -14,29 +14,20 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New in [1.7.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.7.0)** ([all changes](CHANGELOG.md)):
+**New in [1.8.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.8.0)** ([all changes](CHANGELOG.md)):
 
-![tqLLM 1.7.0](https://tqllm.com/assets/tqllm-1.7.0.png)
-
-- **Inkling-2-Mini (Thinking Machines) on NVIDIA and Mac:** loads the official NVFP4 / MXFP8 checkpoint, exact by
-  default (KLD 0.0023 against BF16 on an RTX 3090), with MTP drafting, tool calls and the thinking split.
-  [Inkling guide](docs/models/inkling2.md).
-  - DGX Spark against Strata 0.2.20 on the same weights, exact against exact: prompts 2.1x faster at 8K, 3.2x at 128K,
-    3.7x at 256K (1,451 against 385 tok/s).
-  - RTX 3090: answers 1.8x faster at 64K (65.3 against 34.9 tok/s); at 128K 55.0 tok/s, where Strata runs out of
-    VRAM unless its K/V goes to host RAM (6.4 tok/s). Strata leads short context (8K: 93.4 against 77.9 exact).
-  - Mac M5 Pro against MTPLX 2.13.1: exact answers +14 % (40.4 against 35.3 tok/s), prompts faster from 1K to 64K.
-  - `--exact off`: INT8 dense weights, and FP4 tensor-core prompt experts on Blackwell / DGX Spark (approximate:
-    KLD 0.0096, top-1 96.0 %).
-- **TQV-12 and TQT weight formats** by @Scoobylolo: TQ4's size with lower error (Qwen3.8-27B at 14.72 GB: KLD -38 %).
-- **Two GPUs or two PCs:** `--split layer` for Flash-Next and the 27B, with the memory fit across both cards
-  ([multi-GPU guide](docs/guides/multi-gpu.md)).
-- Runtime LoRA adapters, an embeddings server, `--embed-host` / `--head-host`, a prompt cache that follows a
-  conversation across slots, and Flash-Next on 64 GB hosts.
-- 22 pull requests by @Scoobylolo: faster verify attention and long-context prefill, a warning-free build, exact
-  sampling from the int8 head, and more ([changelog](CHANGELOG.md)).
-- **Known issue:** on 16 GB cards Inkling-2-Mini's 20 GB checkpoint streams part of its experts from RAM; a 14.5 GB
-  file is planned for 1.7.1.
+- **Inkling-2-Mini drafting with DFlash2** (`-md FOLDER`, incoai's Apache-2.0 drafter), verified on tensor cores so
+  drafted output equals plain output. RTX 3090, official checkpoint, exact: code 240.7, math 252.5, chat 142.7 tok/s
+  (plain 91; 1.7.0 plain 78.9). DGX Spark / GB10: code 85.3, math 85.5 tok/s. [Inkling guide](docs/models/inkling2.md).
+- **Inkling-2-Mini on 16 GB cards:** TQT expert files on
+  [YTan2000/Inkling-2-Mini-TQT](https://huggingface.co/YTan2000/Inkling-2-Mini-TQT) (13.06 GB and 14.08 GB). RTX 5060 Ti,
+  13.06 GB file, `--exact off`, decode at 1K / 8K / 32K: 71.0 / 63.4 / 50.1 tok/s against Strata SQ-15's 57.5 / 43.8 /
+  3.5 on the same card.
+- **Inkling-2-Mini on Mac:** exact speculative decoding and the DFlash2 drafter (M5 Pro: 63.5 tok/s exact, 67.4
+  `--exact off`, from 52.6 / 56.3), turn reuse (follow-up first token at 20K: 11.35 -> 0.57 s).
+- **Conversation reuse:** Inkling-2-Mini resumes a follow-up turn exactly (first token after a 21K-token turn 8.07 ->
+  0.45 s on a 3090); the 27B prompt cache no longer re-prefills each user turn when earlier reasoning is dropped (#82).
+- GB10: the 48 GB BF16 prompt expert copies only when memory allows (an over-allocation could restart the box).
 
 Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
