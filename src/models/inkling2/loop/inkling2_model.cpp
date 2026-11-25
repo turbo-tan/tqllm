@@ -14,6 +14,7 @@
 #include "inkling2_dflash2.cuh"
 #include "nlohmann/json.hpp"  // tqllm::Json
 #include "graph_capture.hpp"
+#include "device_free_cuda.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -496,7 +497,12 @@ struct Inkling2Model::Impl {
         size_t bf16_need = 0, bf16_free = 0, bf16_tot = 0;
         for (const auto & Y : Ls) bf16_need += Y.eg.bf16_bytes() * 2 + Y.ed.bf16_bytes();
         bf16_need += size_t(chunk) * topk * (D * 4 + 2 * I * 2 + 4);
-        if (cudaMemGetInfo(&bf16_free, &bf16_tot) != cudaSuccess) bf16_free = 0;
+        // unified memory: cudaMemGetInfo counts the page cache as used, and a cgroup may cap the process below the device
+        bf16_free = tqllm::device_free_bytes(&bf16_tot);
+        if (int dv = 0, integ = 0; cudaGetDevice(&dv) == cudaSuccess && cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dv) == cudaSuccess && integ) {
+            std::ifstream mi("/proc/meminfo");
+            bf16_free = std::min(bf16_free, tqllm::host_available_bytes(std::string(std::istreambuf_iterator<char>(mi), {})));
+        }
         const bool bf16_fits = bf16_free >= bf16_need + (size_t(16) << 30);
         if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX && !bf16_fits)
             std::fprintf(stderr, "inkling2: BF16 prompt copies skipped (%.1f GB needed + 16 GB headroom, %.1f GB free): quantized prompt path\n",
