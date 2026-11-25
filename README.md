@@ -14,22 +14,20 @@ with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New in [1.8.0](https://github.com/turbo-tan/tqllm/releases/tag/v1.8.0)** ([all changes](CHANGELOG.md)):
+**New in [1.8.1](https://github.com/turbo-tan/tqllm/releases/tag/v1.8.1)** ([all changes](CHANGELOG.md)):
 
-![tqLLM 1.8.0](https://tqllm.com/assets/tqllm-1.8.0.png)
+![tqLLM 1.8.1](https://tqllm.com/assets/tqllm-1.8.1.png)
 
-- **Inkling-2-Mini drafting with DFlash2** (`-md FOLDER`, incoai's Apache-2.0 drafter), verified on tensor cores so
-  drafted output equals plain output. RTX 3090, official checkpoint, exact: code 240.7, math 252.5, chat 142.7 tok/s
-  (plain 91; 1.7.0 plain 78.9). DGX Spark / GB10: code 85.3, math 85.5 tok/s. [Inkling guide](docs/models/inkling2.md).
-- **Inkling-2-Mini on 16 GB cards:** TQT expert files on
-  [YTan2000/Inkling-2-Mini-TQT](https://huggingface.co/YTan2000/Inkling-2-Mini-TQT) (13.06 GB and 14.08 GB). RTX 5060 Ti,
-  13.06 GB file, `--exact off`, decode at 1K / 8K / 32K: 71.0 / 63.4 / 50.1 tok/s against Strata SQ-15's 57.5 / 43.8 /
-  3.5 on the same card.
-- **Inkling-2-Mini on Mac:** exact speculative decoding and the DFlash2 drafter (M5 Pro: 63.5 tok/s exact, 67.4
-  `--exact off`, from 52.6 / 56.3), turn reuse (follow-up first token at 20K: 11.35 -> 0.57 s).
-- **Conversation reuse:** Inkling-2-Mini resumes a follow-up turn exactly (first token after a 21K-token turn 8.07 ->
-  0.45 s on a 3090); the 27B prompt cache no longer re-prefills each user turn when earlier reasoning is dropped (#82).
-- GB10: the 48 GB BF16 prompt expert copies only when memory allows (an over-allocation could restart the box).
+- **Inkling-2-Mini, raced on our own boxes with the same prompts** (Tech2Wild's `bench_inkling.py`, both engines with
+  DFlash2): on one RTX 3090 against project-maya 1.1.80, counting 343.5 against 219.1 tok/s (+57 %), math +25 %, coding
+  +7 %; behind by 1-6 % on json, prose, narrative and summary. On a DGX Spark against TensorFold: ahead on coding, behind
+  on six of eight types by 5-16 % (next on our list). [Release notes](https://github.com/turbo-tan/tqllm/releases/tag/v1.8.1).
+- **Upgrade from 1.8.0 if you serve Inkling-2-Mini on CUDA:** 1.8.0's tqserve drafted a fixed 4 tokens a step. 1.8.1 picks
+  the verify window from the drafts' own confidences per step (RTX 3090 +8-23 %, DGX Spark +4-32 % over 1.8.0); drafted
+  output still equals undrafted.
+- **Thinking off is off:** `enable_thinking: false` opens Inkling's answer directly.
+- **`pip install tqllm` on Linux** (RTX 30 / 40 / 50 and GB10, NVIDIA driver 580+; no Docker needed) and
+  `pip install "tqllm[mlx]"` on Macs with macOS 26.
 
 Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
 [YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
