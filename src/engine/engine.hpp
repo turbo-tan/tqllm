@@ -156,7 +156,7 @@ bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);
 // Inkling-2-Mini (HF folder, Inkling2LoopForConditionalGeneration), src/models/inkling2/loop; MTP from mtp.safetensors
-std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact = true);
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact = true, const std::string & draft_model = {});
 // tensor parallelism over linked boxes: world ranks, rank 0 at peer:port (rank 0 listens there for the others)
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",

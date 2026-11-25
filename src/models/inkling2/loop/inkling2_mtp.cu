@@ -243,8 +243,9 @@ void mtp_attention(const __nv_bfloat16 * q, const __nv_bfloat16 * kb, const __nv
                    const __nv_bfloat16 * vc, int ring, int pos0, int nb, int heads, int kvheads, int window, int splits, float * part,
                    __nv_bfloat16 * out, cudaStream_t s) {
     const int lo = window > 0 ? (pos0 > window ? pos0 - window : 0) : 0, nctx = pos0 - lo;
-    if (heads / kvheads != 3) throw std::runtime_error("mtp attention: 3 query heads per kv head");
-    attn_k<3><<<dim3(splits, kvheads, nb), 128, 0, s>>>(q, kb, vb, ldq, ldkv, kc, vc, ring, lo, nctx, nb, heads, kvheads, splits, part);
+    if (heads == 3 * kvheads) attn_k<3><<<dim3(splits, kvheads, nb), 128, 0, s>>>(q, kb, vb, ldq, ldkv, kc, vc, ring, lo, nctx, nb, heads, kvheads, splits, part);
+    else if (heads == 4 * kvheads) attn_k<4><<<dim3(splits, kvheads, nb), 128, 0, s>>>(q, kb, vb, ldq, ldkv, kc, vc, ring, lo, nctx, nb, heads, kvheads, splits, part);  // DFlash2
+    else throw std::runtime_error("mtp attention: 3 or 4 query heads per kv head");
     attn_merge_k<<<dim3(heads, nb), HD, 0, s>>>(part, heads, splits, out);
 }
 void mtp_silu_mul(const __nv_bfloat16 * g, const __nv_bfloat16 * u, __nv_bfloat16 * act, size_t n, cudaStream_t s) {

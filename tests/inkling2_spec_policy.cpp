@@ -15,7 +15,7 @@ int main() {
         p.plain_done(0.010); p.plain_done(0.010);
         for (int i = 0; i < tqllm::Inkling2SpecPolicy::kWarm; ++i) {
             const int L = p.next(100);
-            check(L >= 2 && L <= 7, "spec steps while warming up");
+            check(L >= 1 && L <= 7, "spec steps while warming up");
             p.spec_done(1, L, 0.025);
         }
         int plain = 0;
@@ -44,6 +44,31 @@ int main() {
         for (int i = 0; i < 20; ++i) { const int L = p.next(100); check(L == 7, "fixed depth"); p.spec_done(0, L, 0.050); }
         check(p.next(3) == 2, "depth capped by the room left");
     }
+    // drafts per step follow the device's step-time line and the acceptance record
+    auto converge = [&](double a_ms, double b_ms, double p) {  // step time a + b L, each draft kept with probability p (fixed sequence)
+        tqllm::Inkling2SpecPolicy pol;
+        pol.next(1000); pol.next(1000); pol.plain_done(0.030); pol.plain_done(0.030);
+        unsigned r = 12345;
+        int last = 0, hist[8] = {};
+        for (int i = 0; i < 400; ++i) {
+            const int L = pol.next(1000);
+            if (L == 0) { pol.plain_done(0.030); continue; }
+            int acc = 0;
+            while (acc < L) { r = r * 1103515245u + 12345u; if (double((r >> 8) & 0xffff) / 65536.0 >= p) break; ++acc; }
+            pol.spec_done(acc, L, (a_ms + b_ms * L) / 1000.0);
+            if (i >= 300) ++hist[L];
+            last = L;
+        }
+        int mode = 1;
+        for (int L = 1; L <= 7; ++L) if (hist[L] > hist[mode]) mode = L;
+        (void)last;
+        return mode;
+    };
+    // (the EMA rule alone picks about 3-4 and 2 here)
+    const int cheap = converge(10.0, 0.4, 0.75), costly = converge(10.0, 6.0, 0.6);
+    std::printf("drafts per step: cheap rows, 75 %% acceptance -> %d; costly rows, 60 %% -> %d\n", cheap, costly);
+    check(cheap >= 6, "cheap verify rows: long drafts");
+    check(costly == 1, "costly verify rows and lower acceptance: one draft");
     std::printf(ok ? "inkling2-spec-policy: PASS\n" : "inkling2-spec-policy: FAIL\n");
     return ok ? 0 : 1;
 }

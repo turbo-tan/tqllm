@@ -498,8 +498,8 @@ def write_overlay(path, layers, dense=()):
             pad = (-len(b)) % 32
             blobs.append(b + bytes(pad))
             off += len(b) + pad
-    for name, ne, b in dense:
-        infos.append((name, ne, 8, off))
+    for name, ne, b, typ in dense:
+        infos.append((name, ne, typ, off))
         pad = (-len(b)) % 32
         blobs.append(b + bytes(pad))
         off += len(b) + pad
@@ -522,6 +522,104 @@ def write_overlay(path, layers, dense=()):
     return len(head) + off
 
 
+DENSE = (("attn_q", "wq_du"), ("attn_k", "wk_dv"), ("attn_v", "wv_dv"), ("attn_output", "wo_ud"))
+
+
+def cmd_dense_hessian(args):
+    """calibrate the inputs of every layer's attention q / k / v (one shared input) and o projections, summed over the
+    layer's visits: <out>/hess_dense/L<l>.pt {"Hqkv": [D][D], "Ho": [Hd][Hd], "N": tokens}"""
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = False
+    hd = Path(args.out) / "hess_dense"
+    hd.mkdir(parents=True, exist_ok=True)
+    model, _ = load_model(args.model)
+    from safetensors import safe_open
+    f = safe_open(str(Path(args.model) / "model-00001-of-00001.safetensors"), "pt")
+    mods = {}
+    for name, mod in model.named_modules():
+        m = re.search(r"layers\.(\d+)\..*\.(q|k|v|o)_proj\.linear$", name)
+        if m and isinstance(mod, torch.nn.Linear):
+            mods[(int(m.group(1)), m.group(2))] = mod
+    hn = {"q": "wq_du", "k": "wk_dv", "v": "wv_dv", "o": "wo_ud"}
+    for (l, r), mod in mods.items():  # the hooked module must hold the checkpoint matrix the engine reads
+        assert torch.equal(mod.weight.data.cpu(), f.get_tensor(f"model.llm.layers.{l}.attn.{hn[r]}.weight")), (l, r)
+    assert sorted({l for l, _ in mods}) == list(range(24)) and len(mods) == 96, len(mods)
+    H = {k: None for k in mods}
+    N = {k: 0 for k in mods}
+    hooks = []
+    for k, mod in mods.items():
+        if k[1] in ("k", "v"):
+            continue  # same input as q
+        def pre(module, a, k=k):
+            x = a[0].reshape(-1, a[0].shape[-1]).float()
+            h = x.T @ x
+            H[k] = h if H[k] is None else H[k] + h
+            N[k] += x.shape[0]
+        hooks.append(mod.register_forward_pre_hook(pre))
+    from transformers import AutoTokenizer
+    seqs = calib_ids(AutoTokenizer.from_pretrained(args.model), args.wiki, args.srcdir, args.tokens, args.seqlen)
+    t0 = time.time()
+    with torch.no_grad():
+        for i, ids in enumerate(seqs):
+            model(input_ids=torch.tensor([ids], device="cuda"), use_cache=False, logits_to_keep=1)
+            if i % 32 == 31:
+                log(f"  calibration {i + 1}/{len(seqs)} {time.time() - t0:.0f} s")
+    for h in hooks:
+        h.remove()
+    for l in range(24):
+        torch.save({"Hqkv": H[(l, "q")].cpu(), "Ho": H[(l, "o")].cpu(), "N": N[(l, "q")]}, str(hd / f"L{l:02d}.pt.tmp"))
+        os.replace(str(hd / f"L{l:02d}.pt.tmp"), hd / f"L{l:02d}.pt")
+    log(f"saved dense Hessians of 24 layers ({N[(0, 'q')]} rows at layer 0)")
+
+
+def cmd_dense(args):
+    """dense TQT: each layer's attention q / k / v / o in one code into <out>/enc_dense_<code>/L<l>_<name>.bin (rows x
+    cols/128 records), with the input Hessians of `dense-hessian` when <out>/hess_dense exists (else identity H: damping
+    only); pack --dense-tqt <code> writes them into the overlay"""
+    import torch
+    from safetensors import safe_open
+    codec = CODECS[args.code]
+    out = Path(args.out) / f"enc_dense_{args.code}"
+    out.mkdir(parents=True, exist_ok=True)
+    f = safe_open(str(Path(args.model) / "model-00001-of-00001.safetensors"), "pt")
+    for l in parse_layers(args.layers):
+        for en, hn in DENSE:
+            dst = out / f"L{l:02d}_{en}.bin"
+            if dst.exists():
+                continue
+            W = f.get_tensor(f"model.llm.layers.{l}.attn.{hn}.weight").float().cuda()
+            hp = Path(args.out) / "hess_dense" / f"L{l:02d}.pt"
+            if hp.exists():
+                hs = torch.load(str(hp))
+                H = (hs["Ho"] if en == "attn_output" else hs["Hqkv"]).cuda() / max(hs["N"], 1)
+            else:
+                H = torch.eye(W.shape[1], device="cuda", dtype=torch.float32)
+            packed, err = encode_matrix(W, H, args.damp, args.scales, codec)
+            packed.tofile(str(dst) + ".tmp"); os.replace(str(dst) + ".tmp", dst)
+            log(f"dense {args.code} L{l:02d} {en} {tuple(W.shape)} rel err {err:.5f}")
+
+
+def dense_tqt_tensors(out, code, layers=24):
+    """[(engine name, ne, record bytes, gguf type)] of the dense-TQT matrices encoded by `dense`"""
+    codec = CODECS[code]
+    d = Path(out) / f"enc_dense_{code}"
+    res = []
+    for l in range(layers):
+        for en, _ in DENSE:
+            p = d / f"L{l:02d}_{en}.bin"
+            if not p.exists():
+                raise SystemExit(f"missing {p}: run `dense --code {code}` first")
+            b = np.fromfile(p, np.uint8)
+            rows = None
+            # cols from the checkpoint shape: q / gate 3072 x 2304, k / v 1024 x 2304, o 2304 x 3072
+            cols = 3072 if en == "attn_output" else 2304
+            per_row = cols // BLOCK * codec.BLOCK_BYTES
+            assert b.size % per_row == 0, (p, b.size, per_row)
+            rows = b.size // per_row
+            res.append((f"blk.{l}.{en}.weight", (cols, rows), b.tobytes(), codec.GGUF_TYPE))
+    return res
+
+
 def cmd_pack(args):
     out = Path(args.out)
     layers = [(l, out / "enc", tqt) for l in parse_layers(args.layers) if (out / "enc" / f"L{l:02d}_dn.bin").exists()]
@@ -529,7 +627,10 @@ def cmd_pack(args):
     layers += [(l, out / "enc3", tqt3) for l in (parse_layers(args.layers3) if args.layers3 else []) if (out / "enc3" / f"L{l:02d}_dn.bin").exists()]
     if len({l for l, _, _ in layers}) != len(layers):
         raise SystemExit("a layer is in more than one of --layers / --layers2 / --layers3")
-    dense = dense_q8_tensors(args.model) if args.dense_q8 else ()
+    dense = {n_: (n_, ne, b, 8) for n_, ne, b in dense_q8_tensors(args.model)} if args.dense_q8 else {}
+    if args.dense_tqt:  # dense TQT replaces the Q8_0 copy of the same matrix
+        dense.update({n_: (n_, ne, b, t) for n_, ne, b, t in dense_tqt_tensors(args.out, args.dense_tqt)})
+    dense = list(dense.values())
     n = write_overlay(args.gguf, sorted(layers, key=lambda x: x[0]), dense)
     log(f"{args.gguf}: {len(layers)} layers ({[l for l, _, c in layers if c is tqt]} tqt, {[l for l, _, c in layers if c is tqt2]} tqt2, {[l for l, _, c in layers if c is tqt3]} tqt3), {n / 1e9:.3f} GB")
 
@@ -537,7 +638,7 @@ def cmd_pack(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("encode", "hessian", "eval", "pack", "sweep", "compare"):
+    for name in ("encode", "hessian", "eval", "pack", "sweep", "compare", "dense", "dense-hessian"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="the official checkpoint folder")
         p.add_argument("--out", required=True)
@@ -547,11 +648,21 @@ def main():
         if name in ("pack", "eval"):
             p.add_argument("--layers2", default="", help="layers of the 2-bit code TQT2 (their enc2 files)")
             p.add_argument("--layers3", default="", help="layers of the 3-bit code TQT3 (their enc3 files)")
+        if name == "dense":
+            p.add_argument("--code", choices=sorted(CODECS), default="tqt")
+            p.add_argument("--damp", type=float, default=0.01)
+            p.add_argument("--scales", type=int, default=3)
         if name == "pack":
+            p.add_argument("--dense-tqt", default="", choices=["", *sorted(CODECS)], help="dense q / k / v / o in this code (from `dense`)")
             p.add_argument("--gguf", required=True)
             p.add_argument("--dense-q8", action="store_true", help="also the embedding, head and attention q / k / v / o as Q8_0")
         if name == "encode":
             p.add_argument("--from-h", default="", help="folder of Hessians from `hessian` (no reference model is loaded)")
+        if name == "dense-hessian":
+            p.add_argument("--wiki", default="")
+            p.add_argument("--srcdir", default="")
+            p.add_argument("--tokens", type=int, default=200000)
+            p.add_argument("--seqlen", type=int, default=1000)
         if name in ("encode", "hessian"):
             p.add_argument("--wiki", default="")
             p.add_argument("--srcdir", default="")
@@ -565,7 +676,7 @@ def main():
             p.add_argument("--n0", type=float, required=True)
             p.add_argument("--nmin", type=float, default=64)
     args = ap.parse_args()
-    {"encode": cmd_encode, "hessian": cmd_hessian, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep, "compare": cmd_compare}[args.cmd](args)
+    {"encode": cmd_encode, "hessian": cmd_hessian, "eval": cmd_eval, "pack": cmd_pack, "sweep": cmd_sweep, "compare": cmd_compare, "dense": cmd_dense, "dense-hessian": cmd_dense_hessian}[args.cmd](args)
 
 
 if __name__ == "__main__":

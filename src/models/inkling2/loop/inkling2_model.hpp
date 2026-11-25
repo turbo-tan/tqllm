@@ -26,7 +26,7 @@ public:
     // exact (default): BF16 dense weights as the checkpoint; --exact off: the device's fast dense format
     // (inkling2_int8_dense), gated by KLD / PPL against the BF16 path
     Inkling2Model(const std::string & path, int context, int chunk = 64, bool hf_attention = false, size_t expert_budget = SIZE_MAX,
-                  bool exact = true);
+                  bool exact = true, size_t drafter_bytes = 0);
     ~Inkling2Model();
     Inkling2Model(const Inkling2Model &) = delete;
     Inkling2Model & operator=(const Inkling2Model &) = delete;
@@ -57,7 +57,12 @@ public:
     // MTP (mtp.safetensors in dir; before the first forward): every committed token's target taps become draft context.
     // draft(anchor, steps): the first `steps` (<= 7) greedy draft tokens of the block after `anchor` at position length(). verify(tokens, n <= 8): the target over
     // the block (all n logits), then commit(keep): keep its first keep tokens (conv states rolled back, the rest dropped).
-    void enable_mtp(const std::string & dir);
+    void enable_mtp(const std::string & dir);  // or a DFlash2 drafter folder (incoai/Inkling-2-Mini-DFlash2)
+    // device bytes enable_mtp(dir) will take (weights, conversion peak, caches, scratch): pass it as drafter_bytes to the
+    // constructor so the expert plan leaves it free
+    static size_t drafter_bytes(const std::string & dir);
+    // DFlash2 reference check (tools/inkling2/dflash2_reference.py): the drafter alone over `tokens`' input rows as taps
+    void draft_trace(const std::vector<int> & tokens, int anchor, std::vector<float> & hidden, std::vector<int> & ids, std::vector<int> & path);
     void draft(int anchor, std::vector<int> & tokens, int steps = 7);
     void verify(const int * tokens, int n, std::vector<float> & logits);
     void commit(int keep);

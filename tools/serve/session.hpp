@@ -839,9 +839,23 @@ inline std::vector<uint32_t> prepare(const tqllm::Tokenizer & tokenizer, const C
 // Generated ids of the speculative path -> text, finish reason, stop strings, reasoning split, tool calls.
 // like vLLM's reasoning parser: the answer is what follows </think>; truncated thinking -> empty answer. </think> is a
 // special token (decode() drops it), so the split is on its id. Both decode paths (speculative finish() and plain) use it.
+// The reply itself opens a thinking message: its first tokens, past role tokens that decode to nothing, are think_open
+// (one token). Inkling-2 writes a short thinking message even with thinking off or reasoning_effort "none"; vLLM's
+// reasoning parser moves it to reasoning_content, so the split follows the reply, not only the request.
+inline bool opens_thinking(const tqllm::Tokenizer & tokenizer, const std::vector<uint32_t> & output) {
+    const auto & open_text = serve_options().think_open;
+    if (open_text.empty()) return false;
+    const auto open = tokenizer.encode(open_text);
+    if (open.size() != 1) return false;
+    for (size_t i = 0; i < output.size() && i < 3; ++i) {
+        if (output[i] == open[0]) return true;
+        if (!tokenizer.decode({output[i]}).empty()) return false;
+    }
+    return false;
+}
 inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & output,
                             DecodeResult & result) {
-    if (!req.thinking) return;
+    if (!req.thinking && !opens_thinking(tokenizer, output)) return;
     static const auto think_end = tokenizer.encode(serve_options().think_close);
     const auto at = think_end.size() == 1 ? std::find(output.begin(), output.end(), think_end[0]) : output.end();
     result.reasoning = trim(tokenizer.decode({output.begin(), at}));
@@ -1162,6 +1176,11 @@ public:
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
         const auto te = tok_.encode(serve_options().think_close);  // finish() splits on this id only when it is one token
         think_id_ = te.size() == 1 ? int64_t(te[0]) : -1;
+        thinking_ = req.thinking;
+        if (!serve_options().think_open.empty()) {
+            const auto to = tok_.encode(serve_options().think_open);
+            open_id_ = to.size() == 1 ? int64_t(to[0]) : -1;
+        }
     }
     // One delta per new token (clients count deltas as tokens). Incremental: each token's bytes are appended once and
     // only the still-unstable tail (incomplete UTF-8, a possible stop or tool-marker prefix, trailing whitespace) is looked
@@ -1169,7 +1188,7 @@ public:
     bool update(const std::vector<uint32_t> & gen) {
         for (size_t k = std::min(seen_ + 1, gen.size()); k <= gen.size() && k > seen_; ++k) {
             take(gen[k - 1]);
-            if (req_.thinking && !emit_view(view(rraw_, rlead_, rlast_), sr_, true)) return false;
+            if (thinking_ && !emit_view(view(rraw_, rlead_, rlast_), sr_, true)) return false;
             const std::string_view text = answer_view();
             if (req_.tools) { if (!emit_view(text.substr(0, rstrip(text, tool_limit(text))), sc_, false)) return false; }
             else if (!emit_view(text, sc_, false)) return false;
@@ -1272,16 +1291,19 @@ private:
     void take(uint32_t t) {  // the same token handling as finish(): stop at EOS, split reasoning at </think>
         if (done_) return;
         if (tok_.is_eog(t)) {if (!req_.ignore_eos) done_ = true; return;}  // ignore_eos: counted, not printed
-        if (req_.thinking && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
-        std::string & raw = req_.thinking && !in_answer_ ? rraw_ : araw_;
+        // the reply opens a thinking message (opens_thinking(): within its first 3 tokens, nothing printed before it)
+        if (!thinking_ && taken_ < 3 && open_id_ >= 0 && int64_t(t) == open_id_ && araw_.empty()) thinking_ = true;
+        ++taken_;
+        if (thinking_ && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
+        std::string & raw = thinking_ && !in_answer_ ? rraw_ : araw_;
         const size_t from = raw.size();
         raw += tok_.decode({t});
         if (&raw == &rraw_) extend_trim(rraw_, from, rlead_, rlast_);
-        else if (req_.thinking || req_.tools) extend_trim(araw_, from, alead_, alast_);
+        else if (thinking_ || req_.tools) extend_trim(araw_, from, alead_, alast_);
     }
     // the answer as finish() returns it: trimmed (thinking) or raw, cut at the first stop string
     std::string_view answer_view() {
-        const std::string_view t = req_.thinking ? view(araw_, alead_, alast_)
+        const std::string_view t = thinking_ ? view(araw_, alead_, alast_)
                                  : req_.tools ? (alead_ == std::string::npos ? std::string_view() : std::string_view(araw_).substr(alead_))
                                               : std::string_view(araw_);
         if (stop_at_ != std::string::npos) return t.substr(0, std::min(stop_at_, t.size()));
@@ -1375,7 +1397,9 @@ private:
     bool role_sent_ = false;
     // incremental update() state
     int64_t think_id_ = -1;
-    bool done_ = false, in_answer_ = false;
+    bool done_ = false, in_answer_ = false, thinking_ = false;  // thinking_: the request thinks, or the reply opened a thinking message
+    int64_t open_id_ = -1;
+    size_t taken_ = 0;
     std::string rraw_, araw_;
     size_t rlead_ = std::string::npos, rlast_ = 0, alead_ = std::string::npos, alast_ = 0;
     size_t stop_at_ = std::string::npos, stop_scan_ = 0, tool_at_ = std::string::npos, tool_scan_ = 0;

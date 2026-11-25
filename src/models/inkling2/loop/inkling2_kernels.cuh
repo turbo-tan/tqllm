@@ -37,6 +37,8 @@ void msg_gate_in(const float * h, const float * m, __nv_bfloat16 * z, int n, int
 // second half: g = F32(bf16 [n][rank]); f = tanh(F g), a = tanh(G g) (FT, GT: F, G transposed, BF16 [rank][D]); y = (1 - f) h + a m
 void msg_gate_out(const __nv_bfloat16 * g, const __nv_bfloat16 * FT, const __nv_bfloat16 * GT, const float * h, const float * m, float * y, int n, int D,
                   int rank, cudaStream_t s);
+// the same from fa = [F g, G g] (F32 [n][2 D], the gate projections as one gemv): y = (1 - tanh f) h + tanh(a) m
+void msg_gate_combine(const float * fa, const float * h, const float * m, float * y, int n, int D, cudaStream_t s);
 // r = boundary ? o : h + o (F32); out = bf16-valued F32 of r + y   (two separate helpers)
 void add(const float * a, const float * b, float * y, size_t n, bool round_bf16, cudaStream_t s);
 // out[t] = bf16(sum_k w[t][k] * y[t * topk + k])  (BF16 as F32 / BF16)
@@ -53,12 +55,25 @@ constexpr int kSmallN = 8;
 // F32, F32 accumulate; K % 8 == 0, 16-byte aligned rows
 constexpr int kMaxSegs = 8;
 // scale non-null: W is INT8 [rows][K] (the bytes behind the pointer), row r's weights = int8 x scale[r] (fast mode)
-struct GemvSeg { const __nv_bfloat16 * W; const __nv_bfloat16 * x; void * y; int rows, K, ldx, ldy, f32; const float * scale = nullptr; };
+struct GemvSeg { const __nv_bfloat16 * W; const __nv_bfloat16 * x; void * y; int rows, K, ldx, ldy, f32; const float * scale = nullptr;
+                 const void * tq = nullptr; };  // tq: host-side TQT matrix (dense TQT): gemv() never reads it, project() routes it
 // fast mode: rows of a BF16 matrix -> INT8 symmetric per row (scale = max |w| / 127, round to nearest)
 void quantize_rows_i8(const __nv_bfloat16 * w, int8_t * q, float * scale, int rows, int K, cudaStream_t s);
 // and back to BF16 (prompt chunks: cuBLAS on the dequantised rows, the same weights as the INT8 gemv)
 void dequant_rows_i8(const int8_t * q, const float * scale, __nv_bfloat16 * w, int rows, int K, cudaStream_t s);
+// BF16 segments with K % 64 == 0 run on tensor cores (a token's sums independent of n), INT8 rows on gemv_k
 void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
+// per device (chosen at model load by measuring both): BF16 gemv on tensor cores (default) or on gemv_k; either way a
+// token's sums do not depend on n
+void set_gemv_mma(bool on);
+// the kernel family to run on this device: rate = tokens per microsecond of its 1-token step, or with a drafter the better
+// of that and a verify block of 8 rows gaining `spec_tokens`; true = the tensor-core family
+inline bool prefer_mma(double t1_warp, double t8_warp, double t1_mma, double t8_mma, bool drafter, double spec_tokens = 3.5) {
+    auto rate = [&](double t1, double t8) { return drafter ? (1.0 / t1 > spec_tokens / t8 ? 1.0 / t1 : spec_tokens / t8) : 1.0 / t1; };
+    return rate(t1_mma, t8_mma) >= rate(t1_warp, t8_warp);
+}
+// every segment on gemv_k (per row: the sum order of the bounded LM head's BF16 rescoring, bf16_row_dot): the LM head
+void gemv_rows(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
 // a stack of routed experts on the device: fmt 1 MXFP8 rows (w: per expert rows x (cols + cols / 32) bytes), fmt 2 NVF4
 // planes (w: codes [rows][cols / 2]; aux: [rows][cols / 16 E4M3 scales, F32 global]), fmt 3 TQT planes (w: stream bytes
 // [rows][cols / 2]; aux: FP16 scales [rows][cols / 128]; weights in TQ4's rotated basis, so the few-token kernels read the
@@ -91,8 +106,27 @@ int attn_res_norm_scratch_words(int n, int D);
 // verify blocks (1 < n <= kSmallN): each distinct routed expert read once for all its assignments, every assignment with
 // the arithmetic of expert_gate_up / expert_down (outputs equal those of single-token calls bitwise); groups: device
 // scratch of 1 + n * topk * (1 + kSmallN) ints; act [n * topk][I], yd [n * topk][D] scratch
+// expert_dedup for TQT / TQT2 / TQT3 experts: xh = x rotated per 128 (FP16 [n][D]), acth scratch [n * topk][I]; each group's
+// rows are read once; results equal expert_gate_up / expert_down with the rotated activations bitwise
+void expert_dedup_tqt(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __half * xh, const int * ids, const float * wts,
+                      int * groups, __nv_bfloat16 * act, __half * acth, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc,
+                      cudaStream_t s);
 void expert_dedup(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __nv_bfloat16 * x, const int * ids, const float * wts,
                   int * groups, __nv_bfloat16 * act, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc, cudaStream_t s);
+// decode / verify experts on tensor cores (NVF4 / MXFP8, n <= kSmallN): groups of the assignments routed to one expert, each
+// expert's 16-row tiles once for all of its members; a token's results do not depend on n or the other tokens (bitwise).
+// act [n * topk][I], yd [n * topk][D] scratch, out [n][D] (moe_combine of yd)
+bool expert_mma_ok(const ExpertMat & g, const ExpertMat & d, int I, int D);
+// TQT (fmt 3 .. 5): xh [n][D] and acth [n * topk][I] FP16 scratch for the rotated activations
+void expert_mma(const ExpertMat & g, const ExpertMat & u, const ExpertMat & d, int I, int D, const __nv_bfloat16 * x, const int * ids, const float * wts,
+                int * groups, __nv_bfloat16 * act, __nv_bfloat16 * yd, __nv_bfloat16 * out, int n, int topk, float gc, float uc, cudaStream_t s,
+                __half * xh = nullptr, __half * acth = nullptr);
+// its parts (benches): groups of A = n * topk assignments, then gate / up and down
+void expert_mma_groups(const int * ids, int A, int * groups, cudaStream_t s);
+void expert_mma_gate_up(const ExpertMat & g, const ExpertMat & u, int I, int D, const __nv_bfloat16 * x, const int * ids, const int * groups,
+                        __nv_bfloat16 * act, int A, int topk, float gc, float uc, cudaStream_t s);
+void expert_mma_down(const ExpertMat & d, int D, int I, const __nv_bfloat16 * act, const int * ids, const int * groups, __nv_bfloat16 * yd, int A,
+                     cudaStream_t s);
 // counts[ids[a]] += 1 for a < A (routed-expert use per layer)
 void count_routes(const int * ids, int A, int * counts, cudaStream_t s);
 // router selection from F32 logits [n][E]: s = sigmoid; top-k of s + bias (lowest id on ties); w = s / sum * scale

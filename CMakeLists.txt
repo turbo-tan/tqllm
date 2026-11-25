@@ -260,7 +260,7 @@ if(TQLLM_CUDA)
     src/spec/dflash.cu src/spec/dflash2_drafter.cpp src/spec/dspine.cu src/spec/suffix_copy.cpp src/vision/vision.cpp src/vision/vision.cu
     src/core/fp8_gemm.cu src/core/int8_gemm.cu src/experts/mmq_experts.cu src/experts/mmq_runtime.cpp src/models/inkling2/loop/inkling2_attention.cu src/models/inkling2/loop/inkling2_prompt_attn.cu
     src/models/inkling2/loop/inkling2_model.cpp src/models/inkling2/loop/inkling2_kernels.cu src/models/inkling2/loop/inkling2_grouped.cu
-    src/models/inkling2/loop/inkling2_mtp.cu src/models/inkling2/loop/inkling2_engine.cpp
+    src/models/inkling2/loop/inkling2_mtp.cu src/models/inkling2/loop/inkling2_dflash2.cu src/models/inkling2/loop/inkling2_engine.cpp
     src/spec/head_sampler.cu)
   # GLM-5.3-Flash (src/models/glm/glm5next): Model dispatch opens it by its GGUF arch, so the engine is in the library; it reads
   # weights through MappedGguf, which moves here from the per-tool source lists (tqserve, tqfn-stage).
@@ -962,14 +962,14 @@ if(TQLLM_CUDA)
   add_test(NAME inkling2-attention COMMAND test-inkling2-attention)
   set_tests_properties(inkling2-attention PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(test-inkling2-kernels tests/inkling2_kernels.cu src/models/inkling2/loop/inkling2_kernels.cu src/models/inkling2/loop/inkling2_grouped.cu
-    src/models/inkling2/loop/inkling2_attention.cu)  # Inkling-2-Mini few-token kernels vs CPU references
+    src/models/inkling2/loop/inkling2_attention.cu src/models/inkling2/loop/inkling2_dflash2.cu)  # Inkling-2-Mini few-token kernels vs CPU references
   target_include_directories(test-inkling2-kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
   target_link_libraries(test-inkling2-kernels PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME inkling2-kernels COMMAND test-inkling2-kernels)
   set_tests_properties(inkling2-kernels PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(inkling2-check tools/inkling2_check.cpp src/models/inkling2/loop/inkling2_model.cpp src/models/inkling2/loop/inkling2_kernels.cu
     src/models/inkling2/loop/inkling2_grouped.cu src/models/inkling2/loop/inkling2_prompt_attn.cu src/models/inkling2/loop/inkling2_mtp.cu
-    src/models/inkling2/loop/inkling2_attention.cu src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/hf/arch_qwen4_exp.cpp src/core/hf/arch_qwen35.cpp src/core/hf/arch_inkling2_loop.cpp src/core/safetensors.cpp ${TQLLM_OS_SOURCE})  # Inkling-2-Mini text model vs golden references
+    src/models/inkling2/loop/inkling2_dflash2.cu src/models/inkling2/loop/inkling2_attention.cu src/core/gguf.cpp src/core/paw_gguf.cpp src/core/hf/hf_folder.cpp src/core/hf/hf_arch.cpp src/core/hf/arch_minimax_m3.cpp src/core/hf/arch_minimax_m3_dspark.cpp src/core/hf/arch_qwen4_exp.cpp src/core/hf/arch_qwen35.cpp src/core/hf/arch_inkling2_loop.cpp src/core/safetensors.cpp ${TQLLM_OS_SOURCE})  # Inkling-2-Mini text model vs golden references
   target_include_directories(inkling2-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
   target_link_libraries(inkling2-check PRIVATE CUDA::cudart CUDA::cublas)
   add_executable(test-attention128-exact tests/attention128_exact.cu)
@@ -1075,6 +1075,13 @@ if(BUILD_TESTING)
     target_link_libraries(test-stream-incremental PRIVATE CUDA::cudart)
   endif()
   add_test(NAME stream_incremental COMMAND test-stream-incremental)
+  add_executable(test-inkling2-reasoning-split tests/inkling2_reasoning_split.cpp)  # Inkling-2: the thinking message -> reasoning_content in every mode
+  target_include_directories(test-inkling2-reasoning-split PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
+  target_link_libraries(test-inkling2-reasoning-split PRIVATE tqllm)
+  if(TQLLM_CUDA)
+    target_link_libraries(test-inkling2-reasoning-split PRIVATE CUDA::cudart)
+  endif()
+  add_test(NAME inkling2-reasoning-split COMMAND test-inkling2-reasoning-split)
   add_executable(test-tool-calls tests/tool_calls.cpp)  # parallel tool calls in one turn (Qwen4 readiness)
   target_include_directories(test-tool-calls PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
   target_link_libraries(test-tool-calls PRIVATE tqllm)

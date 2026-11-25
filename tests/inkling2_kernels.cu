@@ -4,6 +4,7 @@
 // must give token t of an n-token call bitwise the same result as a 1-token call on that token (verify == plain decode).
 // Prompt-chunk kernels: grouped expert GEMM (tensor cores) vs the CPU reference, parallel convolutions vs the per-step ones;
 // the spec-decode conv rollback vs running only the kept tokens; the exact greedy LM head; one depth-attention scratch for every n.
+#include "inkling2_dflash2.cuh"
 #include "inkling2_grouped.cuh"
 #include "inkling2_kernels.cuh"
 
@@ -199,8 +200,8 @@ void make_bank(ExpertBank & b, int fmt, int E, int rows, int cols) {
     b.upload();
 }
 
-void test_experts(int fmt) {
-    const int E = 16, topk = 8, D = 2304, I = 1152, NMAX = 4;
+void test_experts(int fmt, int NMAX = 4) {  // NMAX 8: dedup groups of up to 8 members (16 experts)
+    const int E = 16, topk = 8, D = 2304, I = 1152;
     const float gc = 4.0f, uc = 25.0f;
     ExpertBank G, U, Dn;
     make_bank(G, fmt, E, I, D); make_bank(U, fmt, E, I, D); make_bank(Dn, fmt, E, D, I);
@@ -267,8 +268,12 @@ void test_experts(int fmt) {
         bit = bit && std::memcmp(o1.data(), o2.data(), o1.size() * 4) == 0 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0;
         cudaFree(groups); cudaFree(yd); cudaFree(act2); cudaFree(out2);
     }
-    report(fmt == 2 ? "experts NVF4 gate/up + SwiGLU" : "experts MXFP8 gate/up + SwiGLU", ea, 2e-2, bit);
-    report(fmt == 2 ? "experts NVF4 down + combine" : "experts MXFP8 down + combine", eo, 2e-2, bit);
+    if (NMAX > 4) {  // the numbers are checked at 4 tokens; at 8 the dedup groups (up to 8 members) == the per-token kernels bitwise
+        report(fmt == 2 ? "experts NVF4 dedup, 8 tokens" : "experts MXFP8 dedup, 8 tokens", 0.0, 0.0, bit);
+    } else {
+        report(fmt == 2 ? "experts NVF4 gate/up + SwiGLU" : "experts MXFP8 gate/up + SwiGLU", ea, 2e-2, bit);
+        report(fmt == 2 ? "experts NVF4 down + combine" : "experts MXFP8 down + combine", eo, 2e-2, bit);
+    }
     cudaFree(dx); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
 }
 
@@ -346,7 +351,7 @@ std::vector<__half> rot_half(const std::vector<float> & x, size_t rows, size_t c
 }
 
 void test_experts_tqt(int fmt) {
-    const int E = 16, topk = 8, D = 2304, I = 1152, NMAX = 4;
+    const int E = 16, topk = 8, D = 2304, I = 1152, NMAX = 8;  // 8 tokens over 16 experts: dedup groups of 1 .. 8 members
     const float gc = 4.0f, uc = 25.0f;
     ExpertBank G, U, Dn;
     make_bank_tqt(G, E, I, D, fmt); make_bank_tqt(U, E, I, D, fmt); make_bank_tqt(Dn, E, D, I, fmt);
@@ -431,6 +436,26 @@ void test_experts_tqt(int fmt) {
     }
     report(fmt == 5 ? "experts TQT3 gate/up + SwiGLU" : fmt == 4 ? "experts TQT2 gate/up + SwiGLU" : "experts TQT gate/up + SwiGLU", ea, 2e-2, bit);
     report(fmt == 5 ? "experts TQT3 down + combine" : fmt == 4 ? "experts TQT2 down + combine" : "experts TQT down + combine", eo, 3e-2, bit);
+    {   // verify blocks: expert_dedup_tqt (groups of 1 .. 8 members, rows read once) == the per-assignment kernels with the device rotation, bitwise
+        bf16 * act2 = nullptr, * out2 = nullptr, * yd = nullptr, * out1 = nullptr;
+        __half * ah1 = nullptr, * ah2 = nullptr;
+        int * groups = nullptr;
+        ck(cudaMalloc(&act2, size_t(NMAX) * topk * I * 2), "act2"); ck(cudaMalloc(&out2, size_t(NMAX) * D * 2), "out2");
+        ck(cudaMalloc(&out1, size_t(NMAX) * D * 2), "out1"); ck(cudaMalloc(&yd, size_t(NMAX) * topk * D * 2), "yd");
+        ck(cudaMalloc(&ah1, size_t(NMAX) * topk * I * 2), "ah1"); ck(cudaMalloc(&ah2, size_t(NMAX) * topk * I * 2), "ah2");
+        ck(cudaMalloc(&groups, size_t(1 + NMAX * topk * (1 + NMAX)) * 4), "groups");
+        K::expert_gate_up(G.m, U.m, I, D, nullptr, dids, dact, NMAX, topk, gc, uc, 0, dxh);
+        K::rotate_h(dact, ah1, I, NMAX * topk, 0);
+        K::expert_down(Dn.m, D, I, nullptr, dids, dw, out1, NMAX, topk, 0, ah1);
+        K::expert_dedup_tqt(G.m, U.m, Dn.m, I, D, dxh, dids, dw, groups, act2, ah2, yd, out2, NMAX, topk, gc, uc, 0);
+        ck(cudaDeviceSynchronize(), "dedup tqt");
+        const auto a1 = down(dact, size_t(NMAX) * topk * I), a2 = down(act2, size_t(NMAX) * topk * I);
+        const auto o1 = down(out1, size_t(NMAX) * D), o2 = down(out2, size_t(NMAX) * D);
+        const bool same = std::memcmp(a1.data(), a2.data(), a1.size() * 2) == 0 && std::memcmp(o1.data(), o2.data(), o1.size() * 2) == 0;
+        report(fmt == 5 ? "experts TQT3 dedup, 8 tokens == per assignment" : fmt == 4 ? "experts TQT2 dedup, 8 tokens == per assignment"
+                                                                                   : "experts TQT dedup, 8 tokens == per assignment", 0.0, 0.0, same);
+        cudaFree(act2); cudaFree(out2); cudaFree(out1); cudaFree(yd); cudaFree(ah1); cudaFree(ah2); cudaFree(groups);
+    }
     cudaFree(dxh); cudaFree(dah); cudaFree(dact); cudaFree(dout); cudaFree(dids); cudaFree(dw);
 }
 
@@ -872,6 +897,43 @@ void test_attn_res_capture(int n) {
 // small cards: the TQT prompt path decodes and multiplies G experts at a time (expert_slice + grouped_gather +
 // grouped_gate_up_part_bf16 + grouped_down_bf16 on the group's hc / ho slices) == the whole layer at once, bitwise;
 // a group with no routed rows is skipped. choose_tqt_group keeps every expert resident when a smaller group allows it.
+// dense TQT (q / k / v / o of a dense-TQT overlay): the model runs a dense matrix as one TQT expert through the down
+// kernel (id 0, weight 1) on the input rotated per 128, and prompt chunks decode it to BF16 for the GEMM; both must equal
+// W x with W the record's original-basis weights
+void test_tqt_dense(int fmt) {
+    const int rows = 3072, cols = 2304, n = 3;
+    ExpertBank W;
+    make_bank_tqt(W, 1, rows, cols, fmt);
+    const auto X = randv(size_t(n) * cols, 1.0f);
+    const auto Xb = to_bf(X);
+    bf16 * dx = up(Xb), * dy = nullptr, * dw16 = nullptr;
+    __half * dxh = nullptr;
+    std::vector<int> ids(n, 0); std::vector<float> wts(n, 1.0f);
+    int * dids = up(ids); float * dwts = up(wts);
+    ck(cudaMalloc(&dxh, size_t(n) * cols * 2), "xh"); ck(cudaMalloc(&dy, size_t(n) * rows * 2), "y");
+    ck(cudaMalloc(&dw16, size_t(rows) * cols * 2), "w16");
+    K::rotate_h(dx, dxh, cols, n, 0);
+    K::expert_down(W.m, rows, cols, dx, dids, dwts, dy, n, 1, 0, dxh);
+    K::experts_decode_bf16(W.m, 1, rows, cols, rows, dw16, 0);
+    ck(cudaDeviceSynchronize(), "dense tqt");
+    const auto y = from_bf(down(dy, size_t(n) * rows));
+    const auto w16 = from_bf(down(dw16, size_t(rows) * cols));
+    double err = 0, derr = 0;
+    for (int t = 0; t < n; ++t)
+        for (int r = 0; r < rows; ++r) {
+            double ref = 0, mag = 0;
+            for (int c = 0; c < cols; ++c) {
+                const double xv = from_bf(std::vector<bf16>{Xb[size_t(t) * cols + c]})[0];
+                ref += double(W.w[size_t(r) * cols + c]) * xv; mag += std::fabs(double(W.w[size_t(r) * cols + c]) * xv);
+            }
+            err = std::max(err, std::fabs(y[size_t(t) * rows + r] - ref) / (std::max(std::fabs(ref), mag / std::sqrt(double(cols))) + 1e-6));
+        }
+    for (size_t i = 0; i < w16.size(); ++i) derr = std::max(derr, double(std::fabs(w16[i] - W.w[i])) / (std::fabs(W.w[i]) + 1e-3));
+    report(fmt == 3 ? "dense TQT 3072x2304: one-expert down == W x" : fmt == 5 ? "dense TQT3 3072x2304: one-expert down == W x"
+                                                                              : "dense TQT2 3072x2304: one-expert down == W x", err, 2e-2, true);
+    report("dense TQT decode to BF16 (prompt path) == record weights", derr, 1e-2, true);
+    cudaFree(dx); cudaFree(dy); cudaFree(dw16); cudaFree(dxh); cudaFree(dids); cudaFree(dwts);
+}
 void test_tqt_groups(int fmt) {
     const int E = 16, G = 4, topk = 4, D = 256, I = 128, n = 96, A = n * topk;
     const float gc = 4.0f, uc = 25.0f;
@@ -969,7 +1031,7 @@ void test_head_greedy() {
         ck(cudaMemcpy(dx, xb.data(), D * 2, cudaMemcpyHostToDevice), "x");
         // full head on the device: the reference logits
         K::GemvSeg sg{dw, dx, dl16, V, D, D, V, 0};
-        K::gemv(&sg, 1, 1, 0);
+        K::gemv_rows(&sg, 1, 1, 0);
         K::to_f32(dl16, dlog, V, 0);
         K::softcap(dlog, V, cap, 0);
         auto lg = down(dlog, V);
@@ -981,7 +1043,7 @@ void test_head_greedy() {
                 wb[size_t(c2) * D + k] = wb[size_t(best) * D + k];
             }
             ck(cudaMemcpy(dw, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice), "w");
-            K::gemv(&sg, 1, 1, 0);
+            K::gemv_rows(&sg, 1, 1, 0);
             K::to_f32(dl16, dlog, V, 0);
             K::softcap(dlog, V, cap, 0);
             lg = down(dlog, V);
@@ -1010,7 +1072,7 @@ void test_head_greedy() {
         const auto t3 = down(dt3, 3);
         for (int r = 0; r < 3; ++r) {
             K::GemvSeg sg{dw, dx3 + size_t(r) * D, dl16, V, D, D, V, 0};
-            K::gemv(&sg, 1, 1, 0);
+            K::gemv_rows(&sg, 1, 1, 0);
             K::to_f32(dl16, dlog, V, 0);
             K::softcap(dlog, V, cap, 0);
             const auto lg = down(dlog, V);
@@ -1065,6 +1127,204 @@ void test_attn_res_shared_scratch() {
     cudaFree(dq); cudaFree(dw); cudaFree(shared); cudaFree(fresh); cudaFree(y);
 }
 
+// DFlash2 drafter kernels vs CPU references: the two-tap dynamic convolution and double-rounded SiLU-mul bitwise, top-16
+// (ties broken by the lower id, across chunk borders) exactly, and the selector walk (path and the stop at the vocabulary)
+void test_dflash2() {
+    const int m = 8, H = 2304, group = 16, G = H / group, I = 6912;
+    bool same = true;
+    {
+        const auto x = randv(size_t(m) * H, 1.0f), res = randv(size_t(m) * H, 2.0f), base = randv(size_t(4) * H, 0.5f);
+        const auto dyn = randv(size_t(m) * 4 * G, 0.5f);
+        float * dx = up(x), * dr = up(res), * db = up(base), * dy = nullptr;
+        bf16 * dd = up(to_bf(dyn));
+        ck(cudaMalloc(&dy, size_t(m) * H * 4), "y");
+        for (int side = 0; side < 2; ++side)
+            for (int withres = 0; withres < 2; ++withres) {
+                K::dflash_conv(dx, dd, db, m, H, group, side, withres ? dr : nullptr, dy, 0);
+                const auto y = down(dy, size_t(m) * H);
+                for (int r = 0; r < m; ++r)
+                    for (int c = 0; c < H; ++c) {
+                        const int gi = c / group, c0 = 2 * side;
+                        const float w0 = dyn[size_t(r) * 4 * G + c0 * G + gi] + base[size_t(c0) * H + c];
+                        const float w1 = dyn[size_t(r) * 4 * G + (c0 + 1) * G + gi] + base[size_t(c0 + 1) * H + c];
+                        float acc = 0.0f + w0 * x[size_t(r) * H + c];
+                        acc = acc + w1 * (r ? x[size_t(r - 1) * H + c] : 0.0f);
+                        float o = bf(acc);
+                        if (withres) o = bf(res[size_t(r) * H + c] + o);
+                        same = same && o == y[size_t(r) * H + c];
+                    }
+            }
+        cudaFree(dx); cudaFree(dr); cudaFree(db); cudaFree(dy); cudaFree(dd);
+    }
+    report("dflash2 conv (both sides, with / without residual)", 0.0, 0.0, same);
+    same = true;
+    {
+        const auto gu = randv(size_t(m) * 2 * I, 2.0f);
+        bf16 * dg = up(to_bf(gu)), * da = nullptr;
+        ck(cudaMalloc(&da, size_t(m) * I * 2), "a");
+        K::dflash_silu_mul(dg, da, m, I, 0);
+        const auto a = from_bf(down(da, size_t(m) * I));
+        for (int r = 0; r < m; ++r)
+            for (int c = 0; c < I; ++c) {
+                const float g = gu[size_t(r) * 2 * I + c], u = gu[size_t(r) * 2 * I + I + c];
+                const float want = bf(bf(g * (1.0f / (1.0f + std::exp(-g)))) * u);
+                same = same && std::fabs(want - a[size_t(r) * I + c]) <= std::fabs(want) * 0.0079f;  // expf vs exp: one BF16 ulp
+            }
+        cudaFree(dg); cudaFree(da);
+    }
+    report("dflash2 silu-mul (double rounded)", 0.0, 0.0, same);
+    same = true;
+    {
+        const int n = 200058, ld = 201024;
+        std::vector<float> x(size_t(m) * ld, 1e30f);  // the padding columns must not count
+        std::uniform_int_distribution<int> q(-400, 400);
+        for (int r = 0; r < m; ++r) for (int c = 0; c < n; ++c) x[size_t(r) * ld + c] = q(rng) * 0.25f;  // many ties
+        for (int c : {4095, 4096, 8191, 199999}) x[size_t(3) * ld + c] = 1000.0f;  // equal maxima on chunk borders
+        float * dx = up(x), * dv = nullptr, * ds = nullptr;
+        int * di = nullptr;
+        ck(cudaMalloc(&dv, size_t(m) * 16 * 4), "v"); ck(cudaMalloc(&di, size_t(m) * 16 * 4), "i");
+        ck(cudaMalloc(&ds, size_t(K::dflash_top16_floats(m, n)) * 4), "s");
+        K::dflash_top16(dx, m, n, ld, di, dv, ds, 0);
+        const auto ids = down(di, size_t(m) * 16);
+        const auto vals = down(dv, size_t(m) * 16);
+        for (int r = 0; r < m; ++r) {
+            std::vector<int> o(static_cast<size_t>(n));
+            for (int c = 0; c < n; ++c) o[size_t(c)] = c;
+            const float * xr = x.data() + size_t(r) * ld;
+            std::partial_sort(o.begin(), o.begin() + 16, o.end(), [&](int a, int b) { return xr[a] > xr[b] || (xr[a] == xr[b] && a < b); });
+            for (int j = 0; j < 16; ++j) same = same && ids[size_t(r) * 16 + j] == o[size_t(j)] && vals[size_t(r) * 16 + j] == xr[o[size_t(j)]];
+        }
+        // the selector walk over these candidates
+        const int V = n, Rk = 256, count = 7;
+        const auto gate = randv(size_t(m) * Rk, 1.0f), pred = randv(size_t(V) * Rk, 0.3f), succ = randv(size_t(V) * Rk, 0.3f);
+        bf16 * dgt = up(to_bf(gate)), * dp = up(to_bf(pred)), * dsu = up(to_bf(succ));
+        int * dt = nullptr, * da = nullptr;
+        const int anchor = 46389;
+        da = up(std::vector<int>{anchor});
+        ck(cudaMalloc(&dt, count * 4), "t");
+        auto walk = [&](const std::vector<int> & cid, int vocab) {
+            std::vector<int> out;
+            int prev = anchor;
+            for (int e = 1; e <= count; ++e) {
+                double best = -1e300; int w = 0;
+                for (int c = 0; c < 16; ++c) {
+                    double sum = 0;
+                    for (int k = 0; k < Rk; ++k) sum += double(succ[size_t(cid[size_t(e * 16 + c)]) * Rk + k]) * (pred[size_t(prev) * Rk + k] * gate[size_t(e) * Rk + k]);
+                    const double sc = sum + vals[size_t(e * 16 + c)];
+                    if (sc > best) { best = sc; w = c; }
+                }
+                prev = cid[size_t(e * 16 + w)];
+                if (prev >= vocab) { while (int(out.size()) < count) out.push_back(vocab); break; }
+                out.push_back(prev);
+            }
+            return out;
+        };
+        K::dflash_select(di, dv, dgt, dsu, dp, da, count, V, dt, 0);
+        const auto path = down(dt, count);
+        const auto want = walk(ids, V);
+        bool p1 = std::equal(want.begin(), want.end(), path.begin());
+        // a vocabulary below every candidate of row 1: the walk stops at once
+        K::dflash_select(di, dv, dgt, dsu, dp, da, count, 0, dt, 0);
+        const auto stop = down(dt, count);
+        for (int v : stop) p1 = p1 && v == 0;
+        if (!p1) { std::printf("  select path:"); for (int v : path) std::printf(" %d", v); std::printf(" want"); for (int v : want) std::printf(" %d", v); std::printf("\n"); }
+        same = same && p1;
+        cudaFree(dx); cudaFree(dv); cudaFree(ds); cudaFree(di); cudaFree(dgt); cudaFree(dp); cudaFree(dsu); cudaFree(dt); cudaFree(da);
+    }
+    report("dflash2 top-16 (ties, chunk borders) + selector walk", 0.0, 0.0, same);
+}
+
+// tensor-core experts (K::expert_mma) vs the CPU reference; every token of an 8-token block == the same token alone bitwise,
+// and the same token in each of the 8 MMA columns (slot invariance) == alone bitwise
+void test_experts_mma(int fmt) {
+    const int E = 16, topk = 8, D = 2304, I = 1152, N = 8;
+    const float gc = 4.0f, uc = 25.0f;
+    ExpertBank G, U, Dn;
+    if (fmt >= 3) { make_bank_tqt(G, E, I, D, fmt); make_bank_tqt(U, E, I, D, fmt); make_bank_tqt(Dn, E, D, I, fmt); }
+    else { make_bank(G, fmt, E, I, D); make_bank(U, fmt, E, I, D); make_bank(Dn, fmt, E, D, I); }
+    const char * nm = fmt == 2 ? "NVF4" : fmt == 1 ? "MXFP8" : fmt == 3 ? "TQT" : fmt == 4 ? "TQT2" : "TQT3";
+    const auto X = randv(size_t(N) * D, 1.0f);
+    std::vector<int> ids(size_t(N) * topk);
+    std::vector<float> wts(ids.size());
+    for (int t = 0; t < N; ++t) {
+        std::vector<int> p(E);
+        for (int e = 0; e < E; ++e) p[e] = e;
+        std::shuffle(p.begin(), p.end(), rng);
+        for (int k = 0; k < topk; ++k) { ids[t * topk + k] = p[k]; wts[t * topk + k] = 0.5f + float(rng() % 100) / 100.0f; }
+    }
+    bf16 * dx = up(to_bf(X)), * act = nullptr, * yd = nullptr, * out = nullptr;
+    int * dids = up(ids), * groups = nullptr;
+    float * dw = up(wts);
+    ck(cudaMalloc(&act, size_t(N) * topk * I * 2), "act"); ck(cudaMalloc(&yd, size_t(N) * topk * D * 2), "yd");
+    ck(cudaMalloc(&out, size_t(N) * D * 2), "out"); ck(cudaMalloc(&groups, size_t(1 + 8 * 8 * 9) * 4), "groups");
+    __half * xh = nullptr, * acth = nullptr;
+    ck(cudaMalloc(&xh, size_t(N) * D * 2), "xh"); ck(cudaMalloc(&acth, size_t(N) * topk * I * 2), "acth");
+    auto run = [&](const bf16 * x, const int * id, const float * w, int n) {
+        K::expert_mma(G.m, U.m, Dn.m, I, D, x, id, w, groups, act, yd, out, n, topk, gc, uc, 0, xh, acth);
+        ck(cudaDeviceSynchronize(), "expert_mma");
+        return std::make_pair(from_bf(down(act, size_t(n) * topk * I)), from_bf(down(out, size_t(n) * D)));
+    };
+    const auto [a8, o8] = run(dx, dids, dw, N);
+    double ea = 0, eo = 0;
+    for (int t = 0; t < N; ++t) {
+        std::vector<double> y(D, 0.0);
+        for (int k = 0; k < topk; ++k) {
+            const int a = t * topk + k, e = ids[a];
+            for (int i = 0; i < I; ++i) {
+                double g = 0, u = 0;
+                for (int c = 0; c < D; ++c) {
+                    g += double(G.w[(size_t(e) * I + i) * D + c]) * X[size_t(t) * D + c];
+                    u += double(U.w[(size_t(e) * I + i) * D + c]) * X[size_t(t) * D + c];
+                }
+                g = bf(float(g)); u = bf(float(u));
+                const double ref = gc * std::tanh(g / gc) / (1.0 + std::exp(-g)) * uc * std::tanh(u / uc);
+                ea = std::max(ea, std::fabs(a8[size_t(a) * I + i] - ref) / (std::fabs(ref) + 0.05));
+            }
+            for (int r = 0; r < D; ++r) {
+                double d = 0;
+                for (int i = 0; i < I; ++i) d += double(Dn.w[(size_t(e) * D + r) * I + i]) * a8[size_t(a) * I + i];
+                y[r] += bf(float(d)) * wts[a];
+            }
+        }
+        double ms = 0;  // error relative to |y|, floored at a tenth of the token's RMS (outputs near zero carry the absolute error)
+        for (int r = 0; r < D; ++r) ms += y[r] * y[r];
+        const double floor_ = 0.1 * std::sqrt(ms / D);
+        for (int r = 0; r < D; ++r) eo = std::max(eo, std::fabs(o8[size_t(t) * D + r] - y[r]) / (std::fabs(y[r]) + floor_));
+    }
+    bool bit = true;
+    for (int t = 0; t < N; ++t) {
+        const auto [a1, o1] = run(dx + size_t(t) * D, dids + t * topk, dw + t * topk, 1);
+        bit = bit && std::memcmp(a1.data(), a8.data() + size_t(t) * topk * I, a1.size() * 4) == 0;
+        bit = bit && std::memcmp(o1.data(), o8.data() + size_t(t) * D, o1.size() * 4) == 0;
+    }
+    char name[96];
+    std::snprintf(name, sizeof name, "mma experts %s gate/up, 8 tokens == 1", nm);
+    report(name, ea, fmt >= 3 ? 4e-2 : 2e-2, bit);  // TQT: FP16 activations after the rotation
+    // tensor-core F32 accumulation (truncating alignment); MXFP8's wider E4M3 values spread the error further
+    std::snprintf(name, sizeof name, "mma experts %s down + combine", nm);
+    report(name, eo, fmt >= 3 ? 6e-2 : 3e-2, bit);  // TQT: the activations enter as FP16 after the rotation
+    {   // token 0 in all 8 columns: every column == token 0 alone
+        const auto [a1, o1] = run(dx, dids, dw, 1);
+        std::vector<bf16> x8(size_t(N) * D);
+        const auto x0 = to_bf(std::vector<float>(X.begin(), X.begin() + D));
+        for (int t = 0; t < N; ++t) std::copy(x0.begin(), x0.end(), x8.begin() + size_t(t) * D);
+        std::vector<int> id8(size_t(N) * topk);
+        std::vector<float> w8(id8.size());
+        for (int t = 0; t < N; ++t) for (int k = 0; k < topk; ++k) { id8[t * topk + k] = ids[k]; w8[t * topk + k] = wts[k]; }
+        bf16 * dx8 = up(x8); int * di8 = up(id8); float * dw8 = up(w8);
+        const auto [as, os] = run(dx8, di8, dw8, N);
+        bool slot = true;
+        for (int t = 0; t < N; ++t) {
+            slot = slot && std::memcmp(a1.data(), as.data() + size_t(t) * topk * I, a1.size() * 4) == 0;
+            slot = slot && std::memcmp(o1.data(), os.data() + size_t(t) * D, o1.size() * 4) == 0;
+        }
+        std::snprintf(name, sizeof name, "mma experts %s: one token in each of 8 columns", nm);
+        report(name, 0.0, 0.0, slot);
+        cudaFree(dx8); cudaFree(di8); cudaFree(dw8);
+    }
+    cudaFree(dx); cudaFree(act); cudaFree(yd); cudaFree(out); cudaFree(dids); cudaFree(groups); cudaFree(dw); cudaFree(xh); cudaFree(acth);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
@@ -1086,11 +1346,27 @@ int main() {
     test_grouped_bf16_threshold();
     test_grouped_bf16(2);
     test_grouped_bf16(1);
+    test_tqt_dense(3);
+    test_tqt_dense(4);
+    test_tqt_dense(5);
     test_tqt_groups(3);
     test_tqt_groups(5);
     test_tqt_group_choice();
     test_conv();
     test_head_greedy();
+    test_dflash2();
+    test_experts(2, 8);  // last: its random draws would move every later test's data
+    test_experts(1, 8);
+    {   // per-device family choice: plain-only picks the faster 1-token step; with a drafter the better of plain and spec
+        const bool a = K::prefer_mma(70, 550, 68, 340, false), b = K::prefer_mma(60, 550, 75, 340, false), c = K::prefer_mma(60, 550, 75, 200, true),
+                   d = K::prefer_mma(60, 200, 75, 340, true);
+        report("kernel family choice (1-token / verify times)", 0.0, 0.0, a && !b && c && !d);
+    }
+    test_experts_mma(2);
+    test_experts_mma(1);
+    test_experts_mma(3);
+    test_experts_mma(4);
+    test_experts_mma(5);
     std::printf(ok ? "inkling2-kernels: PASS\n" : "inkling2-kernels: FAIL\n");
     return ok ? 0 : 1;
 }

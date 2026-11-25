@@ -11,6 +11,8 @@
 #include "inkling2_kernels.cuh"
 #include "inkling2_mtp.cuh"
 #include "safetensors.hpp"
+#include "inkling2_dflash2.cuh"
+#include "nlohmann/json.hpp"  // tqllm::Json
 #include "graph_capture.hpp"
 
 #include <cublas_v2.h>
@@ -24,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -65,7 +69,13 @@ struct Dev {
 };
 
 // a dense projection: BF16 [rows][cols], or (int8 dense mode) INT8 rows + per-row scales in q8 / sc (d then empty)
-struct Mat { Dev d, q8, sc; int rows = 0, cols = 0; const bf16 * w() const { return d.as<bf16>(); } };
+// dense matrix: BF16 rows, or INT8 rows + per-row scales (--exact off), or TQT / TQT2 / TQT3 planes from a dense-TQT
+// overlay (tq.fmt >= 3: few tokens run the one-expert TQT down kernel on the rotated input, prompt chunks decode to BF16)
+struct Mat {
+    Dev d, q8, sc, tqw, tqa; K::ExpertMat tq; int rows = 0, cols = 0;
+    const bf16 * w() const { return d.as<bf16>(); }
+    bool tqt() const { return tq.fmt >= 3; }
+};
 // page-locked host memory mapped into the device address space (experts that do not fit the device stream from it)
 struct Pinned {
     void * p = nullptr;
@@ -89,7 +99,7 @@ struct Experts {
     size_t bytes() const { return (m.stride + m.aux_stride) * size_t(E); }
     size_t bf16_bytes() const { return size_t(rows) * cols * 2 * size_t(E); }
 };
-struct Ctrl { Mat down; Dev FT, GT; };  // FT / GT: forget / gain weights transposed, BF16 [rank][D]
+struct Ctrl { Mat down, fg; Dev FT, GT; };  // fg: forget then gain rows, BF16 [2 D][rank] (few tokens); FT / GT: transposed [rank][D] (prompts)
 
 struct Layer {
     bool full = false, loop = false;
@@ -147,7 +157,7 @@ struct Inkling2Model::Impl {
     // workspace
     Dev ids, x0, hA, hB, P, B1[2], O17[2], a3, msgs, gt[3], r, m, oconv, mconv, tmp;
     Dev arn;  // attn_res_norm split-k scratch (n <= kSmallN), allocated and zeroed before any capture
-    Dev xq, xk, xv, q, rs, sink, gate, kraw, vraw, kt, vt, kdyn, vdyn, att, o, xb, eids, ewts, rlog, yg, yu, act, yd, moe, z, g64, fin, logits16,
+    Dev xq, xk, xv, q, rs, sink, gate, kraw, vraw, kt, vt, kdyn, vdyn, att, o, xb, eids, ewts, rlog, yg, yu, act, yd, moe, z, g64, msgfa, fin, logits16,
         logits, part, gorder, gcounts, goffsets, gtile, pq, pr, gdedup;
     // BF16 expert prompt path (big cards): gathered inputs, gate+up GEMM out, down GEMM out, host counts / offsets
     Dev xg, guo, ygo, ginv;
@@ -199,6 +209,30 @@ struct Inkling2Model::Impl {
         const auto b = f.read(t);
         return upload(b.data(), b.size());
     }
+    // dense TQT records (FP16 scale + code bytes per 128 columns) -> device planes [rows][cols * bits / 8] + scales [rows][cols / 128]
+    bool tqt_dense_used = false;
+    void tqt_dense(const std::string & n, const GgufTensor & t, Mat & m) {
+        const int fmt = t.type == GGML_TQT ? 3 : t.type == GGML_TQT2 ? 4 : 5;
+        const size_t R = size_t(m.rows), C = size_t(m.cols), nb = C / 128, cb = fmt == 3 ? 64 : fmt == 4 ? 32 : 48;
+        const auto b = f.read(t);
+        if (C % 128 || b.size() != R * nb * (cb + 2)) throw std::runtime_error("inkling2: " + n + " TQT bytes");
+        std::vector<uint8_t> codes(R * nb * cb), sc(R * nb * 2);
+        for (size_t r = 0; r < R; ++r)
+            for (size_t k = 0; k < nb; ++k) {
+                const uint8_t * rec = reinterpret_cast<const uint8_t *>(b.data()) + (r * nb + k) * (cb + 2);
+                std::memcpy(sc.data() + (r * nb + k) * 2, rec, 2);
+                std::memcpy(codes.data() + r * nb * cb + k * cb, rec + 2, cb);
+            }
+        m.tqw = upload(codes.data(), codes.size()); m.tqa = upload(sc.data(), sc.size());
+        m.tq.w = m.tqw.as<uint8_t>(); m.tq.aux = m.tqa.as<uint8_t>(); m.tq.fmt = fmt;
+        m.tq.stride = R * nb * cb; m.tq.aux_stride = R * nb * 2;
+        if (!tq_xh.p) {  // made at load: decode steps run inside graph capture, which cannot allocate
+            tq_xh = Dev(size_t(K::kSmallN) * 8192 * 2);
+            std::vector<int> z(K::kSmallN, 0); std::vector<float> one(K::kSmallN, 1.0f);
+            tq_ids = upload(z.data(), z.size() * 4); tq_wts = upload(one.data(), one.size() * 4);
+        }
+        tqt_dense_used = true;
+    }
     // int8 dense mode (opt-in, not exact against the reference): the projections, the LM head and the message-gate downs
     // as INT8 W8A16 rows with per-row max-abs scales; the router and the norms stay BF16 / F32
     bool int8_dense = false;
@@ -207,6 +241,11 @@ struct Inkling2Model::Impl {
     Mat mat(const std::string & n, bool small = false) {
         const auto & t = T(n);
         Mat m; m.cols = int(t.ne[0]); m.rows = int(t.ne[1]);
+        if (t.type == GGML_TQT || t.type == GGML_TQT2 || t.type == GGML_TQT3) {
+            if (small) throw std::runtime_error("inkling2: " + n + " is TQT but feeds a gate / exponential (kept BF16)");
+            tqt_dense(n, t, m);
+            return m;
+        }
         m.d = raw(n, GGML_BF16);
         if (int8_dense && !small && m.cols % 16 == 0) {
             m.q8 = Dev(size_t(m.rows) * m.cols); m.sc = Dev(size_t(m.rows) * 4);
@@ -340,7 +379,8 @@ struct Inkling2Model::Impl {
     }
     // device memory for the routed experts after everything else: all of them when they fit, else the same share of
     // every layer's experts (the embedding table moves to mapped host memory first: one row per token crosses the bus)
-    size_t expert_budget = SIZE_MAX;
+    size_t expert_budget = SIZE_MAX, drafter_keep = 0;
+    bool mma_experts = true, mma_dense = true;  // decode / verify kernel families, chosen per device at load (choose_kernels)
     size_t dev_mem = 0;
     int resident_share = 0;  // experts per 128 kept on the device (128: all)
     // TQT prompt path without whole-model BF16 copies: one layer's BF16 experts (gate+up, down) plus the grouped GEMM buffers
@@ -349,13 +389,84 @@ struct Inkling2Model::Impl {
         const size_t A = size_t(chunk) * topk;
         return A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
     }
+    // decode / verify kernel families: each family gives a token the same bits for any n (verify rows == single steps), so
+    // per device the faster one runs. Measured at load on layer 0's experts and a D x D projection, 1 token and 8 tokens.
+    void choose_kernels() {
+        const Layer & Y = Ls[0];
+        if (!K::expert_mma_ok(Y.eg.m, Y.ed.m, I, D)) { mma_experts = false; }
+        const int n8 = K::kSmallN, A = n8 * topk;
+        std::vector<int> bid(static_cast<size_t>(A));
+        uint32_t r = 7;
+        for (int t = 0; t < n8; ++t)
+            for (int k = 0; k < topk; ++k) {
+                int e;
+                do { r = r * 1664525u + 1013904223u; e = int((r >> 8) % uint32_t(Y.eg.E)); } while (std::find(bid.begin() + t * topk, bid.begin() + t * topk + k, e) != bid.begin() + t * topk + k);
+                bid[size_t(t) * topk + k] = e;
+            }
+        std::vector<float> w(static_cast<size_t>(A), 1.0f / topk);
+        Dev did = upload(bid.data(), bid.size() * 4), dw = upload(w.data(), w.size() * 4);
+        // its own scratch for 8 tokens (the model's buffers are sized for the prompt chunk, which may be 1 token)
+        Dev bx(size_t(n8) * D * 2), bact(size_t(A) * I * 2), byd(size_t(A) * D * 2), bmoe(size_t(n8) * D * 2), bxh(size_t(n8) * D * 2),
+            bah(size_t(A) * I * 2), bgr(size_t(1 + K::kSmallN * topk * (1 + K::kSmallN)) * 4), bout(size_t(n8) * D * 2);
+        ck(cudaMemsetAsync(bx.p, 0, size_t(n8) * D * 2, s), "bench x");
+        cudaEvent_t a, b;
+        ck(cudaEventCreate(&a), "ev"); ck(cudaEventCreate(&b), "ev");
+        auto time = [&](auto && f) {
+            for (int i = 0; i < 3; ++i) f();
+            ck(cudaEventRecord(a, s), "ev");
+            for (int i = 0; i < 20; ++i) f();
+            ck(cudaEventRecord(b, s), "ev"); ck(cudaEventSynchronize(b), "ev");
+            float ms = 0; ck(cudaEventElapsedTime(&ms, a, b), "ev");
+            return double(ms) * 1000.0 / 20;
+        };
+        const bool tqt = Y.eg.m.fmt >= 3;
+        auto warp = [&](int n) {
+            if (tqt) {
+                K::rotate_h(bx.as<bf16>(), bxh.as<__half>(), D, n, s);
+                K::expert_gate_up(Y.eg.m, Y.eu.m, I, D, bx.as<bf16>(), did.as<int>(), bact.as<bf16>(), n, topk, gcap, ucap, s, bxh.as<__half>());
+                K::rotate_h(bact.as<bf16>(), bah.as<__half>(), I, n * topk, s);
+                K::expert_down(Y.ed.m, D, I, bact.as<bf16>(), did.as<int>(), dw.as<float>(), bmoe.as<bf16>(), n, topk, s, bah.as<__half>());
+            } else if (n > 1) {
+                K::expert_dedup(Y.eg.m, Y.eu.m, Y.ed.m, I, D, bx.as<bf16>(), did.as<int>(), dw.as<float>(), bgr.as<int>(), bact.as<bf16>(), byd.as<bf16>(),
+                                bmoe.as<bf16>(), n, topk, gcap, ucap, s);
+            } else {
+                K::expert_gate_up(Y.eg.m, Y.eu.m, I, D, bx.as<bf16>(), did.as<int>(), bact.as<bf16>(), n, topk, gcap, ucap, s);
+                K::expert_down(Y.ed.m, D, I, bact.as<bf16>(), did.as<int>(), dw.as<float>(), bmoe.as<bf16>(), n, topk, s);
+            }
+        };
+        auto mma = [&](int n) {
+            K::expert_mma(Y.eg.m, Y.eu.m, Y.ed.m, I, D, bx.as<bf16>(), did.as<int>(), dw.as<float>(), bgr.as<int>(), bact.as<bf16>(), byd.as<bf16>(),
+                          bmoe.as<bf16>(), n, topk, gcap, ucap, s, bxh.as<__half>(), bah.as<__half>());
+        };
+        const bool drafter = drafter_keep > 0;
+        if (mma_experts) {
+            const double w1 = time([&] { warp(1); }), w8 = time([&] { warp(n8); }), m1 = time([&] { mma(1); }), m8 = time([&] { mma(n8); });
+            mma_experts = K::prefer_mma(w1, w8, m1, m8, drafter);
+            std::fprintf(stderr, "inkling2: experts per visit: warp kernels %.1f / %.1f us, tensor cores %.1f / %.1f us (1 / %d tokens) -> %s\n", w1, w8, m1, m8,
+                         n8, mma_experts ? "tensor cores" : "warp kernels");
+        }
+        {   // a D x D BF16 projection (the dense projections' shape class)
+            const Mat * W = nullptr;
+            if (Y.wo.d.p && Y.wo.cols % 64 == 0) W = &Y.wo;
+            if (W) {
+                auto gemv = [&](int n, bool on) { K::set_gemv_mma(on); K::GemvSeg sg = seg(*W, bx.as<bf16>(), bout.p); K::gemv(&sg, 1, n, s); };
+                const double w1 = time([&] { gemv(1, false); }), w8 = time([&] { gemv(n8, false); }), m1 = time([&] { gemv(1, true); }), m8 = time([&] { gemv(n8, true); });
+                mma_dense = K::prefer_mma(w1, w8, m1, m8, drafter);
+                std::fprintf(stderr, "inkling2: dense %dx%d: gemv %.1f / %.1f us, tensor cores %.1f / %.1f us -> %s\n", W->rows, W->cols, w1, w8, m1, m8,
+                             mma_dense ? "tensor cores" : "gemv");
+            }
+            K::set_gemv_mma(mma_dense);
+        }
+        cudaEventDestroy(a); cudaEventDestroy(b);
+        ck(cudaStreamSynchronize(s), "choose kernels");
+    }
     void place_experts() {
         size_t total = 0;
         for (const auto & Y : Ls) total += Y.eg.bytes() + Y.eu.bytes() + Y.ed.bytes();
         auto budget = [&] {
             size_t fr = 0, tot = 0;
             ck(cudaMemGetInfo(&fr, &tot), "mem info");
-            size_t keep = size_t(1536) << 20;  // cuBLAS workspace, graphs, logits growth
+            size_t keep = (size_t(1536) << 20) + drafter_keep;  // cuBLAS workspace, graphs, logits growth; the drafter enabled after the plan
             if (tqt_experts && dev_mem < (size_t(96) << 30)) {  // the per-visit BF16 decode of a TQT layer, one group at a time
                 tqt_group = K::choose_tqt_group(E, fr, total, keep + tqt_fixed_bytes(), tqt_per_expert_bytes());
                 keep += tqt_fixed_bytes() + size_t(tqt_group) * tqt_per_expert_bytes();
@@ -547,6 +658,14 @@ struct Inkling2Model::Impl {
                 for (int c = 0; c < 4; ++c) {
                     const std::string g = std::string("loop_ctrl_") + "qkvf"[c] + (c == 3 ? "fn_" : "_");
                     Y.ctrl[c].down = mat(d + g + "down.weight", true);
+                    const auto & ft = T(d + g + "forget.weight");
+                    if (int(ft.ne[0]) != rank || int(ft.ne[1]) != D) throw std::runtime_error("inkling2: loop control forget shape");
+                    const Dev F = bf16_of(d + g + "forget.weight"), Gm = bf16_of(d + g + "gain.weight");  // [D][rank] each
+                    Mat & fg = Y.ctrl[c].fg;
+                    fg.rows = 2 * D; fg.cols = rank;
+                    fg.d = Dev(size_t(fg.rows) * fg.cols * 2);
+                    ck(cudaMemcpy(fg.d.p, F.p, size_t(D) * rank * 2, cudaMemcpyDeviceToDevice), "fg");
+                    ck(cudaMemcpy(fg.d.as<char>() + size_t(D) * rank * 2, Gm.p, size_t(D) * rank * 2, cudaMemcpyDeviceToDevice), "fg");
                     Y.ctrl[c].FT = bf16_of(d + g + "forget.weight", true);
                     Y.ctrl[c].GT = bf16_of(d + g + "gain.weight", true);
                 }
@@ -593,6 +712,7 @@ struct Inkling2Model::Impl {
         gorder = Dev(size_t(n) * topk * 4); gcounts = Dev(size_t(E) * 4); goffsets = Dev(size_t(E) * 4); gtile = Dev(size_t(E + 1) * 4);
         yd = Dev(size_t(n) * topk * D * 2);
         z = Dev(size_t(n) * 2 * D * 2 * 3); g64 = Dev(size_t(n) * rank * 2 * 3);  // up to three gates at once
+        msgfa = Dev(size_t(n) * 2 * D * 4 * 3);
         grow_logits(std::max(1, std::min(n, K::kSmallN)));
         int pf = tqllm_cuda::inkling2_attention_decode_floats(H, K::kSmallN, kSplitsFull);
         pq = Dev(size_t(n) * H * HD * 2); pr = Dev(size_t(n) * H * DR * 4);  // prompt attention scratch
@@ -620,15 +740,45 @@ struct Inkling2Model::Impl {
         cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, cols, &one, W, CUDA_R_16BF, cols, X, CUDA_R_16BF, cols,
                         &zero, Y, f32 ? CUDA_R_32F : CUDA_R_16BF, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "gemm");
     }
+    // rows r0 .. r0 + nr - 1 of W (BF16 or INT8 rows)
+    static K::GemvSeg seg_rows(const Mat & W, int r0, int nr, const bf16 * x, void * y) {
+        if (W.tqt()) throw std::runtime_error("inkling2: row slice of a TQT matrix");
+        if (W.q8.p) return K::GemvSeg{reinterpret_cast<const bf16 *>(W.q8.as<int8_t>() + size_t(r0) * W.cols), x, y, nr, W.cols, W.cols, nr, 0, W.sc.as<float>() + r0};
+        return K::GemvSeg{W.w() + size_t(r0) * W.cols, x, y, nr, W.cols, W.cols, nr, 0};
+    }
     static K::GemvSeg seg(const Mat & W, const bf16 * x, void * y, bool f32 = false) {
+        if (W.tqt()) return K::GemvSeg{nullptr, x, y, W.rows, W.cols, W.cols, W.rows, f32 ? 1 : 0, nullptr, &W};
         if (W.q8.p) return K::GemvSeg{reinterpret_cast<const bf16 *>(W.q8.p), x, y, W.rows, W.cols, W.cols, W.rows, f32 ? 1 : 0, W.sc.as<float>()};
         return K::GemvSeg{W.w(), x, y, W.rows, W.cols, W.cols, W.rows, f32 ? 1 : 0};
     }
     // projections that share nothing but the launch: few tokens -> one gemv launch, else one cuBLAS GEMM each (INT8 rows
     // dequantised to a BF16 scratch first: the same weights as the gemv)
     Dev dq_scratch;
-    void project(const K::GemvSeg * sg, int ns, int n) {
-        if (n <= K::kSmallN) { K::gemv(sg, ns, n, s); return; }
+    // dense TQT segments: few tokens -> rotate the input per 128 (FP16), the one-expert TQT down kernel (id 0, weight 1);
+    // prompt chunks -> decode the matrix to the BF16 scratch, then the GEMM
+    Dev tq_xh, tq_ids, tq_wts;
+    void project_tqt(const K::GemvSeg & g, int n) {
+        const Mat & W = *static_cast<const Mat *>(g.tq);
+        if (g.f32 || g.ldx != W.cols || g.ldy != W.rows) throw std::runtime_error("inkling2: dense TQT segment layout");
+        if (n <= K::kSmallN) {
+            if (W.cols > 8192) throw std::runtime_error("inkling2: dense TQT cols > 8192");
+            K::rotate_h(g.x, tq_xh.as<__half>(), W.cols, n, s);
+            K::expert_down(W.tq, W.rows, W.cols, g.x, tq_ids.as<int>(), tq_wts.as<float>(), static_cast<bf16 *>(g.y), n, 1, s, tq_xh.as<__half>());
+            return;
+        }
+        const size_t need = size_t(W.rows) * W.cols * 2;
+        if (!dq_scratch.p || dq_bytes < need) { ck(cudaStreamSynchronize(s), "scratch"); dq_scratch = Dev(need); dq_bytes = need; }
+        K::experts_decode_bf16(W.tq, 1, W.rows, W.cols, W.rows, dq_scratch.as<bf16>(), s);
+        gemm(dq_scratch.as<bf16>(), W.rows, W.cols, g.x, g.y, n, false);
+    }
+    void project(const K::GemvSeg * sg, int ns, int n, bool head = false) {  // head: the LM head (K::gemv_rows for few tokens)
+        K::GemvSeg plain[K::kMaxSegs]; int np = 0;
+        for (int i = 0; i < ns; ++i) {
+            if (sg[i].tq) project_tqt(sg[i], n);
+            else plain[np++] = sg[i];
+        }
+        if (np < ns) { sg = plain; ns = np; if (!ns) return; }
+        if (n <= K::kSmallN) { if (head) K::gemv_rows(sg, ns, n, s); else K::gemv(sg, ns, n, s); return; }
         for (int i = 0; i < ns; ++i) {
             const bf16 * W = sg[i].W;
             if (sg[i].scale) {
@@ -650,8 +800,18 @@ struct Inkling2Model::Impl {
             sg[i] = seg(Y.ctrl[c0 + i].down, zi, g64.as<bf16>() + size_t(i) * n * rank);
         }
         project(sg, count, n);
+        if (n > K::kSmallN) {  // prompt chunks: the tile kernel (weights read once per 8 tokens)
+            for (int i = 0; i < count; ++i)
+                K::msg_gate_out(g64.as<bf16>() + size_t(i) * n * rank, Y.ctrl[c0 + i].FT.as<bf16>(), Y.ctrl[c0 + i].GT.as<bf16>(), h[i], msg[i], y[i], n, D,
+                                rank, s);
+            return;
+        }
+        // few tokens: f / a = F g, G g as one tensor-core projection per gate ([2 D] rows, F32), then y = (1 - tanh f) h + tanh(a) m
         for (int i = 0; i < count; ++i)
-            K::msg_gate_out(g64.as<bf16>() + size_t(i) * n * rank, Y.ctrl[c0 + i].FT.as<bf16>(), Y.ctrl[c0 + i].GT.as<bf16>(), h[i], msg[i], y[i], n, D, rank, s);
+            sg[i] = K::GemvSeg{Y.ctrl[c0 + i].fg.w(), g64.as<bf16>() + size_t(i) * n * rank, msgfa.as<float>() + size_t(i) * n * 2 * D, 2 * D, rank, rank,
+                               2 * D, 1};
+        project(sg, count, n);
+        for (int i = 0; i < count; ++i) K::msg_gate_combine(msgfa.as<float>() + size_t(i) * n * 2 * D, h[i], msg[i], y[i], n, D, s);
     }
     int slot_of(int l, int pass) const { return pass == 0 || l < core0 || l >= core1 ? l : L + (pass - 1) * (core1 - core0) + (l - core0); }
     // decode attention: splits of a query's span (full / windowed layers)
@@ -783,7 +943,14 @@ struct Inkling2Model::Impl {
             ck(cudaMemcpyAsync(route_log->back().data(), eids.p, size_t(n) * topk * 4, cudaMemcpyDeviceToHost, s), "route log");
             ck(cudaStreamSynchronize(s), "route log");
         }
-        if (small && Y.eg.m.fmt >= 3) {  // TQT: the weights live in TQ4's rotated basis, so the activations rotate per 128 (FP16)
+        if (small && mma_experts && K::expert_mma_ok(Y.eg.m, Y.ed.m, I, D)) {  // decode and verify: tensor cores, a token's bits independent of n
+            K::expert_mma(Y.eg.m, Y.eu.m, Y.ed.m, I, D, xb.as<bf16>(), eids.as<int>(), ewts.as<float>(), gdedup.as<int>(), act.as<bf16>(), yd.as<bf16>(),
+                          moe.as<bf16>(), n, topk, gcap, ucap, s, xh16.as<__half>(), acth16.as<__half>());
+        } else if (small && Y.eg.m.fmt >= 3 && n > 1 && Y.eg.m.fmt == Y.eu.m.fmt) {  // TQT verify blocks: each routed expert's rows read once per block
+            K::rotate_h(xb.as<bf16>(), xh16.as<__half>(), D, n, s);
+            K::expert_dedup_tqt(Y.eg.m, Y.eu.m, Y.ed.m, I, D, xh16.as<__half>(), eids.as<int>(), ewts.as<float>(), gdedup.as<int>(), act.as<bf16>(),
+                                acth16.as<__half>(), yd.as<bf16>(), moe.as<bf16>(), n, topk, gcap, ucap, s);
+        } else if (small && Y.eg.m.fmt >= 3) {  // TQT: the weights live in TQ4's rotated basis, so the activations rotate per 128 (FP16)
             K::rotate_h(xb.as<bf16>(), xh16.as<__half>(), D, n, s);
             K::expert_gate_up(Y.eg.m, Y.eu.m, I, D, xb.as<bf16>(), eids.as<int>(), act.as<bf16>(), n, topk, gcap, ucap, s, xh16.as<__half>());
             K::rotate_h(act.as<bf16>(), acth16.as<__half>(), I, n * topk, s);
@@ -856,6 +1023,7 @@ struct Inkling2Model::Impl {
     Mat m_rnn;
     Dev d_h, d_xb, d_qkv, d_att, d_ao, d_g, d_u, d_act, d_mo, d_hid, d_base, d_z, d_proj, d_state, d_lat, d_part, d_step, d_tok, d_frnn, d_cx, d_ckv, d_x0;
     void enable_mtp(const std::string & dir) {
+        if (is_dflash2_folder(dir)) { enable_dflash2(dir); return; }
         const auto idx = safetensors_index_file(std::filesystem::path(dir) / "mtp.safetensors");
         auto get = [&](const std::string & n) {
             const auto it = idx.find(n);
@@ -943,6 +1111,11 @@ struct Inkling2Model::Impl {
         d_frnn = Dev(size_t(D) * 2); d_x0 = Dev(size_t(D) * 4);
         d_part = Dev(size_t(K::mtp_attention_floats(H, nb, kMtpSplits)) * 4);
         d_cx = Dev(size_t(std::max(chunk, nb)) * D * 2); d_ckv = Dev(size_t(std::max(chunk, nb)) * ml[0].kvc.rows * 2);
+        mtp_common();
+    }
+    // both drafters: verify-block histories, the decode graphs recaptured with the taps
+    void mtp_common() {
+        if (len) throw std::runtime_error("inkling2 mtp: enable before the first forward");
         for (auto & S : slots) {
             const int C[4] = {G * HD, G * HD, D, D};
             for (int c = 0; c < 4; ++c) { S.hist[c] = Dev(size_t(K::kSmallN) * C[c] * 2); S.snap[c] = Dev(size_t(C[c]) * 12); }
@@ -950,7 +1123,6 @@ struct Inkling2Model::Impl {
         for (auto & g : graphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }  // the steps now capture the taps
         for (auto & g : vgraphs) if (g) { cudaGraphExecDestroy(g); g = nullptr; }
         mtp_on = true;
-        if (len) throw std::runtime_error("inkling2 mtp: enable before the first forward");
         prepare_greedy_graphs();
     }
     // capture (not run) the greedy decode graph and the greedy verify graphs of every block size now: their first use
@@ -970,8 +1142,257 @@ struct Inkling2Model::Impl {
         verifying = false; greedy_step = false;
     }
     static constexpr int kMtpSplits = 16;
+
+    // ---- DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2, -md FOLDER): five block-diffusion layers over [anchor, mask x 7]
+    // whose keys come from the committed tokens' taps (fc + hidden_norm), two-tap dynamic convolutions around attention and
+    // MLP, the target's LM head (its INT8 copy when there is one) for the top-16 candidates of each block row and a
+    // rank-256 selector walking one path through them (sglang srt/models/dflash.py; the Metal port Inkling2MlxDFlash2).
+    // It only proposes tokens; every one is verified.
+    struct DfLayer { Dev in_norm, post_norm, q_norm, k_norm, attn_base, mlp_base, kc, vc; Mat qkv, o, attn_kernel, mlp_kernel, gate_up, down; int ring = 0; };
+    bool dflash = false;
+    std::vector<DfLayer> dfl;
+    Mat df_fc, df_sel;
+    Dev df_fc_norm, df_norm, df_pred, df_succ, df_mask;
+    int df_pos = -1;  // draft_trace(): the block position instead of length()
+    int df_H = 0, df_G = 0, df_I = 0, df_group = 0, df_window = 0, df_vocab = 0;
+    float df_theta = 1e4f, df_eps = 1e-6f;
+    Dev df_x, df_nf, df_n16, df_kern, df_cin, df_cin16, df_qkv, df_att, df_o16, df_of, df_gu, df_act, df_hid, df_logits, df_ids, df_vals, df_gate,
+        df_tok, df_top, df_part, df_ctxf, df_ctx16, df_kv;
+    static tqllm::Json read_json(const std::filesystem::path & f) {
+        std::ifstream in(f, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        return tqllm::Parser(text).parse();
+    }
+    static bool is_dflash2_folder(const std::string & dir) {
+        const auto cfg = std::filesystem::path(dir) / "config.json";
+        if (!std::filesystem::exists(cfg) || !std::filesystem::exists(std::filesystem::path(dir) / "model.safetensors")) return false;
+        try {
+            const auto j = read_json(cfg);
+            const auto * a = j.get("architectures");
+            return a && !a->arr.empty() && a->arr[0].str == "DFlash2DraftModel";
+        } catch (const std::exception &) { return false; }
+    }
+    void enable_dflash2(const std::string & dir) {
+        const auto cfg = read_json(std::filesystem::path(dir) / "config.json");
+        auto num = [&](const tqllm::Json & j, const char * k) {
+            const auto * v = j.get(k);
+            if (!v) throw std::runtime_error(std::string("inkling2 DFlash2 config: missing ") + k);
+            return v->num;
+        };
+        const auto * dcp = cfg.get("dflash_config");
+        if (!dcp) throw std::runtime_error("inkling2 DFlash2: no dflash_config in " + dir);
+        const auto & dc = *dcp;
+        const int Dd = int(num(cfg, "hidden_size")), Ld = int(num(cfg, "num_hidden_layers")), HDd = int(num(cfg, "head_dim"));
+        df_H = int(num(cfg, "num_attention_heads")); df_G = int(num(cfg, "num_key_value_heads")); df_I = int(num(cfg, "intermediate_size"));
+        if (cfg.get("rms_norm_eps")) df_eps = float(num(cfg, "rms_norm_eps"));
+        df_window = int(num(cfg, "sliding_window"));
+        if (const auto * rp = cfg.get("rope_parameters")) if (const auto * th = rp->get("rope_theta")) df_theta = float(th->num);
+        df_group = int(num(dc, "conv_group_size"));
+        std::vector<int> taps_ids;
+        if (const auto * t = dc.get("target_layer_ids")) for (const auto & v : t->arr) taps_ids.push_back(int(v.num));
+        const auto * mode = dc.get("selector_softcap_mode");
+        if (Dd != D || HDd != 128 || df_G != G || df_H % df_G || taps_ids != std::vector<int>{5, 23, 41, 48} || int(num(dc, "block_size")) != mtp_block ||
+            int(num(dc, "conv_kernel_size")) != 2 || int(num(dc, "selector_top_k")) != 16 || int(num(dc, "selector_rank")) != 256 || D % df_group ||
+            !mode || mode->str != "after_correction" || df_window <= 0)
+            throw std::runtime_error("inkling2: unsupported DFlash2 drafter configuration in " + dir);
+        const auto idx = safetensors_index_file(std::filesystem::path(dir) / "model.safetensors");
+        auto get = [&](const std::string & n) {
+            const auto it = idx.find(n);
+            if (it == idx.end() || it->second.dtype != "BF16") throw std::runtime_error("inkling2 DFlash2: missing BF16 " + n);
+            const auto b = safetensors_read(it->second);
+            std::vector<uint16_t> v(b.size() / 2);
+            std::memcpy(v.data(), b.data(), b.size());
+            return std::make_pair(v, it->second.shape);
+        };
+        auto f32v = [&](const std::string & n) {
+            const auto v = get(n).first;
+            std::vector<float> f(v.size());
+            for (size_t i = 0; i < v.size(); ++i) f[i] = bf16_f(v[i]);
+            return upload(f.data(), f.size() * 4);
+        };
+        auto bf = [&](const std::string & n) { const auto v = get(n).first; return upload(v.data(), v.size() * 2); };
+        auto cat = [&](std::initializer_list<std::string> names) {
+            std::vector<uint16_t> all; int rows = 0, cols = 0;
+            for (const auto & n : names) {
+                const auto [v, sh] = get(n);
+                rows += int(sh[0]); cols = int(sh[1]);
+                all.insert(all.end(), v.begin(), v.end());
+            }
+            Mat m; m.rows = rows; m.cols = cols; m.d = upload(all.data(), all.size() * 2);
+            if (cols % 16 == 0) {  // drafter weights as INT8 rows: half the bytes per draft; drafts are verified, so output is unchanged
+                m.q8 = Dev(size_t(rows) * cols); m.sc = Dev(size_t(rows) * 4);
+                K::quantize_rows_i8(m.w(), m.q8.as<int8_t>(), m.sc.as<float>(), rows, cols, s);
+                ck(cudaStreamSynchronize(s), "quantize");
+                m.d = Dev();
+            }
+            return m;
+        };
+        const int ring = window_ring(df_window);
+        dfl.resize(size_t(Ld));
+        for (int l = 0; l < Ld; ++l) {
+            DfLayer & Y = dfl[size_t(l)];
+            const std::string p = "layers." + std::to_string(l) + ".";
+            Y.in_norm = f32v(p + "input_layernorm.weight"); Y.post_norm = f32v(p + "post_attention_layernorm.weight");
+            Y.q_norm = f32v(p + "self_attn.q_norm.weight"); Y.k_norm = f32v(p + "self_attn.k_norm.weight");
+            Y.attn_base = f32v(p + "attention_conv.base_kernel"); Y.mlp_base = f32v(p + "mlp_conv.base_kernel");
+            Y.qkv = cat({p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"});
+            Y.o = cat({p + "self_attn.o_proj.weight"});
+            Y.attn_kernel = cat({p + "attention_conv.kernel_projection.weight"}); Y.mlp_kernel = cat({p + "mlp_conv.kernel_projection.weight"});
+            Y.gate_up = cat({p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"}); Y.down = cat({p + "mlp.down_proj.weight"});
+            Y.ring = ring;
+            const size_t rows = ring ? size_t(ring) : size_t(context);
+            Y.kc = Dev(rows * G * HD * 2); Y.vc = Dev(rows * G * HD * 2);
+            if (Y.qkv.rows != (df_H + 2 * G) * HD || Y.attn_kernel.rows != 4 * D / df_group || Y.gate_up.rows != 2 * df_I)
+                throw std::runtime_error("inkling2 DFlash2: layer shapes");
+        }
+        df_fc = cat({"fc.weight"});
+        if (df_fc.rows != D || df_fc.cols != 4 * D) throw std::runtime_error("inkling2 DFlash2: fc shape");
+        df_fc_norm = f32v("hidden_norm.weight"); df_norm = f32v("norm.weight");
+        df_sel = cat({"candidate_selector.hidden_projection.weight"});
+        {
+            const auto [pv, psh] = get("candidate_selector.predecessor_codebook");
+            if (psh.size() != 2 || psh[1] != 256) throw std::runtime_error("inkling2 DFlash2: selector codebook shape");
+            if (int(psh[0]) < V) throw std::runtime_error("inkling2 DFlash2: selector codebook smaller than the vocabulary");
+            df_vocab = V;  // candidates among the real tokens (the codebooks are padded like the embedding)
+            df_pred = upload(pv.data(), pv.size() * 2);
+            df_succ = bf("candidate_selector.successor_codebook");
+        }
+        if (df_sel.rows != 256) throw std::runtime_error("inkling2 DFlash2: selector shape");
+        {   // the mask row: the target's normalised input row of the mask token (embedding + embed_norm)
+            const int mask = int(num(dc, "mask_token_id"));
+            Dev mt = upload(&mask, 4), mf(size_t(D) * 4);
+            K::embed(embed_ptr, mt.as<int>(), embed_norm.as<float>(), mf.as<float>(), 1, D, eps, s);
+            df_mask = Dev(size_t(D) * 2);
+            K::to_bf16(mf.as<float>(), df_mask.as<bf16>(), size_t(D), s);
+            ck(cudaStreamSynchronize(s), "mask row");
+        }
+        const int nb = mtp_block, qn = df_H * HD;
+        df_x = Dev(size_t(nb) * D * 4); df_nf = Dev(size_t(nb) * D * 4); df_n16 = Dev(size_t(nb) * D * 2);
+        df_kern = Dev(size_t(nb) * 4 * D / df_group * 2); df_cin = Dev(size_t(nb) * D * 4); df_cin16 = Dev(size_t(nb) * D * 2);
+        df_qkv = Dev(size_t(nb) * dfl[0].qkv.rows * 2); df_att = Dev(size_t(nb) * qn * 2); df_o16 = Dev(size_t(nb) * D * 2); df_of = Dev(size_t(nb) * D * 4);
+        df_gu = Dev(size_t(nb) * 2 * df_I * 2); df_act = Dev(size_t(nb) * df_I * 2); df_hid = Dev(size_t(nb) * D * 2);
+        df_logits = Dev(size_t(nb) * V * 4); df_ids = Dev(size_t(nb) * 16 * 4); df_vals = Dev(size_t(nb) * 16 * 4); df_gate = Dev(size_t(nb) * 256 * 4);
+        df_tok = Dev(size_t(nb) * 4); df_top = Dev(size_t(K::dflash_top16_floats(nb, df_vocab)) * 4);
+        df_part = Dev(size_t(K::mtp_attention_floats(df_H, nb, kMtpSplits)) * 4);
+        const int cm = std::max(chunk, nb);
+        df_ctxf = Dev(size_t(cm) * D * 4); df_ctx16 = Dev(size_t(cm) * D * 2); df_kv = Dev(size_t(cm) * 2 * G * HD * 2);
+        taps = Dev(size_t(cm) * 4 * D * 2);
+        d_tok = Dev(size_t(nb) * 4); d_x0 = Dev(size_t(D) * 4);
+        dflash = true;
+        {   // warm-up: one context row and one block on zero taps, so every drafter kernel is loaded now (a lazily loaded module
+            // needs device memory, which the expert plan may have taken by the first real draft); the rows are overwritten
+            // by the first committed tokens
+            ck(cudaMemsetAsync(taps.p, 0, size_t(4) * D * 2, s), "warm-up taps");
+            dflash_context(0, 1);
+            df_pos = 1;
+            std::vector<int> tok;
+            dflash_draft(0, tok, mtp_block - 1);
+            df_pos = -1;
+            for (auto & Y : dfl) {
+                ck(cudaMemsetAsync(Y.kc.p, 0, size_t(Y.ring ? Y.ring : context) * G * HD * 2, s), "warm-up kv");
+                ck(cudaMemsetAsync(Y.vc.p, 0, size_t(Y.ring ? Y.ring : context) * G * HD * 2, s), "warm-up kv");
+            }
+            ck(cudaStreamSynchronize(s), "DFlash2 warm-up");
+        }
+        std::fprintf(stderr, "inkling2: DFlash2 drafter %s: %d layers, %d heads, window %d, selector over %d tokens\n", dir.c_str(), Ld, df_H, df_window, df_vocab);
+        mtp_common();
+    }
+    // the reference check (tools/inkling2/dflash2_reference.py): context taps = the normalised input rows of `tokens`
+    // (the same row at all four taps) at 0 .., one block after `anchor`; the final normed rows, top-16 ids, the path
+    void dflash_trace(const std::vector<int> & tokens, int anchor, std::vector<float> & hidden, std::vector<int> & ids, std::vector<int> & path) {
+        if (!dflash) throw std::runtime_error("inkling2: draft_trace needs a DFlash2 drafter");
+        const int m = int(tokens.size()), nb = mtp_block;
+        if (m < 1 || m > std::max(chunk, nb)) throw std::runtime_error("inkling2: draft_trace context");
+        Dev t = upload(tokens.data(), size_t(m) * 4), rf(size_t(m) * D * 4), rb(size_t(m) * D * 2);
+        K::embed(embed_ptr, t.as<int>(), embed_norm.as<float>(), rf.as<float>(), m, D, eps, s);
+        K::to_bf16(rf.as<float>(), rb.as<bf16>(), size_t(m) * D, s);
+        for (int r = 0; r < m; ++r)
+            for (int k = 0; k < 4; ++k)
+                ck(cudaMemcpyAsync(taps.as<bf16>() + (size_t(r) * 4 + k) * D, rb.as<bf16>() + size_t(r) * D, size_t(D) * 2, cudaMemcpyDeviceToDevice, s), "taps");
+        dflash_context(0, m);
+        df_pos = m;
+        dflash_draft(anchor, path, nb - 1);
+        df_pos = -1;
+        std::vector<uint16_t> h(size_t(nb) * D);
+        ids.resize(size_t(nb) * 16);
+        ck(cudaMemcpy(h.data(), df_hid.p, h.size() * 2, cudaMemcpyDeviceToHost), "trace");
+        ck(cudaMemcpy(ids.data(), df_ids.p, ids.size() * 4, cudaMemcpyDeviceToHost), "trace");
+        hidden.resize(h.size());
+        for (size_t i = 0; i < h.size(); ++i) hidden[i] = bf16_f(h[i]);
+    }
+    int window_ring(int w) const { const int r = w + std::max(chunk, K::kSmallN); return r < context ? r : 0; }
+    // draft context of the m committed tokens at pos0 .. (their taps): fc(taps) -> hidden_norm -> every layer's K / V
+    void dflash_context(int pos0, int m) {
+        const int kn = G * HD, qn = df_H * HD;
+        K::GemvSeg sg = seg(df_fc, taps.as<bf16>(), df_ctx16.p);
+        project(&sg, 1, m);
+        K::to_f32(df_ctx16.as<bf16>(), df_ctxf.as<float>(), size_t(m) * D, s);
+        K::rms_norm(df_ctxf.as<float>(), df_fc_norm.as<float>(), nullptr, df_ctx16.as<bf16>(), m, D, df_eps, s);
+        for (auto & Y : dfl) {
+            K::GemvSeg kv = seg_rows(Y.qkv, qn, 2 * kn, df_ctx16.as<bf16>(), df_kv.p);
+            project(&kv, 1, m);
+            K::mtp_head_norm_rope(df_kv.as<bf16>(), 2 * kn, m, G, Y.k_norm.as<float>(), pos0, df_theta, df_eps, s);
+            K::mtp_store_kv(df_kv.as<bf16>(), df_kv.as<bf16>() + kn, 2 * kn, Y.kc.as<bf16>(), Y.vc.as<bf16>(), m, G, pos0, Y.ring, s);
+        }
+    }
+    void dflash_draft(int anchor, std::vector<int> & out_tokens, int steps) {
+        const int nb = mtp_block, P = df_pos >= 0 ? df_pos : len, qn = df_H * HD, kn = G * HD;
+        ck(cudaMemcpyAsync(d_tok.p, &anchor, 4, cudaMemcpyHostToDevice, s), "anchor");
+        K::embed(embed_ptr, d_tok.as<int>(), embed_norm.as<float>(), d_x0.as<float>(), 1, D, eps, s);
+        K::to_bf16(d_x0.as<float>(), df_n16.as<bf16>(), size_t(D), s);
+        K::to_f32(df_n16.as<bf16>(), d_x0.as<float>(), size_t(D), s);
+        K::mtp_block_init(d_x0.as<float>(), df_mask.as<bf16>(), df_x.as<float>(), nb, D, s);
+        auto gemv = [&](const Mat & W, const bf16 * x, void * y, bool f32) { K::GemvSeg sg = seg(W, x, y, f32); K::gemv(&sg, 1, nb, s); };
+        for (auto & Y : dfl) {
+            // attention: conv(side 0) of the normed rows in, conv(side 1) of its output + the residual out
+            K::rms_norm(df_x.as<float>(), Y.in_norm.as<float>(), nullptr, df_n16.as<bf16>(), nb, D, df_eps, s);
+            K::to_f32(df_n16.as<bf16>(), df_nf.as<float>(), size_t(nb) * D, s);
+            gemv(Y.attn_kernel, df_n16.as<bf16>(), df_kern.p, false);
+            K::dflash_conv(df_nf.as<float>(), df_kern.as<bf16>(), Y.attn_base.as<float>(), nb, D, df_group, 0, nullptr, df_cin.as<float>(), s);
+            K::to_bf16(df_cin.as<float>(), df_cin16.as<bf16>(), size_t(nb) * D, s);
+            gemv(Y.qkv, df_cin16.as<bf16>(), df_qkv.p, false);
+            const int ld = Y.qkv.rows;
+            bf16 * q = df_qkv.as<bf16>(), * k = q + qn, * v = k + kn;
+            K::mtp_head_norm_rope(q, ld, nb, df_H, Y.q_norm.as<float>(), P, df_theta, df_eps, s);
+            K::mtp_head_norm_rope(k, ld, nb, G, Y.k_norm.as<float>(), P, df_theta, df_eps, s);
+            K::mtp_attention(q, k, v, ld, ld, Y.kc.as<bf16>(), Y.vc.as<bf16>(), Y.ring, P, nb, df_H, G, df_window, kMtpSplits, df_part.as<float>(),
+                             df_att.as<bf16>(), s);
+            gemv(Y.o, df_att.as<bf16>(), df_o16.p, false);
+            K::to_f32(df_o16.as<bf16>(), df_of.as<float>(), size_t(nb) * D, s);
+            K::dflash_conv(df_of.as<float>(), df_kern.as<bf16>(), Y.attn_base.as<float>(), nb, D, df_group, 1, df_x.as<float>(), df_x.as<float>(), s);
+            // MLP, the same wrapping
+            K::rms_norm(df_x.as<float>(), Y.post_norm.as<float>(), nullptr, df_n16.as<bf16>(), nb, D, df_eps, s);
+            K::to_f32(df_n16.as<bf16>(), df_nf.as<float>(), size_t(nb) * D, s);
+            gemv(Y.mlp_kernel, df_n16.as<bf16>(), df_kern.p, false);
+            K::dflash_conv(df_nf.as<float>(), df_kern.as<bf16>(), Y.mlp_base.as<float>(), nb, D, df_group, 0, nullptr, df_cin.as<float>(), s);
+            K::to_bf16(df_cin.as<float>(), df_cin16.as<bf16>(), size_t(nb) * D, s);
+            gemv(Y.gate_up, df_cin16.as<bf16>(), df_gu.p, false);
+            K::dflash_silu_mul(df_gu.as<bf16>(), df_act.as<bf16>(), nb, df_I, s);
+            gemv(Y.down, df_act.as<bf16>(), df_o16.p, false);
+            K::to_f32(df_o16.as<bf16>(), df_of.as<float>(), size_t(nb) * D, s);
+            K::dflash_conv(df_of.as<float>(), df_kern.as<bf16>(), Y.mlp_base.as<float>(), nb, D, df_group, 1, df_x.as<float>(), df_x.as<float>(), s);
+        }
+        K::rms_norm(df_x.as<float>(), df_norm.as<float>(), nullptr, df_hid.as<bf16>(), nb, D, df_eps, s);
+        {   // candidates: the target head over the real tokens (its INT8 copy when there is one)
+            K::GemvSeg sg = seg(out, df_hid.as<bf16>(), df_logits.p, true);
+            if (hq8.p) sg = K::GemvSeg{reinterpret_cast<const bf16 *>(hq8.p), df_hid.as<bf16>(), df_logits.p, V, D, D, V, 1, hsc.as<float>()};
+            K::gemv(&sg, 1, nb, s);
+        }
+        K::dflash_top16(df_logits.as<float>(), nb, df_vocab, V, df_ids.as<int>(), df_vals.as<float>(), df_top.as<float>(), s);
+        gemv(df_sel, df_hid.as<bf16>(), df_gate.p, false);
+        K::dflash_select(df_ids.as<int>(), df_vals.as<float>(), df_gate.as<bf16>(), df_succ.as<bf16>(), df_pred.as<bf16>(), d_tok.as<int>(), steps,
+                         df_vocab, df_tok.as<int>(), s);
+        out_tokens.resize(size_t(steps));
+        // a drafter kernel that did not launch (e.g. its module could not load: no device memory left) must fail loudly,
+        // not leave stale candidates that verify rejects forever
+        ck(cudaPeekAtLastError(), "DFlash2 draft launch");
+        ck(cudaMemcpyAsync(out_tokens.data(), df_tok.p, size_t(steps) * 4, cudaMemcpyDeviceToHost, s), "draft");
+        ck(cudaStreamSynchronize(s), "draft");
+        ck(cudaGetLastError(), "DFlash2 draft");
+    }
     // draft context K / V of the m committed tokens at positions pos0.. (their taps are in `taps`), and f_rnn of the last
     void mtp_context(int pos0, int m) {
+        if (dflash) { dflash_context(pos0, m); return; }
         for (int i = 0; i < 3; ++i) {
             MtpLayer & Y = ml[size_t(i)];
             K::mtp_mix_norm(taps.as<bf16>(), 4, m_alpha.as<float>() + i * 4, Y.dflare.as<float>(), d_cx.as<bf16>(), m, D, mtp_eps, s);
@@ -986,6 +1407,7 @@ struct Inkling2Model::Impl {
     // the block at position len: [anchor, mask x 7] -> 7 greedy draft tokens
     void draft(int anchor, std::vector<int> & out_tokens, int steps) {
         if (!mtp_on) throw std::runtime_error("inkling2: draft needs enable_mtp()");
+        if (dflash) { dflash_draft(anchor, out_tokens, std::max(1, std::min(steps, mtp_block - 1))); return; }  // -md DFlash2 folder
         const int nb = mtp_block, P = len;
         steps = std::max(1, std::min(steps, nb - 1));
         ck(cudaMemcpyAsync(d_tok.p, &anchor, 4, cudaMemcpyHostToDevice, s), "anchor");
@@ -1219,7 +1641,7 @@ struct Inkling2Model::Impl {
                 K::head_greedy(hb, last, want, fcap, happrox.as<float>(), hcells.as<unsigned long long>(), dtok.as<int>(), nullptr, s);
             } else {
                 K::GemvSeg sg = seg(out, last, logits16.p);
-                project(&sg, 1, want);
+                project(&sg, 1, want, true);
                 K::to_f32(logits16.as<bf16>(), logits.as<float>(), size_t(want) * V, s);
                 K::softcap(logits.as<float>(), size_t(want) * V, fcap, s);
                 for (int i = 0; i < want; ++i)
@@ -1229,7 +1651,7 @@ struct Inkling2Model::Impl {
             return;
         }
         K::GemvSeg sg = seg(out, last, logits16.p);
-        project(&sg, 1, want);
+        project(&sg, 1, want, true);
         K::to_f32(logits16.as<bf16>(), logits.as<float>(), size_t(want) * V, s);
         K::softcap(logits.as<float>(), size_t(want) * V, fcap, s);
         ck(cudaMemcpyAsync(logits_dst, logits.p, size_t(want) * V * 4, cudaMemcpyDeviceToHost, s), "logits");
@@ -1299,11 +1721,11 @@ struct Inkling2Model::Impl {
     }
     void copy_window(bool save) {
         const size_t rb = size_t(G) * HD * 2;  // bytes per cache row
-        const int p0 = std::max(0, keep_len - window), n = keep_len - p0;
         size_t k = 0;
-        auto one = [&](Dev & kc, Dev & vc, int ring) {
+        auto one = [&](Dev & kc, Dev & vc, int ring, int win) {  // the last `win` rows of a ring cache
             if (!ring) return;
-            if (save && keep_kv.size() < k + 2) { keep_kv.emplace_back(size_t(window) * rb); keep_kv.emplace_back(size_t(window) * rb); }
+            const int p0 = std::max(0, keep_len - win), n = keep_len - p0;
+            if (save && keep_kv.size() < k + 2) { keep_kv.emplace_back(size_t(win) * rb); keep_kv.emplace_back(size_t(win) * rb); }
             int r[2][2];
             ring_ranges(ring, p0, n, r);
             size_t off = 0;
@@ -1322,8 +1744,9 @@ struct Inkling2Model::Impl {
             }
             k += 2;
         };
-        for (auto & S : slots) one(S.kc, S.vc, S.ring);
-        for (auto & Y : ml) one(Y.kc, Y.vc, Y.ring);
+        for (auto & S : slots) one(S.kc, S.vc, S.ring, window);
+        for (auto & Y : ml) one(Y.kc, Y.vc, Y.ring, window);
+        for (auto & Y : dfl) one(Y.kc, Y.vc, Y.ring, df_window);
     }
     void snapshot() {
         if (verify_n) throw std::runtime_error("inkling2: snapshot inside a verify block");
@@ -1363,7 +1786,7 @@ int inkling2_prompt_chunk() {
 }
 int Inkling2Model::chunk() const { return p_->chunk; }
 
-Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, bool hf_attention, size_t expert_budget, bool exact)
+Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, bool hf_attention, size_t expert_budget, bool exact, size_t drafter_bytes)
     : p_(std::make_unique<Impl>()) {
     {
         int dev = 0; cudaDeviceProp pr{};
@@ -1380,9 +1803,11 @@ Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, b
     cb(cublasCreate(&p_->blas), "create");
     cb(cublasSetStream(p_->blas, p_->s), "stream");
     p_->expert_budget = expert_budget;
+    p_->drafter_keep = drafter_bytes;
     p_->load(path);
     p_->alloc();
     p_->place_experts();
+    p_->choose_kernels();
     p_->reset();
 }
 Inkling2Model::~Inkling2Model() {
@@ -1405,6 +1830,18 @@ int Inkling2Model::length() const { return p_->len; }
 int Inkling2Model::replan_experts() { return p_->replan_experts(); }
 void Inkling2Model::enable_mtp(const std::string & dir) { p_->enable_mtp(dir); }
 void Inkling2Model::draft(int anchor, std::vector<int> & tokens, int steps) { p_->draft(anchor, tokens, steps); }
+size_t Inkling2Model::drafter_bytes(const std::string & dir) {
+    namespace fs = std::filesystem;
+    if (dir.empty()) return 0;
+    const fs::path df = fs::path(dir) / "model.safetensors", mtp = fs::path(dir) / "mtp.safetensors";
+    std::error_code ec;
+    const size_t w = fs::exists(df, ec) ? size_t(fs::file_size(df, ec)) : fs::exists(mtp, ec) ? size_t(fs::file_size(mtp, ec)) : 0;
+    // BF16 weights (+ their INT8 copy while converting), KV caches, block scratch
+    return w * 3 / 2 + (size_t(384) << 20);
+}
+void Inkling2Model::draft_trace(const std::vector<int> & tokens, int anchor, std::vector<float> & hidden, std::vector<int> & ids, std::vector<int> & path) {
+    p_->dflash_trace(tokens, anchor, hidden, ids, path);
+}
 void Inkling2Model::verify(const int * tokens, int n, std::vector<float> & logits) { p_->verify(tokens, n, logits); }
 void Inkling2Model::commit(int keep) { p_->commit(keep); }
 int Inkling2Model::resident_experts() const { return p_->resident_share; }

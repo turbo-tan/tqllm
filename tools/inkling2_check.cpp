@@ -37,6 +37,7 @@ namespace {
 size_t g_budget = SIZE_MAX;  // --expert-budget-mb: device bytes for the routed experts (default: what fits)
 bool g_exact = true;           // --exact off: the device fast dense format (INT8 W8A16 on Ampere)
 bool g_spec_trace = false;    // --spec-trace: every adaptive spec / plain step (drafts, accepted, ms) on stderr
+std::string g_drafter;          // --drafter DIR
 template <class T> std::vector<T> load(const std::string & p) {
     std::ifstream in(p, std::ios::binary);
     if (!in) throw std::runtime_error("cannot read " + p);
@@ -297,6 +298,22 @@ int run_bench(const std::string & model, const std::string & dir, const std::str
             m.log_routes(&routes);
             run(ctx, b, hb, tp2, td2);
             m.log_routes(nullptr);
+            {   // distinct routed experts per visit over windows of W consecutive decode tokens (what a W-row verify reads)
+                std::vector<const std::vector<int> *> one;
+                for (const auto & r : routes) if (r.size() == 8) one.push_back(&r);
+                const int visits = 48, steps = int(one.size()) / visits;
+                for (int W : {1, 3, 5, 8}) {
+                    double sum = 0; int cnt = 0;
+                    for (int s0 = 0; s0 + W <= steps; s0 += W)
+                        for (int v = 0; v < visits; ++v) {
+                            std::vector<int> e;
+                            for (int k = 0; k < W; ++k) e.insert(e.end(), one[size_t((s0 + k) * visits + v)]->begin(), one[size_t((s0 + k) * visits + v)]->end());
+                            std::sort(e.begin(), e.end());
+                            sum += double(std::unique(e.begin(), e.end()) - e.begin()); ++cnt;
+                        }
+                    std::printf("bench routes: %d-token windows, %.1f distinct experts per visit (of %d assignments)\n", W, cnt ? sum / cnt : 0.0, 8 * W);
+                }
+            }
             std::printf("bench ctx %6d run 2 (eager, route log): decode %.2f tok/s; graph == eager: tokens %s, logits %s\n", ctx, ndec / td2,
                         a == b ? "equal" : "DIFFER", ha == hb ? "equal" : "DIFFER");
             if (a != b || ha != hb) return 1;
@@ -459,6 +476,7 @@ GenStats gen_spec(Inkling2Model & m, const std::vector<int> & prompt, int chunk,
             continue;
         }
         m.draft(anchor, d, L);
+        const double tdraft = secs(ts);
         blk[0] = anchor;
         for (int i = 0; i < L; ++i) blk[size_t(i + 1)] = d[size_t(i)];
         int nx[8];
@@ -467,7 +485,7 @@ GenStats gen_spec(Inkling2Model & m, const std::vector<int> & prompt, int chunk,
         while (a < L && nx[a] == d[size_t(a)]) ++a;
         m.commit(a + 1);
         pol.spec_done(a, L, secs(ts));
-        if (g_spec_trace && adaptive) std::fprintf(stderr, "  step %3d spec L %d accepted %d %.2f ms\n", g.steps + 1, L, a, secs(ts) * 1e3);
+        if (g_spec_trace && adaptive) std::fprintf(stderr, "  step %3d spec L %d accepted %d %.2f ms (draft %.2f)\n", g.steps + 1, L, a, secs(ts) * 1e3, tdraft * 1e3);
         for (int i = 0; i < a; ++i) g.tok.push_back(d[size_t(i)]);
         g.tok.push_back(nx[a]);
         ++g.steps;
@@ -476,6 +494,38 @@ GenStats gen_spec(Inkling2Model & m, const std::vector<int> & prompt, int chunk,
     if (prof) cudaProfilerStop();
     g.tok.resize(size_t(N));
     return g;
+}
+// one decode step after a prompt, launched as the CUDA graph and eagerly (a route log forces eager launches), each twice:
+// all four logits rows must be equal bitwise
+int run_graph_debug(const std::string & model, const std::string & mt, int ctx, int chunk) {
+    const Texts tx = read_texts(mt);
+    std::vector<int> text;
+    for (const auto & v : tx.ids) text.insert(text.end(), v.begin(), v.end());
+    std::vector<int> fill;
+    while (int(fill.size()) < ctx + 8) fill.insert(fill.end(), text.begin(), text.end());
+    Inkling2Model m(model, ctx + 64, chunk, false, g_budget, g_exact);
+    std::vector<float> lg;
+    auto one = [&](bool eager, int steps) {
+        std::vector<std::vector<int>> routes;
+        m.reset();
+        for (int p = 0; p < ctx; p += chunk) { const int n = std::min(chunk, ctx - p); m.forward(fill.data() + p, n, 1, lg); }
+        if (eager) m.log_routes(&routes);
+        std::vector<std::vector<float>> out{lg};  // [0]: the prompt's last logits
+        for (int i = 0; i < steps; ++i) { m.forward(&fill[size_t(ctx + i)], 1, 1, lg); out.push_back(lg); }
+        m.log_routes(nullptr);
+        return out;
+    };
+    const auto g1 = one(false, 4), g2 = one(false, 4), e1 = one(true, 4), e2 = one(true, 4);
+    for (int i = 0; i < 5; ++i) {
+        auto diff = [&](const std::vector<float> & a, const std::vector<float> & b) {
+            double mx = 0; int nd = 0;
+            for (size_t k = 0; k < a.size(); ++k) if (a[k] != b[k]) { ++nd; mx = std::max(mx, double(std::fabs(a[k] - b[k]))); }
+            char buf[64]; std::snprintf(buf, sizeof buf, "%d differ (max %.3g)", nd, mx); return std::string(buf);
+        };
+        std::printf("%s %d: graph vs graph %s, eager vs eager %s, graph vs eager %s\n", i ? "step" : "prompt", i ? i - 1 : 0, diff(g1[size_t(i)], g2[size_t(i)]).c_str(),
+                    diff(e1[size_t(i)], e2[size_t(i)]).c_str(), diff(g1[size_t(i)], e1[size_t(i)]).c_str());
+    }
+    return 0;
 }
 int run_spec(const std::string & model, const std::string & mt, const std::string & gb, const std::string & list, int chunk, int N, bool prof) {
     std::vector<int> ctxs;
@@ -502,8 +552,8 @@ int run_spec(const std::string & model, const std::string & mt, const std::strin
         }
     }
     for (int c : ctxs) prompts.emplace_back("ctx" + std::to_string(c), std::vector<int>(fill.begin(), fill.begin() + c));
-    Inkling2Model m(model, std::max(maxc, 64) + N + 64, chunk, false, g_budget, g_exact);
-    m.enable_mtp(model);
+    Inkling2Model m(model, std::max(maxc, 64) + N + 64, chunk, false, g_budget, g_exact, Inkling2Model::drafter_bytes(g_drafter.empty() ? model : g_drafter));
+    m.enable_mtp(g_drafter.empty() ? model : g_drafter);
     bool all = true;
     for (const auto & [name, pin] : prompts) {
         const auto p = gen_plain(m, pin, chunk, N);
@@ -527,6 +577,50 @@ int run_spec(const std::string & model, const std::string & mt, const std::strin
     std::printf("spec: %s\n", all ? "PASS (every spec stream equals plain)" : "FAIL");
     return all ? 0 : 1;
 }
+
+// the DFlash2 drafter against the sglang-math reference (tools/inkling2/dflash2_reference.py, tests/data/inkling2_dflash2_ref.bin):
+// the final normed block rows, the top-16 candidates and the 7-token path. The drafter amplifies rounding (the reference
+// moves 10 % hidden RMS between BF16 and FP32 activations), so it is held to the Metal port's bands
+int run_dflash2_ref(const std::string & model, const std::string & drafter, const std::string & fixture) {
+    static const int kTokens[] = {1719, 220, 46389, 7, 77, 8, 25, 198, 149862, 150003, 149934, 196982, 220, 17, 25, 198, 149860,
+                                  149862, 150583, 149934, 198, 149862, 150583, 220};
+    std::ifstream in(fixture, std::ios::binary);
+    int32_t h[8];
+    if (!in.read(reinterpret_cast<char *>(h), sizeof(h)) || h[0] != 0x32464C44) throw std::runtime_error("dflash2 fixture header");
+    const int M = h[1], anchor = h[2], block = h[4], D = h[5], K = h[6];
+    if (M != int(std::size(kTokens)) || K != 16) throw std::runtime_error("dflash2 fixture shape");
+    std::vector<uint32_t> ref_tok(size_t(block - 1)), ref_ids(size_t(block * K));
+    std::vector<float> ref_lg(ref_ids.size()), ref_hid(size_t(block * D));
+    in.read(reinterpret_cast<char *>(ref_tok.data()), ref_tok.size() * 4);
+    in.read(reinterpret_cast<char *>(ref_ids.data()), ref_ids.size() * 4);
+    in.read(reinterpret_cast<char *>(ref_lg.data()), ref_lg.size() * 4);
+    in.read(reinterpret_cast<char *>(ref_hid.data()), ref_hid.size() * 4);
+    if (!in) throw std::runtime_error("dflash2 fixture truncated");
+    Inkling2Model m(model, 4096, 64, false, g_budget, g_exact, Inkling2Model::drafter_bytes(drafter));
+    m.enable_mtp(drafter);
+    std::vector<float> hid;
+    std::vector<int> ids, path;
+    m.draft_trace(std::vector<int>(std::begin(kTokens), std::end(kTokens)), anchor, hid, ids, path);
+    double err = 0, mag = 0;
+    for (size_t i = size_t(D); i < ref_hid.size(); ++i) { const double e = hid[i] - ref_hid[i]; err += e * e; mag += double(ref_hid[i]) * ref_hid[i]; }
+    int overlap = K;
+    for (int r = 1; r < block; ++r) {
+        int same = 0;
+        for (int j = 0; j < K; ++j) same += std::count(ref_ids.begin() + r * K, ref_ids.begin() + (r + 1) * K, uint32_t(ids[size_t(r * K + j)])) > 0;
+        overlap = std::min(overlap, same);
+    }
+    int matched = 0;
+    while (matched < block - 1 && uint32_t(path[size_t(matched)]) == ref_tok[size_t(matched)]) ++matched;
+    const double rms = std::sqrt(err / mag);
+    std::printf("DFLASH2 head %s hidden_rel_rms %.5f top16_overlap_min %d/%d path %d/%d tokens", g_exact ? "int8-copy" : "bf16", rms, overlap, K, matched,
+                block - 1);
+    for (int t : path) std::printf(" %d", t);
+    std::printf("\nreference tokens");
+    for (auto t : ref_tok) std::printf(" %u", t);
+    const bool pass = rms < 0.12 && overlap >= 12 && matched >= 1;
+    std::printf("\nDFLASH2 %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -534,9 +628,9 @@ int main(int argc, char ** argv) {
     const std::string model = argv[1], gold = argv[2];
     int chunk = 64;
     bool do_tf = true, do_greedy = true, first64 = false, hf = false;
-    std::string visits, mt_ref, bench, gdebug, profile, spec_bin, spec_ctx, reuse;
+    std::string visits, mt_ref, bench, gdebug, profile, spec_bin, spec_ctx, reuse, df_ref;
     bool onestep = false, handover = false;
-    int ndec = 64;
+    int ndec = 64, graph_debug = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--chunk" && i + 1 < argc) chunk = std::atoi(argv[++i]);
@@ -555,11 +649,16 @@ int main(int argc, char ** argv) {
         else if (a == "--expert-budget-mb" && i + 1 < argc) g_budget = size_t(std::atoll(argv[++i])) << 20;
         else if (a == "--exact" && i + 1 < argc) g_exact = std::string(argv[++i]) != "off";
         else if (a == "--spec-trace") g_spec_trace = true;
+        else if (a == "--drafter" && i + 1 < argc) g_drafter = argv[++i];  // a DFlash2 folder for --spec (default: the checkpoint's MTP)
+        else if (a == "--dflash2-ref" && i + 1 < argc) df_ref = argv[++i];  // fixture; needs --drafter
+        else if (a == "--graph-debug" && i + 1 < argc) graph_debug = std::atoi(argv[++i]);  // prompt length: graph vs eager decode steps
         else if (a == "--visits" && i + 1 < argc) visits = argv[++i];
         else if (a == "--first64") { do_greedy = false; first64 = true; }
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     try {
+        if (!df_ref.empty()) return run_dflash2_ref(model, g_drafter, df_ref);
+        if (graph_debug > 0) return run_graph_debug(model, gold, graph_debug, chunk);
         if (!mt_ref.empty()) return run_mt(model, gold, mt_ref, chunk, hf);
         if (onestep) return run_onestep(model, gold, hf);
         if (handover) return run_handover(model, gold, chunk);
