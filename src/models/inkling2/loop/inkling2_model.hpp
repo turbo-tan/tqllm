@@ -64,6 +64,10 @@ public:
     // DFlash2 reference check (tools/inkling2/dflash2_reference.py): the drafter alone over `tokens`' input rows as taps
     void draft_trace(const std::vector<int> & tokens, int anchor, std::vector<float> & hidden, std::vector<int> & ids, std::vector<int> & path);
     void draft(int anchor, std::vector<int> & tokens, int steps = 7);
+    // DFlash2: the same draft, plus conf[i] = the softmax weight of tokens[i] among its row's 16 head candidates (empty for
+    // the MTP drafter); read in the draft's own device-to-host copy, so it costs no extra sync
+    void draft(int anchor, std::vector<int> & tokens, int steps, std::vector<float> & conf);
+    bool dflash_drafter() const;  // the drafter is DFlash2 (one pass drafts the whole block)
     void verify(const int * tokens, int n, std::vector<float> & logits);
     void commit(int keep);
     // verify() without logits: next[i] = the greedy token after tokens[0 .. i] (exact, as argmax of verify()'s rows)

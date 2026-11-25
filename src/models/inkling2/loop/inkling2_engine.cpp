@@ -62,6 +62,8 @@ public:
     }
     bool has_drafter() const override { return mtp_; }
     bool native_mtp() const override { return mtp_; }
+    // the engine picks each step's drafts (Inkling2SpecPolicy): tqserve then passes depth 0, not the MTP default of 4
+    bool adaptive_depth() const override { return mtp_; }
     void set_ignore_eos(bool on) override { ignore_eos_ = on; }
     void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float) override {
         temp_ = temperature > 0.f ? temperature : 0.f;
@@ -107,9 +109,9 @@ public:
         const int room = int(context_) - m_.length() - 1;
         if (room <= 1) { done_ = true; return false; }
         // greedy with the drafter: the policy picks a spec step (L drafts verified at once) or a plain step, by measured speed
-        const int L = !mtp_ || temp_ > 0.f ? 0 : pol_.next(room);
+        const int L0 = !mtp_ || temp_ > 0.f ? 0 : pol_.next(room);
         const auto ts = std::chrono::steady_clock::now();
-        if (L == 0) {  // plain step (sampled requests: no drafter)
+        if (L0 == 0) {  // plain step (sampled requests: no drafter)
             const int t = int(tok_);
             if (temp_ > 0.f) { m_.forward(&t, 1, 1, lg_); tok_ = pick(0); }
             else tok_ = uint32_t(m_.forward_greedy(t));
@@ -119,8 +121,17 @@ public:
             emit(tok_);
             return !done_;
         }
-        std::vector<int> d, blk(size_t(L) + 1);
-        m_.draft(int(tok_), d, L);
+        // DFlash2 (one pass drafts the whole block): draft the most the room allows, then verify the window the drafts'
+        // confidences pay for; the MTP drafter (one pass a draft) drafts the policy's depth
+        std::vector<int> d;
+        std::vector<float> conf;
+        int L = L0;
+        if (fixed_d_ == 0 && m_.dflash_drafter()) {
+            m_.draft(int(tok_), d, std::min(Inkling2SpecPolicy::kMaxL, room - 1), conf);
+            L = pol_.window(conf.data(), int(d.size()));
+        } else m_.draft(int(tok_), d, L);
+        L = std::min<int>(L, int(d.size()));
+        std::vector<int> blk(size_t(L) + 1);
         blk[0] = int(tok_);
         for (int i = 0; i < L; ++i) blk[size_t(i) + 1] = d[size_t(i)];
         int nx[8];
@@ -128,7 +139,7 @@ public:
         int a = 0;
         while (a < L && nx[a] == d[size_t(a)]) ++a;
         m_.commit(a + 1);
-        pol_.spec_done(a, L, std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
+        pol_.spec_done(a, L, std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), conf.empty() ? nullptr : conf.data());
         ctx_.insert(ctx_.end(), blk.begin(), blk.begin() + a + 1);
         ++steps_; drafted_ += uint64_t(L); accepted_ += uint64_t(a);
         for (int i = 0; i < a && !done_; ++i) emit(uint32_t(d[size_t(i)]));

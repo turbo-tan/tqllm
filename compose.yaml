@@ -1,6 +1,6 @@
 services:
   tqllm:
-    image: ${TQLLM_IMAGE:-ghcr.io/turbo-tan/tqllm:1.8.0}
+    image: ${TQLLM_IMAGE:-ghcr.io/turbo-tan/tqllm:1.8.1}
     restart: on-failure  # tqserve exits 70 when the GPU context is lost (docs/guides/quickstart.md); compose starts it again
     build:
       context: .
