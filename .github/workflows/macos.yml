@@ -1,5 +1,7 @@
 name: macos
 
+# Also builds the Linux wheels (PyPI trusts this file as the publisher of tqllm).
+
 # Prebuilt tqLLM for Apple Silicon Macs on macOS 26: the tqllm wheel (tqserve inside, built against PyPI's MLX) plus the
 # PyPI wheels it needs, as one tar for tqllm.com/install.sh. Runs on GitHub's Apple Silicon runner; no model is served
 # here (the release test with real models runs on our Mac).
@@ -7,7 +9,7 @@ on:
   push:
     tags: ['v*']
   pull_request:
-    paths: ['.github/workflows/macos.yml', 'pyproject.toml', 'python/**', 'src/backends/metal/**']
+    paths: ['.github/workflows/macos.yml', 'pyproject.toml', 'python/**', 'src/backends/metal/**', 'CMakeLists.txt']
   workflow_dispatch:
     inputs:
       ref:
@@ -69,10 +71,44 @@ jobs:
           name: pypi-wheel
           path: out/tqllm-*.whl
 
-  # PyPI: the macOS wheel only (Linux runs the Docker images; an sdist would try to build tqserve there). Trusted
+  # Linux wheels: CUDA 13 tqserve inside the tqllm package, NVIDIA's pip packages for the CUDA libraries
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest, repo: x86_64, cuda_archs: '86;120' }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, repo: sbsa, cuda_archs: '121' }
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_34_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: CUDA 13.0 toolkit
+        run: |
+          dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/${{ matrix.repo }}/cuda-rhel9.repo
+          dnf install -y -q cuda-toolkit-13-0 && dnf clean all
+      - name: Build the tqllm wheel
+        env:
+          CMAKE_ARGS: -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}
+        run: |
+          export PATH=/usr/local/cuda-13.0/bin:$PATH CUDACXX=/usr/local/cuda-13.0/bin/nvcc
+          /opt/python/cp312-cp312/bin/python -m pip wheel --no-deps . -w raw
+          EX=""; for l in libcuda.so.1 libcudart.so.13 libcublas.so.13 libcublasLt.so.13 libcusolver.so.12 libcusparse.so.12 libnvJitLink.so.13; do EX="$EX --exclude $l"; done
+          auditwheel repair --disable-isa-ext-check $EX -w out raw/tqllm-*.whl
+          ls -la out
+      - name: Size (PyPI limit 100 MB)
+        run: |
+          s=$(stat -c %s out/tqllm-*.whl); echo "$s bytes"; [ "$s" -lt 100000000 ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheel-linux-${{ matrix.arch }}
+          path: out/tqllm-*.whl
+
+  # PyPI: the macOS and Linux wheels (no sdist: it would try to build tqserve on the user's machine). Trusted
   # Publishing (OIDC): no token in the repo. Runs for v* tags, or on demand with publish = true.
   pypi:
-    needs: prebuilt
+    needs: [prebuilt, linux]
     if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
     runs-on: ubuntu-latest
     environment: pypi
@@ -81,6 +117,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: pypi-wheel
+          pattern: pypi-wheel*
+          merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
