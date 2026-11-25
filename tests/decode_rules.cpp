@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 // Flash-Next decode rules (no CUDA): the F39 verify path choice, the F38 slots=auto keep, the adaptive draft stop.
 #include "models/qwen/qwen4exp/decode_rules.hpp"
 #include "experts/packed_span.hpp"
@@ -617,6 +618,17 @@ int main() {
         check(prefill_through_bank(false, true, true, 180, 206), "on demand, routed experts fit the bank: the bank (short prompts unchanged)");
         check(!prefill_through_bank(false, true, true, 512, 206), "on demand, 28K prompt routing to every expert: streamed, not 'active set exceeds slots'");
         check(!prefill_through_bank(false, true, false, 10, 206), "on demand, borrowed layer (no bank): streamed");
+    }
+    {   // reply timings: drafts offered are the drafts the steps verified, not steps x the most MTP drafts (5): steps of an
+        // adaptive MTP stop, a copy draft and a DFlash2 block of 15, tallied and reported as spec_advance/spec_finish do
+        struct { uint64_t steps_ = 0, toks_ = 0, offered_ = 0, decode_us_ = 700, prefill_us_ = 50; std::array<uint64_t, 17> taken_{}; } s;
+        const int block[] = {5, 2, 1, 1, 3, 4, 15}, kept[] = {5, 1, 2, 1, 1, 5, 13};  // drafts verified, tokens committed
+        for (int i = 0; i < 7; ++i) count_step(s, size_t(block[i]), kept[i]);
+        uint64_t st[5] = {};
+        reply_timings(st, s);
+        check(st[0] == 7 && st[1] == 31 && st[2] == 21 && st[3] == 700 && st[4] == 50, "timings: steps 7, 31 drafts offered, 21 accepted (steps x 5 read 35)");
+        check(st[2] <= st[1], "accepted drafts never exceed the drafts offered (a DFlash2 block of 15 included)");
+        check(s.taken_[1] == 3 && s.taken_[5] == 2 && s.taken_[13] == 1, "steps by tokens kept (LEDGER decode steps)");
     }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

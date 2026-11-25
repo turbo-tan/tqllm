@@ -194,6 +194,16 @@ inline bool side_branches(bool device_maps_on, bool several_seqs, bool prefill_s
 // The MTP layer's catch-up after each decode step feeds only the next step's drafts: a server that never drafts (drafts=0
 // and no DFlash2 drafter) skips it (the plain step then runs the trunk and the head only).
 inline bool mtp_after_step(int drafts, bool dflash) { return drafts > 0 || dflash; }
+// One verified decode step's tally on a slot (both spec paths): `drafted` drafts were verified and `kept` tokens committed.
+template <class Slot> void count_step(Slot & s, size_t drafted, int kept) {
+    ++s.steps_; s.toks_ += uint64_t(kept); s.offered_ += drafted; ++s.taken_[size_t(std::min(kept, 16))];
+}
+// One request's tqserve timings from its slot: steps, drafts offered, drafts accepted, decode us, prefill us. Drafts offered
+// are the drafts the steps verified (offered_): the adaptive stop (TQFN_DRAFT_CONF), copy drafts and a DFlash2 block make
+// them differ from steps x the most MTP drafts, which overstated draft_n and understated the acceptance rate.
+template <class Slot> void reply_timings(uint64_t * st, const Slot & s) {
+    st[0] = s.steps_; st[1] = s.offered_; st[2] = s.toks_ - s.steps_; st[3] = s.decode_us_; st[4] = s.prefill_us_;
+}
 // A trunk call reads the routed ids back for the waves rule (layer_takes_waves) when a block's assignments outnumber the
 // bank's slots or a prompt chunk runs; a bank holding every expert never takes waves, so it never reads them.
 inline bool reads_routes_for_waves(bool hot_map, bool device_maps_on, int n, int topk, int slots, bool spec) {
