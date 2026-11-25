@@ -3,13 +3,40 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
-## Unreleased
+## 1.8.1 (2026-11-25)
 
 ### Fixed
+- Inkling-2-Mini (CUDA) in tqserve drafted a fixed 4 tokens a step: the engine did not declare its own depth policy
+  (`adaptive_depth`), so tqserve passed the MTP default. The depth policy now runs in tqserve as in `inkling2-check`
+  (the 1.8.0 card's numbers came from `inkling2-check`).
+- Inkling-2-Mini: thinking off (`enable_thinking: false`) opens the answer's text message in the prompt, so the reply
+  has no thinking message. At effort "none" the model
+  still wrote one, up to ~1,500 tokens (it ran answers into `max_tokens`). With tools the turn is left to the model.
+- Inkling-2-Mini (CUDA): the expert kernel family (tensor cores or warp kernels) chosen at load keeps the tensor cores
+  unless the warp kernels are more than 10 % faster. On a GB10 the two time within ~5 %, so a restart could switch
+  them and change the greedy text (each family is exact with itself: spec == plain).
+
 - Flash-Next replies report the drafts the decode steps verified as `timings.draft_n` (and in the request log's draft
   acceptance) instead of steps x the most MTP drafts, which overstated it whenever the adaptive stop, a copy draft or a
   DFlash2 block verified another count. ISTA IQ3_XXS, two greedy replies: draft_n 260 / 440 -> 233 / 171 (the `LEDGER`
   drafts offered), acceptance 76 % / 27 % -> 85 % / 70 %; replies identical (md5).
+
+### Performance
+- Inkling-2-Mini with DFlash2: the drafter drafts its whole block each step and the verify window is chosen from the
+  drafts' own confidences (the softmax weight of each drafted token among its 16 candidates), calibrated online against
+  what this request's drafts were actually accepted at, and the step time per verified row measured on the device. A
+  card where verify rows are costly (16 GB: experts stream from RAM) verifies fewer; a 3090 or GB10 more. Output is
+  unchanged (40 / 40 replies equal to `--draft-max 7` on all three cards). Tech2Wild's `bench_inkling.py` (types, one
+  user), tok/s, 1.8.0 -> 1.8.1:
+  - RTX 3090, official checkpoint, exact: coding 200.3 -> 230.5, math 195.4 -> 215.8, json 211.1 -> 228.3,
+    html 193.8 -> 216.9, prose 158.5 -> 178.0, narrative 163.7 -> 182.3, summary 174.4 -> 188.9, counting 232.8 -> 287.5
+    (thinking at effort "none", as 1.8.0 rendered it).
+  - DGX Spark (GB10), official checkpoint, `--exact off`: 86.4 -> 102.6, 83.6 -> 99.8, 80.7 -> 102.5, 79.6 -> 93.4,
+    72.4 -> 78.9, 70.1 -> 72.6, 75.2 -> 84.5, 100.7 -> 132.5.
+  - RTX 5060 Ti 16 GB, TQT 13.06 GB, `--exact off`: 56.2 -> 60.2, 61.1 -> 71.1, 62.5 -> 62.4, 53.6 -> 51.3,
+    48.1 -> 61.7, 55.6 -> 64.8, 58.0 -> 61.9, 97.8 -> 109.5.
+- `pip install tqllm` on Linux (x86-64 RTX 30 / 40 / 50, arm64 GB10): the CUDA `tqserve` in the wheel, CUDA 13 from
+  NVIDIA's pip packages (driver 580 or newer); `tqllm serve` runs it without Docker.
 
 ## 1.8.0 (2026-11-25)
 
