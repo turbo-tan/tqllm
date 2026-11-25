@@ -1360,7 +1360,9 @@ int main() {
     {   // per-device family choice: plain-only picks the faster 1-token step; with a drafter the better of plain and spec
         const bool a = K::prefer_mma(70, 550, 68, 340, false), b = K::prefer_mma(60, 550, 75, 340, false), c = K::prefer_mma(60, 550, 75, 200, true),
                    d = K::prefer_mma(60, 200, 75, 340, true);
-        report("kernel family choice (1-token / verify times)", 0.0, 0.0, a && !b && c && !d);
+        // a near tie (warp 5 % faster) keeps the tensor cores, so a restart does not change the rounding
+        const bool e = K::prefer_mma(140, 1140, 147, 1188, true), f = K::prefer_mma(140, 1140, 147, 1188, false);
+        report("kernel family choice (1-token / verify times)", 0.0, 0.0, a && !b && c && !d && e && f);
     }
     test_experts_mma(2);
     test_experts_mma(1);

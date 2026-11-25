@@ -67,10 +67,12 @@ void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
 // token's sums do not depend on n
 void set_gemv_mma(bool on);
 // the kernel family to run on this device: rate = tokens per microsecond of its 1-token step, or with a drafter the better
-// of that and a verify block of 8 rows gaining `spec_tokens`; true = the tensor-core family
+// of that and a verify block of 8 rows gaining `spec_tokens`; true = the tensor-core family. The warp kernels are taken
+// only when more than 10 % faster: the two families round differently, so a near tie decided by timing noise at load
+// gave different greedy text after a restart (GB10: 1,140 vs 1,189 us a visit)
 inline bool prefer_mma(double t1_warp, double t8_warp, double t1_mma, double t8_mma, bool drafter, double spec_tokens = 3.5) {
     auto rate = [&](double t1, double t8) { return drafter ? (1.0 / t1 > spec_tokens / t8 ? 1.0 / t1 : spec_tokens / t8) : 1.0 / t1; };
-    return rate(t1_mma, t8_mma) >= rate(t1_warp, t8_warp);
+    return rate(t1_warp, t8_warp) <= 1.10 * rate(t1_mma, t8_mma);
 }
 // every segment on gemv_k (per row: the sum order of the bounded LM head's BF16 rescoring, bf16_row_dot): the LM head
 void gemv_rows(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
