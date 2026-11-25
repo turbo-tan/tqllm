@@ -71,7 +71,9 @@ jobs:
           name: pypi-wheel
           path: out/tqllm-*.whl
 
-  # Linux wheels: CUDA 13 tqserve inside the tqllm package, NVIDIA's pip packages for the CUDA libraries
+  # Linux wheels: CUDA 13 tqserve inside the tqllm package, NVIDIA's pip packages for the CUDA libraries. Only refs that
+  # carry the Linux pyproject override build them (1.8.1 on). x86_64: RTX 30 / 40 / 50 (86 runs on 89 too; compute_86 PTX
+  # for newer cards). aarch64: GB10 / DGX Spark only (121a). No NCCL in the wheel: --split needs the Docker image.
   linux:
     strategy:
       matrix:
@@ -121,3 +123,5 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true  # a re-run for a published version uploads only the missing files
