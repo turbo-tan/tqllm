@@ -99,6 +99,71 @@ int main() {
         if (tqllm::kept_state_sys({300, 500}, 600, 0, 500, 4096) != 0) { std::fprintf(stderr, "FAIL a short system message keeps nothing\n"); ++failures; }
         if (tqllm::kept_state_sys({31680}, 31877, 0, 31680, 4096) != 0) { std::fprintf(stderr, "FAIL the same position as the last-message state\n"); ++failures; }
     }
+    // issue 82: an agent's conversation (user, then assistant tool calls and tool results, then a final answer, then the
+    // next user message) through a template that drops the reasoning of assistant messages before the last user message.
+    // Every user turn re-renders the previous turn's assistant messages without reasoning; with only the last-message and
+    // system states it shared none of them and read the whole prompt again (every other request at 120K on GB10).
+    {
+        // tool results go out as user messages opening with <tool_response> (the Qwen templates)
+        enum : uint32_t { IM = 1, SYS = 2, USER = 3, ASST = 4, TOOL = 5, THINK = 6, NL = 7, RESULT = 8 };
+        struct Msg { uint32_t role, len, think; };
+        auto render = [](const std::vector<Msg> & msgs) {
+            size_t last_user = 0;
+            for (size_t i = 0; i < msgs.size(); ++i) if (msgs[i].role == USER) last_user = i;
+            std::vector<uint32_t> t;
+            uint32_t fill = 100;
+            for (size_t i = 0; i < msgs.size(); ++i) {
+                if (msgs[i].role == TOOL) { t.push_back(IM); t.push_back(USER); t.push_back(NL); t.push_back(RESULT); }
+                else { t.push_back(IM); t.push_back(msgs[i].role); }
+                if (msgs[i].role == ASST && i > last_user) { t.push_back(THINK); for (uint32_t j = 0; j < msgs[i].think; ++j) t.push_back(50); t.push_back(THINK); }
+                for (uint32_t j = 0; j < msgs[i].len; ++j) t.push_back(fill++);
+            }
+            t.push_back(IM); t.push_back(ASST);  // the generation prompt
+            return t;
+        };
+        for (bool anchor_on : {false, true}) {
+            std::vector<Msg> msgs{{SYS, 600, 0}, {USER, 4000, 0}};
+            std::vector<uint32_t> seq;
+            tqllm::KeptStates k;
+            uint32_t worst_user_turn = ~0u, turns = 0;
+            for (int req = 0; req < 12; ++req) {
+                const auto prompt = render(msgs);
+                const auto P = uint32_t(prompt.size());
+                const uint32_t P0 = tqllm::kept_resume(k, [&](uint32_t n) {
+                    return n < P && n <= seq.size() && std::equal(seq.begin(), seq.begin() + n, prompt.begin());
+                });
+                if (k.snap > P0) k.snap = 0;
+                if (k.anchor > P0) k.anchor = 0;
+                std::vector<uint32_t> starts;
+                for (uint32_t i = 1; i < P; ++i) if (prompt[i] == IM) starts.push_back(i);
+                const uint32_t snap_new = tqllm::kept_state_msg(starts, P, P0);
+                if (anchor_on) {
+                    bool move = false;
+                    k.anchor = tqllm::kept_anchor_next(k, P0, tqllm::kept_state_turn(starts, prompt.data(), P, USER, RESULT), snap_new, &move);
+                    if (move) k.snap = 0;
+                }
+                if (snap_new) k.snap = snap_new;
+                if (req > 0 && msgs.end()[-1].role == USER) { worst_user_turn = std::min(worst_user_turn, P0); ++turns; }
+                seq = prompt;
+                // the reply: tool calls for the first three requests of a user turn, then the answer and the next user message
+                const int step = req % 4;
+                msgs.push_back({ASST, 40, 300});
+                if (step < 3) msgs.push_back({TOOL, 2000, 0});
+                else msgs.push_back({USER, 200, 0});
+            }
+            if (turns < 2) { std::fprintf(stderr, "FAIL conversation shape\n"); ++failures; }
+            if (!anchor_on && worst_user_turn != 0) { std::fprintf(stderr, "FAIL the old states were expected to miss (resumed at %u)\n", worst_user_turn); ++failures; }
+            if (anchor_on && worst_user_turn < 4600) { std::fprintf(stderr, "FAIL a user turn resumed at %u: read the conversation again\n", worst_user_turn); ++failures; }
+        }
+        // sys, user, asst, tool result (a user message opening with RESULT), gen
+        const std::vector<uint32_t> toks{0, 2, 9, 9, 1, 3, 9, 1, 4, 9, 1, 3, 7, 8, 9, 1, 4};
+        if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 3, 8) != 7) { std::fprintf(stderr, "FAIL turn anchor (a tool result is not a turn)\n"); ++failures; }
+        if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 3, 99) != 15) { std::fprintf(stderr, "FAIL without the result token the tool result counts\n"); ++failures; }
+        if (tqllm::kept_state_turn({4, 7, 10, 15}, toks.data(), 17, 5, 8) != 0) { std::fprintf(stderr, "FAIL no user message: no anchor\n"); ++failures; }
+        // no system message: the user message starts at 0 (the engine adds 0 to the message starts for this scan)
+        const std::vector<uint32_t> nosys{1, 3, 9, 1, 4, 9, 1, 3, 7, 8, 9, 1, 4};
+        if (tqllm::kept_state_turn({0, 3, 6, 11}, nosys.data(), 13, 3, 8) != 3) { std::fprintf(stderr, "FAIL user message at 0: anchor\n"); ++failures; }
+    }
     if (failures) return 1;
     std::puts("prefill_chunk: ok");
     return 0;

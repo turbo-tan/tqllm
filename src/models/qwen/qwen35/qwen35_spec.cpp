@@ -232,6 +232,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
     if (pc_on && !P0) pc_conv = ++conv_clock;  // a new conversation in this slot
     if (P0 < pc_snap) pc_snap = 0;
+    if (P0 < pc_anchor) pc_anchor = 0;
     if (pc_sys && pc_shared(pc_seq, false, pc_sys, prompt) != pc_sys) pc_sys = 0;  // kept only while the prompt shares it
     pc_live = false;
     if (pc_on) pc_seq.assign(prompt.begin(), prompt.end());
@@ -256,6 +257,18 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
             for (uint32_t i = 1; i < P; ++i) if (prompt[i] == im_start_) starts.push_back(i);
         const uint32_t snap = !pc_on ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
         const uint32_t sys_at = !pc_on ? 0 : kept_state_sys(starts, P, P0, snap, kSysKeep);
+        uint32_t anchor_at = 0;  // the turn anchor this prefill saves on its way (0: kept already, or none)
+        if (pc_on && user_tok_ != ~0u && !starts.empty()) {
+            bool move = false;
+            // `starts` leaves out position 0 (no chunk restarts there); a first message that is the user's still counts
+            std::vector<uint32_t> msgs = starts;
+            if (prompt[0] == im_start_) msgs.insert(msgs.begin(), 0u);
+            const uint32_t a = kept_state_turn(msgs, prompt.data(), P, user_tok_, result_tok_);
+            const uint32_t next = kept_anchor_next(KeptStates{pc_snap, pc_sys, pc_anchor}, P0, a, snap, &move);
+            if (move) std::swap(pc_host, pc_anchor_host), pc_snap = 0;  // an earlier turn's last-message state is the anchor now
+            if (next > P0) anchor_at = next, pc_anchor = 0;
+            else pc_anchor = next;
+        }
         const size_t chunks = (P - P0 + CH - 1) / CH + 1 + starts.size();  // + the split at snap and at each message start
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
         HostBuf staged_pos(chunks * 2 * sizeof(int));
@@ -319,7 +332,8 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                     dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                 }
                 if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
-                if (t + uint32_t(m) == sys_at) pc_copy(true, true), pc_sys = sys_at;
+                if (t + uint32_t(m) == sys_at) pc_copy(true, pc_system), pc_sys = sys_at;
+                if (t + uint32_t(m) == anchor_at) pc_copy(true, pc_turn), pc_anchor = anchor_at;
                 tqllm::prefill_completed(stream,t+uint32_t(m),P,P0);
                 if (show_progress && (final || (t + uint32_t(m)) % 8192 < uint32_t(m))) {
                     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
