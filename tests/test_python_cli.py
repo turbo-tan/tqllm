@@ -154,6 +154,20 @@ class Cli(unittest.TestCase):
         self.assertTrue(c[c.index("--model") + 1].startswith(str(cli.models_dir())))
         self.assertEqual(c[c.index("--port") + 1], "9000")
 
+    def test_linux_pip_install_serves_the_packaged_tqserve(self):  # pip install tqllm on Linux: no Docker needed
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "tqserve"; exe.write_text("")
+            orig = cli.server, cli.sys.platform, cli.linux_command
+            cli.server, cli.sys.platform = (lambda: exe), "linux"
+            cli.linux_command = lambda args, native=None: [native] + list(args)
+            try:
+                self.assertEqual(cli.server_command(["--port", "9001"], False), [str(exe), "--port", "9001"])
+                self.assertEqual(cli.server_command([], False, native="/opt/tqserve"), ["/opt/tqserve"])  # --native wins
+            finally:
+                cli.server, cli.sys.platform, cli.linux_command = orig
+
     def test_linux_own_model_downloads_nothing(self):
         c = cli.linux_command(["--model", "/models/x.gguf"], vram=24, download=self.fake)
         self.assertEqual(self.asked, [])

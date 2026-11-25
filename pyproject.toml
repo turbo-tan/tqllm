@@ -1,5 +1,5 @@
-# pip package (macOS arm64): `pip install "tqllm[mlx]"` builds tqserve against the stock MLX wheel and installs the
-# `tqllm` command (serve / pull). Linux users run the Docker images (see README); `tqllm` there prints the command.
+# pip package. macOS arm64: `pip install "tqllm[mlx]"`, tqserve built against the stock MLX wheel. Linux x86-64 / arm64
+# with an NVIDIA card: `pip install tqllm`, tqserve built with CUDA 13 against NVIDIA's pip libraries (driver 580 or newer).
 [build-system]
 requires = ["scikit-build-core>=0.10", "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 build-backend = "scikit_build_core.build"
@@ -7,11 +7,19 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "tqllm"
 version = "1.8.0"
-description = "tqLLM: fast exact LLM serving (Apple Silicon build of tqserve)"
+description = "tqLLM: fast exact LLM serving (tqserve for Apple Silicon and Linux with NVIDIA)"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
-dependencies = []
+# Linux: the CUDA 13 libraries tqserve links (sonames .13 / .12, all in site-packages/nvidia/cu13/lib)
+dependencies = [
+  "nvidia-cuda-runtime>=13,<14; sys_platform == 'linux'",
+  "nvidia-cublas>=13,<14; sys_platform == 'linux'",
+  "nvidia-cusolver>=12,<13; sys_platform == 'linux'",
+  "nvidia-cusparse>=12,<13; sys_platform == 'linux'",
+  "nvidia-nvjitlink>=13,<14; sys_platform == 'linux'",
+  "huggingface_hub>=0.24; sys_platform == 'linux'",
+]
 
 [project.optional-dependencies]
 # the C++ ABI of MLX changes between releases: the wheel runs against the exact MLX it was built with
@@ -27,6 +35,7 @@ Source = "https://github.com/turbo-tan/tqllm"
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 wheel.packages = ["python/tqllm"]
+wheel.py-api = "py3"  # tqserve is a program, not a Python extension: one wheel for every Python 3
 build.targets = ["tqserve"]
 install.components = ["wheel"]
 cmake.build-type = "Release"
@@ -35,3 +44,9 @@ cmake.build-type = "Release"
 TQLLM_CUDA = "OFF"
 TQLLM_MLX = "ON"
 BUILD_TESTING = "OFF"
+
+# Linux wheel: the CUDA engine instead of MLX (GPU targets from the build environment: CMAKE_ARGS=-DCMAKE_CUDA_ARCHITECTURES=...)
+[[tool.scikit-build.overrides]]
+if.platform-system = "linux"
+cmake.define.TQLLM_CUDA = "ON"
+cmake.define.TQLLM_MLX = "OFF"
