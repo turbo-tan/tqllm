@@ -1102,6 +1102,9 @@ if(BUILD_TESTING)
   add_executable(test-inkling2-spec-policy tests/inkling2_spec_policy.cpp)  # Inkling-2-Mini: spec / plain step choice
   target_include_directories(test-inkling2-spec-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
   add_test(NAME inkling2-spec-policy COMMAND test-inkling2-spec-policy)
+  add_executable(test-inkling2-residency tests/inkling2_residency.cpp)  # Inkling-2: resident experts re-planned in plain and drafted decode (#106)
+  target_include_directories(test-inkling2-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2/loop)
+  add_test(NAME inkling2-residency COMMAND test-inkling2-residency)
   add_executable(test-inkling2-prompt tests/inkling2_prompt.cpp)  # Inkling-2-Mini: chat template + tokenizer == the reference's input_ids
   target_include_directories(test-inkling2-prompt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/serve)
   target_link_libraries(test-inkling2-prompt PRIVATE tqjinja tqllm)

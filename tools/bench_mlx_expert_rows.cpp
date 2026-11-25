@@ -83,6 +83,32 @@ int main(int argc, char** argv) {
         // the row-invariant kernels the engine runs (decode and verify): gate_up with the fused SwiGLU, then down
         report("inkling2_rows gate_up+swiglu", time_ms([&] { return inkling2_rows_experts(x, tk, s, gu.codes, gu.scales, gu.global, bits, true, 4.f, 25.f); }, reps), bytes_gu);
         report("inkling2_rows down", time_ms([&] { return inkling2_rows_experts(a, mx::arange(P, mx::uint32), s, dn.codes, dn.scales, dn.global, bits); }, reps), bytes_dn);
+        if (bits == 4) {  // wide lanes: time, closeness to the 16-weight kernel, and row invariance (a pair alone == in the block)
+            using tqllm::mlx_backend::inkling2_rows_experts4;
+            for (int wsg : {2, 4, 8}) {
+                const std::string tag = " sg" + std::to_string(wsg);
+                report(("wide gate_up+swiglu" + tag).c_str(), time_ms([&] { return inkling2_rows_experts4(x, tk, s, gu.codes, gu.scales, *gu.global, true, 4.f, 25.f, wsg); }, reps), bytes_gu);
+                report(("wide down" + tag).c_str(), time_ms([&] { return inkling2_rows_experts4(a, mx::arange(P, mx::uint32), s, dn.codes, dn.scales, *dn.global, false, 0.f, 0.f, wsg); }, reps), bytes_dn);
+            }
+            auto v1 = inkling2_rows_experts(a, mx::arange(P, mx::uint32), s, dn.codes, dn.scales, dn.global, bits);
+            auto v2 = inkling2_rows_experts4(a, mx::arange(P, mx::uint32), s, dn.codes, dn.scales, *dn.global);
+            auto g1 = inkling2_rows_experts(x, tk, s, gu.codes, gu.scales, gu.global, bits, true, 4.f, 25.f);
+            auto g2 = inkling2_rows_experts4(x, tk, s, gu.codes, gu.scales, *gu.global, true, 4.f, 25.f);
+            auto rel = [](const mx::array& u, const mx::array& v) {
+                auto d = mx::max(mx::abs(mx::astype(u, mx::float32) - mx::astype(v, mx::float32)));
+                auto m = mx::max(mx::abs(mx::astype(u, mx::float32)));
+                return mx::divide(d, m).item<float>();
+            };
+            int same = 0, tried = 0;
+            for (int i = 0; i < P; i += 7) {
+                ++tried;
+                auto one = inkling2_rows_experts4(x, mx::slice(tk, {i}, {i + 1}), mx::slice(s, {i}, {i + 1}), gu.codes, gu.scales, *gu.global, true, 4.f, 25.f);
+                auto inb = mx::slice(g2, {i, 0}, {i + 1, I});
+                same += mx::array_equal(one, inb).item<bool>();
+            }
+            std::printf("EXPERT_ROWS wide check: down rel diff vs 16-weight %.2e, gate_up+swiglu %.2e; row alone == in block %d / %d\n",
+                        rel(v2, v1), rel(g2, g1), same, tried);
+        }
         for (auto [sg, to] : std::vector<std::pair<int, int>>{{2, 2}, {8, 2}, {8, 4}}) {
             const std::string tag = " sg" + std::to_string(sg) + " to" + std::to_string(to);
             report(("simd gate_up+swiglu" + tag).c_str(), time_ms([&] { return inkling2_rows_experts(x, tk, s, gu.codes, gu.scales, gu.global, bits, true, 4.f, 25.f, sg, to); }, reps), bytes_gu);
