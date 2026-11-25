@@ -45,7 +45,7 @@ TQLLM_CUDA = "OFF"
 TQLLM_MLX = "ON"
 BUILD_TESTING = "OFF"
 
-# Linux wheel: the CUDA engine instead of MLX (CMAKE_CUDA_ARCHITECTURES comes from the build environment, CUDAARCHS)
+# Linux wheel: the CUDA engine instead of MLX (GPU targets from the build environment: CMAKE_ARGS=-DCMAKE_CUDA_ARCHITECTURES=...)
 [[tool.scikit-build.overrides]]
 if.platform-system = "linux"
 cmake.define.TQLLM_CUDA = "ON"
