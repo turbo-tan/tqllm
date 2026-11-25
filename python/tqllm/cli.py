@@ -334,6 +334,8 @@ def server_command(args, mac, native=None):
         return [str(exe)] + serve_args(args)
     if sys.platform != "linux":
         raise SystemExit("tqllm serve runs on Apple Silicon Macs and on Linux with an NVIDIA card")
+    if not native and server().exists():  # pip install tqllm on Linux: the packaged CUDA tqserve
+        native = str(server())
     if not native and not shutil.which("docker"):
         raise SystemExit("Docker is not installed: install it with the NVIDIA container toolkit, or pass --native PATH/tqserve")
     return linux_command(args, native=native)
