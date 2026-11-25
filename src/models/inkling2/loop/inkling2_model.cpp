@@ -491,7 +491,17 @@ struct Inkling2Model::Impl {
                          double(size_t(tqt_group) * tqt_per_expert_bytes()) / 1e9, resident_share, E_);
         // big cards (>= 96 GB): BF16 prompt copies for the cuBLAS path, allocated after the quantized stacks are placed
         // (the pinned host copies are free again then); a failed allocation keeps the WMMA path
-        if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX) {
+        // Only with room to spare: on unified memory (GB10) an allocation past what is free does not fail cleanly, the
+        // system runs out (a 1.8.0 release check rebooted a GB10 at this step with another job holding ~50 GB)
+        size_t bf16_need = 0, bf16_free = 0, bf16_tot = 0;
+        for (const auto & Y : Ls) bf16_need += Y.eg.bf16_bytes() * 2 + Y.ed.bf16_bytes();
+        bf16_need += size_t(chunk) * topk * (D * 4 + 2 * I * 2 + 4);
+        if (cudaMemGetInfo(&bf16_free, &bf16_tot) != cudaSuccess) bf16_free = 0;
+        const bool bf16_fits = bf16_free >= bf16_need + (size_t(16) << 30);
+        if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX && !bf16_fits)
+            std::fprintf(stderr, "inkling2: BF16 prompt copies skipped (%.1f GB needed + 16 GB headroom, %.1f GB free): quantized prompt path\n",
+                         double(bf16_need) / 1e9, double(bf16_free) / 1e9);
+        if (!fp4_experts && dev_mem >= (size_t(96) << 30) && expert_budget == SIZE_MAX && bf16_fits) {
             try {
                 const size_t A = size_t(chunk) * topk;
                 xg = Dev(A * D * 2); guo = Dev(A * 2 * I * 2); ygo = Dev(A * D * 2); ginv = Dev(A * 4);
