@@ -4,6 +4,7 @@
 // tiers the same refill takes that room (3090 after a 30K prompt: 75 MB free, out of memory in decode), and where even
 // that is short it evicts other layers' banks (each step one bank evicted the next: 67 -> 4.9 tok/s).
 #include "tq3_expert_cache.hpp"
+#include "device_cap.h"
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -20,6 +21,9 @@ int main() {
     {   int dev = 0, shared = 0; cudaGetDevice(&dev);
         if (cudaDeviceGetAttribute(&shared, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) == cudaSuccess && shared) {
             std::printf("expert slot tiers: skipped (device memory is system memory)\n"); return 77; } }
+    // the scenarios fill a 2 GB device (device_cap.h): on the real one the desktop sharing the card frees and retakes tens
+    // of MB while it is full, more than the few slots the even split and the regrow margin are checked to
+    device_cap::limit(size_t(2) << 30);
     const int layers = 4, experts = 96, hidden = 2560, ff = 640, target = 40, floor = 8;
     const std::array<uint32_t, 3> types{18, 18, 20};
     std::vector<std::array<std::vector<char>, 3>> raw(size_t(layers) * experts);
