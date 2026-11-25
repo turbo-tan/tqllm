@@ -62,6 +62,8 @@ public:
     }
     bool has_drafter() const override { return mtp_; }
     bool native_mtp() const override { return mtp_; }
+    // the engine picks each step's drafts (Inkling2SpecPolicy): tqserve then passes depth 0, not the MTP default of 4
+    bool adaptive_depth() const override { return mtp_; }
     void set_ignore_eos(bool on) override { ignore_eos_ = on; }
     void set_sampling(float temperature, float top_p, int top_k, uint64_t seed, float) override {
         temp_ = temperature > 0.f ? temperature : 0.f;
