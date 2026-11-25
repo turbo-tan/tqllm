@@ -15,6 +15,13 @@ tqllm                # first run downloads the model and drafter (~17 GB), then 
 tqllm stop           # stops the server
 ```
 
+or pip (macOS 26, Apple Silicon, Python 3.10-3.13; the wheel carries `tqserve` built against MLX 0.32.4):
+
+```sh
+pip install "tqllm[mlx]"
+tqllm serve
+```
+
 or the one-line installer (tries Homebrew, then pip in a venv under `~/.tqllm`, then a source build; `--check` reports
 which route will work without installing; `--index-url URL` or `--wheels DIR` for networks that block PyPI):
 
