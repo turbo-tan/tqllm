@@ -36,6 +36,14 @@ namespace fntk {
 constexpr int kGroup = 640;
 // TQ4 / TQT rotation signs (tqv12.py sign_vec: bit i % 32 of S1[i / 32] set -> -1)
 __constant__ uint32_t kS1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};  // = tqv12.py S1, tq4k::S1
+// FNT-kX: 5-point Hartley transform cas(2 pi i j / 5) / sqrt(5) across the 5 blocks of a 640-group (symmetric, orthogonal:
+// its own inverse), FP32 (the same constants in dequant.cpp and fnt_quant.py's encoder basis)
+__constant__ float kH5[25] = {
+    0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f,
+    0x1.c9f25cp-2f, 0x1.2085f4p-1f, -0x1.953fd8p-4f, -0x1.3fd49cp-1f, -0x1.260518p-2f,
+    0x1.c9f25cp-2f, -0x1.953fd8p-4f, -0x1.260518p-2f, 0x1.2085f4p-1f, -0x1.3fd49cp-1f,
+    0x1.c9f25cp-2f, -0x1.3fd49cp-1f, 0x1.2085f4p-1f, -0x1.260518p-2f, -0x1.953fd8p-4f,
+    0x1.c9f25cp-2f, -0x1.260518p-2f, -0x1.3fd49cp-1f, -0x1.953fd8p-4f, 0x1.2085f4p-1f};
 
 __device__ __forceinline__ uint32_t code16(uint32_t w) {
     const uint32_t y = (w * 0x9E3779B1u + 0x7F4A7C15u) & 0xFFFFu;
@@ -87,6 +95,40 @@ __device__ __forceinline__ void unrot128(float (&v)[4], int lane) {
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] = v[j] * 0.08838834764831845f * sign_of(4 * lane + j);
+}
+// FNT-kX: v[b][j] (5 blocks of a 640-group, lane's elements 4l + j) -> sum over b' of kH5[b][b'] v[b'][j], FMA chain in b' order
+__device__ __forceinline__ void mix5(float (&v)[5][4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {  // per element: 5 temporaries (register pressure of the 3-CTA kernels)
+        float o[5];
+#pragma unroll
+        for (int b = 0; b < 5; ++b) {
+            float a = kH5[b * 5] * v[0][j];
+#pragma unroll
+            for (int c = 1; c < 5; ++c) a = fmaf(kH5[b * 5 + c], v[c][j], a);
+            o[b] = a;
+        }
+#pragma unroll
+        for (int b = 0; b < 5; ++b) v[b][j] = o[b];
+    }
+}
+// warp: one 640-group of an FP16 input row in the FNT-kX basis (rot128 per block in FP32, then mix5), rounded to FP16 once
+__device__ __noinline__ void stage_group_mix(const __half * src, __half * dst, int lane) {  // not inlined: keeps the 3-CTA kernels within 80 registers
+    float v[5][4];
+#pragma unroll
+    for (int b = 0; b < 5; ++b) {
+        const __half2 * s2 = reinterpret_cast<const __half2 *>(src + b * 128 + 4 * lane);
+        const float2 p0 = __half22float2(s2[0]), p1 = __half22float2(s2[1]);
+        v[b][0] = p0.x; v[b][1] = p0.y; v[b][2] = p1.x; v[b][3] = p1.y;
+        rot128(v[b], lane);
+    }
+    mix5(v);
+#pragma unroll
+    for (int b = 0; b < 5; ++b) {
+        __half2 * d2 = reinterpret_cast<__half2 *>(dst + b * 128 + 4 * lane);
+        d2[0] = __floats2half2_rn(v[b][0], v[b][1]);
+        d2[1] = __floats2half2_rn(v[b][2], v[b][3]);
+    }
 }
 template <class T> __device__ __forceinline__ T out_cast(float v) {
     if constexpr (std::is_same_v<T, float>) return v;
@@ -172,23 +214,38 @@ __device__ __forceinline__ void mma_pass(const uint32_t * __restrict__ w, const 
 // shared layout: xs [kCols][cols + kXPad] FP16, then red [8 warps][32][4] F32
 __host__ __device__ constexpr size_t mma_smem(int cols) { return size_t(kCols) * (cols + kXPad) * 2 + 8 * 32 * 4 * 4; }
 // stage nc columns (input rows in_rows[c]) rotated; columns nc..7 zero
+template <bool MIX>
 __device__ __forceinline__ void stage_cols(__half * xs, const __half * x, const int * in_rows, int nc, int cols) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32, nb = cols / 128, xstride = cols + kXPad;
-    for (int q = warp; q < kCols * nb; q += 8) {
-        const int c = q / nb, b = q % nb;
-        __half2 * dst = reinterpret_cast<__half2 *>(xs + c * xstride + b * 128 + 4 * lane);
-        if (c >= nc) { dst[0] = dst[1] = __floats2half2_rn(0.f, 0.f); continue; }
-        const __half2 * src = reinterpret_cast<const __half2 *>(x + int64_t(in_rows[c]) * cols + b * 128 + 4 * lane);
-        const float2 p0 = __half22float2(src[0]), p1 = __half22float2(src[1]);
-        float v[4] = {p0.x, p0.y, p1.x, p1.y};
-        rot128(v, lane);
-        dst[0] = __floats2half2_rn(v[0], v[1]);
-        dst[1] = __floats2half2_rn(v[2], v[3]);
+    if constexpr (MIX) {  // warp per (column, 640-group)
+        const int ng = cols / kGroup;
+        for (int q = warp; q < kCols * ng; q += 8) {
+            const int c = q / ng, gi = q % ng;
+            __half * dst = xs + c * xstride + gi * kGroup;
+            if (c >= nc) {
+#pragma unroll
+                for (int b = 0; b < 5; ++b) { __half2 * d2 = reinterpret_cast<__half2 *>(dst + b * 128 + 4 * lane); d2[0] = d2[1] = __floats2half2_rn(0.f, 0.f); }
+                continue;
+            }
+            stage_group_mix(x + int64_t(in_rows[c]) * cols + gi * kGroup, dst, lane);
+        }
+    } else {
+        for (int q = warp; q < kCols * nb; q += 8) {
+            const int c = q / nb, b = q % nb;
+            __half2 * dst = reinterpret_cast<__half2 *>(xs + c * xstride + b * 128 + 4 * lane);
+            if (c >= nc) { dst[0] = dst[1] = __floats2half2_rn(0.f, 0.f); continue; }
+            const __half2 * src = reinterpret_cast<const __half2 *>(x + int64_t(in_rows[c]) * cols + b * 128 + 4 * lane);
+            const float2 p0 = __half22float2(src[0]), p1 = __half22float2(src[1]);
+            float v[4] = {p0.x, p0.y, p1.x, p1.y};
+            rot128(v, lane);
+            dst[0] = __floats2half2_rn(v[0], v[1]);
+            dst[1] = __floats2half2_rn(v[2], v[3]);
+        }
     }
 }
 // work item -> (expert, up to 8 (input row, output row) pairs); MODE 0: assignment a = blockIdx.y (ids, topk; id -1 skipped);
 // 1: dedup map entry; 2: moe_group lists (the expert's tokens 8 at a time)
-template <int KB, int MODE, class T>
+template <int KB, int MODE, class T, bool MIX>
 __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
                                                 const __half * __restrict__ x, T * __restrict__ y, int rows, int cols,
                                                 int experts, const int * __restrict__ ids, int topk, bool per_expert,
@@ -224,7 +281,7 @@ __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __
                 in_rows[threadIdx.x] = in; out_rows[threadIdx.x] = o;
             }
             __syncthreads();
-            stage_cols(xs, x, in_rows, nc, cols);
+            stage_cols<MIX>(xs, x, in_rows, nc, cols);
             __syncthreads();
             float v[4]; bool valid;
             mma_pass<KB>(w, sc, xs, int64_t(bad ? 0 : expert) * rows + row0, rows_left, cols, red, v, valid);
@@ -243,7 +300,7 @@ __global__ void __launch_bounds__(256, KB % 2 ? 2 : 3) k_mma(const uint32_t * __
 // k_mma: the same block MMAs per group, product s * tmp per group, the groups summed in order (cols 640 and 2560).
 constexpr int kGemmTok = 32;
 __host__ __device__ constexpr size_t gemm_smem() { return size_t(kGemmTok) * (kGroup + kXPad) * 2; }
-template <int KB>
+template <int KB, bool MIX>
 __global__ void __launch_bounds__(256, 2) k_gemm(const uint32_t * __restrict__ w, const __half * __restrict__ sc,
                                                  const __half * __restrict__ x, __nv_bfloat16 * __restrict__ y, int rows,
                                                  int cols, const int * __restrict__ counts, const int * __restrict__ groups,
@@ -268,6 +325,17 @@ __global__ void __launch_bounds__(256, 2) k_gemm(const uint32_t * __restrict__ w
     float c[NT][4] = {};
     for (int gi = 0; gi < ng; ++gi) {
         __syncthreads();  // in_rows written / the previous group's inputs read
+        if constexpr (MIX) {  // warp per token: the group's 5 blocks in the FNT-kX basis
+            for (int tok = warp; tok < kGemmTok; tok += 8) {
+                __half * dst = xs + tok * XS;
+                if (tok >= nc) {
+#pragma unroll
+                    for (int b = 0; b < 5; ++b) { __half2 * d2 = reinterpret_cast<__half2 *>(dst + b * 128 + 4 * lane); d2[0] = d2[1] = __floats2half2_rn(0.f, 0.f); }
+                    continue;
+                }
+                stage_group_mix(x + int64_t(in_rows[tok]) * cols + gi * kGroup, dst, lane);
+            }
+        } else
         for (int q = warp; q < kGemmTok * 5; q += 8) {  // stage the group's 5 blocks of every token, rotated
             const int tok = q / 5, b = q % 5;
             __half2 * dst = reinterpret_cast<__half2 *>(xs + tok * XS + b * 128 + 4 * lane);
@@ -337,6 +405,30 @@ __global__ void k_dequant(const uint32_t * __restrict__ w, const __half * __rest
     dst[0] = __floats2half2_rn(v[0], v[1]);
     dst[1] = __floats2half2_rn(v[2], v[3]);
 }
+// FNT-kX: warp per (row, 640-group): decode the 5 blocks, scale, unmix (mix5 is its own inverse), unrotate, round
+template <int KB>
+__global__ void k_dequant_mix(const uint32_t * __restrict__ w, const __half * __restrict__ sc, __half * __restrict__ out,
+                              int rows, int cols) {
+    const int lane = threadIdx.x & 31;
+    const int64_t t = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32, ng = cols / kGroup;
+    if (t >= int64_t(rows) * ng) return;
+    const float s = __half2float(sc[t]);  // scales [rows][cols / 640]: index row * ng + group = t
+    float v[5][4];
+#pragma unroll
+    for (int b = 0; b < 5; ++b) {
+        lane_w<KB>(w + (t * 5 + b) * 2 * KB, lane, v[b]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[b][j] *= s;
+    }
+    mix5(v);
+#pragma unroll
+    for (int b = 0; b < 5; ++b) {
+        unrot128(v[b], lane);
+        __half2 * dst = reinterpret_cast<__half2 *>(out + t * kGroup + b * 128 + 4 * lane);
+        dst[0] = __floats2half2_rn(v[b][0], v[b][1]);
+        dst[1] = __floats2half2_rn(v[b][2], v[b][3]);
+    }
+}
 void check(int kb, const void * w, const void * sc, const void * x, const void * y, int rows, int cols) {
     if (kb < 4 || kb > 7 || !w || !sc || !x || !y || rows <= 0 || cols <= 0 || cols % kGroup)
         throw std::invalid_argument("FNT: invalid pointer, bit rate or shape");
@@ -346,16 +438,17 @@ void check(int kb, const void * w, const void * sc, const void * x, const void *
 #define FNT_KB(kb, F) switch (kb) { case 4: F(4); break; case 5: F(5); break; case 6: F(6); break; default: F(7); break; }
 
 template <int MODE, class T>
-static void launch_mma(int kb, const void * w, const __half * sc, const __half * x, T * y, int rows, int cols, int experts,
+static void launch_mma(bool mix, int kb, const void * w, const __half * sc, const __half * x, T * y, int rows, int cols, int experts,
                        const int * ids, int topk, bool per_expert, const int * dmap, int ngroups, const int * counts,
                        const int * groups, int capacity, unsigned gy, cudaStream_t s) {
     const int KG = cols >= 2560 ? 4 : cols >= 1280 ? 2 : 1, RT = 8 / KG;
     const dim3 grid(unsigned((rows + RT * 16 - 1) / (RT * 16)), gy);
     const size_t smem = fntk::mma_smem(cols);
-    static bool attr[4] = {};
+    static bool attr[8] = {};
 #define L(K) do { \
-        auto kern = fntk::k_mma<K, MODE, T>; \
-        if (smem > 48 * 1024 && !attr[K - 4]) { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr[K - 4] = true; } \
+        auto kern = mix ? fntk::k_mma<K, MODE, T, true> : fntk::k_mma<K, MODE, T, false>; \
+        const int ai = (K - 4) + (mix ? 4 : 0); \
+        if (smem > 48 * 1024 && !attr[ai]) { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr[ai] = true; } \
         kern<<<grid, 256, smem, s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, experts, ids, topk, per_expert, dmap, ngroups, counts, groups, capacity); \
     } while (0)
     FNT_KB(kb, L)
@@ -364,26 +457,26 @@ static void launch_mma(int kb, const void * w, const __half * sc, const __half *
 static void check_cols(int cols) {
     if (cols != 640 && cols != 1280 && cols != 2560) throw std::invalid_argument("FNT: kernels take rows of 640, 1280 or 2560");
 }
-void fnt_expert_matvec(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
+void fnt_expert_matvec(bool mix, int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                        int experts, const int * ids, int n, int topk, bool per_expert, cudaStream_t s) {
     fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (n <= 0 || topk <= 0 || int64_t(n) * topk > 65535 || experts <= 0 || int64_t(experts) * rows > INT_MAX)
         throw std::invalid_argument("FNT: invalid expert grid");
-    launch_mma<0>(kb, w, sc, x, y, rows, cols, experts, ids, topk, per_expert, nullptr, 0, nullptr, nullptr, 0, unsigned(n * topk), s);
+    launch_mma<0>(mix, kb, w, sc, x, y, rows, cols, experts, ids, topk, per_expert, nullptr, 0, nullptr, nullptr, 0, unsigned(n * topk), s);
 }
-void fnt_matvec_f32(int kb, const void * w, const __half * sc, const __half * x, float * y, int rows, int cols, int n, cudaStream_t s) {
+void fnt_matvec_f32(bool mix, int kb, const void * w, const __half * sc, const __half * x, float * y, int rows, int cols, int n, cudaStream_t s) {
     fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (n <= 0 || n > 65535) throw std::invalid_argument("FNT: invalid column count");
-    launch_mma<0>(kb, w, sc, x, y, rows, cols, 1, nullptr, 1, true, nullptr, 0, nullptr, nullptr, 0, unsigned(n), s);
+    launch_mma<0>(mix, kb, w, sc, x, y, rows, cols, 1, nullptr, 1, true, nullptr, 0, nullptr, nullptr, 0, unsigned(n), s);
 }
-void fnt_expert_dedup(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
+void fnt_expert_dedup(bool mix, int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                       const int * dmap, int groups, cudaStream_t s) {
     fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (!dmap || groups <= 0 || groups > 65535) throw std::invalid_argument("FNT: invalid dedup map");
-    launch_mma<1>(kb, w, sc, x, y, rows, cols, 0, nullptr, 1, true, dmap, groups, nullptr, nullptr, 0,
+    launch_mma<1>(mix, kb, w, sc, x, y, rows, cols, 0, nullptr, 1, true, dmap, groups, nullptr, nullptr, 0,
                   unsigned(std::min(groups, kDedupGridGroups)), s);
 }
-void fnt_expert_grouped(int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
+void fnt_expert_grouped(bool mix, int kb, const void * w, const __half * sc, const __half * x, __nv_bfloat16 * y, int rows, int cols,
                         const int * counts, const int * groups, int capacity, int experts, int topk, bool per_expert, cudaStream_t s) {
     fntk::check(kb, w, sc, x, y, rows, cols); check_cols(cols);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * rows > INT_MAX)
@@ -391,15 +484,17 @@ void fnt_expert_grouped(int kb, const void * w, const __half * sc, const __half 
     const unsigned ty = unsigned((capacity + fntk::kGemmTok - 1) / fntk::kGemmTok);
     if (ty > 65535) throw std::invalid_argument("FNT: grouped capacity too large");
     const dim3 grid(unsigned((rows + 127) / 128), ty, unsigned(experts));
-#define L(K) fntk::k_gemm<K><<<grid, 256, fntk::gemm_smem(), s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, counts, groups, capacity, topk, per_expert)
+#define L(K) do { if (mix) fntk::k_gemm<K, true><<<grid, 256, fntk::gemm_smem(), s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, counts, groups, capacity, topk, per_expert); \
+                   else fntk::k_gemm<K, false><<<grid, 256, fntk::gemm_smem(), s>>>(static_cast<const uint32_t *>(w), sc, x, y, rows, cols, counts, groups, capacity, topk, per_expert); } while (0)
     FNT_KB(kb, L)
 #undef L
 }
-void fnt_dequant_h(int kb, const void * w, const __half * sc, __half * out, int rows, int cols, cudaStream_t s) {
+void fnt_dequant_h(bool mix, int kb, const void * w, const __half * sc, __half * out, int rows, int cols, cudaStream_t s) {
     fntk::check(kb, w, sc, out, out, rows, cols);
-    const int64_t warps = int64_t(rows) * (cols / 128);
+    const int64_t warps = int64_t(rows) * (cols / (mix ? 640 : 128));
     if ((warps + 7) / 8 > INT_MAX) throw std::invalid_argument("FNT: dequant grid overflow");
-#define L(K) fntk::k_dequant<K><<<unsigned((warps + 7) / 8), 256, 0, s>>>(static_cast<const uint32_t *>(w), sc, out, rows, cols)
+#define L(K) do { if (mix) fntk::k_dequant_mix<K><<<unsigned((warps + 7) / 8), 256, 0, s>>>(static_cast<const uint32_t *>(w), sc, out, rows, cols); \
+                   else fntk::k_dequant<K><<<unsigned((warps + 7) / 8), 256, 0, s>>>(static_cast<const uint32_t *>(w), sc, out, rows, cols); } while (0)
     FNT_KB(kb, L)
 #undef L
 }

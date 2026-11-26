@@ -158,6 +158,7 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
         case GGML_TQT2:   elems = 128; bytes = 34;  return true;  // TQLLM: FP16 scale + 32 B 2-bit trellis stream
         case GGML_TQT3:   elems = 128; bytes = 50;  return true;  // TQLLM: FP16 scale + 48 B 3-bit trellis stream
         case GGML_FNT4: case GGML_FNT5: case GGML_FNT6: case GGML_FNT7:  // TQLLM: FP16 scale + 5 x k * 8 B trellis streams
+        case GGML_FNT4X: case GGML_FNT5X: case GGML_FNT6X: case GGML_FNT7X:
             elems = 640; bytes = 2 + 40 * uint64_t(gguf_fnt_kb(type)); return true;
         default: return false;
     }
@@ -317,7 +318,7 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
     const bool tqt3_c1 = tqt3 != f.kv.end();
     if (tqt3_c1 && tqt3->second.str != "tqt3-c1-v1")
         throw std::runtime_error("GGUF " + path + ": TQT3 code \"" + tqt3->second.str + "\" is not supported (this build has tqt3-c1-v1)");
-    // FNT files: tensor types 330-333 + the code tag
+    // FNT files: tensor types 330-333 / 338-341 + the code tag
     const auto fnt = f.kv.find("tqllm.fnt.code");
     const bool fnt_c2 = fnt != f.kv.end();
     if (fnt_c2 && fnt->second.str != "fnt-c2w16-v1")

@@ -53,9 +53,13 @@ enum GgmlType : uint32_t {
     // Hadamard basis, one FP16 scale per 640 weights; docs/reference/formats.md "FNT"): 640 weights = FP16 scale + 5 x k * 8
     // stream bytes. Only together with the key tqllm.fnt.code = "fnt-c2w16-v1".
     GGML_FNT4 = 330, GGML_FNT5 = 331, GGML_FNT6 = 332, GGML_FNT7 = 333,
+    // FNT-kX: the same streams and scales in a basis that also mixes the 5 blocks of each 640-group (5-point Hartley
+    // transform after the 128-block Hadamard; docs/reference/formats.md "FNT"), same code tag
+    GGML_FNT4X = 338, GGML_FNT5X = 339, GGML_FNT6X = 340, GGML_FNT7X = 341,
 };
-inline bool gguf_is_fnt(uint32_t t) { return t >= GGML_FNT4 && t <= GGML_FNT7; }
-inline int gguf_fnt_kb(uint32_t t) { return int(t - GGML_FNT4) + 4; }
+inline bool gguf_fnt_mix(uint32_t t) { return t >= GGML_FNT4X && t <= GGML_FNT7X; }
+inline bool gguf_is_fnt(uint32_t t) { return (t >= GGML_FNT4 && t <= GGML_FNT7) || gguf_fnt_mix(t); }
+inline int gguf_fnt_kb(uint32_t t) { return int(t - (gguf_fnt_mix(t) ? GGML_FNT4X : GGML_FNT4)) + 4; }
 
 
 struct GgufTensor {

@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- FNT-kX (GGUF types 338-341): FNT-k streams in a basis that also mixes the 5 blocks of each 640-group (5-point Hartley
+  transform after the 128-block Hadamard), in every FNT kernel, `dequantize_host` and tests/fnt_format.cu (bit-exact
+  as FNT-k). The mixed staging is also faster: `expert-dedup-bench` (RTX 3090, 16 experts x 2 columns) gate / up FNT4
+  23.0 -> 19.8 us, FNT5 26.2 -> 23.5 us; down FNT7 23.6 -> 23.8 us, FNT6 22.9 -> 26.9 us.
+
 ## 1.8.3 (2026-11-25)
 
 ### Fixed

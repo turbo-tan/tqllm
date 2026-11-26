@@ -461,20 +461,29 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         }
-        case GGML_FNT4: case GGML_FNT5: case GGML_FNT6: case GGML_FNT7: {
-            // docs/reference/formats.md "FNT" (fnt-c2w16-v1): decoded, scaled (FP32 product) and rotated back to the plain
-            // basis with fnt.cu's butterfly order (stages h = 1, 2, ..., 64, then / sqrt(128) and the TQ4 signs)
+        case GGML_FNT4: case GGML_FNT5: case GGML_FNT6: case GGML_FNT7:
+        case GGML_FNT4X: case GGML_FNT5X: case GGML_FNT6X: case GGML_FNT7X: {
+            // docs/reference/formats.md "FNT" (fnt-c2w16-v1): decoded, scaled (FP32 product), for FNT-kX unmixed across the
+            // group's 5 blocks (fnt.cu mix5: FMA chain in block order) and rotated back to the plain basis with fnt.cu's
+            // butterfly order (stages h = 1, 2, ..., 64, then / sqrt(128) and the TQ4 signs)
             if (n < 0 || n % 640) break;
             const int kb = gguf_fnt_kb(type), sb = kb * 8;
+            const bool mix = gguf_fnt_mix(type);
             static const uint32_t S1[4] = {0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u};
+            static const float H5[25] = {
+                0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f, 0x1.c9f25cp-2f,
+                0x1.c9f25cp-2f, 0x1.2085f4p-1f, -0x1.953fd8p-4f, -0x1.3fd49cp-1f, -0x1.260518p-2f,
+                0x1.c9f25cp-2f, -0x1.953fd8p-4f, -0x1.260518p-2f, 0x1.2085f4p-1f, -0x1.3fd49cp-1f,
+                0x1.c9f25cp-2f, -0x1.3fd49cp-1f, 0x1.2085f4p-1f, -0x1.260518p-2f, -0x1.953fd8p-4f,
+                0x1.c9f25cp-2f, -0x1.260518p-2f, -0x1.3fd49cp-1f, -0x1.953fd8p-4f, 0x1.2085f4p-1f};
             auto h16 = [](uint32_t v) { return half_to_float(uint16_t(v)); };
             for (int64_t g = 0; g < n / 640; ++g) {
                 const uint8_t * blk = s + g * (2 + 5 * sb);
                 uint16_t hs; std::memcpy(&hs, blk, 2);
                 const float d = half_to_float(hs);
+                float v[5][128];
                 for (int b = 0; b < 5; ++b) {
                     const uint8_t * B = blk + 2 + b * sb;
-                    float v[128];
                     uint8_t E[64];  // the stream + its first 4 bytes again (the windows wrap inside the block)
                     std::memcpy(E, B, sb); std::memcpy(E + sb, B, 4);
                     for (int p = 0; p < 64; ++p) {
@@ -484,14 +493,27 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
                         const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
                         const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
                         for (int e = 0; e < 2; ++e)
-                            v[2 * p + e] = half_to_float(float_to_half(h16(h1 >> (16 * e)) + h16(h2 >> (16 * e)))) * d;
+                            v[b][2 * p + e] = half_to_float(float_to_half(h16(h1 >> (16 * e)) + h16(h2 >> (16 * e)))) * d;
                     }
+                }
+                if (mix)
+                    for (int i = 0; i < 128; ++i) {
+                        float o[5];
+                        for (int b = 0; b < 5; ++b) {
+                            float a = H5[b * 5] * v[0][i];
+                            for (int c = 1; c < 5; ++c) a = std::fma(H5[b * 5 + c], v[c][i], a);
+                            o[b] = a;
+                        }
+                        for (int b = 0; b < 5; ++b) v[b][i] = o[b];
+                    }
+                for (int b = 0; b < 5; ++b) {
+                    float * u = v[b];
                     for (int h = 1; h < 128; h *= 2)
                         for (int i = 0; i < 128; ++i)
-                            if (!(i & h)) { const float a = v[i], c = v[i + h]; v[i] = a + c; v[i + h] = a - c; }
+                            if (!(i & h)) { const float a = u[i], c = u[i + h]; u[i] = a + c; u[i + h] = a - c; }
                     for (int i = 0; i < 128; ++i) {
-                        const float u = v[i] * 0.08838834764831845f;
-                        dst[g * 640 + b * 128 + i] = (S1[i / 32] >> (i % 32)) & 1u ? -u : u;
+                        const float q = u[i] * 0.08838834764831845f;
+                        dst[g * 640 + b * 128 + i] = (S1[i / 32] >> (i % 32)) & 1u ? -q : q;
                     }
                 }
             }

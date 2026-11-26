@@ -3,7 +3,8 @@
 //    funnel shifts), rounded to FP16: bit-identical;
 //  - dequantize_host (the CPU fallback / cold store) equals the same oracle in FP32: bit-identical;
 //  - expert_matvec agrees with a double oracle (rotated FP16 inputs) and the plain-basis double product within FP error;
-//  - dedup, grouped (prefill) and the plain matvec give the bits of expert_matvec per column; invalid ids give NaN.
+//  - dedup, grouped (prefill) and the plain matvec give the bits of expert_matvec per column; invalid ids give NaN;
+//  - the same for FNT-kX (types 338-341: the 5 blocks of each 640-group mixed by a 5-point Hartley transform).
 #include "weight_format.hpp"
 #include "gguf.hpp"
 #include "dequant.hpp"
@@ -60,18 +61,36 @@ static void unrot(float * v) {
             if (!(i & h)) { const float a = v[i], c = v[i + h]; v[i] = a + c; v[i + h] = a - c; }
     for (int i = 0; i < 128; ++i) v[i] = v[i] * 0.08838834764831845f * sgn(i);
 }
-static void rot_h(const __half * x, __half * o) {  // forward rotation of one 128-block, rounded to FP16 (fnt.cu stage_rot)
-    float v[128];
+static void rot_f(const __half * x, float * v) {  // forward rotation of one 128-block in FP32
     for (int i = 0; i < 128; ++i) v[i] = __half2float(x[i]) * sgn(i);
     for (int h = 1; h < 128; h *= 2)
         for (int i = 0; i < 128; ++i)
             if (!(i & h)) { const float a = v[i], c = v[i + h]; v[i] = a + c; v[i + h] = a - c; }
-    for (int i = 0; i < 128; ++i) o[i] = __float2half_rn(v[i] * 0.08838834764831845f);
+    for (int i = 0; i < 128; ++i) v[i] *= 0.08838834764831845f;
+}
+// FNT-kX: the 5-point Hartley transform cas(2 pi i j / 5) / sqrt(5) (here from double, rounded to FP32) across the 5
+// blocks of a 640-group, FMA chain in block order (fnt.cu mix5)
+static float H5(int i, int j) { const double a = 2 * M_PI * i * j / 5; return float((std::cos(a) + std::sin(a)) / std::sqrt(5.0)); }
+static void mix5(float * v) {  // v [5][128] in place
+    float o[640];
+    for (int b = 0; b < 5; ++b)
+        for (int i = 0; i < 128; ++i) {
+            float a = H5(b, 0) * v[i];
+            for (int c = 1; c < 5; ++c) a = std::fma(H5(b, c), v[c * 128 + i], a);
+            o[b * 128 + i] = a;
+        }
+    std::memcpy(v, o, sizeof(o));
+}
+static void rot_group(const __half * x, __half * o, bool mix) {  // one 640-group of an input row in the kernels' basis, FP16
+    float v[640];
+    for (int b = 0; b < 5; ++b) rot_f(x + b * 128, v + b * 128);
+    if (mix) mix5(v);
+    for (int i = 0; i < 640; ++i) o[i] = __float2half_rn(v[i]);
 }
 
-static void run(int kb, int rows, int cols, int n, bool per_expert) {
+static void run(int kb, int rows, int cols, int n, bool per_expert, bool mix = false) {
     const int experts = 3, topk = 2;
-    const uint32_t type = GGML_FNT4 + uint32_t(kb - 4);
+    const uint32_t type = (mix ? GGML_FNT4X : GGML_FNT4) + uint32_t(kb - 4);
     const auto * fmt = weight_format(type);
     require(fmt && fmt->has_expert_matvec() && fmt->has_expert_dedup() && fmt->basis() == Basis::Plain, "FNT format missing");
     std::mt19937 rng(kb * 7919 + cols + n);
@@ -87,6 +106,7 @@ static void run(int kb, int rows, int cols, int n, bool per_expert) {
     for (size_t g = 0; g < ng; ++g) {
         oracle_group(reinterpret_cast<const uint8_t *>(raw.data()) + g * gb, kb, rotv.data() + g * 640);
         std::memcpy(plain.data() + g * 640, rotv.data() + g * 640, 640 * 4);
+        if (mix) mix5(plain.data() + g * 640);  // its own inverse
         for (int b = 0; b < 5; ++b) unrot(plain.data() + g * 640 + b * 128);
     }
     // CPU dequant (fallback path) = oracle in FP32
@@ -115,7 +135,7 @@ static void run(int kb, int rows, int cols, int n, bool per_expert) {
     fmt->expert_matvec(m, dx.p, dy.p, rows, di.p, n, topk, per_expert, nullptr);
     const auto y = dy.get(size_t(A) * rows);
     std::vector<__half> xr(x.size());
-    for (size_t i = 0; i < x.size(); i += 128) rot_h(x.data() + i, xr.data() + i);
+    for (size_t i = 0; i < x.size(); i += 640) rot_group(x.data() + i, xr.data() + i, mix);
     double worst = 0, worst_plain = 0;
     for (int a = 0; a < A; ++a)
         for (int r = 0; r < rows; ++r) {
@@ -205,7 +225,7 @@ static void run(int kb, int rows, int cols, int n, bool per_expert) {
     require(std::isnan(__bfloat162float(dy.get(1)[0])), "FNT invalid expert id did not fail closed");
     check(cudaDeviceSynchronize());
     for (auto * p : owned) cudaFree(const_cast<void *>(p));
-    std::printf("FNT%d rows %d cols %d n %d per_expert %d: ok (rel err vs oracle %.2e, vs plain %.2e)\n", kb, rows, cols, n,
+    std::printf("FNT%d%s rows %d cols %d n %d per_expert %d: ok (rel err vs oracle %.2e, vs plain %.2e)\n", kb, mix ? "X" : "", rows, cols, n,
                 int(per_expert), worst, worst_plain);
 }
 
@@ -220,6 +240,12 @@ int main() {
         run(5, 640, 2560, 9, false);
         run(6, 640, 2560, 60, false);  // > 32 tokens per expert: two prefill GEMM chunks
         run(7, 2560, 640, 40, true);
+        for (int kb = 4; kb <= 7; ++kb) {  // FNT-kX (group-mixed basis)
+            run(kb, 70, 2560, 3, false, true);
+            run(kb, 130, 640, 2, true, true);
+        }
+        run(6, 640, 2560, 60, false, true);
+        run(5, 2560, 640, 40, true, true);
         std::printf("fnt_format: all passed\n");
         return 0;
     } catch (const std::exception & e) {

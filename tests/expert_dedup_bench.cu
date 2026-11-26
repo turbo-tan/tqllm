@@ -24,9 +24,12 @@ int main(int argc, char ** argv) {
                           Case{323, 152, 640, 2560, "gate/up NVF4"}, Case{323, 152, 2560, 640, "down NVF4"}, Case{302, 72, 2560, 640, "down GSQ_Q2_0"},
                           Case{12, 144, 512, 2048, "gate/up Q4_K 35B"}, Case{13, 176, 2048, 512, "down Q5_K 35B"},
                           Case{330, 162, 640, 2560, "gate/up FNT4"}, Case{331, 202, 640, 2560, "gate/up FNT5"}, Case{332, 242, 640, 2560, "gate/up FNT6"},
-                          Case{330, 162, 2560, 640, "down FNT4"}, Case{333, 282, 2560, 640, "down FNT7"}}) {
+                          Case{330, 162, 2560, 640, "down FNT4"}, Case{333, 282, 2560, 640, "down FNT7"},
+                          Case{338, 162, 640, 2560, "gate/up FNT4X"}, Case{339, 202, 640, 2560, "gate/up FNT5X"}, Case{340, 242, 640, 2560, "gate/up FNT6X"},
+                          Case{338, 162, 2560, 640, "down FNT4X"}, Case{339, 202, 2560, 640, "down FNT5X"}, Case{340, 242, 2560, 640, "down FNT6X"},
+                          Case{341, 282, 2560, 640, "down FNT7X"}, Case{331, 202, 2560, 640, "down FNT5"}, Case{332, 242, 2560, 640, "down FNT6"}}) {
         if (argc > 5 && !std::strstr(cs.what, argv[5])) continue;
-        const bool fnt = cs.ty >= 330 && cs.ty <= 333;  // FNT-k: bb bytes per 640 weights (FP16 scale first)
+        const bool fnt = (cs.ty >= 330 && cs.ty <= 333) || (cs.ty >= 338 && cs.ty <= 341);  // FNT-k / FNT-kX: bb bytes per 640 weights (FP16 scale first)
         std::vector<char> raw(size_t(cs.rows) * slots * cs.cols / (fnt ? 640 : 256) * cs.bb);
         for (auto & c : raw) c = char(g() & 255);
         const __half d = __float2half(0.001f);

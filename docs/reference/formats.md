@@ -128,6 +128,7 @@ weights (+0.025 bits per weight). On Gaussian data the MSE is 0.0715 / 0.0364 / 
 | Code (32-bit unsigned arithmetic) | y = (w * 0x9E3779B1 + 0x7F4A7C15) & 0xFFFF; z = y * 0x2C1B3C6D + 0x9E3779B9; z2 = z * 0x297A2D39 + 0x7F4A7C15; h(v) = (v & 0x8FFF8FFF) ^ 0x3B603B60 read as two FP16 (low half first): TQT's c2 with a 16-bit window |
 | Weights 2p, 2p+1 | the FP16 sums h(z) + h(z2) (round to nearest even; low halves = weight 2p), times the block's scale, in the rotated basis |
 | Basis | TQ4's per 128 weights (H D / sqrt(128)); the engine sees a plain-basis matrix: every FNT kernel rotates its input itself |
+| FNT-kX (types 338 / 339 / 340 / 341) | the same bytes in a basis that also mixes the 5 blocks of each 640-group: after the per-128 rotation, block b' of the group = sum over b of C[b'][b] times block b, C = cas(2 pi b' b / 5) / sqrt(5) (5-point Hartley transform, FP32 constants, symmetric and orthogonal), FMA chain in block order; same code tag |
 
 The encoder (BlockLDLQ with a tail-biting Viterbi search per 128 weights, per-expert Hessians from captured routed
 inputs, `tools/convert/qwen4exp/fnt_quant.py`) and the measurements are in the [FNT guide](../guides/fnt.md). On
