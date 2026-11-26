@@ -94,6 +94,29 @@ int main() {
         int w = 99; for (int i = 0; i < 6; ++i) w = std::min(w, p.window(c, 7));
         check(w <= 2, "then the window shrinks to the first draft or two");
     }
+    {   // #106: a step that also re-planned the resident experts reports no time (-1): acceptance counts, timing does not, so
+        // copies in a cold start's steps do not make spec look slower than plain (plain 10 ms, spec 10 + 2.5 L ms, all kept;
+        // every 8th step re-planned). Before: -1 entered the time averages and the request fell into plain runs.
+        tqllm::Inkling2SpecPolicy p;
+        const float c[7] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
+        int plain = 0, steps = 0;
+        for (int toks = 0; toks < 2000; ++steps) {
+            const bool replan = steps % 8 == 7;
+            if (p.next(4096) == 0) { ++plain; ++toks; p.plain_done(replan ? -1.0 : 0.010); continue; }
+            const int L = p.window(c, 7);
+            toks += L + 1; p.spec_done(L, L, replan ? -1.0 : 0.010 + 0.0025 * L, c);
+        }
+        check(plain == 2, "re-planned steps (time -1) never send a winning request to plain steps");
+        int w = 0; for (int i = 0; i < 4; ++i) w = std::max(w, p.window(c, 7));
+        check(w >= 5, "and the window stays wide");
+        // losing spec (plain 10 ms / token, spec 25 ms for 2 tokens) with a re-planned plain step: plain steps still win
+        tqllm::Inkling2SpecPolicy q;
+        q.next(100); q.next(100); q.plain_done(0.010); q.plain_done(-1.0);
+        for (int i = 0; i < tqllm::Inkling2SpecPolicy::kWarm; ++i) { const int L = q.next(100); q.spec_done(1, L, i == 1 ? -1.0 : 0.025); }
+        int qp = 0;
+        for (int i = 0; i < tqllm::Inkling2SpecPolicy::kPlainRun; ++i) qp += q.next(100) == 0;
+        check(qp == tqllm::Inkling2SpecPolicy::kPlainRun, "a re-planned plain step keeps the plain reference: losing spec still yields plain steps");
+    }
     {   // a fixed depth ignores the confidences
         tqllm::Inkling2SpecPolicy p(5);
         const float low[7] = {0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f};

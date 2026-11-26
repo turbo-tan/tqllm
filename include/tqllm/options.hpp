@@ -21,6 +21,9 @@ struct EngineOptions {
     bool exact = true;  // --exact on|off (see above)
     int dense_bits = 8;  // --dense-bits 8|4: with --exact off, the bits of the dense projections and LM head where an engine
                          // quantizes them (Inkling-2-Mini on Metal); 4 trades quality (KLD gate) for decode speed
+    int expert_kernels = -1;  // --expert-kernels auto|tensor|warp: the routed-expert kernel family (Inkling-2-Mini CUDA). The two
+                              // round differently, so the family changes the greedy text; auto (-1) picks it by a fixed rule
+                              // (device, residency), never by timing, so a launch gives the same text on every start
     int qsa_from = -1;  // --qsa-from N|off: QSA sparse attention for rows past N keys when the model file carries QSA indexers
                         // (-1: Metal the file's qsa.sparse_from, else 49152; CUDA dense, QSA is opt-in there; 0 / off: always dense). The value changes the text.
     std::string kv_store = "flat";  // --kv-store POLICY: where KV rows live (src/kv/kv_store.hpp; flat, paged, tiered)

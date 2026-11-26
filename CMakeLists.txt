@@ -348,13 +348,16 @@ if(TQLLM_CUDA)
   target_include_directories(tqfeat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
   target_link_libraries(tqfeat PRIVATE tqllm CUDA::cudart)
   endif()
-  # engine commit: src/COMMIT is filled in by git archive (export-subst); a checkout asks git, anything else is "dev"
-  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/src/COMMIT TQLLM_COMMIT LIMIT_COUNT 1)
-  if(NOT TQLLM_COMMIT OR TQLLM_COMMIT MATCHES "Format")
-    execute_process(COMMAND git rev-parse --short=7 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                    OUTPUT_VARIABLE TQLLM_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE git_rc)
-    if(NOT git_rc EQUAL 0 OR NOT TQLLM_COMMIT)
-      set(TQLLM_COMMIT dev)
+  # engine commit: -DTQLLM_COMMIT=... (the wheel builds, where git does not run) wins; else src/COMMIT, filled in by git
+  # archive (export-subst); else a checkout asks git; anything else is "dev"
+  if(NOT TQLLM_COMMIT)
+    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/src/COMMIT TQLLM_COMMIT LIMIT_COUNT 1)
+    if(NOT TQLLM_COMMIT OR TQLLM_COMMIT MATCHES "Format")
+      execute_process(COMMAND git rev-parse --short=7 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                      OUTPUT_VARIABLE TQLLM_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE git_rc)
+      if(NOT git_rc EQUAL 0 OR NOT TQLLM_COMMIT)
+        set(TQLLM_COMMIT dev)
+      endif()
     endif()
   endif()
   message(STATUS "TQLLM engine commit: ${TQLLM_COMMIT}")

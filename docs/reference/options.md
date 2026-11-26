@@ -69,6 +69,12 @@ later turn can reuse (64 tokens before its end), on the first read too, so long-
 prompt with `--prompt-cache off` (one read in whole chunks); with the cache on, a reused turn gives the same text as its
 first read. `--prompt-cache off` reads every prompt afresh.
 
+`--expert-kernels auto|tensor|warp` (Inkling-2-Mini on CUDA, default auto) picks the routed-expert kernels. The two
+families round differently, so they give different greedy text; auto picks by a fixed rule (tensor cores when the format
+has them and at least 104 of every layer's 128 experts fit on the card, else the warp kernels, which are faster when most
+experts stream over the bus), never by a timing, so the same launch gives the same text on every start. `/health`
+("kernels") and the startup log say what ran. Set it to compare the two on one build.
+
 `--dense-bits 8|4` (with `--exact off`, default 8) picks the precision of the dense projections and the LM head where an
 engine quantizes them (Inkling-2-Mini on Metal: attention q / k / v / output / gate and the head, group 64). 8 keeps
 greedy tokens on the BF16 head; 4 also takes them from the 4-bit head (the precision of MTPLX's Bare-Speed pack):

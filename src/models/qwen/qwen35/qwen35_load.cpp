@@ -264,14 +264,32 @@ void Qwen35Engine::load_lora() {
                 throw std::invalid_argument("--lora " + path + ": " + name + " is not a layer matrix of this model");
             Layer & L = layer[size_t(l)];
             const std::string k = kind;
-            Mat * m = k == "attn_output" ? &L.wo : k == "ssm_out" ? &L.w_out : k == "ffn_down" ? &L.w_down : nullptr;
+            // the matrix the adapted part lives in, and its rows there (the load stacks ffn_gate + ffn_up into w_gu and
+            // attn_q + attn_k + attn_v into w_mix, in that order, when the formats allow)
+            const int F = int(cfg.ffn), hd = int(cfg.head_dim), qr = (cfg.gated_attention ? 2 : 1) * int(cfg.heads) * hd,
+                      kvr = int(cfg.kvheads) * hd;
+            Mat * m = nullptr;
+            int row0 = 0, rows = 0;
+            auto part = [&](Mat & fused, int r0, int nr, Mat & alone) {
+                if (fused.p) { m = &fused; row0 = r0; rows = nr; } else { m = &alone; rows = alone.rows; }
+            };
+            if (k == "attn_output") m = &L.wo;
+            else if (k == "ssm_out") m = &L.w_out;
+            else if (k == "ffn_down") m = &L.w_down;
+            else if (k == "ffn_gate") part(L.w_gu, 0, F, L.w_gate);
+            else if (k == "ffn_up") part(L.w_gu, F, F, L.w_up);
+            else if (cfg.full[size_t(l)] && k == "attn_q") part(L.w_mix, 0, qr, L.wq);
+            else if (cfg.full[size_t(l)] && k == "attn_k") part(L.w_mix, qr, kvr, L.wk);
+            else if (cfg.full[size_t(l)] && k == "attn_v") part(L.w_mix, qr + kvr, kvr, L.wv);
             if (!m)
                 throw std::invalid_argument("--lora " + path + ": " + name +
-                                            ": only attn_output, ssm_out and ffn_down adapters are supported so far");
+                                            ": adapters on attn_q / attn_k / attn_v / attn_output, ffn_gate / ffn_up / ffn_down and "
+                                            "ssm_out are supported so far (not the linear-attention input projections)");
             if (!m->p) throw std::invalid_argument("--lora " + path + ": the model has no " + name);
-            if (t.rows != m->rows || t.cols != m->cols)
+            if (!rows) rows = m->rows;
+            if (t.rows != rows || t.cols != m->cols)
                 throw std::invalid_argument("--lora " + path + ": " + name + " is " + std::to_string(t.rows) + " x " +
-                                            std::to_string(t.cols) + ", the model's " + std::to_string(m->rows) + " x " +
+                                            std::to_string(t.cols) + ", the model's " + std::to_string(rows) + " x " +
                                             std::to_string(m->cols));
             if (t.rank > tqllm_cuda::kLoraMaxRank || t.cols % 2)
                 throw std::invalid_argument("--lora " + path + ": " + name + ": rank above " +
@@ -301,6 +319,8 @@ void Qwen35Engine::load_lora() {
             LoraPiece p;
             p.adapter = i;
             p.rank = t.rank;
+            p.row0 = row0;
+            p.rows = rows;
             p.a = upload(a.data(), a.size() * 4);
             p.b = upload(b.data(), b.size() * 4);
             lora_of[m].push_back(std::move(p));

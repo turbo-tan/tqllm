@@ -382,7 +382,9 @@ struct Inkling2Model::Impl {
     // device memory for the routed experts after everything else: all of them when they fit, else the same share of
     // every layer's experts (the embedding table moves to mapped host memory first: one row per token crosses the bus)
     size_t expert_budget = SIZE_MAX, drafter_keep = 0;
-    bool mma_experts = true, mma_dense = true;  // decode / verify kernel families, chosen per device at load (choose_kernels)
+    bool mma_experts = true, mma_dense = true;  // decode / verify kernel families, fixed at load (choose_kernels)
+    int expert_force = -1;                       // --expert-kernels: 1 tensor cores, 0 warp, -1 the rule (expert_family_mma)
+    std::string kernel_note;                     // what choose_kernels picked (/health)
     size_t dev_mem = 0;
     int resident_share = 0;  // experts per 128 kept on the device (128: all)
     // TQT prompt path without whole-model BF16 copies: one layer's BF16 experts (gate+up, down) plus the grouped GEMM buffers
@@ -391,11 +393,14 @@ struct Inkling2Model::Impl {
         const size_t A = size_t(chunk) * topk;
         return A * D * 2 * 2 + A * 2 * I * 2 + A * 4;
     }
-    // decode / verify kernel families: each family gives a token the same bits for any n (verify rows == single steps), so
-    // per device the faster one runs. Measured at load on layer 0's experts and a D x D projection, 1 token and 8 tokens.
+    // decode / verify kernel families: each family gives a token the same bits for any n (verify rows == single steps), but
+    // the two families round differently, so the pick is a rule (K::expert_family_mma), never a timing: the same launch gives
+    // the same text on every start (#105). The timings on layer 0's experts and a D x D projection are logged only.
     void choose_kernels() {
         const Layer & Y = Ls[0];
-        if (!K::expert_mma_ok(Y.eg.m, Y.ed.m, I, D)) { mma_experts = false; }
+        const bool mma_ok = K::expert_mma_ok(Y.eg.m, Y.ed.m, I, D);
+        if (!mma_ok && expert_force == 1) std::fprintf(stderr, "inkling2: --expert-kernels tensor: this expert format has no tensor-core kernels; warp kernels\n");
+        mma_experts = K::expert_family_mma(expert_force, mma_ok, resident_share, Y.eg.E);
         const int n8 = K::kSmallN, A = n8 * topk;
         std::vector<int> bid(static_cast<size_t>(A));
         uint32_t r = 7;
@@ -440,13 +445,12 @@ struct Inkling2Model::Impl {
             K::expert_mma(Y.eg.m, Y.eu.m, Y.ed.m, I, D, bx.as<bf16>(), did.as<int>(), dw.as<float>(), bgr.as<int>(), bact.as<bf16>(), byd.as<bf16>(),
                           bmoe.as<bf16>(), n, topk, gcap, ucap, s, bxh.as<__half>(), bah.as<__half>());
         };
-        const bool drafter = drafter_keep > 0;
-        if (mma_experts) {
+        if (mma_ok) {
             const double w1 = time([&] { warp(1); }), w8 = time([&] { warp(n8); }), m1 = time([&] { mma(1); }), m8 = time([&] { mma(n8); });
-            mma_experts = K::prefer_mma(w1, w8, m1, m8, drafter);
-            std::fprintf(stderr, "inkling2: experts per visit: warp kernels %.1f / %.1f us, tensor cores %.1f / %.1f us (1 / %d tokens) -> %s\n", w1, w8, m1, m8,
-                         n8, mma_experts ? "tensor cores" : "warp kernels");
+            std::fprintf(stderr, "inkling2: experts per visit: warp kernels %.1f / %.1f us, tensor cores %.1f / %.1f us (1 / %d tokens), %d of %d resident -> %s (%s)\n",
+                         w1, w8, m1, m8, n8, resident_share, Y.eg.E, mma_experts ? "tensor cores" : "warp kernels", expert_force < 0 ? "auto" : "--expert-kernels");
         }
+        kernel_note = std::string("experts ") + (mma_experts ? "tensor cores" : "warp kernels") + (expert_force < 0 ? " (auto)" : " (--expert-kernels)");
         {   // a D x D BF16 projection (the dense projections' shape class)
             const Mat * W = nullptr;
             if (Y.wo.d.p && Y.wo.cols % 64 == 0) W = &Y.wo;
@@ -460,6 +464,7 @@ struct Inkling2Model::Impl {
                              w1, w8, m1, m8);
             }
             K::set_gemv_mma(mma_dense);
+            kernel_note += std::string(", dense ") + (mma_dense ? "tensor cores" : "gemv");
         }
         cudaEventDestroy(a); cudaEventDestroy(b);
         ck(cudaStreamSynchronize(s), "choose kernels");
@@ -555,6 +560,7 @@ struct Inkling2Model::Impl {
     // partial residency: per layer the resident_share experts routed most so far (since load) move to the device
     std::vector<float> route_hist;  // decayed routed counts per (layer, expert), host side
     Inkling2ReplanClock replan_clock;  // re-plan every kEvery decode steps (plain tokens and verify blocks)
+    bool replanned = false;  // a re-plan ran since take_replanned() (its copies sit in that step's time)
     int replan_experts() {
         if (resident_share >= Ls[0].eg.E) return 0;
         const int E_ = Ls[0].eg.E;
@@ -1505,7 +1511,7 @@ struct Inkling2Model::Impl {
     }
     void forward(const int * tokens, int n, int want, std::vector<float> & logits_out) {
         // partial residency: re-plan the resident experts from the recent routing every Inkling2ReplanClock::kEvery decode steps
-        if (replan_clock.step(n, verifying, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
+        if (replan_clock.step(n, verifying, resident_share < Ls[0].eg.E)) { replan_clock.planned(replan_experts(), 3 * L); replanned = true; }  // settled: <= one expert a layer
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (n <= 0 || n > chunk || want > n) throw std::runtime_error("inkling2: chunk size");
         grow_logits(want);
@@ -1539,7 +1545,7 @@ struct Inkling2Model::Impl {
         if (!mtp_on) throw std::runtime_error("inkling2: verify needs enable_mtp()");
         if (n < 1 || n > K::kSmallN) throw std::runtime_error("inkling2: a verify block is n <= 8 tokens");
         if (len + n > context) throw std::runtime_error("inkling2: context full");
-        if (replan_clock.step(n, true, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
+        if (replan_clock.step(n, true, resident_share < Ls[0].eg.E)) { replan_clock.planned(replan_experts(), 3 * L); replanned = true; }  // settled: <= one expert a layer
         grow_logits(n);
         verifying = true; verify_n = n; greedy_step = true;
         *h_len = len;
@@ -1560,7 +1566,7 @@ struct Inkling2Model::Impl {
     }
     // one decode token at length(): the greedy next token (argmax of the softcapped logits, lowest index on ties), no logits
     int forward_greedy(int token) {
-        if (replan_clock.step(1, false, resident_share < Ls[0].eg.E)) replan_clock.planned(replan_experts(), 3 * L);  // settled: <= one expert a layer
+        if (replan_clock.step(1, false, resident_share < Ls[0].eg.E)) { replan_clock.planned(replan_experts(), 3 * L); replanned = true; }  // settled: <= one expert a layer
         if (len == 0 && !dumped) { if (const char * d = debug_cstr("inkling2_dump")) dump = std::fopen(d, "wb"); dumped = true; }
         if (len + 1 > context) throw std::runtime_error("inkling2: context full");
         if (verifying) throw std::runtime_error("inkling2: forward_greedy inside a verify block");
@@ -1819,8 +1825,10 @@ int inkling2_prompt_chunk() {
     return pr.totalGlobalMem >= (size_t(64) << 30) ? 8192 : 2048;
 }
 int Inkling2Model::chunk() const { return p_->chunk; }
+std::string Inkling2Model::kernels() const { return p_->kernel_note; }
 
-Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, bool hf_attention, size_t expert_budget, bool exact, size_t drafter_bytes)
+Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, bool hf_attention, size_t expert_budget, bool exact, size_t drafter_bytes,
+                             int expert_kernels)
     : p_(std::make_unique<Impl>()) {
     {
         int dev = 0; cudaDeviceProp pr{};
@@ -1838,6 +1846,7 @@ Inkling2Model::Inkling2Model(const std::string & path, int context, int chunk, b
     cb(cublasSetStream(p_->blas, p_->s), "stream");
     p_->expert_budget = expert_budget;
     p_->drafter_keep = drafter_bytes;
+    p_->expert_force = expert_kernels;
     p_->load(path);
     p_->alloc();
     p_->place_experts();
@@ -1862,6 +1871,7 @@ void Inkling2Model::debug_visits(const std::vector<float> & hs, int n) { p_->vis
 void Inkling2Model::log_routes(std::vector<std::vector<int>> * log) { p_->route_log = log; }
 int Inkling2Model::length() const { return p_->len; }
 int Inkling2Model::replan_experts() { return p_->replan_experts(); }
+bool Inkling2Model::take_replanned() { const bool r = p_->replanned; p_->replanned = false; return r; }
 void Inkling2Model::enable_mtp(const std::string & dir) { p_->enable_mtp(dir); }
 void Inkling2Model::draft(int anchor, std::vector<int> & tokens, int steps) { p_->draft(anchor, tokens, steps); }
 bool Inkling2Model::dflash_drafter() const { return p_->dflash; }

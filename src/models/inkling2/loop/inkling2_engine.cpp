@@ -27,9 +27,9 @@ constexpr uint32_t kEos = 200006;  // generation_config eos_token_id
 class Inkling2Engine final : public Engine {
 public:
     // drafter: -md FOLDER (a DFlash2 drafter folder), else --mtp (the DSpark head in the checkpoint's mtp.safetensors)
-    Inkling2Engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model)
+    Inkling2Engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model, int expert_kernels)
         : m_(dir, int(context), prompt_chunk(), false, SIZE_MAX, exact,
-             Inkling2Model::drafter_bytes(!draft_model.empty() ? draft_model : mtp ? dir : std::string())),
+             Inkling2Model::drafter_bytes(!draft_model.empty() ? draft_model : mtp ? dir : std::string()), expert_kernels),
           context_(context) {
         if (!draft_model.empty()) {
             m_.enable_mtp(draft_model);
@@ -62,6 +62,7 @@ public:
     }
     bool has_drafter() const override { return mtp_; }
     bool native_mtp() const override { return mtp_; }
+    std::string kernels() const override { return m_.kernels(); }
     // the engine picks each step's drafts (Inkling2SpecPolicy): tqserve then passes depth 0, not the MTP default of 4
     bool adaptive_depth() const override { return mtp_; }
     void set_ignore_eos(bool on) override { ignore_eos_ = on; }
@@ -115,7 +116,8 @@ public:
             const int t = int(tok_);
             if (temp_ > 0.f) { m_.forward(&t, 1, 1, lg_); tok_ = pick(0); }
             else tok_ = uint32_t(m_.forward_greedy(t));
-            if (mtp_ && temp_ <= 0.f) pol_.plain_done(std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
+            const bool own = !m_.take_replanned();
+            if (mtp_ && temp_ <= 0.f) pol_.plain_done(own ? std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count() : -1.0);
             ctx_.push_back(uint32_t(t));
             ++steps_;
             emit(tok_);
@@ -139,7 +141,8 @@ public:
         int a = 0;
         while (a < L && nx[a] == d[size_t(a)]) ++a;
         m_.commit(a + 1);
-        pol_.spec_done(a, L, std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), conf.empty() ? nullptr : conf.data());
+        const double secs = m_.take_replanned() ? -1.0 : std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+        pol_.spec_done(a, L, secs, conf.empty() ? nullptr : conf.data());
         ctx_.insert(ctx_.end(), blk.begin(), blk.begin() + a + 1);
         ++steps_; drafted_ += uint64_t(L); accepted_ += uint64_t(a);
         for (int i = 0; i < a && !done_; ++i) emit(uint32_t(d[size_t(i)]));
@@ -214,8 +217,9 @@ private:
 };
 }  // namespace
 
-std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model) {
-    return std::make_unique<Inkling2Engine>(dir, context, mtp, exact, draft_model);
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact, const std::string & draft_model,
+                                            int expert_kernels) {
+    return std::make_unique<Inkling2Engine>(dir, context, mtp, exact, draft_model, expert_kernels);
 }
 
 }  // namespace tqllm

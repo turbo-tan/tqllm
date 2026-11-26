@@ -26,7 +26,7 @@ public:
     // exact (default): BF16 dense weights as the checkpoint; --exact off: the device's fast dense format
     // (inkling2_int8_dense), gated by KLD / PPL against the BF16 path
     Inkling2Model(const std::string & path, int context, int chunk = 64, bool hf_attention = false, size_t expert_budget = SIZE_MAX,
-                  bool exact = true, size_t drafter_bytes = 0);
+                  bool exact = true, size_t drafter_bytes = 0, int expert_kernels = -1);
     ~Inkling2Model();
     Inkling2Model(const Inkling2Model &) = delete;
     Inkling2Model & operator=(const Inkling2Model &) = delete;
@@ -53,6 +53,8 @@ public:
     // partial residency: move every layer's most-routed experts (counted since load) onto the device; returns the experts
     // moved (0 when all are resident). The decode graph stays valid (its kernels read the pointer tables).
     int replan_experts();
+    // true once after a step that also re-planned the resident experts (the spec policy leaves that step's time out)
+    bool take_replanned();
     int resident_experts() const;  // experts per layer on the device (of 128)
     // MTP (mtp.safetensors in dir; before the first forward): every committed token's target taps become draft context.
     // draft(anchor, steps): the first `steps` (<= 7) greedy draft tokens of the block after `anchor` at position length(). verify(tokens, n <= 8): the target over
@@ -61,6 +63,8 @@ public:
     // device bytes enable_mtp(dir) will take (weights, conversion peak, caches, scratch): pass it as drafter_bytes to the
     // constructor so the expert plan leaves it free
     static size_t drafter_bytes(const std::string & dir);
+    // the decode / verify kernel families the load picked, e.g. "experts tensor cores (auto), dense tensor cores"
+    std::string kernels() const;
     // DFlash2 reference check (tools/inkling2/dflash2_reference.py): the drafter alone over `tokens`' input rows as taps
     void draft_trace(const std::vector<int> & tokens, int anchor, std::vector<float> & hidden, std::vector<int> & ids, std::vector<int> & path);
     void draft(int anchor, std::vector<int> & tokens, int steps = 7);

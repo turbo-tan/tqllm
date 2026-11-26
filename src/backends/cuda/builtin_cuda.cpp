@@ -122,7 +122,7 @@ void register_builtin_engines() {
     register_engine({"inkling2", [](const std::filesystem::path & p) { return hf_folder_arch(p.string()) == "inkling2-loop"; },
                      [](const std::string & m, const std::string &, uint32_t c, int slots, const EngineOptions & o) {
                          one_slot(slots, "Inkling-2-Mini");
-                         return make_inkling2_engine(m, c, o.native_mtp, o.exact, o.draft_model);  // --mtp: the DSpark head in mtp.safetensors; -md: a DFlash2 folder
+                         return make_inkling2_engine(m, c, o.native_mtp, o.exact, o.draft_model, o.expert_kernels);  // --mtp: the DSpark head in mtp.safetensors; -md: a DFlash2 folder
                      },
                      true});  // exact: spec == plain, verify blocks == single steps
     register_engine({"minimax", [](const std::filesystem::path & p) { return gguf_like(p) && is_minimax_gguf(p.string()); },

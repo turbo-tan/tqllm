@@ -11,6 +11,7 @@
 // and bench-text contexts, spec == plain and tokens per step (--spec-trace: every adaptive step on stderr);
 // --reuse CTXLIST (GOLDEN_BIN = golden/mt): exact conversation reuse vs a fresh prefill (first logits, tokens, TTFT);
 // --exact off: the device fast dense format (INT8 W8A16 on Ampere), gated by KLD / PPL
+// --expert-kernels auto|tensor|warp: the routed-expert family (default auto: the load's rule)
 // --expert-budget-mb N: device memory for the routed experts (the rest stream from mapped host memory);
 // --handover (golden/mt): prompt -> decode hand-over KLD; --greedy-debug NAME (golden/bin): one prompt's paths per step.
 #include "inkling2_model.hpp"
@@ -34,6 +35,7 @@
 using namespace tqllm;
 
 namespace {
+int g_kernels = -1;  // --expert-kernels auto|tensor|warp
 size_t g_budget = SIZE_MAX;  // --expert-budget-mb: device bytes for the routed experts (default: what fits)
 bool g_exact = true;           // --exact off: the device fast dense format (INT8 W8A16 on Ampere)
 bool g_spec_trace = false;    // --spec-trace: every adaptive spec / plain step (drafts, accepted, ms) on stderr
@@ -92,7 +94,7 @@ int run_mt(const std::string & model, const std::string & dir, const std::string
     const Texts tx = read_texts(dir);
     size_t total = 0; int maxn = 0;
     for (const auto & v : tx.ids) { total += v.size(); maxn = std::max(maxn, int(v.size())); }
-    Inkling2Model m(model, maxn + 64, chunk, hf, g_budget, g_exact);
+    Inkling2Model m(model, maxn + 64, chunk, hf, g_budget, g_exact, 0, g_kernels);
     const int V = m.vocab();
     std::ifstream lpf(dir + "/lp_" + ref + ".f16", std::ios::binary);
     const auto top1 = load<int32_t>(dir + "/top1_" + ref + ".i32");
@@ -158,7 +160,7 @@ int run_onestep(const std::string & model, const std::string & dir, bool hf) {
     const char * names[] = {"wiki00", "wiki01", "code_textwrap", "code_heapq"};
     const int idx[] = {0, 1, 12, 14};
     const int N = 512;
-    Inkling2Model m(model, N + 64, N, hf, g_budget, g_exact);
+    Inkling2Model m(model, N + 64, N, hf, g_budget, g_exact, 0, g_kernels);
     const auto routes = load<int16_t>(dir + "/route_bf16.i16");
     std::vector<size_t> roff(tx.ids.size() + 1, 0);
     for (size_t i = 0; i < tx.ids.size(); ++i) roff[i + 1] = roff[i] + size_t(48) * tx.ids[i].size() * 8;
@@ -196,7 +198,7 @@ int run_reuse(const std::string & model, const std::string & dir, const std::str
     const int maxc = *std::max_element(ctxs.begin(), ctxs.end()), longr = 2 * chunk + 100;
     std::vector<int> fill;
     while (int(fill.size()) < maxc + longr + 400) fill.insert(fill.end(), text.begin(), text.end());
-    Inkling2Model m(model, maxc + longr + 512, chunk, false, g_budget, g_exact);
+    Inkling2Model m(model, maxc + longr + 512, chunk, false, g_budget, g_exact, 0, g_kernels);
     std::vector<float> lg;
     const int U = 64, G = 32;
     int keep = 0;
@@ -253,7 +255,7 @@ int run_bench(const std::string & model, const std::string & dir, const std::str
     const int maxc = *std::max_element(ctxs.begin(), ctxs.end());
     std::vector<int> fill;
     while (int(fill.size()) < maxc) fill.insert(fill.end(), text.begin(), text.end());
-    Inkling2Model m(model, maxc + ndec + 8, chunk, false, g_budget, g_exact);
+    Inkling2Model m(model, maxc + ndec + 8, chunk, false, g_budget, g_exact, 0, g_kernels);
     std::vector<float> lg;
     // --profile decode | prefill: cudaProfilerStart / Stop around the first run's decode steps or prompt chunks (nsys
     // --capture-range=cudaProfilerApi)
@@ -350,7 +352,7 @@ int run_greedy_debug(const std::string & model, const std::string & dir, const s
         std::vector<int> ref(ngen);
         for (auto & x : ref) in >> x;
         if (name != want_name) continue;
-        Inkling2Model m(model, nin + steps + 64, chunk, false, g_budget, g_exact);
+        Inkling2Model m(model, nin + steps + 64, chunk, false, g_budget, g_exact, 0, g_kernels);
         std::vector<int> seq(pin);
         seq.insert(seq.end(), ref.begin(), ref.begin() + steps);
         std::vector<std::vector<float>> P(steps), E(steps), S(steps), F(steps);
@@ -398,7 +400,7 @@ int run_greedy_debug(const std::string & model, const std::string & dir, const s
 int run_handover(const std::string & model, const std::string & dir, int chunk) {
     const Texts tx = read_texts(dir);
     const auto & ids = tx.ids[0];
-    Inkling2Model m(model, int(ids.size()) + 64, chunk, false, g_budget, g_exact);
+    Inkling2Model m(model, int(ids.size()) + 64, chunk, false, g_budget, g_exact, 0, g_kernels);
     const int V = m.vocab(), K = 8;
     auto kld = [&](const float * p, const float * q) {
         double mp = -1e30, mq = -1e30;
@@ -503,7 +505,7 @@ int run_graph_debug(const std::string & model, const std::string & mt, int ctx, 
     for (const auto & v : tx.ids) text.insert(text.end(), v.begin(), v.end());
     std::vector<int> fill;
     while (int(fill.size()) < ctx + 8) fill.insert(fill.end(), text.begin(), text.end());
-    Inkling2Model m(model, ctx + 64, chunk, false, g_budget, g_exact);
+    Inkling2Model m(model, ctx + 64, chunk, false, g_budget, g_exact, 0, g_kernels);
     std::vector<float> lg;
     auto one = [&](bool eager, int steps) {
         std::vector<std::vector<int>> routes;
@@ -552,7 +554,7 @@ int run_spec(const std::string & model, const std::string & mt, const std::strin
         }
     }
     for (int c : ctxs) prompts.emplace_back("ctx" + std::to_string(c), std::vector<int>(fill.begin(), fill.begin() + c));
-    Inkling2Model m(model, std::max(maxc, 64) + N + 64, chunk, false, g_budget, g_exact, Inkling2Model::drafter_bytes(g_drafter.empty() ? model : g_drafter));
+    Inkling2Model m(model, std::max(maxc, 64) + N + 64, chunk, false, g_budget, g_exact, Inkling2Model::drafter_bytes(g_drafter.empty() ? model : g_drafter), g_kernels);
     m.enable_mtp(g_drafter.empty() ? model : g_drafter);
     bool all = true;
     for (const auto & [name, pin] : prompts) {
@@ -596,7 +598,7 @@ int run_dflash2_ref(const std::string & model, const std::string & drafter, cons
     in.read(reinterpret_cast<char *>(ref_lg.data()), ref_lg.size() * 4);
     in.read(reinterpret_cast<char *>(ref_hid.data()), ref_hid.size() * 4);
     if (!in) throw std::runtime_error("dflash2 fixture truncated");
-    Inkling2Model m(model, 4096, 64, false, g_budget, g_exact, Inkling2Model::drafter_bytes(drafter));
+    Inkling2Model m(model, 4096, 64, false, g_budget, g_exact, Inkling2Model::drafter_bytes(drafter), g_kernels);
     m.enable_mtp(drafter);
     std::vector<float> hid;
     std::vector<int> ids, path;
@@ -648,6 +650,7 @@ int main(int argc, char ** argv) {
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
         else if (a == "--expert-budget-mb" && i + 1 < argc) g_budget = size_t(std::atoll(argv[++i])) << 20;
         else if (a == "--exact" && i + 1 < argc) g_exact = std::string(argv[++i]) != "off";
+        else if (a == "--expert-kernels" && i + 1 < argc) { const std::string v = argv[++i]; g_kernels = v == "tensor" ? 1 : v == "warp" ? 0 : -1; }
         else if (a == "--spec-trace") g_spec_trace = true;
         else if (a == "--drafter" && i + 1 < argc) g_drafter = argv[++i];  // a DFlash2 folder for --spec (default: the checkpoint's MTP)
         else if (a == "--dflash2-ref" && i + 1 < argc) df_ref = argv[++i];  // fixture; needs --drafter
@@ -668,7 +671,7 @@ int main(int argc, char ** argv) {
         if (!reuse.empty()) return run_reuse(model, gold, reuse, chunk);
         const auto t0 = std::chrono::steady_clock::now();
         const auto ids = load<int32_t>(gold + "/tf_ids.i32");
-        Inkling2Model m(model, int(ids.size()) + 64, chunk, hf, g_budget, g_exact);
+        Inkling2Model m(model, int(ids.size()) + 64, chunk, hf, g_budget, g_exact, 0, g_kernels);
         std::printf("loaded in %.0f s\n", secs(t0));
         const int V = m.vocab();
         if (!visits.empty()) { const auto hs = load<float>(visits); m.debug_visits(hs, 64); return 0; }

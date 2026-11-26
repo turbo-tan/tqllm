@@ -15,6 +15,9 @@
 // the calibrated chances of drafts 1 .. i, per the step-time line a + b L is largest. The calibration maps a confidence
 // to the measured chance that a draft which was verified was kept (kBins bins, decaying, prior = the confidence itself),
 // so a drafter that is over- or under-confident on this device and request is corrected from its own record.
+// A step whose time is not the step's own (secs < 0: it also moved experts to the card, a partial-residency re-plan, #106)
+// counts for acceptance but not for timing: those copies once landed in spec steps of a cold start, made spec look slower
+// than plain, and the request ran mostly plain steps to its end (110 vs 171 tok/s on a 3090 Ti).
 #include <algorithm>
 #include <array>
 
@@ -30,7 +33,7 @@ public:
         const int L = fixed_ ? fixed_ : depth();
         return std::min(L, room - 1) >= 1 ? std::min(L, room - 1) : 0;
     }
-    void plain_done(double secs) { t_plain_ = t_plain_ > 0 ? 0.7 * t_plain_ + 0.3 * secs : secs; }
+    void plain_done(double secs) { if (secs > 0) t_plain_ = t_plain_ > 0 ? 0.7 * t_plain_ + 0.3 * secs : secs; }
     // verify window for drafts with confidences conf[0 .. n) (n >= 1): 1 .. n, or the fixed depth
     int window(const float * conf, int n) {
         if (fixed_) return std::min(fixed_, n);
@@ -69,13 +72,13 @@ public:
         if (L >= 1 && L <= kMaxL) {
             for (int i = 1; i <= kMaxL; ++i) { reach_[i] *= kDecay; kept_[i] *= kDecay; }
             for (int i = 1; i <= L && i <= accepted + 1; ++i) { reach_[i] += 1.0; kept_[i] += i <= accepted ? 1.0 : 0.0; }
-            t_len_[L] = t_len_[L] > 0 ? 0.7 * t_len_[L] + 0.3 * secs : secs;
+            if (secs > 0) t_len_[L] = t_len_[L] > 0 ? 0.7 * t_len_[L] + 0.3 * secs : secs;
         }
         ema_acc_ = 0.7 * ema_acc_ + 0.3 * (accepted == L ? accepted + 1.0 : double(accepted));
         gain_ = 0.7 * gain_ + 0.3 * (accepted + 1.0);
-        t_spec_ = t_spec_ > 0 ? 0.7 * t_spec_ + 0.3 * secs : secs;
+        if (secs > 0) t_spec_ = t_spec_ > 0 ? 0.7 * t_spec_ + 0.3 * secs : secs;
         ++spec_steps_;
-        if (fixed_ || t_plain_ <= 0 || ++since_ < (probing_ ? kProbe : kWarm)) return;
+        if (fixed_ || t_plain_ <= 0 || t_spec_ <= 0 || ++since_ < (probing_ ? kProbe : kWarm)) return;
         if (gain_ / t_spec_ < 1.0 / t_plain_) {  // spec loses: a run of plain steps, longer after each losing probe
             run_ = probing_ ? std::min(kPlainMax, run_ * 2) : kPlainRun;
             plain_left_ = run_;

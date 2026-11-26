@@ -63,16 +63,18 @@ void quantize_rows_i8(const __nv_bfloat16 * w, int8_t * q, float * scale, int ro
 void dequant_rows_i8(const int8_t * q, const float * scale, __nv_bfloat16 * w, int rows, int K, cudaStream_t s);
 // BF16 segments with K % 64 == 0 run on tensor cores (a token's sums independent of n), INT8 rows on gemv_k
 void gemv(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
-// per device (chosen at model load by measuring both): BF16 gemv on tensor cores (default) or on gemv_k; either way a
+// BF16 gemv on tensor cores (fixed at load, #105) or on gemv_k (tests); either way a
 // token's sums do not depend on n
 void set_gemv_mma(bool on);
-// the kernel family to run on this device: rate = tokens per microsecond of its 1-token step, or with a drafter the better
-// of that and a verify block of 8 rows gaining `spec_tokens`; true = the tensor-core family. The warp kernels are taken
-// only when more than 10 % faster: the two families round differently, so a near tie decided by timing noise at load
-// gave different greedy text after a restart (GB10: 1,140 vs 1,189 us a visit)
-inline bool prefer_mma(double t1_warp, double t8_warp, double t1_mma, double t8_mma, bool drafter, double spec_tokens = 3.5) {
-    auto rate = [&](double t1, double t8) { return drafter ? (1.0 / t1 > spec_tokens / t8 ? 1.0 / t1 : spec_tokens / t8) : 1.0 / t1; };
-    return rate(t1_warp, t8_warp) <= 1.10 * rate(t1_mma, t8_mma);
+// the routed-expert family for decode / verify (force: --expert-kernels, 1 tensor cores, 0 warp, -1 this rule). A fixed
+// rule, not a timing: the families round differently and time close together, so a timed pick changed the greedy text
+// between restarts (#105). Tensor cores when the format has them and at least kMmaMinShare of every layer's experts
+// sit on the card; with fewer, most visits read experts over the bus, where the warp kernels are faster.
+constexpr int kMmaMinShare = 104;  // of 128: RTX 3090 (DFlash2, --exact off, 6 prompts) tensor cores 160 vs warp 133 tok/s at 128 resident, 105 vs 106 at 102, 56 vs 63 at 76
+inline bool expert_family_mma(int force, bool mma_ok, int resident_share, int experts) {
+    if (!mma_ok) return false;
+    if (force >= 0) return force == 1;
+    return resident_share * 128 >= kMmaMinShare * experts;
 }
 // every segment on gemv_k (per row: the sum order of the bounded LM head's BF16 rescoring, bf16_row_dot): the LM head
 void gemv_rows(const GemvSeg * segs, int nseg, int n, cudaStream_t s);
