@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -48,6 +49,7 @@ struct KldSums {
     double sum_kld = 0, sum_kld2 = 0, sum_p_diff = 0, sum_p_diff2 = 0, sum_p_diff4 = 0;
     float max_p_diff = 0;
     size_t n_same_top = 0, count = 0;
+    std::vector<float> nll_tok;  // per-token NLL in scoring order (written next to TQKLD_TOKENS)
 };
 std::pair<double, float> kld_token(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, KldSums & kld) {
     float max_logit = logits[0];
@@ -61,6 +63,7 @@ std::pair<double, float> kld_token(int n_vocab, const float * logits, const uint
     const float scale = d[0], min_log_prob = d[1];
     base_log_prob += 4;
     const float nll = max_logit + log_sum_exp - logits[tok];
+    kld.nll_tok.push_back(nll);
     kld.sum_nll += nll;
     kld.sum_nll2 += nll * nll;
     const float nll_base = -(scale * base_log_prob[tok] + min_log_prob);
@@ -158,6 +161,10 @@ int llama_base_mode(const std::string & model_path, const std::string & tok_path
         }
         std::printf("%4d  %10.6f  %6.3f %%\n", c + 1, kld.sum_kld / kld.count, 100.0 * kld.n_same_top / kld.count);
         std::fflush(stdout);
+    }
+    if (const char * dump = std::getenv("TQKLD_TOKENS")) {  // per-token KLD and NLL (DUMP.nll), scoring order: paired comparisons
+        std::ofstream(dump, std::ios::binary).write(reinterpret_cast<const char *>(kld_values.data()), std::streamsize(kld_values.size() * 4));
+        std::ofstream(std::string(dump) + ".nll", std::ios::binary).write(reinterpret_cast<const char *>(kld.nll_tok.data()), std::streamsize(kld.nll_tok.size() * 4));
     }
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());

@@ -10,6 +10,7 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   transform after the 128-block Hadamard), in every FNT kernel, `dequantize_host` and tests/fnt_format.cu (bit-exact
   as FNT-k). The mixed staging is also faster: `expert-dedup-bench` (RTX 3090, 16 experts x 2 columns) gate / up FNT4
   23.0 -> 19.8 us, FNT5 26.2 -> 23.5 us; down FNT7 23.6 -> 23.8 us, FNT6 22.9 -> 26.9 us.
+- `tqkld`: `TQKLD_TOKENS=FILE` writes the per-token KLD (and `FILE.nll`) in scoring order, for paired comparisons.
 
 ## 1.8.3 (2026-11-25)
 
