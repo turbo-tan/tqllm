@@ -11,6 +11,12 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   as FNT-k). The mixed staging is also faster: `expert-dedup-bench` (RTX 3090, 16 experts x 2 columns) gate / up FNT4
   23.0 -> 19.8 us, FNT5 26.2 -> 23.5 us; down FNT7 23.6 -> 23.8 us, FNT6 22.9 -> 26.9 us.
 - `tqkld`: `TQKLD_TOKENS=FILE` writes the per-token KLD (and `FILE.nll`) in scoring order, for paired comparisons.
+- `fnt_quant.py`: per-layer rates (`encode --rates`), the FNT-kX bases (`--rot-gu g5`, `--rot-dn x5`), the tail-biting
+  warm-up and start-scale search (`--ab`, `--grid`, `--iters`) and per-layer, per-role sources (`assemble` / `verify
+  --override`). FNT v2 for Qwen3.8-Flash-Next (docs/guides/fnt.md): v1's encoding with seven deep down projections at
+  FNT7X and five shallow gate / up at FNT4X, shard 41.52 -> 41.57 GB, KLD vs the Q8_0-expert reference 0.1451 -> 0.1361
+  (paired -0.0090 +- 0.0026 over 8 x 2048 WikiText-2 tokens), PPL 2.0947 -> 2.0912, decode speed unchanged (RTX 3090,
+  131K context).
 
 ## 1.8.3 (2026-11-25)
 

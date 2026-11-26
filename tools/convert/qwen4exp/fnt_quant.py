@@ -210,15 +210,15 @@ def _lib():
     return _LIB
 
 
-def viterbi(X, KB):
-    """X float32 CUDA [n, 128] (code units) -> chunks uint8 CUDA [n, 64]"""
+def viterbi(X, KB, ab=(16, 12)):
+    """X float32 CUDA [n, 128] (code units) -> chunks uint8 CUDA [n, 64]; ab = tail-biting warm-up pairs (A, B)"""
     import torch
     X = X.contiguous().float()
     n = X.shape[0]
     out = torch.empty(n, T // 2, dtype=torch.uint8, device=X.device)
     cost = torch.empty(n, dtype=torch.float32, device=X.device)
     torch.cuda.synchronize()
-    r = _lib().fnt_viterbi(X.data_ptr(), 0, n, L16, KB, T, out.data_ptr(), cost.data_ptr(), 16, 12)
+    r = _lib().fnt_viterbi(X.data_ptr(), 0, n, L16, KB, T, out.data_ptr(), cost.data_ptr(), ab[0], ab[1])
     if r:
         raise RuntimeError(f"fnt_viterbi: CUDA error {r}")
     if not bool((cost > -1e38).all()):
@@ -265,23 +265,26 @@ def chol_u_inv(H):
     return U
 
 
-def ldlq(W, H, KB, gamma):
+def ldlq(W, H, KB, gamma, ab=(16, 12), s0=None):
     """batched BlockLDLQ: W [E, N, K] rotated, H [E, K, K] damped -> chunks [E, N, K/128, 64], scales [E, N, K/640],
-    unscaled code values [E, N, K]"""
+    unscaled code values [E, N, K]; s0: start scales (instead of gamma x group RMS)"""
     import torch
     E, N, K = W.shape
     nb, G = K // T, K // SEG
     tab = torch.from_numpy(table()).to(W.device)
     W = W.clone()
     U = chol_u_inv(H)
-    s = (W.reshape(E, N, G, SEG).pow(2).mean(3).sqrt() * (gamma / code_rms())).half().float().clamp_min(2.0 ** -24)
+    if s0 is None:
+        s = (W.reshape(E, N, G, SEG).pow(2).mean(3).sqrt() * (gamma / code_rms())).half().float().clamp_min(2.0 ** -24)
+    else:
+        s = s0.clone()
     chunks = torch.empty(E, N, nb, T // 2, dtype=torch.uint8, device=W.device)
     V = torch.empty_like(W)
     for b in range(nb):
         i1, i2 = b * T, (b + 1) * T
         W0 = W[:, :, i1:i2]
         sb = s[:, :, i1 // SEG]
-        lo = viterbi((W0 / sb[..., None]).reshape(E * N, T), KB)
+        lo = viterbi((W0 / sb[..., None]).reshape(E * N, T), KB, ab)
         chunks[:, :, b] = lo.view(E, N, T // 2)
         v = tab[windows_t(lo, KB)].reshape(E, N, T)
         V[:, :, i1:i2] = v
@@ -329,13 +332,82 @@ def load_dump(d, layer):
     return x, ids
 
 
+def hartley5():
+    a = 2 * np.pi * np.outer(np.arange(5), np.arange(5)) / 5
+    return (np.cos(a) + np.sin(a)) / np.sqrt(5)
+
+
+def basis_np(kind, K):
+    """orthogonal input basis M (x' = M x, W' = W M^T): 'h128' = FNT v1 (128-block Hadamard with TQ4's signs);
+    'g5' / 'x5' = FNT-kX (GGUF types 338-341): then the 5-point Hartley transform (FP32 constants, as the kernels) across
+    the 5 blocks of each 640-group"""
+    h = np.zeros((128, 128))
+    h[:] = 1
+    n = 1
+    while n < 128:
+        h[:2 * n, :2 * n] = np.block([[h[:n, :n], h[:n, :n]], [h[:n, :n], -h[:n, :n]]])
+        n *= 2
+    M = np.kron(np.eye(K // 128), h / math.sqrt(128) * sign_vec()[None, :])
+    if kind in ("x5", "g5"):  # FNT-kX: the 5 blocks of each 640-group mixed (any K)
+        M = np.kron(np.eye(K // 640), np.kron(hartley5().astype(np.float32).astype(np.float64), np.eye(128))) @ M
+    elif kind != "h128":
+        raise ValueError(kind)
+    return M
+
+
+def parse_rates(spec):
+    """'gu=<48 digits>,dn=<48 digits>' (digit = KB per layer) -> {layer: (kb_gu, kb_dn)}"""
+    d = dict(kv.split("=") for kv in spec.split(","))
+    return {l: (int(d["gu"][l]), int(d["dn"][l])) for l in range(len(d["gu"]))}
+
+
+def quant_mat(Wt, H, Hd, KB, gamma, ab, grid, iters):
+    """encode Wt [E, N, K] (rotated target): BlockLDLQ under Hd (damped) per start gamma of `grid` (best per row under
+    H), closed-form scale refit, then `iters` re-searches from the refit scales (kept per row when better)
+    -> chunks [E, N, K/128, 64], scales [E, N, K/640], unscaled codes [E, N, K]"""
+    import torch
+
+    def run(g, s0):
+        ch, s, V = ldlq(Wt, Hd, KB, g, ab, s0)
+        s2 = refit(V, Wt, H).half().float()
+        s = torch.where((s2 > 0) & torch.isfinite(s2), s2, s)
+        D = V * s.repeat_interleave(SEG, -1) - Wt
+        return ch, s, V, ((D @ H) * D).sum(-1)
+    best = None
+    for g in grid or [gamma]:
+        r = run(g, None)
+        if best is None:
+            best = r
+        else:
+            m = r[3] < best[3]
+            best = tuple(torch.where(m.reshape(*m.shape, *([1] * (x.dim() - 2))), x, y) for x, y in zip(r[:3], best[:3])) + \
+                (torch.minimum(r[3], best[3]),)
+    for _ in range(iters):
+        r = run(None, best[1])
+        m = r[3] < best[3]
+        best = tuple(torch.where(m.reshape(*m.shape, *([1] * (x.dim() - 2))), x, y) for x, y in zip(r[:3], best[:3])) + \
+            (torch.minimum(r[3], best[3]),)
+    return best[:3]
+
+
 def cmd_encode(a):
+    """v1 recipe by default; options: --rates (per-layer KB), --rot-gu g5 / --rot-dn x5 (FNT-kX bases), --ab 32,32 (tail-biting
+    warm-up), --grid / --iters (start-scale search)"""
     import torch
     dev = torch.device("cuda")
     t_start = time.time()
     st = Safetensors(a.bf16)
     l = a.layer
-    kgu, kdn = (a.kb_gu, a.kb_dn) if a.kb_gu else layer_kb(template_types(gguf_parse(a.template)), l)
+    if a.rates:
+        kgu, kdn = parse_rates(a.rates)[l]
+    else:
+        kgu, kdn = (a.kb_gu, a.kb_dn) if a.kb_gu else layer_kb(template_types(gguf_parse(a.template)), l)
+    ab = tuple(int(v) for v in a.ab.split(","))
+    grid = [float(v) for v in a.grid.split(",")] if a.grid else None
+    Mg = torch.from_numpy(basis_np(a.rot_gu, HID).astype(np.float32)).to(dev)
+    Md = torch.from_numpy(basis_np(a.rot_dn, FF).astype(np.float32)).to(dev)
+    rg = (lambda x: rot_t(x)) if a.rot_gu == "h128" else (lambda x: x @ Mg.T)  # noqa: E731
+    rd = (lambda x: rot_t(x)) if a.rot_dn == "h128" else (lambda x: x @ Md.T)  # noqa: E731
     od = Path(a.out) / f"L{l}"
     od.mkdir(parents=True, exist_ok=True)
     x, ids = load_dump(a.dump, l)
@@ -350,10 +422,13 @@ def cmd_encode(a):
         return np.sort(t[keep[t]])
     rng = np.random.default_rng(l)
     prior = np.sort(rng.choice(np.flatnonzero(keep), size=min(a.prior_tokens, int(keep.sum())), replace=False))
-    Xp = rot_t(torch.from_numpy(np.asarray(x[prior], np.float32)).to(dev))
+    Xp = rg(torch.from_numpy(np.asarray(x[prior], np.float32)).to(dev))
     Hp = Xp.T @ Xp / len(prior)
     gu, dn = st.experts(l)
     bf = lambda arr: torch.from_numpy(np.ascontiguousarray(arr).astype(np.int32) << 16).to(dev).view(torch.float32)  # noqa: E731
+    silu = torch.nn.functional.silu
+    meta = dict(L=L16, kb_gu=kgu, kb_dn=kdn, gamma=a.gamma, tau=a.tau, damp=a.damp, code=CODE_TAG,
+                rot_gu=a.rot_gu, rot_dn=a.rot_dn, ab=list(ab), grid=grid, iters=a.iters)
     for b0 in range(0, NE, a.batch):
         b1 = min(NE, b0 + a.batch) - 1
         fn = od / f"e{b0:03d}-{b1:03d}.npz"
@@ -364,51 +439,48 @@ def cmd_encode(a):
             return 3
         t0 = time.time()
         es = list(range(b0, b1 + 1))
-        Wgu, Wdn = rot_t(bf(gu[b0:b1 + 1])), rot_t(bf(dn[b0:b1 + 1]))
-        Hs, Hr, ns = [], [], []
-        for e in es:
-            tk = tok_of(e)
-            ns.append(len(tk))
-            G = torch.zeros(HID, HID, device=dev)
-            if len(tk):
-                Xe = rot_t(torch.from_numpy(np.asarray(x[tk], np.float32)).to(dev))
-                G = Xe.T @ Xe
-            Hr.append(G / max(1, len(tk)))
-            Hs.append((G + a.tau * Hp) / (len(tk) + a.tau))
-        H, Hr = torch.stack(Hs), torch.stack(Hr)
+        Wg_p, Wd_p = bf(gu[b0:b1 + 1]), bf(dn[b0:b1 + 1])  # plain [E, 1280, 2560], [E, 2560, 640]
+        toks = [tok_of(e) for e in es]
+        ns = [len(t) for t in toks]
+        Xs = [torch.from_numpy(np.asarray(x[t], np.float32)).to(dev) if len(t) else torch.zeros(0, HID, device=dev) for t in toks]
+        Wgu, Wdn = rg(Wg_p), rd(Wd_p)
+        Hs, Hr = [], []
+        Xr = [rg(X) for X in Xs]
+        for X in Xr:
+            G = X.T @ X
+            Hr.append(G / max(1, len(X)))
+            Hs.append((G + a.tau * Hp) / (len(X) + a.tau))
+        Hr = torch.stack(Hr)
+        H = torch.stack(Hs)
         md = torch.diagonal(H, dim1=1, dim2=2).mean(1)
-        ch_gu, s_gu, V_gu = ldlq(Wgu, H + a.damp * md[:, None, None] * torch.eye(HID, device=dev), kgu, a.gamma)
-        s2 = refit(V_gu, Wgu, H).half().float()
-        s_gu = torch.where((s2 > 0) & torch.isfinite(s2), s2, s_gu)
+        ch_gu, s_gu, V_gu = quant_mat(Wgu, H, H + a.damp * md[:, None, None] * torch.eye(HID, device=dev), kgu, a.gamma, ab, grid, a.iters)
+        del H
         Qgu = V_gu * s_gu.repeat_interleave(SEG, -1)
         e_gu = out_err(Qgu, Wgu, Hr)
+        del Hr
         Hd, Hdr = [], []
-        for k, e in enumerate(es):
-            tk = tok_of(e)
-
-            def act(Xr):
-                return rot_t(torch.nn.functional.silu(Xr @ Qgu[k, :FF].T) * (Xr @ Qgu[k, FF:].T))
+        for k in range(len(es)):
+            def act(Xq):
+                return rd(silu(Xq @ Qgu[k, :FF].T) * (Xq @ Qgu[k, FF:].T))
             Ap = act(Xp)
-            G = torch.zeros(FF, FF, device=dev)
-            if len(tk):
-                Ae = act(rot_t(torch.from_numpy(np.asarray(x[tk], np.float32)).to(dev)))
-                G = Ae.T @ Ae
-            Hdr.append(G / max(1, len(tk)))
-            Hd.append((G + a.tau * (Ap.T @ Ap / len(prior))) / (len(tk) + a.tau))
+            G = Ap.T @ Ap
+            Aq = act(Xr[k])
+            Hdr.append(Aq.T @ Aq / max(1, len(Aq)))
+            Hd.append((Aq.T @ Aq + a.tau * G / len(prior)) / (len(Aq) + a.tau))
         Hd, Hdr = torch.stack(Hd), torch.stack(Hdr)
         md = torch.diagonal(Hd, dim1=1, dim2=2).mean(1)
-        ch_dn, s_dn, V_dn = ldlq(Wdn, Hd + a.damp * md[:, None, None] * torch.eye(FF, device=dev), kdn, a.gamma)
-        s2 = refit(V_dn, Wdn, Hd).half().float()
-        s_dn = torch.where((s2 > 0) & torch.isfinite(s2), s2, s_dn)
+        Hdd = Hd + a.damp * md[:, None, None] * torch.eye(FF, device=dev)
+        ch_dn, s_dn, V_dn = quant_mat(Wdn, Hd, Hdd, kdn, a.gamma, ab, grid, a.iters)
         e_dn = out_err(V_dn * s_dn.repeat_interleave(SEG, -1), Wdn, Hdr)
         tmp = str(fn) + ".tmp.npz"
         np.savez(tmp, experts=np.array(es), st_gu=pack_t(ch_gu, kgu).cpu().numpy(), s_gu=s_gu.half().cpu().numpy(),
                  st_dn=pack_t(ch_dn, kdn).cpu().numpy(), s_dn=s_dn.half().cpu().numpy(), n_tok=np.array(ns),
-                 err_gu_raw=e_gu.cpu().numpy(), err_dn_raw=e_dn.cpu().numpy(),
-                 meta=json.dumps(dict(L=L16, kb_gu=kgu, kb_dn=kdn, gamma=a.gamma, tau=a.tau, damp=a.damp, code=CODE_TAG)))
+                 err_gu_raw=e_gu.cpu().numpy(), err_dn_raw=e_dn.cpu().numpy(), meta=json.dumps(meta))
         os.replace(tmp, fn)
         print(f"L{l} e{b0}-{b1} {time.time() - t0:.1f}s tokens min {min(ns)} median {int(np.median(ns))} | "
               f"gate/up FNT{kgu} out {e_gu.mean():.4f} | down FNT{kdn} out {e_dn.mean():.4f}", flush=True)
+        del Xs, Xr, Hd, Hdr, Hdd
+        torch.cuda.empty_cache()
     (od / "done").touch()
     return 0
 
@@ -444,22 +516,41 @@ def role_rows(z, role):
     return _streams(z, "gu")[:, sl], z["s_gu"][:, sl]
 
 
+def parse_overrides(specs):
+    """--override DIR:gu=L,L:dn=L,L (repeatable) -> {(layer, "gu" / "dn"): DIR}"""
+    over = {}
+    for o in specs:
+        d, *parts = o.split(":")
+        for part in parts:
+            k, ls = part.split("=")
+            if k not in ("gu", "dn"):
+                raise ValueError(f"--override {o}: role {k} (gu or dn)")
+            for v in ls.split(","):
+                over[(int(v), k)] = d
+    return over
+
+
 def cmd_assemble(a):
     g = gguf_parse(a.template)
     src = open(a.template, "rb")
+    over = parse_overrides(a.override)
     plan = {}
     for l in range(1000):
         if not (Path(a.enc) / f"L{l}" / "done").exists():
             continue
-        meta = json.loads(str(np.load(sorted(glob.glob(f"{a.enc}/L{l}/e*.npz"))[0])["meta"]))
         for role in ("gate", "up", "down"):
-            plan[f"blk.{l}.ffn_{role}_exps.weight"] = (l, role, meta["kb_dn" if role == "down" else "kb_gu"])
+            enc = over.get((l, "dn" if role == "down" else "gu"), a.enc)
+            meta = json.loads(str(np.load(sorted(glob.glob(f"{enc}/L{l}/e*.npz"))[0])["meta"]))
+            rot = meta.get("rot_dn" if role == "down" else "rot_gu", "h128")
+            if rot not in ("h128", "g5", "x5"):
+                raise ValueError(f"layer {l}: basis {rot} has no FNT tensor type")
+            plan[f"blk.{l}.ffn_{role}_exps.weight"] = (l, role, meta["kb_dn" if role == "down" else "kb_gu"], rot != "h128", enc)
     print(f"{len(plan) // 3} layers to FNT", flush=True)
     infos, off = [], 0
     for t in g["tensors"]:
         if t["name"] in plan:
-            KB = plan[t["name"]][2]
-            nbytes, typ = int(np.prod(t["ne"])) // SEG * (2 + 40 * KB), FNT_TYPE[KB]
+            KB, mix = plan[t["name"]][2:4]
+            nbytes, typ = int(np.prod(t["ne"])) // SEG * (2 + 40 * KB), FNT_TYPE[KB] + (8 if mix else 0)
         else:
             nxt = [u["off"] for u in g["tensors"] if u["off"] > t["off"]]
             nbytes, typ = (min(nxt) if nxt else g["size"] - g["base"]) - t["off"], t["type"]
@@ -488,9 +579,9 @@ def cmd_assemble(a):
                     o.write(b)
                     left -= len(b)
                 continue
-            l, role, KB = plan[t["name"]]
-            if cache.get("l") != l:
-                cache = dict(l=l, z=layer_npz(a.enc, l))
+            l, role, KB, _, enc = plan[t["name"]]
+            if cache.get("k") != (l, enc):
+                cache = dict(k=(l, enc), z=layer_npz(enc, l))
             for z in cache["z"]:
                 st, sc = role_rows(z, role)
                 E, R = st.shape[:2]
@@ -508,13 +599,13 @@ def cmd_verify(a):
     f = open(a.file, "rb")
     bad, n = 0, 0
     for t in g["tensors"]:
-        if t["type"] not in FNT_TYPE.values():
+        if not (330 <= t["type"] <= 333 or 338 <= t["type"] <= 341):  # FNT-k / FNT-kX
             continue
-        KB = t["type"] - 326
+        KB, mix = (t["type"] - 330) % 4 + 4, t["type"] >= 338
         l, role = int(t["name"].split(".")[1]), t["name"].split(".")[2].split("_")[1]
         K, R = t["ne"][0], t["ne"][1]
         rowb = K // SEG * (2 + 40 * KB)
-        zs = layer_npz(a.enc, l)
+        zs = layer_npz(parse_overrides(a.override).get((l, "dn" if role == "down" else "gu"), a.enc), l)
         gu, dn = st.experts(l)
         for e in a.experts:
             f.seek(g["base"] + t["off"] + e * R * rowb)
@@ -527,6 +618,8 @@ def cmd_verify(a):
                 bad += 1
             sc = raw[:, :, :2].copy().view("<f2")[..., 0].astype(np.float32)
             v = decode_stream(raw[:, :, 2:].reshape(R, K // T, KB * 8), KB).reshape(R, K) * np.repeat(sc, SEG, 1)
+            if mix:  # FNT-kX: undo the 5-block Hartley mix (FP32 constants, symmetric orthogonal)
+                v = np.einsum("bc,rgcj->rgbj", hartley5().astype(np.float32).astype(np.float64), v.reshape(R, K // SEG, 5, 128)).reshape(R, K)
             Wp = unrot_np(v)
             src = (dn[e] if role == "down" else gu[e, :FF] if role == "gate" else gu[e, FF:])
             W = (np.asarray(src).astype(np.uint32) << 16).view(np.float32)
@@ -567,17 +660,26 @@ def main():
     p.add_argument("--prior-tokens", type=int, default=4096)
     p.add_argument("--holdout", action="store_true", help="leave out every 4th 2048-row chunk (allocation checks)")
     p.add_argument("--time-limit", type=float, default=1e9, help="seconds; exit 3 before the next chunk past it")
+    p.add_argument("--rates", default="", help="per-layer rates 'gu=<digit per layer>,dn=<digit per layer>' (digit = KB)")
+    p.add_argument("--rot-gu", default="h128", choices=["h128", "g5"], help="g5: FNT-kX basis (5-block mix)")
+    p.add_argument("--rot-dn", default="h128", choices=["h128", "x5"], help="x5: FNT-kX basis (5-block mix)")
+    p.add_argument("--ab", default="16,12", help="tail-biting warm-up pairs A,B of the Viterbi search")
+    p.add_argument("--grid", default="", help="start gammas, best per row (e.g. 0.95,1.05,1.15)")
+    p.add_argument("--iters", type=int, default=0, help="re-searches from the refit scales")
     p = sub.add_parser("assemble")
     p.add_argument("--template", required=True)
     p.add_argument("--enc", required=True)
+    p.add_argument("--override", action="append", default=[],
+                   help="DIR:gu=L,L:dn=L,L takes those layers' gate / up or down from another encoder output (repeatable)")
     p.add_argument("--out", required=True)
     p = sub.add_parser("verify")
     p.add_argument("--file", required=True)
     p.add_argument("--enc", required=True)
+    p.add_argument("--override", action="append", default=[], help="as for assemble")
     p.add_argument("--bf16", required=True)
     p.add_argument("--experts", type=lambda s: [int(v) for v in s.split(",")], default=[0, 511])
     a = ap.parse_args()
-    if a.cmd == "encode" and not a.kb_gu and not a.template:
+    if a.cmd == "encode" and not a.kb_gu and not a.template and not a.rates:
         ap.error("encode needs --template or --kb-gu / --kb-dn")
     return {"alloc": cmd_alloc, "encode": cmd_encode, "assemble": cmd_assemble, "verify": cmd_verify}[a.cmd](a) or 0
 

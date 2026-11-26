@@ -27,6 +27,35 @@ Per tensor, FNT's rate is the smallest whose output error on held-out calibratio
 IQ3_XXS and IQ3_S -> FNT6 (3 bits); down GSQ Q2_0 -> FNT4, IQ4_NL -> FNT7 (3.5 bits). Measured ratios (FNT / ISTA,
 median): IQ2_XS 0.32-0.39, IQ2_XXS 0.31-0.35, IQ2_S 0.82, IQ3_XXS 0.45, IQ3_S 0.45-0.50, Q2_0 0.49-0.52, IQ4_NL 0.69.
 
+## FNT v2: the same size, rates moved to where they count
+
+A second file keeps the v1 encoding and moves bits between tensors: the down projections of the seven deep layers that
+v1 left at FNT4 (24, 25, 33, 36, 40, 41, 45) go to FNT7X, paid for by the gate / up projections of the five shallow
+FNT6 layers (8, 18, 20, 22, 23), which go to FNT4X (FNT-kX: the 5-block-mixed basis, encoded with `--rot-gu g5`,
+`--rot-dn x5 --ab 32,32` on a capture from the v1 FNT file). The shard grows by 0.05 GB (41.57 GB).
+
+| | FNT v1 | FNT v2 |
+|---|---:|---:|
+| KLD vs the Q8_0-expert reference, mean / 99 % | 0.1451 / 2.16 | 0.1361 / 2.03 |
+| paired per token (same 8 x 2048 tokens) | | -0.0090 +- 0.0026, lower in 7 of 8 chunks |
+| same top token | 90.60 % | 91.18 % |
+| PPL (reference 1.9934) | 2.0947 | 2.0912 |
+
+How the moves were chosen (each row: a file assembled from the two encodings, tqkld against the same reference):
+raising every v1 FNT4 down projection to FNT6X / FNT7X costs 4.0 GB and gives KLD 0.1114 (PPL 2.0671); the deep half
+of that (+1.4 GB) alone gives 0.1310, the shallow half (+2.6 GB) 0.1306; lowering the deep FNT6 gate / up to FNT4 costs
++0.025 KLD for 2.9 GB, the five shallow FNT6 gate / up +0.004 for 1.0 GB. Lowering every FNT6 gate / up to fund FNT6 /
+FNT7 down everywhere (the same size) gives 0.1402 but PPL 2.1355: deep gate / up error is expensive. Encoder changes
+measured on held-out captured inputs (whole-expert output error, 8 layers x 16 experts): A32B32 warm-up -1.7 %, the
+5-block mix on down -3.4 %, on gate / up -0.4 %; a full-row rotation, unit sorting and a GPTAQ-style down target did not
+help (+-0.5 %, +2.5 %).
+
+```sh
+python3 $Q assemble --template $ISTA --enc /data/enc --override /data/enc2:gu=8,18,20,22,23:dn=24,25,33,36,40,41,45 \
+  --out Qwen3.8-Flash-Next-FNT2-00001-of-00002.gguf
+```
+`/data/enc2` holds those layers encoded with `--rates` (gate / up KB 4, down KB 7) and the X bases.
+
 ## Requirements
 
 An NVIDIA GPU with 24 GB, 64 GB of RAM, `nvcc` on `PATH`, Python 3.10+ with `numpy` and PyTorch (CUDA), a tqLLM build
