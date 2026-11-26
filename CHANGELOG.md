@@ -3,6 +3,14 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Added
+- Flash-Next runtime directional ablation (`TQFN_ABLATE=FILE`): per block, user-supplied unit directions are projected
+  out of the attention / GDN output, the FFN output and the hyper-connection streams, with per-block weights read from
+  a TQAB file (versions 1-3, up to four stream directions per block). `TQFN_RESDUMP=FILE` writes the per-layer residuals
+  of a prompt for computing directions. Off by default: output bit-identical to before. docs/reference/options.md.
+
 ## 1.8.3 (2026-11-25)
 
 ### Fixed

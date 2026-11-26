@@ -516,6 +516,10 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // move and the bank refill): published at the pick, the second token followed it 0.25-1.2 s later (3090, 32K / 128K)
     const bool hold_first = host_res;
     auto first_token = [&](const float * row) {
+        if (const char * dp = std::getenv("TQFN_RESDUMP"); dp && *dp && head) {  // debug: the first token's logits beside the residual dump (fn_step.cpp)
+            const auto lg = checkpoint.head_logits_device(row, 1);
+            if (FILE * f = std::fopen((std::string(dp) + ".logits").c_str(), "wb")) { std::fwrite(lg.data(), 4, lg.size(), f); std::fclose(f); }
+        }
         std::vector<int> t = head ? pick(row, 1) : std::vector<int>(1);
         if (run.head_only) {
             int buf[64] = {t[0]};

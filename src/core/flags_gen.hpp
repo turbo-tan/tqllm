@@ -54,6 +54,7 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_TREE", Kind::Retired, "-", "removed", "tree verify is on with -md; --no-tree turns it off"},
     {"TQLLM_TREE_CHAIN", Kind::Retired, "-", "removed", "TQLLM_DEBUG=tree_chain"},
     {"TQLLM_VRAM_MARGIN_MB", Kind::Retired, "-", "removed", "-fitt MiB (-fit on|off)"},
+    {"TQFN_ABLATE", Kind::User, "-", "FILE: Flash-Next directional ablation from a TQAB file: per block, user-supplied unit directions are projected out of the attention / GDN output, the FFN output and the hyper-connection streams at run time, with per-block weights (docs/reference/options.md, \"Directional ablation\"). Unset: nothing runs and the output is unchanged", ""},
     {"TQFN_ARENA_MB", Kind::User, "-", "MB: Flash-Next scratch arena size instead of the measured rule (the high-water mark is printed at exit)", ""},
     {"TQFN_CPU_MISS", Kind::User, "0", "N: compute up to N missed experts per layer call on the CPU instead of copying them to the GPU (default on small cards: min(15, cores / 2 - 1); else off)", ""},
     {"TQFN_DENSE_INT8", Kind::User, "0", "1 / 2: int8 activations for the dense prefill projections (per-32 / per-token scales); 0 = fp16 (exact path)", ""},
@@ -64,6 +65,7 @@ inline constexpr Flag ALL[] = {
     {"TQFN_LAYER_SLOTS", Kind::User, "-", "comma list of expert slots per layer (overrides the packed file's .slots profile)", ""},
     {"TQFN_MTP_SLOTS", Kind::User, "256", "MTP expert slots (every expert when the trunk keeps every expert; 64 on small cards)", ""},
     {"TQFN_PREFILL_INT8", Kind::User, "0", "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)", ""},
+    {"TQFN_RESDUMP", Kind::Debug, "-", "FILE: Flash-Next: each prompt chunk writes the last position's wide residual after the embedding and every trunk layer to FILE, and the first token's logits to FILE.logits (for computing TQFN_ABLATE directions; docs/reference/options.md)", ""},
     {"TQFN_TAIL_SKIP", Kind::Retired, "-", "removed", "--exact off (tail skip at rank 8)"}
 };
 inline const Flag * find(const char * name) {

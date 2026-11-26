@@ -1,5 +1,6 @@
 // Flash-Next model step: host prep of a chunk, the per-layer pass over a chunk or a batched step, speculative accept.
 #include "fn_model.hpp"
+#include <cstdio>
 
 DecodeModel::HostPrep DecodeModel::prepare_host(const std::vector<int> & tokens) {
     HostPrep p; p.tokens = tokens; p.hist0 = history.size();
@@ -18,6 +19,27 @@ void capture_rows(const std::vector<int> * layers, __nv_bfloat16 * out, int64_t 
     for (size_t i = 0; i < layers->size(); ++i)
         if ((*layers)[i] == layer) tqllm_cuda::hc_mean_bf16(res, n, hc, h, out + i * size_t(h), stride, nullptr);
 }
+// TQFN_RESDUMP=<file> (debug, off by default): each non-speculative step() (a prompt chunk) writes the wide residual
+// row of its last position after the embedding and after every trunk layer: int32 n, position, rows (layers + 1),
+// width, then rows x width floats ([streams][hidden] each). The file is rewritten by every such step; the first
+// token's logits go to <file>.logits (fn_engine_prefill.cpp). For computing directions (TQFN_ABLATE, fn_ablate.hpp).
+struct ResDump {
+    const char * path = std::getenv("TQFN_RESDUMP");
+    std::vector<float> rows; int width = 0;
+    bool on() const { return path && *path; }
+    void begin(int w, int layers) { width = w; rows.assign(size_t(layers + 1) * size_t(w), 0.f); }
+    void take(int row, const float * dev) { ck(cudaMemcpy(rows.data() + size_t(row) * width, dev, size_t(width) * sizeof(float), cudaMemcpyDeviceToHost)); }
+    void take(int row, const __nv_bfloat16 * dev) {
+        std::vector<__nv_bfloat16> b(static_cast<size_t>(width)); ck(cudaMemcpy(b.data(), dev, b.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        for (int j = 0; j < width; ++j) rows[size_t(row) * width + size_t(j)] = __bfloat162float(b[size_t(j)]);
+    }
+    void write(int n, int position) const {
+        FILE * f = std::fopen(path, "wb"); if (!f) return;
+        const int32_t hdr[4] = {n, position, int32_t(rows.size() / size_t(width)), width};
+        std::fwrite(hdr, 4, 4, f); std::fwrite(rows.data(), 4, rows.size(), f); std::fclose(f);
+    }
+};
+ResDump & resdump() { static ResDump d; return d; }
 }  // namespace
 void DecodeModel::capture(int layer, const float * res, int n) { capture_rows(cap_layers, cap_out, cap_stride, layer, res, n, c.hc, h); }
 void DecodeModel::capture(int layer, const __nv_bfloat16 * res, int n) { capture_rows(cap_layers, cap_out, cap_stride, layer, res, n, c.hc, h); }
@@ -37,6 +59,8 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
         std::memcpy(dst, prep.embedding.data(), prep.embedding.size() * sizeof(float)); });
     auto residual = std::make_unique<Device<float>>(size_t(width) * n);
     tqllm_cuda::hc_init(de.p, residual->p, h, c.hc, n, nullptr);
+    ResDump & dump = resdump(); const bool dumping = dump.on() && !spec;
+    if (dumping) { dump.begin(width, c.layers); dump.take(0, residual->p + size_t(n - 1) * width); }
     Device<float> dp(prep.ple.size()); dp.put(prep.ple);
     if (kPrefillLog && n >= 256) std::fprintf(stderr, "tqllm: prefill chunk host prep (embedding + PLE) %.0f ms\n",
                                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count());
@@ -56,12 +80,15 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
         if (prefill_wide_bf16(std::min(sub, n))) {
             if (!res_keep_b || res_keep_b->count < size_t(n) * width) { PersistentAlloc keep; res_keep_b.reset(); res_keep_b = std::make_unique<Device<__nv_bfloat16>>(size_t(n) * width); }
             tqllm_cuda::wide_pack(res_keep->p, res_keep_b->p, int64_t(n) * width, nullptr);
-            trunk_layers([&](int layer) { prefill_layer(layer, nullptr, n, dp.p, experts, nullptr, res_keep_b->p); capture(layer, res_keep_b->p, n); g_arena->used = base; },
+            trunk_layers([&](int layer) { prefill_layer(layer, nullptr, n, dp.p, experts, nullptr, res_keep_b->p); capture(layer, res_keep_b->p, n); g_arena->used = base;
+                                         if (dumping) dump.take(layer + 1, res_keep_b->p + size_t(n - 1) * width); },
                          [&] { return static_cast<void *>(res_keep_b->p); }, size_t(n) * width * sizeof(__nv_bfloat16), n);
             tqllm_cuda::wide_unpack(res_keep_b->p, res_keep->p, int64_t(n) * width, nullptr);
         } else
-        trunk_layers([&](int layer) { prefill_layer(layer, res_keep->p, n, dp.p, experts); capture(layer, res_keep->p, n); g_arena->used = base; },
+        trunk_layers([&](int layer) { prefill_layer(layer, res_keep->p, n, dp.p, experts); capture(layer, res_keep->p, n); g_arena->used = base;
+                                     if (dumping) dump.take(layer + 1, res_keep->p + size_t(n - 1) * width); },
                      [&] { return static_cast<void *>(res_keep->p); }, size_t(n) * width * sizeof(float), n);
+        if (dumping) dump.write(n, position + n);
         position += n;
         Device<float> norm(size_t(width) * n);
         tqllm_cuda::hc_norm(res_keep->p, cp.dense_device("output_hc_norm.weight"), norm.p, h, c.hc, n, float(cp.epsilon), nullptr);
@@ -74,6 +101,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
     trunk_layers([&](int layer) {
         layer_forward(layer, residual, n, dp.p, nullptr, experts);
         capture(layer, residual->p, n);
+        if (dumping) dump.take(layer + 1, residual->p + size_t(n - 1) * width);
         if (!layer_reset) return;
         auto & pp = pingpong[layer & 1];
         if (!pp || pp->count < size_t(n) * width) { PersistentAlloc keep; pp = std::make_unique<Device<float>>(size_t(n) * width); }
@@ -81,6 +109,7 @@ std::unique_ptr<Device<float>> DecodeModel::step(const std::vector<int> & tokens
         residual = std::make_unique<Device<float>>(Device<float>::View{}, pp->p, size_t(n) * width);
         g_arena->used = base;
     }, [&] { return static_cast<void *>(residual->p); }, size_t(n) * width * sizeof(float), n);
+    if (dumping) dump.write(n, position + n);
     position += n;
     if (res_keep->count < size_t(n) * width) { PersistentAlloc keep; res_keep = std::make_unique<Device<float>>(size_t(n) * width); }
     ck(cudaMemcpyAsync(res_keep->p, residual->p, size_t(n) * width * sizeof(float), cudaMemcpyDeviceToDevice, nullptr));

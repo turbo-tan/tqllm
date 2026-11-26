@@ -212,6 +212,61 @@ prefill FP16 weight blocks of 2048 rows (choose yourself with --kv, -ub, --gemm-
 | `TQLLM_DEBUG=key,...` | memlog, profile, steps, stageprof, matvec, tune, prefill, draft, tree_chain, sample_chain, tf_dump:FILE, fakeq_k:N, fakeq_v:N |
 | `TQLLM_MATVEC_RULE=BITS:KERNEL[:PF],...` | override the decode matvec kernel per format (e.g. `3:legacy:0`) |
 
+## Directional ablation (Flash-Next)
+
+`TQFN_ABLATE=FILE` projects user-supplied unit directions out of Flash-Next's residual computation at run time, per
+block, with per-block weights: activation steering by orthogonal projection, as in directional ablation, a known
+interpretability technique (Arditi et al. 2024, [arXiv 2406.11717](https://arxiv.org/abs/2406.11717)). The weight files
+stay as they are; one server can run with or without a file. For block `l` with direction `r` (unit length) and
+weights `w`:
+
+| Weight | Applied to | Operation |
+|---|---|---|
+| `w_attn` | the attention / GDN output `a` | `a -= w_attn (a . r) r` |
+| `w_ffn` | the FFN output `f` (routed + shared experts) | `f -= w_ffn (f . r) r` |
+| `w_stream` | every hyper-connection stream `x_s` of the block's updated residual | `x_s -= w_stream sum_k (x_s . d_k) d_k` |
+
+The stream projection uses `d_1 = r`, or (version 3) up to four orthonormal directions of its own. It runs in decode,
+verify, the layer-major prefill and the MTP block. Without the variable nothing is allocated and no kernel runs: the
+output is bit-identical to a build without the feature. A file whose weights are all zero is the same as no file. The
+server prints `tqllm: directional ablation from FILE (TQAB vN): ...` with the number of blocks each weight reaches.
+
+**TQAB file** (little endian):
+
+| Field | Type |
+|---|---|
+| magic | `"TQAB"` |
+| version | int32: 1 (attention + FFN), 2 (+ stream weight), 3 (+ stream directions) |
+| hidden | int32, must equal the model's hidden size (Qwen3.8 Flash-Next: 2560) |
+| entries | int32, 1 .. layers + 1: entry `i < layers` is trunk layer `i`, entry `layers` the MTP block |
+| k | int32, version 3 only: stream directions per entry (1 .. 4) |
+| per entry | float `w_attn`, float `w_ffn`, [v2+: float `w_stream`], float `dir[hidden]`, [v3: float `sdir[k][hidden]`] |
+
+Entries after the file's last one have weight 0. A file with another hidden size, too many entries, a bad `k`, a short
+body or trailing bytes is refused at load.
+
+**Computing directions.** `TQFN_RESDUMP=FILE` (debug) makes every prompt chunk write the wide residual of its last
+position after the embedding and after every trunk layer: int32 `n`, `position`, `rows` (layers + 1), `width`
+(streams x hidden), then `rows x width` floats. The first token's logits go to `FILE.logits` (float32, vocabulary
+size). One request per prompt with `max_tokens 1` gives one residual per layer and prompt; a direction per layer is,
+for example, the normalised difference of the mean residual (averaged over the streams) between two prompt sets that
+differ in the property to remove, and the logits give a first-token KL to a reference run when choosing the weights.
+Use prompts shorter than one prefill chunk (one step per prompt), one sequence (`--np 1`) and one GPU. A minimal
+writer:
+
+```python
+import struct, numpy as np
+def write_tqab(path, w_attn, w_ffn, dirs, w_stream=None):  # dirs [entries][hidden], unit rows
+    ver = 1 if w_stream is None else 2
+    with open(path, "wb") as f:
+        f.write(b"TQAB" + struct.pack("<3i", ver, dirs.shape[1], dirs.shape[0]))
+        for i in range(dirs.shape[0]):
+            w = [w_attn[i], w_ffn[i]] + ([] if w_stream is None else [w_stream[i]])
+            f.write(struct.pack(f"<{len(w)}f", *w) + dirs[i].astype("<f4").tobytes())
+```
+
+The file is read once when the server starts; restart it to change the file.
+
 ## Request sampling numbers
 
 `top_k` accepts integers from 0 to INT_MAX; sampling currently uses at most 16 candidates.

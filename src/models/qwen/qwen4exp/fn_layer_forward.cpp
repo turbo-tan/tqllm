@@ -8,6 +8,7 @@
 #include <atomic>
 #include "fn_graphs.hpp"
 #include "fn_moe_dump.hpp"
+#include "fn_ablate.hpp"
 #include "gguf.hpp"
 #include <map>
 #include <mutex>
@@ -265,6 +266,8 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // TQLLM_DEBUG=capture_throw:L: a capture of layer L fails after its mixer core changed the host state (test of the rerun)
     static const int throw_layer = tqllm::debug_cstr("capture_throw") ? std::atoi(tqllm::debug_cstr("capture_throw")) : -1;
     if (capturing && layer == throw_layer) throw std::runtime_error("TQLLM_DEBUG=capture_throw");
+    const auto & ab = tqllm::flashnext::ablation();  // TQFN_ABLATE (fn_ablate.hpp); off: nothing below runs
+    if (ab.attn(layer)) tqllm_cuda::fn_ablate_rows(block.p, ab.dir(layer), ab.wa[size_t(layer)], h, n, nullptr);  // the attention / GDN output
     // a prefill sub-chunk writes its combined rows straight into the layer's wide rows (combine is elementwise, so in place
     // over the residual view is safe)
     float * comb = sink && !wb ? sink->wide + size_t(sink->off) * width : combined.p;
@@ -385,6 +388,7 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
     // (fn_moe_hc_combine_to: fn_moe_combine then hc_combine, the same values); the waves and --split paths keep the pair
     std::unique_ptr<Device<float>> updated;
     auto moe_out = [&](const __nv_bfloat16 * ed) {
+        if (ab.ffn(layer)) { tqllm_cuda::fn_moe_combine(ed, weights.p, sd.p, shared_weights.p, fo.p, h, c.topk, n, nullptr); return; }  // the pair below
         updated = std::make_unique<Device<float>>(size_t(width) * n);
         tqllm_cuda::fn_moe_hc_combine_to(ed, weights.p, sd.p, shared_weights.p, inject.p, combined.p, updated->p, h, c.topk, c.hc, n, nullptr);
     };
@@ -865,9 +869,12 @@ void DecodeModel::layer_forward_step(int layer, std::unique_ptr<Device<float>> &
         moe_out(ed.p);
     }
     if (!updated) {
+        if (ab.ffn(layer)) tqllm_cuda::fn_ablate_rows(fo.p, ab.dir(layer), ab.wf[size_t(layer)], h, n, nullptr);  // the FFN output
         updated = std::make_unique<Device<float>>(size_t(width) * n);
         tqllm_cuda::hc_combine(combined.p, fo.p, inject.p, updated->p, h, c.hc, n, nullptr);
     }
+    // every hyper-connection stream of the updated rows
+    if (ab.stream(layer)) tqllm_cuda::fn_ablate_rows(updated->p, ab.sdir(layer), ab.ws[size_t(layer)], h, n * c.hc, nullptr, ab.sdir_count());
     residual = std::move(updated);
     end_capture();
     if (ep) ep->after_layer(layer);

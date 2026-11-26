@@ -915,12 +915,15 @@ __global__ void fn_moe_combine_k(const __nv_bfloat16 * r, const float * w, const
 }
 // fn_moe_combine_k then combine_k in place over the wide rows, one thread per (token, column) for all streams: the expert
 // sum is formed once and never stored (the same arithmetic as the two kernels)
+// ar / coef (optional, directional ablation): the FFN output loses coef[t] * ar (coef from fn_ablate_moe_coef)
 template<class R> __global__ void fn_moe_hc_combine_k(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw,
-                                                      const float * inject, R * wide, int h, int k, int c, int n) {
+                                                      const float * inject, R * wide, int h, int k, int c, int n,
+                                                      const float * ar, const float * coef) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= int64_t(n) * h) return;
     const int t = int(i / h), j = int(i % h); float v = 0.f;
     for (int e = 0; e < k; ++e) v += w[t * k + e] * __bfloat162float(r[(int64_t(t) * k + e) * h + j]);
-    const float fo = v + sw[t] * sh[i];
+    float fo = v + sw[t] * sh[i];
+    if (ar) fo = __fsub_rn(fo, __fmul_rn(coef[t], ar[j]));
     for (int stream = 0; stream < c; ++stream) {
         const float scatter = 2.f / (1.f + expf(-inject[t * c + stream] / c));
         const int64_t at = (int64_t(t) * c + stream) * h + j;
@@ -1748,14 +1751,67 @@ void fn_swiglu_f32(const float * g, const float * u, float * o, int64_t n, cudaS
     fn_swiglu_f32_k<<<(n + 255) / 256, 256, 0, s>>>(g, u, o, n, o_h);
 }
 template<class R> static void moe_hc_combine_run(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, const float * inject, R * wide,
-                                                 int h, int k, int c, int n, cudaStream_t s) {
+                                                 int h, int k, int c, int n, cudaStream_t s, const float * ar, const float * coef) {
     if (h <= 0 || k <= 0 || c <= 0 || n <= 0 || !r || !w || !sh || !sw || !inject || !wide) throw std::invalid_argument("Flash-Next moe + hc combine: invalid shape or pointer");
-    fn_moe_hc_combine_k<<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, inject, wide, h, k, c, n);
+    fn_moe_hc_combine_k<<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, inject, wide, h, k, c, n, ar, coef);
 }
 void fn_moe_hc_combine(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, const float * inject, float * wide,
-                       int h, int k, int c, int n, cudaStream_t s) { moe_hc_combine_run(r, w, sh, sw, inject, wide, h, k, c, n, s); }
+                       int h, int k, int c, int n, cudaStream_t s, const float * ar, const float * coef) { moe_hc_combine_run(r, w, sh, sw, inject, wide, h, k, c, n, s, ar, coef); }
 void fn_moe_hc_combine(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, const float * inject, __nv_bfloat16 * wide,
-                       int h, int k, int c, int n, cudaStream_t s) { moe_hc_combine_run(r, w, sh, sw, inject, wide, h, k, c, n, s); }
+                       int h, int k, int c, int n, cudaStream_t s, const float * ar, const float * coef) { moe_hc_combine_run(r, w, sh, sw, inject, wide, h, k, c, n, s, ar, coef); }
+// Directional ablation (TQFN_ABLATE): one block of 256 threads per row, x -= weight * sum_k (x . d_k) d_k over ndirs
+// (1..4) orthonormal directions [ndirs][h]; the dots reduce in a fixed order (deterministic)
+template<class R> __global__ void fn_ablate_rows_k(R * x, const float * dir, float weight, int h, int ndirs) {
+    R * row = x + int64_t(blockIdx.x) * h;
+    float sum[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        const float v = rdf(row[j]);
+        for (int k = 0; k < ndirs; ++k) sum[k] += v * dir[int64_t(k) * h + j];
+    }
+    __shared__ float part[4][256];
+    __shared__ float coef[4];
+    for (int k = 0; k < ndirs; ++k) part[k][threadIdx.x] = sum[k];
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) for (int k = 0; k < ndirs; ++k) part[k][threadIdx.x] += part[k][threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x < ndirs) coef[threadIdx.x] = weight * part[threadIdx.x][0];
+    __syncthreads();
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        float v = rdf(row[j]);
+        for (int k = 0; k < ndirs; ++k) v = __fsub_rn(v, __fmul_rn(coef[k], dir[int64_t(k) * h + j]));
+        row[j] = wr<R>(v);
+    }
+}
+void fn_ablate_rows(float * x, const float * dir, float weight, int h, int n, cudaStream_t s, int ndirs) {
+    if (h <= 0 || n <= 0 || ndirs <= 0 || ndirs > 4 || !x || !dir) throw std::invalid_argument("Flash-Next ablation: invalid shape or pointer");
+    fn_ablate_rows_k<<<n, 256, 0, s>>>(x, dir, weight, h, ndirs);
+}
+void fn_ablate_rows(__nv_bfloat16 * x, const float * dir, float weight, int h, int n, cudaStream_t s, int ndirs) {
+    if (h <= 0 || n <= 0 || ndirs <= 0 || ndirs > 4 || !x || !dir) throw std::invalid_argument("Flash-Next ablation: invalid shape or pointer");
+    fn_ablate_rows_k<<<n, 256, 0, s>>>(x, dir, weight, h, ndirs);
+}
+// coef[t] = weight * (fo[t] . dir) with fo[t] the FFN output fn_moe_hc_combine_k forms (same per-column arithmetic)
+__global__ void fn_ablate_moe_coef_k(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, const float * dir,
+                                     float weight, float * coef, int h, int k) {
+    const int t = blockIdx.x;
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        float v = 0.f;
+        for (int e = 0; e < k; ++e) v += w[t * k + e] * __bfloat162float(r[(int64_t(t) * k + e) * h + j]);
+        sum += (v + sw[t] * sh[int64_t(t) * h + j]) * dir[j];
+    }
+    __shared__ float part[256];
+    part[threadIdx.x] = sum; __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) part[threadIdx.x] += part[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) coef[t] = weight * part[0];
+}
+void fn_ablate_moe_coef(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, const float * dir, float weight,
+                        float * coef, int h, int k, int n, cudaStream_t s) {
+    if (h <= 0 || k <= 0 || n <= 0 || !r || !w || !sh || !sw || !dir || !coef) throw std::invalid_argument("Flash-Next ablation coef: invalid shape or pointer");
+    fn_ablate_moe_coef_k<<<n, 256, 0, s>>>(r, w, sh, sw, dir, weight, coef, h, k);
+}
 void fn_moe_combine(const __nv_bfloat16 * r, const float * w, const float * sh, const float * sw, float * o, int h, int k, int n, cudaStream_t s) {
     if (h <= 0 || k <= 0 || n <= 0 || !r || !w || !sh || !sw || !o) throw std::invalid_argument("Flash-Next moe combine: invalid shape or pointer");
     fn_moe_combine_k<<<(int64_t(n) * h + 255) / 256, 256, 0, s>>>(r, w, sh, sw, o, h, k, n);

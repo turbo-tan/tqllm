@@ -208,6 +208,10 @@ flags:
     replaced_by: "-fitt MiB (-fit on|off)"
 
   # Apple MLX backend; unset preserves the base path.
+  - name: TQFN_ABLATE
+    kind: user
+    default: "-"
+    doc: "FILE: Flash-Next directional ablation from a TQAB file: per block, user-supplied unit directions are projected out of the attention / GDN output, the FFN output and the hyper-connection streams at run time, with per-block weights (docs/reference/options.md, \"Directional ablation\"). Unset: nothing runs and the output is unchanged"
   - name: TQFN_ARENA_MB
     kind: user
     default: "-"
@@ -248,6 +252,10 @@ flags:
     kind: user
     default: "0"
     doc: "1 / 2: int8 activations for the layer-major expert GEMMs (per-32 / per-token scales)"
+  - name: TQFN_RESDUMP
+    kind: debug
+    default: "-"
+    doc: "FILE: Flash-Next: each prompt chunk writes the last position's wide residual after the embedding and every trunk layer to FILE, and the first token's logits to FILE.logits (for computing TQFN_ABLATE directions; docs/reference/options.md)"
   - name: TQFN_TAIL_SKIP
     kind: retired
     default: "-"

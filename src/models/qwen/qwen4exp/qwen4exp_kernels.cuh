@@ -193,10 +193,20 @@ void fn_swiglu_bf16_h_groups(const __nv_bfloat16 * gate, const __nv_bfloat16 * u
                              int slots, int capacity, int ff, cudaStream_t);
 void fn_swiglu_f32(const float * gate, const float * up, float * out, int64_t count, cudaStream_t, __half * out_h = nullptr);
 // fn_moe_combine + hc_combine in place over `wide` ([n][c][h]) in one pass (same values)
+// ablate_dir / ablate_coef (optional): the FFN output loses ablate_coef[t] * ablate_dir before the update (fn_ablate_moe_coef)
 void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * inject,
-                       float * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
+                       float * wide, int hidden, int topk, int streams, int tokens, cudaStream_t,
+                       const float * ablate_dir = nullptr, const float * ablate_coef = nullptr);
 void fn_moe_hc_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * inject,
-                       __nv_bfloat16 * wide, int hidden, int topk, int streams, int tokens, cudaStream_t);
+                       __nv_bfloat16 * wide, int hidden, int topk, int streams, int tokens, cudaStream_t,
+                       const float * ablate_dir = nullptr, const float * ablate_coef = nullptr);
+// Directional ablation (TQFN_ABLATE): rows [n][h] in place, x -= weight * (x . dir) dir (dir unit length)
+// ndirs (1..4) orthonormal directions [ndirs][hidden], every one projected out of every row
+void fn_ablate_rows(float * x, const float * dir, float weight, int hidden, int tokens, cudaStream_t, int ndirs = 1);
+void fn_ablate_rows(__nv_bfloat16 * x, const float * dir, float weight, int hidden, int tokens, cudaStream_t, int ndirs = 1);  // BF16 rows (stored rounded)
+// coef[t] = weight * (fo[t] . dir), fo the FFN output fn_moe_hc_combine forms from the same inputs
+void fn_ablate_moe_coef(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights, const float * dir,
+                        float weight, float * coef, int hidden, int topk, int tokens, cudaStream_t);
 void fn_moe_combine(const __nv_bfloat16 * routed, const float * weights, const float * shared, const float * shared_weights,
                     float * out, int hidden, int topk, int tokens, cudaStream_t);
 // fn_moe_combine then hc_combine(residual, that, inject) -> out ([n][c][h], out != residual) in one pass (same values)

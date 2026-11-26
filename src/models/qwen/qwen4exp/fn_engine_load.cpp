@@ -7,6 +7,7 @@
 #include "debug.hpp"
 #include "device_free.hpp"
 #include "fn_engine.hpp"
+#include "fn_ablate.hpp"
 #include "core/tp_comm.hpp"
 #include "core/split_bounds.hpp"
 #include <filesystem>
@@ -516,6 +517,7 @@ FlashNextEngine::FlashNextEngine(const std::string & manifest, uint32_t context,
       for (auto & t : pool) t.join(); }
     char * mp = f.mtp_packed; const size_t mb = f.mtp_block; const int L = c.layers;
     f.mtp_cache->set_prepacked([mp, mb, L](int layer, int id) -> const char * { return layer == L ? mp + size_t(id) * mb : nullptr; }, true);
+    tqllm::flashnext::ablation().load(c.hidden, c.layers);  // TQFN_ABLATE (fn_ablate.hpp): before any capture
     std::fprintf(stderr, "tqllm: Flash-Next ready: %d layers, %d experts, %d slots/layer, context %u, %d drafts\n",
                  c.layers, c.experts, f.slots, context, f.drafts);
     // warm-up: one short prompt uploads every dense weight and creates every expert bank now, so the first request is

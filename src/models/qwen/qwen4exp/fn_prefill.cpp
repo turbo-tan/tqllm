@@ -1,6 +1,7 @@
 // Flash-Next layer-major prefill: dense sub-chunks, then the routed experts once per layer from the expert banks and the staged groups.
 #include "debug.hpp"
 #include "fn_model.hpp"
+#include "fn_ablate.hpp"
 #include "decode_rules.hpp"
 #include "host_expert_tier.hpp"
 
@@ -389,12 +390,27 @@ void DecodeModel::prefill_layer(int layer, float * wide, int n, const float * pl
     if (pf_hold_next) {}  // step_outer: the next chunk of this layer reads the same staged experts
     else if (next >= 0 && stage_early(next)) stage_begin(st, cache, next); else st.layer = -1;
     // combine and the hyper-connection update per sub-chunk (rows of `wide` replaced)
+    // TQFN_ABLATE: the FFN output loses coef[t] * dir in the combine (fn_ablate.hpp; coef from the same FFN rows)
+    const auto & ab = tqllm::flashnext::ablation();
+    const float * adir = ab.ffn(layer) ? ab.dir(layer) : nullptr;
     for (int d = 0; d < n; d += sub) {
         const int nd = std::min(sub, n - d); ArenaMark scratch;
+        std::unique_ptr<Device<float>> coef;
+        if (adir) {
+            coef = std::make_unique<Device<float>>(size_t(nd));
+            tqllm_cuda::fn_ablate_moe_coef(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K, pf_sd->p + size_t(d) * h, pf_sw->p + d,
+                                           adir, ab.wf[size_t(layer)], coef->p, h, K, nd, nullptr);
+        }
         if (wide_b) tqllm_cuda::fn_moe_hc_combine(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K, pf_sd->p + size_t(d) * h, pf_sw->p + d,
-                                                  pf_inject->p + size_t(d) * c.hc, wide_b + size_t(d) * width, h, K, c.hc, nd, nullptr);
+                                                  pf_inject->p + size_t(d) * c.hc, wide_b + size_t(d) * width, h, K, c.hc, nd, nullptr,
+                                                  adir, coef ? coef->p : nullptr);
         else tqllm_cuda::fn_moe_hc_combine(pf_ed->p + size_t(d) * K * h, pf_weights->p + size_t(d) * K, pf_sd->p + size_t(d) * h, pf_sw->p + d,
-                                           pf_inject->p + size_t(d) * c.hc, wide + size_t(d) * width, h, K, c.hc, nd, nullptr);
+                                           pf_inject->p + size_t(d) * c.hc, wide + size_t(d) * width, h, K, c.hc, nd, nullptr,
+                                           adir, coef ? coef->p : nullptr);
+        if (ab.stream(layer)) {  // TQFN_ABLATE stream weight over every stream of these rows
+            if (wide_b) tqllm_cuda::fn_ablate_rows(wide_b + size_t(d) * width, ab.sdir(layer), ab.ws[size_t(layer)], h, nd * c.hc, nullptr, ab.sdir_count());
+            else tqllm_cuda::fn_ablate_rows(wide + size_t(d) * width, ab.sdir(layer), ab.ws[size_t(layer)], h, nd * c.hc, nullptr, ab.sdir_count());
+        }
     }
     if (kPrefillLog) { lmark(3); if (lt[3] > 0)
         std::fprintf(stderr, "tqllm: prefill layer %d n %d %.0f ms: dense %.0f, routing + plan %.0f, experts %.0f, combine %.0f\n",
