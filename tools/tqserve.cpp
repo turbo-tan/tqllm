@@ -7,6 +7,7 @@
 #include "serve/net.hpp"
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
+#include "serve/stream_heartbeat.hpp"
 #include "serve/jinja_template.hpp"
 #include "serve/embeddings.hpp"
 #include "serve/cuda_health.hpp"
@@ -1018,24 +1019,24 @@ int main(int argc, char ** argv) {
                 } else if (parsed.stream) {
                     send_all(client, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                                      "Connection: close\r\n\r\n");
-                    // SSE comments every 10 s until the first token: a long prefill otherwise looks like a dead connection to
-                    // clients with a read timeout (agents on 200K contexts)
-                    std::mutex ka_mx; std::condition_variable ka_cv; bool ka_stop = false;
-                    auto raw = [&](const std::string & d) { std::lock_guard<std::mutex> lk(ka_mx); return send_all(client, d); };
-                    std::thread keepalive([&] {
-                        std::unique_lock<std::mutex> lk(ka_mx);
-                        while (!ka_cv.wait_for(lk, std::chrono::seconds(10), [&] { return ka_stop; }))
-                            if (!send_all(client, ": keepalive\n\n")) break;
-                    });
-                    auto stop_keepalive = [&] { { std::lock_guard<std::mutex> lk(ka_mx); ka_stop = true; } ka_cv.notify_all(); };
-                    struct KeepaliveJoin { std::function<void()> stop; std::thread & t; ~KeepaliveJoin() { stop(); if (t.joinable()) t.join(); } } ka_join{stop_keepalive, keepalive};
+                    // a heartbeat whenever the answer is quiet for 5 s (prefill, a tool call held back): a real event of
+                    // the stream's API, so agent clients with an event-idle watchdog keep the stream (stream_heartbeat.hpp)
                     std::unique_ptr<tqserve::ResponsesSse> rsse;
                     std::unique_ptr<tqserve::MessagesSse> msse;
+                    auto raw = [&](const std::string & d) { return send_all(client, d); };
                     if (api == tqserve::Api::Responses) { rsse = std::make_unique<tqserve::ResponsesSse>(name, raw); rsse->begin(); }
                     if (api == tqserve::Api::Messages) { msse = std::make_unique<tqserve::MessagesSse>(name, raw); msse->begin(); }
-                    auto send = [&](const std::string & d) { return rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d); };
+                    tqserve::StreamHeartbeat heartbeat(std::chrono::seconds(5), [&] {
+                        return rsse ? rsse->heartbeat() : msse ? msse->heartbeat() : raw(": keepalive\n\n");
+                    });
+                    auto send = [&](const std::string & d) {
+                        std::lock_guard<std::mutex> lk(heartbeat.lock());
+                        const bool ok = rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d);
+                        heartbeat.wrote();
+                        return ok;
+                    };
                     auto run_stream = [&](const tqserve::ChatRequest & r, tqserve::StreamWriter & w) {
-                        auto on_tokens = [&](const std::vector<uint32_t> & ids) { stop_keepalive(); return w.update(ids); };
+                        auto on_tokens = [&](const std::vector<uint32_t> & ids) { return w.update(ids); };
                         auto result = guarded([&] {
                             return scheduler ? scheduler->submit_stream(r, on_tokens)
                                              : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
@@ -1084,6 +1085,7 @@ int main(int argc, char ** argv) {
                     }
                     if (!scheduler) model.set_continuation(0);  // a thinking budget's held phase 1 state, if phase 2 did not run
                     if (parsed.observation) parsed.observation->finish();
+                    heartbeat.stop();  // before the socket closes (its number may be reused at once)
                     tqnet::close(client);
                     return;
                 } else {
