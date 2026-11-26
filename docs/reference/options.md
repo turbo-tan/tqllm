@@ -64,10 +64,11 @@ Environment variables (`TQLLM_*`, `TQFN_*`) are listed with their defaults and s
 `--exact on` (default) runs every step at the reference precision: FP16 / BF16 activations and KV, no int8 / FP8 GEMMs,
 no CPU-served experts. Greedy output is then the same from build to build. `--exact off` lets each engine use its
 measured approximations (the middle column below): faster, with a small, measured change in the output. Published speed
-numbers say which one they ran. With the prompt cache (on by default for Flash-Next where memory fits) a long prompt's prefill is split at the point a
-later turn can reuse (64 tokens before its end), on the first read too, so long-prompt replies can differ from the same
-prompt with `--prompt-cache off` (one read in whole chunks); with the cache on, a reused turn gives the same text as its
-first read. `--prompt-cache off` reads every prompt afresh.
+numbers say which one they ran. With the prompt cache (on by default for Flash-Next where memory fits) a chat prompt's
+prefill is split at every message start from position 1024 (turn chunks), on a cold read too, so a long multi-message
+prompt's reply can differ in the last digits from the same prompt with `--prompt-cache off`; with the cache on, a resumed
+turn gives the same text as a cold read of the same prompt. Chats whose last message starts before position 1024 read
+exactly as with the cache off. `--prompt-cache off` reads every prompt afresh.
 
 `--expert-kernels auto|tensor|warp` (Inkling-2-Mini on CUDA, default auto) picks the routed-expert kernels. The two
 families round differently, so they give different greedy text; auto picks by a fixed rule (tensor cores when the format
@@ -164,7 +165,7 @@ Changing a scale needs no graph recapture (the kernels read it from device memor
 | `--head-host on\|off` | memory fit | the int8 LM head in system RAM (exact): the 4-bit first pass stays on the GPU and only the re-scored rows cross PCIe (see `--embed-host` for measurements) |
 | `--kv-stage on\|off` | on | stream the RAM part back to the GPU layer by layer while decoding |
 | `--kv-compact R [--kv-compact-at idle\|turn]` | off, idle | compress old KV R-fold (not exact; one slot, tq3 or trellis KV) |
-| `--prompt-cache on\|off` | Flash-Next: on where memory fits (discrete cards: on; unified memory: when every slot's kept conversation leaves 20 GB available; the start-up log says which); other engines: off | each slot keeps its conversation's KV so a follow-up does not re-read the document; replies are the same as with it off (on with `--kv-compact`). Mac (Metal): a follow-up turn resumes where the previous prompt ended even when the client drops the reasoning, and the server prefills the returned answer while idle, so a follow-up starts in about 0.3-0.4 s at 24-34K tokens; the kept conversation holds about 3-5 GB (34-51K tokens). Replies equal a cold prefill of the same prompt with the cache on; they can differ in the last digits from runs with it off (other prefill chunks). Off: the prompt is prefilled as one stream (faster for a chat that arrives with a long history of short messages) |
+| `--prompt-cache on\|off` | Flash-Next: on where memory fits (discrete cards: on; unified memory: when every slot's kept conversation leaves 20 GB available; the start-up log says which); other engines: off | each slot keeps its conversation's KV so a follow-up does not re-read the document; replies are the same as with it off (on with `--kv-compact`). Mac (Metal): a follow-up turn resumes where the previous prompt ended even when the client drops the reasoning, and the server prefills the returned answer while idle, so a follow-up starts in about 0.3-0.4 s at 24-34K tokens; the kept conversation holds about 3-5 GB (34-51K tokens). Flash-Next does the same (turn chunks, idle prefill of the returned answer): a short follow-up starts in 0.2-0.3 s at 30-110K tokens (RTX 3090). Replies equal a cold prefill of the same prompt with the cache on; they can differ in the last digits from runs with it off (other prefill chunks). Off: the prompt is prefilled as one stream (faster for a chat that arrives with a long history of short messages) |
 | `--prompt-park N` | from memory (a quarter of RAM on unified memory, up to 16 GB otherwise) | with `--prompt-cache on` and several slots: up to N conversations' kept states wait in host memory when their slot serves someone else, so their next turn still resumes; 0 = off |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |

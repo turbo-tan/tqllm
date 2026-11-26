@@ -6,6 +6,14 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
 ## Unreleased
 
 ### Fixed
+- Flash-Next prompt cache: a follow-up turn's reply is now byte-identical to a cold read of the same prompt. It was not,
+  because the turn resumed 64 tokens before the last prompt's end (or after its reply) and the prefill kernels give other
+  numbers for other chunk sizes (RTX 3090, ISTA IQ3_XXS, 5-turn chats: 16 of 16 follow-ups differed). Chat prompts now
+  prefill in turn chunks, as the qwen35 CUDA and Metal engines do: chunks restart at every message start from position
+  1024, chunks under 256 tokens are read as 8-row decode steps and longer ones layer-major, cold and resumed alike, and the
+  state is kept at the generation prompt. While idle the server prefills the answer as the client will send it back.
+  Follow-up questions after a 28.5K paste: 0.22-0.30 s to the first token (0.26 s before); a 110K chat's follow-up 0.20 s
+  (1.04 s). tqserve now runs that idle prefill when `--prompt-cache` is not given (Flash-Next keeps the cache by default).
 - Qwen3.8-27B with `--lora`: prompt chunks run the adapters as GEMMs (cuBLAS) instead of one row at a time (#81). GB10,
   the reporter's command line with the Hermes LoRA: prefill 567 -> 1251 tok/s (1412 without the adapter).
 - Streaming on `/v1/responses` and `/v1/messages`: the server sends a heartbeat event (`response.in_progress` / `ping`)

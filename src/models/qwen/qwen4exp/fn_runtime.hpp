@@ -177,6 +177,7 @@ struct FnConfig {
     bool prompt_cache = false;  // --prompt-cache on: a slot keeps its sequence and reuses a shared prompt prefix
     bool prompt_cache_set = false;  // --prompt-cache given (else prompt_cache_by_fit may turn it on at start-up)
     int prompt_park = -1;       // --prompt-park N: kept states parked outside the slots (0: off; -1: 4 x slots), at most 4 GB
+    uint32_t im_start = ~0u;    // the chat template's message-start token: with the prompt cache, chat prompts prefill in turn chunks
     bool unified_memory = false;  // the GPU shares system memory (GB10): set at load
     // --split experts: the link to the other rank (rank 0 serves, rank 1 computes its experts of rank 0's decode forwards)
     std::shared_ptr<tqllm::TpComm> ep;

@@ -50,6 +50,10 @@ void FlashNextEngine::arena_resize(size_t bytes) {
 
 void FlashNextEngine::take_snapshot(SlotState & s) {
     auto & m = *s.model_; const size_t L = m.rec.size();
+    if (s.stash_) {  // prefill_ahead: the restored snapshot stays as alt_ (fresh buffers below)
+        s.alt_state_.swap(s.snap_state_); s.alt_conv_.swap(s.snap_conv_); s.alt_ple_.swap(s.snap_ple_);
+        s.snap_state_.clear(); s.snap_conv_.clear(); s.snap_ple_.clear(); s.stash_ = false;
+    }
     s.snap_state_.resize(L); s.snap_conv_.resize(L); s.snap_ple_.resize(L);
     auto copy = [](std::unique_ptr<Device<float>> & dst, const std::unique_ptr<Device<float>> & src) {
         if (!src) { dst.reset(); return; }
@@ -173,7 +177,12 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     static std::map<int, std::vector<int>> bank_keep;  // lent trunk banks: their resident experts before the prompt
     auto & checkpoint = *f_.cp; const auto & c = checkpoint.config;
     require(!prompt.empty() && prompt.size() + count + 16 <= slot_context(), "prompt plus max_tokens exceeds the slot context");
-    int P0 = caching() ? reuse(S(), prompt) : 0;  // prompt positions [0, P0) come from this slot's last request
+    // a chat prompt (turn chunks) resumes only at a kept message start, never from the last reply's own state (live_)
+    const bool chat = turns() && turn_prompt(prompt, f_.cp->run.im_start);
+    int P0 = !caching() ? 0 : chat ? (S().model_ ? reusable_prefix(S().seq_, S().snap_, prompt) : 0) : reuse(S(), prompt);  // prompt positions [0, P0) come from this slot's last request
+    // the state before an idle prefill (prefill_ahead): the client sent the answer back otherwise than expected
+    if (chat && S().model_ && !P0 && (P0 = reusable_prefix(S().alt_seq_, S().alt_snap_, prompt))) S().swap_alt();
+    if (!S().stash_) S().drop_alt();
     // a kept sequence has the capacity of the request that built it (cached_sequence_rows / multi_sequence_rows): a request
     // it does not hold grows it (kept_sequence_rows); only when the memory cannot hold that is the prompt read afresh
     if (P0 && !kept_sequence_fits(prompt.size(), count, size_t(S().model_->kv_capacity))) {
@@ -185,7 +194,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     const size_t seq_rows = slots_.size() > 1 ? tqllm::flashnext::multi_sequence_rows(caching(), prompt.size(), count, size_t(slot_context()))
                           : P0 ? size_t(S().model_->kv_capacity)
                           : caching() ? cached_sequence_rows(prompt.size(), count, size_t(slot_context())) : prompt.size() + count + 16;
-    const bool live = P0 && P0 == S().live_;  // the last reply's own state: no restore
+    const bool live = !chat && P0 && P0 == S().live_;  // the last reply's own state: no restore
     S().snap_ = S().live_ = 0;  // set again once this prefill has completed
     if (!P0) { S().model_.reset(); if (caching()) S().conv_ = ++conv_clock_; }  // a new conversation in this slot
     S().prompt_res_.reset();
@@ -297,12 +306,23 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // keeps its residuals in pinned host memory, drops the MTP bank before the trunk and the layer-major buffers
     // after it. The catch-up runs the same batches in the same order as when it followed each chunk.
     const int P = int(ids.size()), T = P - P0; const int W = S().model_->width;
-    // the snapshot for the next request: a chunk boundary kTail before the prompt's end
-    int snap = caching() ? snapshot_at(P, P0, kTail) : 0;
+    // turn chunks (chat prompts with the prompt cache, decode_rules.hpp): chunks restart at every message start from
+    // kTurnMin, a chunk of kTurnShort tokens or more runs layer-major and a shorter one as kTurnStep-row decode steps, every
+    // piece writes its MTP keys / values itself, and the state is kept at the last message start, so a prompt's reply is
+    // the same cold and resumed. A chat prompt with no message start past kTurnMin is read as before and keeps nothing.
+    const std::vector<int> starts = chat ? turn_starts(ids, f_.cp->run.im_start) : std::vector<int>{};
+    const bool turn = chat && (!starts.empty() || P0 > 0);
+    const bool turn_lm = turn && turn_has_long(starts, P0, P);  // a layer-major chunk: the prefill plans (else decode steps only)
+    S().chat_ = chat;
+    // the snapshot for the next request: the last message start (chat), or a chunk boundary kTail before the prompt's end
+    int snap = chat ? (turn ? turn_kept_at(starts, P0) : 0) : caching() ? snapshot_at(P, P0, kTail) : 0;
     int keep_snap = P0;  // no new snapshot: the restored one still holds P0
     const bool snap_at_start = live && !snap;
     if (snap_at_start) take_snapshot(S());  // a short next message: the same prompt again restores here
-    auto chunk_end = [&](int b, int ch) { const int e = std::min(P, b + ch); return snap > b && snap < e ? snap : e; };
+    int grid = 0;  // turn: the chunk grid inside a message (a constant of the server, set with the plan)
+    auto chunk_end = [&](int b, int ch) {
+        if (turn) return turn_piece_end(starts, b, P, grid > 0 ? std::min(grid, ch) : ch);
+        const int e = std::min(P, b + ch); return snap > b && snap < e ? snap : e; };
     int outer = 0, outer_group = 0;  // leading chunks run layer-outer (step_outer) in groups: experts read from the GGUF on demand
     std::vector<std::pair<int, int>> spans;
     stamp("model ready");
@@ -316,11 +336,15 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     // 16K chunk cost 6.5 GB there, and giving up banks for them only adds the refill (11-11: 1.2K prompt 2.38 -> 2.16 s).
     constexpr int kMaxChunk = 32768;
     // a DFlash2 drafter captures every chunk row's features (5 x hidden BF16 each): the chunk is capped at its buffer
-    const int chunk0 = std::min(f_.cp->run.tune.chunk_set || !f_.cp->run.small_card ? f_.chunk : tqllm::flashnext::small_card_chunk(T, kMaxChunk), f_.dfl_feat ? int(f_.dfl_feat_rows) : kMaxChunk);
+    const int chunk_cap = f_.dfl_feat ? int(f_.dfl_feat_rows) : kMaxChunk;
+    // a turn's short new part (a follow-up message) plans its own rows (turn_min_chunk)
+    const int min_chunk = turn ? turn_min_chunk(T) : 2048;
+    const int chunk0 = turn && T < 2048 ? min_chunk
+                     : std::min(f_.cp->run.tune.chunk_set || !f_.cp->run.small_card ? f_.chunk : tqllm::flashnext::small_card_chunk(T, kMaxChunk), chunk_cap);
     int chunk = chunk0, block = 0; size_t arena_req = f_.arena_prefill; size_t heads_parked = 0;  // the arena a chunk needs: the start-up size, or less once the chunk has halved
     struct UnparkGuard { Checkpoint & cp; size_t & n; ~UnparkGuard() { if (n) { try { cp.unpark_heads(); } catch (...) {} n = 0; } } } unpark_guard{checkpoint, heads_parked};
     std::unique_ptr<Device<float>> last_row;  // heads parked: the last chunk's head row, picked once they are back
-    if (T >= 256 && chunk >= 256) {
+    if ((turn ? turn_lm : T >= 256) && chunk >= 256) {
         const auto & c = checkpoint.config;
         tqllm::PrefillShape sh; sh.hidden = c.hidden; sh.hc = c.hc; sh.expert_ff = c.expert_ff; sh.topk = c.topk; sh.experts = c.experts; sh.layers = c.layers;
         sh.wide_bf16 = S().model_->prefill_wide_bf16(std::min(checkpoint.run.tune.sub, chunk));
@@ -340,7 +364,8 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         if (T > 131072) tu.workspace_bytes += size_t(448) << 20;
         int attn = 0; for (int l = 0; l < c.layers; ++l) if (checkpoint.has_tensor("blk." + std::to_string(l) + ".indexer.k_proj.weight")) ++attn;
         const int seq_cap = S().model_ && S().model_->kv_capacity ? S().model_->kv_capacity : f_.cp->rt.kv_capacity;
-        auto context_term = [&](int block) { return tqllm::prefill_context_bytes(seq_cap, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
+        int plan_cap = seq_cap, plan_T = T;  // the context and prompt the plan sizes for (turn grid: the slot context, below)
+        auto context_term = [&](int block) { return tqllm::prefill_context_bytes(plan_cap, block, attn, checkpoint.attention_kvheads, checkpoint.attention_dim, c.index_dim); };
         // the plan counts the QSA selection scratch in context_bytes: release the old one so the free memory it reads is right
         if (f_.cp->rt.qsa_batch) { ck(cudaDeviceSynchronize()); f_.cp->rt.qsa_batch.reset(); cudaMemPool_t pool; ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0)); }
         auto free_now = [] { return tqllm::device_free_bytes(); };
@@ -360,7 +385,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             tqllm::PrefillTuning t = tu;
             t.chunk = chunk; t.sub = std::min(f_.cp->run.tune.sub, block); t.context_bytes = context_term(block);
             // the QSA score scratch holds one block of queries: a prompt shorter than the block has only its own (sizing only)
-            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, std::min(block, T), checkpoint.attention_heads);
+            t.arena_bytes = tqllm::prefill_arena_req(f_.arena_prefill, chunk, std::min(block, plan_T), checkpoint.attention_heads);
             return t;
         };
         const tqllm::PlanRoom base_room = room_for(0, 0);
@@ -368,7 +393,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             std::fprintf(stderr, "tqllm: prefill plan: %.0f MB free + %.0f MB of banks + %.0f MB staging is below the %.0f MB fixed plan room; this request plans with what is there, its chunk may differ\n",
                          free_now() / 1048576.0, banks_total / 1048576.0, f_.cache->device_staging_bytes() / 1048576.0, f_.plan_budget / 1048576.0);
         tqllm::PrefillChoice choice = tqllm::prefill_choice(
-            sh, tune_for, T, base_room.room, mtp_bank, f_.cp->run.small_card ? checkpoint.heads_bytes() : 0, chunk0, block0);
+            sh, tune_for, T, base_room.room, mtp_bank, f_.cp->run.small_card ? checkpoint.heads_bytes() : 0, chunk0, block0, min_chunk);
         // the LM heads (needed only for the first token) in pinned host memory, when their room makes the whole prompt one
         // chunk (a >32K prompt): the pick then hangs on a host copy, so the trunk reads it back after its buffers are gone.
         // A one-chunk prompt picks in place, so parking there buys nothing and is not done (11-12: it was parked and
@@ -376,9 +401,35 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         if (choice.park_heads && T > choice.chunk && (heads_parked = checkpoint.park_heads())) {
             cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
         } else if (choice.park_heads) {
-            choice = tqllm::prefill_choice(sh, tune_for, T, base_room.room, mtp_bank, 0, chunk0, block0);
+            choice = tqllm::prefill_choice(sh, tune_for, T, base_room.room, mtp_bank, 0, chunk0, block0, min_chunk);
         }
         chunk = choice.chunk; block = choice.block;
+        if (turn) {
+            // the grid and the selection block of every turn prompt are the ones a full-context prompt plans on the fixed
+            // plan room: a constant of the server, so a turn's chunks and block do not depend on the prompt's length and
+            // a conversation's earlier turns were read as a cold read of its latest prompt reads them
+            const size_t fixed_room = f_.plan_budget ? f_.plan_budget : base_room.room;
+            const int whole_T = int(slot_context()) - 16;
+            const int grid0 = std::min(f_.cp->run.tune.chunk_set || !f_.cp->run.small_card ? f_.chunk : tqllm::flashnext::small_card_chunk(whole_T, kMaxChunk), chunk_cap);
+            tqllm::PrefillShape sh_whole = sh; sh_whole.wide_bf16 = S().model_->prefill_wide_bf16(std::min(checkpoint.run.tune.sub, grid0));
+            const tqllm::PrefillTuning tu_now = tu;
+            tu.stage = tqllm::flashnext::small_card_stage(f_.cp->run.small_card, f_.cp->run.tune.stage_set, f_.cp->run.tune.stage, whole_T, f_.chunk);
+            tu.workspace_bytes = size_t(1024 + std::max(0L, f_.cp->run.tune.reserve_mb)) << 20; if (whole_T > 131072) tu.workspace_bytes += size_t(448) << 20;
+            if (mtp_bank) tu.mtp_bank_bytes = mtp_bank;  // the start-up snapshot, not the bank's peak of the moment
+            plan_cap = int(slot_context()); plan_T = whole_T;
+            const auto whole = tqllm::prefill_choice(sh_whole, tune_for, whole_T, fixed_room, mtp_bank, 0, grid0, block0);
+            plan_cap = seq_cap; plan_T = T; tu = tu_now;
+            grid = whole.chunk; block = whole.block;
+            // the plan's chunk below the grid only matters for a message longer than that chunk
+            bool cut = false;
+            for (int b = P0, e; b < P && !cut; b = e) { e = turn_chunk_end(starts, b, P, grid); cut = e - b > chunk; }
+            static int told_grid = 0, told_block = 0;  // printed when it is first set (or would ever change) and when a message is cut
+            if (grid != told_grid || block != told_block || cut || tqllm::debug_on("fn_prefill_log"))
+                std::fprintf(stderr, "tqllm: turn chunks: grid %d, selection block %d (this prompt: %d of %d tokens, %zu message starts, chunk %d)%s\n", grid, block, T, P, starts.size(), chunk,
+                             cut ? ": a message is longer than the plan's chunk, this read can differ from a cold one" : "");
+            told_grid = grid; told_block = block;
+            chunk = std::min(chunk, grid);
+        }
         if (f_.cp->run.split) { int cb[2] = {chunk, block}; DecodeModel::split_agree(*f_.cp->run.split, cb, 2); chunk = cb[0]; block = cb[1]; }
         tu = tune_for(chunk, block); arena_req = tu.arena_bytes;
         tqllm::PrefillPlan plan;
@@ -394,7 +445,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         // experts read from the GGUF on demand: the chunks up to the snapshot run layer-outer when the device holds a whole
         // layer's streamed experts and every chunk's rows (the chunk and block above stay as chosen: the text follows them)
         if (f_.cache->host_tier() && !f_.dfl_feat && !f_.cp->run.split && slots_.size() == 1 && T > chunk) {
-            const int rows = reused_read_rows(live, P0 ? S().snap_rows_ : 0, T, chunk);
+            const int rows = turn ? chunk : reused_read_rows(live, P0 ? S().snap_rows_ : 0, T, chunk);
             for (int b = P0, e = 0; b < P; b = e) { e = chunk_end(b, rows); spans.push_back({b, e}); }
             if (const int n = tqllm::flashnext::layer_outer_chunks(spans, snap)) {
                 // the largest group of chunks whose rows (BF16 or fp32 wide rows and PLE rows) fit beside the plan, with a
@@ -468,7 +519,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             std::fprintf(stderr, "tqllm: prefill +%.2f s %s\n", std::chrono::duration<double>(pclk::now() - p0).count(), at); }
     };
     mem_note("banks borrowed"); stamp("plan + banks borrowed");
-    if (const size_t back = kv_back_for_prompt(T, chunk) ? S().model_->kv_to_device() : 0)
+    if (const size_t back = (turn ? turn_lm : kv_back_for_prompt(T, chunk)) ? S().model_->kv_to_device() : 0)
         std::fprintf(stderr, "tqllm: attention KV: %.0f MB back on the device for this prompt\n", back / 1048576.0);
     if (host_res) {
         f_.mtp_cache->clear();
@@ -478,7 +529,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         }
     }
     mem_note("residual host buffer ready"); stamp("KV + residual host buffer ready");
-    if (T >= 256 && chunk >= 256) arena_resize(arena_req);  // layer-major prefill; decode shrinks it again
+    if ((turn ? turn_lm : T >= 256) && chunk >= 256) arena_resize(arena_req);  // layer-major prefill; decode shrinks it again
     stamp("KV + arena ready");
     mem_note("prefill arena ready");
     // tokens per MTP catch-up batch (each needs topk unique MTP slots)
@@ -528,9 +579,10 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     if (dfl) { S().model_->cap_layers = &f_.drafter->target_layers(); S().model_->cap_out = f_.dfl_feat->p; S().model_->cap_stride = f_.drafter->features(); }
     // a multi-chunk prompt (residuals in host memory, MTP bank dropped) writes the MTP layer's keys / values chunk by chunk
     // inside the trunk loop: run after the trunk, the catch-up held the second token 0.3 s behind the first (3090, 32K)
-    const bool kv_inline = host_res && head && mtp_lm && chunk >= 256;
+    // turn chunks: every chunk, one-chunk prompts too (the same pieces cold and resumed; the catch-up below runs others)
+    const bool kv_inline = (host_res || turn) && head && mtp_lm && chunk >= 256;
     std::unique_ptr<Device<float>> last_res;  // kv_inline: the prompt's last residual row, for its MTP layer after the trunk
-    const int step_rows = reused_read_rows(live, P0 ? S().snap_rows_ : 0, T, chunk);
+    const int step_rows = turn ? chunk : reused_read_rows(live, P0 ? S().snap_rows_ : 0, T, chunk);
     // after a chunk's trunk: the first token, the MTP layer's K/V, the host residual copy, the snapshot
     auto after_chunk = [&](int b, int e, const Device<float> * rows, pclk::time_point tl) {
         if (e == P && (heads_parked || kv_inline)) {  // picked after the trunk buffers go and the heads are back, or after the K/V catch-up below
@@ -559,7 +611,7 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
         stamp("first token picked");
         if (host_res && head && !kv_inline) ck(cudaMemcpyAsync(f_.res_host + size_t(b) * W, S().model_->res_keep->p, size_t(e - b) * W * sizeof(float), cudaMemcpyDeviceToHost, nullptr));
         if (host_res) mem_note("chunk done");
-        else if (head) { catch_up(b, e, S().model_->res_keep->p); lap(mtp_ms, tl); }
+        else if (head && !kv_inline) { catch_up(b, e, S().model_->res_keep->p); lap(mtp_ms, tl); }
         if (e == snap) take_snapshot(S());
         tqllm::prefill_completed(nullptr, uint32_t(e), uint32_t(P));
     };
@@ -572,8 +624,17 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
             const auto & sp = spans[size_t(g0) + i]; lap(trunk_ms, tl); after_chunk(sp.first, sp.second, &rows, tl); });
         b0 = spans[size_t(g1) - 1].second;
     }
+    bool stepped = false;  // turn: a short chunk ran as decode steps since the last layer-major chunk
     for (int b = b0, e = 0; b < P; b = e) {
         e = chunk_end(b, step_rows);
+        // decode steps build the banks of lent layers from the memory the plan had counted for its layer-major chunks
+        // (3090, a cold 15K chat read: the next chunk out of memory, 27 MiB free): they go again before the next one, as
+        // the refill releases a bank built mid-prompt (refill_rebuilds)
+        if (turn && e - b >= kTurnShort && stepped && S().ledger_) {
+            for (int l : S().ledger_->borrowed_layers()) if (f_.cache->bank_ready(l)) f_.cache->release_bank(l);
+            cudaMemPool_t pool; ck(cudaDeviceSynchronize()); ck(cudaDeviceGetDefaultMemPool(&pool, 0)); ck(cudaMemPoolTrimTo(pool, 0));
+        }
+        stepped = turn && e - b < kTurnShort ? true : e - b >= kTurnShort ? false : stepped;
         auto tl = pclk::now();
         const std::vector<int> next(ids.begin() + e, ids.begin() + (e < P ? chunk_end(e, step_rows) : P));
         auto rows = S().model_->step(std::vector<int>(ids.begin() + b, ids.begin() + e), &next);
@@ -644,7 +705,11 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     }
     if (kPrefillLog) std::fprintf(stderr, "tqllm: prefill %d tokens %.1f s: trunk %.1f s (QSA %.1f s), MTP catch-up %.1f s\n", P,
         std::chrono::duration<double>(pclk::now() - p0).count(), trunk_ms / 1000, f_.cp->rt.qsa_ms / 1000, mtp_ms / 1000);
-    if (!host_res && T >= 256 && chunk >= 256) S().model_->release_prefill();  // single-chunk layer-major prompt
+    if (!host_res && kv_inline) {  // a turn prompt in one chunk: the whole MTP layer for its last position
+        if (g_arena) g_arena->used = 0;
+        S().d1_ = S().model_->mtp_batch({S().out_[0]}, last_res->p); last_res.reset();
+    }
+    if (!host_res && (turn ? turn_lm : T >= 256) && chunk >= 256) S().model_->release_prefill();  // single-chunk layer-major prompt
     arena_resize(f_.arena_decode);
     f_.arena.high = 0;  // decode high-water from here (LEDGER decode of: arena high)
     if (P >= 256) {  // long prompt: the old K/V rows to host memory, the refill below takes the freed device memory
@@ -673,6 +738,35 @@ void FlashNextEngine::spec_begin(const std::vector<uint32_t> & prompt, uint32_t 
     S().done_ = int(S().out_.size()) >= S().generate_ || is_eos(S().out_.back());
     if (caching()) { S().seq_ = ids; S().snap_ = snap ? snap : keep_snap; if (snap || snap_at_start) S().snap_rows_ = step_rows; }
     (void) c;
+}
+
+bool FlashNextEngine::prefill_ahead(int s, const std::vector<uint32_t> & prefix) {
+    if (!turns() || slots_.size() != 1 || s != 0 || f_.cp->run.split || f_.cp->run.experts) return false;
+    const auto lk = ep_lock();
+    auto & sl = slots_[0];
+    if (!sl.model_ || sl.serving_ || !sl.done_ || sl.snap_ <= 0) return false;
+    std::vector<uint32_t> p = prefix; p.push_back(f_.cp->run.im_start);  // the next message's start: the state is kept there
+    const int P0 = reusable_prefix(sl.seq_, sl.snap_, p);
+    if (!P0 || int(p.size()) < P0 + 3 || p.size() + 1 + 16 > slot_context()) return false;
+    cur_ = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<int> old_seq = sl.seq_; const int old_snap = sl.snap_;
+    auto hook = std::move(first_token_hook_); first_token_hook_ = nullptr;
+    sl.stash_ = true;
+    try { spec_begin(p, 1, 0); }
+    catch (const std::exception & e) {
+        std::fprintf(stderr, "tqllm: idle prefill of the returned answer failed: %s\n", e.what());
+        abort_prefill();
+        sl.stash_ = false; sl.done_ = true; sl.serving_ = false; sl.model_.reset(); sl.snap_ = sl.live_ = 0; sl.drop_alt();
+        first_token_hook_ = std::move(hook); ep_note_state(); return false;
+    }
+    first_token_hook_ = std::move(hook);
+    sl.done_ = true; sl.serving_ = false; ep_note_state();
+    if (sl.stash_ || sl.alt_state_.empty()) { sl.stash_ = false; sl.drop_alt(); }  // no new snapshot was taken
+    else { sl.alt_seq_ = old_seq; sl.alt_snap_ = old_snap; }
+    std::fprintf(stderr, "tqllm: prefilled the returned answer while idle: %zu tokens in %.2f s (kept at %d)\n", p.size() - size_t(P0),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), sl.snap_);
+    return true;
 }
 
 }  // namespace tqllm::flashnext

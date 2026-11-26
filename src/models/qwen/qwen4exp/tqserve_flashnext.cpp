@@ -2,6 +2,7 @@
 #include "registry.hpp"
 #include "fn_engine.hpp"
 #include "core/tp_comm.hpp"
+#include "tqllm/tokenizer.hpp"
 
 namespace {
 using tqllm::flashnext::FlashNextEngine;
@@ -11,9 +12,12 @@ struct TpChannel final : tqllm::ByteChannel {  // the lockstep calls go over the
     void recv(void * p, size_t n) override { tp->ctl_recv(p, n); }
     std::shared_ptr<tqllm::TpComm> tp;
 };
-std::unique_ptr<tqllm::Engine> make_flashnext(const std::string & manifest, const std::string &, uint32_t context, int slots,
+std::unique_ptr<tqllm::Engine> make_flashnext(const std::string & manifest, const std::string & tokenizer, uint32_t context, int slots,
                                               const tqllm::EngineOptions & o) {
     FnConfig cfg; cfg.exact = o.exact; cfg.prompt_cache = o.prompt_cache; cfg.prompt_cache_set = o.prompt_cache_set; cfg.prompt_park = o.prompt_park;
+    if (!tokenizer.empty() && (o.prompt_cache || !o.prompt_cache_set)) {  // turn chunks (decode_rules.hpp): the message-start token
+        tqllm::Tokenizer tok; tok.load(tokenizer); cfg.im_start = tok.special_id("<|im_start|>");
+    }
     if (o.prefill_chunk > 0) { cfg.tune.chunk = o.prefill_chunk; cfg.tune.chunk_set = true; }
     if (o.prefill_sub > 0) cfg.tune.sub = o.prefill_sub;
     if (o.prefill_stage > 0) { cfg.tune.stage = o.prefill_stage; cfg.tune.stage_set = true; }
