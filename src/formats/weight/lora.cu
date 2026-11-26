@@ -77,7 +77,26 @@ __global__ void lora_up_k(const float * __restrict__ b, int rows, int rank, cons
     __nv_bfloat16 & o = y[size_t(j) * ldy + i];
     o = __float2bfloat16(__bfloat162float(o) + s * acc);
 }
+__global__ void lora_scale_k(const float * __restrict__ t, size_t m, const float * __restrict__ scale, __nv_bfloat16 * __restrict__ tb) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < m) tb[i] = __float2bfloat16(t[i] * *scale);
+}
 }  // namespace
+
+void lora_apply_gemm(cublasHandle_t h, const __half * a16, const __nv_bfloat16 * b16, int rows, int cols, int rank, const __half * x,
+                     __nv_bfloat16 * y, int n, int ldy, const float * scale, float * t, __nv_bfloat16 * tb, cudaStream_t s) {
+    if (n <= 0 || rank <= 0) return;
+    cublasSetStream(h, s);
+    const float one = 1.f, zero = 0.f;
+    // column-major: t (rank x n) = a16^T (rank x cols) . x (cols x n)
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rank, n, cols, &one, a16, CUDA_R_16F, cols, x, CUDA_R_16F, cols, &zero, t, CUDA_R_32F, rank,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    const size_t m = size_t(n) * rank;
+    lora_scale_k<<<unsigned((m + 255) / 256), 256, 0, s>>>(t, m, scale, tb);
+    // y (rows x n, ld ldy) += b16^T (rows x rank) . tb (rank x n)
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, rank, &one, b16, CUDA_R_16BF, rank, tb, CUDA_R_16BF, rank, &one, y, CUDA_R_16BF, ldy,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
 
 void lora_apply(const float * a, const float * b, int rows, int cols, int rank, const __half * x, __nv_bfloat16 * y, int n,
                 int ldy, const float * scale, float * t, cudaStream_t s) {

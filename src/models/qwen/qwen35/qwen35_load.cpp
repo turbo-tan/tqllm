@@ -323,6 +323,12 @@ void Qwen35Engine::load_lora() {
             p.rows = rows;
             p.a = upload(a.data(), a.size() * 4);
             p.b = upload(b.data(), b.size() * 4);
+            {   // FP16 A / BF16 B for the prompt-chunk GEMMs (lora_apply_gemm)
+                std::vector<__half> ah(a.size()); std::vector<bf16> bh(b.size());
+                for (size_t j = 0; j < a.size(); ++j) ah[j] = __float2half(a[j]);
+                for (size_t j = 0; j < b.size(); ++j) bh[j] = __float2bfloat16(b[j]);
+                p.a16 = upload(ah.data(), ah.size() * 2); p.b16 = upload(bh.data(), bh.size() * 2);
+            }
             lora_of[m].push_back(std::move(p));
             rlo = std::min(rlo, t.rank), rhi = std::max(rhi, t.rank);
             lora_cmax = std::max(lora_cmax, t.cols);

@@ -142,7 +142,7 @@ public:
             nslots = slots;
             load_lora();
             allocate();
-            if (lora_n) lora_t = Buf(tqllm_cuda::lora_scratch_floats(NBUF, lora_cmax, lora_rmax) * 4);
+            if (lora_n) { lora_t = Buf(tqllm_cuda::lora_scratch_floats(NBUF, lora_cmax, lora_rmax) * 4); lora_g = Buf(size_t(NBUF) * lora_rmax * 6); }
             memlog("buffers");
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
@@ -860,11 +860,11 @@ private:
     // adapter kernels run at all (some scale of the verify's slots nonzero) is part of the graph key (lora_now).
     // row0 / rows: the adapted part's output rows inside a matrix the load fused (ffn_gate / ffn_up in w_gu, attn_q / k / v in
     // w_mix), the whole matrix otherwise
-    struct LoraPiece { int adapter = 0, rank = 0, row0 = 0, rows = 0; Buf a, b; };
+    struct LoraPiece { int adapter = 0, rank = 0, row0 = 0, rows = 0; Buf a, b, a16, b16; };  // a16 / b16: copies for the prompt GEMMs
     std::unordered_map<const Mat *, std::vector<LoraPiece>> lora_of;
     int lora_n = 0, lora_rmax = 0, lora_cmax = 0;
     std::vector<std::vector<float>> lora_slot;  // [slot][adapter]: host copy of d_lscale
-    Buf d_lscale, lora_t;                       // lora_t: A x partials of one matrix (lora_scratch_floats)
+    Buf d_lscale, lora_t, lora_g;               // lora_t: A x partials of one matrix (lora_scratch_floats); lora_g: the GEMM path's t + tb
     void load_lora();
     bool lora_on(int slot) const {
         for (float v : lora_slot[size_t(slot)]) if (v != 0.f) return true;
