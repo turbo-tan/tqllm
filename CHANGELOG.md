@@ -23,6 +23,10 @@ x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest rele
   `ssm_out`, `ffn_down` as before), so harness adapters such as harness-hub's Hermes Agent LoRA (rank 32, q / k / v /
   o and gate / up / down) load (#81). DGX Spark, 27B TQ_XS: a request with scale 0 gives the base model's text bit for
   bit; with DFlash2 the adapter decodes at 60-75 tok/s (base 70-100) on agent prompts.
+- Monitor: a **Cluster** view (`/monitor`): the front door and its `--peer` boxes (status, queue, prefill / decode rates
+  from the last router sample, sample age), `--split layer` ranks with their layers and memory, and the last 24 routing
+  decisions (node, reused prefix tokens or a planned state transfer, forwarded or served here), with the measured
+  state-transfer rate. (#111)
 
 ## 1.8.3 (2026-11-25)
 
