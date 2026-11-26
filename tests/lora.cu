@@ -1,6 +1,7 @@
 // Runtime LoRA kernels (src/formats/weight/lora.cuh) against the CPU reference (lora.hpp): y = base + scale * B (A x) for
 // verify widths (1, 8, 16 columns) and a prefill chunk, ranks below / above one kernel pass, scale 0 leaving y
 // bit-identical, and A stored in the TQ4 rotated basis (the rows of A rotated like an activation) reading the rotated x.
+#include <cublas_v2.h>
 #include "formats/weight/lora.cuh"
 #include "formats/weight/lora.hpp"
 #include "formats/weight/quant_kernels.cuh"
@@ -33,7 +34,9 @@ template <class T> static std::vector<T> down(const T * d, size_t n) {
 // one case: max |gpu - ref| relative to max |delta|; false on failure
 // ld > rows: the adapted part is rows [row0, row0 + rows) of a fused output of ld rows (ffn_gate / ffn_up in gate|up, attn_q /
 // k / v in q|k|v); the rows outside it must stay bit-identical
-static bool run(int rows, int cols, int rank, int n, float scale, bool rotate, std::mt19937 & rng, int ld = 0, int row0 = 0) {
+static cublasHandle_t g_blas = nullptr;
+// gemm: the prompt-chunk path (lora_apply_gemm: FP16 A, BF16 B and t, cuBLAS) instead of the per-column kernels
+static bool run(int rows, int cols, int rank, int n, float scale, bool rotate, std::mt19937 & rng, int ld = 0, int row0 = 0, bool gemm = false) {
     if (!ld) ld = rows;
     std::normal_distribution<float> nd(0.f, 1.f);
     LoraTensor t;
@@ -71,7 +74,19 @@ static bool run(int rows, int cols, int rank, int n, float scale, bool rotate, s
     float *da = up(a), *db = up(b), *dt = nullptr, *ds = up(std::vector<float>{scale});
     check(cudaMalloc(&dt, tqllm_cuda::lora_scratch_floats(n, cols, rank) * 4));
     __nv_bfloat16 * dy = up(y0);
-    tqllm_cuda::lora_apply(da, db, rows, cols, rank, dx, dy + row0, n, ld, ds, dt, nullptr);
+    if (gemm) {
+        std::vector<__half> ah(a.size()); std::vector<__nv_bfloat16> bh(b.size());
+        for (size_t i = 0; i < a.size(); ++i) ah[i] = __float2half(a[i]);
+        for (size_t i = 0; i < b.size(); ++i) bh[i] = __float2bfloat16(b[i]);
+        __half * da16 = up(ah); __nv_bfloat16 * db16 = up(bh);
+        float * dg = nullptr; check(cudaMalloc(&dg, size_t(n) * rank * 6));
+        tqllm_cuda::lora_apply_gemm(g_blas, da16, db16, rows, cols, rank, dx, dy + row0, n, ld, ds, dg,
+                                    reinterpret_cast<__nv_bfloat16 *>(dg + size_t(n) * rank), nullptr);
+        check(cudaDeviceSynchronize());
+        cudaFree(da16), cudaFree(db16), cudaFree(dg);
+    } else {
+        tqllm_cuda::lora_apply(da, db, rows, cols, rank, dx, dy + row0, n, ld, ds, dt, nullptr);
+    }
     check(cudaDeviceSynchronize());
     const auto y = down(dy, y0.size());
     double err = 0, mag = 0;
@@ -84,9 +99,9 @@ static bool run(int rows, int cols, int rank, int n, float scale, bool rotate, s
         same &= __bfloat16_as_ushort(y[i]) == __bfloat16_as_ushort(y0[i]);
     }
     // BF16 output rounding: half an ulp of values up to ~4 (0.016), plus the rotation's FP16 / BF16 rounding of x and A
-    const double tol = 0.02 + (rotate ? 0.02 * mag : 1e-3 * mag);
+    const double tol = 0.02 + (rotate ? 0.02 * mag : 1e-3 * mag) + (gemm ? 0.01 * mag : 0.0);  // gemm: BF16 B and t
     const bool ok = outside && (scale == 0.f ? same : err <= tol);
-    std::printf("rows %5d cols %5d rank %2d n %4d scale %4.1f %s: max |delta| %.4f, max err %.5f%s%s -> %s\n", rows, cols, rank,
+    std::printf("%s rows %5d cols %5d rank %2d n %4d scale %4.1f %s: max |delta| %.4f, max err %.5f%s%s -> %s\n", gemm ? "gemm  " : "kernel", rows, cols, rank,
                 n, double(scale), rotate ? "tq4-rot" : "plain  ", mag, err, scale == 0.f ? (same ? " (bit-identical)" : " (changed)") : "",
                 ld == rows ? "" : (" (rows " + std::to_string(row0) + ".." + std::to_string(row0 + rows) + " of " + std::to_string(ld) +
                                    (outside ? ", the rest unchanged)" : ", OTHER ROWS CHANGED)")).c_str(), ok ? "ok" : "FAIL");
@@ -105,6 +120,13 @@ int main() {
     fails += !run(640, 2176, 3, 16, 0.f, false, rng);    // scale 0: y unchanged
     fails += !run(640, 2176, 3, 2048, 0.f, false, rng);
     for (const int n : {1, 16, 300}) fails += !run(640, 2176, 3, n, 1.f, true, rng);
+    cublasCreate(&g_blas);
+    for (const int n : {65, 300, 4096}) {  // prompt chunks on the GEMM path: whole matrix, a fused part, scale 0, rotated
+        fails += !run(640, 2176, 32, n, 1.f, false, rng, 0, 0, true);
+        fails += !run(2176, 640, 32, n, -0.7f, true, rng, 2 * 2176, 2176, true);
+        fails += !run(640, 2176, 32, n, 0.f, false, rng, 0, 0, true);
+    }
+    cublasDestroy(g_blas);
     for (const int n : {1, 8, 300}) {  // a part of a fused matrix: up in gate|up, k in q|k|v (Qwen3.8-27B shapes / 8)
         fails += !run(2176, 640, 32, n, 1.f, true, rng, 2 * 2176, 2176);
         fails += !run(128, 640, 32, n, 1.f, false, rng, 1536 + 2 * 128, 1536);

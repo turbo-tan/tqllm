@@ -589,6 +589,12 @@ void Qwen35Engine::lora_mm(const Mat & m, bf16 * out, int n) {
     for (const auto & p : it->second) {
         const auto * a = p.a.as<float>();
         const auto * b = p.b.as<float>();
+        if (segs.empty() && n > tqllm_cuda::kLoraGemmCols) {  // prompt chunk: tensor-core GEMMs
+            tqllm_cuda::lora_apply_gemm(blas, p.a16.as<__half>(), p.b16.as<bf16>(), p.rows, m.cols, p.rank, xh, out + p.row0, n, m.rows,
+                                        sc + size_t(active) * lora_n + p.adapter, lora_g.as<float>(),
+                                        reinterpret_cast<bf16 *>(lora_g.as<float>() + size_t(n) * p.rank), stream);
+            continue;
+        }
         if (segs.empty()) {
             tqllm_cuda::lora_apply(a, b, p.rows, m.cols, p.rank, xh, out + p.row0, n, m.rows, sc + size_t(active) * lora_n + p.adapter,
                                    lora_t.as<float>(), stream);

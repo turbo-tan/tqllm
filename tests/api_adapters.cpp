@@ -1,7 +1,11 @@
 // /v1/responses and /v1/messages adapters: request -> chat-completions body, chat answer / chat SSE -> the other API.
 #include "tools/serve/api_adapters.hpp"
+#include "tools/serve/stream_heartbeat.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -146,6 +150,51 @@ static void test_messages() {
     CHECK(!has(sent, "thinking"));  // unsigned thinking blocks stall Anthropic clients
 }
 
+// Heartbeats are real events of the stream's API (Hermes on /v1/responses drops a stream with no event for 12 s; SSE
+// comments do not count), and none follow a finished Responses stream
+static void test_heartbeat_events() {
+    std::string sent;
+    tqserve::ResponsesSse sse("tqllm", [&](const std::string & x) { sent += x; return true; });
+    CHECK(sse.begin());
+    sent.clear();
+    CHECK(sse.heartbeat());
+    CHECK(sent.rfind("event: response.in_progress\ndata: {\"type\": \"response.in_progress\"", 0) == 0);
+    CHECK(has(sent, "\"sequence_number\": 2") && has(sent, "\"status\": \"in_progress\""));
+    for (const auto & c : chat_chunks(true)) CHECK(sse.feed(c));
+    sent.clear();
+    CHECK(sse.heartbeat());
+    CHECK(sent.empty());  // nothing after response.completed
+    std::string ms;
+    tqserve::MessagesSse msse("tqllm", [&](const std::string & x) { ms += x; return true; });
+    CHECK(msse.begin());
+    ms.clear();
+    CHECK(msse.heartbeat());
+    CHECK(ms == "event: ping\ndata: {\"type\": \"ping\"}\n\n");
+}
+
+// The heartbeat keeps going after the first token (a tool call's text is held back until the call is parsed, so a long
+// call streams nothing; the old keep-alive stopped at the first token) and stays quiet while output flows
+static void test_stream_heartbeat() {
+    using namespace std::chrono;
+    std::atomic<int> beats{0};
+    tqserve::StreamHeartbeat hb(milliseconds(60), [&] { ++beats; return true; });
+    for (int i = 0; i < 10; ++i) {  // tokens every 15 ms: no beat
+        { std::lock_guard<std::mutex> lk(hb.lock()); hb.wrote(); }
+        std::this_thread::sleep_for(milliseconds(15));
+    }
+    CHECK(beats.load() == 0);
+    std::this_thread::sleep_for(milliseconds(400));  // quiet after output started: beats
+    const int quiet = beats.load();
+    CHECK(quiet >= 3 && quiet <= 8);
+    hb.stop();
+    std::this_thread::sleep_for(milliseconds(150));
+    CHECK(beats.load() == quiet);  // none after stop
+    std::atomic<int> tries{0};
+    tqserve::StreamHeartbeat gone(milliseconds(20), [&] { ++tries; return false; });  // client went away: stop beating
+    std::this_thread::sleep_for(milliseconds(150));
+    CHECK(tries.load() == 1);
+}
+
 int main() {
     test_paths();
     test_responses_request();
@@ -153,6 +202,8 @@ int main() {
     test_responses_stream(false);
     test_responses_stream(true);
     test_messages();
+    test_heartbeat_events();
+    test_stream_heartbeat();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("api_adapters: PASS\n");
     return 0;

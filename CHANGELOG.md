@@ -3,6 +3,17 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Qwen3.8-27B with `--lora`: prompt chunks run the adapters as GEMMs (cuBLAS) instead of one row at a time (#81). GB10,
+  the reporter's command line with the Hermes LoRA: prefill 567 -> 1251 tok/s (1412 without the adapter).
+- Streaming on `/v1/responses` and `/v1/messages`: the server sends a heartbeat event (`response.in_progress` / `ping`)
+  after 5 s without output, for the whole answer. Agent clients that drop a stream with no event for a while (Hermes
+  Agent on the Responses API: 12 s for short prompts) cut answers short during a long prefill or while a tool call is
+  generated, and kept the partial text as the final answer or gave up after three tries (#81). Chat completions keep
+  SSE comments as before, now also after the first token.
+
 ## 1.8.4 (2026-11-26)
 
 ### Fixed

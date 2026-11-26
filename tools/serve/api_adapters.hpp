@@ -242,6 +242,12 @@ public:
         return ev("response.created", O({{"response", resp_object(id_, model_, "in_progress", {}, nullptr)}})) &&
                ev("response.in_progress", O({{"response", resp_object(id_, model_, "in_progress", {}, nullptr)}}));
     }
+    // keep-alive while nothing streams (prefill, a held-back tool call): a real event, since clients with an event-idle
+    // watchdog do not count SSE comments
+    bool heartbeat() {
+        if (done_) return true;
+        return ev("response.in_progress", adapt::O({{"response", adapt::resp_object(id_, model_, "in_progress", {}, nullptr)}}));
+    }
     bool feed(const std::string & sse) {
         size_t pos = 0;
         while (pos < sse.size()) {
@@ -301,7 +307,7 @@ private:
     bool chunk(const tqllm::Json & d) {
         using namespace adapt;
         if (const auto * err = field(d, "error")) {
-            failed_ = true;
+            failed_ = done_ = true;
             return ev("response.failed", O({{"response", O({{"id", S(id_)}, {"object", S("response")}, {"status", S("failed")},
                           {"model", S(model_)}, {"error", O({{"code", S("server_error")}, {"message", S(str_of(field(*err, "message")))}})}})}}));
         }
@@ -355,6 +361,7 @@ private:
                 std::vector<Json> out;
                 for (auto & o : output_) if (o.kind != Json::Null) out.push_back(o);
                 const bool cut = fr->str == "length";
+                done_ = true;
                 return ev(cut ? "response.incomplete" : "response.completed",
                           O({{"response", resp_object(id_, model_, cut ? "incomplete" : "completed", std::move(out), field(d, "usage"))}}));
             }
@@ -367,7 +374,7 @@ private:
     std::vector<tqllm::Json> output_;
     int msg_index_ = -1, rs_index_ = -1;
     unsigned long long seq_ = 0;
-    bool text_open_ = false, reasoning_open_ = false, failed_ = false;
+    bool text_open_ = false, reasoning_open_ = false, failed_ = false, done_ = false;
 };
 
 // ---- Anthropic Messages -> chat completions ----
@@ -524,6 +531,8 @@ public:
                   {"model", S(model_)}, {"content", A()}, {"stop_reason", Nul()}, {"stop_sequence", Nul()},
                   {"usage", O({{"input_tokens", N(0)}, {"output_tokens", N(0)}})}})}}));
     }
+    // Anthropic's keep-alive event
+    bool heartbeat() { return ev("ping", adapt::O({})); }
     bool feed(const std::string & sse) {
         size_t pos = 0;
         while (pos < sse.size()) {
