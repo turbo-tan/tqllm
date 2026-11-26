@@ -56,6 +56,8 @@ void chat_proxy_gate() {
     const auto start = std::chrono::steady_clock::now();
     const auto metrics = get(server.port(), "/api/monitor/v1/snapshot", "test-key");
     check(metrics.find("200 OK") != std::string::npos && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(400), "chat blocks telemetry");
+    check(metrics.find("\"cluster\":{") != std::string::npos, "cluster telemetry over HTTP");
+    check(get(server.port(), "/api/monitor/v1/snapshot").find("401") != std::string::npos, "unauthenticated cluster telemetry");
     check(metrics.find("private prompt") == std::string::npos, "chat body leaked into telemetry");
     check(get(server.port(), "/api/monitor/v1/chat/completions", "test-key", "POST", body).find("429") != std::string::npos, "unbounded chat concurrency");
     check(get(server.port(), "/api/monitor/v1/chat/completions", "", "POST", body).find("401") != std::string::npos, "unauthenticated chat");
@@ -72,6 +74,27 @@ int main(int argc, char ** argv) {
     try {
         Monitor m({"Sample Qwen engine", "fixture", "Test host", "", 32768, 2});
         m.reasoning(false, {"low", "medium", "xhigh"}, "medium");  // a template with reasoning_effort, thinking off by default
+        m.cluster({"GB10 worker", "RTX worker"}, {
+            {0, "0000:01:00.0", 0, 32, "GeForce RTX 3090", 19.2 * (1ull << 30), 24.0 * (1ull << 30)},
+            {1, "0000:0b:00.0", 32, 64, "GeForce RTX 3090", 17.1 * (1ull << 30), 24.0 * (1ull << 30)},
+        });
+        const std::vector<tqserve::BoxStatus> boxes = {
+            {true, 2, 2, 0, 0, 0, 1476, 91},
+            {true, 1, 3, 1, 0, 16750, 2460, 106},
+            {false},
+        };
+        m.route(boxes, {true, true, false}, {0, 1, 0.16}, 822e6);
+        m.route_forwarded(m.route(boxes, {true, true, false}, {2}, 822e6), false);
+        m.route_forwarded(m.route(boxes, {true, true, false}, {1}, 822e6), true);
+        {
+            const auto model = snapshot(m);
+            const auto * cluster = model.get("cluster");
+            check(cluster->get("nodes")->arr.size() == 3 && cluster->get("devices")->arr.size() == 2, "cluster topology");
+            const auto & routes = cluster->get("routes")->arr;
+            check(routes[0].get("outcome")->str == "forwarded" && routes[1].get("outcome")->str == "local fallback" &&
+                  routes[2].get("state_source")->num == 1, "cluster routing outcomes");
+            check(cluster->get("state_link_bytes_per_second")->num == 822e6, "measured state link");
+        }
 #if defined(__linux__)
         if (argc >= 3 && argc <= 5 && std::string(argv[1]) == "--fixture") {
             tqserve::MonitorServer server(m, "127.0.0.1", 0, argc >= 4 ? argv[3] : "", "", argc == 5 ? uint16_t(std::stoul(argv[4])) : 0);
@@ -91,7 +114,12 @@ int main(int argc, char ** argv) {
                         if (last_mode=="decode") job->timings(8192,128,1000,1200,0,0);
                         job->finish();
                     }
-                    if (mode != "idle" && mode != "empty") job = m.begin();
+                    if (mode == "cluster-shift") {
+                        auto shifted = boxes;
+                        shifted[1].ok = false;
+                        m.route_forwarded(m.route(shifted, {true, false, false}, {1}, 822e6), false);
+                    }
+                    if (mode != "idle" && mode != "empty" && mode != "cluster-shift") job = m.begin();
                     if (mode == "prefill" || mode == "decode") job->prefill(8192);
                     if (mode == "decode") { std::this_thread::sleep_for(std::chrono::seconds(1)); job->progress(8192,8192); job->decoding(); }
                     if (mode == "failed") job->finish("failed");

@@ -176,6 +176,38 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
   td:first-child{grid-row:span 2;align-self:center}td:first-child::before{content:none}
   .request-select{min-width:44px}
 }
+/* Cluster view uses the same monitor snapshot and API key. */
+body[data-cluster="true"] main{grid-template-columns:minmax(0,1fr)}
+body[data-cluster="true"] .right,body[data-cluster="true"] .tabs,
+body[data-cluster="true"] .left > :not(#clusterView):not(#notice):not(#auth){display:none}
+body[data-cluster="true"] .left{border-right:0}
+#clusterButton{display:inline-flex;align-items:center;gap:7px;border-radius:8px}
+#clusterButton svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.5}
+#clusterButton[aria-pressed="true"]{color:var(--decode);border-color:var(--decode)}
+#clusterView{width:min(100%,1150px);margin:0 auto;padding:24px 12px 36px}
+.cluster-intro{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:24px;flex-wrap:wrap}
+.cluster-intro h1{margin:3px 0}.cluster-intro p,.cluster-caption{margin:0;color:var(--muted)}
+.cluster-sample{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 13px;color:var(--muted)}
+.cluster-group{margin:22px 0 0}
+.cluster-group h2{font-size:16px;margin:0 0 10px}
+.cluster-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px}
+.cluster-card,.cluster-routes{background:var(--panel);border:1px solid var(--line);border-radius:12px;min-width:0}
+.cluster-card{padding:16px 17px}.cluster-card[data-local="true"]{border-top:2px solid var(--decode)}
+.cluster-card[data-status="unreachable"]{border-top:2px solid var(--bad)}
+.cluster-card header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;align-items:center}
+.cluster-card h3{font-size:14px;margin:0;overflow-wrap:anywhere}
+.cluster-tag{font-size:11px;color:var(--muted);border:1px solid var(--line);padding:2px 7px;border-radius:999px}
+[data-status="reachable"] .cluster-tag{color:var(--live)}
+[data-status="unreachable"] .cluster-tag{color:var(--bad)}
+.cluster-card p{margin:8px 0;color:var(--muted);overflow-wrap:anywhere}
+.cluster-card dl{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0 0;padding-top:10px;border-top:1px solid var(--line)}
+.cluster-card dt{color:var(--muted);font-size:11px}.cluster-card dd{margin:3px 0 0;font-size:15px}
+.cluster-routes{list-style:none;padding:0;margin:0;overflow:hidden}
+.cluster-routes li{display:grid;grid-template-columns:85px minmax(130px,1fr) minmax(180px,1.7fr);gap:8px;padding:11px 15px;overflow-wrap:anywhere}
+.cluster-routes li + li{border-top:1px solid var(--line)}.cluster-routes li span:first-child,.cluster-routes li span:last-child{color:var(--muted)}
+.cluster-caption{font-size:12px;margin-top:9px}
+@media(max-width:760px){.bar .id{grid-column:1/3}#clusterButton{grid-column:3/5;grid-row:2;justify-content:center}}
+@media(max-width:600px){#clusterView{padding:10px 0 24px}.cluster-routes li{grid-template-columns:58px 1fr}.cluster-routes li span:last-child{grid-column:2}}
 </style>
 </head>
 <body data-connection="connecting">
@@ -183,6 +215,7 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
   <div class="brand">tq<b>LLM</b> monitor</div>
   <div class="id"><strong id="model">engine</strong> on <span id="host">--</span>, build <span id="build">--</span>, <span id="slots">-- slots</span></div>
   <span class="pill" role="status"><i></i><span id="connection">Connecting</span></span>
+  <button type="button" id="clusterButton" aria-pressed="false" aria-controls="clusterView"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4m-6 4v-4h12v4"/></svg>Cluster</button>
   <button type="button" id="themeButton" title="Switch to light theme" aria-label="Switch to light theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15A8.5 8.5 0 0 1 9 4a8.5 8.5 0 1 0 11 11Z"/></svg></button>
   <button type="button" id="keyButton" class="icon-button" title="Server API key" aria-label="Server API key" aria-expanded="false" aria-controls="auth"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="4"/><path d="m11 12 8 8m-4-4 3-3m-6 0 3-3"/></svg></button>
 </header>
@@ -191,6 +224,16 @@ button.primary{background:var(--decode);color:var(--bg);border-color:var(--decod
 <section class="left" aria-label="Telemetry">
   <div id="notice" class="notice" hidden role="alert"></div>
   <form id="auth" hidden><label for="apiKey">api key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="the key configured on tqserve"><button type="submit">connect</button><small>Kept in memory for this tab only; never written to storage or a URL.</small></form>
+  <section id="clusterView" aria-labelledby="clusterTitle" hidden>
+    <div class="cluster-intro">
+      <div><div class="eyebrow">tqLLM / Cluster</div><h1 id="clusterTitle">Cluster overview</h1><p>See which boxes are serving requests and where the model runs.</p></div>
+      <div class="cluster-sample" id="clusterSample">Waiting for telemetry</div>
+    </div>
+    <section class="cluster-group"><h2>Serving nodes</h2><div id="clusterNodes" class="cluster-grid"></div></section>
+    <section class="cluster-group"><h2>Local model placement</h2><div id="clusterDevices" class="cluster-grid"></div></section>
+    <section class="cluster-group"><h2>Recent routing</h2><ol id="clusterRoutes" class="cluster-routes"></ol>
+      <p class="cluster-caption" id="clusterLink"></p></section>
+  </section>
   <div class="status"><span class="prompt">&gt;</span><span id="phase">Connecting to telemetry</span><span id="sample">no snapshot yet</span><span id="prefillStatus" class="status-rate" title="Completed prefill tokens per second, excluding cached tokens" hidden><span id="prefillSpeed">--</span> tok/s prefill <span id="prefillCount"></span></span><span class="status-rate" title="Combined rate of active decoding requests"><b id="speed">--</b> tok/s</span></div>
   <div class="intro"><div class="eyebrow">tqLLM / Request workbench</div><h1>Follow the work.</h1><p>Select a request. See its journey. Compare what changed.</p></div>
   <section class="lens" id="requestLens" aria-label="Selected request">
@@ -243,9 +286,83 @@ let focusedId = null, pinnedRequest = null, currentRows = [];
 const COLUMNS = ['id', 'phase', 'in / out', 'first out', 'tok/s', 'elapsed'];
 let key = '', timer = null, instance = null, samples = [], previous = null, lastSuccess = null, generation = 0;
 
+function clusterElement(tag, value, className) {
+  return Object.assign(document.createElement(tag), {textContent: value, className: className || ''});
+}
+function clusterCard(label, status, description, metrics) {
+  const card = clusterElement('article', '', 'cluster-card');
+  const head = document.createElement('header');
+  head.append(clusterElement('h3', label), clusterElement('span', status, 'cluster-tag'));
+  const list = document.createElement('dl');
+  for (const [name, value] of metrics) {
+    const item = document.createElement('div');
+    item.append(clusterElement('dt', name), clusterElement('dd', value));
+    list.append(item);
+  }
+  card.append(head, clusterElement('p', description), list);
+  return card;
+}
+const clusterRate = v => v == null ? '—' : number(v) + ' tok/s';
+const clusterMemory = v => v == null ? '—' : number(v / 1073741824, 1) + ' GiB';
+let clusterData;
+function renderCluster(data) {
+  clusterData = data;
+  if ($('clusterView').hidden) return;
+  const c = data.cluster;
+  if (!c) { text('clusterSample', 'Cluster telemetry unavailable'); return; }
+  const age = c.sample_age_ms;
+  text('clusterSample', c.nodes.length === 1 ? 'Single server' : age == null ? 'Awaiting a routed request' :
+    'Peer sample from last route · ' + number(age / 1000) + 's ago');
+  $('clusterNodes').replaceChildren(...c.nodes.map(n => {
+    const stale = n.id !== 0 && age > 10000;
+    const active = data.requests.filter(r => !terminal(r.phase));
+    const localRates = data.requests.slice().reverse();
+    const rate = (value, field) => n.id === 0 && value == null ? localRates.find(r => r[field] != null)?.[field] : value;
+    const card = clusterCard(n.label || 'This server', n.id === 0 ? 'Front door' : stale ? 'Last sample' : n.status,
+      n.model || 'Peer model unavailable', [
+        ['Active', number(n.id === 0 && c.nodes.length === 1 ? active.filter(r => r.phase !== 'queued').length : n.busy)],
+        ['Queued', number(n.id === 0 && c.nodes.length === 1 ? active.filter(r => r.phase === 'queued').length : n.queued)],
+        ['Prefill', clusterRate(rate(n.prefill, 'prefill_tokens_per_second'))],
+        ['Decode', clusterRate(rate(n.decode, 'decode_tokens_per_second'))],
+      ]);
+    card.dataset.local = String(n.id === 0);
+    card.dataset.status = stale ? 'stale' : n.status;
+    return card;
+  }));
+  $('clusterDevices').replaceChildren(...(c.devices.length ? c.devices.map(d => {
+    const layers = d.layer_start == null ? '—' : d.layer_end == null ? 'from ' + d.layer_start :
+      d.layer_start + '–' + (d.layer_end - 1);
+    return clusterCard(d.name || 'GPU rank ' + d.rank, 'Rank ' + d.rank, d.bus || 'Device identity unavailable', [
+      ['Layers', layers], ['VRAM used', clusterMemory(d.used_bytes)],
+      ['VRAM free', clusterMemory(d.total_bytes != null && d.used_bytes != null ? Math.max(0, d.total_bytes - d.used_bytes) : null)],
+      ['VRAM total', clusterMemory(d.total_bytes)],
+    ]);
+  }) : [clusterElement('p', 'No GPU placement reported.', 'cluster-caption')]));
+  const label = id => c.nodes[id]?.label || 'Node ' + id;
+  $('clusterRoutes').replaceChildren(...(c.routes.length ? c.routes.map(r => {
+    const row = document.createElement('li');
+    const served = r.outcome === 'local fallback' ? label(r.selected) + ' → ' + label(0) : label(r.selected);
+    const reason = r.state_source != null ? 'State transfer planned from ' + label(r.state_source) :
+      r.reuse_tokens ? number(r.reuse_tokens) + ' reusable prefix tokens' : 'Slot availability and estimated completion';
+    row.append(clusterElement('span', 'Route ' + r.id), clusterElement('strong', served), clusterElement('span', reason + ' · ' + r.outcome));
+    return row;
+  }) : [clusterElement('li', 'No routing decisions recorded.')]));
+  text('clusterLink', c.state_link_bytes_per_second ? 'Measured state-transfer rate · ' +
+    number(c.state_link_bytes_per_second / 1000000) + ' MB/s' : 'State-transfer rate unavailable');
+}
+$('clusterButton').addEventListener('click', () => {
+  const open = $('clusterView').hidden;
+  $('clusterView').hidden = !open;
+  $('clusterButton').setAttribute('aria-pressed', String(open));
+  document.body.dataset.cluster = String(open);
+  if (open && clusterData && document.body.dataset.connection === 'live') renderCluster(clusterData);
+});
 function connection(state, message) { document.body.dataset.connection = state; text('connection', message); }
 function notice(message) { $('notice').hidden = !message; text('notice', message); }
 function clearLive() {
+  text('clusterSample', 'Telemetry unavailable');
+  for (const id of ['clusterNodes', 'clusterDevices', 'clusterRoutes']) $(id).replaceChildren();
+  text('clusterLink', '');
   text('lensPhase', 'Snapshot unavailable'); $('pinRequest').disabled = true; $('followLatest').disabled = true;
   $('prefillStatus').hidden = true;
   for (const id of ['speed', 'queue', 'tokens', 'acceptance', 'context', 'gpuMemory', 'ramMemory', 'gpu', 'temperature', 'power', 'cpu']) text(id, '--');
@@ -408,7 +525,7 @@ function render(data) {
   text('device', h.device_name || data.engine.device_id || 'unknown');
   text('hardwareAge', typeof h.sample_age_ms === 'number' ? (fresh ? number(h.sample_age_ms / 1000, 1) + ' s old' : 'stale, ' + number(h.sample_age_ms / 1000, 0) + ' s old') : 'no sample');
   text('sample', 'snapshot ' + new Date().toLocaleTimeString());
-  connection('live', 'Connected'); notice(''); lastSuccess = now; monitorPanels.update(data);
+  connection('live', 'Connected'); notice(''); lastSuccess = now; monitorPanels.update(data); renderCluster(data);
 }
 async function poll(token = generation) {
   if (token !== generation) return;
