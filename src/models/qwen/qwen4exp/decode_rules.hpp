@@ -345,6 +345,59 @@ inline bool prompt_cache_keeps(bool prompt_cache, size_t slots) { return prompt_
 inline bool kv_back_for_prompt(int new_tokens, int chunk) { return new_tokens >= 256 && chunk >= 256; }
 // where the next prompt's state is kept: kTail before this prompt's end, when the new part is at least 2 x kTail
 inline int snapshot_at(int prompt, int reused, int tail) { return prompt >= reused + 2 * tail ? prompt - tail : 0; }
+// --prompt-cache, chat prompts (turn chunks, the rule of the qwen35 CUDA and Metal engines). The prefill kernels are not
+// chunk-size invariant, so a turn resumed kTail before the last prompt's end (or after its reply) read other chunks than a
+// cold read of the same prompt and its reply differed (RTX 3090, ISTA IQ3_XXS, 5-turn chat: 8 of 8 follow-ups). Prefill
+// chunks restart at every message start instead, so a prompt's chunks are a property of its prefix: the same for a cold
+// read and for one resumed at a message start. The state is kept at the prompt's last message start (its generation
+// prompt), which the next turn shares whether or not the client sends the reply's reasoning back. Message starts before
+// kTurnMin do not split: short chats keep their single pass (and keep no state).
+constexpr int kTurnMin = 1024;
+// positions p >= kTurnMin of the message-start token, ascending (none when the token is unknown)
+template <class P> inline std::vector<int> turn_starts(const P & prompt, uint32_t im_start) {
+    std::vector<int> out;
+    if (im_start == ~0u) return out;
+    for (size_t p = kTurnMin; p < prompt.size(); ++p) if (uint32_t(prompt[p]) == im_start) out.push_back(int(p));
+    return out;
+}
+// a chat prompt: it holds the message-start token anywhere
+template <class P> inline bool turn_prompt(const P & prompt, uint32_t im_start) {
+    if (im_start == ~0u) return false;
+    for (const auto t : prompt) if (uint32_t(t) == im_start) return true;
+    return false;
+}
+// the end of the chunk that begins at t: the grid of `chunk` restarts at each message start
+inline int turn_chunk_end(const std::vector<int> & starts, int t, int prompt, int chunk) {
+    const auto next = std::upper_bound(starts.begin(), starts.end(), t);
+    const int seg = next == starts.begin() ? 0 : *(next - 1);
+    int64_t end = int64_t(seg) + int64_t((t - seg) / chunk + 1) * chunk;
+    if (next != starts.end()) end = std::min<int64_t>(end, *next);
+    return int(std::min<int64_t>(end, prompt));
+}
+// where a turn prompt keeps its state: its last message start, when past `from` (the position the prefill resumed at)
+inline int turn_kept_at(const std::vector<int> & starts, int from) { return !starts.empty() && starts.back() > from ? starts.back() : 0; }
+// Short turn chunks (a follow-up message, a short answer, the generation prompt: under kTurnShort tokens) are read as
+// decode steps of kTurnStep rows from the chunk's start, in a cold read and in a resumed turn alike; longer ones run
+// layer-major. A follow-up then needs no prefill plan: no bank is lent, nothing streams (RTX 3090, ISTA IQ3_XXS, 30K chat:
+// 24-token follow-ups 2.5 s layer-major). kTurnShort is the layer-major floor (kLayerMajorChunkMin); kTurnStep is the
+// decode-size block a reused part already used (reused_read_rows: one step of every row did not fit at 128K).
+constexpr int kTurnShort = 256, kTurnStep = 8;
+// the end of the piece of a turn prompt that begins at t (a whole chunk, or a kTurnStep step of a short chunk)
+inline int turn_piece_end(const std::vector<int> & starts, int t, int prompt, int chunk) {
+    const int e = turn_chunk_end(starts, t, prompt, chunk);
+    const auto next = std::upper_bound(starts.begin(), starts.end(), t);
+    const int seg = next == starts.begin() ? 0 : *(next - 1), cs = seg + (t - seg) / chunk * chunk;  // the chunk's start
+    return e - cs < kTurnShort ? std::min(e, cs + ((t - cs) / kTurnStep + 1) * kTurnStep) : e;
+}
+// does [from, prompt) (from: a message start or 0) hold a layer-major chunk: a message part of kTurnShort tokens or more
+inline bool turn_has_long(const std::vector<int> & starts, int from, int prompt) {
+    int b = from;
+    for (const int s : starts) if (s > from && s < prompt) { if (s - b >= kTurnShort) return true; b = s; }
+    return prompt - b >= kTurnShort;
+}
+// the chunk a turn prompt's new part plans with: under 2048 tokens its own length (256-token steps), so a follow-up
+// message borrows no bank for a 2K chunk's buffers; the chunks themselves still follow turn_chunk_end
+inline int turn_min_chunk(int new_tokens) { return new_tokens < 2048 ? std::max(256, (new_tokens + 255) / 256 * 256) : 2048; }
 
 // The pinned residual buffer of a multi-chunk prefill (prompt x width floats) is pinned once at start-up when the host
 // easily holds it: four times its size available and at most a tenth of RAM. Pinning it per request cost a 32K prompt

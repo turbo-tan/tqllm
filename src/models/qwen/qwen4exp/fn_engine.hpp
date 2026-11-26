@@ -77,20 +77,31 @@ class FlashNextEngine final : public tqllm::Engine {
         // live_ (one slot): the position the finished request's own state ended at (seq_ = prompt ++ output); a next turn
         // that repeats seq_[0, live_] reads only its new part, without a restore (reusable_from)
         // snap_rows_: the step size that read [snap_, end) when the snapshot was taken (0: the chunk); a restore reads alike
-        std::vector<int> seq_; int snap_ = 0, live_ = 0, snap_rows_ = 0;
+        // chat_: the last prompt was a chat prompt (turn chunks): its state is kept at its last message start only, never at
+        // live_ (decode steps read the reply, a cold read reads it as a chunk)
+        std::vector<int> seq_; int snap_ = 0, live_ = 0, snap_rows_ = 0; bool chat_ = false;
         bool serving_ = false;  // a request is in this slot (spec_begin .. spec_finish / spec_abort): --split experts rank 1 is not idle
         std::vector<std::unique_ptr<Device<float>>> snap_state_, snap_conv_, snap_ple_;
+        // prefill_ahead (one slot, turn chunks): the state at the generation prompt stays as alt_ while the snapshot moves
+        // to the end of the answer as the client is expected to send it back; a next prompt that differs there (the client
+        // sent the reasoning back, or the same prompt again) resumes from alt_
+        std::vector<int> alt_seq_; int alt_snap_ = 0; bool stash_ = false;
+        std::vector<std::unique_ptr<Device<float>>> alt_state_, alt_conv_, alt_ple_;
+        void swap_alt() { std::swap(seq_, alt_seq_); std::swap(snap_, alt_snap_); snap_state_.swap(alt_state_); snap_conv_.swap(alt_conv_); snap_ple_.swap(alt_ple_); }
+        void drop_alt() { alt_seq_.clear(); alt_snap_ = 0; alt_state_.clear(); alt_conv_.clear(); alt_ple_.clear(); }
         uint64_t conv_ = 0;  // the conversation this slot's kept state belongs to (0: none)
     };
-    // the next turn re-renders the end of the last prompt (assistant header) differently. A reused prompt is not
-    // byte-identical to an uncached one at any tail (10de944a: 256, both chunks layer-major, still differed): the prefill
-    // kernels are not chunk-size invariant, so --exact on warns (exact_conflicts)
+    // prompts that are not chat prompts keep their state kTail before the end. Such a reused prompt is not byte-identical
+    // to an uncached one at any tail (10de944a: 256, both chunks layer-major, still differed): the prefill kernels are not
+    // chunk-size invariant. Chat prompts prefill in turn chunks instead (decode_rules.hpp turn_starts) and are exact.
     static constexpr int kTail = 64;
     bool caching() const { return tqllm::flashnext::prompt_cache_keeps(f_.cp->run.prompt_cache, slots_.size()); }
+    // turn chunks: the prompt cache is on and the chat template's message-start token is known
+    bool turns() const { return caching() && f_.cp->run.im_start != ~0u; }
     // conversations moving between slots, the park and other boxes: several slots only
     bool sharing() const { return caching() && slots_.size() > 1; }
     static int reuse(const SlotState & s, const std::vector<uint32_t> & prompt) {  // prompt tokens [0, live_ or snap_) are reusable
-        return s.model_ ? reusable_from(s.seq_, s.live_, s.snap_, prompt) : 0;
+        return s.model_ ? std::max(reusable_from(s.seq_, s.live_, s.snap_, prompt), reusable_prefix(s.alt_seq_, s.alt_snap_, prompt)) : 0;
     }
     void take_snapshot(SlotState & s);   // copy the recurrent and PLE state at the current position
     // --prompt-cache: the kept sequence's K/V capacity grown to `rows` with its state (kept_sequence_rows); false when the
@@ -163,7 +174,7 @@ public:
         auto & sl = slots_[size_t(s)];
         sl.done_ = true; sl.serving_ = false; ep_note_state();
         try { if (sl.model_) { cudaDeviceSynchronize(); cudaGetLastError(); sl.model_.reset(); } } catch (...) {}
-        sl.snap_ = sl.live_ = 0;
+        sl.snap_ = sl.live_ = 0; sl.drop_alt();
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override {
         const auto lk = ep_lock();
@@ -211,7 +222,7 @@ public:
         if (!caching()) S().model_.reset();
         else if (slots_.size() == 1 && S().model_ && !S().out_.empty()) {  // the reply's state stays for the next turn
             S().seq_.insert(S().seq_.end(), S().out_.begin(), S().out_.end());
-            S().live_ = S().model_->position + 1 == int(S().seq_.size()) ? S().model_->position : 0;
+            S().live_ = !S().chat_ && S().model_->position + 1 == int(S().seq_.size()) ? S().model_->position : 0;
         }
         S().prompt_res_.reset();
         return r;
@@ -225,6 +236,11 @@ public:
     }
     int slots() const override { return int(slots_.size()); }
     void set_first_token_hook(std::function<void()> hook) override { first_token_hook_ = std::move(hook); }
+    // one slot, turn chunks: while idle, prefill the answer's message as the client will send it back (tqserve renders
+    // `prefix`, the next prompt up to the next message start) from the state kept at the generation prompt; the next
+    // request then resumes at that message start and reads only its new message. Exact: the answer's message is a chunk
+    // of its own in a cold read too.
+    bool prefill_ahead(int s, const std::vector<uint32_t> & prefix) override;
     uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
         if (!caching() || s < 0 || s >= int(slots_.size())) return 0;
         return uint32_t(std::max(reuse(slots_[size_t(s)], prompt), park_best(prompt, nullptr)));  // a parked state resumes in any slot

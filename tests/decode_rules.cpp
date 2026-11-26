@@ -630,6 +630,74 @@ int main() {
         check(st[2] <= st[1], "accepted drafts never exceed the drafts offered (a DFlash2 block of 15 included)");
         check(s.taken_[1] == 3 && s.taken_[5] == 2 && s.taken_[13] == 1, "steps by tokens kept (LEDGER decode steps)");
     }
+    {   // turn chunks (--prompt-cache, chat prompts): the chunks of a prompt's prefix do not depend on what follows it, so a
+        // turn resumed at a kept message start reads what a cold read of the same prompt reads
+        const uint32_t S = 7;
+        std::vector<uint32_t> p(5000, 1);
+        p[0] = S; p[100] = S; p[1500] = S; p[3000] = S; p[4990] = S;  // starts before kTurnMin do not split
+        const auto st = turn_starts(p, S);
+        check(st == std::vector<int>({1500, 3000, 4990}), "message starts from kTurnMin on");
+        check(turn_starts(p, ~0u).empty() && !turn_prompt(p, ~0u), "unknown message-start token: no starts, no chat prompt");
+        check(turn_prompt(p, S) && !turn_prompt(std::vector<uint32_t>(10, 1), S), "a chat prompt holds the message-start token");
+        auto chunks = [](const std::vector<int> & s, int from, int P, int ch) {
+            std::vector<int> e; for (int b = from; b < P; b = e.back()) e.push_back(turn_chunk_end(s, b, P, ch)); return e; };
+        check(chunks(st, 0, 5000, 1024) == std::vector<int>({1024, 1500, 2524, 3000, 4024, 4990, 5000}), "the grid restarts at every message start");
+        check(chunks(st, 3000, 5000, 1024) == std::vector<int>({4024, 4990, 5000}), "resumed at a message start: the cold read's chunks from there");
+        check(turn_kept_at(st, 0) == 4990 && turn_kept_at(st, 4990) == 0 && turn_kept_at({}, 0) == 0, "state kept at the last message start past the resume point");
+        // the next turn, its reply sent back with or without the reasoning: both share the kept generation prompt
+        for (const int reply : {40, 400}) {
+            std::vector<uint32_t> next(p.begin(), p.begin() + 4991); next.resize(size_t(4991 + reply), 2); next.resize(size_t(4991 + reply + 600), 3);
+            next[size_t(4991 + reply)] = S; next.back() = S;  // the user's message, then the new generation prompt
+            check(reusable_prefix(p, 4990, next) == 4990, "the next turn resumes at the kept message start");
+            const auto st2 = turn_starts(next, S);
+            const auto cold = chunks(st2, 0, int(next.size()), 1024);
+            std::vector<int> head; for (int e : cold) if (e <= 4990) head.push_back(e);
+            check(head == std::vector<int>({1024, 1500, 2524, 3000, 4024, 4990}), "the longer prompt's chunks up to the kept start are the first prompt's");
+            std::vector<int> tail; for (int e : cold) if (e > 4990) tail.push_back(e);
+            check(tail == chunks(st2, 4990, int(next.size()), 1024), "resumed there: the cold read's chunks from there");
+            check(turn_kept_at(st2, 4990) == int(next.size()) - 1, "and keeps its own generation prompt");
+            // idle prefill (prefill_ahead): the answer's message as sent back plus the next message start, read from the
+            // kept generation prompt, keeps its state at that start; the next prompt resumes there with the cold chunks
+            const int user_at = 4991 + reply;
+            std::vector<uint32_t> ahead(next.begin(), next.begin() + user_at + 1);
+            const auto sa = turn_starts(ahead, S);
+            check(reusable_prefix(p, 4990, ahead) == 4990 && turn_kept_at(sa, 4990) == user_at, "idle prefill: kept at the next message start");
+            std::vector<int> mid; for (int e : cold) if (e > 4990 && e <= user_at) mid.push_back(e);
+            check(chunks(sa, 4990, user_at + 1, 1024) == [&] { auto m = mid; m.push_back(user_at + 1); return m; }(), "idle prefill: the answer's chunks are the cold read's");
+            check(reusable_prefix(ahead, user_at, next) == user_at && chunks(st2, user_at, int(next.size()), 1024) == [&] {
+                      std::vector<int> t; for (int e : cold) if (e > user_at) t.push_back(e); return t; }(), "the next request resumes at it with the cold read's chunks");
+        }
+        // random prompts: every message start splits the chunks, so each prefix up to a start reads alike in any longer prompt
+        uint32_t r = 12345; auto rnd = [&r] { r = r * 1103515245u + 12345u; return (r >> 8) & 0xffff; };
+        bool same = true;
+        for (int trial = 0; trial < 200 && same; ++trial) {
+            std::vector<uint32_t> q(size_t(1200 + rnd() % 40000), 1);
+            for (size_t i = 0; i < q.size(); i += 1 + rnd() % 9000) q[i] = S;
+            const int ch = 256 << (rnd() % 7);
+            const auto s = turn_starts(q, S);
+            const auto all = chunks(s, 0, int(q.size()), ch);
+            for (const int at : s) {
+                std::vector<int> ref; for (int e : all) if (e > at) ref.push_back(e);
+                same = same && chunks(s, at, int(q.size()), ch) == ref;
+                same = same && std::find(all.begin(), all.end(), at) != all.end();  // every message start ends a chunk
+            }
+            for (size_t i = 1; i < all.size(); ++i) same = same && all[i] - all[i - 1] <= ch;
+        }
+        check(same, "random prompts: resumed at any message start, the chunks are the cold read's; no chunk exceeds the grid");
+        {   // short chunks as kTurnStep-row decode steps from the chunk's start, long ones whole: the same pieces cold and resumed
+            const std::vector<int> s = {1500, 1520, 3000, 3010};  // a 20-token message, a long one, the generation prompt
+            auto pieces = [&](int from, int P, int ch) { std::vector<int> e; for (int b = from; b < P; b = e.back()) e.push_back(turn_piece_end(s, b, P, ch)); return e; };
+            const auto all = pieces(0, 3014, 1024);
+            const std::vector<int> want = {1024, 1500, 1508, 1516, 1520, 2544, 3000};
+            check(std::vector<int>(all.begin(), all.begin() + 7) == want, "a 20-token message in 8-row steps; a long one in grid chunks, its 456-token remainder whole");
+            check(all.back() == 3014 && all[all.size() - 2] == 3010 && all[all.size() - 3] == 3008, "the generation prompt in 8-row steps");
+            check(pieces(3000, 3014, 1024) == std::vector<int>({3008, 3010, 3014}), "resumed at a message start: the cold read's pieces from there");
+            check(turn_has_long(s, 0, 3014) && turn_has_long(s, 1520, 3014) && !turn_has_long(s, 3000, 3014) && !turn_has_long(s, 1500, 1520),
+                  "a layer-major chunk when a message part has kTurnShort tokens or more");
+        }
+        check(turn_min_chunk(5) == 256 && turn_min_chunk(300) == 512 && turn_min_chunk(2047) == 2048 && turn_min_chunk(9000) == 2048,
+              "a short new part plans its own rows (256-token steps), from 2048 the usual floor");
+    }
     std::printf("decode rules: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

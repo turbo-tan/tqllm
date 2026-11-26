@@ -1002,10 +1002,11 @@ int main(int argc, char ** argv) {
                         parsed.thinking = false;
                     }
                 }
-                // --prompt-cache on, after a chat reply: the engine may prefill the reply as the client will return it while the server is idle
-                // (Engine::prefill_ahead). Not for tool calls (the next request follows at once) or image prompts.
+                // --prompt-cache on (or not given: an engine may keep the cache by default, Flash-Next does), after a chat reply: the
+                // engine may prefill the reply as the client will return it while the server is idle (Engine::prefill_ahead; an
+                // engine that keeps no cache returns at once). Not for tool calls (the next request follows at once) or image prompts.
                 auto prefill_ahead = [&](const tqserve::DecodeResult & reply) {
-                    if (!engine.prompt_cache || scheduler || !chat || !reply.error.empty() || !reply.tool_calls.empty() || !parsed.images.empty()) return;
+                    if ((!engine.prompt_cache && engine.prompt_cache_set) || scheduler || !chat || !reply.error.empty() || !reply.tool_calls.empty() || !parsed.images.empty()) return;
                     // rendered on the worker: a non-streamed reply is sent without waiting for it
                     ahead_worker.post([&tokenizer, &renderer, &default_kwargs, body = in, reply, max_tokens, system, reasoning, effort] {
                         const auto prefix = tqserve::next_prompt_prefix(body, reply, tqserve::returns_reasoning(body), max_tokens, system, reasoning,
