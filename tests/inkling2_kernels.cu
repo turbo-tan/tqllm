@@ -1357,12 +1357,14 @@ int main() {
     test_dflash2();
     test_experts(2, 8);  // last: its random draws would move every later test's data
     test_experts(1, 8);
-    {   // per-device family choice: plain-only picks the faster 1-token step; with a drafter the better of plain and spec
-        const bool a = K::prefer_mma(70, 550, 68, 340, false), b = K::prefer_mma(60, 550, 75, 340, false), c = K::prefer_mma(60, 550, 75, 200, true),
-                   d = K::prefer_mma(60, 200, 75, 340, true);
-        // a near tie (warp 5 % faster) keeps the tensor cores, so a restart does not change the rounding
-        const bool e = K::prefer_mma(140, 1140, 147, 1188, true), f = K::prefer_mma(140, 1140, 147, 1188, false);
-        report("kernel family choice (1-token / verify times)", 0.0, 0.0, a && !b && c && !d && e && f);
+    {   // expert family: a rule over what the load knows (format, residency), never timings (#105); --expert-kernels wins
+        const int E = 128, m = K::kMmaMinShare;
+        const bool rule = K::expert_family_mma(-1, true, E, E) && K::expert_family_mma(-1, true, m, E) && !K::expert_family_mma(-1, true, m - 1, E) &&
+                          !K::expert_family_mma(-1, true, 8, E) && !K::expert_family_mma(-1, false, E, E);
+        const bool force = K::expert_family_mma(1, true, 8, E) && !K::expert_family_mma(0, true, E, E) && !K::expert_family_mma(1, false, E, E);
+        bool same = true;  // the same inputs give the same pick on every call (no clock, no state)
+        for (int i = 0; i < 1000; ++i) same = same && K::expert_family_mma(-1, true, m, E) && !K::expert_family_mma(-1, true, m - 1, E);
+        report("expert kernel family rule (residency, --expert-kernels)", 0.0, 0.0, rule && force && same);
     }
     test_experts_mma(2);
     test_experts_mma(1);

@@ -58,6 +58,10 @@ int main() {
     expect(d.dense_bits == 8 && parse({"--exact", "off", "--dense-bits", "4"}).dense_bits == 4 &&
            parse({"--dense-bits", "8"}).dense_bits == 8, "--dense-bits 8|4 (default 8)");
     expect(throws({"--dense-bits", "6"}) && throws({"--dense-bits", "16"}), "--dense-bits only 8 or 4");
+    expect(d.expert_kernels == -1 && parse({"--expert-kernels", "auto"}).expert_kernels == -1 &&
+           parse({"--expert-kernels", "tensor"}).expert_kernels == 1 && parse({"--expert-kernels", "warp"}).expert_kernels == 0,
+           "--expert-kernels auto|tensor|warp (default auto)");
+    expect(throws({"--expert-kernels", "mma"}) && throws({"--expert-kernels", ""}), "--expert-kernels only auto, tensor or warp");
     // --exact on conflicts: listed and warned; the asked options win (no question, no stop)
     static const char * (*no_env)(const char *) = [](const char *) -> const char * { return nullptr; };
     static const char * (*cpu_miss)(const char *) = [](const char * n) -> const char * { return std::strcmp(n, "TQFN_CPU_MISS") ? nullptr : "4"; };

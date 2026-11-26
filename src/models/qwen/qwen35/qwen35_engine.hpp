@@ -858,7 +858,9 @@ private:
     // it reads the same prepared v_xh) and B (alpha / rank folded in). Scales live on the device per slot and adapter
     // (d_lscale [nslots][lora_n]); captured graphs read them at run time, so a new scale needs no recapture. Whether the
     // adapter kernels run at all (some scale of the verify's slots nonzero) is part of the graph key (lora_now).
-    struct LoraPiece { int adapter = 0, rank = 0; Buf a, b; };
+    // row0 / rows: the adapted part's output rows inside a matrix the load fused (ffn_gate / ffn_up in w_gu, attn_q / k / v in
+    // w_mix), the whole matrix otherwise
+    struct LoraPiece { int adapter = 0, rank = 0, row0 = 0, rows = 0; Buf a, b; };
     std::unordered_map<const Mat *, std::vector<LoraPiece>> lora_of;
     int lora_n = 0, lora_rmax = 0, lora_cmax = 0;
     std::vector<std::vector<float>> lora_slot;  // [slot][adapter]: host copy of d_lscale

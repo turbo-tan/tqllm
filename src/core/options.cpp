@@ -75,6 +75,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "8" && v != "4") throw std::invalid_argument("--dense-bits must be 8 or 4");
         o.dense_bits = std::stoi(v);
     }
+    else if (a == "--expert-kernels") {
+        const std::string v = value();
+        if (v != "auto" && v != "tensor" && v != "warp") throw std::invalid_argument("--expert-kernels must be auto, tensor or warp");
+        o.expert_kernels = v == "auto" ? -1 : v == "tensor" ? 1 : 0;
+    }
     else if (a == "--qsa-from") {
         const std::string v = value();
         o.qsa_from = v == "off" ? 0 : std::stoi(v);

@@ -75,6 +75,7 @@ struct Engine {
     virtual void stop_followers() {}
     virtual bool has_drafter() const { return false; }
     virtual bool native_mtp() const { return false; }  // --mtp drafts with the model's own nextn head
+    virtual std::string kernels() const { return {}; }  // the kernel families the load picked (/health), or empty
     // spec_begin with depth 0 lets the engine choose each step's drafts from its own acceptance and step time; serving
     // then passes 0 unless --draft-max fixes the depth
     virtual bool adaptive_depth() const { return false; }
@@ -156,7 +157,8 @@ bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);
 // Inkling-2-Mini (HF folder, Inkling2LoopForConditionalGeneration), src/models/inkling2/loop; MTP from mtp.safetensors
-std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact = true, const std::string & draft_model = {});
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & dir, uint32_t context, bool mtp, bool exact = true, const std::string & draft_model = {},
+                                            int expert_kernels = -1);
 // tensor parallelism over linked boxes: world ranks, rank 0 at peer:port (rank 0 listens there for the others)
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",

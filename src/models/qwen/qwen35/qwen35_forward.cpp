@@ -590,12 +590,12 @@ void Qwen35Engine::lora_mm(const Mat & m, bf16 * out, int n) {
         const auto * a = p.a.as<float>();
         const auto * b = p.b.as<float>();
         if (segs.empty()) {
-            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh, out, n, m.rows, sc + size_t(active) * lora_n + p.adapter,
+            tqllm_cuda::lora_apply(a, b, p.rows, m.cols, p.rank, xh, out + p.row0, n, m.rows, sc + size_t(active) * lora_n + p.adapter,
                                    lora_t.as<float>(), stream);
             continue;
         }
         for (const auto & g : segs)  // batched verify: each slot's columns with its own request's scale
-            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh + size_t(g.col0) * m.cols, out + size_t(g.col0) * m.rows,
+            tqllm_cuda::lora_apply(a, b, p.rows, m.cols, p.rank, xh + size_t(g.col0) * m.cols, out + size_t(g.col0) * m.rows + p.row0,
                                    g.n, m.rows, sc + size_t(g.slot) * lora_n + p.adapter, lora_t.as<float>(), stream);
     }
 }
@@ -1303,7 +1303,8 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
         return;
     }
     if (!L.w_gu.p) throw std::runtime_error("multi-token path needs fused gate/up weights");
-    if (basis_ == Basis::Tq4Rot128 && prefill_gemm(L.w_gu, n) && L.w_gu.fmt->basis() == basis_) {
+    // (the FP16 gate / up go straight into the fused SwiGLU: no BF16 output an adapter could add to, so not with --lora on w_gu)
+    if (basis_ == Basis::Tq4Rot128 && prefill_gemm(L.w_gu, n) && L.w_gu.fmt->basis() == basis_ && !(lora_now() && lora_of.count(&L.w_gu))) {
         gemm_rows(L.w_gu, nullptr, n, L.w_gu.rows);  // FP16 gate / up straight into the fused SwiGLU + rotation
         tqllm_cuda::tq4_swiglu_rot_from_h(gemm_c.as<__half>(), n, F, XH, stream);
         mm_h(L.w_down, X, n);

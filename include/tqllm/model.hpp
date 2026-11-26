@@ -56,6 +56,7 @@ public:
     bool native_mtp() const;   // --mtp: the model's own MTP head drafts
     bool adaptive_depth() const;   // depth 0 to spec_begin: the engine picks each step's drafts
     std::string fit_note() const;  // what the memory fit chose instead of the defaults (KV, context, buffers), or empty
+    std::string kernels() const;   // the kernel families the load picked (Inkling-2-Mini CUDA: experts / dense), or empty
     bool incremental() const;  // spec_begin / spec_advance / spec_finish available (chunked prefill), with or without a drafter
     void select_slot(int slot);
     // Image embeddings for the next spec_begin on the active slot: prompt tokens [at, at + nx * ny) are placeholders;

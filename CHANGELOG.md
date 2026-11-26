@@ -3,6 +3,27 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## 1.8.4 (2026-11-26)
+
+### Fixed
+- Inkling-2-Mini (CUDA): the routed-expert kernel family is picked by a fixed rule instead of a timing at load (#105).
+  The two families round differently, so a timed pick near a tie could change the greedy text between restarts.
+  Tensor cores when the format has them and at least 104 of every layer's 128 experts fit on the card, else the warp
+  kernels (RTX 3090, DFlash2, `--exact off`: tensor cores 160 vs warp 133 tok/s with all experts on the card, 56 vs 63
+  with 76). `--expert-kernels auto|tensor|warp` picks one for a controlled comparison, and `/health` (`kernels`) shows
+  what ran. RTX 3090, the reporter's setups, three restarts each: the same kernels and the same text every start.
+- Inkling-2-Mini (CUDA) with a drafter: a cold start could stay in a slow mode for the whole first reply (RTX 3090 Ti,
+  1 start in 3: 110 instead of 171 tok/s, about half the drafts, #106). The expert re-plans of a start landed in the
+  step times the drafting policy compares, so drafting looked slower than plain steps. Steps that re-planned now count
+  for acceptance only.
+- `pip install tqllm` wheels report their engine commit in `/health` (was `dev`).
+
+### Added
+- Qwen3.8-27B `--lora`: adapters on `attn_q` / `attn_k` / `attn_v` and `ffn_gate` / `ffn_up` (with `attn_output`,
+  `ssm_out`, `ffn_down` as before), so harness adapters such as harness-hub's Hermes Agent LoRA (rank 32, q / k / v /
+  o and gate / up / down) load (#81). DGX Spark, 27B TQ_XS: a request with scale 0 gives the base model's text bit for
+  bit; with DFlash2 the adapter decodes at 60-75 tok/s (base 70-100) on agent prompts.
+
 ## 1.8.3 (2026-11-25)
 
 ### Fixed
