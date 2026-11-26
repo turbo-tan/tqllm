@@ -29,6 +29,21 @@ equal counts do not establish equal prompts or benchmark conditions. Hardware
 readings stay visible under **Engine and hardware**. The compact chat dock remains
 available beside the workbench, or below it on small screens.
 
+## Cluster view
+
+Open **Cluster** in the monitor header to see the front door, configured
+`--peer` endpoints and layer-split ranks. Node queues and rates reflect the last
+router observation. Until a request is routed, peer status and rates are
+unknown. The view shows the sample age so idle peers are distinguishable from
+peers that failed a status query.
+
+Recent routing shows the selected node, reusable prefix tokens or a planned
+state transfer, and whether a peer response was relayed or the request fell
+back locally. State-transfer throughput appears after the first measurement.
+Placement shows explicit layer boundaries when configured. GPU memory appears
+where the front door can identify and sample the device. Keep using the CLI to
+configure peers and splits.
+
 ## Start
 
 Build from source as described in CONTRIBUTING.md, then:

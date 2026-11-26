@@ -24,7 +24,8 @@ constexpr size_t kStateFetchMax = size_t(4) << 30;  // a fetch above this is ref
 struct LinkRate {
     std::mutex m; double bps = 0;
     void note(size_t bytes, double s) { if (s <= 0) return; std::lock_guard<std::mutex> g(m); const double r = double(bytes) / s; bps = bps > 0 ? 0.7 * bps + 0.3 * r : r; }
-    double get() { std::lock_guard<std::mutex> g(m); return bps > 0 ? bps : 1e9; }
+    double measured() { std::lock_guard<std::mutex> g(m); return bps; }
+    double get() { const double rate = measured(); return rate > 0 ? rate : 1e9; }
 };
 
 // "host:port;positions=N" -> peer + N

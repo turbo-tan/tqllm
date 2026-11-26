@@ -573,6 +573,21 @@ int main(int argc, char ** argv) {
             (void)device;
 #endif
             monitor = std::make_unique<tqserve::Monitor>(tqserve::Monitor::Info{name, TQLLM_COMMIT, hostname, pci, slot_context, np});
+            std::vector<std::string> peer_labels;
+            for (const auto & peer : peers) peer_labels.push_back(peer.host + ":" + std::to_string(peer.port));
+            std::vector<tqserve::Monitor::ClusterDevice> devices;
+            if (engine.split_layers) {
+                for (int rank = 0; rank < engine.tp_world; ++rank) {
+                    tqserve::Monitor::ClusterDevice entry{rank, rank == engine.tp_rank ? pci : ""};
+                    if (rank == 0) entry.layer_start = 0;
+                    else if (size_t(rank - 1) < engine.split_at.size()) entry.layer_start = engine.split_at[size_t(rank - 1)];
+                    if (size_t(rank) < engine.split_at.size()) entry.layer_end = engine.split_at[size_t(rank)];
+                    devices.push_back(std::move(entry));
+                }
+            } else if (*pci) {
+                devices.push_back({engine.tp_rank, pci});
+            }
+            monitor->cluster(std::move(peer_labels), std::move(devices));
             monitor_server = std::make_unique<tqserve::MonitorServer>(*monitor, host, uint16_t(monitor_port), api_key, pci, uint16_t(port), monitor_port && monitor_port != port);
             std::cerr << "tqserve: monitor http://" << host << ':' << (monitor_port ? monitor_port : port) << "/monitor (read-only)\n";
         }
@@ -911,6 +926,9 @@ int main(int argc, char ** argv) {
                     static std::vector<tqserve::PeerMemory> memory(peers.size() + 1);  // last answer per peer (router.hpp)
                     static std::mutex route_mutex;
                     int pick = 0; tqserve::RoutePick rp;
+                    uint64_t route_id = 0;
+                    std::vector<bool> answered;
+                    for (const auto & box : boxes) answered.push_back(box.ok);
                     {
                         std::lock_guard<std::mutex> lk(route_mutex);
                         for (size_t i = 0; i < boxes.size(); ++i) {
@@ -925,6 +943,7 @@ int main(int argc, char ** argv) {
                         holders.apply(boxes, hkey, now_s);
                         rp = tqserve::pick_box_fetch(boxes, prompt, gen, link_rate.get());
                         pick = rp.box;
+                        if (monitor) route_id = monitor->route(boxes, answered, rp, link_rate.measured());
                         holders.served(hkey, pick, prompt, now_s);
                         if (tqllm::debug_on("route"))
                             std::fprintf(stderr, "tqserve: route key %zx -> box %d (reuse b0 %.0f b1 %.0f, fetch from %d)\n", hkey & 0xffffff, pick,
@@ -953,6 +972,7 @@ int main(int argc, char ** argv) {
                         const auto & peer = peers[size_t(pick - 1)];
                         const bool sent = tqserve::peer_proxy(peer, tqserve::forward_bytes(request, peer, owner_hint), client);
                         --inflight[size_t(pick)];
+                        if (monitor) monitor->route_forwarded(route_id, sent);
                         if (sent) { tqnet::close(client); return; }
                         std::fprintf(stderr, "tqserve: peer %s:%u did not take the request; serving it here\n", peer.host.c_str(), unsigned(peer.port));
                         ++inflight[0];
